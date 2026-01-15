@@ -29,10 +29,14 @@ fn main() {
         .add_systems(
             Update,
             (
+                // Console (runs first, captures input when visible)
+                ui::console::toggle_console,
+                ui::console::handle_console_input,
+                ui::console::update_console_display,
                 // Mode handling
                 state::mode::handle_mode_input,
                 ui::shell::update_mode_indicator,
-                // Input handling (keyboard + IME)
+                // Input handling (keyboard + IME) - skipped when console visible
                 ui::input::handle_keyboard_input,
                 ui::input::handle_ime_input,
                 ui::input::update_input_display,
@@ -42,8 +46,6 @@ fn main() {
                 ui::context::handle_navigation,
                 ui::context::handle_collapse_toggle,
                 ui::context::update_selection_highlight,
-                // Console
-                ui::console::toggle_console,
             ),
         )
         .run();

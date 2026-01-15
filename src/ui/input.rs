@@ -6,6 +6,7 @@ use bevy::{
 
 use crate::state::{input::InputBuffer, mode::Mode};
 
+use super::console::ConsoleState;
 use super::context::MessageEvent;
 
 /// Marker for the input bar text display
@@ -18,7 +19,13 @@ pub fn handle_keyboard_input(
     mut buffer: ResMut<InputBuffer>,
     mut message_events: MessageWriter<MessageEvent>,
     mode: Res<State<Mode>>,
+    console: Res<ConsoleState>,
 ) {
+    // Skip if console is visible (console handles its own input)
+    if console.visible {
+        return;
+    }
+
     // Only capture input in Insert mode
     if *mode.get() != Mode::Insert {
         return;
@@ -58,7 +65,13 @@ pub fn handle_ime_input(
     mut ime_events: MessageReader<Ime>,
     mut buffer: ResMut<InputBuffer>,
     mode: Res<State<Mode>>,
+    console: Res<ConsoleState>,
 ) {
+    // Skip if console is visible
+    if console.visible {
+        return;
+    }
+
     // Only capture input in Insert mode
     if *mode.get() != Mode::Insert {
         return;
