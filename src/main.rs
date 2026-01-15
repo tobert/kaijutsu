@@ -38,8 +38,9 @@ fn main() {
                 ui::input::update_input_display,
                 // Context area
                 ui::context::spawn_messages,
-                // Navigation
+                // Navigation and interaction
                 ui::context::handle_navigation,
+                ui::context::handle_collapse_toggle,
                 ui::context::update_selection_highlight,
                 // Console
                 ui::console::toggle_console,
@@ -48,10 +49,31 @@ fn main() {
         .run();
 }
 
-/// Send a welcome message on startup
+/// Send demo messages on startup to show DAG structure
 fn send_welcome_message(mut events: MessageWriter<ui::context::MessageEvent>) {
-    events.write(ui::context::MessageEvent {
-        sender: "system".to_string(),
-        content: "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode.".to_string(),
-    });
+    use ui::context::MessageEvent;
+
+    // System welcome
+    events.write(MessageEvent::system(
+        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, j/k to navigate.",
+    ));
+
+    // Demo conversation showing DAG structure
+    events.write(MessageEvent::user("amy", "@claude help me refactor this code"));
+
+    events.write(MessageEvent::agent(
+        "claude-opus",
+        "I'll analyze the codebase and suggest improvements.",
+    ));
+
+    // Tool call (would be child of agent message id=2 in real DAG)
+    events.write(MessageEvent::tool_call("Read", 2));
+
+    // Tool result
+    events.write(MessageEvent::tool_result("src/main.rs (245 lines)", 3));
+
+    events.write(MessageEvent::agent(
+        "claude-opus",
+        "Here are my suggestions:\n1. Extract the config parsing\n2. Add error handling",
+    ));
 }

@@ -35,10 +35,7 @@ pub fn handle_keyboard_input(
             (Key::Enter, _) => {
                 let text = buffer.clear();
                 if !text.is_empty() {
-                    message_events.write(MessageEvent {
-                        sender: "amy".to_string(),
-                        content: text,
-                    });
+                    message_events.write(MessageEvent::user("amy", text));
                 }
             }
             // Backspace removes last character

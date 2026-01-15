@@ -102,3 +102,18 @@ RUST_LOG=debug cargo run
 # Check Bevy 0.18 examples
 cd ~/src/bevy && cargo run --example standard_widgets
 ```
+
+## Git Conventions
+
+**Add files by name, not with `-A` or `.`**
+
+```bash
+# Good - explicit about what we're committing
+git add src/ui/context.rs src/main.rs
+
+# Avoid - might grab unintended files
+git add -A
+git add .
+```
+
+This keeps commits focused and avoids accidentally staging debug files, scratch work, or other cruft.
