@@ -1,4 +1,4 @@
-use bevy::{input::keyboard::{Key, KeyboardInput}, prelude::*};
+use bevy::{input::keyboard::{Key, KeyboardInput}, prelude::*, ui::widget::NodeImageMode};
 
 use super::theme::Theme;
 
@@ -137,28 +137,12 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
             ConsolePanel,
         ))
         .with_children(|console| {
-            // Frame overlay image
-            console.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(0.0),
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                    bottom: Val::Px(0.0),
-                    ..default()
-                },
-                ImageNode {
-                    image: frame_image,
-                    ..default()
-                },
-            ));
-
             // Content container (inside the frame)
             console
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
                     flex_grow: 1.0,
-                    padding: UiRect::all(Val::Px(16.0)),
+                    padding: UiRect::all(Val::Px(24.0)), // Extra padding for frame border
                     ..default()
                 })
                 .with_children(|content| {
@@ -216,6 +200,30 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
                             ));
                         });
                 });
+
+            // Frame overlay with 9-slice (spawned last = renders on top)
+            console.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(0.0),
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                ImageNode {
+                    image: frame_image,
+                    image_mode: NodeImageMode::Sliced(TextureSlicer {
+                        // console-frame-border.png: 5695x1623, border ~150px
+                        border: BorderRect::all(150.0),
+                        center_scale_mode: SliceScaleMode::Stretch,
+                        sides_scale_mode: SliceScaleMode::Stretch,
+                        max_corner_scale: 1.0,
+                    }),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ));
         });
 }
 

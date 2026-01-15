@@ -1,4 +1,4 @@
-use bevy::{ecs::hierarchy::ChildSpawnerCommands, prelude::*};
+use bevy::{ecs::hierarchy::ChildSpawnerCommands, prelude::*, ui::widget::NodeImageMode};
 
 use super::{context::ContextArea, input::InputDisplay, theme::Theme};
 use crate::state::mode::Mode;
@@ -18,6 +18,10 @@ pub fn setup(mut commands: Commands, theme: Res<Theme>, asset_server: Res<AssetS
     // Load fonts
     let jp_font: Handle<Font> = asset_server.load("fonts/DroidSansJapanese.ttf");
     commands.insert_resource(UiFonts { jp: jp_font.clone() });
+
+    // Load frame assets
+    let sidebar_frame: Handle<Image> = asset_server.load("ui/panel-frame.png");
+    let context_frame: Handle<Image> = asset_server.load("ui/context-frame-thin.png");
 
     // Root container
     commands
@@ -41,8 +45,8 @@ pub fn setup(mut commands: Commands, theme: Res<Theme>, asset_server: Res<AssetS
                 ..default()
             })
             .with_children(|middle| {
-                sidebar(middle, &theme);
-                context_area(middle, &theme);
+                sidebar(middle, &theme, sidebar_frame);
+                context_area(middle, &theme, context_frame);
             });
 
             // Input bar (SACRED)
@@ -87,25 +91,47 @@ fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme, font: Handle<Font
         });
 }
 
-fn sidebar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
+fn sidebar(parent: &mut ChildSpawnerCommands, theme: &Theme, frame: Handle<Image>) {
     parent
         .spawn((
             Node {
                 width: Val::Px(180.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(12.0)),
-                border: UiRect::right(Val::Px(2.0)),
+                padding: UiRect::all(Val::Px(20.0)), // Extra padding for frame border
                 row_gap: Val::Px(16.0),
                 ..default()
             },
-            BorderColor::all(theme.accent),
             BackgroundColor(theme.panel_bg),
         ))
         .with_children(|side| {
+            // Content first
             sidebar_section(side, theme, "ROOMS", &["> lobby", "  dev", "  ops"]);
             sidebar_section(side, theme, "AGENTS", &["◉ opus", "◉ haiku", "○ local"]);
             sidebar_section(side, theme, "EQUIP", &["filesystem", "web_search"]);
+
+            // Frame overlay with 9-slice (spawned last = renders on top)
+            side.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(0.0),
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                ImageNode {
+                    image: frame,
+                    image_mode: NodeImageMode::Sliced(TextureSlicer {
+                        // panel-frame.png: 2438x2574, border ~100px
+                        border: BorderRect::all(100.0),
+                        center_scale_mode: SliceScaleMode::Stretch,
+                        sides_scale_mode: SliceScaleMode::Stretch,
+                        max_corner_scale: 1.0,
+                    }),
+                    ..default()
+                },
+            ));
         });
 }
 
@@ -138,22 +164,46 @@ fn sidebar_section(parent: &mut ChildSpawnerCommands, theme: &Theme, title: &str
         });
 }
 
-fn context_area(parent: &mut ChildSpawnerCommands, theme: &Theme) {
+fn context_area(parent: &mut ChildSpawnerCommands, theme: &Theme, frame: Handle<Image>) {
     parent
         .spawn((
             Node {
                 flex_grow: 1.0,
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(16.0)),
-                border: UiRect::all(Val::Px(1.0)),
+                padding: UiRect::all(Val::Px(24.0)), // Extra padding for frame border
                 row_gap: Val::Px(8.0),
                 ..default()
             },
-            BorderColor::all(theme.border),
             BackgroundColor(theme.bg),
             ContextArea,
-        ));
+        ))
+        .with_children(|ctx| {
+            // Frame overlay with 9-slice (spawned = renders on top of messages)
+            ctx.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(0.0),
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                ImageNode {
+                    image: frame,
+                    image_mode: NodeImageMode::Sliced(TextureSlicer {
+                        // context-frame-thin.png: 5695x1623, border ~150px
+                        border: BorderRect::all(150.0),
+                        center_scale_mode: SliceScaleMode::Stretch,
+                        sides_scale_mode: SliceScaleMode::Stretch,
+                        max_corner_scale: 1.0,
+                    }),
+                    ..default()
+                },
+                // Don't block clicks on content below
+                Pickable::IGNORE,
+            ));
+        });
 }
 
 fn input_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
