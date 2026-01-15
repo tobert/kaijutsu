@@ -6,8 +6,18 @@ use crate::state::mode::Mode;
 #[derive(Component)]
 pub struct ModeIndicator;
 
-pub fn setup(mut commands: Commands, theme: Res<Theme>) {
+/// Resource holding our loaded fonts
+#[derive(Resource)]
+pub struct UiFonts {
+    pub jp: Handle<Font>,
+}
+
+pub fn setup(mut commands: Commands, theme: Res<Theme>, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d);
+
+    // Load fonts
+    let jp_font: Handle<Font> = asset_server.load("fonts/DroidSansJapanese.ttf");
+    commands.insert_resource(UiFonts { jp: jp_font.clone() });
 
     // Root container
     commands
@@ -21,7 +31,7 @@ pub fn setup(mut commands: Commands, theme: Res<Theme>) {
             BackgroundColor(theme.bg),
         ))
         .with_children(|root| {
-            title_bar(root, &theme);
+            title_bar(root, &theme, jp_font.clone());
 
             // Middle: sidebar + context
             root.spawn(Node {
@@ -40,7 +50,7 @@ pub fn setup(mut commands: Commands, theme: Res<Theme>) {
         });
 }
 
-fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
+fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme, font: Handle<Font>) {
     parent
         .spawn((
             Node {
@@ -52,13 +62,14 @@ fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
                 border: UiRect::bottom(Val::Px(2.0)),
                 ..default()
             },
-            BorderColor::all(theme.border),
+            BorderColor::all(theme.accent),
             BackgroundColor(theme.panel_bg),
         ))
         .with_children(|bar| {
             bar.spawn((
                 Text::new("【会術】 Kaijutsu"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 20.0,
                     ..default()
                 },
@@ -67,6 +78,7 @@ fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
             bar.spawn((
                 Text::new("▣ room: lobby"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 14.0,
                     ..default()
                 },
@@ -87,7 +99,7 @@ fn sidebar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
                 row_gap: Val::Px(16.0),
                 ..default()
             },
-            BorderColor::all(theme.border),
+            BorderColor::all(theme.accent),
             BackgroundColor(theme.panel_bg),
         ))
         .with_children(|side| {
@@ -127,18 +139,21 @@ fn sidebar_section(parent: &mut ChildSpawnerCommands, theme: &Theme, title: &str
 }
 
 fn context_area(parent: &mut ChildSpawnerCommands, theme: &Theme) {
-    parent.spawn((
-        Node {
-            flex_grow: 1.0,
-            height: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::all(Val::Px(16.0)),
-            row_gap: Val::Px(8.0),
-            ..default()
-        },
-        BackgroundColor(theme.bg),
-        ContextArea,
-    ));
+    parent
+        .spawn((
+            Node {
+                flex_grow: 1.0,
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(16.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                row_gap: Val::Px(8.0),
+                ..default()
+            },
+            BorderColor::all(theme.border),
+            BackgroundColor(theme.bg),
+            ContextArea,
+        ));
 }
 
 fn input_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
@@ -153,7 +168,7 @@ fn input_bar(parent: &mut ChildSpawnerCommands, theme: &Theme) {
                 border: UiRect::top(Val::Px(2.0)),
                 ..default()
             },
-            BorderColor::all(theme.border),
+            BorderColor::all(theme.accent),
             BackgroundColor(theme.panel_bg),
         ))
         .with_children(|bar| {
