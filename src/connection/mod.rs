@@ -3,14 +3,20 @@
 //! Architecture:
 //! - SSH handles auth and transport (russh)
 //! - Cap'n Proto handles RPC over SSH channels (capnp-rpc)
-//! - Bevy resources wrap the connection state
+//! - Bridge module connects async RPC to Bevy ECS via channels
 
+pub mod bridge;
 pub mod rpc;
 pub mod ssh;
 
+pub use bridge::{
+    ConnectionBridgePlugin, ConnectionCommand, ConnectionCommandSender, ConnectionEvent,
+    ConnectionEventReceiver,
+};
+
 use bevy::prelude::*;
 
-/// Connection state resource
+/// Connection state resource (updated by systems responding to ConnectionEvent)
 #[derive(Resource, Default)]
 pub struct ConnectionState {
     pub status: ConnectionStatus,
@@ -18,27 +24,11 @@ pub struct ConnectionState {
     pub username: Option<String>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub enum ConnectionStatus {
     #[default]
     Disconnected,
     Connecting,
     Connected,
     Error(String),
-}
-
-/// Event fired when connection status changes
-#[derive(Message)]
-pub struct ConnectionEvent {
-    pub status: ConnectionStatus,
-}
-
-/// Plugin for connection management
-pub struct ConnectionPlugin;
-
-impl Plugin for ConnectionPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<ConnectionState>()
-            .add_message::<ConnectionEvent>();
-    }
 }
