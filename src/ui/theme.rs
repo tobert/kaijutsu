@@ -1,0 +1,26 @@
+use bevy::prelude::*;
+
+#[derive(Resource)]
+pub struct Theme {
+    pub bg: Color,
+    pub panel_bg: Color,
+    pub fg: Color,
+    pub fg_dim: Color,
+    pub accent: Color,
+    pub accent2: Color,
+    pub border: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            bg: Color::srgb(0.05, 0.07, 0.09),
+            panel_bg: Color::srgba(0.05, 0.07, 0.09, 0.9),
+            fg: Color::srgb(0.79, 0.82, 0.84),
+            fg_dim: Color::srgb(0.5, 0.5, 0.5),
+            accent: Color::srgb(0.34, 0.65, 1.0),
+            accent2: Color::srgb(0.97, 0.47, 0.73),
+            border: Color::srgb(0.19, 0.21, 0.24),
+        }
+    }
+}
