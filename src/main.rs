@@ -1,7 +1,13 @@
 use bevy::prelude::*;
 
+mod connection;
 mod state;
 mod ui;
+
+// Cap'n Proto generated code (must be at crate root for `crate::` paths to work)
+pub mod kaijutsu_capnp {
+    include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
+}
 
 fn main() {
     App::new()
