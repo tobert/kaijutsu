@@ -1,3 +1,4 @@
+pub mod console;
 pub mod context;
 pub mod input;
 pub mod shell;

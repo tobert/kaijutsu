@@ -18,10 +18,13 @@ fn main() {
         // Resources
         .init_resource::<ui::theme::Theme>()
         .init_resource::<state::input::InputBuffer>()
+        .init_resource::<state::nav::NavigationState>()
+        .init_resource::<ui::context::MessageCount>()
+        .init_resource::<ui::console::ConsoleState>()
         // Messages
         .add_message::<ui::context::MessageEvent>()
         // Startup
-        .add_systems(Startup, (ui::shell::setup, send_welcome_message))
+        .add_systems(Startup, (ui::shell::setup, ui::console::setup_console, send_welcome_message))
         // Update
         .add_systems(
             Update,
@@ -35,6 +38,11 @@ fn main() {
                 ui::input::update_input_display,
                 // Context area
                 ui::context::spawn_messages,
+                // Navigation
+                ui::context::handle_navigation,
+                ui::context::update_selection_highlight,
+                // Console
+                ui::console::toggle_console,
             ),
         )
         .run();
