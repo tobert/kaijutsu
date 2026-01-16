@@ -63,6 +63,7 @@ impl Default for ConsoleState {
 #[derive(Clone)]
 pub struct ConsoleLine {
     pub text: String,
+    #[allow(dead_code)]
     pub line_type: LineType,
 }
 
@@ -148,7 +149,7 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
                 .with_children(|content| {
                     // Header
                     content.spawn((
-                        Text::new("【kaish】 /room/lobby"),
+                        Text::new("【kaish】 /kernel/lobby"),
                         TextFont {
                             font_size: 14.0,
                             ..default()
@@ -330,20 +331,20 @@ fn execute_command(state: &mut ConsoleState, input: &str) {
     state.history_index = None;
 
     // Parse and execute
-    let parts: Vec<&str> = input.trim().split_whitespace().collect();
+    let parts: Vec<&str> = input.split_whitespace().collect();
     let response = match parts.as_slice() {
         ["help"] => ConsoleLine::output(
-            "Commands: help, ls, pwd, echo <text>, clear, room <name>",
+            "Commands: help, ls, pwd, echo <text>, clear, kernel <name>",
         ),
         ["ls"] => ConsoleLine::output("Cargo.toml  src/  docs/  assets/  README.md"),
-        ["pwd"] => ConsoleLine::output("/room/lobby/worktree"),
+        ["pwd"] => ConsoleLine::output("/kernel/lobby/mnt/kaijutsu"),
         ["clear"] => {
             state.history.clear();
             return;
         }
         ["echo", rest @ ..] => ConsoleLine::output(rest.join(" ")),
-        ["room", name] => ConsoleLine::system(format!("Switching to room: {}", name)),
-        ["room"] => ConsoleLine::error("Usage: room <name>"),
+        ["kernel", name] => ConsoleLine::system(format!("Switching to kernel: {}", name)),
+        ["kernel"] => ConsoleLine::error("Usage: kernel <name>"),
         [] => return,
         [cmd, ..] => ConsoleLine::error(format!("Unknown command: {}", cmd)),
     };

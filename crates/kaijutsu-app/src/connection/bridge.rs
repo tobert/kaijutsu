@@ -8,10 +8,11 @@ use bevy::prelude::*;
 use tokio::sync::mpsc;
 
 // Use types from the client library
-use kaijutsu_client::{Identity, RoomConfig, RoomHandle, RoomInfo, Row, RpcClient, SshConfig};
+use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, Row, RpcClient, SshConfig};
 
 /// Commands sent from Bevy to the connection thread
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ConnectionCommand {
     /// Connect to a server via SSH
     ConnectSsh { config: SshConfig },
@@ -21,19 +22,19 @@ pub enum ConnectionCommand {
     Disconnect,
     /// Get current identity
     Whoami,
-    /// List available rooms
-    ListRooms,
-    /// Join a room by name
-    JoinRoom { name: String },
-    /// Create a new room
-    CreateRoom { config: RoomConfig },
-    /// Leave current room
-    LeaveRoom,
-    /// Send a message to the current room
+    /// List available kernels
+    ListKernels,
+    /// Attach to a kernel by ID
+    AttachKernel { id: String },
+    /// Create a new kernel
+    CreateKernel { config: KernelConfig },
+    /// Detach from current kernel
+    DetachKernel,
+    /// Send a message to the current kernel
     SendMessage { content: String },
     /// Mention an agent
     MentionAgent { agent: String, content: String },
-    /// Get room history
+    /// Get kernel history
     GetHistory { limit: u32 },
 }
 
@@ -46,12 +47,12 @@ pub enum ConnectionEvent {
     ConnectionFailed(String),
     /// Identity received
     Identity(Identity),
-    /// Room list received
-    RoomList(Vec<RoomInfo>),
-    /// Joined a room
-    JoinedRoom(RoomInfo),
-    /// Left a room
-    LeftRoom,
+    /// Kernel list received
+    KernelList(Vec<KernelInfo>),
+    /// Attached to a kernel
+    AttachedKernel(KernelInfo),
+    /// Detached from a kernel
+    DetachedKernel,
     /// New message (from send or history)
     NewMessage(Row),
     /// Multiple messages (from history)
@@ -79,7 +80,7 @@ pub struct ConnectionEvents(pub mpsc::UnboundedReceiver<ConnectionEvent>);
 pub struct ConnectionState {
     pub connected: bool,
     pub identity: Option<Identity>,
-    pub current_room: Option<RoomInfo>,
+    pub current_kernel: Option<KernelInfo>,
 }
 
 /// Plugin for connection management
@@ -129,16 +130,16 @@ fn update_connection_state(
             ConnectionEvent::Disconnected | ConnectionEvent::ConnectionFailed(_) => {
                 state.connected = false;
                 state.identity = None;
-                state.current_room = None;
+                state.current_kernel = None;
             }
             ConnectionEvent::Identity(id) => {
                 state.identity = Some(id.clone());
             }
-            ConnectionEvent::JoinedRoom(info) => {
-                state.current_room = Some(info.clone());
+            ConnectionEvent::AttachedKernel(info) => {
+                state.current_kernel = Some(info.clone());
             }
-            ConnectionEvent::LeftRoom => {
-                state.current_room = None;
+            ConnectionEvent::DetachedKernel => {
+                state.current_kernel = None;
             }
             _ => {}
         }
@@ -176,7 +177,7 @@ async fn connection_loop(
 
     let mut _ssh_client: Option<SshClient> = None;
     let mut rpc_client: Option<RpcClient> = None;
-    let mut current_room: Option<RoomHandle> = None;
+    let mut current_kernel: Option<KernelHandle> = None;
 
     loop {
         let Some(cmd) = cmd_rx.recv().await else {
@@ -244,7 +245,7 @@ async fn connection_loop(
                     let _ = client.disconnect().await;
                 }
                 rpc_client = None;
-                current_room = None;
+                current_kernel = None;
                 let _ = evt_tx.send(ConnectionEvent::Disconnected);
             }
 
@@ -263,11 +264,11 @@ async fn connection_loop(
                 }
             }
 
-            ConnectionCommand::ListRooms => {
+            ConnectionCommand::ListKernels => {
                 if let Some(rpc) = &rpc_client {
-                    match rpc.list_rooms().await {
-                        Ok(rooms) => {
-                            let _ = evt_tx.send(ConnectionEvent::RoomList(rooms));
+                    match rpc.list_kernels().await {
+                        Ok(kernels) => {
+                            let _ = evt_tx.send(ConnectionEvent::KernelList(kernels));
                         }
                         Err(e) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
@@ -278,13 +279,13 @@ async fn connection_loop(
                 }
             }
 
-            ConnectionCommand::JoinRoom { name } => {
+            ConnectionCommand::AttachKernel { id } => {
                 if let Some(rpc) = &rpc_client {
-                    match rpc.join_room(&name).await {
-                        Ok(room) => match room.get_info().await {
+                    match rpc.attach_kernel(&id).await {
+                        Ok(kernel) => match kernel.get_info().await {
                             Ok(info) => {
-                                current_room = Some(room);
-                                let _ = evt_tx.send(ConnectionEvent::JoinedRoom(info));
+                                current_kernel = Some(kernel);
+                                let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
                             }
                             Err(e) => {
                                 let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
@@ -299,13 +300,13 @@ async fn connection_loop(
                 }
             }
 
-            ConnectionCommand::CreateRoom { config } => {
+            ConnectionCommand::CreateKernel { config } => {
                 if let Some(rpc) = &rpc_client {
-                    match rpc.create_room(config).await {
-                        Ok(room) => match room.get_info().await {
+                    match rpc.create_kernel(config).await {
+                        Ok(kernel) => match kernel.get_info().await {
                             Ok(info) => {
-                                current_room = Some(room);
-                                let _ = evt_tx.send(ConnectionEvent::JoinedRoom(info));
+                                current_kernel = Some(kernel);
+                                let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
                             }
                             Err(e) => {
                                 let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
@@ -320,16 +321,16 @@ async fn connection_loop(
                 }
             }
 
-            ConnectionCommand::LeaveRoom => {
-                if let Some(room) = current_room.take() {
-                    let _ = room.leave().await;
-                    let _ = evt_tx.send(ConnectionEvent::LeftRoom);
+            ConnectionCommand::DetachKernel => {
+                if let Some(kernel) = current_kernel.take() {
+                    let _ = kernel.detach().await;
+                    let _ = evt_tx.send(ConnectionEvent::DetachedKernel);
                 }
             }
 
             ConnectionCommand::SendMessage { content } => {
-                if let Some(room) = &current_room {
-                    match room.send(&content).await {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.send(&content).await {
                         Ok(row) => {
                             let _ = evt_tx.send(ConnectionEvent::NewMessage(row));
                         }
@@ -338,13 +339,13 @@ async fn connection_loop(
                         }
                     }
                 } else {
-                    let _ = evt_tx.send(ConnectionEvent::Error("Not in a room".into()));
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
                 }
             }
 
             ConnectionCommand::MentionAgent { agent, content } => {
-                if let Some(room) = &current_room {
-                    match room.mention(&agent, &content).await {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.mention(&agent, &content).await {
                         Ok(row) => {
                             let _ = evt_tx.send(ConnectionEvent::NewMessage(row));
                         }
@@ -353,13 +354,13 @@ async fn connection_loop(
                         }
                     }
                 } else {
-                    let _ = evt_tx.send(ConnectionEvent::Error("Not in a room".into()));
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
                 }
             }
 
             ConnectionCommand::GetHistory { limit } => {
-                if let Some(room) = &current_room {
-                    match room.get_history(limit, 0).await {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.get_history(limit, 0).await {
                         Ok(rows) => {
                             let _ = evt_tx.send(ConnectionEvent::History(rows));
                         }
@@ -368,7 +369,7 @@ async fn connection_loop(
                         }
                     }
                 } else {
-                    let _ = evt_tx.send(ConnectionEvent::Error("Not in a room".into()));
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
                 }
             }
         }

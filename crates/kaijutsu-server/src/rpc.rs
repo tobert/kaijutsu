@@ -1,6 +1,8 @@
 //! Cap'n Proto RPC server implementation
 //!
-//! Implements World, Room, and KaishKernel capabilities.
+//! Implements World and Kernel capabilities.
+
+#![allow(refining_impl_trait)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,9 +21,10 @@ use crate::kaijutsu_capnp::*;
 /// Server state shared across all capabilities
 pub struct ServerState {
     pub identity: Identity,
-    pub rooms: HashMap<String, RoomState>,
-    next_room_id: AtomicU64,
+    pub kernels: HashMap<String, KernelState>,
+    next_kernel_id: AtomicU64,
     next_row_id: AtomicU64,
+    next_exec_id: AtomicU64,
 }
 
 impl ServerState {
@@ -31,18 +34,23 @@ impl ServerState {
                 username: username.clone(),
                 display_name: username,
             },
-            rooms: HashMap::new(),
-            next_room_id: AtomicU64::new(1),
+            kernels: HashMap::new(),
+            next_kernel_id: AtomicU64::new(1),
             next_row_id: AtomicU64::new(1),
+            next_exec_id: AtomicU64::new(1),
         }
     }
 
-    fn next_room_id(&self) -> u64 {
-        self.next_room_id.fetch_add(1, Ordering::SeqCst)
+    fn next_kernel_id(&self) -> String {
+        format!("kernel-{}", self.next_kernel_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn next_row_id(&self) -> u64 {
         self.next_row_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn next_exec_id(&self) -> u64 {
+        self.next_exec_id.fetch_add(1, Ordering::SeqCst)
     }
 }
 
@@ -52,11 +60,18 @@ pub struct Identity {
     pub display_name: String,
 }
 
-pub struct RoomState {
-    pub id: u64,
+pub struct KernelState {
+    pub id: String,
     pub name: String,
-    pub branch: String,
+    pub consent_mode: ConsentMode,
     pub rows: Vec<RowData>,
+    pub command_history: Vec<CommandEntry>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ConsentMode {
+    Collaborative,
+    Autonomous,
 }
 
 #[derive(Clone)]
@@ -66,6 +81,13 @@ pub struct RowData {
     pub row_type: RowType,
     pub sender: String,
     pub content: String,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+pub struct CommandEntry {
+    pub id: u64,
+    pub code: String,
     pub timestamp: u64,
 }
 
@@ -103,105 +125,106 @@ impl world::Server for WorldImpl {
         Promise::ok(())
     }
 
-    fn list_rooms(
+    fn list_kernels(
         self: Rc<Self>,
-        _params: world::ListRoomsParams,
-        mut results: world::ListRoomsResults,
+        _params: world::ListKernelsParams,
+        mut results: world::ListKernelsResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
-        let mut rooms = results.get().init_rooms(state.rooms.len() as u32);
-        for (i, room) in state.rooms.values().enumerate() {
-            let mut r = rooms.reborrow().get(i as u32);
-            r.set_id(room.id);
-            r.set_name(&room.name);
-            r.set_branch(&room.branch);
-            r.set_user_count(1);
-            r.set_agent_count(0);
+        let mut kernels = results.get().init_kernels(state.kernels.len() as u32);
+        for (i, kernel) in state.kernels.values().enumerate() {
+            let mut k = kernels.reborrow().get(i as u32);
+            k.set_id(&kernel.id);
+            k.set_name(&kernel.name);
+            k.set_user_count(1);
+            k.set_agent_count(0);
         }
         Promise::ok(())
     }
 
-    fn join_room(
+    fn attach_kernel(
         self: Rc<Self>,
-        params: world::JoinRoomParams,
-        mut results: world::JoinRoomResults,
+        params: world::AttachKernelParams,
+        mut results: world::AttachKernelResults,
     ) -> Promise<(), capnp::Error> {
-        let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
+        let id = pry!(pry!(pry!(params.get()).get_id()).to_str()).to_owned();
 
+        // Create kernel if it doesn't exist (for now, later this should error)
         {
             let mut state = self.state.borrow_mut();
-            if !state.rooms.contains_key(&name) {
-                let id = state.next_room_id();
-                state.rooms.insert(name.clone(), RoomState {
-                    id,
-                    name: name.clone(),
-                    branch: "main".to_string(),
+            if !state.kernels.contains_key(&id) {
+                state.kernels.insert(id.clone(), KernelState {
+                    id: id.clone(),
+                    name: id.clone(),
+                    consent_mode: ConsentMode::Collaborative,
                     rows: Vec::new(),
+                    command_history: Vec::new(),
                 });
             }
         }
 
-        let room_impl = RoomImpl::new(self.state.clone(), name);
-        results.get().set_room(capnp_rpc::new_client(room_impl));
+        let kernel_impl = KernelImpl::new(self.state.clone(), id);
+        results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         Promise::ok(())
     }
 
-    fn create_room(
+    fn create_kernel(
         self: Rc<Self>,
-        params: world::CreateRoomParams,
-        mut results: world::CreateRoomResults,
+        params: world::CreateKernelParams,
+        mut results: world::CreateKernelResults,
     ) -> Promise<(), capnp::Error> {
         let config = pry!(pry!(params.get()).get_config());
         let name = pry!(pry!(config.get_name()).to_str()).to_owned();
-        let branch = config.get_branch().ok()
-            .and_then(|b| b.to_str().ok())
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| "main".to_string());
+        let consent_mode = match config.get_consent_mode() {
+            Ok(crate::kaijutsu_capnp::ConsentMode::Autonomous) => ConsentMode::Autonomous,
+            _ => ConsentMode::Collaborative,
+        };
 
-        {
+        let id = {
             let mut state = self.state.borrow_mut();
-            let id = state.next_room_id();
-            state.rooms.insert(name.clone(), RoomState {
-                id,
-                name: name.clone(),
-                branch,
+            let id = state.next_kernel_id();
+            state.kernels.insert(id.clone(), KernelState {
+                id: id.clone(),
+                name,
+                consent_mode,
                 rows: Vec::new(),
+                command_history: Vec::new(),
             });
-        }
+            id
+        };
 
-        let room_impl = RoomImpl::new(self.state.clone(), name);
-        results.get().set_room(capnp_rpc::new_client(room_impl));
+        let kernel_impl = KernelImpl::new(self.state.clone(), id);
+        results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         Promise::ok(())
     }
 }
 
 // ============================================================================
-// Room Implementation
+// Kernel Implementation
 // ============================================================================
 
-struct RoomImpl {
+struct KernelImpl {
     state: Rc<RefCell<ServerState>>,
-    room_name: String,
+    kernel_id: String,
 }
 
-impl RoomImpl {
-    fn new(state: Rc<RefCell<ServerState>>, room_name: String) -> Self {
-        Self { state, room_name }
+impl KernelImpl {
+    fn new(state: Rc<RefCell<ServerState>>, kernel_id: String) -> Self {
+        Self { state, kernel_id }
     }
 }
 
-impl room::Server for RoomImpl {
+impl kernel::Server for KernelImpl {
     fn get_info(
         self: Rc<Self>,
-        _params: room::GetInfoParams,
-        mut results: room::GetInfoResults,
+        _params: kernel::GetInfoParams,
+        mut results: kernel::GetInfoResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
-        if let Some(room) = state.rooms.get(&self.room_name) {
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
             let mut info = results.get().init_info();
-            info.set_id(room.id);
-            info.set_name(&room.name);
-            info.set_branch(&room.branch);
+            info.set_id(&kernel.id);
+            info.set_name(&kernel.name);
             info.set_user_count(1);
             info.set_agent_count(0);
         }
@@ -210,16 +233,16 @@ impl room::Server for RoomImpl {
 
     fn get_history(
         self: Rc<Self>,
-        params: room::GetHistoryParams,
-        mut results: room::GetHistoryResults,
+        params: kernel::GetHistoryParams,
+        mut results: kernel::GetHistoryResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
         let limit = params.get_limit() as usize;
         let before_id = params.get_before_id();
 
         let state = self.state.borrow();
-        if let Some(room) = state.rooms.get(&self.room_name) {
-            let rows: Vec<_> = room.rows.iter()
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let rows: Vec<_> = kernel.rows.iter()
                 .filter(|r| before_id == 0 || r.id < before_id)
                 .take(limit)
                 .collect();
@@ -240,8 +263,8 @@ impl room::Server for RoomImpl {
 
     fn send(
         self: Rc<Self>,
-        params: room::SendParams,
-        mut results: room::SendResults,
+        params: kernel::SendParams,
+        mut results: kernel::SendResults,
     ) -> Promise<(), capnp::Error> {
         let content = pry!(pry!(pry!(params.get()).get_content()).to_str()).to_owned();
 
@@ -260,8 +283,8 @@ impl room::Server for RoomImpl {
                     .unwrap()
                     .as_secs(),
             };
-            if let Some(room) = state.rooms.get_mut(&self.room_name) {
-                room.rows.push(row.clone());
+            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+                kernel.rows.push(row.clone());
             }
             row
         };
@@ -278,8 +301,8 @@ impl room::Server for RoomImpl {
 
     fn mention(
         self: Rc<Self>,
-        params: room::MentionParams,
-        mut results: room::MentionResults,
+        params: kernel::MentionParams,
+        mut results: kernel::MentionResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
         let agent = pry!(pry!(params.get_agent()).to_str()).to_owned();
@@ -301,8 +324,8 @@ impl room::Server for RoomImpl {
                     .unwrap()
                     .as_secs(),
             };
-            if let Some(room) = state.rooms.get_mut(&self.room_name) {
-                room.rows.push(row.clone());
+            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+                kernel.rows.push(row.clone());
             }
             row
         };
@@ -319,124 +342,143 @@ impl room::Server for RoomImpl {
 
     fn subscribe(
         self: Rc<Self>,
-        _params: room::SubscribeParams,
-        _results: room::SubscribeResults,
+        _params: kernel::SubscribeParams,
+        _results: kernel::SubscribeResults,
     ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 
-    fn get_kernel(
-        self: Rc<Self>,
-        _params: room::GetKernelParams,
-        mut results: room::GetKernelResults,
-    ) -> Promise<(), capnp::Error> {
-        let kernel_impl = KaishKernelImpl::new();
-        results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
-        Promise::ok(())
-    }
+    // kaish execution methods (directly on Kernel, no indirection)
 
-    fn leave(
-        self: Rc<Self>,
-        _params: room::LeaveParams,
-        _results: room::LeaveResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
-    }
-
-    fn fork(
-        self: Rc<Self>,
-        _params: room::ForkParams,
-        _results: room::ForkResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("fork not yet implemented".into()))
-    }
-
-    fn list_equipment(
-        self: Rc<Self>,
-        _params: room::ListEquipmentParams,
-        mut results: room::ListEquipmentResults,
-    ) -> Promise<(), capnp::Error> {
-        // Return empty tools list for now
-        results.get().init_tools(0);
-        Promise::ok(())
-    }
-
-    fn equip(
-        self: Rc<Self>,
-        _params: room::EquipParams,
-        _results: room::EquipResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("equip not yet implemented".into()))
-    }
-
-    fn unequip(
-        self: Rc<Self>,
-        _params: room::UnequipParams,
-        _results: room::UnequipResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("unequip not yet implemented".into()))
-    }
-}
-
-// ============================================================================
-// KaishKernel Implementation
-// ============================================================================
-
-struct KaishKernelImpl {
-    next_exec_id: AtomicU64,
-}
-
-impl KaishKernelImpl {
-    fn new() -> Self {
-        Self {
-            next_exec_id: AtomicU64::new(1),
-        }
-    }
-}
-
-impl kaish_kernel::Server for KaishKernelImpl {
     fn execute(
         self: Rc<Self>,
-        params: kaish_kernel::ExecuteParams,
-        mut results: kaish_kernel::ExecuteResults,
+        params: kernel::ExecuteParams,
+        mut results: kernel::ExecuteResults,
     ) -> Promise<(), capnp::Error> {
-        let _code = pry!(pry!(pry!(params.get()).get_code()).to_str()).to_owned();
-        let exec_id = self.next_exec_id.fetch_add(1, Ordering::SeqCst);
+        let code = pry!(pry!(pry!(params.get()).get_code()).to_str()).to_owned();
+
+        let exec_id = {
+            let mut state = self.state.borrow_mut();
+            let exec_id = state.next_exec_id();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+                kernel.command_history.push(CommandEntry {
+                    id: exec_id,
+                    code,
+                    timestamp,
+                });
+            }
+            exec_id
+        };
+
         results.get().set_exec_id(exec_id);
         Promise::ok(())
     }
 
     fn interrupt(
         self: Rc<Self>,
-        _params: kaish_kernel::InterruptParams,
-        _results: kaish_kernel::InterruptResults,
+        _params: kernel::InterruptParams,
+        _results: kernel::InterruptResults,
     ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 
     fn complete(
         self: Rc<Self>,
-        _params: kaish_kernel::CompleteParams,
-        mut results: kaish_kernel::CompleteResults,
+        _params: kernel::CompleteParams,
+        mut results: kernel::CompleteResults,
     ) -> Promise<(), capnp::Error> {
         results.get().init_completions(0);
         Promise::ok(())
     }
 
-    fn subscribe(
+    fn subscribe_output(
         self: Rc<Self>,
-        _params: kaish_kernel::SubscribeParams,
-        _results: kaish_kernel::SubscribeResults,
+        _params: kernel::SubscribeOutputParams,
+        _results: kernel::SubscribeOutputResults,
     ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 
-    fn get_history(
+    fn get_command_history(
         self: Rc<Self>,
-        _params: kaish_kernel::GetHistoryParams,
-        mut results: kaish_kernel::GetHistoryResults,
+        params: kernel::GetCommandHistoryParams,
+        mut results: kernel::GetCommandHistoryResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().init_entries(0);
+        let limit = pry!(params.get()).get_limit() as usize;
+
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let entries: Vec<_> = kernel.command_history.iter()
+                .rev()
+                .take(limit)
+                .collect();
+
+            let mut result_entries = results.get().init_entries(entries.len() as u32);
+            for (i, entry) in entries.iter().enumerate() {
+                let mut e = result_entries.reborrow().get(i as u32);
+                e.set_id(entry.id);
+                e.set_code(&entry.code);
+                e.set_timestamp(entry.timestamp);
+            }
+        }
+        Promise::ok(())
+    }
+
+    // Equipment
+
+    fn list_equipment(
+        self: Rc<Self>,
+        _params: kernel::ListEquipmentParams,
+        mut results: kernel::ListEquipmentResults,
+    ) -> Promise<(), capnp::Error> {
+        results.get().init_tools(0);
+        Promise::ok(())
+    }
+
+    fn equip(
+        self: Rc<Self>,
+        _params: kernel::EquipParams,
+        _results: kernel::EquipResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("equip not yet implemented".into()))
+    }
+
+    fn unequip(
+        self: Rc<Self>,
+        _params: kernel::UnequipParams,
+        _results: kernel::UnequipResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("unequip not yet implemented".into()))
+    }
+
+    // Lifecycle
+
+    fn fork(
+        self: Rc<Self>,
+        _params: kernel::ForkParams,
+        _results: kernel::ForkResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("fork not yet implemented".into()))
+    }
+
+    fn thread(
+        self: Rc<Self>,
+        _params: kernel::ThreadParams,
+        _results: kernel::ThreadResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("thread not yet implemented".into()))
+    }
+
+    fn detach(
+        self: Rc<Self>,
+        _params: kernel::DetachParams,
+        _results: kernel::DetachResults,
+    ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 }

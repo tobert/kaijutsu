@@ -1,6 +1,6 @@
 //! Cap'n Proto RPC client for kaijutsu
 //!
-//! Provides typed interface to the World, Room, and KaishKernel capabilities.
+//! Provides typed interface to the World and Kernel capabilities.
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
@@ -66,56 +66,56 @@ impl RpcClient {
         })
     }
 
-    /// List available rooms
-    pub async fn list_rooms(&self) -> Result<Vec<RoomInfo>, RpcError> {
-        let request = self.world.list_rooms_request();
+    /// List available kernels
+    pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, RpcError> {
+        let request = self.world.list_kernels_request();
         let response = request.send().promise.await?;
-        let rooms = response.get()?.get_rooms()?;
+        let kernels = response.get()?.get_kernels()?;
 
-        let mut result = Vec::with_capacity(rooms.len() as usize);
-        for room in rooms.iter() {
-            result.push(RoomInfo {
-                id: room.get_id(),
-                name: room.get_name()?.to_string()?,
-                branch: room.get_branch()?.to_string()?,
-                user_count: room.get_user_count(),
-                agent_count: room.get_agent_count(),
+        let mut result = Vec::with_capacity(kernels.len() as usize);
+        for kernel in kernels.iter() {
+            result.push(KernelInfo {
+                id: kernel.get_id()?.to_string()?,
+                name: kernel.get_name()?.to_string()?,
+                user_count: kernel.get_user_count(),
+                agent_count: kernel.get_agent_count(),
             });
         }
         Ok(result)
     }
 
-    /// Join a room by name
-    pub async fn join_room(&self, name: &str) -> Result<RoomHandle, RpcError> {
-        let mut request = self.world.join_room_request();
-        request.get().set_name(name);
+    /// Attach to a kernel by ID
+    pub async fn attach_kernel(&self, id: &str) -> Result<KernelHandle, RpcError> {
+        let mut request = self.world.attach_kernel_request();
+        request.get().set_id(id);
         let response = request.send().promise.await?;
-        let room = response.get()?.get_room()?;
+        let kernel = response.get()?.get_kernel()?;
 
-        Ok(RoomHandle { room })
+        Ok(KernelHandle { kernel })
     }
 
-    /// Create a new room
-    pub async fn create_room(&self, config: RoomConfig) -> Result<RoomHandle, RpcError> {
-        let mut request = self.world.create_room_request();
+    /// Create a new kernel
+    pub async fn create_kernel(&self, config: KernelConfig) -> Result<KernelHandle, RpcError> {
+        let mut request = self.world.create_kernel_request();
         {
             let mut cfg = request.get().init_config();
             cfg.set_name(&config.name);
-            if let Some(branch) = &config.branch {
-                cfg.set_branch(branch);
-            }
-            let mut repos = cfg.init_repos(config.repos.len() as u32);
-            for (i, repo) in config.repos.iter().enumerate() {
-                let mut r = repos.reborrow().get(i as u32);
-                r.set_name(&repo.name);
-                r.set_url(&repo.url);
-                r.set_writable(repo.writable);
+            cfg.set_consent_mode(match config.consent_mode {
+                ConsentMode::Collaborative => crate::kaijutsu_capnp::ConsentMode::Collaborative,
+                ConsentMode::Autonomous => crate::kaijutsu_capnp::ConsentMode::Autonomous,
+            });
+            let mut mounts = cfg.init_mounts(config.mounts.len() as u32);
+            for (i, mount) in config.mounts.iter().enumerate() {
+                let mut m = mounts.reborrow().get(i as u32);
+                m.set_path(&mount.path);
+                m.set_source(&mount.source);
+                m.set_writable(mount.writable);
             }
         }
         let response = request.send().promise.await?;
-        let room = response.get()?.get_room()?;
+        let kernel = response.get()?.get_kernel()?;
 
-        Ok(RoomHandle { room })
+        Ok(KernelHandle { kernel })
     }
 }
 
@@ -130,70 +130,75 @@ pub struct Identity {
 }
 
 #[derive(Debug, Clone)]
-pub struct RoomInfo {
-    pub id: u64,
+pub struct KernelInfo {
+    pub id: String,
     pub name: String,
-    pub branch: String,
     pub user_count: u32,
     pub agent_count: u32,
 }
 
 #[derive(Debug, Clone)]
-pub struct RoomConfig {
+pub struct KernelConfig {
     pub name: String,
-    pub branch: Option<String>,
-    pub repos: Vec<RepoMount>,
+    pub consent_mode: ConsentMode,
+    pub mounts: Vec<MountSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsentMode {
+    #[default]
+    Collaborative,
+    Autonomous,
 }
 
 #[derive(Debug, Clone)]
-pub struct RepoMount {
-    pub name: String,
-    pub url: String,
+pub struct MountSpec {
+    pub path: String,
+    pub source: String,
     pub writable: bool,
 }
 
-/// Handle to a joined room
-pub struct RoomHandle {
-    room: crate::kaijutsu_capnp::room::Client,
+/// Handle to an attached kernel
+pub struct KernelHandle {
+    kernel: crate::kaijutsu_capnp::kernel::Client,
 }
 
-impl RoomHandle {
-    /// Get room info
-    pub async fn get_info(&self) -> Result<RoomInfo, RpcError> {
-        let request = self.room.get_info_request();
+impl KernelHandle {
+    /// Get kernel info
+    pub async fn get_info(&self) -> Result<KernelInfo, RpcError> {
+        let request = self.kernel.get_info_request();
         let response = request.send().promise.await?;
         let info = response.get()?.get_info()?;
-        Ok(RoomInfo {
-            id: info.get_id(),
+        Ok(KernelInfo {
+            id: info.get_id()?.to_string()?,
             name: info.get_name()?.to_string()?,
-            branch: info.get_branch()?.to_string()?,
             user_count: info.get_user_count(),
             agent_count: info.get_agent_count(),
         })
     }
 
-    /// Send a message to the room
+    /// Send a message to the kernel
     pub async fn send(&self, content: &str) -> Result<Row, RpcError> {
-        let mut request = self.room.send_request();
+        let mut request = self.kernel.send_request();
         request.get().set_content(content);
         let response = request.send().promise.await?;
         let row = response.get()?.get_row()?;
-        Ok(Row::from_capnp(&row)?)
+        Row::from_capnp(&row)
     }
 
     /// Mention an agent
     pub async fn mention(&self, agent: &str, content: &str) -> Result<Row, RpcError> {
-        let mut request = self.room.mention_request();
+        let mut request = self.kernel.mention_request();
         request.get().set_agent(agent);
         request.get().set_content(content);
         let response = request.send().promise.await?;
         let row = response.get()?.get_row()?;
-        Ok(Row::from_capnp(&row)?)
+        Row::from_capnp(&row)
     }
 
-    /// Get room history
+    /// Get kernel history
     pub async fn get_history(&self, limit: u32, before_id: u64) -> Result<Vec<Row>, RpcError> {
-        let mut request = self.room.get_history_request();
+        let mut request = self.kernel.get_history_request();
         request.get().set_limit(limit);
         request.get().set_before_id(before_id);
         let response = request.send().promise.await?;
@@ -206,28 +211,8 @@ impl RoomHandle {
         Ok(result)
     }
 
-    /// Get the kaish kernel for this room
-    pub async fn get_kernel(&self) -> Result<KernelHandle, RpcError> {
-        let request = self.room.get_kernel_request();
-        let response = request.send().promise.await?;
-        let kernel = response.get()?.get_kernel()?;
-        Ok(KernelHandle { kernel })
-    }
+    // kaish execution methods (directly on Kernel)
 
-    /// Leave the room
-    pub async fn leave(self) -> Result<(), RpcError> {
-        let request = self.room.leave_request();
-        request.send().promise.await?;
-        Ok(())
-    }
-}
-
-/// Handle to a kaish kernel
-pub struct KernelHandle {
-    kernel: crate::kaijutsu_capnp::kaish_kernel::Client,
-}
-
-impl KernelHandle {
     /// Execute code in the kernel
     pub async fn execute(&self, code: &str) -> Result<u64, RpcError> {
         let mut request = self.kernel.execute_request();
@@ -261,6 +246,31 @@ impl KernelHandle {
             });
         }
         Ok(result)
+    }
+
+    /// Get command history
+    pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, RpcError> {
+        let mut request = self.kernel.get_command_history_request();
+        request.get().set_limit(limit);
+        let response = request.send().promise.await?;
+        let entries = response.get()?.get_entries()?;
+
+        let mut result = Vec::with_capacity(entries.len() as usize);
+        for e in entries.iter() {
+            result.push(HistoryEntry {
+                id: e.get_id(),
+                code: e.get_code()?.to_string()?,
+                timestamp: e.get_timestamp(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Detach from the kernel
+    pub async fn detach(self) -> Result<(), RpcError> {
+        let request = self.kernel.detach_request();
+        request.send().promise.await?;
+        Ok(())
     }
 }
 
@@ -332,6 +342,13 @@ impl CompletionKind {
             crate::kaijutsu_capnp::CompletionKind::Keyword => CompletionKind::Keyword,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub id: u64,
+    pub code: String,
+    pub timestamp: u64,
 }
 
 // ============================================================================

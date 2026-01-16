@@ -6,8 +6,8 @@ pub mod bridge;
 
 pub use bridge::{
     ConnectionBridgePlugin, ConnectionCommand, ConnectionCommands, ConnectionEvent,
-    ConnectionEvents, ConnectionState,
+    ConnectionState,
 };
 
 // Re-export client types for convenience
-pub use kaijutsu_client::{Identity, RoomConfig, RoomInfo, Row, RowType};
+pub use kaijutsu_client::RowType;

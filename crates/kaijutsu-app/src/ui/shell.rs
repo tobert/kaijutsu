@@ -9,6 +9,7 @@ pub struct ModeIndicator;
 /// Resource holding our loaded fonts
 #[derive(Resource)]
 pub struct UiFonts {
+    #[allow(dead_code)]
     pub jp: Handle<Font>,
 }
 
@@ -80,7 +81,7 @@ fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme, font: Handle<Font
                 TextColor(theme.accent),
             ));
             bar.spawn((
-                Text::new("▣ room: lobby"),
+                Text::new("▣ kernel: lobby"),
                 TextFont {
                     font: font.clone(),
                     font_size: 14.0,
@@ -106,7 +107,7 @@ fn sidebar(parent: &mut ChildSpawnerCommands, theme: &Theme, frame: Handle<Image
         ))
         .with_children(|side| {
             // Content first
-            sidebar_section(side, theme, "ROOMS", &["> lobby", "  dev", "  ops"]);
+            sidebar_section(side, theme, "KERNELS", &["> lobby", "  dev", "  ops"]);
             sidebar_section(side, theme, "AGENTS", &["◉ opus", "◉ haiku", "○ local"]);
             sidebar_section(side, theme, "EQUIP", &["filesystem", "web_search"]);
 

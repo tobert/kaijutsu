@@ -41,6 +41,7 @@ pub struct MessageEvent {
     pub parent_id: Option<usize>,
 }
 
+#[allow(dead_code)]
 impl MessageEvent {
     /// Simple user message
     pub fn user(sender: impl Into<String>, content: impl Into<String>) -> Self {
@@ -102,6 +103,7 @@ pub struct ContextArea;
 pub struct ContextBlock {
     pub id: usize,
     pub row_type: RowType,
+    #[allow(dead_code)]
     pub parent_id: Option<usize>,
     pub collapsed: bool,
     pub depth: usize,

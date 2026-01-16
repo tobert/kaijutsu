@@ -78,43 +78,43 @@ fn test_whoami() {
 }
 
 #[test]
-fn test_list_rooms_empty() {
+fn test_list_kernels_empty() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        let rooms = client.list_rooms().await.unwrap();
-        assert!(rooms.is_empty(), "Expected no rooms initially");
+        let kernels = client.list_kernels().await.unwrap();
+        assert!(kernels.is_empty(), "Expected no kernels initially");
     });
 }
 
 #[test]
-fn test_join_room_creates_room() {
+fn test_attach_kernel_creates_kernel() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        // Join a room (should auto-create)
-        let room = client.join_room("test-room").await.unwrap();
-        let info = room.get_info().await.unwrap();
-        assert_eq!(info.name, "test-room");
-        assert_eq!(info.branch, "main");
+        // Attach to a kernel (should auto-create for now)
+        let kernel = client.attach_kernel("test-kernel").await.unwrap();
+        let info = kernel.get_info().await.unwrap();
+        assert_eq!(info.name, "test-kernel");
+        assert_eq!(info.id, "test-kernel");
     });
 }
 
 #[test]
-fn test_room_appears_in_list() {
+fn test_kernel_appears_in_list() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        // Join a room
-        let _room = client.join_room("listed-room").await.unwrap();
+        // Attach to a kernel
+        let _kernel = client.attach_kernel("listed-kernel").await.unwrap();
 
         // Check it appears in list
-        let rooms = client.list_rooms().await.unwrap();
-        assert_eq!(rooms.len(), 1);
-        assert_eq!(rooms[0].name, "listed-room");
+        let kernels = client.list_kernels().await.unwrap();
+        assert_eq!(kernels.len(), 1);
+        assert_eq!(kernels[0].name, "listed-kernel");
     });
 }
 
@@ -124,8 +124,8 @@ fn test_send_message() {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        let room = client.join_room("chat-room").await.unwrap();
-        let row = room.send("Hello, world!").await.unwrap();
+        let kernel = client.attach_kernel("chat-kernel").await.unwrap();
+        let row = kernel.send("Hello, world!").await.unwrap();
 
         assert!(row.id > 0);
         assert_eq!(row.content, "Hello, world!");
@@ -139,15 +139,15 @@ fn test_get_history() {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        let room = client.join_room("history-room").await.unwrap();
+        let kernel = client.attach_kernel("history-kernel").await.unwrap();
 
         // Send some messages
-        room.send("Message 1").await.unwrap();
-        room.send("Message 2").await.unwrap();
-        room.send("Message 3").await.unwrap();
+        kernel.send("Message 1").await.unwrap();
+        kernel.send("Message 2").await.unwrap();
+        kernel.send("Message 3").await.unwrap();
 
         // Get history
-        let history = room.get_history(10, 0).await.unwrap();
+        let history = kernel.get_history(10, 0).await.unwrap();
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].content, "Message 1");
         assert_eq!(history[1].content, "Message 2");
@@ -156,21 +156,20 @@ fn test_get_history() {
 }
 
 #[test]
-fn test_create_room_with_config() {
+fn test_create_kernel_with_config() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        let config = kaijutsu_client::RoomConfig {
+        let config = kaijutsu_client::KernelConfig {
             name: "feature/test".to_string(),
-            branch: Some("develop".to_string()),
-            repos: vec![],
+            consent_mode: kaijutsu_client::ConsentMode::Collaborative,
+            mounts: vec![],
         };
-        let room = client.create_room(config).await.unwrap();
-        let info = room.get_info().await.unwrap();
+        let kernel = client.create_kernel(config).await.unwrap();
+        let info = kernel.get_info().await.unwrap();
 
         assert_eq!(info.name, "feature/test");
-        assert_eq!(info.branch, "develop");
     });
 }
 
@@ -180,10 +179,46 @@ fn test_mention_agent() {
         let addr = start_server().await;
         let client = connect_client(addr).await.unwrap();
 
-        let room = client.join_room("agent-room").await.unwrap();
-        let row = room.mention("claude", "help me write tests").await.unwrap();
+        let kernel = client.attach_kernel("agent-kernel").await.unwrap();
+        let row = kernel.mention("claude", "help me write tests").await.unwrap();
 
         assert!(row.content.contains("@claude"));
         assert!(row.content.contains("help me write tests"));
+    });
+}
+
+#[test]
+fn test_execute_command() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await.unwrap();
+
+        let kernel = client.attach_kernel("exec-kernel").await.unwrap();
+        let exec_id = kernel.execute("echo hello").await.unwrap();
+
+        assert!(exec_id > 0);
+    });
+}
+
+#[test]
+fn test_command_history() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await.unwrap();
+
+        let kernel = client.attach_kernel("cmd-history-kernel").await.unwrap();
+
+        // Execute some commands
+        kernel.execute("ls").await.unwrap();
+        kernel.execute("pwd").await.unwrap();
+        kernel.execute("echo test").await.unwrap();
+
+        // Get command history
+        let history = kernel.get_command_history(10).await.unwrap();
+        assert_eq!(history.len(), 3);
+        // History is in reverse order (most recent first)
+        assert_eq!(history[0].code, "echo test");
+        assert_eq!(history[1].code, "pwd");
+        assert_eq!(history[2].code, "ls");
     });
 }

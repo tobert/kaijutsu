@@ -119,11 +119,11 @@ fn handle_input_submit(
         return;
     }
 
-    // Send to server if connected and in a room
-    if conn_state.connected && conn_state.current_room.is_some() {
+    // Send to server if connected and in a kernel
+    if conn_state.connected && conn_state.current_kernel.is_some() {
         // Check for @mention
-        if content.starts_with('@') {
-            if let Some((agent, rest)) = content[1..].split_once(' ') {
+        if let Some(mention) = content.strip_prefix('@') {
+            if let Some((agent, rest)) = mention.split_once(' ') {
                 cmds.send(connection::ConnectionCommand::MentionAgent {
                     agent: agent.to_string(),
                     content: rest.to_string(),
@@ -142,7 +142,7 @@ fn handle_input_submit(
         ));
     } else {
         events.write(ui::context::MessageEvent::system(
-            "Not in a room. Use /join <room> to join a room.",
+            "Not attached to a kernel. Use /attach <id> to attach.",
         ));
     }
 }
@@ -154,7 +154,7 @@ fn handle_slash_command(
     events: &mut MessageWriter<ui::context::MessageEvent>,
 ) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
-    match parts.first().map(|s| *s) {
+    match parts.first().copied() {
         Some("/connect") => {
             if let Some(addr) = parts.get(1) {
                 events.write(ui::context::MessageEvent::system(format!(
@@ -173,20 +173,20 @@ fn handle_slash_command(
         Some("/disconnect") => {
             conn_cmds.send(connection::ConnectionCommand::Disconnect);
         }
-        Some("/join") => {
-            if let Some(room) = parts.get(1) {
-                conn_cmds.send(connection::ConnectionCommand::JoinRoom {
-                    name: room.to_string(),
+        Some("/attach") => {
+            if let Some(id) = parts.get(1) {
+                conn_cmds.send(connection::ConnectionCommand::AttachKernel {
+                    id: id.to_string(),
                 });
             } else {
-                events.write(ui::context::MessageEvent::system("Usage: /join <room>"));
+                events.write(ui::context::MessageEvent::system("Usage: /attach <kernel-id>"));
             }
         }
-        Some("/leave") => {
-            conn_cmds.send(connection::ConnectionCommand::LeaveRoom);
+        Some("/detach") => {
+            conn_cmds.send(connection::ConnectionCommand::DetachKernel);
         }
-        Some("/rooms") => {
-            conn_cmds.send(connection::ConnectionCommand::ListRooms);
+        Some("/kernels") => {
+            conn_cmds.send(connection::ConnectionCommand::ListKernels);
         }
         Some("/whoami") => {
             conn_cmds.send(connection::ConnectionCommand::Whoami);
@@ -197,7 +197,7 @@ fn handle_slash_command(
         }
         Some("/help") => {
             events.write(ui::context::MessageEvent::system(
-                "Commands: /connect <addr>, /disconnect, /join <room>, /leave, /rooms, /whoami, /history [n]",
+                "Commands: /connect <addr>, /disconnect, /attach <id>, /detach, /kernels, /whoami, /history [n]",
             ));
         }
         _ => {
@@ -213,7 +213,6 @@ fn handle_slash_command(
 fn handle_connection_events(
     mut conn_events: MessageReader<connection::ConnectionEvent>,
     mut ui_events: MessageWriter<ui::context::MessageEvent>,
-    conn_state: Res<connection::ConnectionState>,
 ) {
     use connection::ConnectionEvent;
     use ui::context::{MessageEvent, RowType};
@@ -235,38 +234,31 @@ fn handle_connection_events(
                     id.display_name, id.username
                 )));
             }
-            ConnectionEvent::RoomList(rooms) => {
-                if rooms.is_empty() {
-                    ui_events.write(MessageEvent::system("No rooms available"));
+            ConnectionEvent::KernelList(kernels) => {
+                if kernels.is_empty() {
+                    ui_events.write(MessageEvent::system("No kernels available"));
                 } else {
-                    let list = rooms
+                    let list = kernels
                         .iter()
-                        .map(|r| format!("  {} ({})", r.name, r.branch))
+                        .map(|k| format!("  {} ({})", k.name, k.id))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    ui_events.write(MessageEvent::system(format!("Available rooms:\n{}", list)));
+                    ui_events.write(MessageEvent::system(format!("Available kernels:\n{}", list)));
                 }
             }
-            ConnectionEvent::JoinedRoom(info) => {
+            ConnectionEvent::AttachedKernel(info) => {
                 ui_events.write(MessageEvent::system(format!(
-                    "Joined room: {} (branch: {})",
-                    info.name, info.branch
+                    "Attached to kernel: {} ({})",
+                    info.name, info.id
                 )));
             }
-            ConnectionEvent::LeftRoom => {
-                ui_events.write(MessageEvent::system("Left room"));
+            ConnectionEvent::DetachedKernel => {
+                ui_events.write(MessageEvent::system("Detached from kernel"));
             }
             ConnectionEvent::NewMessage(row) => {
                 // Convert server Row to UI MessageEvent
                 let row_type = match row.row_type {
-                    connection::RowType::Chat => {
-                        // Check if it's from the current user
-                        if conn_state.identity.as_ref().map(|i| &i.username) == Some(&row.sender) {
-                            RowType::User
-                        } else {
-                            RowType::User // Could differentiate other users
-                        }
-                    }
+                    connection::RowType::Chat => RowType::User,
                     connection::RowType::AgentResponse => RowType::Agent,
                     connection::RowType::ToolCall => RowType::ToolCall,
                     connection::RowType::ToolResult => RowType::ToolResult,
