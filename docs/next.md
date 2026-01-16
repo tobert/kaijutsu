@@ -1,6 +1,6 @@
 # Kaijutsu: What's Next
 
-*Last updated: 2026-01-16 (kaish 04aa394 integration)*
+*Last updated: 2026-01-16 (kaish fe506f2 — L6 Tools complete)*
 
 ## Current State
 
@@ -44,7 +44,7 @@
 | Client kernel API | ✅ Basic impl |
 | Server kernel storage | 📋 Planned |
 | Client kernel UI | 📋 Planned |
-| **kaish (execution engine)** | ✅ L0-L4 solid (47 integration tests) |
+| **kaish (execution engine)** | ✅ L0-L6 solid (305 tests) |
 | kaish embedding | 🚧 Ready to start |
 | Lease system | 📋 Planned |
 | Checkpoint system | 📋 Planned |
@@ -69,9 +69,10 @@ kaijutsu's `Kernel.execute()` delegates to the embedded kaish kernel. kaijutsu a
 
 | kaish Layer | Status | kaijutsu Blocker |
 |-------------|--------|------------------|
-| L0-L4: Lexer, Parser, Runtime, REPL | ✅ Solid (47 tests) | **Unblocked — can embed now** |
-| L5: VFS | 📋 Planned | Needed for file operations |
-| L6: Tools | 📋 Planned | Needed for builtins |
+| L0-L4: Lexer, Parser, Interpreter, REPL | ✅ Complete (257 kernel tests) | **Unblocked** |
+| L5: VFS | ✅ Complete (29 tests) | **Unblocked** |
+| L6: Tools | ✅ Complete (33 tests, wired to REPL) | **Unblocked** |
+| L7: Job Scheduler | 📋 Next | Needed for pipelines, background jobs |
 | L10: State | 📋 Planned | Needed for persistence |
 | L11: RPC | 📋 Planned | Optional (we embed directly) |
 | L14: context-emit | 📋 Planned | Needed for AI context generation |
@@ -91,8 +92,9 @@ kaijutsu's `Kernel.execute()` delegates to the embedded kaish kernel. kaijutsu a
 
 **Parallel with kaish development:**
 
-5. **VFS mounting** — Coordinate with kaish L5, attach worktrees at `/mnt/project`
-6. **Context generation** — Use kaish L14 `context-emit` when available
+5. **VFS mounting** — kaish L5 complete; LocalFs at `/mnt/local`, MemoryFs at `/scratch`
+6. **Pipelines** — Wait for kaish L7 Job Scheduler for `cmd1 | cmd2` support
+7. **Context generation** — Use kaish L14 `context-emit` when available
 
 ### Phase 4: Kernel Operations
 
