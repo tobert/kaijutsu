@@ -13,6 +13,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
+use crate::kaish::KaishRuntime;
 
 // ============================================================================
 // Server State
@@ -66,6 +67,8 @@ pub struct KernelState {
     pub consent_mode: ConsentMode,
     pub rows: Vec<RowData>,
     pub command_history: Vec<CommandEntry>,
+    /// Embedded kaish runtime for execution
+    pub kaish: KaishRuntime,
 }
 
 #[derive(Clone, Copy)]
@@ -159,6 +162,7 @@ impl world::Server for WorldImpl {
                     consent_mode: ConsentMode::Collaborative,
                     rows: Vec::new(),
                     command_history: Vec::new(),
+                    kaish: KaishRuntime::new(),
                 });
             }
         }
@@ -189,6 +193,7 @@ impl world::Server for WorldImpl {
                 consent_mode,
                 rows: Vec::new(),
                 command_history: Vec::new(),
+                kaish: KaishRuntime::new(),
             });
             id
         };
@@ -357,7 +362,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let code = pry!(pry!(pry!(params.get()).get_code()).to_str()).to_owned();
 
-        let exec_id = {
+        let (exec_id, exec_result) = {
             let mut state = self.state.borrow_mut();
             let exec_id = state.next_exec_id();
             let timestamp = std::time::SystemTime::now()
@@ -365,17 +370,59 @@ impl kernel::Server for KernelImpl {
                 .unwrap()
                 .as_secs();
 
-            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            let exec_result = if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+                // Record in command history
                 kernel.command_history.push(CommandEntry {
                     id: exec_id,
-                    code,
+                    code: code.clone(),
                     timestamp,
                 });
-            }
-            exec_id
+
+                // Execute via kaish runtime
+                match kernel.kaish.execute(&code) {
+                    Ok(result) => result,
+                    Err(e) => kaish_kernel::interpreter::ExecResult::failure(1, e.to_string()),
+                }
+            } else {
+                kaish_kernel::interpreter::ExecResult::failure(1, "kernel not found")
+            };
+
+            (exec_id, exec_result)
         };
 
+        // Build the response
         results.get().set_exec_id(exec_id);
+
+        // Also add output as a row in the kernel's history
+        {
+            let mut state = self.state.borrow_mut();
+            let sender = state.identity.username.clone();
+            let row_id = state.next_row_id();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+                // Add output as a tool result row
+                if !exec_result.out.is_empty() || !exec_result.err.is_empty() {
+                    let content = if exec_result.ok() {
+                        exec_result.out.clone()
+                    } else {
+                        format!("Error: {}", exec_result.err)
+                    };
+                    kernel.rows.push(RowData {
+                        id: row_id,
+                        parent_id: 0,
+                        row_type: RowType::ToolResult,
+                        sender,
+                        content,
+                        timestamp,
+                    });
+                }
+            }
+        }
+
         Promise::ok(())
     }
 

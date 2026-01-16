@@ -38,6 +38,7 @@ fn main() {
                 // Console (runs first, captures input when visible)
                 ui::console::toggle_console,
                 ui::console::handle_console_input,
+                ui::console::handle_execute_results,
                 ui::console::update_console_display,
                 // Mode handling
                 state::mode::handle_mode_input,
@@ -290,6 +291,14 @@ fn handle_connection_events(
             }
             ConnectionEvent::Error(err) => {
                 ui_events.write(MessageEvent::system(format!("Error: {}", err)));
+            }
+            ConnectionEvent::ExecuteResult { exec_id: _, output, success } => {
+                // ExecuteResult is primarily handled by the console system
+                // but we also show it in the context view for visibility
+                if !output.is_empty() {
+                    let prefix = if *success { "✓" } else { "✗" };
+                    ui_events.write(MessageEvent::system(format!("{} {}", prefix, output)));
+                }
             }
         }
     }

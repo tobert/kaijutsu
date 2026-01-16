@@ -1,6 +1,6 @@
 # Kaijutsu: What's Next
 
-*Last updated: 2026-01-16*
+*Last updated: 2026-01-16 (kaish 04aa394 integration)*
 
 ## Current State
 
@@ -44,8 +44,8 @@
 | Client kernel API | ✅ Basic impl |
 | Server kernel storage | 📋 Planned |
 | Client kernel UI | 📋 Planned |
-| **kaish (execution engine)** | 🚧 L0-L4 complete (lexer, parser, runtime, REPL) |
-| kaish embedding | 📋 Planned (blocked on kaish L5-L6) |
+| **kaish (execution engine)** | ✅ L0-L4 solid (47 integration tests) |
+| kaish embedding | 🚧 Ready to start |
 | Lease system | 📋 Planned |
 | Checkpoint system | 📋 Planned |
 
@@ -55,21 +55,44 @@
 
 **Dependency:** kaish (~/src/kaish) provides the execution engine. kaijutsu embeds kaish-kernel.
 
+#### Interface Ownership
+
+| Interface | Owner | Purpose |
+|-----------|-------|---------|
+| `kaish.capnp::Kernel` | **kaish** | Execution: parse, eval, tools, VFS, MCP, state, blobs |
+| `kaijutsu.capnp::World` | **kaijutsu** | Multi-kernel orchestration |
+| `kaijutsu.capnp::Kernel` | **kaijutsu** | Collaboration: lease, consent, fork/thread, checkpoint, messaging |
+
+kaijutsu's `Kernel.execute()` delegates to the embedded kaish kernel. kaijutsu adds collaboration on top (lease, consent, checkpoint, messaging).
+
+#### kaish Layer Dependencies
+
 | kaish Layer | Status | kaijutsu Blocker |
 |-------------|--------|------------------|
-| L0-L4: Lexer, Parser, Runtime, REPL | ✅ Complete | Can start embedding |
+| L0-L4: Lexer, Parser, Runtime, REPL | ✅ Solid (47 tests) | **Unblocked — can embed now** |
 | L5: VFS | 📋 Planned | Needed for file operations |
 | L6: Tools | 📋 Planned | Needed for builtins |
 | L10: State | 📋 Planned | Needed for persistence |
 | L11: RPC | 📋 Planned | Optional (we embed directly) |
+| L14: context-emit | 📋 Planned | Needed for AI context generation |
 
-**kaijutsu work (parallel with kaish):**
+**kaijutsu work (unblocked):**
 
-1. **Embed kaish-kernel** — Add kaish as workspace dependency, wire to execute()
-2. **Kernel state storage** — SQLite + filesystem per kernel (kaijutsu-side)
-3. **VFS mounting** — Coordinate with kaish VFS, attach worktrees
-4. **Wire console to kernel** — RPC streaming output via kaish
-5. **Lease system** — Who holds the pen, UI indicator (kaijutsu-side)
+1. **Embed kaish-kernel** — Add kaish as workspace dependency, wire `execute()` through
+   ```rust
+   // kaijutsu-server wraps kaish-kernel
+   let kaish = kaish_kernel::Kernel::new();
+   let client = kaish_kernel::EmbeddedClient::new(kaish);
+   // Kernel.execute() → client.execute() → kaish interpreter
+   ```
+2. **Wire console to kernel** — RPC streaming output via embedded kaish
+3. **Lease system** — Who holds the pen, UI indicator (kaijutsu-side)
+4. **Kernel state storage** — SQLite + filesystem per kernel (kaijutsu-side, or defer to kaish L10)
+
+**Parallel with kaish development:**
+
+5. **VFS mounting** — Coordinate with kaish L5, attach worktrees at `/mnt/project`
+6. **Context generation** — Use kaish L14 `context-emit` when available
 
 ### Phase 4: Kernel Operations
 
@@ -114,6 +137,7 @@ kaijutsu/
 
 - **Start here:** [docs/06-kernel-model.md](./06-kernel-model.md) — Full kernel model specification (includes kaish integration)
 - **Background:** [docs/05-lexicon-exploration.md](./05-lexicon-exploration.md) — Design philosophy and decisions
-- **kaish:** `~/src/kaish/docs/BUILD.md` — Execution engine build plan and layer dependencies
-- **kaish language:** `~/src/kaish/docs/LANGUAGE.md` — Shell language specification
+- **kaish BUILD:** `~/src/kaish/docs/BUILD.md` — Execution engine build plan and layer dependencies
+- **kaish ARCHITECTURE:** `~/src/kaish/docs/ARCHITECTURE.md` — Interface ownership, embedding pattern
+- **kaish LANGUAGE:** `~/src/kaish/docs/LANGUAGE.md` — Shell language specification
 - **Bevy 0.18:** `~/src/bevy` — UI framework source

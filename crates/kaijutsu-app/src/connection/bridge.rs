@@ -36,6 +36,8 @@ pub enum ConnectionCommand {
     MentionAgent { agent: String, content: String },
     /// Get kernel history
     GetHistory { limit: u32 },
+    /// Execute kaish code in the current kernel
+    ExecuteCode { code: String },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -57,6 +59,12 @@ pub enum ConnectionEvent {
     NewMessage(Row),
     /// Multiple messages (from history)
     History(Vec<Row>),
+    /// Code execution result
+    ExecuteResult {
+        exec_id: u64,
+        output: String,
+        success: bool,
+    },
     /// Error occurred
     Error(String),
 }
@@ -363,6 +371,46 @@ async fn connection_loop(
                     match kernel.get_history(limit, 0).await {
                         Ok(rows) => {
                             let _ = evt_tx.send(ConnectionEvent::History(rows));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::ExecuteCode { code } => {
+                if let Some(kernel) = &current_kernel {
+                    // Execute the code
+                    match kernel.execute(&code).await {
+                        Ok(exec_id) => {
+                            // Get the most recent history row (which should be our output)
+                            match kernel.get_history(1, 0).await {
+                                Ok(rows) => {
+                                    let (output, success) = if let Some(row) = rows.first() {
+                                        // ToolResult row contains the output
+                                        let success = !row.content.starts_with("Error:");
+                                        (row.content.clone(), success)
+                                    } else {
+                                        (String::new(), true)
+                                    };
+                                    let _ = evt_tx.send(ConnectionEvent::ExecuteResult {
+                                        exec_id,
+                                        output,
+                                        success,
+                                    });
+                                }
+                                Err(e) => {
+                                    // Execution succeeded but couldn't get output
+                                    let _ = evt_tx.send(ConnectionEvent::ExecuteResult {
+                                        exec_id,
+                                        output: format!("(executed, but couldn't fetch output: {})", e),
+                                        success: true,
+                                    });
+                                }
+                            }
                         }
                         Err(e) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));

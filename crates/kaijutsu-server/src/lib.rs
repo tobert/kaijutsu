@@ -2,6 +2,7 @@
 //!
 //! SSH + Cap'n Proto server for kaijutsu.
 
+pub mod kaish;
 pub mod rpc;
 pub mod ssh;
 
@@ -10,5 +11,6 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
+pub use kaish::KaishRuntime;
 pub use rpc::WorldImpl;
 pub use ssh::{SshServer, SshServerConfig};

@@ -13,6 +13,9 @@ license = "MIT"
 repository = "https://github.com/atobey/kaijutsu"
 
 [workspace.dependencies]
+# Kaish (embedded execution engine)
+kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
+
 # Cap'n Proto
 capnp = "0.25"
 capnp-rpc = "0.25"
@@ -30,6 +33,7 @@ russh = "0.56"
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
+anyhow = "1"
 whoami = "1.5"
 
 # Testing

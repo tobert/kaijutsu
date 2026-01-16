@@ -1,5 +1,6 @@
 use bevy::{input::keyboard::{Key, KeyboardInput}, prelude::*, ui::widget::NodeImageMode};
 
+use crate::connection::{ConnectionCommands, ConnectionEvent, ConnectionState};
 use super::theme::Theme;
 
 /// Console height options (percentage of window)
@@ -265,6 +266,8 @@ pub fn toggle_console(
 pub fn handle_console_input(
     mut keyboard_events: MessageReader<KeyboardInput>,
     mut state: ResMut<ConsoleState>,
+    conn_state: Res<ConnectionState>,
+    conn_cmds: Res<ConnectionCommands>,
 ) {
     if !state.visible {
         return;
@@ -280,7 +283,7 @@ pub fn handle_console_input(
             (Key::Enter, _) => {
                 let input = std::mem::take(&mut state.input);
                 if !input.is_empty() {
-                    execute_command(&mut state, &input);
+                    execute_command(&mut state, &input, &conn_state, &conn_cmds);
                 }
             }
             // Backspace removes last character
@@ -322,7 +325,12 @@ pub fn handle_console_input(
 }
 
 /// Execute a console command
-fn execute_command(state: &mut ConsoleState, input: &str) {
+fn execute_command(
+    state: &mut ConsoleState,
+    input: &str,
+    conn_state: &ConnectionState,
+    conn_cmds: &ConnectionCommands,
+) {
     // Add to history display
     state.history.push(ConsoleLine::input(format!("> {}", input)));
 
@@ -330,26 +338,53 @@ fn execute_command(state: &mut ConsoleState, input: &str) {
     state.command_history.push(input.to_string());
     state.history_index = None;
 
-    // Parse and execute
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let response = match parts.as_slice() {
-        ["help"] => ConsoleLine::output(
-            "Commands: help, ls, pwd, echo <text>, clear, kernel <name>",
-        ),
-        ["ls"] => ConsoleLine::output("Cargo.toml  src/  docs/  assets/  README.md"),
-        ["pwd"] => ConsoleLine::output("/kernel/lobby/mnt/kaijutsu"),
-        ["clear"] => {
-            state.history.clear();
-            return;
-        }
-        ["echo", rest @ ..] => ConsoleLine::output(rest.join(" ")),
-        ["kernel", name] => ConsoleLine::system(format!("Switching to kernel: {}", name)),
-        ["kernel"] => ConsoleLine::error("Usage: kernel <name>"),
-        [] => return,
-        [cmd, ..] => ConsoleLine::error(format!("Unknown command: {}", cmd)),
-    };
+    let trimmed = input.trim();
 
-    state.history.push(response);
+    // Handle local console commands (start with /)
+    if trimmed.starts_with('/') {
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        let response = match parts.as_slice() {
+            ["/help"] | ["/h"] => ConsoleLine::output(
+                "Console commands:\n  /help      - Show this help\n  /clear     - Clear console\n  /status    - Show connection status\n\nKaish commands are sent to the kernel when connected.",
+            ),
+            ["/clear"] => {
+                state.history.clear();
+                return;
+            }
+            ["/status"] => {
+                if conn_state.connected {
+                    if let Some(kernel) = &conn_state.current_kernel {
+                        ConsoleLine::system(format!(
+                            "Connected. Kernel: {} ({})",
+                            kernel.name, kernel.id
+                        ))
+                    } else {
+                        ConsoleLine::system("Connected, but not attached to a kernel")
+                    }
+                } else {
+                    ConsoleLine::system("Not connected to server")
+                }
+            }
+            [cmd, ..] => ConsoleLine::error(format!("Unknown console command: {}", cmd)),
+            [] => return,
+        };
+        state.history.push(response);
+    } else if conn_state.connected && conn_state.current_kernel.is_some() {
+        // Send kaish code to the kernel via the bridge
+        conn_cmds.send(crate::connection::ConnectionCommand::ExecuteCode {
+            code: trimmed.to_string(),
+        });
+        // Output will be added when we receive ExecuteResult event
+        state.history.push(ConsoleLine::system("..."));
+    } else if !conn_state.connected {
+        state.history.push(ConsoleLine::error(
+            "Not connected. Start server with: cargo run -p kaijutsu-server",
+        ));
+    } else {
+        state.history.push(ConsoleLine::error(
+            "Not attached to a kernel. Use /attach <id> in the main input.",
+        ));
+    }
 
     // Keep history bounded
     while state.history.len() > 100 {
@@ -387,5 +422,39 @@ pub fn update_console_display(
 
     for mut text in &mut output_query {
         **text = output_text.clone();
+    }
+}
+
+/// Handle ExecuteResult events from the connection bridge
+pub fn handle_execute_results(
+    mut conn_events: MessageReader<ConnectionEvent>,
+    mut console_state: ResMut<ConsoleState>,
+) {
+    for event in conn_events.read() {
+        if let ConnectionEvent::ExecuteResult { output, success, .. } = event {
+            // Remove the "..." placeholder if present
+            if let Some(last) = console_state.history.last() {
+                if last.text == "..." {
+                    console_state.history.pop();
+                }
+            }
+
+            // Add the result to console history
+            if output.is_empty() {
+                // Silent success - just show checkmark
+                if *success {
+                    console_state.history.push(ConsoleLine::output("✓"));
+                }
+            } else if *success {
+                console_state.history.push(ConsoleLine::output(output.clone()));
+            } else {
+                console_state.history.push(ConsoleLine::error(output.clone()));
+            }
+
+            // Keep history bounded
+            while console_state.history.len() > 100 {
+                console_state.history.remove(0);
+            }
+        }
     }
 }
