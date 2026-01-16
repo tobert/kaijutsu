@@ -1,14 +1,22 @@
 //! Bevy integration bridge for async connection
 //!
 //! Runs SSH + RPC in a dedicated thread, communicates with Bevy via channels.
+//! Handles auto-connect and reconnection with exponential backoff.
 
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use tokio::sync::mpsc;
 
 // Use types from the client library
 use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, Row, RpcClient, SshConfig};
+
+/// Default server address for local development
+pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
+
+/// Default kernel to attach to after connecting
+pub const DEFAULT_KERNEL_ID: &str = "lobby";
 
 /// Commands sent from Bevy to the connection thread
 #[derive(Debug)]
@@ -43,10 +51,14 @@ pub enum ConnectionCommand {
 /// Events sent from the connection thread to Bevy
 #[derive(Debug, Clone, Message)]
 pub enum ConnectionEvent {
-    /// Connection status changed
+    /// Successfully connected to server
     Connected,
+    /// Disconnected from server (will auto-reconnect unless manual disconnect)
     Disconnected,
+    /// Connection attempt failed
     ConnectionFailed(String),
+    /// Attempting to reconnect (with attempt number)
+    Reconnecting { attempt: u32, delay_secs: u32 },
     /// Identity received
     Identity(Identity),
     /// Kernel list received
@@ -84,11 +96,36 @@ impl ConnectionCommands {
 pub struct ConnectionEvents(pub mpsc::UnboundedReceiver<ConnectionEvent>);
 
 /// Resource tracking current connection state
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct ConnectionState {
     pub connected: bool,
     pub identity: Option<Identity>,
     pub current_kernel: Option<KernelInfo>,
+    /// Target address for (re)connection
+    pub target_addr: String,
+    /// Whether auto-reconnect is enabled
+    pub auto_reconnect: bool,
+    /// Current reconnect attempt (0 = not reconnecting)
+    pub reconnect_attempt: u32,
+    /// Time of last connection attempt
+    pub last_attempt: Option<Instant>,
+    /// Whether we've ever successfully connected
+    pub was_connected: bool,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            identity: None,
+            current_kernel: None,
+            target_addr: DEFAULT_SERVER_ADDR.to_string(),
+            auto_reconnect: true,
+            reconnect_attempt: 0,
+            last_attempt: None,
+            was_connected: false,
+        }
+    }
 }
 
 /// Plugin for connection management
@@ -110,7 +147,14 @@ impl Plugin for ConnectionBridgePlugin {
             .insert_resource(ConnectionEvents(evt_rx))
             .init_resource::<ConnectionState>()
             .add_message::<ConnectionEvent>()
-            .add_systems(Update, (poll_connection_events, update_connection_state));
+            .add_systems(
+                Update,
+                (
+                    poll_connection_events,
+                    update_connection_state,
+                    auto_reconnect_system,
+                ),
+            );
     }
 }
 
@@ -129,16 +173,37 @@ fn poll_connection_events(
 fn update_connection_state(
     mut state: ResMut<ConnectionState>,
     mut events: MessageReader<ConnectionEvent>,
+    cmds: Res<ConnectionCommands>,
 ) {
     for event in events.read() {
         match event {
             ConnectionEvent::Connected => {
                 state.connected = true;
+                state.was_connected = true;
+                state.reconnect_attempt = 0;
+                // Auto-attach to lobby kernel
+                cmds.send(ConnectionCommand::AttachKernel {
+                    id: DEFAULT_KERNEL_ID.to_string(),
+                });
             }
-            ConnectionEvent::Disconnected | ConnectionEvent::ConnectionFailed(_) => {
+            ConnectionEvent::Disconnected => {
                 state.connected = false;
                 state.identity = None;
                 state.current_kernel = None;
+                // Don't reset reconnect_attempt - let auto_reconnect_system handle it
+            }
+            ConnectionEvent::ConnectionFailed(_) => {
+                state.connected = false;
+                state.identity = None;
+                state.current_kernel = None;
+                state.last_attempt = Some(Instant::now());
+                // Increment attempt counter for backoff
+                if state.auto_reconnect {
+                    state.reconnect_attempt += 1;
+                }
+            }
+            ConnectionEvent::Reconnecting { attempt, .. } => {
+                state.reconnect_attempt = *attempt;
             }
             ConnectionEvent::Identity(id) => {
                 state.identity = Some(id.clone());
@@ -151,6 +216,59 @@ fn update_connection_state(
             }
             _ => {}
         }
+    }
+}
+
+/// Calculate backoff delay for reconnection attempts
+fn backoff_delay(attempt: u32) -> Duration {
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+    let secs = match attempt {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        4 => 16,
+        _ => 30,
+    };
+    Duration::from_secs(secs)
+}
+
+/// System that handles auto-reconnection with exponential backoff
+fn auto_reconnect_system(
+    mut state: ResMut<ConnectionState>,
+    cmds: Res<ConnectionCommands>,
+    mut events: MessageWriter<ConnectionEvent>,
+) {
+    // Skip if connected, auto-reconnect disabled, or no target
+    if state.connected || !state.auto_reconnect || state.target_addr.is_empty() {
+        return;
+    }
+
+    // Check if we should attempt reconnection
+    let should_attempt = match state.last_attempt {
+        None => true, // Never attempted, try now (startup)
+        Some(last) => {
+            let delay = backoff_delay(state.reconnect_attempt);
+            last.elapsed() >= delay
+        }
+    };
+
+    if should_attempt {
+        let attempt = state.reconnect_attempt + 1;
+        let delay = backoff_delay(attempt);
+
+        // Notify UI about reconnection attempt
+        events.write(ConnectionEvent::Reconnecting {
+            attempt,
+            delay_secs: delay.as_secs() as u32,
+        });
+
+        // Update state
+        state.last_attempt = Some(Instant::now());
+
+        // Send connect command
+        let addr = state.target_addr.clone();
+        cmds.send(ConnectionCommand::ConnectTcp { addr });
     }
 }
 

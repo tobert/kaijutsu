@@ -138,6 +138,12 @@ impl KaishRuntime {
                     let val = self.eval_expr(value)?;
                     evaluated_args.push(format!("{}={}", key, format_value(&val)));
                 }
+                Arg::ShortFlag(flag) => {
+                    evaluated_args.push(format!("-{}", flag));
+                }
+                Arg::LongFlag(flag) => {
+                    evaluated_args.push(format!("--{}", flag));
+                }
             }
         }
 
@@ -161,6 +167,8 @@ impl KaishRuntime {
                                 format!("{}=<error>", key)
                             }
                         }
+                        Arg::ShortFlag(flag) => format!("-{}", flag),
+                        Arg::LongFlag(flag) => format!("--{}", flag),
                     })
                     .collect();
                 Ok(ExecResult::success(output.join(" ")))

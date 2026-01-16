@@ -62,23 +62,11 @@ fn main() {
         .run();
 }
 
-/// On startup, connect to a local test server (if running)
-fn startup_connect(
-    cmds: Res<connection::ConnectionCommands>,
-    mut events: MessageWriter<ui::context::MessageEvent>,
-) {
-    // Welcome message
+/// On startup, show welcome message (auto-reconnect handles connection)
+fn startup_connect(mut events: MessageWriter<ui::context::MessageEvent>) {
     events.write(ui::context::MessageEvent::system(
-        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, j/k to navigate.",
+        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, ` for console.",
     ));
-
-    // Try connecting to local test server
-    events.write(ui::context::MessageEvent::system(
-        "Connecting to localhost:7878...",
-    ));
-    cmds.send(connection::ConnectionCommand::ConnectTcp {
-        addr: "127.0.0.1:7878".to_string(),
-    });
 }
 
 /// Handle Enter key in Insert mode to submit input
@@ -213,6 +201,7 @@ fn handle_slash_command(
 /// Convert connection events to UI messages
 fn handle_connection_events(
     mut conn_events: MessageReader<connection::ConnectionEvent>,
+    conn_state: Res<connection::ConnectionState>,
     mut ui_events: MessageWriter<ui::context::MessageEvent>,
 ) {
     use connection::ConnectionEvent;
@@ -224,10 +213,26 @@ fn handle_connection_events(
                 ui_events.write(MessageEvent::system("✓ Connected to server"));
             }
             ConnectionEvent::Disconnected => {
-                ui_events.write(MessageEvent::system("Disconnected from server"));
+                ui_events.write(MessageEvent::system(
+                    "⚡ Disconnected from server (reconnecting...)",
+                ));
             }
             ConnectionEvent::ConnectionFailed(err) => {
-                ui_events.write(MessageEvent::system(format!("✗ Connection failed: {}", err)));
+                // Only show detailed errors after first attempt to reduce startup noise
+                if conn_state.was_connected || conn_state.reconnect_attempt > 2 {
+                    ui_events.write(MessageEvent::system(format!("✗ Connection failed: {}", err)));
+                }
+            }
+            ConnectionEvent::Reconnecting { attempt, delay_secs } => {
+                // Show reconnection status periodically
+                if *attempt == 1 {
+                    ui_events.write(MessageEvent::system("Connecting to server..."));
+                } else if *attempt % 3 == 0 {
+                    ui_events.write(MessageEvent::system(format!(
+                        "⟳ Reconnecting (attempt {}, next in {}s)...",
+                        attempt, delay_secs
+                    )));
+                }
             }
             ConnectionEvent::Identity(id) => {
                 ui_events.write(MessageEvent::system(format!(
