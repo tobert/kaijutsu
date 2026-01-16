@@ -44,7 +44,8 @@
 | Client kernel API | ✅ Basic impl |
 | Server kernel storage | 📋 Planned |
 | Client kernel UI | 📋 Planned |
-| kaish interpreter | 📋 Planned |
+| **kaish (execution engine)** | 🚧 L0-L4 complete (lexer, parser, runtime, REPL) |
+| kaish embedding | 📋 Planned (blocked on kaish L5-L6) |
 | Lease system | 📋 Planned |
 | Checkpoint system | 📋 Planned |
 
@@ -52,11 +53,23 @@
 
 ### Immediate: Kernel Integration
 
-1. **Implement kernel state storage** — SQLite + filesystem per kernel
-2. **Implement VFS mounting** — Attach worktrees to kernel paths
-3. **Build kaish interpreter** — Parse/eval loop, builtins
-4. **Wire console to kernel** — RPC streaming output
-5. **Lease system** — Who holds the pen, UI indicator
+**Dependency:** kaish (~/src/kaish) provides the execution engine. kaijutsu embeds kaish-kernel.
+
+| kaish Layer | Status | kaijutsu Blocker |
+|-------------|--------|------------------|
+| L0-L4: Lexer, Parser, Runtime, REPL | ✅ Complete | Can start embedding |
+| L5: VFS | 📋 Planned | Needed for file operations |
+| L6: Tools | 📋 Planned | Needed for builtins |
+| L10: State | 📋 Planned | Needed for persistence |
+| L11: RPC | 📋 Planned | Optional (we embed directly) |
+
+**kaijutsu work (parallel with kaish):**
+
+1. **Embed kaish-kernel** — Add kaish as workspace dependency, wire to execute()
+2. **Kernel state storage** — SQLite + filesystem per kernel (kaijutsu-side)
+3. **VFS mounting** — Coordinate with kaish VFS, attach worktrees
+4. **Wire console to kernel** — RPC streaming output via kaish
+5. **Lease system** — Who holds the pen, UI indicator (kaijutsu-side)
 
 ### Phase 4: Kernel Operations
 
@@ -99,7 +112,8 @@ kaijutsu/
 
 ## Key Reading
 
-- **Start here:** [docs/06-kernel-model.md](./06-kernel-model.md) — Full kernel model specification
+- **Start here:** [docs/06-kernel-model.md](./06-kernel-model.md) — Full kernel model specification (includes kaish integration)
 - **Background:** [docs/05-lexicon-exploration.md](./05-lexicon-exploration.md) — Design philosophy and decisions
-- **kaish:** `~/src/kaish/LANGUAGE.md` — Shell language specification
+- **kaish:** `~/src/kaish/docs/BUILD.md` — Execution engine build plan and layer dependencies
+- **kaish language:** `~/src/kaish/docs/LANGUAGE.md` — Shell language specification
 - **Bevy 0.18:** `~/src/bevy` — UI framework source

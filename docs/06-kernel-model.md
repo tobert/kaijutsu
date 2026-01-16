@@ -9,13 +9,107 @@
 | Component | Status |
 |-----------|--------|
 | Kernel concept | ✅ Designed (this document) |
-| Cap'n Proto schema | 🚧 Draft |
+| Cap'n Proto schema | ✅ Complete |
 | Server (kaijutsu-server) | 🚧 Partial |
 | Client (kaijutsu-app) | 🚧 Partial |
-| kaish integration | 📋 Planned |
+| kaish integration | 🚧 kaish L0-L4 complete, embedding planned |
 | Lease system | 📋 Planned |
 | Checkpoint system | 📋 Planned |
 | Fork/Thread | 📋 Planned |
+
+## kaish Integration
+
+**kaish is the execution engine. Kaijutsu wraps it with collaboration.**
+
+### Interface Ownership
+
+| Interface | Owner | Purpose |
+|-----------|-------|---------|
+| `kaish.capnp::Kernel` | **kaish** | Execution: parse, eval, tools, VFS, MCP, state, blobs |
+| `kaijutsu.capnp::World` | **kaijutsu** | Multi-kernel orchestration |
+| `kaijutsu.capnp::Kernel` | **kaijutsu** | Collaboration: lease, consent, fork/thread, checkpoint, messaging |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      kaijutsu-server                            │
+│                                                                 │
+│  kaijutsu.capnp::World                                          │
+│  └── listKernels, attachKernel, createKernel                    │
+│                                                                 │
+│  kaijutsu.capnp::Kernel (collaboration layer)                   │
+│  ├── lease: acquireLease, releaseLease, subscribeLease          │
+│  ├── consent: collaborative vs autonomous                       │
+│  ├── lifecycle: fork, thread, checkpoint, archive               │
+│  ├── messaging: send, mention, subscribe                        │
+│  ├── equipment: listEquipment, equip, unequip                   │
+│  │                                                              │
+│  │  execute() ─────────────────────────────────────────┐        │
+│  │                                                     │        │
+│  └─────────────────────────────────────────────────────┼────────┤
+│                                                        │        │
+│  kaish-kernel (embedded, no IPC)                       ▼        │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  kaish.capnp::Kernel (execution layer)                     │ │
+│  │  ├── execute, executeStreaming                             │ │
+│  │  ├── getVar, setVar, listVars                              │ │
+│  │  ├── listTools, callTool, getToolSchema                    │ │
+│  │  ├── mount, unmount, listMounts                            │ │
+│  │  ├── registerMcp, listMcpServers                           │ │
+│  │  ├── snapshot, restore                                     │ │
+│  │  └── readBlob, writeBlob                                   │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Execution Flow
+
+When a user or AI executes code in kaijutsu:
+
+1. **Lease acquisition** — kaijutsu acquires lease for the session
+2. **Execute** — kaijutsu calls `kaish_kernel.execute(code)`
+3. **Record** — Output recorded in message DAG
+4. **Lease release** — kaijutsu releases lease
+5. **Checkpoint** — If autonomous mode, may trigger checkpoint
+
+```rust
+// In kaijutsu-server kernel handler
+async fn execute(&self, code: String) -> Result<ExecId> {
+    // 1. Acquire lease
+    self.lease.acquire(holder).await?;
+
+    // 2. Execute via embedded kaish
+    let exec_id = self.next_exec_id();
+    let result = self.kaish.execute(&code).await;
+
+    // 3. Record in DAG
+    self.dag.append(Row::tool_result(exec_id, &result));
+
+    // 4. Release lease
+    self.lease.release().await;
+
+    // 5. Maybe checkpoint
+    if self.consent_mode == Autonomous && self.should_checkpoint() {
+        self.checkpoint_auto().await?;
+    }
+
+    Ok(exec_id)
+}
+```
+
+### kaish Standalone Mode
+
+kaish also runs independently (for testing, scripting, other tools):
+
+```bash
+kaish                              # Interactive REPL
+kaish script.kai                   # Run script
+kaish serve --socket=/tmp/k.sock   # RPC server
+kaish serve tools.kai --stdio      # MCP server
+```
+
+See `~/src/kaish/docs/BUILD.md` for kaish's build plan and layer dependencies.
 
 ## Overview
 
