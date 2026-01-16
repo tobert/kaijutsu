@@ -43,6 +43,8 @@ fn main() {
                 // Mode handling
                 state::mode::handle_mode_input,
                 ui::shell::update_mode_indicator,
+                ui::shell::update_title_kernel,
+                ui::console::update_console_header,
                 // Input handling (keyboard + IME) - skipped when console visible
                 ui::input::handle_keyboard_input,
                 ui::input::handle_ime_input,

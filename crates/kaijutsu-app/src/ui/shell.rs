@@ -1,10 +1,14 @@
 use bevy::{ecs::hierarchy::ChildSpawnerCommands, prelude::*, ui::widget::NodeImageMode};
 
 use super::{context::ContextArea, input::InputDisplay, theme::Theme};
+use crate::connection::ConnectionState;
 use crate::state::mode::Mode;
 
 #[derive(Component)]
 pub struct ModeIndicator;
+
+#[derive(Component)]
+pub struct TitleKernelText;
 
 /// Resource holding our loaded fonts
 #[derive(Resource)]
@@ -81,13 +85,14 @@ fn title_bar(parent: &mut ChildSpawnerCommands, theme: &Theme, font: Handle<Font
                 TextColor(theme.accent),
             ));
             bar.spawn((
-                Text::new("▣ kernel: lobby"),
+                Text::new("○ disconnected"),
                 TextFont {
                     font: font.clone(),
                     font_size: 14.0,
                     ..default()
                 },
                 TextColor(theme.fg),
+                TitleKernelText,
             ));
         });
 }
@@ -248,6 +253,22 @@ pub fn update_mode_indicator(mode: Res<State<Mode>>, mut query: Query<&mut Text,
     if mode.is_changed() {
         for mut text in &mut query {
             **text = mode.get().indicator().to_string();
+        }
+    }
+}
+
+pub fn update_title_kernel(
+    conn_state: Res<ConnectionState>,
+    mut query: Query<&mut Text, With<TitleKernelText>>,
+) {
+    if conn_state.is_changed() {
+        for mut text in &mut query {
+            let display = match (&conn_state.connected, &conn_state.current_kernel) {
+                (true, Some(k)) => format!("▣ kernel: {}", k.name),
+                (true, None) => "▣ kernel: none".to_string(),
+                (false, _) => "○ disconnected".to_string(),
+            };
+            **text = display;
         }
     }
 }

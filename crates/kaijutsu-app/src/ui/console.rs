@@ -118,6 +118,10 @@ pub struct ConsoleOutputText;
 #[derive(Component)]
 pub struct ConsoleInputDisplay;
 
+/// Marker for the console header text
+#[derive(Component)]
+pub struct ConsoleHeaderText;
+
 /// Spawn the console panel (hidden by default)
 pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Res<AssetServer>) {
     // Load the console frame image
@@ -150,12 +154,13 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
                 .with_children(|content| {
                     // Header
                     content.spawn((
-                        Text::new("【kaish】 /kernel/lobby"),
+                        Text::new("【kaish】 /kernel/none"),
                         TextFont {
                             font_size: 14.0,
                             ..default()
                         },
                         TextColor(theme.accent),
+                        ConsoleHeaderText,
                     ));
 
                     // Output scrollback area
@@ -455,6 +460,23 @@ pub fn handle_execute_results(
             while console_state.history.len() > 100 {
                 console_state.history.remove(0);
             }
+        }
+    }
+}
+
+/// Update console header based on connection state
+pub fn update_console_header(
+    conn_state: Res<ConnectionState>,
+    mut query: Query<&mut Text, With<ConsoleHeaderText>>,
+) {
+    if conn_state.is_changed() {
+        for mut text in &mut query {
+            let path = conn_state
+                .current_kernel
+                .as_ref()
+                .map(|k| format!("/kernel/{}", k.name))
+                .unwrap_or_else(|| "/kernel/none".to_string());
+            **text = format!("【kaish】 {}", path);
         }
     }
 }
