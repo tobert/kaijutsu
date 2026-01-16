@@ -1,0 +1,22 @@
+[package]
+name = "kaijutsu-client"
+version.workspace = true
+edition.workspace = true
+description = "Cap'n Proto RPC client library for kaijutsu"
+
+[dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+russh.workspace = true
+log.workspace = true
+thiserror.workspace = true
+whoami.workspace = true
+
+[build-dependencies]
+capnpc.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

@@ -1,4 +1,4 @@
-//! SSH client for sshwarma server connection
+//! SSH client for kaijutsu server connection
 //!
 //! Uses russh for SSH transport with SSH agent authentication.
 //! The connection provides channels for:
@@ -34,7 +34,6 @@ impl Default for SshConfig {
 
 /// Client handler for russh - handles server key verification
 struct ClientHandler {
-    /// Known host keys (TODO: implement proper known_hosts checking)
     #[allow(dead_code)]
     server_key: Option<PublicKey>,
 }
@@ -47,7 +46,6 @@ impl client::Handler for ClientHandler {
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
         // TODO: Implement proper known_hosts verification
-        // For now, accept all keys (INSECURE - fine for development)
         log::warn!(
             "Accepting server key without verification: {}",
             server_public_key.fingerprint(HashAlg::Sha256)
@@ -57,7 +55,7 @@ impl client::Handler for ClientHandler {
     }
 }
 
-/// Channel handles for the three sshwarma channels
+/// Channel handles for the three kaijutsu channels
 pub struct SshChannels {
     pub control: Channel<client::Msg>,
     pub rpc: Channel<client::Msg>,
@@ -79,15 +77,12 @@ impl SshClient {
     }
 
     /// Connect to the server using SSH agent authentication
-    ///
-    /// Returns channel handles for control, rpc, and events
     pub async fn connect(&mut self) -> Result<SshChannels, SshError> {
         // Connect to SSH agent
         let mut agent = AgentClient::connect_env()
             .await
             .map_err(|e| SshError::AgentFailed(e.to_string()))?;
 
-        // Get available keys from agent
         let keys = agent
             .request_identities()
             .await
@@ -99,7 +94,6 @@ impl SshClient {
 
         log::info!("Found {} keys in SSH agent", keys.len());
 
-        // Create client config
         let config = Config {
             inactivity_timeout: Some(Duration::from_secs(300)),
             keepalive_interval: Some(Duration::from_secs(30)),
@@ -108,8 +102,6 @@ impl SshClient {
         };
 
         let handler = ClientHandler { server_key: None };
-
-        // Connect to server
         let addr = (self.config.host.as_str(), self.config.port);
         let mut session = client::connect(Arc::new(config), addr, handler)
             .await
@@ -126,7 +118,6 @@ impl SshClient {
         for key in &keys {
             log::debug!("Trying key: {}", key.fingerprint(HashAlg::Sha256));
 
-            // Get the best hash algorithm for this key type
             let hash_alg = session
                 .best_supported_rsa_hash()
                 .await
@@ -158,12 +149,10 @@ impl SshClient {
         }
 
         if !authenticated {
-            return Err(SshError::AuthFailed(
-                "No keys accepted by server".to_string(),
-            ));
+            return Err(SshError::AuthFailed("No keys accepted by server".into()));
         }
 
-        // Open three session channels for sshwarma protocol
+        // Open three session channels
         let control = session
             .channel_open_session()
             .await
@@ -180,14 +169,9 @@ impl SshClient {
             .map_err(|e| SshError::ChannelFailed(format!("events: {}", e)))?;
 
         log::info!("Opened control, rpc, and events channels");
-
         self.session = Some(session);
 
-        Ok(SshChannels {
-            control,
-            rpc,
-            events,
-        })
+        Ok(SshChannels { control, rpc, events })
     }
 
     /// Disconnect from the server
@@ -203,41 +187,28 @@ impl SshClient {
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
-        self.session
-            .as_ref()
-            .map(|s| !s.is_closed())
-            .unwrap_or(false)
+        self.session.as_ref().map(|s| !s.is_closed()).unwrap_or(false)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SshError {
+    #[error("SSH not yet implemented")]
     NotImplemented,
+    #[error("Connection failed: {0}")]
     ConnectionFailed(String),
+    #[error("Auth failed: {0}")]
     AuthFailed(String),
+    #[error("Channel failed: {0}")]
     ChannelFailed(String),
+    #[error("SSH agent error: {0}")]
     AgentFailed(String),
+    #[error("No SSH keys available in agent")]
     NoKeysAvailable,
+    #[error("Disconnected")]
     Disconnected,
 }
 
-impl std::fmt::Display for SshError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SshError::NotImplemented => write!(f, "SSH not yet implemented"),
-            SshError::ConnectionFailed(s) => write!(f, "Connection failed: {}", s),
-            SshError::AuthFailed(s) => write!(f, "Auth failed: {}", s),
-            SshError::ChannelFailed(s) => write!(f, "Channel failed: {}", s),
-            SshError::AgentFailed(s) => write!(f, "SSH agent error: {}", s),
-            SshError::NoKeysAvailable => write!(f, "No SSH keys available in agent"),
-            SshError::Disconnected => write!(f, "Disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for SshError {}
-
-// Implement From<russh::Error> for SshError
 impl From<russh::Error> for SshError {
     fn from(e: russh::Error) -> Self {
         SshError::ConnectionFailed(e.to_string())

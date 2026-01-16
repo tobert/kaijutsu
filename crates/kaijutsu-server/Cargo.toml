@@ -1,0 +1,27 @@
+[package]
+name = "kaijutsu-server"
+version.workspace = true
+edition.workspace = true
+description = "SSH + Cap'n Proto server for kaijutsu"
+
+[dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+russh.workspace = true
+log.workspace = true
+env_logger.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+
+# No separate russh-keys needed - russh 0.56 includes keys module
+
+[build-dependencies]
+capnpc.workspace = true
+
+[dev-dependencies]
+kaijutsu-client = { path = "../kaijutsu-client" }
+futures.workspace = true

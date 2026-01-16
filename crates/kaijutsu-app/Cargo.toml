@@ -1,0 +1,15 @@
+[package]
+name = "kaijutsu-app"
+version.workspace = true
+edition.workspace = true
+description = "Bevy GUI client for kaijutsu"
+
+[dependencies]
+kaijutsu-client = { path = "../kaijutsu-client" }
+
+bevy = { version = "0.18", features = ["default"] }
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+log.workspace = true
+whoami.workspace = true

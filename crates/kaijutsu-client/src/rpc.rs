@@ -1,4 +1,4 @@
-//! Cap'n Proto RPC client for sshwarma
+//! Cap'n Proto RPC client for kaijutsu
 //!
 //! Provides typed interface to the World, Room, and KaishKernel capabilities.
 
@@ -8,8 +8,6 @@ use russh::client::Msg;
 use russh::ChannelStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-// Re-export the generated Cap'n Proto code from crate root
-pub use crate::kaijutsu_capnp;
 use crate::kaijutsu_capnp::world;
 
 /// RPC client wrapper
@@ -25,17 +23,21 @@ pub struct RpcClient {
 impl RpcClient {
     /// Initialize RPC over an SSH channel stream
     ///
-    /// Bootstraps the World capability from the server.
-    /// The channel stream should be the RPC channel from SshChannels.
-    ///
     /// MUST be called within a `tokio::task::LocalSet::run_until()` context.
-    /// The RpcSystem is spawned with `spawn_local`.
     pub async fn new(channel_stream: ChannelStream<Msg>) -> Result<Self, RpcError> {
-        // Convert tokio AsyncRead/Write to futures AsyncRead/Write
         let compat_stream = TokioAsyncReadCompatExt::compat(channel_stream);
-        let (reader, writer) = compat_stream.split();
+        Self::from_stream(compat_stream).await
+    }
 
-        // Create the RPC network
+    /// Initialize RPC from any AsyncRead+AsyncWrite stream
+    ///
+    /// Useful for testing with Unix sockets or in-memory streams.
+    pub async fn from_stream<S>(stream: S) -> Result<Self, RpcError>
+    where
+        S: futures::AsyncRead + futures::AsyncWrite + Unpin + 'static,
+    {
+        let (reader, writer) = stream.split();
+
         let rpc_network = Box::new(twoparty::VatNetwork::new(
             futures::io::BufReader::new(reader),
             futures::io::BufWriter::new(writer),
@@ -43,7 +45,6 @@ impl RpcClient {
             Default::default(),
         ));
 
-        // Create the RPC system and bootstrap the World capability
         let mut rpc_system = RpcSystem::new(rpc_network, None);
         let world: world::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
@@ -56,7 +57,7 @@ impl RpcClient {
     /// Get current identity from the server
     pub async fn whoami(&self) -> Result<Identity, RpcError> {
         let request = self.world.whoami_request();
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let identity = response.get()?.get_identity()?;
 
         Ok(Identity {
@@ -68,7 +69,7 @@ impl RpcClient {
     /// List available rooms
     pub async fn list_rooms(&self) -> Result<Vec<RoomInfo>, RpcError> {
         let request = self.world.list_rooms_request();
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let rooms = response.get()?.get_rooms()?;
 
         let mut result = Vec::with_capacity(rooms.len() as usize);
@@ -88,7 +89,7 @@ impl RpcClient {
     pub async fn join_room(&self, name: &str) -> Result<RoomHandle, RpcError> {
         let mut request = self.world.join_room_request();
         request.get().set_name(name);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let room = response.get()?.get_room()?;
 
         Ok(RoomHandle { room })
@@ -111,7 +112,7 @@ impl RpcClient {
                 r.set_writable(repo.writable);
             }
         }
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let room = response.get()?.get_room()?;
 
         Ok(RoomHandle { room })
@@ -119,7 +120,7 @@ impl RpcClient {
 }
 
 // ============================================================================
-// Local types (mirror schema types for Rust ergonomics)
+// Types
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -157,11 +158,25 @@ pub struct RoomHandle {
 }
 
 impl RoomHandle {
+    /// Get room info
+    pub async fn get_info(&self) -> Result<RoomInfo, RpcError> {
+        let request = self.room.get_info_request();
+        let response = request.send().promise.await?;
+        let info = response.get()?.get_info()?;
+        Ok(RoomInfo {
+            id: info.get_id(),
+            name: info.get_name()?.to_string()?,
+            branch: info.get_branch()?.to_string()?,
+            user_count: info.get_user_count(),
+            agent_count: info.get_agent_count(),
+        })
+    }
+
     /// Send a message to the room
     pub async fn send(&self, content: &str) -> Result<Row, RpcError> {
         let mut request = self.room.send_request();
         request.get().set_content(content);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let row = response.get()?.get_row()?;
         Ok(Row::from_capnp(&row)?)
     }
@@ -171,7 +186,7 @@ impl RoomHandle {
         let mut request = self.room.mention_request();
         request.get().set_agent(agent);
         request.get().set_content(content);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let row = response.get()?.get_row()?;
         Ok(Row::from_capnp(&row)?)
     }
@@ -181,7 +196,7 @@ impl RoomHandle {
         let mut request = self.room.get_history_request();
         request.get().set_limit(limit);
         request.get().set_before_id(before_id);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let rows = response.get()?.get_rows()?;
 
         let mut result = Vec::with_capacity(rows.len() as usize);
@@ -194,7 +209,7 @@ impl RoomHandle {
     /// Get the kaish kernel for this room
     pub async fn get_kernel(&self) -> Result<KernelHandle, RpcError> {
         let request = self.room.get_kernel_request();
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let kernel = response.get()?.get_kernel()?;
         Ok(KernelHandle { kernel })
     }
@@ -202,7 +217,7 @@ impl RoomHandle {
     /// Leave the room
     pub async fn leave(self) -> Result<(), RpcError> {
         let request = self.room.leave_request();
-        request.send().promise.await.map_err(RpcError::from)?;
+        request.send().promise.await?;
         Ok(())
     }
 }
@@ -217,7 +232,7 @@ impl KernelHandle {
     pub async fn execute(&self, code: &str) -> Result<u64, RpcError> {
         let mut request = self.kernel.execute_request();
         request.get().set_code(code);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         Ok(response.get()?.get_exec_id())
     }
 
@@ -225,7 +240,7 @@ impl KernelHandle {
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {
         let mut request = self.kernel.interrupt_request();
         request.get().set_exec_id(exec_id);
-        request.send().promise.await.map_err(RpcError::from)?;
+        request.send().promise.await?;
         Ok(())
     }
 
@@ -234,7 +249,7 @@ impl KernelHandle {
         let mut request = self.kernel.complete_request();
         request.get().set_partial(partial);
         request.get().set_cursor(cursor);
-        let response = request.send().promise.await.map_err(RpcError::from)?;
+        let response = request.send().promise.await?;
         let completions = response.get()?.get_completions()?;
 
         let mut result = Vec::with_capacity(completions.len() as usize);
@@ -323,45 +338,18 @@ impl CompletionKind {
 // Errors
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RpcError {
-    Capnp(capnp::Error),
-    NotInSchema(capnp::NotInSchema),
-    Utf8(std::str::Utf8Error),
+    #[error("Cap'n Proto error: {0}")]
+    Capnp(#[from] capnp::Error),
+    #[error("Not in schema: {0}")]
+    NotInSchema(#[from] capnp::NotInSchema),
+    #[error("UTF-8 error: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error("Not connected to server")]
     NotConnected,
+    #[error("Capability no longer valid")]
     CapabilityLost,
+    #[error("Server error: {0}")]
     ServerError(String),
 }
-
-impl From<capnp::Error> for RpcError {
-    fn from(e: capnp::Error) -> Self {
-        RpcError::Capnp(e)
-    }
-}
-
-impl From<capnp::NotInSchema> for RpcError {
-    fn from(e: capnp::NotInSchema) -> Self {
-        RpcError::NotInSchema(e)
-    }
-}
-
-impl From<std::str::Utf8Error> for RpcError {
-    fn from(e: std::str::Utf8Error) -> Self {
-        RpcError::Utf8(e)
-    }
-}
-
-impl std::fmt::Display for RpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RpcError::Capnp(e) => write!(f, "Cap'n Proto error: {}", e),
-            RpcError::NotInSchema(e) => write!(f, "Not in schema: {}", e),
-            RpcError::Utf8(e) => write!(f, "UTF-8 error: {}", e),
-            RpcError::NotConnected => write!(f, "Not connected to server"),
-            RpcError::CapabilityLost => write!(f, "Capability no longer valid"),
-            RpcError::ServerError(s) => write!(f, "Server error: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}

@@ -1,20 +1,39 @@
-[package]
-name = "kaijutsu"
+[workspace]
+resolver = "2"
+members = [
+    "crates/kaijutsu-client",
+    "crates/kaijutsu-server",
+    "crates/kaijutsu-app",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/atobey/kaijutsu"
 
-[dependencies]
-bevy = { version = "0.18", features = ["default"] }
-
-# SSH + RPC
-russh = "0.56"
+[workspace.dependencies]
+# Cap'n Proto
 capnp = "0.25"
 capnp-rpc = "0.25"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
-tokio-util = { version = "0.7", features = ["compat"] }  # bridge tokio<->futures AsyncRead/Write
-futures = "0.3"
-whoami = "1.5"
-log = "0.4"
-
-[build-dependencies]
 capnpc = "0.25"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+
+# SSH
+russh = "0.56"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+whoami = "1.5"
+
+# Testing
+async-trait = "0.1"
+
+# Utilities
+rand = "0.8"  # must match russh's dependency
