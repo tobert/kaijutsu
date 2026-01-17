@@ -120,8 +120,8 @@ pub trait ExecutionEngine: Send + Sync {
 pub struct ToolRegistry {
     /// Available tools.
     tools: HashMap<String, ToolInfo>,
-    /// Equipped tools (subset of available).
-    equipped: HashMap<String, Arc<dyn ExecutionEngine>>,
+    /// Execution engines (stored separately from equipped state).
+    engines: HashMap<String, Arc<dyn ExecutionEngine>>,
     /// Default execution engine name.
     default_engine: Option<String>,
 }
@@ -130,7 +130,7 @@ impl std::fmt::Debug for ToolRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolRegistry")
             .field("tools", &self.tools)
-            .field("equipped", &self.equipped.keys().collect::<Vec<_>>())
+            .field("engines", &self.engines.keys().collect::<Vec<_>>())
             .field("default_engine", &self.default_engine)
             .finish()
     }
@@ -142,27 +142,51 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Register a tool as available.
+    /// Register a tool as available (without an engine).
     pub fn register(&mut self, info: ToolInfo) {
         self.tools.insert(info.name.clone(), info);
     }
 
-    /// Equip a tool with an execution engine.
-    pub fn equip(&mut self, name: &str, engine: Arc<dyn ExecutionEngine>) -> bool {
+    /// Register a tool with an execution engine.
+    /// The tool is registered but not equipped by default.
+    pub fn register_with_engine(&mut self, info: ToolInfo, engine: Arc<dyn ExecutionEngine>) {
+        let name = info.name.clone();
+        self.tools.insert(name.clone(), info);
+        self.engines.insert(name, engine);
+    }
+
+    /// Equip a tool (must have an engine already registered).
+    /// Returns true if the tool was equipped, false if the tool doesn't exist
+    /// or doesn't have an engine registered.
+    pub fn equip(&mut self, name: &str) -> bool {
+        // Check if tool has a registered engine
+        if !self.engines.contains_key(name) {
+            return false;
+        }
         if let Some(info) = self.tools.get_mut(name) {
             info.equipped = true;
-            self.equipped.insert(name.to_string(), engine);
             true
         } else {
             false
         }
     }
 
-    /// Unequip a tool.
+    /// Equip a tool with an execution engine (for backwards compatibility).
+    /// Registers the engine and marks the tool as equipped.
+    pub fn equip_with_engine(&mut self, name: &str, engine: Arc<dyn ExecutionEngine>) -> bool {
+        if let Some(info) = self.tools.get_mut(name) {
+            info.equipped = true;
+            self.engines.insert(name.to_string(), engine);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unequip a tool (keeps the engine registered for later re-equipping).
     pub fn unequip(&mut self, name: &str) -> bool {
         if let Some(info) = self.tools.get_mut(name) {
             info.equipped = false;
-            self.equipped.remove(name);
             true
         } else {
             false
@@ -174,9 +198,21 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// Get a mutable reference to a tool's info.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut ToolInfo> {
+        self.tools.get_mut(name)
+    }
+
     /// Get an equipped engine.
+    /// Returns the engine only if the tool is equipped.
     pub fn get_engine(&self, name: &str) -> Option<Arc<dyn ExecutionEngine>> {
-        self.equipped.get(name).cloned()
+        // Check if tool is equipped
+        let is_equipped = self.tools.get(name).map(|t| t.equipped).unwrap_or(false);
+        if is_equipped {
+            self.engines.get(name).cloned()
+        } else {
+            None
+        }
     }
 
     /// List all available tools.
@@ -194,7 +230,7 @@ impl ToolRegistry {
 
     /// Set the default execution engine.
     pub fn set_default_engine(&mut self, name: &str) {
-        if self.equipped.contains_key(name) {
+        if self.engines.contains_key(name) {
             self.default_engine = Some(name.to_string());
         }
     }
@@ -203,8 +239,7 @@ impl ToolRegistry {
     pub fn default_engine(&self) -> Option<Arc<dyn ExecutionEngine>> {
         self.default_engine
             .as_ref()
-            .and_then(|name| self.equipped.get(name))
-            .cloned()
+            .and_then(|name| self.get_engine(name))
     }
 
     /// Execute code using the default engine.
@@ -270,13 +305,19 @@ mod tests {
         assert!(!registry.get("test").unwrap().equipped);
 
         let engine = Arc::new(NoopEngine);
-        registry.equip("test", engine);
+        registry.equip_with_engine("test", engine);
         assert!(registry.get("test").unwrap().equipped);
         assert!(registry.get_engine("test").is_some());
 
         registry.unequip("test");
         assert!(!registry.get("test").unwrap().equipped);
+        // Engine is still registered, just not equipped
         assert!(registry.get_engine("test").is_none());
+
+        // Re-equip the tool (engine is still there)
+        registry.equip("test");
+        assert!(registry.get("test").unwrap().equipped);
+        assert!(registry.get_engine("test").is_some());
     }
 
     #[tokio::test]
@@ -284,7 +325,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
 
         registry.register(ToolInfo::new("noop", "Noop", "test"));
-        registry.equip("noop", Arc::new(NoopEngine));
+        registry.equip_with_engine("noop", Arc::new(NoopEngine));
         registry.set_default_engine("noop");
 
         let result = registry.execute("hello").await.unwrap();

@@ -19,11 +19,45 @@ use capnp_rpc::pry;
 use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
-use kaijutsu_kernel::{CellDb, CellKind, CellStore, Kernel, LocalBackend, VfsOps};
+use kaijutsu_kernel::{
+    CellDb, CellEditEngine, CellKind, CellListEngine, CellReadEngine, CellStore, Kernel,
+    LocalBackend, ToolInfo, VfsOps,
+};
+use std::sync::Mutex as StdMutex;
 
 // ============================================================================
 // Server State
 // ============================================================================
+
+/// Register cell editing tools with a kernel.
+async fn register_cell_tools(kernel: &Arc<Kernel>, cells: Arc<StdMutex<CellStore>>) {
+    // Register cell.edit tool
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("cell.edit", "Line-based cell editing", "cell"),
+            Arc::new(CellEditEngine::new(cells.clone(), "server")),
+        )
+        .await;
+    kernel.equip("cell.edit").await;
+
+    // Register cell.read tool
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("cell.read", "Read cell content by ID", "cell"),
+            Arc::new(CellReadEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("cell.read").await;
+
+    // Register cell.list tool
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("cell.list", "List all cells with metadata", "cell"),
+            Arc::new(CellListEngine::new(cells)),
+        )
+        .await;
+    kernel.equip("cell.list").await;
+}
 
 /// Server state shared across all capabilities
 pub struct ServerState {
@@ -112,8 +146,10 @@ pub struct KernelState {
     pub kaish: Option<Rc<KaishProcess>>,
     /// The kernel (VFS, state, tools, control plane)
     pub kernel: Arc<Kernel>,
-    /// Cell CRDT store
-    pub cells: CellStore,
+    /// Cell CRDT store (wrapped for sharing with tools)
+    pub cells: Arc<StdMutex<CellStore>>,
+    /// Subscribers for cell update events
+    pub cell_subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>,
 }
 
 #[derive(Clone, Copy)]
@@ -228,6 +264,13 @@ impl world::Server for WorldImpl {
                     }
                 }
 
+                // Wrap cells in Arc<Mutex> for sharing with tools
+                let cells = Arc::new(StdMutex::new(cells));
+
+                // Register cell tools
+                let kernel_arc = Arc::new(kernel);
+                register_cell_tools(&kernel_arc, cells.clone()).await;
+
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
                     id.clone(),
@@ -238,8 +281,9 @@ impl world::Server for WorldImpl {
                         rows: Vec::new(),
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
-                        kernel: Arc::new(kernel),
+                        kernel: kernel_arc,
                         cells,
+                        cell_subscribers: Vec::new(),
                     },
                 );
             }
@@ -292,6 +336,13 @@ impl world::Server for WorldImpl {
                 }
             }
 
+            // Wrap cells in Arc<Mutex> for sharing with tools
+            let cells = Arc::new(StdMutex::new(cells));
+
+            // Register cell tools
+            let kernel_arc = Arc::new(kernel);
+            register_cell_tools(&kernel_arc, cells.clone()).await;
+
             {
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
@@ -303,8 +354,9 @@ impl world::Server for WorldImpl {
                         rows: Vec::new(),
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
-                        kernel: Arc::new(kernel),
+                        kernel: kernel_arc,
                         cells,
+                        cell_subscribers: Vec::new(),
                     },
                 );
             }
@@ -608,24 +660,72 @@ impl kernel::Server for KernelImpl {
         _params: kernel::ListEquipmentParams,
         mut results: kernel::ListEquipmentResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().init_tools(0);
-        Promise::ok(())
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            let tools = kernel.list_tools().await;
+            let mut builder = results.get().init_tools(tools.len() as u32);
+            for (i, tool) in tools.iter().enumerate() {
+                let mut t = builder.reborrow().get(i as u32);
+                t.set_name(&tool.name);
+                t.set_description(&tool.description);
+                t.set_equipped(tool.equipped);
+            }
+            Ok(())
+        })
     }
 
     fn equip(
         self: Rc<Self>,
-        _params: kernel::EquipParams,
+        params: kernel::EquipParams,
         _results: kernel::EquipResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("equip not yet implemented".into()))
+        let tool_name = pry!(pry!(pry!(params.get()).get_tool()).to_str()).to_owned();
+
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            // Tools must be pre-registered with engines
+            // equip() just sets the equipped flag
+            if kernel.equip(&tool_name).await {
+                Ok(())
+            } else {
+                Err(capnp::Error::failed(format!(
+                    "Unknown tool or no engine registered: {}",
+                    tool_name
+                )))
+            }
+        })
     }
 
     fn unequip(
         self: Rc<Self>,
-        _params: kernel::UnequipParams,
+        params: kernel::UnequipParams,
         _results: kernel::UnequipResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("unequip not yet implemented".into()))
+        let tool_name = pry!(pry!(pry!(params.get()).get_tool()).to_str()).to_owned();
+
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            kernel.unequip(&tool_name).await;
+            Ok(())
+        })
     }
 
     // Lifecycle
@@ -787,7 +887,8 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells: Vec<_> = kernel.cells.iter().collect();
+            let cells_guard = kernel.cells.lock().unwrap();
+            let cells: Vec<_> = cells_guard.iter().collect();
             let mut builder = results.get().init_cells(cells.len() as u32);
             for (i, doc) in cells.iter().enumerate() {
                 let mut c = builder.reborrow().get(i as u32);
@@ -810,7 +911,8 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            if let Some(doc) = kernel.cells.get(&cell_id) {
+            let cells_guard = kernel.cells.lock().unwrap();
+            if let Some(doc) = cells_guard.get(&cell_id) {
                 let mut cell = results.get().init_cell();
                 let mut info = cell.reborrow().init_info();
                 info.set_id(&doc.id);
@@ -841,20 +943,65 @@ impl kernel::Server for KernelImpl {
         // Generate a new cell ID
         let cell_id = uuid::Uuid::new_v4().to_string();
 
-        let mut state = self.state.borrow_mut();
-        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-            if let Ok(doc) = kernel.cells.create_cell(cell_id, kind, language.clone()) {
-                let mut cell = results.get().init_cell();
-                let mut info = cell.reborrow().init_info();
-                info.set_id(&doc.id);
-                info.set_kind(cell_kind_to_capnp(doc.kind));
-                if let Some(ref lang) = doc.language {
-                    info.set_language(lang);
+        // Collect data for notification before releasing the borrow
+        let cell_data: Option<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64, Vec<u8>)>;
+        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
+
+        {
+            let state = self.state.borrow();
+            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+                let mut cells_guard = kernel.cells.lock().unwrap();
+                if let Ok(doc) = cells_guard.create_cell(cell_id, kind, language.clone()) {
+                    // Build results
+                    let mut cell = results.get().init_cell();
+                    let mut info = cell.reborrow().init_info();
+                    info.set_id(&doc.id);
+                    info.set_kind(cell_kind_to_capnp(doc.kind));
+                    if let Some(ref lang) = doc.language {
+                        info.set_language(lang);
+                    }
+                    cell.set_content(&doc.content());
+                    cell.set_version(doc.frontier_version());
+
+                    // Collect data for notification
+                    cell_data = Some((
+                        doc.id.clone(),
+                        doc.kind,
+                        doc.language.clone(),
+                        doc.content(),
+                        doc.frontier_version(),
+                        doc.encode_full(),
+                    ));
+                } else {
+                    cell_data = None;
                 }
-                cell.set_content(&doc.content());
-                cell.set_version(doc.frontier_version());
+                subscribers = kernel.cell_subscribers.clone();
+            } else {
+                cell_data = None;
+                subscribers = Vec::new();
             }
         }
+
+        // Notify subscribers (outside of borrow scope)
+        if let Some((id, cell_kind, lang, content, version, encoded_doc)) = cell_data {
+            for subscriber in subscribers {
+                let mut req = subscriber.on_cell_created_request();
+                {
+                    let mut cell = req.get().init_cell();
+                    let mut info = cell.reborrow().init_info();
+                    info.set_id(&id);
+                    info.set_kind(cell_kind_to_capnp(cell_kind));
+                    if let Some(ref l) = lang {
+                        info.set_language(l);
+                    }
+                    cell.set_content(&content);
+                    cell.set_version(version);
+                    cell.set_encoded_doc(&encoded_doc);
+                }
+                let _ = req.send(); // Fire and forget
+            }
+        }
+
         Promise::ok(())
     }
 
@@ -865,10 +1012,30 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
 
-        let mut state = self.state.borrow_mut();
-        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-            let _ = kernel.cells.delete_cell(&cell_id);
+        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
+        let deleted: bool;
+
+        {
+            let state = self.state.borrow();
+            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+                let mut cells_guard = kernel.cells.lock().unwrap();
+                deleted = cells_guard.delete_cell(&cell_id).is_ok();
+                subscribers = kernel.cell_subscribers.clone();
+            } else {
+                deleted = false;
+                subscribers = Vec::new();
+            }
         }
+
+        // Notify subscribers
+        if deleted {
+            for subscriber in subscribers {
+                let mut req = subscriber.on_cell_deleted_request();
+                req.get().set_cell_id(&cell_id);
+                let _ = req.send(); // Fire and forget
+            }
+        }
+
         Promise::ok(())
     }
 
@@ -885,53 +1052,107 @@ impl kernel::Server for KernelImpl {
         // Use a fixed agent name for server-side ops
         let agent_name = "server";
 
-        let mut state = self.state.borrow_mut();
-        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-            if let Some(doc) = kernel.cells.get_mut(&cell_id) {
-                // Capture version before operation for delta encoding
-                let version_before = doc.frontier();
+        // Data for persistence and notification
+        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
+        // (from_version, to_version, delta)
+        let patch_data: Option<(u64, u64, Vec<u8>)>;
 
-                // Apply the operation
-                match crdt_op.which() {
-                    Ok(crate::kaijutsu_capnp::crdt_op::Insert(insert)) => {
-                        let pos = insert.get_pos() as usize;
-                        let text = pry!(pry!(insert.get_text()).to_str());
-                        doc.insert(agent_name, pos, text);
-                    }
-                    Ok(crate::kaijutsu_capnp::crdt_op::Delete(delete)) => {
-                        let pos = delete.get_pos() as usize;
-                        let len = delete.get_len() as usize;
-                        doc.delete(agent_name, pos, pos + len);
-                    }
-                    Ok(crate::kaijutsu_capnp::crdt_op::FullState(data)) => {
-                        // Merge full state
-                        let data = pry!(data);
-                        let _ = doc.merge(&data);
-                    }
-                    Err(_) => {}
-                }
+        {
+            let state = self.state.borrow();
+            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+                let mut cells_guard = kernel.cells.lock().unwrap();
+                subscribers = kernel.cell_subscribers.clone();
 
-                let new_version = doc.frontier_version();
-                results.get().set_new_version(new_version);
+                // Apply operation and collect data for persistence (avoiding borrow conflict)
+                patch_data = {
+                    if let Some(doc) = cells_guard.get_mut(&cell_id) {
+                        // Capture version before operation for delta encoding
+                        let version_before = doc.frontier();
+                        let version_before_u64 = doc.frontier_version();
 
-                // Persist the delta to database
-                let delta = doc.encode_patch_from(&version_before);
-                if !delta.is_empty() {
-                    if let Err(e) = kernel.cells.persist_op(&cell_id, agent_name, &delta) {
+                        // Apply the operation
+                        match crdt_op.which() {
+                            Ok(crate::kaijutsu_capnp::crdt_op::Insert(insert)) => {
+                                let pos = insert.get_pos() as usize;
+                                let text = pry!(pry!(insert.get_text()).to_str());
+                                doc.insert(agent_name, pos, text);
+                            }
+                            Ok(crate::kaijutsu_capnp::crdt_op::Delete(delete)) => {
+                                let pos = delete.get_pos() as usize;
+                                let len = delete.get_len() as usize;
+                                doc.delete(agent_name, pos, pos + len);
+                            }
+                            Ok(crate::kaijutsu_capnp::crdt_op::FullState(data)) => {
+                                // Merge full state
+                                let data = pry!(data);
+                                let _ = doc.merge(&data);
+                            }
+                            Err(_) => {}
+                        }
+
+                        let new_version = doc.frontier_version();
+                        results.get().set_new_version(new_version);
+
+                        // Collect delta for persistence and notification
+                        let delta = doc.encode_patch_from(&version_before);
+                        if !delta.is_empty() {
+                            Some((version_before_u64, new_version, delta))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                // Persist outside the doc borrow scope
+                if let Some((_, _, ref delta)) = patch_data {
+                    if let Err(e) = cells_guard.persist_op(&cell_id, agent_name, delta) {
                         log::warn!("Failed to persist cell op: {}", e);
                     }
+                    // Auto-snapshot if enough ops have accumulated
+                    let _ = cells_guard.maybe_snapshot(&cell_id);
                 }
+            } else {
+                subscribers = Vec::new();
+                patch_data = None;
             }
         }
+
+        // Notify subscribers (outside of borrow scope)
+        if let Some((from_version, to_version, delta)) = patch_data {
+            for subscriber in subscribers {
+                let mut req = subscriber.on_cell_updated_request();
+                {
+                    let mut patch = req.get().init_patch();
+                    patch.set_cell_id(&cell_id);
+                    patch.set_from_version(from_version);
+                    patch.set_to_version(to_version);
+                    patch.set_ops(&delta);
+                }
+                let _ = req.send(); // Fire and forget
+            }
+        }
+
         Promise::ok(())
     }
 
     fn subscribe_cells(
         self: Rc<Self>,
-        _params: kernel::SubscribeCellsParams,
+        params: kernel::SubscribeCellsParams,
         _results: kernel::SubscribeCellsResults,
     ) -> Promise<(), capnp::Error> {
-        // TODO: Store callback and notify on changes
+        let callback = pry!(pry!(params.get()).get_callback());
+
+        let mut state = self.state.borrow_mut();
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            kernel.cell_subscribers.push(callback);
+            log::debug!(
+                "Added cell subscriber for kernel {} (total: {})",
+                self.kernel_id,
+                kernel.cell_subscribers.len()
+            );
+        }
         Promise::ok(())
     }
 
@@ -954,11 +1175,15 @@ impl kernel::Server for KernelImpl {
                 }
             }
 
+            // Collect data from cells (must clone/copy since we hold a mutex guard)
+            let cells_guard = kernel.cells.lock().unwrap();
+
             // Find cells that need patches and new cells
             let mut patches: Vec<(String, Vec<u8>, u64, u64)> = Vec::new();
-            let mut new_cells: Vec<&kaijutsu_kernel::CellDoc> = Vec::new();
+            // Store owned data for new cells: (id, kind, language, content, version, encoded_doc)
+            let mut new_cells: Vec<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64, Vec<u8>)> = Vec::new();
 
-            for doc in kernel.cells.iter() {
+            for doc in cells_guard.iter() {
                 if let Some(&client_version) = client_versions.get(&doc.id) {
                     // Client has this cell - send patch if needed
                     let server_version = doc.frontier_version();
@@ -967,10 +1192,18 @@ impl kernel::Server for KernelImpl {
                         patches.push((doc.id.clone(), patch, client_version, server_version));
                     }
                 } else {
-                    // Client doesn't have this cell - send full state
-                    new_cells.push(doc);
+                    // Client doesn't have this cell - send full state (clone all needed data)
+                    new_cells.push((
+                        doc.id.clone(),
+                        doc.kind,
+                        doc.language.clone(),
+                        doc.content(),
+                        doc.frontier_version(),
+                        doc.encode_full(),
+                    ));
                 }
             }
+            drop(cells_guard); // Explicitly release the lock
 
             // Build response
             let mut patches_builder = results.get().init_patches(patches.len() as u32);
@@ -983,20 +1216,98 @@ impl kernel::Server for KernelImpl {
             }
 
             let mut new_cells_builder = results.get().init_new_cells(new_cells.len() as u32);
-            for (i, doc) in new_cells.iter().enumerate() {
+            for (i, (id, kind, language, content, version, encoded_doc)) in new_cells.iter().enumerate() {
                 let mut c = new_cells_builder.reborrow().get(i as u32);
                 let mut info = c.reborrow().init_info();
-                info.set_id(&doc.id);
-                info.set_kind(cell_kind_to_capnp(doc.kind));
-                if let Some(ref lang) = doc.language {
+                info.set_id(id);
+                info.set_kind(cell_kind_to_capnp(*kind));
+                if let Some(lang) = language {
                     info.set_language(lang);
                 }
-                c.set_content(&doc.content());
-                c.set_version(doc.frontier_version());
-                c.set_encoded_doc(&doc.encode_full());
+                c.set_content(content);
+                c.set_version(*version);
+                c.set_encoded_doc(encoded_doc);
             }
         }
         Promise::ok(())
+    }
+
+    // Tool execution
+
+    fn execute_tool(
+        self: Rc<Self>,
+        params: kernel::ExecuteToolParams,
+        mut results: kernel::ExecuteToolResults,
+    ) -> Promise<(), capnp::Error> {
+        let call = pry!(params.get());
+        let call = pry!(call.get_call());
+        let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
+        let tool_params = pry!(pry!(call.get_params()).to_str()).to_owned();
+        let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
+
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            let mut result = results.get().init_result();
+            result.set_request_id(&request_id);
+
+            // Get the engine for this tool
+            let engine = kernel.tools().read().await.get_engine(&tool_name);
+            match engine {
+                Some(engine) => {
+                    match engine.execute(&tool_params).await {
+                        Ok(exec_result) => {
+                            result.set_success(exec_result.success);
+                            result.set_output(&exec_result.stdout);
+                            if !exec_result.stderr.is_empty() {
+                                result.set_error(&exec_result.stderr);
+                            }
+                        }
+                        Err(e) => {
+                            result.set_success(false);
+                            result.set_error(&e.to_string());
+                        }
+                    }
+                }
+                None => {
+                    result.set_success(false);
+                    result.set_error(&format!("Tool not equipped: {}", tool_name));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_tool_schemas(
+        self: Rc<Self>,
+        _params: kernel::GetToolSchemasParams,
+        mut results: kernel::GetToolSchemasResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            let tools = kernel.list_tools().await;
+            let mut builder = results.get().init_schemas(tools.len() as u32);
+            for (i, tool) in tools.iter().enumerate() {
+                let mut s = builder.reborrow().get(i as u32);
+                s.set_name(&tool.name);
+                s.set_description(&tool.description);
+                s.set_category(&tool.category);
+                // TODO: Add input_schema when we add schema() method to ExecutionEngine
+                s.set_input_schema("{}");
+            }
+            Ok(())
+        })
     }
 }
 

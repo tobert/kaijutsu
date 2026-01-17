@@ -195,14 +195,33 @@ impl Kernel {
         self.tools.write().await.register(info);
     }
 
-    /// Equip a tool.
-    pub async fn equip(&self, name: &str, engine: Arc<dyn ExecutionEngine>) -> bool {
-        self.tools.write().await.equip(name, engine)
+    /// Register a tool with an execution engine.
+    pub async fn register_tool_with_engine(
+        &self,
+        info: ToolInfo,
+        engine: Arc<dyn ExecutionEngine>,
+    ) {
+        self.tools.write().await.register_with_engine(info, engine);
+    }
+
+    /// Equip a tool (must have an engine already registered).
+    pub async fn equip(&self, name: &str) -> bool {
+        self.tools.write().await.equip(name)
+    }
+
+    /// Equip a tool with an execution engine.
+    pub async fn equip_with_engine(&self, name: &str, engine: Arc<dyn ExecutionEngine>) -> bool {
+        self.tools.write().await.equip_with_engine(name, engine)
     }
 
     /// Unequip a tool.
     pub async fn unequip(&self, name: &str) -> bool {
         self.tools.write().await.unequip(name)
+    }
+
+    /// Get the tools registry (for RPC access).
+    pub fn tools(&self) -> &RwLock<ToolRegistry> {
+        &self.tools
     }
 
     /// List available tools.
@@ -460,7 +479,7 @@ mod tests {
         let kernel = Kernel::new("test").await;
 
         kernel.register_tool(ToolInfo::new("noop", "Noop engine", "test")).await;
-        kernel.equip("noop", Arc::new(NoopEngine)).await;
+        kernel.equip_with_engine("noop", Arc::new(NoopEngine)).await;
         kernel.set_default_engine("noop").await;
 
         let result = kernel.execute("hello").await.unwrap();

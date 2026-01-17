@@ -43,6 +43,26 @@ struct ToolInfo {
   equipped @2 :Bool;
 }
 
+struct ToolCall {
+  tool @0 :Text;         # Tool name (e.g., "cell.edit")
+  params @1 :Text;       # JSON parameters
+  requestId @2 :Text;    # For correlation
+}
+
+struct ToolResult {
+  requestId @0 :Text;
+  success @1 :Bool;
+  output @2 :Text;       # JSON result
+  error @3 :Text;        # Error if !success
+}
+
+struct ToolSchema {
+  name @0 :Text;
+  description @1 :Text;
+  inputSchema @2 :Text;  # JSON Schema for params
+  category @3 :Text;
+}
+
 struct Completion {
   text @0 :Text;
   displayText @1 :Text;
@@ -223,6 +243,10 @@ interface Kernel {
 
   # Bulk sync for initial load / reconnect
   syncCells @26 (fromVersions :List(CellVersion)) -> (patches :List(CellPatch), newCells :List(CellState));
+
+  # Tool execution
+  executeTool @27 (call :ToolCall) -> (result :ToolResult);
+  getToolSchemas @28 () -> (schemas :List(ToolSchema));
 }
 
 struct CellVersion {

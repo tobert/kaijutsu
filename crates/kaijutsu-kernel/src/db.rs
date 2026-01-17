@@ -284,6 +284,15 @@ impl CellDb {
         )
     }
 
+    /// Count ops for a cell since a given ID (for snapshot decision).
+    pub fn count_ops_since(&self, cell_id: &str, since_id: i64) -> SqliteResult<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM ops WHERE cell_id = ?1 AND id > ?2",
+            params![cell_id, since_id],
+            |row| row.get(0),
+        )
+    }
+
     // =========================================================================
     // Snapshots
     // =========================================================================

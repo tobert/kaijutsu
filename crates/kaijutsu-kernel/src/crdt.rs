@@ -265,6 +265,32 @@ impl CellStore {
         Ok(())
     }
 
+    /// Snapshot interval: number of ops after which to auto-snapshot.
+    const SNAPSHOT_INTERVAL: i64 = 100;
+
+    /// Maybe snapshot a cell if enough ops have accumulated since the last snapshot.
+    /// This prevents slow recovery by periodically checkpointing cell state.
+    pub fn maybe_snapshot(&self, cell_id: &str) -> Result<(), String> {
+        if let Some(db) = &self.db {
+            // Get the version at last snapshot (if any)
+            let last_snapshot_op_id = db
+                .get_snapshot(cell_id)
+                .map_err(|e| format!("DB error: {}", e))?
+                .map(|s| s.version)
+                .unwrap_or(0);
+
+            // Count ops since last snapshot
+            let ops_since = db
+                .count_ops_since(cell_id, last_snapshot_op_id)
+                .map_err(|e| format!("DB error: {}", e))?;
+
+            if ops_since >= Self::SNAPSHOT_INTERVAL {
+                self.snapshot(cell_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load cells from database on startup.
     pub fn load_from_db(&mut self) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;

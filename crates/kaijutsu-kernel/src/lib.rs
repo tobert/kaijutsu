@@ -11,6 +11,7 @@
 //! - Can checkpoint (distill history into summaries)
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 
+pub mod cell_tools;
 pub mod control;
 pub mod crdt;
 pub mod db;
@@ -20,13 +21,14 @@ pub mod state;
 pub mod tools;
 pub mod vfs;
 
+pub use cell_tools::{CellEditEngine, CellListEngine, CellReadEngine};
 pub use control::{ConsentMode, ControlPlane, Lease, LeaseHolder};
 pub use crdt::{CellDoc, CellId, CellStore, SharedCellStore, shared_cell_store, shared_cell_store_with_db};
 pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use script::{HookEvent, HookRegistry, ScriptEngine, ScriptResult};
 pub use state::KernelState;
-pub use tools::{ExecutionEngine, ToolInfo, ToolRegistry};
+pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use vfs::{
     backends::{LocalBackend, MemoryBackend},
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
