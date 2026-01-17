@@ -10,7 +10,7 @@
 
     // Corner shader - same design but smaller
     corner: (
-        path: "shaders/corner.wgsl",
+        path: "shaders/frame_corner.wgsl",
         color: (0.4, 0.4, 0.5, 0.7),  // Gray/neutral
         params: (0.1, 0.6, 0.8, 0.5),  // Subtle glow, slow pulse, shorter brackets (50%)
     ),

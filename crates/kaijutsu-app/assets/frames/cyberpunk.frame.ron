@@ -12,7 +12,7 @@
     // params: (glow_radius, intensity, pulse_speed, bracket_length)
     // - bracket_length is in UV space (0-1), 0.7 = 70% of corner
     corner: (
-        path: "shaders/corner.wgsl",
+        path: "shaders/frame_corner.wgsl",
         color: (0.7, 0.5, 0.9, 1.0),  // Lavender
         params: (0.15, 1.2, 1.5, 0.7),  // glow_radius, intensity, pulse_speed, bracket_length
     ),
@@ -20,7 +20,7 @@
     // Horizontal edges - energy lines between corners
     edge_h: Some((
         shader: (
-            path: "shaders/edge_glow.wgsl",
+            path: "shaders/frame_edge.wgsl",
             color: (0.5, 0.4, 0.8, 0.6),  // Dimmer lavender
             params: (0.1, 0.8, 1.0, 0.0),
         ),
@@ -30,7 +30,7 @@
     // Vertical edges - same as horizontal
     edge_v: Some((
         shader: (
-            path: "shaders/edge_glow.wgsl",
+            path: "shaders/frame_edge.wgsl",
             color: (0.5, 0.4, 0.8, 0.6),
             params: (0.1, 0.8, 1.0, 0.0),
         ),

@@ -105,7 +105,7 @@ pub struct ShaderDef {
 }
 
 fn default_corner_shader() -> String {
-    "shaders/corner.wgsl".to_string()
+    "shaders/frame_corner.wgsl".to_string()
 }
 fn default_color() -> [f32; 4] {
     [0.7, 0.5, 0.9, 1.0]
@@ -161,7 +161,7 @@ impl Default for EdgeDef {
     fn default() -> Self {
         Self {
             shader: ShaderDef {
-                path: "shaders/edge_glow.wgsl".to_string(),
+                path: "shaders/frame_edge.wgsl".to_string(),
                 color: [0.5, 0.4, 0.8, 0.6],
                 params: [0.1, 0.8, 1.0, 0.0],
                 texture: None,
