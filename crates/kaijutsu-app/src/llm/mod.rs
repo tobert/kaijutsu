@@ -2,14 +2,25 @@
 //!
 //! Handles sending prompts to Claude and streaming responses into cells.
 //! Uses a dedicated tokio runtime for API calls since anthropic-api requires tokio.
+//!
+//! ## Content Block Support
+//!
+//! Responses from Claude are parsed into structured content blocks:
+//! - Thinking blocks (extended thinking/reasoning)
+//! - Text blocks (main response)
+//! - Tool use blocks (when tools are enabled)
+//!
+//! These blocks are stored in the CellEditor for structured display.
 
 use bevy::prelude::*;
-use kaijutsu_kernel::{AnthropicProvider, CompletionRequest, LlmMessage, LlmProvider};
+use kaijutsu_kernel::{
+    AnthropicProvider, CompletionRequest, CompletionResponse, LlmMessage, LlmProvider, ResponseBlock,
+};
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 
-use crate::cell::{Cell, CellEditor, CellKind, CellPosition, CellState, PromptSubmitted};
+use crate::cell::{Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock, PromptSubmitted};
 use crate::text::{GlyphonText, TextAreaConfig};
 
 /// Plugin for LLM integration.
@@ -64,14 +75,11 @@ async fn llm_worker(
     result_tx: mpsc::UnboundedSender<LlmResult>,
 ) {
     while let Some(req) = request_rx.recv().await {
-        let result = match req.provider.complete(req.request).await {
-            Ok(response) => Ok(response.content),
-            Err(e) => Err(format!("LLM error: {}", e)),
-        };
+        let result = req.provider.complete(req.request).await;
 
         let _ = result_tx.send(LlmResult {
             cell_entity: req.cell_entity,
-            result,
+            result: result.map_err(|e| format!("LLM error: {}", e)),
         });
     }
     info!("LLM worker shutting down");
@@ -80,7 +88,32 @@ async fn llm_worker(
 /// Result from an LLM completion.
 struct LlmResult {
     cell_entity: Entity,
-    result: Result<String, String>,
+    result: Result<CompletionResponse, String>,
+}
+
+/// Convert a kernel ResponseBlock to an app ContentBlock.
+fn convert_response_block(block: &ResponseBlock) -> ContentBlock {
+    match block {
+        ResponseBlock::Thinking { thinking, .. } => ContentBlock::Thinking {
+            text: thinking.clone(),
+            collapsed: true, // Auto-collapse thinking when complete
+        },
+        ResponseBlock::Text { text } => ContentBlock::Text(text.clone()),
+        ResponseBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ResponseBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            is_error: *is_error,
+        },
+    }
 }
 
 /// Request to send to the LLM worker.
@@ -200,18 +233,45 @@ fn poll_llm_results(
     // Drain all available results (non-blocking)
     while let Ok(llm_result) = result_rx.try_recv() {
         match llm_result.result {
-            Ok(text) => {
-                info!("LLM response received ({} chars) for entity {:?}", text.len(), llm_result.cell_entity);
+            Ok(response) => {
+                let block_count = response.blocks.len();
+                let has_thinking = response.has_thinking();
+                info!(
+                    "LLM response received ({} chars, {} blocks, thinking: {}) for entity {:?}",
+                    response.content.len(),
+                    block_count,
+                    has_thinking,
+                    llm_result.cell_entity
+                );
+
                 match editors.get_mut(llm_result.cell_entity) {
                     Ok(mut editor) => {
-                        info!("Updating cell editor, old text len: {}", editor.text.len());
-                        editor.text = text;
-                        editor.cursor = editor.text.len();
-                        editor.dirty = true;
-                        info!("Cell editor updated, new text len: {}", editor.text.len());
+                        // Convert response blocks to content blocks
+                        let content_blocks: Vec<ContentBlock> = response
+                            .blocks
+                            .iter()
+                            .map(convert_response_block)
+                            .collect();
+
+                        if content_blocks.is_empty() {
+                            // Fallback: use raw text as single block
+                            editor.set_text(response.content);
+                        } else {
+                            // Use structured blocks
+                            editor.replace_blocks(content_blocks);
+                        }
+
+                        info!(
+                            "Cell editor updated: {} blocks, text len: {}",
+                            editor.blocks.len(),
+                            editor.text().len()
+                        );
                     }
                     Err(e) => {
-                        error!("Failed to get editor for entity {:?}: {:?}", llm_result.cell_entity, e);
+                        error!(
+                            "Failed to get editor for entity {:?}: {:?}",
+                            llm_result.cell_entity, e
+                        );
                     }
                 }
                 complete_events.write(LlmResponseComplete {
@@ -223,9 +283,7 @@ fn poll_llm_results(
             Err(e) => {
                 error!("LLM error: {}", e);
                 if let Ok(mut editor) = editors.get_mut(llm_result.cell_entity) {
-                    editor.text = format!("❌ {}", e);
-                    editor.cursor = editor.text.len();
-                    editor.dirty = true;
+                    editor.set_text(format!("❌ {}", e));
                 }
                 complete_events.write(LlmResponseComplete {
                     cell_entity: llm_result.cell_entity,

@@ -23,8 +23,9 @@ mod sync;
 mod systems;
 
 pub use components::{
-    Cell, CellEditor, CellKind, CellPosition, CellState, CurrentMode, EditOp,
-    EditorMode, FocusedCell, WorkspaceLayout,
+    BlockOp, Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock,
+    ConversationContainer, ConversationScrollState, CurrentMode, EditOp, EditorMode, FocusedCell,
+    PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
 };
 pub use frame_style::{FrameStyle, FrameStyleMapping};
 pub use plugin::CellPlugin;

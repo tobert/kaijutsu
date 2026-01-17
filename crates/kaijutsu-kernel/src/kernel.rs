@@ -501,7 +501,7 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmResult, Message, Usage};
+    use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmResult, Message, ResponseBlock, Usage};
     use crate::tools::NoopEngine;
 
     /// Mock LLM provider for testing.
@@ -532,6 +532,7 @@ mod tests {
         async fn complete(&self, _request: CompletionRequest) -> LlmResult<CompletionResponse> {
             Ok(CompletionResponse {
                 content: self.response.clone(),
+                blocks: vec![ResponseBlock::Text { text: self.response.clone() }],
                 model: "mock-model".to_string(),
                 stop_reason: Some("end_turn".to_string()),
                 usage: Usage {

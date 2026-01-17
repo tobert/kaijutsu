@@ -1,10 +1,12 @@
 //! Cell systems for input handling and rendering.
 
 use bevy::input::keyboard::KeyboardInput;
+use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    Cell, CellEditor, CellPosition, CellState, CurrentMode, EditorMode, FocusedCell,
+    Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock, ConversationScrollState,
+    CurrentMode, EditorMode, FocusedCell, PromptCell, PromptContainer, PromptSubmitted,
     WorkspaceLayout,
 };
 use crate::text::{GlyphonText, SharedFontSystem, TextAreaConfig, TextBuffer};
@@ -102,6 +104,12 @@ pub fn handle_cell_input(
     let Ok(mut editor) = editors.get_mut(focused_entity) else {
         return;
     };
+
+    // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
+    // This prevents the mode-switch key from being inserted as text
+    if mode.is_changed() {
+        return;
+    }
 
     // Only handle text input in Insert mode
     if mode.0 != EditorMode::Insert {
@@ -209,7 +217,7 @@ pub fn init_cell_buffers(
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
         buffer.set_text(
             &mut font_system,
-            &editor.text,
+            editor.text(),
             &attrs,
             glyphon::Shaping::Advanced,
         );
@@ -219,7 +227,68 @@ pub fn init_cell_buffers(
     }
 }
 
+/// Format content blocks for display.
+///
+/// This produces a text representation with visual markers for different block types.
+/// Collapsed thinking blocks are shown as a single line.
+fn format_blocks_for_display(blocks: &[ContentBlock]) -> String {
+    if blocks.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::new();
+
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            output.push_str("\n\n");
+        }
+
+        match block {
+            ContentBlock::Thinking { text, collapsed } => {
+                if *collapsed {
+                    // Collapsed: show indicator
+                    output.push_str("💭 [Thinking collapsed - Tab to expand]");
+                } else {
+                    // Expanded: show with dimmed header
+                    output.push_str("💭 ─── Thinking ───\n");
+                    output.push_str(text);
+                    output.push_str("\n───────────────────");
+                }
+            }
+            ContentBlock::Text(text) => {
+                output.push_str(text);
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                output.push_str("🔧 Tool: ");
+                output.push_str(name);
+                output.push('\n');
+                // Pretty-print JSON input
+                if let Ok(pretty) = serde_json::to_string_pretty(input) {
+                    output.push_str(&pretty);
+                } else {
+                    output.push_str(&input.to_string());
+                }
+            }
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                if *is_error {
+                    output.push_str("❌ Error:\n");
+                } else {
+                    output.push_str("📤 Result:\n");
+                }
+                output.push_str(content);
+            }
+        }
+    }
+
+    output
+}
+
 /// Update TextBuffer from CellEditor when dirty.
+///
+/// For cells with content blocks, formats them with visual markers.
+/// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
     mut cells: Query<(&CellEditor, &mut TextBuffer), Changed<CellEditor>>,
     font_system: Res<SharedFontSystem>,
@@ -230,9 +299,17 @@ pub fn sync_cell_buffers(
 
     for (editor, mut buffer) in cells.iter_mut() {
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+
+        // Use block-formatted text if we have blocks, otherwise use raw text
+        let display_text = if editor.has_blocks() {
+            format_blocks_for_display(&editor.blocks)
+        } else {
+            editor.text().to_string()
+        };
+
         buffer.set_text(
             &mut font_system,
-            &editor.text,
+            &display_text,
             &attrs,
             glyphon::Shaping::Advanced,
         );
@@ -240,64 +317,162 @@ pub fn sync_cell_buffers(
 }
 
 /// Compute cell heights based on content.
+///
+/// For cells with blocks, counts lines from the formatted display text.
+/// Collapsed thinking blocks contribute minimal lines.
 pub fn compute_cell_heights(
     mut cells: Query<(&CellEditor, &mut CellState), Changed<CellEditor>>,
     layout: Res<WorkspaceLayout>,
 ) {
     for (editor, mut state) in cells.iter_mut() {
-        let line_count = editor.text.lines().count().max(1);
+        let line_count = if editor.has_blocks() {
+            // Count lines from formatted blocks
+            format_blocks_for_display(&editor.blocks).lines().count().max(1)
+        } else {
+            editor.text().lines().count().max(1)
+        };
         state.computed_height = layout.height_for_lines(line_count);
     }
 }
 
-/// Layout cells based on grid position and computed heights.
+/// Layout conversation cells based on grid position and computed heights.
 ///
 /// Uses a two-pass approach to properly accumulate variable cell heights.
+/// Applies scroll offset for vertical scrolling.
+/// Excludes prompt cell (handled separately).
 pub fn layout_cells(
-    mut cells: Query<(&CellPosition, &CellState, &mut TextAreaConfig)>,
+    mut cells: Query<(&CellPosition, &CellState, &mut TextAreaConfig), Without<PromptCell>>,
     layout: Res<WorkspaceLayout>,
+    windows: Query<&Window>,
+    mut scroll_state: ResMut<ConversationScrollState>,
 ) {
     use std::collections::BTreeMap;
 
+    // Get window height
+    let window_height = windows
+        .iter()
+        .next()
+        .map(|w| w.resolution.height())
+        .unwrap_or(800.0);
+
+    // Calculate visible area (between header and prompt)
+    let visible_top = layout.workspace_margin_top;
+    let visible_bottom = window_height - layout.prompt_area_height;
+    let visible_height = visible_bottom - visible_top;
+
+    // Update scroll state with visible area dimensions
+    scroll_state.visible_height = visible_height;
+
     // First pass: collect maximum height for each row
+    // Note: PromptCell is already excluded by Without<PromptCell> filter
     let mut row_heights: BTreeMap<u32, f32> = BTreeMap::new();
     for (position, state, _) in cells.iter() {
         let current_max = row_heights.entry(position.row).or_insert(layout.min_cell_height);
         *current_max = current_max.max(state.computed_height);
     }
 
-    // Build cumulative Y offsets for each row
+    // Build cumulative Y offsets for each row (content coordinates, not screen)
     let mut row_offsets: BTreeMap<u32, f32> = BTreeMap::new();
-    let mut y_offset = layout.workspace_margin_top;
+    let mut content_y = 0.0; // Start at 0 in content space
 
     // Handle sparse rows - iterate through the range
     let max_row = row_heights.keys().max().copied().unwrap_or(0);
     for row in 0..=max_row {
-        row_offsets.insert(row, y_offset);
+        row_offsets.insert(row, content_y);
         let row_height = row_heights
             .get(&row)
             .copied()
             .unwrap_or(layout.min_cell_height);
-        y_offset += row_height + layout.cell_margin;
+        content_y += row_height + layout.cell_margin;
     }
 
-    // Second pass: apply positions using accumulated offsets
+    // Total content height
+    let content_height = content_y;
+    scroll_state.content_height = content_height;
+
+    // Clamp scroll offset to valid range
+    scroll_state.clamp_offset();
+
+    // Get current scroll offset
+    let scroll_offset = scroll_state.offset;
+
+    // Second pass: apply positions with scroll offset
     for (position, state, mut config) in cells.iter_mut() {
         let x = layout.workspace_margin_left
             + (position.col as f32 * (layout.cell_width + layout.cell_margin));
-        let y = row_offsets
+
+        // Content Y position (before scroll)
+        let content_y = row_offsets
             .get(&position.row)
             .copied()
-            .unwrap_or(layout.workspace_margin_top);
+            .unwrap_or(0.0);
 
-        config.left = x;
-        config.top = y;
+        // Screen Y position (after scroll offset, relative to visible area)
+        let screen_y = visible_top + content_y - scroll_offset;
+        let cell_bottom = screen_y + state.computed_height;
+
+        // Check if cell is visible (even partially)
+        let is_visible = cell_bottom > visible_top && screen_y < visible_bottom;
+
+        if is_visible {
+            // Clip to visible area
+            let clipped_top = screen_y.max(visible_top);
+            let clipped_bottom = cell_bottom.min(visible_bottom);
+
+            config.left = x;
+            config.top = screen_y; // Use actual position for text layout
+            config.scale = 1.0;
+            config.bounds = glyphon::TextBounds {
+                left: x as i32,
+                top: clipped_top as i32,
+                right: (x + layout.cell_width) as i32,
+                bottom: clipped_bottom as i32,
+            };
+        } else {
+            // Cell is off-screen - set zero bounds to skip rendering
+            config.left = 0.0;
+            config.top = -1000.0; // Off-screen
+            config.bounds = glyphon::TextBounds {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+        }
+    }
+}
+
+/// Layout the prompt cell at the bottom of the window.
+/// Uses full window width minus margins for a wide input area.
+pub fn layout_prompt_cell_position(
+    mut cells: Query<(&CellState, &mut TextAreaConfig), With<PromptCell>>,
+    layout: Res<WorkspaceLayout>,
+    windows: Query<&Window>,
+) {
+    let (window_width, window_height) = windows
+        .iter()
+        .next()
+        .map(|w| (w.resolution.width(), w.resolution.height()))
+        .unwrap_or((1280.0, 800.0));
+
+    // Position prompt at bottom of window (above status bar)
+    let prompt_y = window_height - layout.prompt_bottom_offset;
+
+    // Full width minus margins on both sides
+    let margin = layout.workspace_margin_left;
+    let prompt_width = window_width - (margin * 2.0);
+
+    for (state, mut config) in cells.iter_mut() {
+        let height = state.computed_height.max(layout.prompt_min_height);
+
+        config.left = margin;
+        config.top = prompt_y;
         config.scale = 1.0;
         config.bounds = glyphon::TextBounds {
-            left: x as i32,
-            top: y as i32,
-            right: (x + layout.cell_width) as i32,
-            bottom: (y + state.computed_height) as i32,
+            left: margin as i32,
+            top: prompt_y as i32,
+            right: (margin + prompt_width) as i32,
+            bottom: (prompt_y + height) as i32,
         };
     }
 }
@@ -390,12 +565,16 @@ pub fn debug_spawn_cell(
     }
 }
 
-/// Toggle collapse state of focused cell (Tab in Normal mode).
+/// Toggle collapse state of focused cell or thinking blocks (Tab in Normal mode).
+///
+/// Behavior:
+/// - If the cell has thinking blocks, Tab toggles the first thinking block's collapse state
+/// - Otherwise, Tab toggles the whole cell's collapse state
 pub fn handle_collapse_toggle(
     mut key_events: MessageReader<KeyboardInput>,
     mode: Res<CurrentMode>,
     focused: Res<FocusedCell>,
-    mut cells: Query<&mut CellState>,
+    mut cells: Query<(&mut CellEditor, &mut CellState)>,
 ) {
     // Only in Normal mode
     if mode.0 != EditorMode::Normal {
@@ -406,7 +585,7 @@ pub fn handle_collapse_toggle(
         return;
     };
 
-    let Ok(mut state) = cells.get_mut(focused_entity) else {
+    let Ok((mut editor, mut cell_state)) = cells.get_mut(focused_entity) else {
         return;
     };
 
@@ -417,15 +596,49 @@ pub fn handle_collapse_toggle(
 
         // Tab toggles collapse
         if event.key_code == KeyCode::Tab {
-            state.collapsed = !state.collapsed;
-            info!(
-                "Cell collapse: {}",
-                if state.collapsed {
-                    "collapsed"
-                } else {
-                    "expanded"
+            // Check if cell has thinking blocks to toggle
+            let has_thinking = editor
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+
+            if has_thinking {
+                // Toggle all thinking blocks
+                let mut toggled = false;
+                for block in editor.blocks.iter_mut() {
+                    if let ContentBlock::Thinking { collapsed, .. } = block {
+                        *collapsed = !*collapsed;
+                        toggled = true;
+                    }
                 }
-            );
+                if toggled {
+                    editor.dirty = true;
+                    let collapsed = editor
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Thinking { collapsed, .. } => Some(*collapsed),
+                            _ => None,
+                        })
+                        .next()
+                        .unwrap_or(false);
+                    info!(
+                        "Thinking blocks: {}",
+                        if collapsed { "collapsed" } else { "expanded" }
+                    );
+                }
+            } else {
+                // Toggle whole cell collapse
+                cell_state.collapsed = !cell_state.collapsed;
+                info!(
+                    "Cell collapse: {}",
+                    if cell_state.collapsed {
+                        "collapsed"
+                    } else {
+                        "expanded"
+                    }
+                );
+            }
         }
     }
 }
@@ -659,7 +872,7 @@ pub fn update_cursor(
     *visibility = Visibility::Inherited;
 
     // Calculate cursor position from text index
-    let (row, col) = cursor_row_col(&editor.text, editor.cursor);
+    let (row, col) = cursor_row_col(editor.text(), editor.cursor);
 
     // Position relative to cell bounds
     let x = config.left + (col as f32 * CHAR_WIDTH);
@@ -706,4 +919,229 @@ fn cursor_row_col(text: &str, cursor: usize) -> (usize, usize) {
         .map(|pos| cursor - pos - 1)
         .unwrap_or(cursor);
     (row, col)
+}
+
+// ============================================================================
+// PROMPT CELL SYSTEMS
+// ============================================================================
+
+/// Resource tracking the prompt cell entity.
+#[derive(Resource, Default)]
+pub struct PromptCellEntity(pub Option<Entity>);
+
+/// Spawn the prompt cell when the PromptContainer appears.
+pub fn spawn_prompt_cell(
+    mut commands: Commands,
+    mut prompt_entity: ResMut<PromptCellEntity>,
+    mut focused: ResMut<FocusedCell>,
+    prompt_container: Query<Entity, Added<PromptContainer>>,
+    layout: Res<WorkspaceLayout>,
+) {
+    // Only spawn once when we see the PromptContainer
+    if prompt_entity.0.is_some() {
+        return;
+    }
+
+    // Check if prompt container exists
+    if prompt_container.is_empty() {
+        return;
+    }
+
+    // Create a prompt cell with UserMessage kind
+    // Note: Not parented to container - uses absolute positioning for glyphon
+    let cell = Cell::new(CellKind::UserMessage);
+    let cell_id = cell.id.clone();
+
+    let entity = commands
+        .spawn((
+            cell,
+            CellEditor::default().with_text(""),
+            CellState {
+                computed_height: layout.min_cell_height,
+                min_height: 40.0,
+                collapsed: false,
+            },
+            // Row value is unused - PromptCell marker + Without<PromptCell> filters handle exclusion
+            CellPosition::new(0, 0),
+            GlyphonText,
+            TextAreaConfig::default(),
+            PromptCell,
+        ))
+        .id();
+
+    prompt_entity.0 = Some(entity);
+    focused.0 = Some(entity); // Auto-focus the prompt on startup
+    info!("Spawned prompt cell with id {:?}", cell_id.0);
+}
+
+/// Handle prompt submission (Enter key in INSERT mode while focused on PromptCell).
+pub fn handle_prompt_submit(
+    mut key_events: MessageReader<KeyboardInput>,
+    focused: Res<FocusedCell>,
+    mode: Res<CurrentMode>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut editors: Query<&mut CellEditor>,
+    prompt_cells: Query<Entity, With<PromptCell>>,
+    mut submit_events: MessageWriter<PromptSubmitted>,
+) {
+    // Only handle in Insert mode
+    if mode.0 != EditorMode::Insert {
+        return;
+    }
+
+    let Some(focused_entity) = focused.0 else {
+        return;
+    };
+
+    // Check if focused cell is the prompt cell
+    if !prompt_cells.contains(focused_entity) {
+        return;
+    }
+
+    for event in key_events.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+
+        // Enter submits (unless Shift is held for newline)
+        if event.key_code == KeyCode::Enter {
+            let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+            if shift_held {
+                // Shift+Enter = newline (handled by normal input)
+                continue;
+            }
+
+            // Submit the prompt
+            let Ok(mut editor) = editors.get_mut(focused_entity) else {
+                continue;
+            };
+
+            let text = editor.text().trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+
+            // Send the submit message
+            submit_events.write(PromptSubmitted { text: text.clone() });
+            info!("Prompt submitted: {:?}", text);
+
+            // Clear the editor (CRDT-tracked)
+            editor.clear();
+        }
+    }
+}
+
+/// Create a conversation cell from a submitted prompt.
+pub fn handle_prompt_submitted(
+    mut commands: Commands,
+    mut submit_events: MessageReader<PromptSubmitted>,
+    cells: Query<&CellPosition, (With<Cell>, Without<PromptCell>)>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+) {
+    for event in submit_events.read() {
+        // Find the next row for the message
+        // Note: PromptCell is already excluded by Without<PromptCell> filter
+        let next_row = cells
+            .iter()
+            .filter(|p| p.col == 0) // Only count main column cells
+            .map(|p| p.row)
+            .max()
+            .map(|max| max.saturating_add(1))
+            .unwrap_or(0);
+
+        // Create user message cell (not parented - uses absolute positioning)
+        let cell = Cell::new(CellKind::UserMessage);
+        commands.spawn((
+            cell,
+            CellEditor::default().with_text(&event.text),
+            CellState::new(),
+            CellPosition::new(0, next_row),
+            GlyphonText,
+            TextAreaConfig::default(),
+        ));
+
+        info!("Created user message at row {}", next_row);
+
+        // Request scroll to bottom
+        scroll_state.scroll_to_bottom = true;
+    }
+}
+
+/// Auto-focus the prompt cell when entering INSERT mode.
+/// In conversation UI, INSERT mode always means typing in the prompt.
+pub fn auto_focus_prompt(
+    mode: Res<CurrentMode>,
+    mut focused: ResMut<FocusedCell>,
+    prompt_entity: Res<PromptCellEntity>,
+) {
+    // Only when entering INSERT mode
+    if !mode.is_changed() || mode.0 != EditorMode::Insert {
+        return;
+    }
+
+    // Always focus the prompt when entering INSERT mode
+    if let Some(entity) = prompt_entity.0 {
+        focused.0 = Some(entity);
+        info!("Focused prompt cell for INSERT mode");
+    }
+}
+
+/// Scroll conversation to bottom when requested (e.g., after new message).
+pub fn scroll_to_bottom(
+    mut scroll_state: ResMut<ConversationScrollState>,
+) {
+    if !scroll_state.scroll_to_bottom {
+        return;
+    }
+
+    scroll_state.scroll_to_end();
+    scroll_state.scroll_to_bottom = false;
+}
+
+/// Handle mouse wheel scrolling for the conversation area.
+pub fn handle_scroll_input(
+    mut scroll_state: ResMut<ConversationScrollState>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
+    mode: Res<CurrentMode>,
+    keys: Res<ButtonInput<KeyCode>>,
+) {
+    // Scroll speed multiplier
+    const SCROLL_SPEED: f32 = 40.0;
+
+    // Handle mouse wheel
+    for event in mouse_wheel.read() {
+        // Scroll up = negative delta = decrease offset (show earlier content)
+        // Scroll down = positive delta = increase offset (show later content)
+        let delta = -event.y * SCROLL_SPEED;
+        scroll_state.scroll_by(delta);
+    }
+
+    // Handle j/k navigation in Normal mode
+    if mode.0 == EditorMode::Normal {
+        if keys.just_pressed(KeyCode::KeyJ) {
+            scroll_state.scroll_by(SCROLL_SPEED);
+        }
+        if keys.just_pressed(KeyCode::KeyK) {
+            scroll_state.scroll_by(-SCROLL_SPEED);
+        }
+        // Page down/up with Ctrl+d/u
+        if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+            let half_page = scroll_state.visible_height * 0.5;
+            if keys.just_pressed(KeyCode::KeyD) {
+                scroll_state.scroll_by(half_page);
+            }
+            if keys.just_pressed(KeyCode::KeyU) {
+                scroll_state.scroll_by(-half_page);
+            }
+        }
+        // G to go to bottom, gg to go to top
+        if keys.just_pressed(KeyCode::KeyG) {
+            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+                // Shift+G = go to bottom
+                scroll_state.scroll_to_end();
+            }
+            // Note: gg (double tap) would need state tracking, skip for now
+        }
+    }
 }

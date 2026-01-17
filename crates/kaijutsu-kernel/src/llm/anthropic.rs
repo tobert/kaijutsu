@@ -11,7 +11,7 @@ use anthropic_api::{
 };
 use tokio::sync::RwLock;
 
-use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmResult, Message, Role, Usage};
+use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmResult, Message, ResponseBlock, Role, Usage};
 
 /// Default model to use when none specified.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -115,7 +115,34 @@ impl AnthropicProvider {
         }
     }
 
-    /// Extract text content from response blocks.
+    /// Convert API response blocks to our ResponseBlock type.
+    fn convert_blocks(content: &[ResponseContentBlock]) -> Vec<ResponseBlock> {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseContentBlock::Text { text } => Some(ResponseBlock::Text {
+                    text: text.clone(),
+                }),
+                ResponseContentBlock::Thinking { thinking, signature } => {
+                    Some(ResponseBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: Some(signature.clone()),
+                    })
+                }
+                ResponseContentBlock::ToolUse { id, name, input } => {
+                    Some(ResponseBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    })
+                }
+                // Skip other block types for now (redacted thinking, etc.)
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extract text content from response blocks (for backward compatibility).
     fn extract_text(content: &[ResponseContentBlock]) -> String {
         content
             .iter()
@@ -178,9 +205,11 @@ impl LlmProvider for AnthropicProvider {
         })?;
 
         let content = Self::extract_text(&response.content);
+        let blocks = Self::convert_blocks(&response.content);
 
         Ok(CompletionResponse {
             content,
+            blocks,
             model: response.model,
             stop_reason: response.stop_reason,
             usage: Usage {

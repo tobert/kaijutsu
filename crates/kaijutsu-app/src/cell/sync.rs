@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
 use kaijutsu_client::{CellKind as RemoteCellKind, CellOp, CellState, CellVersion, CrdtOp};
 
-use super::components::{Cell, CellEditor, CellId, CellKind, CellPosition};
+use super::components::{Cell, CellEditor, CellId, CellKind, CellPosition, PromptCell};
 use crate::text::{GlyphonText, TextAreaConfig};
 
 /// Marker component for cells that were deleted by the server.
@@ -146,7 +146,7 @@ pub fn handle_cell_sync_result(
     mut registry: ResMut<CellRegistry>,
     mut editors: Query<&mut CellEditor>,
     cmds: Option<Res<ConnectionCommands>>,
-    cells: Query<&CellPosition, With<Cell>>,
+    cells: Query<&CellPosition, (With<Cell>, Without<PromptCell>)>,
     mut recently_deleted: ResMut<RecentlyDeletedByServer>,
     mut pending: ResMut<PendingCellRegistrations>,
 ) {
@@ -186,8 +186,11 @@ pub fn handle_cell_sync_result(
                 }
 
                 // Spawn new cells with proper row positioning
+                // Track row offset for cells spawned in same frame (query doesn't see them yet)
+                let mut row_offset = 0u32;
                 for cell_state in new_cells {
-                    spawn_remote_cell(&mut commands, &mut registry, cell_state, &cells);
+                    spawn_remote_cell(&mut commands, &mut registry, cell_state, &cells, row_offset);
+                    row_offset += 1;
                 }
             }
 
@@ -210,7 +213,7 @@ pub fn handle_cell_sync_result(
                 } else {
                     // No pending entity - this is a remotely-created cell
                     info!("Cell created remotely: {}", cell_state.info.id);
-                    spawn_remote_cell(&mut commands, &mut registry, &cell_state, &cells);
+                    spawn_remote_cell(&mut commands, &mut registry, &cell_state, &cells, 0);
                 }
             }
 
@@ -218,7 +221,8 @@ pub fn handle_cell_sync_result(
                 // Update existing cell or spawn new one
                 if let Some(entity) = registry.get_local(&cell_state.info.id) {
                     if let Ok(mut editor) = editors.get_mut(entity) {
-                        editor.text = cell_state.content.clone();
+                        // Apply server-authoritative content
+                        editor.apply_server_content(cell_state.content.clone());
                         editor.version = cell_state.version;
                         editor.dirty = false;
                         info!(
@@ -227,7 +231,7 @@ pub fn handle_cell_sync_result(
                         );
                     }
                 } else {
-                    spawn_remote_cell(&mut commands, &mut registry, cell_state, &cells);
+                    spawn_remote_cell(&mut commands, &mut registry, cell_state, &cells, 0);
                 }
             }
 
@@ -267,11 +271,14 @@ pub fn handle_cell_sync_result(
 }
 
 /// Spawn a cell entity from remote state.
+/// `row_offset` is used when spawning multiple cells in the same frame
+/// (since the query won't see cells spawned earlier in the same frame).
 fn spawn_remote_cell(
     commands: &mut Commands,
     registry: &mut ResMut<CellRegistry>,
     state: &CellState,
-    existing_cells: &Query<&CellPosition, With<Cell>>,
+    existing_cells: &Query<&CellPosition, (With<Cell>, Without<PromptCell>)>,
+    row_offset: u32,
 ) {
     // Skip if we already have this cell
     if registry.get_local(&state.info.id).is_some() {
@@ -280,12 +287,16 @@ fn spawn_remote_cell(
 
     // Calculate position based on actual existing cell positions
     // This prevents overlaps when cells are deleted and recreated
-    let next_row = existing_cells
+    // Note: PromptCell is excluded by Without<PromptCell> filter
+    let base_row = existing_cells
         .iter()
         .map(|pos| pos.row)
         .max()
-        .map(|max| max + 1)
+        .map(|max| max.saturating_add(1))
         .unwrap_or(0);
+
+    // Add offset for cells spawned in the same frame
+    let next_row = base_row.saturating_add(row_offset);
 
     let entity = commands
         .spawn((
@@ -295,14 +306,9 @@ fn spawn_remote_cell(
                 language: state.info.language.clone(),
                 parent: state.info.parent_id.as_ref().map(|s| CellId(s.clone())),
             },
-            CellEditor {
-                text: state.content.clone(),
-                cursor: 0,
-                selection_start: None,
-                dirty: false,
-                version: state.version,
-                pending_ops: Vec::new(),
-            },
+            CellEditor::default()
+                .with_text(state.content.clone())
+                .with_version(state.version),
             CellPosition::new(0, next_row),
             GlyphonText,
             TextAreaConfig {

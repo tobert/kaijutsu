@@ -48,6 +48,64 @@ impl Message {
     }
 }
 
+/// A block of content in an LLM response.
+///
+/// This mirrors Claude's API response format to support structured content
+/// including extended thinking, tool use, and text blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResponseBlock {
+    /// Model's extended thinking (reasoning before responding).
+    Thinking {
+        /// The thinking text.
+        thinking: String,
+        /// Signature for thinking block verification (if provided).
+        signature: Option<String>,
+    },
+    /// Main text response.
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// Tool invocation request.
+    ToolUse {
+        /// Unique ID for this tool use.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Tool input as JSON.
+        input: serde_json::Value,
+    },
+    /// Result from a tool execution.
+    ToolResult {
+        /// ID of the tool_use this is a result for.
+        tool_use_id: String,
+        /// Result content.
+        content: String,
+        /// Whether this result represents an error.
+        is_error: bool,
+    },
+}
+
+impl ResponseBlock {
+    /// Extract text content if this is a Text block.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ResponseBlock::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a thinking block.
+    pub fn is_thinking(&self) -> bool {
+        matches!(self, ResponseBlock::Thinking { .. })
+    }
+
+    /// Check if this is a tool use block.
+    pub fn is_tool_use(&self) -> bool {
+        matches!(self, ResponseBlock::ToolUse { .. })
+    }
+}
+
 /// Token usage information.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -67,14 +125,41 @@ impl Usage {
 /// Response from an LLM completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResponse {
-    /// The generated text content.
+    /// The generated text content (concatenated from text blocks).
     pub content: String,
+    /// Structured content blocks from the response.
+    pub blocks: Vec<ResponseBlock>,
     /// Model that generated the response.
     pub model: String,
     /// Reason the generation stopped.
     pub stop_reason: Option<String>,
     /// Token usage statistics.
     pub usage: Usage,
+}
+
+impl CompletionResponse {
+    /// Get only text blocks from the response.
+    pub fn text_blocks(&self) -> impl Iterator<Item = &str> {
+        self.blocks.iter().filter_map(|b| b.as_text())
+    }
+
+    /// Get thinking blocks from the response.
+    pub fn thinking_blocks(&self) -> impl Iterator<Item = &str> {
+        self.blocks.iter().filter_map(|b| match b {
+            ResponseBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Check if the response contains any thinking blocks.
+    pub fn has_thinking(&self) -> bool {
+        self.blocks.iter().any(|b| b.is_thinking())
+    }
+
+    /// Check if the response contains any tool use blocks.
+    pub fn has_tool_use(&self) -> bool {
+        self.blocks.iter().any(|b| b.is_tool_use())
+    }
 }
 
 /// Configuration for a completion request.

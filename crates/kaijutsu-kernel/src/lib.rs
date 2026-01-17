@@ -32,7 +32,7 @@ pub use state::KernelState;
 pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use llm::{
     AnthropicProvider, CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmRegistry,
-    LlmResult, Message as LlmMessage, Role as LlmRole, Usage as LlmUsage,
+    LlmResult, Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
 };
 pub use vfs::{
     backends::{LocalBackend, MemoryBackend},

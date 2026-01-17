@@ -2,7 +2,9 @@
 
 use bevy::prelude::*;
 
-use super::components::{CurrentMode, FocusedCell, WorkspaceLayout};
+use super::components::{
+    ConversationScrollState, CurrentMode, FocusedCell, PromptSubmitted, WorkspaceLayout,
+};
 use super::frame_assembly;
 use super::frame_style::{FrameStyle, FrameStyleLoader, FrameStyleMapping};
 use super::sync::{self, CellRegistry, PendingCellRegistrations, RecentlyDeletedByServer};
@@ -17,34 +19,59 @@ impl Plugin for CellPlugin {
         app.init_asset::<FrameStyle>()
             .init_asset_loader::<FrameStyleLoader>();
 
+        // Register messages
+        app.add_message::<PromptSubmitted>();
+
         app.init_resource::<FocusedCell>()
             .init_resource::<CellRegistry>()
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
+            .init_resource::<ConversationScrollState>()
             .init_resource::<systems::DragState>()
             .init_resource::<systems::CollapsedParentsCache>()
             .init_resource::<RecentlyDeletedByServer>()
             .init_resource::<PendingCellRegistrations>()
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
+            .init_resource::<systems::PromptCellEntity>()
             // Input and mode handling (mode_switch must run before cell_input)
             .add_systems(
                 Update,
                 (
                     systems::handle_mode_switch,
-                    systems::handle_cell_input.after(systems::handle_mode_switch),
+                    // Auto-focus prompt when entering INSERT mode (after mode switch, before input)
+                    systems::auto_focus_prompt.after(systems::handle_mode_switch),
+                    // Prompt submit must run before cell_input to intercept Enter in prompt
+                    systems::handle_prompt_submit.after(systems::auto_focus_prompt),
+                    systems::handle_cell_input.after(systems::handle_prompt_submit),
                     systems::click_to_focus,
                     systems::debug_spawn_cell,
                 ),
             )
+            // Prompt cell and conversation management
+            .add_systems(
+                Update,
+                (
+                    systems::spawn_prompt_cell,
+                    systems::handle_prompt_submitted,
+                    systems::scroll_to_bottom,
+                    systems::handle_scroll_input,
+                ),
+            )
             // Layout and rendering
+            // sync_cell_buffers must run after:
+            // - init_cell_buffers (TextBuffer exists)
+            // - handle_cell_input (CellEditor updated with typed text)
             .add_systems(
                 Update,
                 (
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
                     systems::layout_cells,
-                    systems::sync_cell_buffers,
+                    systems::layout_prompt_cell_position,
+                    systems::sync_cell_buffers
+                        .after(systems::init_cell_buffers)
+                        .after(systems::handle_cell_input),
                     systems::highlight_focused_cell,
                 ),
             )

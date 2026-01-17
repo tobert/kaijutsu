@@ -372,8 +372,13 @@ fn spawn_edges(
 // ============================================================================
 
 /// Updates frame piece positions when cell bounds change.
+///
+/// Note: We use `Or<(Changed<TextAreaConfig>, Added<NineSliceFrame>)>` to handle both:
+/// 1. Normal updates when bounds change
+/// 2. First-frame updates after frame is spawned (commands are deferred, so
+///    Changed<TextAreaConfig> from the same frame won't be visible yet)
 pub fn layout_nine_slice_frames(
-    cells: Query<(&NineSliceFrame, &TextAreaConfig), Changed<TextAreaConfig>>,
+    cells: Query<(&NineSliceFrame, &TextAreaConfig), Or<(Changed<TextAreaConfig>, Added<NineSliceFrame>)>>,
     styles: Res<Assets<FrameStyle>>,
     mut corners: Query<(&CornerPosition, &mut Node), With<CornerMarker>>,
     mut edges: Query<(&EdgePosition, &mut Node), (With<EdgeMarker>, Without<CornerMarker>)>,
