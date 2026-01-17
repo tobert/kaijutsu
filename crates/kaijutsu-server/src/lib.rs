@@ -3,6 +3,7 @@
 //! SSH + Cap'n Proto server for kaijutsu.
 
 pub mod kaish;
+pub mod kaish_engine;
 pub mod rpc;
 pub mod ssh;
 

@@ -1,20 +1,25 @@
 //! Cap'n Proto RPC server implementation
 //!
 //! Implements World and Kernel capabilities.
-//! Each kernel spawns a kaish subprocess for code execution.
+//! Each kernel owns a kaijutsu_kernel::Kernel for VFS and state,
+//! plus a kaish subprocess for code execution.
 
 #![allow(refining_impl_trait)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
+
+use kaijutsu_kernel::{Kernel, LocalBackend, VfsOps};
 
 // ============================================================================
 // Server State
@@ -70,6 +75,8 @@ pub struct KernelState {
     pub command_history: Vec<CommandEntry>,
     /// Kaish subprocess for execution (spawned lazily)
     pub kaish: Option<Rc<KaishProcess>>,
+    /// The kernel (VFS, state, tools, control plane)
+    pub kernel: Arc<Kernel>,
 }
 
 #[derive(Clone, Copy)]
@@ -152,25 +159,45 @@ impl world::Server for WorldImpl {
         mut results: world::AttachKernelResults,
     ) -> Promise<(), capnp::Error> {
         let id = pry!(pry!(pry!(params.get()).get_id()).to_str()).to_owned();
+        let state = self.state.clone();
 
-        // Create kernel entry if it doesn't exist (kaish spawned lazily on first execute)
-        {
-            let mut state = self.state.borrow_mut();
-            if !state.kernels.contains_key(&id) {
-                state.kernels.insert(id.clone(), KernelState {
-                    id: id.clone(),
-                    name: id.clone(),
-                    consent_mode: ConsentMode::Collaborative,
-                    rows: Vec::new(),
-                    command_history: Vec::new(),
-                    kaish: None, // Spawned lazily
-                });
+        Promise::from_future(async move {
+            // Create kernel entry if it doesn't exist
+            let needs_create = {
+                let state_ref = state.borrow();
+                !state_ref.kernels.contains_key(&id)
+            };
+
+            if needs_create {
+                // Create the kaijutsu kernel with default mounts
+                let kernel = Kernel::new(&id).await;
+
+                // Mount user's home directory at /home (read-only for now)
+                if let Some(home) = dirs::home_dir() {
+                    kernel
+                        .mount("/home", LocalBackend::read_only(home))
+                        .await;
+                }
+
+                let mut state_ref = state.borrow_mut();
+                state_ref.kernels.insert(
+                    id.clone(),
+                    KernelState {
+                        id: id.clone(),
+                        name: id.clone(),
+                        consent_mode: ConsentMode::Collaborative,
+                        rows: Vec::new(),
+                        command_history: Vec::new(),
+                        kaish: None, // Spawned lazily
+                        kernel: Arc::new(kernel),
+                    },
+                );
             }
-        }
 
-        let kernel_impl = KernelImpl::new(self.state.clone(), id);
-        results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
-        Promise::ok(())
+            let kernel_impl = KernelImpl::new(state.clone(), id);
+            results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
+            Ok(())
+        })
     }
 
     fn create_kernel(
@@ -185,23 +212,44 @@ impl world::Server for WorldImpl {
             _ => ConsentMode::Collaborative,
         };
 
-        let id = {
-            let mut state = self.state.borrow_mut();
-            let id = state.next_kernel_id();
-            state.kernels.insert(id.clone(), KernelState {
-                id: id.clone(),
-                name,
-                consent_mode,
-                rows: Vec::new(),
-                command_history: Vec::new(),
-                kaish: None, // Spawned lazily
-            });
-            id
-        };
+        let state = self.state.clone();
 
-        let kernel_impl = KernelImpl::new(self.state.clone(), id);
-        results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
-        Promise::ok(())
+        Promise::from_future(async move {
+            let id = {
+                let state_ref = state.borrow();
+                state_ref.next_kernel_id()
+            };
+
+            // Create the kaijutsu kernel with default mounts
+            let kernel = Kernel::new(&name).await;
+
+            // Mount user's home directory at /home (read-only for now)
+            if let Some(home) = dirs::home_dir() {
+                kernel
+                    .mount("/home", LocalBackend::read_only(home))
+                    .await;
+            }
+
+            {
+                let mut state_ref = state.borrow_mut();
+                state_ref.kernels.insert(
+                    id.clone(),
+                    KernelState {
+                        id: id.clone(),
+                        name,
+                        consent_mode,
+                        rows: Vec::new(),
+                        command_history: Vec::new(),
+                        kaish: None, // Spawned lazily
+                        kernel: Arc::new(kernel),
+                    },
+                );
+            }
+
+            let kernel_impl = KernelImpl::new(state.clone(), id);
+            results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
+            Ok(())
+        })
     }
 }
 
@@ -550,10 +598,21 @@ impl kernel::Server for KernelImpl {
         _params: kernel::VfsParams,
         mut results: kernel::VfsResults,
     ) -> Promise<(), capnp::Error> {
-        // Return a VFS capability backed by this kernel
-        let vfs_impl = VfsImpl::new(self.state.clone(), self.kernel_id.clone());
-        results.get().set_vfs(capnp_rpc::new_client(vfs_impl));
-        Promise::ok(())
+        // Get the kernel and return a VFS capability backed by it
+        let state = self.state.borrow();
+        let kernel = state
+            .kernels
+            .get(&self.kernel_id)
+            .map(|k| k.kernel.clone());
+
+        match kernel {
+            Some(kernel) => {
+                let vfs_impl = VfsImpl::new(kernel);
+                results.get().set_vfs(capnp_rpc::new_client(vfs_impl));
+                Promise::ok(())
+            }
+            None => Promise::err(capnp::Error::failed("kernel not found".into())),
+        }
     }
 
     fn list_mounts(
@@ -561,25 +620,99 @@ impl kernel::Server for KernelImpl {
         _params: kernel::ListMountsParams,
         mut results: kernel::ListMountsResults,
     ) -> Promise<(), capnp::Error> {
-        // Return empty list for now - VFS integration pending
-        results.get().init_mounts(0);
-        Promise::ok(())
+        // Get the kernel
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            let mounts = kernel.list_mounts().await;
+            let mut builder = results.get().init_mounts(mounts.len() as u32);
+            for (i, mount) in mounts.iter().enumerate() {
+                let mut m = builder.reborrow().get(i as u32);
+                m.set_path(&mount.path.to_string_lossy());
+                m.set_read_only(mount.read_only);
+            }
+            Ok(())
+        })
     }
 
     fn mount(
         self: Rc<Self>,
-        _params: kernel::MountParams,
+        params: kernel::MountParams,
         _results: kernel::MountResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("mount not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s,
+            Err(e) => return Promise::err(e),
+        };
+        let source = match params.get_source().and_then(|p| get_path_str(p)) {
+            Ok(s) => s,
+            Err(e) => return Promise::err(e),
+        };
+        let writable = params.get_writable();
+
+        // Get the kernel
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            // Expand source path (e.g., ~ to home dir)
+            let expanded = shellexpand::tilde(&source);
+            let source_path = std::path::PathBuf::from(expanded.as_ref());
+
+            if !source_path.exists() {
+                return Err(capnp::Error::failed(format!(
+                    "source path does not exist: {}",
+                    source_path.display()
+                )));
+            }
+
+            let backend = if writable {
+                LocalBackend::new(source_path)
+            } else {
+                LocalBackend::read_only(source_path)
+            };
+
+            kernel.mount(&path, backend).await;
+            Ok(())
+        })
     }
 
     fn unmount(
         self: Rc<Self>,
-        _params: kernel::UnmountParams,
-        _results: kernel::UnmountResults,
+        params: kernel::UnmountParams,
+        mut results: kernel::UnmountResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("unmount not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()).and_then(|p| get_path_str(p)) {
+            Ok(s) => s,
+            Err(e) => return Promise::err(e),
+        };
+
+        // Get the kernel
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k.kernel.clone(),
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+        drop(state);
+
+        Promise::from_future(async move {
+            let success = kernel.unmount(&path).await;
+            results.get().set_success(success);
+            Ok(())
+        })
     }
 }
 
@@ -588,121 +721,411 @@ impl kernel::Server for KernelImpl {
 // ============================================================================
 
 struct VfsImpl {
-    #[allow(dead_code)]
-    state: Rc<RefCell<ServerState>>,
-    #[allow(dead_code)]
-    kernel_id: String,
+    kernel: Arc<Kernel>,
 }
 
 impl VfsImpl {
-    fn new(state: Rc<RefCell<ServerState>>, kernel_id: String) -> Self {
-        Self { state, kernel_id }
+    fn new(kernel: Arc<Kernel>) -> Self {
+        Self { kernel }
     }
+}
+
+/// Convert VfsError to capnp Error
+fn vfs_err_to_capnp(e: kaijutsu_kernel::VfsError) -> capnp::Error {
+    capnp::Error::failed(format!("{}", e))
+}
+
+/// Helper to extract path string from capnp text reader
+fn get_path_str(text: capnp::text::Reader<'_>) -> Result<String, capnp::Error> {
+    text.to_str()
+        .map(|s| s.to_owned())
+        .map_err(|e| capnp::Error::failed(format!("invalid UTF-8: {}", e)))
+}
+
+/// Helper to build FileAttr result
+fn set_file_attr(
+    builder: &mut crate::kaijutsu_capnp::file_attr::Builder,
+    attr: &kaijutsu_kernel::FileAttr,
+) {
+    builder.set_size(attr.size);
+    builder.set_kind(match attr.kind {
+        kaijutsu_kernel::FileType::File => crate::kaijutsu_capnp::FileType::File,
+        kaijutsu_kernel::FileType::Directory => crate::kaijutsu_capnp::FileType::Directory,
+        kaijutsu_kernel::FileType::Symlink => crate::kaijutsu_capnp::FileType::Symlink,
+    });
+    builder.set_perm(attr.perm);
+    // Convert SystemTime to duration since epoch
+    let duration = attr
+        .mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    builder.set_mtime_secs(duration.as_secs());
+    builder.set_mtime_nanos(duration.subsec_nanos());
+    builder.set_nlink(attr.nlink);
 }
 
 impl vfs::Server for VfsImpl {
     fn getattr(
         self: Rc<Self>,
-        _params: vfs::GetattrParams,
-        _results: vfs::GetattrResults,
+        params: vfs::GetattrParams,
+        mut results: vfs::GetattrResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS getattr not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel.getattr(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
     }
 
     fn readdir(
         self: Rc<Self>,
-        _params: vfs::ReaddirParams,
-        _results: vfs::ReaddirResults,
+        params: vfs::ReaddirParams,
+        mut results: vfs::ReaddirResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS readdir not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let entries = kernel.readdir(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_entries(entries.len() as u32);
+            for (i, entry) in entries.iter().enumerate() {
+                let mut e = builder.reborrow().get(i as u32);
+                e.set_name(&entry.name);
+                e.set_kind(match entry.kind {
+                    kaijutsu_kernel::FileType::File => crate::kaijutsu_capnp::FileType::File,
+                    kaijutsu_kernel::FileType::Directory => crate::kaijutsu_capnp::FileType::Directory,
+                    kaijutsu_kernel::FileType::Symlink => crate::kaijutsu_capnp::FileType::Symlink,
+                });
+            }
+            Ok(())
+        })
     }
 
     fn read(
         self: Rc<Self>,
-        _params: vfs::ReadParams,
-        _results: vfs::ReadResults,
+        params: vfs::ReadParams,
+        mut results: vfs::ReadResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS read not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let offset = params.get_offset();
+        let size = params.get_size();
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let data = kernel
+                .read(Path::new(&path), offset, size)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            results.get().set_data(&data);
+            Ok(())
+        })
     }
 
     fn readlink(
         self: Rc<Self>,
-        _params: vfs::ReadlinkParams,
-        _results: vfs::ReadlinkResults,
+        params: vfs::ReadlinkParams,
+        mut results: vfs::ReadlinkResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS readlink not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let target = kernel.readlink(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            results.get().set_target(&target.to_string_lossy());
+            Ok(())
+        })
     }
 
     fn write(
         self: Rc<Self>,
-        _params: vfs::WriteParams,
-        _results: vfs::WriteResults,
+        params: vfs::WriteParams,
+        mut results: vfs::WriteResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS write not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let offset = params.get_offset();
+        let data = match params.get_data() {
+            Ok(d) => d.to_vec(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let written = kernel
+                .write(Path::new(&path), offset, &data)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            results.get().set_written(written);
+            Ok(())
+        })
     }
 
     fn create(
         self: Rc<Self>,
-        _params: vfs::CreateParams,
-        _results: vfs::CreateResults,
+        params: vfs::CreateParams,
+        mut results: vfs::CreateResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS create not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let mode = params.get_mode();
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel
+                .create(Path::new(&path), mode)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
     }
 
     fn mkdir(
         self: Rc<Self>,
-        _params: vfs::MkdirParams,
-        _results: vfs::MkdirResults,
+        params: vfs::MkdirParams,
+        mut results: vfs::MkdirResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS mkdir not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let mode = params.get_mode();
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel
+                .mkdir(Path::new(&path), mode)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
     }
 
     fn unlink(
         self: Rc<Self>,
-        _params: vfs::UnlinkParams,
+        params: vfs::UnlinkParams,
         _results: vfs::UnlinkResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS unlink not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            kernel.unlink(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            Ok(())
+        })
     }
 
     fn rmdir(
         self: Rc<Self>,
-        _params: vfs::RmdirParams,
+        params: vfs::RmdirParams,
         _results: vfs::RmdirResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS rmdir not yet implemented".into()))
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            kernel.rmdir(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            Ok(())
+        })
     }
 
     fn rename(
         self: Rc<Self>,
-        _params: vfs::RenameParams,
+        params: vfs::RenameParams,
         _results: vfs::RenameResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS rename not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let from = match params.get_from().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let to = match params.get_to().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            kernel
+                .rename(Path::new(&from), Path::new(&to))
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            Ok(())
+        })
     }
 
     fn truncate(
         self: Rc<Self>,
-        _params: vfs::TruncateParams,
+        params: vfs::TruncateParams,
         _results: vfs::TruncateResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS truncate not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let size = params.get_size();
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            kernel
+                .truncate(Path::new(&path), size)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            Ok(())
+        })
     }
 
     fn setattr(
         self: Rc<Self>,
-        _params: vfs::SetattrParams,
-        _results: vfs::SetattrResults,
+        params: vfs::SetattrParams,
+        mut results: vfs::SetattrResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS setattr not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let attr_reader = match params.get_attr() {
+            Ok(a) => a,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+
+        // Convert to kernel SetAttr
+        let set_attr = kaijutsu_kernel::SetAttr {
+            size: if attr_reader.get_has_size() {
+                Some(attr_reader.get_size())
+            } else {
+                None
+            },
+            perm: if attr_reader.get_has_perm() {
+                Some(attr_reader.get_perm())
+            } else {
+                None
+            },
+            mtime: if attr_reader.get_has_mtime() {
+                Some(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(attr_reader.get_mtime_secs()),
+                )
+            } else {
+                None
+            },
+            atime: None, // Not in capnp schema
+            uid: None,   // Not in capnp schema
+            gid: None,   // Not in capnp schema
+        };
+
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel
+                .setattr(Path::new(&path), set_attr)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_new_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
     }
 
     fn symlink(
         self: Rc<Self>,
-        _params: vfs::SymlinkParams,
-        _results: vfs::SymlinkResults,
+        params: vfs::SymlinkParams,
+        mut results: vfs::SymlinkResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS symlink not yet implemented".into()))
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let target = match params.get_target().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel
+                .symlink(Path::new(&path), Path::new(&target))
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
     }
 
     fn read_only(
@@ -710,15 +1133,28 @@ impl vfs::Server for VfsImpl {
         _params: vfs::ReadOnlyParams,
         mut results: vfs::ReadOnlyResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().set_read_only(false);
+        results.get().set_read_only(self.kernel.vfs().read_only());
         Promise::ok(())
     }
 
     fn statfs(
         self: Rc<Self>,
         _params: vfs::StatfsParams,
-        _results: vfs::StatfsResults,
+        mut results: vfs::StatfsResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("VFS statfs not yet implemented".into()))
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let stat = kernel.statfs().await.map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_stat();
+            builder.set_blocks(stat.blocks);
+            builder.set_bfree(stat.bfree);
+            builder.set_bavail(stat.bavail);
+            builder.set_files(stat.files);
+            builder.set_ffree(stat.ffree);
+            builder.set_bsize(stat.bsize);
+            builder.set_namelen(stat.namelen);
+            Ok(())
+        })
     }
 }

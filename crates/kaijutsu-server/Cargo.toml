@@ -25,6 +25,7 @@ anyhow.workspace = true
 shellexpand.workspace = true
 async-trait.workspace = true
 rand.workspace = true
+dirs = "5"
 
 # No separate russh-keys needed - russh 0.56 includes keys module
 
