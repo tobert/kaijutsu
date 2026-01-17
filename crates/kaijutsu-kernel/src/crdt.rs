@@ -190,6 +190,26 @@ impl CellStore {
         Ok(())
     }
 
+    /// Persist an operation to the database.
+    /// This should be called after applying operations to a cell.
+    pub fn persist_op(
+        &self,
+        cell_id: &str,
+        agent_id: &str,
+        op_bytes: &[u8],
+    ) -> Result<(), String> {
+        if let Some(db) = &self.db {
+            db.append_op(cell_id, agent_id, op_bytes, None)
+                .map_err(|e| format!("DB error: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Check if the store is empty (no cells).
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
     /// Apply an operation from a remote agent.
     pub fn apply_remote_op(
         &mut self,

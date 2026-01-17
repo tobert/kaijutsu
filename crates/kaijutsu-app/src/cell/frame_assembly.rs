@@ -61,11 +61,20 @@ pub fn spawn_nine_slice_frames(
         };
 
         // Calculate frame bounds (TextBounds uses i32, convert to f32)
+        // Use saturating_sub to prevent overflow when bounds are invalid (right < left)
         let bounds = &text_config.bounds;
+        let raw_width = bounds.right.saturating_sub(bounds.left);
+        let raw_height = bounds.bottom.saturating_sub(bounds.top);
+
+        // Skip cells with invalid or zero-size bounds (not yet laid out)
+        if raw_width <= 0 || raw_height <= 0 {
+            continue;
+        }
+
         let frame_left = bounds.left as f32 - FRAME_PADDING;
         let frame_top = bounds.top as f32 - FRAME_PADDING;
-        let frame_width = (bounds.right - bounds.left) as f32 + FRAME_PADDING * 2.0;
-        let frame_height = (bounds.bottom - bounds.top) as f32 + FRAME_PADDING * 2.0;
+        let frame_width = raw_width as f32 + FRAME_PADDING * 2.0;
+        let frame_height = raw_height as f32 + FRAME_PADDING * 2.0;
 
         let corner_size = style.corner_size;
         let edge_thickness = style.edge_thickness;
@@ -379,10 +388,18 @@ pub fn layout_nine_slice_frames(
         };
 
         let bounds = &text_config.bounds;
+        let raw_width = bounds.right.saturating_sub(bounds.left);
+        let raw_height = bounds.bottom.saturating_sub(bounds.top);
+
+        // Skip cells with invalid or zero-size bounds (not yet laid out)
+        if raw_width <= 0 || raw_height <= 0 {
+            continue;
+        }
+
         let frame_left = bounds.left as f32 - FRAME_PADDING;
         let frame_top = bounds.top as f32 - FRAME_PADDING;
-        let frame_width = (bounds.right - bounds.left) as f32 + FRAME_PADDING * 2.0;
-        let frame_height = (bounds.bottom - bounds.top) as f32 + FRAME_PADDING * 2.0;
+        let frame_width = raw_width as f32 + FRAME_PADDING * 2.0;
+        let frame_height = raw_height as f32 + FRAME_PADDING * 2.0;
 
         let corner_size = style.corner_size;
         let edge_thickness = style.edge_thickness;

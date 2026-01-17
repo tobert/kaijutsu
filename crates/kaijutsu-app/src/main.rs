@@ -59,7 +59,6 @@ fn main() {
         .add_systems(Startup, (
             setup_camera,
             setup_placeholder_ui,
-            setup_initial_cell,
             ui::debug::setup_debug_overlay,
             ui::mode_indicator::setup_mode_indicator,
             cell::plugin::setup_frame_styles,
@@ -156,60 +155,6 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                 },
             ));
         });
-}
-
-/// Spawn an initial test cell on startup
-fn setup_initial_cell(
-    mut commands: Commands,
-    font_system: Res<text::SharedFontSystem>,
-) {
-    use cell::{Cell, CellEditor, CellPosition, CellState};
-    use text::{GlyphonText, TextAreaConfig, TextBuffer};
-
-    // Create a proper TextBuffer with the font system
-    let text_content = "// Welcome to Kaijutsu cells!\n\
-                        // Press i to enter INSERT mode\n\
-                        // Press F2 to spawn more cells\n\n\
-                        fn main() {\n    \
-                            println!(\"Hello, 会術!\");\n\
-                        }\n";
-
-    let buffer = {
-        let Ok(mut fs) = font_system.0.lock() else {
-            warn!("Could not lock font system for initial cell");
-            return;
-        };
-        let metrics = glyphon::Metrics::new(14.0, 20.0);
-        let mut buf = glyphon::Buffer::new(&mut fs, metrics);
-        buf.set_size(&mut fs, Some(700.0), Some(400.0));
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
-        buf.set_text(&mut fs, text_content, &attrs, glyphon::Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut fs, false);
-        buf
-    };
-
-    commands.spawn((
-        Cell::code("rust"),
-        CellEditor::default().with_text(text_content),
-        CellState::new(),
-        CellPosition::new(0, 0),
-        GlyphonText,
-        TextBuffer::from_buffer(buffer),
-        TextAreaConfig {
-            left: 20.0,
-            top: 120.0,
-            scale: 1.0,
-            bounds: glyphon::TextBounds {
-                left: 20,
-                top: 120,
-                right: 720,
-                bottom: 520,
-            },
-            default_color: glyphon::Color::rgb(255, 0, 0), // BRIGHT RED for debugging
-        },
-    ));
-
-    info!("Spawned initial cell");
 }
 
 /// Marker for status text

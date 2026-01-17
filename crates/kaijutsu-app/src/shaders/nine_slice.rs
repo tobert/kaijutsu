@@ -73,7 +73,7 @@ impl CornerMaterial {
 
 impl UiMaterial for CornerMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/corner.wgsl".into()
+        "shaders/frame_corner.wgsl".into()
     }
 }
 
@@ -173,7 +173,7 @@ impl EdgeMaterial {
 
 impl UiMaterial for EdgeMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/edge_glow.wgsl".into()
+        "shaders/frame_edge.wgsl".into()
     }
 }
 

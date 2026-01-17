@@ -19,7 +19,7 @@ use capnp_rpc::pry;
 use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
-use kaijutsu_kernel::{CellStore, Kernel, LocalBackend, VfsOps};
+use kaijutsu_kernel::{CellDb, CellKind, CellStore, Kernel, LocalBackend, VfsOps};
 
 // ============================================================================
 // Server State
@@ -65,6 +65,41 @@ impl ServerState {
 pub struct Identity {
     pub username: String,
     pub display_name: String,
+}
+
+/// Get the data directory for a kernel's persistent storage.
+/// Creates the directory if it doesn't exist.
+/// Returns: ~/.local/share/kaijutsu/kernels/{kernel_id}/
+fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let dir = base.join("kaijutsu").join("kernels").join(kernel_id);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("Failed to create kernel data dir {:?}: {}", dir, e);
+    }
+    dir
+}
+
+/// Open or create a CellStore with database persistence for a kernel.
+fn create_cell_store_with_db(kernel_id: &str) -> CellStore {
+    let db_path = kernel_data_dir(kernel_id).join("data.db");
+    match CellDb::open(&db_path) {
+        Ok(db) => {
+            log::info!("Opened cell database at {:?}", db_path);
+            let mut store = CellStore::with_db(db);
+            if let Err(e) = store.load_from_db() {
+                log::warn!("Failed to load cells from DB: {}", e);
+            } else {
+                let count = store.iter().count();
+                log::info!("Loaded {} cells from database", count);
+            }
+            store
+        }
+        Err(e) => {
+            log::warn!("Failed to open cell database at {:?}: {}, using in-memory", db_path, e);
+            CellStore::new()
+        }
+    }
 }
 
 pub struct KernelState {
@@ -181,6 +216,18 @@ impl world::Server for WorldImpl {
                         .await;
                 }
 
+                // Create cell store with database persistence
+                let mut cells = create_cell_store_with_db(&id);
+
+                // Create default cell if none exist
+                if cells.iter().next().is_none() {
+                    let default_id = uuid::Uuid::new_v4().to_string();
+                    log::info!("Creating default cell {} for kernel {}", default_id, id);
+                    if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                        log::warn!("Failed to create default cell: {}", e);
+                    }
+                }
+
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
                     id.clone(),
@@ -192,7 +239,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: Arc::new(kernel),
-                        cells: CellStore::new(),
+                        cells,
                     },
                 );
             }
@@ -233,6 +280,18 @@ impl world::Server for WorldImpl {
                     .await;
             }
 
+            // Create cell store with database persistence
+            let mut cells = create_cell_store_with_db(&id);
+
+            // Create default cell if none exist
+            if cells.iter().next().is_none() {
+                let default_id = uuid::Uuid::new_v4().to_string();
+                log::info!("Creating default cell {} for new kernel {}", default_id, id);
+                if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                    log::warn!("Failed to create default cell: {}", e);
+                }
+            }
+
             {
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
@@ -245,7 +304,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: Arc::new(kernel),
-                        cells: CellStore::new(),
+                        cells,
                     },
                 );
             }
@@ -829,6 +888,9 @@ impl kernel::Server for KernelImpl {
         let mut state = self.state.borrow_mut();
         if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
             if let Some(doc) = kernel.cells.get_mut(&cell_id) {
+                // Capture version before operation for delta encoding
+                let version_before = doc.frontier();
+
                 // Apply the operation
                 match crdt_op.which() {
                     Ok(crate::kaijutsu_capnp::crdt_op::Insert(insert)) => {
@@ -848,7 +910,17 @@ impl kernel::Server for KernelImpl {
                     }
                     Err(_) => {}
                 }
-                results.get().set_new_version(doc.frontier_version());
+
+                let new_version = doc.frontier_version();
+                results.get().set_new_version(new_version);
+
+                // Persist the delta to database
+                let delta = doc.encode_patch_from(&version_before);
+                if !delta.is_empty() {
+                    if let Err(e) = kernel.cells.persist_op(&cell_id, agent_name, &delta) {
+                        log::warn!("Failed to persist cell op: {}", e);
+                    }
+                }
             }
         }
         Promise::ok(())

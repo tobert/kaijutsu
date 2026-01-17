@@ -305,7 +305,18 @@ fn spawn_remote_cell(
             },
             CellPosition::new(0, next_row),
             GlyphonText,
-            TextAreaConfig::default(),
+            TextAreaConfig {
+                left: 20.0,
+                top: 120.0,
+                scale: 1.0,
+                bounds: glyphon::TextBounds {
+                    left: 20,
+                    top: 120,
+                    right: 720,
+                    bottom: 520,
+                },
+                default_color: glyphon::Color::rgb(220, 220, 240),
+            },
         ))
         .id();
 
