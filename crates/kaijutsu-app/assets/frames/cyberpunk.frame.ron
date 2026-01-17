@@ -1,0 +1,71 @@
+// Cyberpunk frame style - ornate corners with glowing edges
+// Used for code cells and agent messages
+(
+    name: "cyberpunk",
+
+    // Sizing
+    corner_size: 48.0,
+    edge_thickness: 6.0,
+    content_padding: 8.0,
+
+    // Corner shader - ornate L-brackets with diamond accents
+    // params: (glow_radius, intensity, pulse_speed, bracket_length)
+    // - bracket_length is in UV space (0-1), 0.7 = 70% of corner
+    corner: (
+        path: "shaders/corner.wgsl",
+        color: (0.7, 0.5, 0.9, 1.0),  // Lavender
+        params: (0.15, 1.2, 1.5, 0.7),  // glow_radius, intensity, pulse_speed, bracket_length
+    ),
+
+    // Horizontal edges - energy lines between corners
+    edge_h: Some((
+        shader: (
+            path: "shaders/edge_glow.wgsl",
+            color: (0.5, 0.4, 0.8, 0.6),  // Dimmer lavender
+            params: (0.1, 0.8, 1.0, 0.0),
+        ),
+        mode: Tile(24.0),  // 24px tile pattern
+    )),
+
+    // Vertical edges - same as horizontal
+    edge_v: Some((
+        shader: (
+            path: "shaders/edge_glow.wgsl",
+            color: (0.5, 0.4, 0.8, 0.6),
+            params: (0.1, 0.8, 1.0, 0.0),
+        ),
+        mode: Tile(24.0),
+    )),
+
+    // Animation mode
+    animation: Synced,
+
+    // State-specific overrides
+    states: {
+        "focused": (
+            color: Some((0.6, 0.5, 0.95, 1.0)),  // Brighter lavender
+            params: Some((0.2, 1.5, 2.0, 0.7)),  // Stronger glow, faster pulse
+            intensity: 1.2,
+        ),
+        "insert": (
+            color: Some((0.9, 0.4, 0.7, 1.0)),  // Magenta/pink
+            params: Some((0.2, 1.5, 2.5, 0.7)),
+            intensity: 1.3,
+        ),
+        "command": (
+            color: Some((0.9, 0.7, 0.3, 1.0)),  // Gold/amber
+            params: Some((0.15, 1.3, 1.8, 0.7)),
+            intensity: 1.2,
+        ),
+        "visual": (
+            color: Some((0.5, 0.8, 0.9, 1.0)),  // Cyan
+            params: Some((0.2, 1.4, 1.5, 0.7)),
+            intensity: 1.2,
+        ),
+        "unfocused": (
+            color: Some((0.5, 0.4, 0.6, 0.8)),  // Dim lavender
+            params: Some((0.1, 0.6, 0.8, 0.7)),
+            intensity: 0.6,
+        ),
+    },
+)
