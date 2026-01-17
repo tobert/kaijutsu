@@ -12,13 +12,19 @@
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 
 pub mod control;
+pub mod crdt;
+pub mod db;
 pub mod kernel;
+pub mod script;
 pub mod state;
 pub mod tools;
 pub mod vfs;
 
 pub use control::{ConsentMode, ControlPlane, Lease, LeaseHolder};
+pub use crdt::{CellDoc, CellId, CellStore, SharedCellStore, shared_cell_store, shared_cell_store_with_db};
+pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
+pub use script::{HookEvent, HookRegistry, ScriptEngine, ScriptResult};
 pub use state::KernelState;
 pub use tools::{ExecutionEngine, ToolInfo, ToolRegistry};
 pub use vfs::{

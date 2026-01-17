@@ -10,7 +10,10 @@ use bevy::prelude::*;
 use tokio::sync::mpsc;
 
 // Use types from the client library
-use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, Row, RpcClient, SshConfig};
+use kaijutsu_client::{
+    CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, CrdtOp, Identity, KernelConfig,
+    KernelHandle, KernelInfo, Row, RpcClient, SshConfig,
+};
 
 /// Default server address for local development
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
@@ -46,6 +49,23 @@ pub enum ConnectionCommand {
     GetHistory { limit: u32 },
     /// Execute kaish code in the current kernel
     ExecuteCode { code: String },
+    // Cell CRDT operations
+    /// List all cells in the current kernel
+    ListCells,
+    /// Get full state of a specific cell
+    GetCell { cell_id: String },
+    /// Create a new cell
+    CreateCell {
+        kind: CellKind,
+        language: Option<String>,
+        parent_id: Option<String>,
+    },
+    /// Delete a cell
+    DeleteCell { cell_id: String },
+    /// Apply a CRDT operation to a cell
+    ApplyCellOp { op: CellOp },
+    /// Sync all cells (on connect or reconnect)
+    SyncCells { versions: Vec<CellVersion> },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -79,6 +99,22 @@ pub enum ConnectionEvent {
     },
     /// Error occurred
     Error(String),
+    // Cell CRDT events
+    /// List of cells received
+    CellList(Vec<CellInfo>),
+    /// Full cell state received
+    CellState(CellState),
+    /// Cell created
+    CellCreated(CellState),
+    /// Cell deleted
+    CellDeleted { cell_id: String },
+    /// Cell operation applied, new version returned
+    CellOpApplied { cell_id: String, new_version: u64 },
+    /// Sync result: patches for existing cells, full state for new cells
+    CellSyncResult {
+        patches: Vec<CellPatch>,
+        new_cells: Vec<CellState>,
+    },
 }
 
 /// Resource holding the command sender
@@ -529,6 +565,107 @@ async fn connection_loop(
                                     });
                                 }
                             }
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            // Cell CRDT commands
+            ConnectionCommand::ListCells => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.list_cells().await {
+                        Ok(cells) => {
+                            let _ = evt_tx.send(ConnectionEvent::CellList(cells));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::GetCell { cell_id } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.get_cell(&cell_id).await {
+                        Ok(cell) => {
+                            let _ = evt_tx.send(ConnectionEvent::CellState(cell));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::CreateCell {
+                kind,
+                language,
+                parent_id,
+            } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel
+                        .create_cell(kind, language.as_deref(), parent_id.as_deref())
+                        .await
+                    {
+                        Ok(cell) => {
+                            let _ = evt_tx.send(ConnectionEvent::CellCreated(cell));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::DeleteCell { cell_id } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.delete_cell(&cell_id).await {
+                        Ok(()) => {
+                            let _ = evt_tx.send(ConnectionEvent::CellDeleted { cell_id });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::ApplyCellOp { op } => {
+                if let Some(kernel) = &current_kernel {
+                    let cell_id = op.cell_id.clone();
+                    match kernel.apply_op(op).await {
+                        Ok(new_version) => {
+                            let _ = evt_tx
+                                .send(ConnectionEvent::CellOpApplied { cell_id, new_version });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::SyncCells { versions } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.sync_cells(versions).await {
+                        Ok((patches, new_cells)) => {
+                            let _ =
+                                evt_tx.send(ConnectionEvent::CellSyncResult { patches, new_cells });
                         }
                         Err(e) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));

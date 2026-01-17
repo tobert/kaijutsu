@@ -6,11 +6,27 @@ description = "Bevy GUI client for kaijutsu"
 
 [dependencies]
 kaijutsu-client = { path = "../kaijutsu-client" }
+kaijutsu-kernel = { path = "../kaijutsu-kernel" }
 
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
+
+# Text rendering
+glyphon.workspace = true
+cosmic-text.workspace = true
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+ron = "0.8"
+thiserror = "1.0"
+
+# Logging
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 log.workspace = true
 whoami.workspace = true
+uuid = { version = "1.0", features = ["v4"] }

@@ -2,9 +2,13 @@
 //!
 //! - F1: Toggle debug overlay OFF (ON by default during development)
 //! - F12: Save screenshot to design/screenshots/
+//! - q: Quit (only in Normal mode)
 
+use bevy::app::AppExit;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+
+use crate::cell::{CurrentMode, EditorMode};
 
 /// Enable the UI debug overlay by default for development
 pub fn setup_debug_overlay(mut debug_options: ResMut<UiDebugOptions>) {
@@ -45,5 +49,17 @@ pub fn handle_screenshot(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path));
+    }
+}
+
+/// q quits (only in Normal mode)
+pub fn handle_quit(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<CurrentMode>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if mode.0 == EditorMode::Normal && keys.just_pressed(KeyCode::KeyQ) {
+        info!("👋 Quitting...");
+        exit.write(AppExit::Success);
     }
 }

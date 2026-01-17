@@ -19,7 +19,7 @@ use capnp_rpc::pry;
 use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
-use kaijutsu_kernel::{Kernel, LocalBackend, VfsOps};
+use kaijutsu_kernel::{CellStore, Kernel, LocalBackend, VfsOps};
 
 // ============================================================================
 // Server State
@@ -77,6 +77,8 @@ pub struct KernelState {
     pub kaish: Option<Rc<KaishProcess>>,
     /// The kernel (VFS, state, tools, control plane)
     pub kernel: Arc<Kernel>,
+    /// Cell CRDT store
+    pub cells: CellStore,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +192,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: Arc::new(kernel),
+                        cells: CellStore::new(),
                     },
                 );
             }
@@ -242,6 +245,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: Arc::new(kernel),
+                        cells: CellStore::new(),
                     },
                 );
             }
@@ -713,6 +717,238 @@ impl kernel::Server for KernelImpl {
             results.get().set_success(success);
             Ok(())
         })
+    }
+
+    // Cell CRDT methods
+
+    fn list_cells(
+        self: Rc<Self>,
+        _params: kernel::ListCellsParams,
+        mut results: kernel::ListCellsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let cells: Vec<_> = kernel.cells.iter().collect();
+            let mut builder = results.get().init_cells(cells.len() as u32);
+            for (i, doc) in cells.iter().enumerate() {
+                let mut c = builder.reborrow().get(i as u32);
+                c.set_id(&doc.id);
+                c.set_kind(cell_kind_to_capnp(doc.kind));
+                if let Some(ref lang) = doc.language {
+                    c.set_language(lang);
+                }
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn get_cell(
+        self: Rc<Self>,
+        params: kernel::GetCellParams,
+        mut results: kernel::GetCellResults,
+    ) -> Promise<(), capnp::Error> {
+        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
+
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            if let Some(doc) = kernel.cells.get(&cell_id) {
+                let mut cell = results.get().init_cell();
+                let mut info = cell.reborrow().init_info();
+                info.set_id(&doc.id);
+                info.set_kind(cell_kind_to_capnp(doc.kind));
+                if let Some(ref lang) = doc.language {
+                    info.set_language(lang);
+                }
+                cell.set_content(&doc.content());
+                cell.set_version(doc.frontier_version());
+                // Encode full doc for sync
+                let encoded = doc.encode_full();
+                cell.set_encoded_doc(&encoded);
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn create_cell(
+        self: Rc<Self>,
+        params: kernel::CreateCellParams,
+        mut results: kernel::CreateCellResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let kind = cell_kind_from_capnp(params.get_kind().unwrap_or(crate::kaijutsu_capnp::CellKind::Code));
+        let language = params.get_language().ok().and_then(|l| l.to_str().ok()).map(|s| s.to_owned());
+        let _parent_id = params.get_parent_id().ok().and_then(|p| p.to_str().ok()).map(|s| s.to_owned());
+
+        // Generate a new cell ID
+        let cell_id = uuid::Uuid::new_v4().to_string();
+
+        let mut state = self.state.borrow_mut();
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            if let Ok(doc) = kernel.cells.create_cell(cell_id, kind, language.clone()) {
+                let mut cell = results.get().init_cell();
+                let mut info = cell.reborrow().init_info();
+                info.set_id(&doc.id);
+                info.set_kind(cell_kind_to_capnp(doc.kind));
+                if let Some(ref lang) = doc.language {
+                    info.set_language(lang);
+                }
+                cell.set_content(&doc.content());
+                cell.set_version(doc.frontier_version());
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn delete_cell(
+        self: Rc<Self>,
+        params: kernel::DeleteCellParams,
+        _results: kernel::DeleteCellResults,
+    ) -> Promise<(), capnp::Error> {
+        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
+
+        let mut state = self.state.borrow_mut();
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            let _ = kernel.cells.delete_cell(&cell_id);
+        }
+        Promise::ok(())
+    }
+
+    fn apply_op(
+        self: Rc<Self>,
+        params: kernel::ApplyOpParams,
+        mut results: kernel::ApplyOpResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let op = pry!(params.get_op());
+        let cell_id = pry!(pry!(op.get_cell_id()).to_str()).to_owned();
+        let crdt_op = pry!(op.get_op());
+
+        // Use a fixed agent name for server-side ops
+        let agent_name = "server";
+
+        let mut state = self.state.borrow_mut();
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            if let Some(doc) = kernel.cells.get_mut(&cell_id) {
+                // Apply the operation
+                match crdt_op.which() {
+                    Ok(crate::kaijutsu_capnp::crdt_op::Insert(insert)) => {
+                        let pos = insert.get_pos() as usize;
+                        let text = pry!(pry!(insert.get_text()).to_str());
+                        doc.insert(agent_name, pos, text);
+                    }
+                    Ok(crate::kaijutsu_capnp::crdt_op::Delete(delete)) => {
+                        let pos = delete.get_pos() as usize;
+                        let len = delete.get_len() as usize;
+                        doc.delete(agent_name, pos, pos + len);
+                    }
+                    Ok(crate::kaijutsu_capnp::crdt_op::FullState(data)) => {
+                        // Merge full state
+                        let data = pry!(data);
+                        let _ = doc.merge(&data);
+                    }
+                    Err(_) => {}
+                }
+                results.get().set_new_version(doc.frontier_version());
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn subscribe_cells(
+        self: Rc<Self>,
+        _params: kernel::SubscribeCellsParams,
+        _results: kernel::SubscribeCellsResults,
+    ) -> Promise<(), capnp::Error> {
+        // TODO: Store callback and notify on changes
+        Promise::ok(())
+    }
+
+    fn sync_cells(
+        self: Rc<Self>,
+        params: kernel::SyncCellsParams,
+        mut results: kernel::SyncCellsResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let from_versions = pry!(params.get_from_versions());
+
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            // Build map of client versions
+            let mut client_versions: HashMap<String, u64> = HashMap::new();
+            for i in 0..from_versions.len() {
+                let v = from_versions.get(i);
+                if let Some(id) = v.get_cell_id().ok().and_then(|t| t.to_str().ok().map(|s| s.to_owned())) {
+                    client_versions.insert(id, v.get_version());
+                }
+            }
+
+            // Find cells that need patches and new cells
+            let mut patches: Vec<(String, Vec<u8>, u64, u64)> = Vec::new();
+            let mut new_cells: Vec<&kaijutsu_kernel::CellDoc> = Vec::new();
+
+            for doc in kernel.cells.iter() {
+                if let Some(&client_version) = client_versions.get(&doc.id) {
+                    // Client has this cell - send patch if needed
+                    let server_version = doc.frontier_version();
+                    if client_version < server_version {
+                        let patch = doc.encode_patch_from(&[client_version as usize]);
+                        patches.push((doc.id.clone(), patch, client_version, server_version));
+                    }
+                } else {
+                    // Client doesn't have this cell - send full state
+                    new_cells.push(doc);
+                }
+            }
+
+            // Build response
+            let mut patches_builder = results.get().init_patches(patches.len() as u32);
+            for (i, (cell_id, ops, from_v, to_v)) in patches.iter().enumerate() {
+                let mut p = patches_builder.reborrow().get(i as u32);
+                p.set_cell_id(cell_id);
+                p.set_from_version(*from_v);
+                p.set_to_version(*to_v);
+                p.set_ops(ops);
+            }
+
+            let mut new_cells_builder = results.get().init_new_cells(new_cells.len() as u32);
+            for (i, doc) in new_cells.iter().enumerate() {
+                let mut c = new_cells_builder.reborrow().get(i as u32);
+                let mut info = c.reborrow().init_info();
+                info.set_id(&doc.id);
+                info.set_kind(cell_kind_to_capnp(doc.kind));
+                if let Some(ref lang) = doc.language {
+                    info.set_language(lang);
+                }
+                c.set_content(&doc.content());
+                c.set_version(doc.frontier_version());
+                c.set_encoded_doc(&doc.encode_full());
+            }
+        }
+        Promise::ok(())
+    }
+}
+
+/// Convert kernel CellKind to capnp CellKind
+fn cell_kind_to_capnp(kind: kaijutsu_kernel::CellKind) -> crate::kaijutsu_capnp::CellKind {
+    match kind {
+        kaijutsu_kernel::CellKind::Code => crate::kaijutsu_capnp::CellKind::Code,
+        kaijutsu_kernel::CellKind::Markdown => crate::kaijutsu_capnp::CellKind::Markdown,
+        kaijutsu_kernel::CellKind::Output => crate::kaijutsu_capnp::CellKind::Output,
+        kaijutsu_kernel::CellKind::System => crate::kaijutsu_capnp::CellKind::System,
+        kaijutsu_kernel::CellKind::UserMessage => crate::kaijutsu_capnp::CellKind::UserMessage,
+        kaijutsu_kernel::CellKind::AgentMessage => crate::kaijutsu_capnp::CellKind::AgentMessage,
+    }
+}
+
+/// Convert capnp CellKind to kernel CellKind
+fn cell_kind_from_capnp(kind: crate::kaijutsu_capnp::CellKind) -> kaijutsu_kernel::CellKind {
+    match kind {
+        crate::kaijutsu_capnp::CellKind::Code => kaijutsu_kernel::CellKind::Code,
+        crate::kaijutsu_capnp::CellKind::Markdown => kaijutsu_kernel::CellKind::Markdown,
+        crate::kaijutsu_capnp::CellKind::Output => kaijutsu_kernel::CellKind::Output,
+        crate::kaijutsu_capnp::CellKind::System => kaijutsu_kernel::CellKind::System,
+        crate::kaijutsu_capnp::CellKind::UserMessage => kaijutsu_kernel::CellKind::UserMessage,
+        crate::kaijutsu_capnp::CellKind::AgentMessage => kaijutsu_kernel::CellKind::AgentMessage,
     }
 }
 

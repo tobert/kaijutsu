@@ -212,6 +212,84 @@ interface Kernel {
   listMounts @17 () -> (mounts :List(MountInfo));
   mount @18 (path :Text, source :Text, writable :Bool);
   unmount @19 (path :Text) -> (success :Bool);
+
+  # Cell CRDT sync
+  listCells @20 () -> (cells :List(CellInfo));
+  getCell @21 (cellId :Text) -> (cell :CellState);
+  createCell @22 (kind :CellKind, language :Text, parentId :Text) -> (cell :CellState);
+  deleteCell @23 (cellId :Text);
+  applyOp @24 (op :CellOp) -> (newVersion :UInt64);
+  subscribeCells @25 (callback :CellEvents);
+
+  # Bulk sync for initial load / reconnect
+  syncCells @26 (fromVersions :List(CellVersion)) -> (patches :List(CellPatch), newCells :List(CellState));
+}
+
+struct CellVersion {
+  cellId @0 :Text;
+  version @1 :UInt64;
+}
+
+# ============================================================================
+# Cell CRDT Types
+# ============================================================================
+
+enum CellKind {
+  code @0;
+  markdown @1;
+  output @2;
+  system @3;
+  userMessage @4;
+  agentMessage @5;
+}
+
+struct CellInfo {
+  id @0 :Text;
+  kind @1 :CellKind;
+  language @2 :Text;          # For code cells, e.g. "rust", "python"
+  parentId @3 :Text;          # For nested cells (tool calls under messages)
+}
+
+struct CellOp {
+  cellId @0 :Text;
+  clientVersion @1 :UInt64;   # Client's version before this op
+  op @2 :CrdtOp;
+}
+
+struct CrdtOp {
+  union {
+    insert :group {
+      pos @0 :UInt64;
+      text @1 :Text;
+    }
+    delete :group {
+      pos @2 :UInt64;
+      len @3 :UInt64;
+    }
+    # Full state sync (for initial load or recovery)
+    fullState @4 :Data;       # Encoded diamond-types document
+  }
+}
+
+struct CellState {
+  info @0 :CellInfo;
+  content @1 :Text;           # Current text content
+  version @2 :UInt64;         # Server's CRDT version
+  encodedDoc @3 :Data;        # Optional: full diamond-types doc for sync
+}
+
+struct CellPatch {
+  cellId @0 :Text;
+  fromVersion @1 :UInt64;     # Version patch is based on
+  toVersion @2 :UInt64;       # Version after applying patch
+  ops @3 :Data;               # Encoded diamond-types patch
+}
+
+# Callback for receiving cell updates from server
+interface CellEvents {
+  onCellCreated @0 (cell :CellState);
+  onCellUpdated @1 (patch :CellPatch);
+  onCellDeleted @2 (cellId :Text);
 }
 
 # ============================================================================

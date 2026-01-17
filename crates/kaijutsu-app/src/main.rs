@@ -1,14 +1,39 @@
+//! Kaijutsu App - Cell-based collaborative workspace
+//!
+//! A fresh implementation with cells as the universal primitive.
+//! CRDT sync via diamond-types, cosmic-text rendering.
+
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod cell;
 mod connection;
-mod state;
+mod shaders;
+mod text;
 mod ui;
 
 // Re-export client crate's generated code
 pub use kaijutsu_client::kaijutsu_capnp;
 
 fn main() {
+    // Set up file logging
+    let log_dir = std::env::var("KAIJUTSU_LOG_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let file_appender = tracing_appender::rolling::never(&log_dir, "kaijutsu-app.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Default to info for our crates, warn for others
+            "kaijutsu_app=debug,kaijutsu_client=debug,warn".into()
+        }))
+        .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .init();
+
+    info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -20,303 +45,209 @@ fn main() {
         }))
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
+        // Text rendering (glyphon + cosmic-text)
+        .add_plugins(text::TextRenderPlugin)
+        // Cell editing
+        .add_plugins(cell::CellPlugin)
+        // Shader effects
+        .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ConnectionBridgePlugin)
-        // State
-        .init_state::<state::mode::Mode>()
         // Resources
         .init_resource::<ui::theme::Theme>()
-        .init_resource::<state::input::InputBuffer>()
-        .init_resource::<state::nav::NavigationState>()
-        .init_resource::<ui::context::MessageCount>()
-        .init_resource::<ui::console::ConsoleState>()
-        // Messages
-        .add_message::<ui::context::MessageEvent>()
         // Startup
         .add_systems(Startup, (
-            ui::shell::setup,
-            ui::console::setup_console,
+            setup_camera,
+            setup_placeholder_ui,
+            setup_initial_cell,
             ui::debug::setup_debug_overlay,
-            startup_connect,
+            ui::mode_indicator::setup_mode_indicator,
+            cell::plugin::setup_frame_styles,
         ))
         // Update
-        .add_systems(
-            Update,
-            (
-                // Console (runs first, captures input when visible)
-                ui::console::toggle_console,
-                ui::console::handle_console_input,
-                ui::console::handle_execute_results,
-                ui::console::update_console_display,
-                // Mode handling
-                state::mode::handle_mode_input,
-                ui::shell::update_mode_indicator,
-                ui::shell::update_title_kernel,
-                ui::console::update_console_header,
-                // Input handling (keyboard + IME) - skipped when console visible
-                ui::input::handle_keyboard_input,
-                ui::input::handle_ime_input,
-                ui::input::update_input_display,
-                // Input submission
-                handle_input_submit,
-                // Context area
-                ui::context::spawn_messages,
-                // Navigation and interaction
-                ui::context::handle_navigation,
-                ui::context::handle_collapse_toggle,
-                ui::context::update_selection_highlight,
-                // Connection events → UI
-                handle_connection_events,
-                // Debug tools (F1 overlay, F12 screenshot)
-                ui::debug::handle_debug_toggle,
-                ui::debug::handle_screenshot,
-            ),
-        )
+        .add_systems(Update, (
+            handle_connection_events,
+            ui::debug::handle_debug_toggle,
+            ui::debug::handle_screenshot,
+            ui::debug::handle_quit,
+            ui::mode_indicator::update_mode_indicator,
+        ))
         .run();
 }
 
-/// On startup, show welcome message (auto-reconnect handles connection)
-fn startup_connect(mut events: MessageWriter<ui::context::MessageEvent>) {
-    events.write(ui::context::MessageEvent::system(
-        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, Ctrl-Z for shell.",
+/// Setup 2D camera for UI
+fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
+    commands.spawn((
+        Camera2d,
+        Camera {
+            clear_color: ClearColorConfig::Custom(theme.bg),
+            ..default()
+        },
     ));
 }
 
-/// Handle Enter key in Insert mode to submit input
-fn handle_input_submit(
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<State<state::mode::Mode>>,
-    mut input: ResMut<state::input::InputBuffer>,
-    console_state: Res<ui::console::ConsoleState>,
-    conn_state: Res<connection::ConnectionState>,
-    cmds: Res<connection::ConnectionCommands>,
-    mut events: MessageWriter<ui::context::MessageEvent>,
-) {
-    // Don't handle if console is visible (console handles its own input)
-    if console_state.visible {
-        return;
-    }
-
-    // Only in Insert mode
-    if *mode.get() != state::mode::Mode::Insert {
-        return;
-    }
-
-    if !keys.just_pressed(KeyCode::Enter) {
-        return;
-    }
-
-    let content = input.text.trim().to_string();
-    if content.is_empty() {
-        return;
-    }
-
-    // Clear input
-    input.text.clear();
-    input.preedit.clear();
-
-    // Handle slash commands
-    if content.starts_with('/') {
-        handle_slash_command(&content, &cmds, &mut events);
-        return;
-    }
-
-    // Send to server if connected and in a kernel
-    if conn_state.connected && conn_state.current_kernel.is_some() {
-        // Check for @mention
-        if let Some(mention) = content.strip_prefix('@') {
-            if let Some((agent, rest)) = mention.split_once(' ') {
-                cmds.send(connection::ConnectionCommand::MentionAgent {
-                    agent: agent.to_string(),
-                    content: rest.to_string(),
-                });
-            } else {
-                events.write(ui::context::MessageEvent::system(
-                    "Usage: @agent message",
-                ));
-            }
-        } else {
-            cmds.send(connection::ConnectionCommand::SendMessage { content });
-        }
-    } else if !conn_state.connected {
-        events.write(ui::context::MessageEvent::system(
-            "Not connected. Use /connect <host:port> to connect.",
-        ));
-    } else {
-        events.write(ui::context::MessageEvent::system(
-            "Not attached to a kernel. Use /attach <id> to attach.",
-        ));
-    }
-}
-
-/// Handle slash commands
-fn handle_slash_command(
-    cmd: &str,
-    conn_cmds: &connection::ConnectionCommands,
-    events: &mut MessageWriter<ui::context::MessageEvent>,
-) {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    match parts.first().copied() {
-        Some("/connect") => {
-            if let Some(addr) = parts.get(1) {
-                events.write(ui::context::MessageEvent::system(format!(
-                    "Connecting to {}...",
-                    addr
-                )));
-                conn_cmds.send(connection::ConnectionCommand::ConnectTcp {
-                    addr: addr.to_string(),
-                });
-            } else {
-                events.write(ui::context::MessageEvent::system(
-                    "Usage: /connect <host:port>",
-                ));
-            }
-        }
-        Some("/disconnect") => {
-            conn_cmds.send(connection::ConnectionCommand::Disconnect);
-        }
-        Some("/attach") => {
-            if let Some(id) = parts.get(1) {
-                conn_cmds.send(connection::ConnectionCommand::AttachKernel {
-                    id: id.to_string(),
-                });
-            } else {
-                events.write(ui::context::MessageEvent::system("Usage: /attach <kernel-id>"));
-            }
-        }
-        Some("/detach") => {
-            conn_cmds.send(connection::ConnectionCommand::DetachKernel);
-        }
-        Some("/kernels") => {
-            conn_cmds.send(connection::ConnectionCommand::ListKernels);
-        }
-        Some("/whoami") => {
-            conn_cmds.send(connection::ConnectionCommand::Whoami);
-        }
-        Some("/history") => {
-            let limit = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(50);
-            conn_cmds.send(connection::ConnectionCommand::GetHistory { limit });
-        }
-        Some("/help") => {
-            events.write(ui::context::MessageEvent::system(
-                "Commands: /connect <addr>, /disconnect, /attach <id>, /detach, /kernels, /whoami, /history [n]",
+/// Temporary placeholder UI - shows connection status
+fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
+    // Root container - NO background so glyphon text shows through
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::FlexStart, // Top-aligned
+                padding: UiRect::top(Val::Px(20.0)),
+                ..default()
+            },
+            // No BackgroundColor - let glyphon text show through
+        ))
+        .with_children(|parent| {
+            // Title
+            parent.spawn((
+                Text::new("会術 Kaijutsu"),
+                TextFont {
+                    font_size: 48.0,
+                    ..default()
+                },
+                TextColor(theme.accent),
             ));
-        }
-        _ => {
-            events.write(ui::context::MessageEvent::system(format!(
-                "Unknown command: {}. Type /help for help.",
-                cmd
-            )));
-        }
-    }
+
+            // Subtitle
+            parent.spawn((
+                Text::new("Cell-based Collaborative Workspace"),
+                TextFont {
+                    font_size: 18.0,
+                    ..default()
+                },
+                TextColor(theme.fg_dim),
+                Node {
+                    margin: UiRect::top(Val::Px(8.0)),
+                    ..default()
+                },
+            ));
+
+            // Status marker
+            parent.spawn((
+                StatusText,
+                Text::new("Connecting..."),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(theme.fg_dim),
+                Node {
+                    margin: UiRect::top(Val::Px(32.0)),
+                    ..default()
+                },
+            ));
+
+            // Instructions
+            parent.spawn((
+                Text::new("F1: Debug | F2: New cell | F3: Toggle shaders | F12: Screenshot"),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(theme.fg_dim),
+                Node {
+                    margin: UiRect::top(Val::Px(16.0)),
+                    ..default()
+                },
+            ));
+        });
 }
 
-/// Convert connection events to UI messages
+/// Spawn an initial test cell on startup
+fn setup_initial_cell(
+    mut commands: Commands,
+    font_system: Res<text::SharedFontSystem>,
+) {
+    use cell::{Cell, CellEditor, CellPosition, CellState};
+    use text::{GlyphonText, TextAreaConfig, TextBuffer};
+
+    // Create a proper TextBuffer with the font system
+    let text_content = "// Welcome to Kaijutsu cells!\n\
+                        // Press i to enter INSERT mode\n\
+                        // Press F2 to spawn more cells\n\n\
+                        fn main() {\n    \
+                            println!(\"Hello, 会術!\");\n\
+                        }\n";
+
+    let buffer = {
+        let Ok(mut fs) = font_system.0.lock() else {
+            warn!("Could not lock font system for initial cell");
+            return;
+        };
+        let metrics = glyphon::Metrics::new(14.0, 20.0);
+        let mut buf = glyphon::Buffer::new(&mut fs, metrics);
+        buf.set_size(&mut fs, Some(700.0), Some(400.0));
+        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        buf.set_text(&mut fs, text_content, &attrs, glyphon::Shaping::Advanced, None);
+        buf.shape_until_scroll(&mut fs, false);
+        buf
+    };
+
+    commands.spawn((
+        Cell::code("rust"),
+        CellEditor::default().with_text(text_content),
+        CellState::new(),
+        CellPosition::new(0, 0),
+        GlyphonText,
+        TextBuffer::from_buffer(buffer),
+        TextAreaConfig {
+            left: 20.0,
+            top: 120.0,
+            scale: 1.0,
+            bounds: glyphon::TextBounds {
+                left: 20,
+                top: 120,
+                right: 720,
+                bottom: 520,
+            },
+            default_color: glyphon::Color::rgb(255, 0, 0), // BRIGHT RED for debugging
+        },
+    ));
+
+    info!("Spawned initial cell");
+}
+
+/// Marker for status text
+#[derive(Component)]
+struct StatusText;
+
+/// Convert connection events to UI updates
 fn handle_connection_events(
     mut conn_events: MessageReader<connection::ConnectionEvent>,
-    conn_state: Res<connection::ConnectionState>,
-    mut ui_events: MessageWriter<ui::context::MessageEvent>,
+    mut status_text: Query<(&mut Text, &mut TextColor), With<StatusText>>,
+    theme: Res<ui::theme::Theme>,
 ) {
     use connection::ConnectionEvent;
-    use ui::context::{MessageEvent, RowType};
 
     for event in conn_events.read() {
-        match event {
-            ConnectionEvent::Connected => {
-                ui_events.write(MessageEvent::system("✓ Connected to server"));
-            }
-            ConnectionEvent::Disconnected => {
-                ui_events.write(MessageEvent::system(
-                    "⚡ Disconnected from server (reconnecting...)",
-                ));
-            }
-            ConnectionEvent::ConnectionFailed(err) => {
-                // Only show detailed errors after first attempt to reduce startup noise
-                if conn_state.was_connected || conn_state.reconnect_attempt > 2 {
-                    ui_events.write(MessageEvent::system(format!("✗ Connection failed: {}", err)));
+        for (mut text, mut color) in status_text.iter_mut() {
+            match event {
+                ConnectionEvent::Connected => {
+                    text.0 = "✓ Connected to server".into();
+                    *color = TextColor(theme.row_result);
                 }
-            }
-            ConnectionEvent::Reconnecting { attempt, delay_secs } => {
-                // Show reconnection status periodically
-                if *attempt == 1 {
-                    ui_events.write(MessageEvent::system("Connecting to server..."));
-                } else if *attempt % 3 == 0 {
-                    ui_events.write(MessageEvent::system(format!(
-                        "⟳ Reconnecting (attempt {}, next in {}s)...",
-                        attempt, delay_secs
-                    )));
+                ConnectionEvent::Disconnected => {
+                    text.0 = "⚡ Disconnected (reconnecting...)".into();
+                    *color = TextColor(theme.row_tool);
                 }
-            }
-            ConnectionEvent::Identity(id) => {
-                ui_events.write(MessageEvent::system(format!(
-                    "Logged in as: {} ({})",
-                    id.display_name, id.username
-                )));
-            }
-            ConnectionEvent::KernelList(kernels) => {
-                if kernels.is_empty() {
-                    ui_events.write(MessageEvent::system("No kernels available"));
-                } else {
-                    let list = kernels
-                        .iter()
-                        .map(|k| format!("  {} ({})", k.name, k.id))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    ui_events.write(MessageEvent::system(format!("Available kernels:\n{}", list)));
+                ConnectionEvent::ConnectionFailed(err) => {
+                    text.0 = format!("✗ {}", err);
+                    *color = TextColor(theme.accent2);
                 }
-            }
-            ConnectionEvent::AttachedKernel(info) => {
-                ui_events.write(MessageEvent::system(format!(
-                    "Attached to kernel: {} ({})",
-                    info.name, info.id
-                )));
-            }
-            ConnectionEvent::DetachedKernel => {
-                ui_events.write(MessageEvent::system("Detached from kernel"));
-            }
-            ConnectionEvent::NewMessage(row) => {
-                // Convert server Row to UI MessageEvent
-                let row_type = match row.row_type {
-                    connection::RowType::Chat => RowType::User,
-                    connection::RowType::AgentResponse => RowType::Agent,
-                    connection::RowType::ToolCall => RowType::ToolCall,
-                    connection::RowType::ToolResult => RowType::ToolResult,
-                    connection::RowType::SystemMessage => RowType::System,
-                };
-                ui_events.write(MessageEvent {
-                    sender: row.sender.clone(),
-                    content: row.content.clone(),
-                    row_type,
-                    parent_id: None, // TODO: map server IDs to local IDs
-                });
-            }
-            ConnectionEvent::History(rows) => {
-                for row in rows {
-                    let row_type = match row.row_type {
-                        connection::RowType::Chat => RowType::User,
-                        connection::RowType::AgentResponse => RowType::Agent,
-                        connection::RowType::ToolCall => RowType::ToolCall,
-                        connection::RowType::ToolResult => RowType::ToolResult,
-                        connection::RowType::SystemMessage => RowType::System,
-                    };
-                    ui_events.write(MessageEvent {
-                        sender: row.sender.clone(),
-                        content: row.content.clone(),
-                        row_type,
-                        parent_id: None,
-                    });
+                ConnectionEvent::Reconnecting { attempt, .. } => {
+                    text.0 = format!("⟳ Reconnecting (attempt {})...", attempt);
+                    *color = TextColor(theme.fg_dim);
                 }
-            }
-            ConnectionEvent::Error(err) => {
-                ui_events.write(MessageEvent::system(format!("Error: {}", err)));
-            }
-            ConnectionEvent::ExecuteResult { exec_id: _, output, success } => {
-                // ExecuteResult is primarily handled by the console system
-                // but we also show it in the context view for visibility
-                if !output.is_empty() {
-                    let prefix = if *success { "✓" } else { "✗" };
-                    ui_events.write(MessageEvent::system(format!("{} {}", prefix, output)));
+                ConnectionEvent::AttachedKernel(info) => {
+                    text.0 = format!("✓ Attached to kernel: {}", info.name);
+                    *color = TextColor(theme.row_result);
                 }
+                _ => {}
             }
         }
     }

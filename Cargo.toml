@@ -51,3 +51,14 @@ shellexpand = "3"
 # Bevy Remote Protocol (debugging)
 bevy_remote = "0.18"
 bevy_brp_extras = "0.18"
+
+# Text rendering (local fork for Bevy 0.18 compat)
+glyphon = { path = "../glyphon" }
+cosmic-text = "0.16"
+
+# CRDT + Persistence
+diamond-types = "1.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Scripting
+rhai = "1.21"

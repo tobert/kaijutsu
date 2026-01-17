@@ -272,6 +272,125 @@ impl KernelHandle {
         request.send().promise.await?;
         Ok(())
     }
+
+    // =========================================================================
+    // Cell CRDT sync methods
+    // =========================================================================
+
+    /// List all cells in the kernel
+    pub async fn list_cells(&self) -> Result<Vec<CellInfo>, RpcError> {
+        let request = self.kernel.list_cells_request();
+        let response = request.send().promise.await?;
+        let cells = response.get()?.get_cells()?;
+
+        let mut result = Vec::with_capacity(cells.len() as usize);
+        for c in cells.iter() {
+            result.push(CellInfo::from_capnp(&c)?);
+        }
+        Ok(result)
+    }
+
+    /// Get full cell state including CRDT document
+    pub async fn get_cell(&self, cell_id: &str) -> Result<CellState, RpcError> {
+        let mut request = self.kernel.get_cell_request();
+        request.get().set_cell_id(cell_id);
+        let response = request.send().promise.await?;
+        let cell = response.get()?.get_cell()?;
+        CellState::from_capnp(&cell)
+    }
+
+    /// Create a new cell
+    pub async fn create_cell(
+        &self,
+        kind: CellKind,
+        language: Option<&str>,
+        parent_id: Option<&str>,
+    ) -> Result<CellState, RpcError> {
+        let mut request = self.kernel.create_cell_request();
+        {
+            let mut builder = request.get();
+            builder.set_kind(kind.to_capnp());
+            if let Some(lang) = language {
+                builder.set_language(lang);
+            }
+            if let Some(parent) = parent_id {
+                builder.set_parent_id(parent);
+            }
+        }
+        let response = request.send().promise.await?;
+        let cell = response.get()?.get_cell()?;
+        CellState::from_capnp(&cell)
+    }
+
+    /// Delete a cell
+    pub async fn delete_cell(&self, cell_id: &str) -> Result<(), RpcError> {
+        let mut request = self.kernel.delete_cell_request();
+        request.get().set_cell_id(cell_id);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Apply a CRDT operation to a cell
+    pub async fn apply_op(&self, op: CellOp) -> Result<u64, RpcError> {
+        let mut request = self.kernel.apply_op_request();
+        {
+            let mut op_builder = request.get().init_op();
+            op_builder.set_cell_id(&op.cell_id);
+            op_builder.set_client_version(op.client_version);
+            let mut crdt_op = op_builder.init_op();
+            match op.op {
+                CrdtOp::Insert { pos, ref text } => {
+                    let mut insert = crdt_op.init_insert();
+                    insert.set_pos(pos);
+                    insert.set_text(text);
+                }
+                CrdtOp::Delete { pos, len } => {
+                    let mut delete = crdt_op.init_delete();
+                    delete.set_pos(pos);
+                    delete.set_len(len);
+                }
+                CrdtOp::FullState(ref data) => {
+                    crdt_op.set_full_state(data);
+                }
+            }
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_new_version())
+    }
+
+    /// Sync cells with the server (get patches for known cells, full state for new)
+    pub async fn sync_cells(
+        &self,
+        versions: Vec<CellVersion>,
+    ) -> Result<(Vec<CellPatch>, Vec<CellState>), RpcError> {
+        let mut request = self.kernel.sync_cells_request();
+        {
+            let mut from_versions = request.get().init_from_versions(versions.len() as u32);
+            for (i, v) in versions.iter().enumerate() {
+                let mut cv = from_versions.reborrow().get(i as u32);
+                cv.set_cell_id(&v.cell_id);
+                cv.set_version(v.version);
+            }
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+
+        // Parse patches
+        let patches_reader = result.get_patches()?;
+        let mut patches = Vec::with_capacity(patches_reader.len() as usize);
+        for p in patches_reader.iter() {
+            patches.push(CellPatch::from_capnp(&p)?);
+        }
+
+        // Parse new cells
+        let new_cells_reader = result.get_new_cells()?;
+        let mut new_cells = Vec::with_capacity(new_cells_reader.len() as usize);
+        for c in new_cells_reader.iter() {
+            new_cells.push(CellState::from_capnp(&c)?);
+        }
+
+        Ok((patches, new_cells))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +468,149 @@ pub struct HistoryEntry {
     pub id: u64,
     pub code: String,
     pub timestamp: u64,
+}
+
+// ============================================================================
+// Cell Types
+// ============================================================================
+
+/// Type of cell content
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellKind {
+    Code,
+    Markdown,
+    Output,
+    System,
+    UserMessage,
+    AgentMessage,
+}
+
+impl CellKind {
+    fn from_capnp(kind: crate::kaijutsu_capnp::CellKind) -> Self {
+        match kind {
+            crate::kaijutsu_capnp::CellKind::Code => CellKind::Code,
+            crate::kaijutsu_capnp::CellKind::Markdown => CellKind::Markdown,
+            crate::kaijutsu_capnp::CellKind::Output => CellKind::Output,
+            crate::kaijutsu_capnp::CellKind::System => CellKind::System,
+            crate::kaijutsu_capnp::CellKind::UserMessage => CellKind::UserMessage,
+            crate::kaijutsu_capnp::CellKind::AgentMessage => CellKind::AgentMessage,
+        }
+    }
+
+    fn to_capnp(self) -> crate::kaijutsu_capnp::CellKind {
+        match self {
+            CellKind::Code => crate::kaijutsu_capnp::CellKind::Code,
+            CellKind::Markdown => crate::kaijutsu_capnp::CellKind::Markdown,
+            CellKind::Output => crate::kaijutsu_capnp::CellKind::Output,
+            CellKind::System => crate::kaijutsu_capnp::CellKind::System,
+            CellKind::UserMessage => crate::kaijutsu_capnp::CellKind::UserMessage,
+            CellKind::AgentMessage => crate::kaijutsu_capnp::CellKind::AgentMessage,
+        }
+    }
+}
+
+/// Basic cell metadata
+#[derive(Debug, Clone)]
+pub struct CellInfo {
+    pub id: String,
+    pub kind: CellKind,
+    pub language: Option<String>,
+    pub parent_id: Option<String>,
+}
+
+impl CellInfo {
+    fn from_capnp(info: &crate::kaijutsu_capnp::cell_info::Reader<'_>) -> Result<Self, RpcError> {
+        Ok(Self {
+            id: info.get_id()?.to_string()?,
+            kind: CellKind::from_capnp(info.get_kind()?),
+            language: {
+                let lang = info.get_language()?;
+                if lang.is_empty() {
+                    None
+                } else {
+                    Some(lang.to_string()?)
+                }
+            },
+            parent_id: {
+                let parent = info.get_parent_id()?;
+                if parent.is_empty() {
+                    None
+                } else {
+                    Some(parent.to_string()?)
+                }
+            },
+        })
+    }
+}
+
+/// Full cell state including content and CRDT document
+#[derive(Debug, Clone)]
+pub struct CellState {
+    pub info: CellInfo,
+    pub content: String,
+    pub version: u64,
+    pub encoded_doc: Option<Vec<u8>>,
+}
+
+impl CellState {
+    fn from_capnp(cell: &crate::kaijutsu_capnp::cell_state::Reader<'_>) -> Result<Self, RpcError> {
+        Ok(Self {
+            info: CellInfo::from_capnp(&cell.get_info()?)?,
+            content: cell.get_content()?.to_string()?,
+            version: cell.get_version(),
+            encoded_doc: {
+                let data = cell.get_encoded_doc()?;
+                if data.is_empty() {
+                    None
+                } else {
+                    Some(data.to_vec())
+                }
+            },
+        })
+    }
+}
+
+/// A patch for syncing a cell from one version to another
+#[derive(Debug, Clone)]
+pub struct CellPatch {
+    pub cell_id: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    pub ops: Vec<u8>,
+}
+
+impl CellPatch {
+    fn from_capnp(patch: &crate::kaijutsu_capnp::cell_patch::Reader<'_>) -> Result<Self, RpcError> {
+        Ok(Self {
+            cell_id: patch.get_cell_id()?.to_string()?,
+            from_version: patch.get_from_version(),
+            to_version: patch.get_to_version(),
+            ops: patch.get_ops()?.to_vec(),
+        })
+    }
+}
+
+/// Client-side cell version for sync requests
+#[derive(Debug, Clone)]
+pub struct CellVersion {
+    pub cell_id: String,
+    pub version: u64,
+}
+
+/// A CRDT operation to apply to a cell
+#[derive(Debug, Clone)]
+pub struct CellOp {
+    pub cell_id: String,
+    pub client_version: u64,
+    pub op: CrdtOp,
+}
+
+/// The actual CRDT operation
+#[derive(Debug, Clone)]
+pub enum CrdtOp {
+    Insert { pos: u64, text: String },
+    Delete { pos: u64, len: u64 },
+    FullState(Vec<u8>),
 }
 
 // ============================================================================
