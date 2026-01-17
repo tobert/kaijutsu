@@ -7,7 +7,7 @@ description = "Bevy GUI client for kaijutsu"
 [dependencies]
 kaijutsu-client = { path = "../kaijutsu-client" }
 
-bevy = { version = "0.18", features = ["default"] }
+bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
 tokio.workspace = true
 tokio-util.workspace = true

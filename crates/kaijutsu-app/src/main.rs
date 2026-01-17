@@ -33,7 +33,12 @@ fn main() {
         // Messages
         .add_message::<ui::context::MessageEvent>()
         // Startup
-        .add_systems(Startup, (ui::shell::setup, ui::console::setup_console, startup_connect))
+        .add_systems(Startup, (
+            ui::shell::setup,
+            ui::console::setup_console,
+            ui::debug::setup_debug_overlay,
+            startup_connect,
+        ))
         // Update
         .add_systems(
             Update,
@@ -62,6 +67,9 @@ fn main() {
                 ui::context::update_selection_highlight,
                 // Connection events → UI
                 handle_connection_events,
+                // Debug tools (F1 overlay, F12 screenshot)
+                ui::debug::handle_debug_toggle,
+                ui::debug::handle_screenshot,
             ),
         )
         .run();
