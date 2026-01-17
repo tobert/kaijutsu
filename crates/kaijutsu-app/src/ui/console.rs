@@ -52,7 +52,7 @@ impl Default for ConsoleState {
             input: String::new(),
             history: vec![
                 ConsoleLine::system("【kaish】 Console ready."),
-                ConsoleLine::system("Type 'help' for commands. Press ` to close."),
+                ConsoleLine::system("Type 'help' for commands. Ctrl-Z to toggle."),
             ],
             command_history: Vec::new(),
             history_index: None,
@@ -235,14 +235,15 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
         });
 }
 
-/// Toggle console visibility with backtick
+/// Toggle console visibility with Ctrl-Z (like backgrounding a process)
 pub fn toggle_console(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<ConsoleState>,
     mut query: Query<(&mut Visibility, &mut Node), With<ConsolePanel>>,
 ) {
-    // Backtick toggles visibility
-    if keys.just_pressed(KeyCode::Backquote) {
+    // Ctrl-Z toggles visibility (muscle memory from Unix job control)
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if ctrl && keys.just_pressed(KeyCode::KeyZ) {
         state.visible = !state.visible;
 
         for (mut vis, mut node) in &mut query {
@@ -256,11 +257,9 @@ pub fn toggle_console(
         }
     }
 
-    // Ctrl+Backtick cycles height (when visible)
-    if state.visible
-        && keys.just_pressed(KeyCode::Backquote)
-        && keys.pressed(KeyCode::ControlLeft)
-    {
+    // Ctrl+Shift+Z cycles height (when visible)
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if state.visible && ctrl && shift && keys.just_pressed(KeyCode::KeyZ) {
         state.height = state.height.cycle();
         for (_, mut node) in &mut query {
             node.height = Val::Percent(state.height.as_percent());

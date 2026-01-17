@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy_brp_extras::BrpExtrasPlugin;
 
 mod connection;
 mod state;
@@ -17,6 +18,8 @@ fn main() {
             }),
             ..default()
         }))
+        // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
+        .add_plugins(BrpExtrasPlugin)
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ConnectionBridgePlugin)
         // State
@@ -67,7 +70,7 @@ fn main() {
 /// On startup, show welcome message (auto-reconnect handles connection)
 fn startup_connect(mut events: MessageWriter<ui::context::MessageEvent>) {
     events.write(ui::context::MessageEvent::system(
-        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, ` for console.",
+        "Welcome to 会術 Kaijutsu! Press 'i' to enter Insert mode, Ctrl-Z for shell.",
     ));
 }
 
