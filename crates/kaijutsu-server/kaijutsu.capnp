@@ -85,6 +85,54 @@ enum RowType {
 }
 
 # ============================================================================
+# VFS Types
+# ============================================================================
+
+enum FileType {
+  file @0;
+  directory @1;
+  symlink @2;
+}
+
+struct FileAttr {
+  size @0 :UInt64;
+  kind @1 :FileType;
+  perm @2 :UInt32;
+  mtimeSecs @3 :UInt64;        # Seconds since UNIX epoch
+  mtimeNanos @4 :UInt32;       # Nanoseconds
+  nlink @5 :UInt32;
+}
+
+struct DirEntry {
+  name @0 :Text;
+  kind @1 :FileType;
+}
+
+struct SetAttr {
+  size @0 :UInt64;             # 0 = not set (use hasSize)
+  hasSize @1 :Bool;
+  perm @2 :UInt32;
+  hasPerm @3 :Bool;
+  mtimeSecs @4 :UInt64;
+  hasMtime @5 :Bool;
+}
+
+struct StatFs {
+  blocks @0 :UInt64;
+  bfree @1 :UInt64;
+  bavail @2 :UInt64;
+  files @3 :UInt64;
+  ffree @4 :UInt64;
+  bsize @5 :UInt32;
+  namelen @6 :UInt32;
+}
+
+struct MountInfo {
+  path @0 :Text;
+  readOnly @1 :Bool;
+}
+
+# ============================================================================
 # Kernel Output Types
 # ============================================================================
 
@@ -159,5 +207,36 @@ interface Kernel {
   thread @14 (name :Text) -> (kernel :Kernel);
   detach @15 ();
 
-  # Future: VFS mount/unmount, Lease acquire/release, Checkpoint
+  # VFS
+  vfs @16 () -> (vfs :Vfs);
+  listMounts @17 () -> (mounts :List(MountInfo));
+  mount @18 (path :Text, source :Text, writable :Bool);
+  unmount @19 (path :Text) -> (success :Bool);
+}
+
+# ============================================================================
+# VFS Interface
+# ============================================================================
+
+interface Vfs {
+  # Reading
+  getattr @0 (path :Text) -> (attr :FileAttr);
+  readdir @1 (path :Text) -> (entries :List(DirEntry));
+  read @2 (path :Text, offset :UInt64, size :UInt32) -> (data :Data);
+  readlink @3 (path :Text) -> (target :Text);
+
+  # Writing
+  write @4 (path :Text, offset :UInt64, data :Data) -> (written :UInt32);
+  create @5 (path :Text, mode :UInt32) -> (attr :FileAttr);
+  mkdir @6 (path :Text, mode :UInt32) -> (attr :FileAttr);
+  unlink @7 (path :Text);
+  rmdir @8 (path :Text);
+  rename @9 (from :Text, to :Text);
+  truncate @10 (path :Text, size :UInt64);
+  setattr @11 (path :Text, attr :SetAttr) -> (newAttr :FileAttr);
+  symlink @12 (path :Text, target :Text) -> (attr :FileAttr);
+
+  # Metadata
+  readOnly @13 () -> (readOnly :Bool);
+  statfs @14 () -> (stat :StatFs);
 }

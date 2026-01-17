@@ -417,22 +417,20 @@ impl kernel::Server for KernelImpl {
                         timestamp,
                     });
 
-                    // Add output as a tool result row
-                    if !exec_result.out.is_empty() || !exec_result.err.is_empty() {
-                        let content = if exec_result.ok() {
-                            exec_result.out.clone()
-                        } else {
-                            format!("Error: {}", exec_result.err)
-                        };
-                        kernel.rows.push(RowData {
-                            id: row_id,
-                            parent_id: 0,
-                            row_type: RowType::ToolResult,
-                            sender,
-                            content,
-                            timestamp,
-                        });
-                    }
+                    // Always add a tool result row (even if empty, so history fetch works)
+                    let content = if !exec_result.ok() {
+                        format!("Error: {}", exec_result.err)
+                    } else {
+                        exec_result.out.clone() // May be empty string
+                    };
+                    kernel.rows.push(RowData {
+                        id: row_id,
+                        parent_id: 0,
+                        row_type: RowType::ToolResult,
+                        sender,
+                        content,
+                        timestamp,
+                    });
                 }
 
                 results.get().set_exec_id(exec_id);
@@ -543,5 +541,184 @@ impl kernel::Server for KernelImpl {
         _results: kernel::DetachResults,
     ) -> Promise<(), capnp::Error> {
         Promise::ok(())
+    }
+
+    // VFS methods
+
+    fn vfs(
+        self: Rc<Self>,
+        _params: kernel::VfsParams,
+        mut results: kernel::VfsResults,
+    ) -> Promise<(), capnp::Error> {
+        // Return a VFS capability backed by this kernel
+        let vfs_impl = VfsImpl::new(self.state.clone(), self.kernel_id.clone());
+        results.get().set_vfs(capnp_rpc::new_client(vfs_impl));
+        Promise::ok(())
+    }
+
+    fn list_mounts(
+        self: Rc<Self>,
+        _params: kernel::ListMountsParams,
+        mut results: kernel::ListMountsResults,
+    ) -> Promise<(), capnp::Error> {
+        // Return empty list for now - VFS integration pending
+        results.get().init_mounts(0);
+        Promise::ok(())
+    }
+
+    fn mount(
+        self: Rc<Self>,
+        _params: kernel::MountParams,
+        _results: kernel::MountResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("mount not yet implemented".into()))
+    }
+
+    fn unmount(
+        self: Rc<Self>,
+        _params: kernel::UnmountParams,
+        _results: kernel::UnmountResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("unmount not yet implemented".into()))
+    }
+}
+
+// ============================================================================
+// VFS Implementation
+// ============================================================================
+
+struct VfsImpl {
+    #[allow(dead_code)]
+    state: Rc<RefCell<ServerState>>,
+    #[allow(dead_code)]
+    kernel_id: String,
+}
+
+impl VfsImpl {
+    fn new(state: Rc<RefCell<ServerState>>, kernel_id: String) -> Self {
+        Self { state, kernel_id }
+    }
+}
+
+impl vfs::Server for VfsImpl {
+    fn getattr(
+        self: Rc<Self>,
+        _params: vfs::GetattrParams,
+        _results: vfs::GetattrResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS getattr not yet implemented".into()))
+    }
+
+    fn readdir(
+        self: Rc<Self>,
+        _params: vfs::ReaddirParams,
+        _results: vfs::ReaddirResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS readdir not yet implemented".into()))
+    }
+
+    fn read(
+        self: Rc<Self>,
+        _params: vfs::ReadParams,
+        _results: vfs::ReadResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS read not yet implemented".into()))
+    }
+
+    fn readlink(
+        self: Rc<Self>,
+        _params: vfs::ReadlinkParams,
+        _results: vfs::ReadlinkResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS readlink not yet implemented".into()))
+    }
+
+    fn write(
+        self: Rc<Self>,
+        _params: vfs::WriteParams,
+        _results: vfs::WriteResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS write not yet implemented".into()))
+    }
+
+    fn create(
+        self: Rc<Self>,
+        _params: vfs::CreateParams,
+        _results: vfs::CreateResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS create not yet implemented".into()))
+    }
+
+    fn mkdir(
+        self: Rc<Self>,
+        _params: vfs::MkdirParams,
+        _results: vfs::MkdirResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS mkdir not yet implemented".into()))
+    }
+
+    fn unlink(
+        self: Rc<Self>,
+        _params: vfs::UnlinkParams,
+        _results: vfs::UnlinkResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS unlink not yet implemented".into()))
+    }
+
+    fn rmdir(
+        self: Rc<Self>,
+        _params: vfs::RmdirParams,
+        _results: vfs::RmdirResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS rmdir not yet implemented".into()))
+    }
+
+    fn rename(
+        self: Rc<Self>,
+        _params: vfs::RenameParams,
+        _results: vfs::RenameResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS rename not yet implemented".into()))
+    }
+
+    fn truncate(
+        self: Rc<Self>,
+        _params: vfs::TruncateParams,
+        _results: vfs::TruncateResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS truncate not yet implemented".into()))
+    }
+
+    fn setattr(
+        self: Rc<Self>,
+        _params: vfs::SetattrParams,
+        _results: vfs::SetattrResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS setattr not yet implemented".into()))
+    }
+
+    fn symlink(
+        self: Rc<Self>,
+        _params: vfs::SymlinkParams,
+        _results: vfs::SymlinkResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS symlink not yet implemented".into()))
+    }
+
+    fn read_only(
+        self: Rc<Self>,
+        _params: vfs::ReadOnlyParams,
+        mut results: vfs::ReadOnlyResults,
+    ) -> Promise<(), capnp::Error> {
+        results.get().set_read_only(false);
+        Promise::ok(())
+    }
+
+    fn statfs(
+        self: Rc<Self>,
+        _params: vfs::StatfsParams,
+        _results: vfs::StatfsResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented("VFS statfs not yet implemented".into()))
     }
 }

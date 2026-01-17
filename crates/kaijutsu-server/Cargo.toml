@@ -5,6 +5,9 @@ edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
 [dependencies]
+# Kaijutsu kernel (VFS + state + control plane)
+kaijutsu-kernel.workspace = true
+
 # Kaish execution engine (spawned as subprocess, connected via IPC)
 kaish-kernel.workspace = true
 kaish-client.workspace = true

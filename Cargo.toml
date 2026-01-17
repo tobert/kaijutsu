@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/kaijutsu-kernel",
     "crates/kaijutsu-client",
     "crates/kaijutsu-server",
     "crates/kaijutsu-app",
@@ -13,6 +14,9 @@ license = "MIT"
 repository = "https://github.com/atobey/kaijutsu"
 
 [workspace.dependencies]
+# Kaijutsu kernel (core VFS + state)
+kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
+
 # Kaish (execution engine + client)
 kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
 kaish-client = { path = "../kaish/crates/kaish-client" }
@@ -43,3 +47,7 @@ async-trait = "0.1"
 # Utilities
 rand = "0.8"  # must match russh's dependency
 shellexpand = "3"
+
+# Bevy Remote Protocol (debugging)
+bevy_remote = "0.18"
+bevy_brp_extras = "0.18"
