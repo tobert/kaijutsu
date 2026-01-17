@@ -4,6 +4,7 @@
 //! - A VFS (MountTable)
 //! - State (variables, history, checkpoints)
 //! - Tools (execution engines)
+//! - LLM providers (for model access)
 //! - Control plane (lease, consent mode)
 
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::control::{ConsentMode, ControlPlane, LeaseError, LeaseHolder};
+use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmRegistry, LlmResult};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 use crate::vfs::{
@@ -34,6 +36,8 @@ pub struct Kernel {
     state: RwLock<KernelState>,
     /// Tool registry (behind RwLock for interior mutability).
     tools: RwLock<ToolRegistry>,
+    /// LLM provider registry (behind RwLock for interior mutability).
+    llm: RwLock<LlmRegistry>,
     /// Control plane (behind RwLock for interior mutability).
     control: RwLock<ControlPlane>,
 }
@@ -44,6 +48,7 @@ impl std::fmt::Debug for Kernel {
             .field("vfs", &self.vfs)
             .field("state", &"<locked>")
             .field("tools", &"<locked>")
+            .field("llm", &"<locked>")
             .field("control", &"<locked>")
             .finish()
     }
@@ -64,6 +69,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
+            llm: RwLock::new(LlmRegistry::new()),
             control: RwLock::new(ControlPlane::new()),
         }
     }
@@ -78,6 +84,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::with_id(id, &name)),
             tools: RwLock::new(ToolRegistry::new()),
+            llm: RwLock::new(LlmRegistry::new()),
             control: RwLock::new(ControlPlane::new()),
         }
     }
@@ -285,6 +292,61 @@ impl Kernel {
     }
 
     // ========================================================================
+    // LLM Providers
+    // ========================================================================
+
+    /// Register an LLM provider.
+    pub async fn register_llm(&self, provider: Arc<dyn LlmProvider>) {
+        self.llm.write().await.register(provider);
+    }
+
+    /// Set the default LLM provider.
+    pub async fn set_default_llm(&self, name: &str) -> bool {
+        self.llm.write().await.set_default(name)
+    }
+
+    /// Get the LLM registry (for direct access).
+    pub fn llm(&self) -> &RwLock<LlmRegistry> {
+        &self.llm
+    }
+
+    /// List registered LLM providers.
+    pub async fn list_llm_providers(&self) -> Vec<String> {
+        self.llm.read().await.list().into_iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Send a prompt to the default LLM provider.
+    ///
+    /// This is the simplest way to get a response from an LLM.
+    pub async fn prompt(&self, prompt: &str) -> LlmResult<String> {
+        self.llm.read().await.prompt(prompt).await
+    }
+
+    /// Send a completion request to the default LLM provider.
+    pub async fn complete(&self, request: CompletionRequest) -> LlmResult<CompletionResponse> {
+        let provider = self
+            .llm
+            .read()
+            .await
+            .default_provider()
+            .ok_or_else(|| crate::llm::LlmError::Unavailable("no default LLM provider".into()))?;
+
+        provider.complete(request).await
+    }
+
+    /// Send a prompt to a specific LLM provider.
+    pub async fn prompt_with(&self, provider_name: &str, model: &str, prompt: &str) -> LlmResult<String> {
+        let provider = self
+            .llm
+            .read()
+            .await
+            .get(provider_name)
+            .ok_or_else(|| crate::llm::LlmError::Unavailable(format!("provider not found: {}", provider_name)))?;
+
+        provider.prompt(model, prompt).await
+    }
+
+    // ========================================================================
     // Control Plane
     // ========================================================================
 
@@ -335,10 +397,14 @@ impl Kernel {
         // Copy mount info (but not backends - they'd need Clone impl)
         // This is a limitation - real fork would need backend cloning
 
+        // Note: LLM providers are not copied - forked kernels start fresh
+        // This matches tool behavior and avoids credential sharing concerns
+
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
+            llm: RwLock::new(LlmRegistry::new()),
             control: RwLock::new(ControlPlane::new()),
         }
     }
@@ -351,10 +417,14 @@ impl Kernel {
         // Share the VFS
         let vfs = Arc::clone(&self.vfs);
 
+        // Note: LLM providers are not shared - threaded kernels get fresh registry
+        // This avoids credential sharing and allows per-thread provider config
+
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
+            llm: RwLock::new(LlmRegistry::new()),
             control: RwLock::new(ControlPlane::new()),
         }
     }
@@ -431,7 +501,46 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmResult, Message, Usage};
     use crate::tools::NoopEngine;
+
+    /// Mock LLM provider for testing.
+    struct MockLlmProvider {
+        response: String,
+    }
+
+    impl MockLlmProvider {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into() }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockLlmProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn available_models(&self) -> Vec<&str> {
+            vec!["mock-model"]
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: CompletionRequest) -> LlmResult<CompletionResponse> {
+            Ok(CompletionResponse {
+                content: self.response.clone(),
+                model: "mock-model".to_string(),
+                stop_reason: Some("end_turn".to_string()),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                },
+            })
+        }
+    }
 
     #[tokio::test]
     async fn test_kernel_creation() {
@@ -540,5 +649,38 @@ mod tests {
         let forked_scratch = forked.getattr(Path::new("/scratch")).await;
         assert!(original_scratch.is_ok());
         assert!(forked_scratch.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_llm_provider() {
+        let kernel = Kernel::new("test").await;
+
+        // Register mock provider
+        let provider = Arc::new(MockLlmProvider::new("Hello from mock!"));
+        kernel.register_llm(provider).await;
+        kernel.set_default_llm("mock").await;
+
+        // Check provider is listed
+        let providers = kernel.list_llm_providers().await;
+        assert_eq!(providers, vec!["mock"]);
+
+        // Test prompt
+        let response = kernel.prompt("Hello").await.unwrap();
+        assert_eq!(response, "Hello from mock!");
+
+        // Test complete
+        let request = CompletionRequest::new("mock-model", vec![Message::user("Hi")]);
+        let response = kernel.complete(request).await.unwrap();
+        assert_eq!(response.content, "Hello from mock!");
+        assert_eq!(response.usage.total(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_llm_no_provider() {
+        let kernel = Kernel::new("test").await;
+
+        // Should fail gracefully without provider
+        let result = kernel.prompt("Hello").await;
+        assert!(result.is_err());
     }
 }

@@ -16,6 +16,7 @@ pub mod control;
 pub mod crdt;
 pub mod db;
 pub mod kernel;
+pub mod llm;
 pub mod script;
 pub mod state;
 pub mod tools;
@@ -29,6 +30,10 @@ pub use kernel::Kernel;
 pub use script::{HookEvent, HookRegistry, ScriptEngine, ScriptResult};
 pub use state::KernelState;
 pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
+pub use llm::{
+    AnthropicProvider, CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmRegistry,
+    LlmResult, Message as LlmMessage, Role as LlmRole, Usage as LlmUsage,
+};
 pub use vfs::{
     backends::{LocalBackend, MemoryBackend},
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,

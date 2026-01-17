@@ -9,6 +9,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod cell;
 mod connection;
+mod llm;
 mod shaders;
 mod text;
 mod ui;
@@ -53,6 +54,8 @@ fn main() {
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ConnectionBridgePlugin)
+        // LLM integration (Claude API)
+        .add_plugins(llm::LlmPlugin)
         // Resources
         .init_resource::<ui::theme::Theme>()
         // Startup
@@ -85,77 +88,160 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     ));
 }
 
-/// Temporary placeholder UI - shows connection status
+/// Set up the main conversation UI layout.
+///
+/// Layout structure:
+/// ```text
+/// ┌─────────────────────────────────────────────────────┐
+/// │ 会術 Kaijutsu                    [status: kernel]   │  ← Header
+/// ├─────────────────────────────────────────────────────┤
+/// │ ┌─────────────────────────────────────────────────┐ │
+/// │ │  (scrollable conversation messages)             │ │  ← Conversation
+/// │ │                                               ▼ │ │    Container
+/// │ └─────────────────────────────────────────────────┘ │
+/// ├─────────────────────────────────────────────────────┤
+/// │ ┌─────────────────────────────────────────────────┐ │
+/// │ │ Type your message...                            │ │  ← Prompt
+/// │ └─────────────────────────────────────────────────┘ │    Container
+/// │ [NORMAL]                              [Ctrl+Enter] │  ← Status bar
+/// └─────────────────────────────────────────────────────┘
+/// ```
 fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
-    // Root container - NO background so glyphon text shows through
+    // Root container - fills window, flex column layout
     commands
         .spawn((
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::FlexStart, // Top-aligned
-                padding: UiRect::top(Val::Px(20.0)),
                 ..default()
             },
-            // No BackgroundColor - let glyphon text show through
+            // Transparent - let camera clear color show through
         ))
-        .with_children(|parent| {
-            // Title
-            parent.spawn((
-                Text::new("会術 Kaijutsu"),
-                TextFont {
-                    font_size: 48.0,
+        .with_children(|root| {
+            // ═══════════════════════════════════════════════════════════════
+            // HEADER SECTION
+            // ═══════════════════════════════════════════════════════════════
+            root.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::all(Val::Px(16.0)),
+                    border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
-                TextColor(theme.accent),
+                BorderColor::all(theme.border),
+            ))
+            .with_children(|header| {
+                // Left: Title
+                header.spawn((
+                    Text::new("会術 Kaijutsu"),
+                    TextFont {
+                        font_size: 24.0,
+                        ..default()
+                    },
+                    TextColor(theme.accent),
+                ));
+
+                // Right: Connection status
+                header.spawn((
+                    StatusText,
+                    Text::new("Connecting..."),
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
+                    TextColor(theme.fg_dim),
+                ));
+            });
+
+            // ═══════════════════════════════════════════════════════════════
+            // CONVERSATION CONTAINER (scrollable)
+            // ═══════════════════════════════════════════════════════════════
+            root.spawn((
+                cell::ConversationContainer,
+                Node {
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Column,
+                    overflow: Overflow::scroll_y(),
+                    padding: UiRect::axes(Val::Px(20.0), Val::Px(12.0)),
+                    ..default()
+                },
             ));
 
-            // Subtitle
-            parent.spawn((
-                Text::new("Cell-based Collaborative Workspace"),
-                TextFont {
-                    font_size: 18.0,
-                    ..default()
-                },
-                TextColor(theme.fg_dim),
+            // ═══════════════════════════════════════════════════════════════
+            // PROMPT CONTAINER (fixed at bottom)
+            // ═══════════════════════════════════════════════════════════════
+            root.spawn((
+                cell::PromptContainer,
                 Node {
-                    margin: UiRect::top(Val::Px(8.0)),
+                    width: Val::Percent(100.0),
+                    min_height: Val::Px(70.0),
+                    max_height: Val::Px(150.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::FlexEnd,
+                    align_items: AlignItems::FlexStart,
+                    padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(8.0), Val::Px(4.0)),
+                    border: UiRect::top(Val::Px(1.0)),
                     ..default()
                 },
-            ));
+                BorderColor::all(theme.border),
+            ))
+            .with_children(|prompt_area| {
+                // Subtle hint text aligned to the right
+                prompt_area.spawn((
+                    PromptHint,
+                    Text::new("'i' to type"),
+                    TextFont {
+                        font_size: 11.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgba(0.4, 0.4, 0.4, 0.6)), // Very dim
+                ));
+            });
 
-            // Status marker
-            parent.spawn((
-                StatusText,
-                Text::new("Connecting..."),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(theme.fg_dim),
+            // ═══════════════════════════════════════════════════════════════
+            // STATUS BAR (bottom)
+            // ═══════════════════════════════════════════════════════════════
+            root.spawn((
                 Node {
-                    margin: UiRect::top(Val::Px(32.0)),
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
                     ..default()
                 },
-            ));
+                BackgroundColor(theme.panel_bg),
+            ))
+            .with_children(|status_bar| {
+                // Left: Mode indicator placeholder (actual mode indicator is in ui::mode_indicator)
+                status_bar.spawn((
+                    Text::new(""),
+                    TextFont {
+                        font_size: 12.0,
+                        ..default()
+                    },
+                    TextColor(theme.fg_dim),
+                ));
 
-            // Instructions
-            parent.spawn((
-                Text::new("F1: Debug | F2: New cell | F3: Toggle shaders | F12: Screenshot"),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
-                TextColor(theme.fg_dim),
-                Node {
-                    margin: UiRect::top(Val::Px(16.0)),
-                    ..default()
-                },
-            ));
+                // Right: Key hints
+                status_bar.spawn((
+                    Text::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode"),
+                    TextFont {
+                        font_size: 11.0,
+                        ..default()
+                    },
+                    TextColor(theme.fg_dim),
+                ));
+            });
         });
 }
+
+/// Marker for the prompt hint text (shows when prompt is empty).
+#[derive(Component)]
+struct PromptHint;
 
 /// Marker for status text
 #[derive(Component)]

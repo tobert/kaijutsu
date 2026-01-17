@@ -23,6 +23,9 @@ rusqlite.workspace = true
 # Scripting
 rhai.workspace = true
 
+# LLM providers
+anthropic-api.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs"] }
 
