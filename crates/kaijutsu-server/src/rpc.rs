@@ -1,6 +1,7 @@
 //! Cap'n Proto RPC server implementation
 //!
 //! Implements World and Kernel capabilities.
+//! Each kernel spawns a kaish subprocess for code execution.
 
 #![allow(refining_impl_trait)]
 
@@ -13,7 +14,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
-use crate::kaish::KaishRuntime;
+use crate::kaish::KaishProcess;
 
 // ============================================================================
 // Server State
@@ -67,8 +68,8 @@ pub struct KernelState {
     pub consent_mode: ConsentMode,
     pub rows: Vec<RowData>,
     pub command_history: Vec<CommandEntry>,
-    /// Embedded kaish runtime for execution
-    pub kaish: KaishRuntime,
+    /// Kaish subprocess for execution (spawned lazily)
+    pub kaish: Option<Rc<KaishProcess>>,
 }
 
 #[derive(Clone, Copy)]
@@ -152,7 +153,7 @@ impl world::Server for WorldImpl {
     ) -> Promise<(), capnp::Error> {
         let id = pry!(pry!(pry!(params.get()).get_id()).to_str()).to_owned();
 
-        // Create kernel if it doesn't exist (for now, later this should error)
+        // Create kernel entry if it doesn't exist (kaish spawned lazily on first execute)
         {
             let mut state = self.state.borrow_mut();
             if !state.kernels.contains_key(&id) {
@@ -162,7 +163,7 @@ impl world::Server for WorldImpl {
                     consent_mode: ConsentMode::Collaborative,
                     rows: Vec::new(),
                     command_history: Vec::new(),
-                    kaish: KaishRuntime::new(),
+                    kaish: None, // Spawned lazily
                 });
             }
         }
@@ -193,7 +194,7 @@ impl world::Server for WorldImpl {
                 consent_mode,
                 rows: Vec::new(),
                 command_history: Vec::new(),
-                kaish: KaishRuntime::new(),
+                kaish: None, // Spawned lazily
             });
             id
         };
@@ -353,7 +354,7 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    // kaish execution methods (directly on Kernel, no indirection)
+    // kaish execution methods
 
     fn execute(
         self: Rc<Self>,
@@ -361,69 +362,84 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ExecuteResults,
     ) -> Promise<(), capnp::Error> {
         let code = pry!(pry!(pry!(params.get()).get_code()).to_str()).to_owned();
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
 
-        let (exec_id, exec_result) = {
-            let mut state = self.state.borrow_mut();
-            let exec_id = state.next_exec_id();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+        // Use Promise::from_future for async execution
+        Promise::from_future(async move {
+            // Get or spawn kaish process
+            let kaish = {
+                let mut state_ref = state.borrow_mut();
+                let kernel = state_ref.kernels.get_mut(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
 
-            let exec_result = if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-                // Record in command history
-                kernel.command_history.push(CommandEntry {
-                    id: exec_id,
-                    code: code.clone(),
-                    timestamp,
-                });
-
-                // Execute via kaish runtime
-                match kernel.kaish.execute(&code) {
-                    Ok(result) => result,
-                    Err(e) => kaish_kernel::interpreter::ExecResult::failure(1, e.to_string()),
+                if kernel.kaish.is_none() {
+                    log::info!("Spawning kaish subprocess for kernel {}", kernel_id);
+                    match KaishProcess::spawn(&kernel_id).await {
+                        Ok(process) => {
+                            kernel.kaish = Some(Rc::new(process));
+                        }
+                        Err(e) => {
+                            log::error!("Failed to spawn kaish: {}", e);
+                            return Err(capnp::Error::failed(format!("kaish spawn failed: {}", e)));
+                        }
+                    }
                 }
-            } else {
-                kaish_kernel::interpreter::ExecResult::failure(1, "kernel not found")
+
+                kernel.kaish.as_ref().unwrap().clone()
             };
 
-            (exec_id, exec_result)
-        };
+            // Execute code via kaish subprocess
+            let exec_result = match kaish.execute(&code).await {
+                Ok(result) => result,
+                Err(e) => {
+                    log::error!("kaish execute error: {}", e);
+                    kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
+                }
+            };
 
-        // Build the response
-        results.get().set_exec_id(exec_id);
+            // Record in state and build response
+            {
+                let mut state_ref = state.borrow_mut();
+                let exec_id = state_ref.next_exec_id();
+                let sender = state_ref.identity.username.clone();
+                let row_id = state_ref.next_row_id();
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-        // Also add output as a row in the kernel's history
-        {
-            let mut state = self.state.borrow_mut();
-            let sender = state.identity.username.clone();
-            let row_id = state.next_row_id();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-                // Add output as a tool result row
-                if !exec_result.out.is_empty() || !exec_result.err.is_empty() {
-                    let content = if exec_result.ok() {
-                        exec_result.out.clone()
-                    } else {
-                        format!("Error: {}", exec_result.err)
-                    };
-                    kernel.rows.push(RowData {
-                        id: row_id,
-                        parent_id: 0,
-                        row_type: RowType::ToolResult,
-                        sender,
-                        content,
+                if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id) {
+                    // Record command history
+                    kernel.command_history.push(CommandEntry {
+                        id: exec_id,
+                        code: code.clone(),
                         timestamp,
                     });
-                }
-            }
-        }
 
-        Promise::ok(())
+                    // Add output as a tool result row
+                    if !exec_result.out.is_empty() || !exec_result.err.is_empty() {
+                        let content = if exec_result.ok() {
+                            exec_result.out.clone()
+                        } else {
+                            format!("Error: {}", exec_result.err)
+                        };
+                        kernel.rows.push(RowData {
+                            id: row_id,
+                            parent_id: 0,
+                            row_type: RowType::ToolResult,
+                            sender,
+                            content,
+                            timestamp,
+                        });
+                    }
+                }
+
+                results.get().set_exec_id(exec_id);
+            }
+
+            Ok(())
+        })
     }
 
     fn interrupt(

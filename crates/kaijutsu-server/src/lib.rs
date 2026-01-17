@@ -11,6 +11,6 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
-pub use kaish::KaishRuntime;
+pub use kaish::KaishProcess;
 pub use rpc::WorldImpl;
 pub use ssh::{SshServer, SshServerConfig};

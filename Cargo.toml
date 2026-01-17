@@ -13,8 +13,9 @@ license = "MIT"
 repository = "https://github.com/atobey/kaijutsu"
 
 [workspace.dependencies]
-# Kaish (embedded execution engine)
+# Kaish (execution engine + client)
 kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
+kaish-client = { path = "../kaish/crates/kaish-client" }
 
 # Cap'n Proto
 capnp = "0.25"
@@ -22,7 +23,7 @@ capnp-rpc = "0.25"
 capnpc = "0.25"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
@@ -41,3 +42,4 @@ async-trait = "0.1"
 
 # Utilities
 rand = "0.8"  # must match russh's dependency
+shellexpand = "3"

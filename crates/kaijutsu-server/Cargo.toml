@@ -5,8 +5,9 @@ edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
 [dependencies]
-# Kaish execution engine
+# Kaish execution engine (spawned as subprocess, connected via IPC)
 kaish-kernel.workspace = true
+kaish-client.workspace = true
 
 capnp.workspace = true
 capnp-rpc.workspace = true
@@ -18,6 +19,7 @@ log.workspace = true
 env_logger.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+shellexpand.workspace = true
 async-trait.workspace = true
 rand.workspace = true
 
