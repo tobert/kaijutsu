@@ -139,6 +139,7 @@ pub fn setup_console(mut commands: Commands, theme: Res<Theme>, asset_server: Re
                 ..default()
             },
             BackgroundColor(Color::srgba(0.02, 0.02, 0.05, 0.95)),
+            GlobalZIndex(100), // Render on top of everything
             Visibility::Hidden,
             ConsolePanel,
         ))
