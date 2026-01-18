@@ -391,6 +391,216 @@ impl KernelHandle {
 
         Ok((patches, new_cells))
     }
+
+    // =========================================================================
+    // Block-based CRDT sync methods (new architecture)
+    // =========================================================================
+
+    /// Apply a block operation to a cell
+    pub async fn apply_block_op(
+        &self,
+        cell_id: &str,
+        op: kaijutsu_crdt::BlockDocOp,
+    ) -> Result<u64, RpcError> {
+        use kaijutsu_crdt::BlockDocOp;
+
+        let mut request = self.kernel.apply_block_op_request();
+        {
+            let mut params = request.get();
+            params.set_cell_id(cell_id);
+            let mut op_builder = params.init_op();
+
+            match op {
+                BlockDocOp::InsertBlock {
+                    id,
+                    after,
+                    content,
+                    author,
+                    created_at,
+                    ..
+                } => {
+                    let mut insert = op_builder.init_insert_block();
+                    let mut id_builder = insert.reborrow().init_id();
+                    id_builder.set_cell_id(&id.cell_id);
+                    id_builder.set_agent_id(&id.agent_id);
+                    id_builder.set_seq(id.seq);
+
+                    if let Some(after_id) = after {
+                        insert.reborrow().set_has_after_id(true);
+                        let mut after_builder = insert.reborrow().init_after_id();
+                        after_builder.set_cell_id(&after_id.cell_id);
+                        after_builder.set_agent_id(&after_id.agent_id);
+                        after_builder.set_seq(after_id.seq);
+                    } else {
+                        insert.reborrow().set_has_after_id(false);
+                    }
+
+                    insert.reborrow().set_author(&author);
+                    insert.reborrow().set_created_at(created_at);
+
+                    build_block_content(insert.init_content(), &content);
+                }
+                BlockDocOp::DeleteBlock { id } => {
+                    let mut delete = op_builder.init_delete_block();
+                    delete.set_cell_id(&id.cell_id);
+                    delete.set_agent_id(&id.agent_id);
+                    delete.set_seq(id.seq);
+                }
+                BlockDocOp::EditBlockText {
+                    id,
+                    pos,
+                    insert,
+                    delete,
+                    ..
+                } => {
+                    let mut edit = op_builder.init_edit_block_text();
+                    let mut id_builder = edit.reborrow().init_id();
+                    id_builder.set_cell_id(&id.cell_id);
+                    id_builder.set_agent_id(&id.agent_id);
+                    id_builder.set_seq(id.seq);
+
+                    edit.set_pos(pos as u64);
+                    edit.set_insert(&insert);
+                    edit.set_delete(delete as u64);
+                }
+                BlockDocOp::SetCollapsed { id, collapsed } => {
+                    let mut set_col = op_builder.init_set_collapsed();
+                    let mut id_builder = set_col.reborrow().init_id();
+                    id_builder.set_cell_id(&id.cell_id);
+                    id_builder.set_agent_id(&id.agent_id);
+                    id_builder.set_seq(id.seq);
+
+                    set_col.set_collapsed(collapsed);
+                }
+                BlockDocOp::MoveBlock { id, after, .. } => {
+                    let mut move_op = op_builder.init_move_block();
+                    let mut id_builder = move_op.reborrow().init_id();
+                    id_builder.set_cell_id(&id.cell_id);
+                    id_builder.set_agent_id(&id.agent_id);
+                    id_builder.set_seq(id.seq);
+
+                    if let Some(after_id) = after {
+                        move_op.reborrow().set_has_after_id(true);
+                        let mut after_builder = move_op.reborrow().init_after_id();
+                        after_builder.set_cell_id(&after_id.cell_id);
+                        after_builder.set_agent_id(&after_id.agent_id);
+                        after_builder.set_seq(after_id.seq);
+                    } else {
+                        move_op.reborrow().set_has_after_id(false);
+                    }
+                }
+            }
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_new_version())
+    }
+
+    /// Get block cell state
+    pub async fn get_block_cell_state(
+        &self,
+        cell_id: &str,
+    ) -> Result<(Vec<(kaijutsu_crdt::BlockId, kaijutsu_crdt::BlockContentSnapshot)>, u64), RpcError>
+    {
+        let mut request = self.kernel.get_block_cell_state_request();
+        request.get().set_cell_id(cell_id);
+        let response = request.send().promise.await?;
+        let state = response.get()?.get_state()?;
+
+        let version = state.get_version();
+        let blocks_reader = state.get_blocks()?;
+        let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
+
+        for block in blocks_reader.iter() {
+            let id = parse_block_id(&block.get_id()?)?;
+            let content = parse_block_content(&block.get_content()?)?;
+            blocks.push((id, content));
+        }
+
+        Ok((blocks, version))
+    }
+}
+
+/// Helper to build block content from snapshot
+fn build_block_content(
+    mut builder: crate::kaijutsu_capnp::block_content::Builder<'_>,
+    content: &kaijutsu_crdt::BlockContentSnapshot,
+) {
+    use kaijutsu_crdt::BlockContentSnapshot;
+
+    match content {
+        BlockContentSnapshot::Thinking { text, collapsed } => {
+            let mut thinking = builder.init_thinking();
+            thinking.set_text(text);
+            thinking.set_collapsed(*collapsed);
+        }
+        BlockContentSnapshot::Text { text } => {
+            builder.set_text(text);
+        }
+        BlockContentSnapshot::ToolUse { id, name, input } => {
+            let mut tool_use = builder.init_tool_use();
+            tool_use.set_id(id);
+            tool_use.set_name(name);
+            tool_use.set_input(&input.to_string());
+        }
+        BlockContentSnapshot::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let mut tool_result = builder.init_tool_result();
+            tool_result.set_tool_use_id(tool_use_id);
+            tool_result.set_content(content);
+            tool_result.set_is_error(*is_error);
+        }
+    }
+}
+
+/// Helper to parse block ID from Cap'n Proto
+fn parse_block_id(
+    reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+    Ok(kaijutsu_crdt::BlockId {
+        cell_id: reader.get_cell_id()?.to_string()?,
+        agent_id: reader.get_agent_id()?.to_string()?,
+        seq: reader.get_seq(),
+    })
+}
+
+/// Helper to parse block content from Cap'n Proto
+fn parse_block_content(
+    reader: &crate::kaijutsu_capnp::block_content::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockContentSnapshot, RpcError> {
+    use crate::kaijutsu_capnp::block_content::Which;
+    use kaijutsu_crdt::BlockContentSnapshot;
+
+    match reader.which()? {
+        Which::Thinking(thinking) => {
+            Ok(BlockContentSnapshot::Thinking {
+                text: thinking.get_text()?.to_string()?,
+                collapsed: thinking.get_collapsed(),
+            })
+        }
+        Which::Text(text) => Ok(BlockContentSnapshot::Text {
+            text: text?.to_string()?,
+        }),
+        Which::ToolUse(tool_use) => {
+            let input_str = tool_use.get_input()?.to_string()?;
+            let input: serde_json::Value =
+                serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+            Ok(BlockContentSnapshot::ToolUse {
+                id: tool_use.get_id()?.to_string()?,
+                name: tool_use.get_name()?.to_string()?,
+                input,
+            })
+        }
+        Which::ToolResult(tool_result) => {
+            Ok(BlockContentSnapshot::ToolResult {
+                tool_use_id: tool_result.get_tool_use_id()?.to_string()?,
+                content: tool_result.get_content()?.to_string()?,
+                is_error: tool_result.get_is_error(),
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

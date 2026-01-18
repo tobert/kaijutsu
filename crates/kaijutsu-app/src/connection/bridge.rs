@@ -11,9 +11,10 @@ use tokio::sync::mpsc;
 
 // Use types from the client library
 use kaijutsu_client::{
-    CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, CrdtOp, Identity, KernelConfig,
+    CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, Identity, KernelConfig,
     KernelHandle, KernelInfo, Row, RpcClient, SshConfig,
 };
+use kaijutsu_crdt::{BlockContentSnapshot, BlockDocOp, BlockId};
 
 /// Default server address for local development
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
@@ -62,10 +63,16 @@ pub enum ConnectionCommand {
     },
     /// Delete a cell
     DeleteCell { cell_id: String },
-    /// Apply a CRDT operation to a cell
+    /// Apply a CRDT operation to a cell (legacy - transitional)
     ApplyCellOp { op: CellOp },
     /// Sync all cells (on connect or reconnect)
     SyncCells { versions: Vec<CellVersion> },
+
+    // Block-based CRDT operations (new architecture)
+    /// Apply a block operation to a cell
+    ApplyBlockOp { cell_id: String, op: BlockDocOp },
+    /// Get block cell state
+    GetBlockCellState { cell_id: String },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -114,6 +121,45 @@ pub enum ConnectionEvent {
     CellSyncResult {
         patches: Vec<CellPatch>,
         new_cells: Vec<CellState>,
+    },
+
+    // Block-based CRDT events (new architecture)
+    /// Block operation applied successfully
+    BlockOpApplied { cell_id: String, new_version: u64 },
+    /// Block was inserted
+    BlockInserted {
+        cell_id: String,
+        block_id: BlockId,
+        after_id: Option<BlockId>,
+        content: BlockContentSnapshot,
+    },
+    /// Block was deleted
+    BlockDeleted { cell_id: String, block_id: BlockId },
+    /// Block text was edited
+    BlockEdited {
+        cell_id: String,
+        block_id: BlockId,
+        pos: usize,
+        insert: String,
+        delete: usize,
+    },
+    /// Block collapsed state changed
+    BlockCollapsed {
+        cell_id: String,
+        block_id: BlockId,
+        collapsed: bool,
+    },
+    /// Block was moved
+    BlockMoved {
+        cell_id: String,
+        block_id: BlockId,
+        after_id: Option<BlockId>,
+    },
+    /// Block cell state received
+    BlockCellState {
+        cell_id: String,
+        blocks: Vec<(BlockId, BlockContentSnapshot)>,
+        version: u64,
     },
 }
 
@@ -666,6 +712,42 @@ async fn connection_loop(
                         Ok((patches, new_cells)) => {
                             let _ =
                                 evt_tx.send(ConnectionEvent::CellSyncResult { patches, new_cells });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            // Block-based CRDT commands
+            ConnectionCommand::ApplyBlockOp { cell_id, op } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.apply_block_op(&cell_id, op).await {
+                        Ok(new_version) => {
+                            let _ = evt_tx
+                                .send(ConnectionEvent::BlockOpApplied { cell_id, new_version });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            ConnectionCommand::GetBlockCellState { cell_id } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.get_block_cell_state(&cell_id).await {
+                        Ok((blocks, version)) => {
+                            let _ = evt_tx.send(ConnectionEvent::BlockCellState {
+                                cell_id,
+                                blocks,
+                                version,
+                            });
                         }
                         Err(e) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));

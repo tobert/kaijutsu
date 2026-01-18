@@ -20,17 +20,16 @@ use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
 use kaijutsu_kernel::{
-    CellDb, CellEditEngine, CellKind, CellListEngine, CellReadEngine, CellStore, Kernel,
-    LocalBackend, ToolInfo, VfsOps,
+    CellDb, CellEditEngine, CellKind, CellListEngine, CellReadEngine, Kernel,
+    LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
 };
-use std::sync::Mutex as StdMutex;
 
 // ============================================================================
 // Server State
 // ============================================================================
 
 /// Register cell editing tools with a kernel.
-async fn register_cell_tools(kernel: &Arc<Kernel>, cells: Arc<StdMutex<CellStore>>) {
+async fn register_cell_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     // Register cell.edit tool
     kernel
         .register_tool_with_engine(
@@ -114,24 +113,27 @@ fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Open or create a CellStore with database persistence for a kernel.
-fn create_cell_store_with_db(kernel_id: &str) -> CellStore {
+/// Open or create a BlockStore with database persistence for a kernel.
+fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
     let db_path = kernel_data_dir(kernel_id).join("data.db");
     match CellDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened cell database at {:?}", db_path);
-            let mut store = CellStore::with_db(db);
-            if let Err(e) = store.load_from_db() {
-                log::warn!("Failed to load cells from DB: {}", e);
-            } else {
-                let count = store.iter().count();
-                log::info!("Loaded {} cells from database", count);
+            let store = shared_block_store_with_db(db, "server");
+            {
+                let mut guard = store.write().unwrap();
+                if let Err(e) = guard.load_from_db() {
+                    log::warn!("Failed to load cells from DB: {}", e);
+                } else {
+                    let count = guard.iter().count();
+                    log::info!("Loaded {} cells from database", count);
+                }
             }
             store
         }
         Err(e) => {
             log::warn!("Failed to open cell database at {:?}: {}, using in-memory", db_path, e);
-            CellStore::new()
+            shared_block_store("server")
         }
     }
 }
@@ -146,8 +148,8 @@ pub struct KernelState {
     pub kaish: Option<Rc<KaishProcess>>,
     /// The kernel (VFS, state, tools, control plane)
     pub kernel: Arc<Kernel>,
-    /// Cell CRDT store (wrapped for sharing with tools)
-    pub cells: Arc<StdMutex<CellStore>>,
+    /// Block-based CRDT store (wrapped for sharing with tools)
+    pub cells: SharedBlockStore,
     /// Subscribers for cell update events
     pub cell_subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>,
 }
@@ -252,20 +254,20 @@ impl world::Server for WorldImpl {
                         .await;
                 }
 
-                // Create cell store with database persistence
-                let mut cells = create_cell_store_with_db(&id);
+                // Create block store with database persistence
+                let cells = create_block_store_with_db(&id);
 
                 // Create default cell if none exist
-                if cells.iter().next().is_none() {
-                    let default_id = uuid::Uuid::new_v4().to_string();
-                    log::info!("Creating default cell {} for kernel {}", default_id, id);
-                    if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                        log::warn!("Failed to create default cell: {}", e);
+                {
+                    let mut guard = cells.write().unwrap();
+                    if guard.iter().next().is_none() {
+                        let default_id = uuid::Uuid::new_v4().to_string();
+                        log::info!("Creating default cell {} for kernel {}", default_id, id);
+                        if let Err(e) = guard.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                            log::warn!("Failed to create default cell: {}", e);
+                        }
                     }
                 }
-
-                // Wrap cells in Arc<Mutex> for sharing with tools
-                let cells = Arc::new(StdMutex::new(cells));
 
                 // Register cell tools
                 let kernel_arc = Arc::new(kernel);
@@ -324,20 +326,20 @@ impl world::Server for WorldImpl {
                     .await;
             }
 
-            // Create cell store with database persistence
-            let mut cells = create_cell_store_with_db(&id);
+            // Create block store with database persistence
+            let cells = create_block_store_with_db(&id);
 
             // Create default cell if none exist
-            if cells.iter().next().is_none() {
-                let default_id = uuid::Uuid::new_v4().to_string();
-                log::info!("Creating default cell {} for new kernel {}", default_id, id);
-                if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                    log::warn!("Failed to create default cell: {}", e);
+            {
+                let mut guard = cells.write().unwrap();
+                if guard.iter().next().is_none() {
+                    let default_id = uuid::Uuid::new_v4().to_string();
+                    log::info!("Creating default cell {} for new kernel {}", default_id, id);
+                    if let Err(e) = guard.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                        log::warn!("Failed to create default cell: {}", e);
+                    }
                 }
             }
-
-            // Wrap cells in Arc<Mutex> for sharing with tools
-            let cells = Arc::new(StdMutex::new(cells));
 
             // Register cell tools
             let kernel_arc = Arc::new(kernel);
@@ -887,7 +889,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.lock().unwrap();
+            let cells_guard = kernel.cells.read().unwrap();
             let cells: Vec<_> = cells_guard.iter().collect();
             let mut builder = results.get().init_cells(cells.len() as u32);
             for (i, doc) in cells.iter().enumerate() {
@@ -911,7 +913,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.lock().unwrap();
+            let cells_guard = kernel.cells.read().unwrap();
             if let Some(doc) = cells_guard.get(&cell_id) {
                 let mut cell = results.get().init_cell();
                 let mut info = cell.reborrow().init_info();
@@ -921,10 +923,10 @@ impl kernel::Server for KernelImpl {
                     info.set_language(lang);
                 }
                 cell.set_content(&doc.content());
-                cell.set_version(doc.frontier_version());
-                // Encode full doc for sync
-                let encoded = doc.encode_full();
-                cell.set_encoded_doc(&encoded);
+                cell.set_version(doc.version());
+                // TODO: Implement block-based encoding for sync
+                // The old flat-text CRDT encoding is being replaced with block ops
+                cell.set_encoded_doc(&[]);
             }
         }
         Promise::ok(())
@@ -950,7 +952,7 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.lock().unwrap();
+                let mut cells_guard = kernel.cells.write().unwrap();
                 if let Ok(doc) = cells_guard.create_cell(cell_id, kind, language.clone()) {
                     // Build results
                     let mut cell = results.get().init_cell();
@@ -961,16 +963,17 @@ impl kernel::Server for KernelImpl {
                         info.set_language(lang);
                     }
                     cell.set_content(&doc.content());
-                    cell.set_version(doc.frontier_version());
+                    cell.set_version(doc.version());
 
                     // Collect data for notification
+                    // Note: encode_full() doesn't exist in BlockStore, using empty placeholder
                     cell_data = Some((
                         doc.id.clone(),
                         doc.kind,
                         doc.language.clone(),
                         doc.content(),
-                        doc.frontier_version(),
-                        doc.encode_full(),
+                        doc.version(),
+                        Vec::new(), // TODO: Implement block-based encoding
                     ));
                 } else {
                     cell_data = None;
@@ -1018,7 +1021,7 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.lock().unwrap();
+                let mut cells_guard = kernel.cells.write().unwrap();
                 deleted = cells_guard.delete_cell(&cell_id).is_ok();
                 subscribers = kernel.cell_subscribers.clone();
             } else {
@@ -1044,93 +1047,24 @@ impl kernel::Server for KernelImpl {
         params: kernel::ApplyOpParams,
         mut results: kernel::ApplyOpResults,
     ) -> Promise<(), capnp::Error> {
+        // NOTE: The old flat-text CRDT ops (Insert, Delete, FullState) are being replaced
+        // with block-based operations. This method is a no-op stub during the transition.
+        // Use the block-based API (apply_block_op) instead.
         let params = pry!(params.get());
         let op = pry!(params.get_op());
         let cell_id = pry!(pry!(op.get_cell_id()).to_str()).to_owned();
-        let crdt_op = pry!(op.get_op());
 
-        // Use a fixed agent name for server-side ops
-        let agent_name = "server";
+        log::warn!(
+            "apply_op called with old CRDT op for cell '{}' - this API is deprecated, use block ops",
+            cell_id
+        );
 
-        // Data for persistence and notification
-        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
-        // (from_version, to_version, delta)
-        let patch_data: Option<(u64, u64, Vec<u8>)>;
-
-        {
-            let state = self.state.borrow();
-            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.lock().unwrap();
-                subscribers = kernel.cell_subscribers.clone();
-
-                // Apply operation and collect data for persistence (avoiding borrow conflict)
-                patch_data = {
-                    if let Some(doc) = cells_guard.get_mut(&cell_id) {
-                        // Capture version before operation for delta encoding
-                        let version_before = doc.frontier();
-                        let version_before_u64 = doc.frontier_version();
-
-                        // Apply the operation
-                        match crdt_op.which() {
-                            Ok(crate::kaijutsu_capnp::crdt_op::Insert(insert)) => {
-                                let pos = insert.get_pos() as usize;
-                                let text = pry!(pry!(insert.get_text()).to_str());
-                                doc.insert(agent_name, pos, text);
-                            }
-                            Ok(crate::kaijutsu_capnp::crdt_op::Delete(delete)) => {
-                                let pos = delete.get_pos() as usize;
-                                let len = delete.get_len() as usize;
-                                doc.delete(agent_name, pos, pos + len);
-                            }
-                            Ok(crate::kaijutsu_capnp::crdt_op::FullState(data)) => {
-                                // Merge full state
-                                let data = pry!(data);
-                                let _ = doc.merge(&data);
-                            }
-                            Err(_) => {}
-                        }
-
-                        let new_version = doc.frontier_version();
-                        results.get().set_new_version(new_version);
-
-                        // Collect delta for persistence and notification
-                        let delta = doc.encode_patch_from(&version_before);
-                        if !delta.is_empty() {
-                            Some((version_before_u64, new_version, delta))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                // Persist outside the doc borrow scope
-                if let Some((_, _, ref delta)) = patch_data {
-                    if let Err(e) = cells_guard.persist_op(&cell_id, agent_name, delta) {
-                        log::warn!("Failed to persist cell op: {}", e);
-                    }
-                    // Auto-snapshot if enough ops have accumulated
-                    let _ = cells_guard.maybe_snapshot(&cell_id);
-                }
-            } else {
-                subscribers = Vec::new();
-                patch_data = None;
-            }
-        }
-
-        // Notify subscribers (outside of borrow scope)
-        if let Some((from_version, to_version, delta)) = patch_data {
-            for subscriber in subscribers {
-                let mut req = subscriber.on_cell_updated_request();
-                {
-                    let mut patch = req.get().init_patch();
-                    patch.set_cell_id(&cell_id);
-                    patch.set_from_version(from_version);
-                    patch.set_to_version(to_version);
-                    patch.set_ops(&delta);
-                }
-                let _ = req.send(); // Fire and forget
+        // Return the current version without making changes
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let cells_guard = kernel.cells.read().unwrap();
+            if let Some(doc) = cells_guard.get(&cell_id) {
+                results.get().set_new_version(doc.version());
             }
         }
 
@@ -1161,6 +1095,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::SyncCellsParams,
         mut results: kernel::SyncCellsResults,
     ) -> Promise<(), capnp::Error> {
+        // NOTE: The old flat-text CRDT sync is being replaced with block-based operations.
+        // This method now returns cells with content but empty encoding.
+        // Full sync will use the block-based protocol.
         let params = pry!(params.get());
         let from_versions = pry!(params.get_from_versions());
 
@@ -1175,48 +1112,34 @@ impl kernel::Server for KernelImpl {
                 }
             }
 
-            // Collect data from cells (must clone/copy since we hold a mutex guard)
-            let cells_guard = kernel.cells.lock().unwrap();
+            // Collect data from cells
+            let cells_guard = kernel.cells.read().unwrap();
 
-            // Find cells that need patches and new cells
-            let mut patches: Vec<(String, Vec<u8>, u64, u64)> = Vec::new();
-            // Store owned data for new cells: (id, kind, language, content, version, encoded_doc)
-            let mut new_cells: Vec<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64, Vec<u8>)> = Vec::new();
+            // Store owned data for new cells: (id, kind, language, content, version)
+            // Note: We return all cells the client doesn't know about, with empty encoding
+            let mut new_cells: Vec<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64)> = Vec::new();
 
             for doc in cells_guard.iter() {
-                if let Some(&client_version) = client_versions.get(&doc.id) {
-                    // Client has this cell - send patch if needed
-                    let server_version = doc.frontier_version();
-                    if client_version < server_version {
-                        let patch = doc.encode_patch_from(&[client_version as usize]);
-                        patches.push((doc.id.clone(), patch, client_version, server_version));
-                    }
-                } else {
-                    // Client doesn't have this cell - send full state (clone all needed data)
+                if !client_versions.contains_key(&doc.id) {
+                    // Client doesn't have this cell - send cell info (content-based, no CRDT encoding)
                     new_cells.push((
                         doc.id.clone(),
                         doc.kind,
                         doc.language.clone(),
                         doc.content(),
-                        doc.frontier_version(),
-                        doc.encode_full(),
+                        doc.version(),
                     ));
                 }
+                // Note: Patches (delta sync) are not supported in the transitional API.
+                // Clients should use block-based sync for incremental updates.
             }
-            drop(cells_guard); // Explicitly release the lock
+            drop(cells_guard);
 
-            // Build response
-            let mut patches_builder = results.get().init_patches(patches.len() as u32);
-            for (i, (cell_id, ops, from_v, to_v)) in patches.iter().enumerate() {
-                let mut p = patches_builder.reborrow().get(i as u32);
-                p.set_cell_id(cell_id);
-                p.set_from_version(*from_v);
-                p.set_to_version(*to_v);
-                p.set_ops(ops);
-            }
+            // No patches in transitional API
+            let _ = results.get().init_patches(0);
 
             let mut new_cells_builder = results.get().init_new_cells(new_cells.len() as u32);
-            for (i, (id, kind, language, content, version, encoded_doc)) in new_cells.iter().enumerate() {
+            for (i, (id, kind, language, content, version)) in new_cells.iter().enumerate() {
                 let mut c = new_cells_builder.reborrow().get(i as u32);
                 let mut info = c.reborrow().init_info();
                 info.set_id(id);
@@ -1226,7 +1149,7 @@ impl kernel::Server for KernelImpl {
                 }
                 c.set_content(content);
                 c.set_version(*version);
-                c.set_encoded_doc(encoded_doc);
+                c.set_encoded_doc(&[]); // Empty encoding - use block-based sync instead
             }
         }
         Promise::ok(())
@@ -1308,6 +1231,76 @@ impl kernel::Server for KernelImpl {
             }
             Ok(())
         })
+    }
+
+    // =========================================================================
+    // Block-based CRDT operations (new architecture)
+    // =========================================================================
+
+    fn apply_block_op(
+        self: Rc<Self>,
+        params: kernel::ApplyBlockOpParams,
+        mut results: kernel::ApplyBlockOpResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let cell_id = pry!(pry!(params.get_cell_id()).to_str()).to_owned();
+        let _op = pry!(params.get_op());
+
+        // TODO: Implement full block operation handling
+        // For now, return a stub version number
+        log::warn!(
+            "apply_block_op called for cell {} - stub implementation",
+            cell_id
+        );
+
+        results.get().set_new_version(1);
+        Promise::ok(())
+    }
+
+    fn subscribe_blocks(
+        self: Rc<Self>,
+        _params: kernel::SubscribeBlocksParams,
+        _results: kernel::SubscribeBlocksResults,
+    ) -> Promise<(), capnp::Error> {
+        // TODO: Implement block event subscription
+        log::warn!("subscribe_blocks called - stub implementation");
+        Promise::ok(())
+    }
+
+    fn get_block_cell_state(
+        self: Rc<Self>,
+        params: kernel::GetBlockCellStateParams,
+        mut results: kernel::GetBlockCellStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
+
+        // TODO: Implement full block cell state retrieval
+        // For now, return an empty state
+        log::warn!(
+            "get_block_cell_state called for cell {} - stub implementation",
+            cell_id
+        );
+
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let cells_guard = kernel.cells.read().unwrap();
+            if let Some(doc) = cells_guard.get(&cell_id) {
+                let mut cell_state = results.get().init_state();
+                {
+                    let mut info = cell_state.reborrow().init_info();
+                    info.set_id(&doc.id);
+                    info.set_kind(cell_kind_to_capnp(doc.kind));
+                    if let Some(ref lang) = doc.language {
+                        info.set_language(lang);
+                    }
+                }
+                cell_state.reborrow().set_version(doc.version());
+                // Initialize empty blocks list for now (consumes cell_state)
+                cell_state.init_blocks(0);
+            }
+        }
+
+        Promise::ok(())
     }
 }
 

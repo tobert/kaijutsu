@@ -247,6 +247,11 @@ interface Kernel {
   # Tool execution
   executeTool @27 (call :ToolCall) -> (result :ToolResult);
   getToolSchemas @28 () -> (schemas :List(ToolSchema));
+
+  # Block-based CRDT operations (new architecture)
+  applyBlockOp @29 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  subscribeBlocks @30 (callback :BlockEvents);
+  getBlockCellState @31 (cellId :Text) -> (state :BlockCellState);
 }
 
 struct CellVersion {
@@ -274,12 +279,14 @@ struct CellInfo {
   parentId @3 :Text;          # For nested cells (tool calls under messages)
 }
 
+# Legacy CellOp - kept for transitional sync (will be removed)
 struct CellOp {
   cellId @0 :Text;
   clientVersion @1 :UInt64;   # Client's version before this op
   op @2 :CrdtOp;
 }
 
+# Legacy CrdtOp - kept for transitional sync (will be removed)
 struct CrdtOp {
   union {
     insert :group {
@@ -295,6 +302,7 @@ struct CrdtOp {
   }
 }
 
+# Legacy CellState - kept for transitional sync
 struct CellState {
   info @0 :CellInfo;
   content @1 :Text;           # Current text content
@@ -302,6 +310,7 @@ struct CellState {
   encodedDoc @3 :Data;        # Optional: full diamond-types doc for sync
 }
 
+# Legacy CellPatch - kept for transitional sync
 struct CellPatch {
   cellId @0 :Text;
   fromVersion @1 :UInt64;     # Version patch is based on
@@ -314,6 +323,102 @@ interface CellEvents {
   onCellCreated @0 (cell :CellState);
   onCellUpdated @1 (patch :CellPatch);
   onCellDeleted @2 (cellId :Text);
+}
+
+# ============================================================================
+# Block-Based CRDT Types (New Architecture)
+# ============================================================================
+
+# Block identifier - globally unique across all cells and agents
+struct BlockId {
+  cellId @0 :Text;
+  agentId @1 :Text;
+  seq @2 :UInt64;
+}
+
+# Block content types - supports structured response blocks
+struct BlockContent {
+  union {
+    # Extended thinking - text CRDT, collapsible
+    thinking :group {
+      text @0 :Text;
+      collapsed @1 :Bool;
+    }
+    # Main response text - text CRDT
+    text @2 :Text;
+    # Tool invocation - immutable after creation
+    toolUse :group {
+      id @3 :Text;
+      name @4 :Text;
+      input @5 :Text;         # JSON encoded
+    }
+    # Tool result - immutable after creation
+    toolResult :group {
+      toolUseId @6 :Text;
+      content @7 :Text;
+      isError @8 :Bool;
+    }
+  }
+}
+
+# Operations on block documents
+struct BlockDocOp {
+  union {
+    # Insert a new block after a reference block
+    insertBlock :group {
+      id @0 :BlockId;
+      afterId @1 :BlockId;
+      hasAfterId @2 :Bool;    # False = insert at start
+      content @3 :BlockContent;
+      author @14 :Text;       # Who created this block (e.g. "user:amy", "model:claude")
+      createdAt @15 :UInt64;  # Unix timestamp in milliseconds
+    }
+    # Delete a block
+    deleteBlock @4 :BlockId;
+    # Edit text within a block (Thinking/Text only)
+    editBlockText :group {
+      id @5 :BlockId;
+      pos @6 :UInt64;
+      insert @7 :Text;
+      delete @8 :UInt64;
+    }
+    # Toggle collapsed state (Thinking only)
+    setCollapsed :group {
+      id @9 :BlockId;
+      collapsed @10 :Bool;
+    }
+    # Move block to new position
+    moveBlock :group {
+      id @11 :BlockId;
+      afterId @12 :BlockId;
+      hasAfterId @13 :Bool;
+    }
+  }
+}
+
+# State of a single block
+struct BlockState {
+  id @0 :BlockId;
+  content @1 :BlockContent;
+  textVersion @2 :UInt64;     # Version of text CRDT (for Thinking/Text)
+  author @3 :Text;            # Who created this block
+  createdAt @4 :UInt64;       # Unix timestamp in milliseconds
+}
+
+# Full cell state with blocks (new architecture)
+struct BlockCellState {
+  info @0 :CellInfo;
+  blocks @1 :List(BlockState);
+  version @2 :UInt64;
+}
+
+# Callback for receiving block updates from server
+interface BlockEvents {
+  onBlockInserted @0 (cellId :Text, block :BlockState, afterId :BlockId, hasAfterId :Bool);
+  onBlockDeleted @1 (cellId :Text, blockId :BlockId);
+  onBlockEdited @2 (cellId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
+  onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);
+  onBlockMoved @4 (cellId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
 }
 
 # ============================================================================

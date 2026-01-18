@@ -9,5 +9,3 @@ pub use bridge::{
     ConnectionState,
 };
 
-// Re-export client types for convenience
-pub use kaijutsu_client::RowType;
