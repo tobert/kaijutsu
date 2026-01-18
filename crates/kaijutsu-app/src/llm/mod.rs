@@ -1,27 +1,27 @@
 //! LLM integration for kaijutsu-app.
 //!
-//! Handles sending prompts to Claude and streaming responses into cells.
+//! Handles sending prompts to Claude and streaming responses into conversations.
 //! Uses a dedicated tokio runtime for API calls since anthropic-api requires tokio.
 //!
-//! ## Content Block Support
+//! ## Conversation Integration
 //!
-//! Responses from Claude are parsed into structured content blocks:
-//! - Thinking blocks (extended thinking/reasoning)
-//! - Text blocks (main response)
-//! - Tool use blocks (when tools are enabled)
-//!
-//! These blocks are stored in the CellEditor for structured display.
+//! When a user submits a prompt:
+//! 1. The user message is added to the current conversation (with author attribution)
+//! 2. The conversation history is sent to the LLM
+//! 3. The response blocks are added to the conversation (with model attribution)
+//! 4. The conversation is auto-saved to SQLite
 
 use bevy::prelude::*;
 use kaijutsu_kernel::{
-    AnthropicProvider, CompletionRequest, CompletionResponse, LlmMessage, LlmProvider, ResponseBlock,
+    AnthropicProvider, CompletionRequest, CompletionResponse, LlmMessage, LlmProvider,
+    Participant, ResponseBlock,
 };
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 
-use crate::cell::{Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock, PromptSubmitted};
-use crate::text::{GlyphonText, TextAreaConfig};
+use crate::cell::PromptSubmitted;
+use crate::conversation::{ConversationRegistry, ConversationStore, CurrentConversation};
 
 /// Plugin for LLM integration.
 pub struct LlmPlugin;
@@ -29,7 +29,6 @@ pub struct LlmPlugin;
 impl Plugin for LlmPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LlmState>()
-            .add_message::<LlmResponseComplete>()
             .add_systems(Startup, configure_llm_from_env)
             .add_systems(
                 Update,
@@ -78,7 +77,7 @@ async fn llm_worker(
         let result = req.provider.complete(req.request).await;
 
         let _ = result_tx.send(LlmResult {
-            cell_entity: req.cell_entity,
+            conversation_id: req.conversation_id,
             result: result.map_err(|e| format!("LLM error: {}", e)),
         });
     }
@@ -87,38 +86,13 @@ async fn llm_worker(
 
 /// Result from an LLM completion.
 struct LlmResult {
-    cell_entity: Entity,
+    conversation_id: String,
     result: Result<CompletionResponse, String>,
-}
-
-/// Convert a kernel ResponseBlock to an app ContentBlock.
-fn convert_response_block(block: &ResponseBlock) -> ContentBlock {
-    match block {
-        ResponseBlock::Thinking { thinking, .. } => ContentBlock::Thinking {
-            text: thinking.clone(),
-            collapsed: true, // Auto-collapse thinking when complete
-        },
-        ResponseBlock::Text { text } => ContentBlock::Text(text.clone()),
-        ResponseBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
-            id: id.clone(),
-            name: name.clone(),
-            input: input.clone(),
-        },
-        ResponseBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
-            is_error: *is_error,
-        },
-    }
 }
 
 /// Request to send to the LLM worker.
 struct LlmRequest {
-    cell_entity: Entity,
+    conversation_id: String,
     request: CompletionRequest,
     provider: Arc<dyn LlmProvider>,
 }
@@ -136,6 +110,8 @@ pub struct LlmState {
     pub default_model: String,
     /// System prompt for the assistant.
     pub system_prompt: String,
+    /// Model participant ID (for author attribution).
+    pub model_participant_id: String,
 }
 
 impl Default for LlmState {
@@ -146,27 +122,24 @@ impl Default for LlmState {
             request_tx: None,
             default_model: "claude-haiku-4-5-20251001".to_string(),
             system_prompt: "You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.".to_string(),
+            model_participant_id: "model:claude".to_string(),
         }
     }
 }
 
-/// Message fired when an LLM response is complete.
-#[derive(Message)]
-pub struct LlmResponseComplete {
-    pub cell_entity: Entity,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
 /// System to handle prompts and send them to the LLM.
 fn handle_prompt_for_llm(
-    mut commands: Commands,
     mut submit_events: MessageReader<PromptSubmitted>,
     llm_state: Res<LlmState>,
-    cells: Query<&CellPosition, With<Cell>>,
+    current: Res<CurrentConversation>,
+    mut registry: ResMut<ConversationRegistry>,
+    store: Option<Res<ConversationStore>>,
 ) {
     let (Some(provider), Some(request_tx)) = (llm_state.provider.clone(), llm_state.request_tx.as_ref()) else {
-        // No provider or channel configured, skip
+        return;
+    };
+
+    let Some(conv_id) = current.id() else {
         return;
     };
 
@@ -177,41 +150,63 @@ fn handle_prompt_for_llm(
             continue;
         }
 
-        info!("Sending prompt to LLM: {}...", &prompt_text.chars().take(50).collect::<String>());
+        // Get the conversation
+        let Some(conv) = registry.get_mut(conv_id) else {
+            error!("Current conversation not found: {}", conv_id);
+            continue;
+        };
 
-        // Find the next row for the agent response
-        let next_row = cells
+        // Add model participant if not present
+        if !conv.has_participant(&llm_state.model_participant_id) {
+            conv.add_participant(Participant::model(
+                &llm_state.model_participant_id,
+                "Claude",
+                "anthropic",
+                &llm_state.default_model,
+            ));
+        }
+
+        // Get user participant ID
+        let user_id = format!("user:{}", whoami::username());
+
+        // Add user message to conversation
+        conv.add_text_message(&user_id, &prompt_text);
+
+        info!(
+            "Added user message to conversation {}: {}...",
+            conv_id,
+            &prompt_text.chars().take(50).collect::<String>()
+        );
+
+        // Build messages from conversation history
+        // Only include Text blocks (skip Thinking, ToolUse, ToolResult for now)
+        let messages: Vec<LlmMessage> = conv
+            .messages()
             .iter()
-            .filter(|p| p.col == 0 && p.row != u32::MAX)
-            .map(|p| p.row)
-            .max()
-            .map(|max| max.saturating_add(1))
-            .unwrap_or(0);
+            .filter(|block| block.content.block_type() == kaijutsu_crdt::BlockType::Text)
+            .map(|block| {
+                let text = block.content.text();
+                if block.author.starts_with("user:") {
+                    LlmMessage::user(text)
+                } else {
+                    LlmMessage::assistant(text)
+                }
+            })
+            .collect();
 
-        // Create agent message cell with thinking indicator
-        let cell = Cell::new(CellKind::AgentMessage);
-        let cell_entity = commands
-            .spawn((
-                cell,
-                CellEditor::default().with_text("⏳ Thinking..."),
-                CellState::new(),
-                CellPosition::new(0, next_row),
-                GlyphonText,
-                TextAreaConfig::default(),
-            ))
-            .id();
+        // Build the request with conversation history
+        let request = CompletionRequest::new(&llm_state.default_model, messages)
+            .with_system(&llm_state.system_prompt)
+            .with_max_tokens(4096);
 
-        // Build the request
-        let request = CompletionRequest::new(
-            &llm_state.default_model,
-            vec![LlmMessage::user(&prompt_text)],
-        )
-        .with_system(&llm_state.system_prompt)
-        .with_max_tokens(4096);
+        // Save conversation after adding user message
+        if let Some(ref store) = store {
+            store.save(conv);
+        }
 
         // Send to worker thread
         if let Err(e) = request_tx.send(LlmRequest {
-            cell_entity,
+            conversation_id: conv_id.to_string(),
             request,
             provider: provider.clone(),
         }) {
@@ -220,76 +215,90 @@ fn handle_prompt_for_llm(
     }
 }
 
-/// System to poll for completed LLM results and update cells.
+/// System to poll for completed LLM results and update conversations.
 fn poll_llm_results(
     mut llm_state: ResMut<LlmState>,
-    mut complete_events: MessageWriter<LlmResponseComplete>,
-    mut editors: Query<&mut CellEditor>,
+    mut registry: ResMut<ConversationRegistry>,
+    store: Option<Res<ConversationStore>>,
 ) {
+    // Extract what we need before mutably borrowing result_rx
+    let model_id = llm_state.model_participant_id.clone();
+
     let Some(result_rx) = llm_state.result_rx.as_mut() else {
         return;
     };
 
     // Drain all available results (non-blocking)
     while let Ok(llm_result) = result_rx.try_recv() {
+
         match llm_result.result {
             Ok(response) => {
                 let block_count = response.blocks.len();
                 let has_thinking = response.has_thinking();
                 info!(
-                    "LLM response received ({} chars, {} blocks, thinking: {}) for entity {:?}",
+                    "LLM response received ({} chars, {} blocks, thinking: {}) for conversation {}",
                     response.content.len(),
                     block_count,
                     has_thinking,
-                    llm_result.cell_entity
+                    llm_result.conversation_id
                 );
 
-                match editors.get_mut(llm_result.cell_entity) {
-                    Ok(mut editor) => {
-                        // Convert response blocks to content blocks
-                        let content_blocks: Vec<ContentBlock> = response
-                            .blocks
-                            .iter()
-                            .map(convert_response_block)
-                            .collect();
+                // Get the conversation
+                let Some(conv) = registry.get_mut(&llm_result.conversation_id) else {
+                    error!("Conversation not found: {}", llm_result.conversation_id);
+                    continue;
+                };
 
-                        if content_blocks.is_empty() {
-                            // Fallback: use raw text as single block
-                            editor.set_text(response.content);
-                        } else {
-                            // Use structured blocks
-                            editor.replace_blocks(content_blocks);
+                // Add response blocks to conversation
+                if response.blocks.is_empty() {
+                    // Fallback: add raw text as single message
+                    conv.add_text_message(&model_id, &response.content);
+                } else {
+                    // Add structured blocks
+                    for block in &response.blocks {
+                        match block {
+                            ResponseBlock::Thinking { thinking, .. } => {
+                                conv.add_thinking_message(&model_id, thinking);
+                            }
+                            ResponseBlock::Text { text } => {
+                                conv.add_text_message(&model_id, text);
+                            }
+                            ResponseBlock::ToolUse { id, name, input } => {
+                                conv.add_tool_use(&model_id, id, name, input.clone());
+                            }
+                            ResponseBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                conv.add_tool_result(&model_id, tool_use_id, content, *is_error);
+                            }
                         }
-
-                        info!(
-                            "Cell editor updated: {} blocks, text len: {}",
-                            editor.blocks.len(),
-                            editor.text().len()
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to get editor for entity {:?}: {:?}",
-                            llm_result.cell_entity, e
-                        );
                     }
                 }
-                complete_events.write(LlmResponseComplete {
-                    cell_entity: llm_result.cell_entity,
-                    success: true,
-                    error: None,
-                });
+
+                info!(
+                    "Conversation {} updated: {} total messages",
+                    llm_result.conversation_id,
+                    conv.message_count()
+                );
+
+                // Auto-save conversation
+                if let Some(ref store) = store {
+                    store.save(conv);
+                }
             }
             Err(e) => {
-                error!("LLM error: {}", e);
-                if let Ok(mut editor) = editors.get_mut(llm_result.cell_entity) {
-                    editor.set_text(format!("❌ {}", e));
+                error!("LLM error for conversation {}: {}", llm_result.conversation_id, e);
+
+                // Add error message to conversation
+                if let Some(conv) = registry.get_mut(&llm_result.conversation_id) {
+                    conv.add_text_message(&model_id, &format!("❌ Error: {}", e));
+
+                    if let Some(ref store) = store {
+                        store.save(conv);
+                    }
                 }
-                complete_events.write(LlmResponseComplete {
-                    cell_entity: llm_result.cell_entity,
-                    success: false,
-                    error: Some(e),
-                });
             }
         }
     }
