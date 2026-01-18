@@ -8,7 +8,9 @@ use bevy_brp_extras::BrpExtrasPlugin;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod cell;
+mod commands;
 mod connection;
+mod conversation;
 mod llm;
 mod shaders;
 mod text;
@@ -56,6 +58,10 @@ fn main() {
         .add_plugins(connection::ConnectionBridgePlugin)
         // LLM integration (Claude API)
         .add_plugins(llm::LlmPlugin)
+        // Conversation management
+        .add_plugins(conversation::ConversationPlugin)
+        // Commands (vim-style : commands)
+        .add_plugins(commands::CommandsPlugin)
         // Resources
         .init_resource::<ui::theme::Theme>()
         // Startup
