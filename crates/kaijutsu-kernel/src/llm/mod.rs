@@ -2,10 +2,18 @@
 //!
 //! This module provides a unified interface for interacting with various
 //! LLM providers (Anthropic, local models, etc.).
+//!
+//! ## Streaming
+//!
+//! For real-time streaming responses, use the [`stream`] module which provides
+//! a provider-agnostic [`StreamEvent`](stream::StreamEvent) enum and
+//! [`LlmStream`](stream::LlmStream) trait.
 
 mod anthropic;
+pub mod stream;
 
-pub use anthropic::AnthropicProvider;
+// Re-export streaming types for public API
+pub use anthropic::{AnthropicProvider, AnthropicStream};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

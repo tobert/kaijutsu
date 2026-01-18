@@ -3,15 +3,21 @@
 use async_trait::async_trait;
 use anthropic_api::{
     messages::{
-        Message as ApiMessage, MessageContent as ApiMessageContent, MessageRole as ApiMessageRole,
-        MessagesBuilder, ResponseContentBlock,
+        ContentBlockDelta, ContentBlockStart, Message as ApiMessage,
+        MessageContent as ApiMessageContent, MessageRole as ApiMessageRole, MessagesBuilder,
+        ResponseContentBlock, StreamEvent as ApiStreamEvent, Thinking, ThinkingType,
     },
     models::ModelList,
     Credentials,
 };
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::RwLock;
 
-use super::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmResult, Message, ResponseBlock, Role, Usage};
+use super::stream::{LlmStream, StreamEvent, StreamRequest, StreamingBlockType};
+use super::{
+    CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmResult, Message, ResponseBlock,
+    Role, Usage,
+};
 
 /// Default model to use when none specified.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -223,6 +229,222 @@ impl LlmProvider for AnthropicProvider {
         let request = CompletionRequest::new(model, vec![Message::user(prompt)]);
         let response = self.complete(request).await?;
         Ok(response.content)
+    }
+}
+
+impl AnthropicProvider {
+    /// Create a streaming request.
+    ///
+    /// Returns an [`AnthropicStream`] that can be polled for events.
+    pub async fn stream(&self, request: StreamRequest) -> LlmResult<AnthropicStream> {
+        let messages: Vec<ApiMessage> = request
+            .messages
+            .iter()
+            .map(Self::convert_message)
+            .collect();
+
+        let mut builder = MessagesBuilder::builder(&request.model, messages, request.max_tokens as u64)
+            .credentials(self.credentials.clone());
+
+        // Add system prompt if provided
+        if let Some(system) = &request.system {
+            builder = builder.system(system.clone());
+        }
+
+        // Add temperature if provided
+        if let Some(temp) = request.temperature {
+            builder = builder.temperature(temp as f64);
+        }
+
+        // Enable thinking if requested
+        if request.thinking_enabled {
+            let budget = request.thinking_budget.unwrap_or(4096);
+            builder = builder.thinking(Thinking {
+                thinking_type: ThinkingType::Enabled,
+                budget_tokens: budget as u64,
+            });
+        }
+
+        let receiver = builder.create_stream().await.map_err(|e| {
+            LlmError::NetworkError(format!("Failed to create stream: {}", e))
+        })?;
+
+        Ok(AnthropicStream {
+            model: request.model.clone(),
+            receiver,
+            current_block: None,
+            current_block_index: None,
+            finished: false,
+            input_tokens: None,
+            output_tokens: None,
+            tool_use_buffer: None,
+        })
+    }
+}
+
+/// Streaming response adapter for Anthropic Claude.
+///
+/// Converts Anthropic's native streaming events into provider-agnostic
+/// [`StreamEvent`]s for consumption by the block handler.
+pub struct AnthropicStream {
+    /// The model name.
+    model: String,
+    /// Receiver for API streaming events.
+    receiver: Receiver<ApiStreamEvent>,
+    /// Current block type being streamed.
+    current_block: Option<StreamingBlockType>,
+    /// Current block index (for tracking).
+    current_block_index: Option<u32>,
+    /// Whether the stream has finished.
+    finished: bool,
+    /// Input tokens (updated at end).
+    input_tokens: Option<u32>,
+    /// Output tokens (updated at end).
+    output_tokens: Option<u32>,
+    /// Buffer for tool use JSON (built incrementally).
+    tool_use_buffer: Option<ToolUseBuffer>,
+}
+
+/// Buffer for building tool use input incrementally.
+struct ToolUseBuffer {
+    id: String,
+    name: String,
+    input_json: String,
+}
+
+impl LlmStream for AnthropicStream {
+    async fn next_event(&mut self) -> Option<StreamEvent> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            let api_event = self.receiver.recv().await?;
+
+            match api_event {
+                ApiStreamEvent::MessageStart { .. } => {
+                    // Ignore message start, we'll emit block events
+                    continue;
+                }
+
+                ApiStreamEvent::ContentBlockStart { index, content_block } => {
+                    self.current_block_index = Some(index);
+
+                    match content_block {
+                        ContentBlockStart::Text { text: _ } => {
+                            // Check if this might be a thinking block
+                            // Unfortunately the anthropic-api crate's ContentBlockStart
+                            // doesn't distinguish thinking from text at the struct level,
+                            // but we can infer from context or just treat as text
+                            // TODO: Check if thinking blocks come through differently
+                            self.current_block = Some(StreamingBlockType::Text);
+                            return Some(StreamEvent::TextStart);
+                        }
+                        ContentBlockStart::ToolUse { id, name, input } => {
+                            self.tool_use_buffer = Some(ToolUseBuffer {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input_json: serde_json::to_string(&input).unwrap_or_default(),
+                            });
+                            // Don't emit yet - we'll emit when the block is complete
+                            continue;
+                        }
+                    }
+                }
+
+                ApiStreamEvent::ContentBlockDelta { index, delta } => {
+                    // Verify we're on the expected block
+                    if self.current_block_index != Some(index) {
+                        // Block index mismatch - update and continue
+                        self.current_block_index = Some(index);
+                    }
+
+                    match delta {
+                        ContentBlockDelta::Text { text } => {
+                            // Check what type of block we're in
+                            match self.current_block {
+                                Some(StreamingBlockType::Thinking) => {
+                                    return Some(StreamEvent::ThinkingDelta(text));
+                                }
+                                Some(StreamingBlockType::Text) | None => {
+                                    return Some(StreamEvent::TextDelta(text));
+                                }
+                            }
+                        }
+                        ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            // Append to tool use buffer
+                            if let Some(ref mut buffer) = self.tool_use_buffer {
+                                buffer.input_json.push_str(&partial_json);
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                ApiStreamEvent::ContentBlockStop { index: _ } => {
+                    // Emit block end if we're in a text/thinking block
+                    if let Some(block_type) = self.current_block.take() {
+                        match block_type {
+                            StreamingBlockType::Thinking => {
+                                return Some(StreamEvent::ThinkingEnd);
+                            }
+                            StreamingBlockType::Text => {
+                                return Some(StreamEvent::TextEnd);
+                            }
+                        }
+                    }
+
+                    // If we have a tool use buffer, emit it now
+                    if let Some(buffer) = self.tool_use_buffer.take() {
+                        let input = serde_json::from_str(&buffer.input_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        return Some(StreamEvent::ToolUse {
+                            id: buffer.id,
+                            name: buffer.name,
+                            input,
+                        });
+                    }
+
+                    continue;
+                }
+
+                ApiStreamEvent::MessageDelta { delta, usage } => {
+                    // Capture usage stats
+                    self.output_tokens = Some(usage.output_tokens);
+                    // input_tokens comes with message_start, not delta
+                    let _ = delta; // stop_reason captured in MessageStop
+                    continue;
+                }
+
+                ApiStreamEvent::MessageStop => {
+                    self.finished = true;
+                    return Some(StreamEvent::Done {
+                        stop_reason: Some("end_turn".to_string()),
+                        input_tokens: self.input_tokens,
+                        output_tokens: self.output_tokens,
+                    });
+                }
+
+                ApiStreamEvent::Ping => {
+                    // Ignore keepalive
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl std::fmt::Debug for AnthropicStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicStream")
+            .field("model", &self.model)
+            .field("current_block", &self.current_block)
+            .field("finished", &self.finished)
+            .finish()
     }
 }
 
