@@ -5,7 +5,6 @@
 use bevy::prelude::*;
 use bevy::render::{
     render_graph::{RenderGraphExt, ViewNodeRunner},
-    render_resource::*,
     renderer::{RenderDevice, RenderQueue},
     Extract, Render, RenderApp,
 };

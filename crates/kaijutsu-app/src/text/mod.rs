@@ -8,7 +8,4 @@ mod render;
 mod resources;
 
 pub use plugin::TextRenderPlugin;
-pub use render::TextRenderNode;
-pub use resources::{
-    GlyphonText, SharedFontSystem, SharedSwashCache, TextAreaConfig, TextBuffer, TextResolution,
-};
+pub use resources::{GlyphonText, SharedFontSystem, TextAreaConfig, TextBuffer};
