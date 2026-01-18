@@ -22,11 +22,9 @@ pub mod plugin;
 mod sync;
 mod systems;
 
+// Re-export public API
 pub use components::{
-    BlockOp, Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock,
-    ConversationContainer, ConversationScrollState, CurrentMode, EditOp, EditorMode, FocusedCell,
-    PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
+    Cell, CellKind, ConversationContainer, CurrentMode, EditorMode, FocusedCell,
+    PromptContainer, PromptSubmitted,
 };
-pub use frame_style::{FrameStyle, FrameStyleMapping};
 pub use plugin::CellPlugin;
-pub use sync::CellRegistry;

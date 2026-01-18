@@ -5,10 +5,11 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    Cell, CellEditor, CellKind, CellPosition, CellState, ContentBlock, ConversationScrollState,
-    CurrentMode, EditorMode, FocusedCell, PromptCell, PromptContainer, PromptSubmitted,
-    WorkspaceLayout,
+    Block, BlockContent, Cell, CellEditor, CellKind, CellPosition, CellState,
+    ConversationScrollState, CurrentMode, EditorMode, FocusedCell, MainCell, PromptCell,
+    PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
+use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{GlyphonText, SharedFontSystem, TextAreaConfig, TextBuffer};
 
 /// Spawn a new cell entity with all required components.
@@ -217,7 +218,7 @@ pub fn init_cell_buffers(
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
         buffer.set_text(
             &mut font_system,
-            editor.text(),
+            &editor.text(),
             &attrs,
             glyphon::Shaping::Advanced,
         );
@@ -231,7 +232,7 @@ pub fn init_cell_buffers(
 ///
 /// This produces a text representation with visual markers for different block types.
 /// Collapsed thinking blocks are shown as a single line.
-fn format_blocks_for_display(blocks: &[ContentBlock]) -> String {
+fn format_blocks_for_display(blocks: &[&Block]) -> String {
     if blocks.is_empty() {
         return String::new();
     }
@@ -243,22 +244,22 @@ fn format_blocks_for_display(blocks: &[ContentBlock]) -> String {
             output.push_str("\n\n");
         }
 
-        match block {
-            ContentBlock::Thinking { text, collapsed } => {
+        match &block.content {
+            BlockContent::Thinking { collapsed, .. } => {
                 if *collapsed {
                     // Collapsed: show indicator
                     output.push_str("💭 [Thinking collapsed - Tab to expand]");
                 } else {
                     // Expanded: show with dimmed header
                     output.push_str("💭 ─── Thinking ───\n");
-                    output.push_str(text);
+                    output.push_str(&block.text());
                     output.push_str("\n───────────────────");
                 }
             }
-            ContentBlock::Text(text) => {
-                output.push_str(text);
+            BlockContent::Text { .. } => {
+                output.push_str(&block.text());
             }
-            ContentBlock::ToolUse { name, input, .. } => {
+            BlockContent::ToolUse { name, input, .. } => {
                 output.push_str("🔧 Tool: ");
                 output.push_str(name);
                 output.push('\n');
@@ -269,7 +270,7 @@ fn format_blocks_for_display(blocks: &[ContentBlock]) -> String {
                     output.push_str(&input.to_string());
                 }
             }
-            ContentBlock::ToolResult {
+            BlockContent::ToolResult {
                 content, is_error, ..
             } => {
                 if *is_error {
@@ -302,9 +303,9 @@ pub fn sync_cell_buffers(
 
         // Use block-formatted text if we have blocks, otherwise use raw text
         let display_text = if editor.has_blocks() {
-            format_blocks_for_display(&editor.blocks)
+            format_blocks_for_display(&editor.blocks())
         } else {
-            editor.text().to_string()
+            editor.text()
         };
 
         buffer.set_text(
@@ -327,7 +328,7 @@ pub fn compute_cell_heights(
     for (editor, mut state) in cells.iter_mut() {
         let line_count = if editor.has_blocks() {
             // Count lines from formatted blocks
-            format_blocks_for_display(&editor.blocks).lines().count().max(1)
+            format_blocks_for_display(&editor.blocks()).lines().count().max(1)
         } else {
             editor.text().lines().count().max(1)
         };
@@ -341,7 +342,10 @@ pub fn compute_cell_heights(
 /// Applies scroll offset for vertical scrolling.
 /// Excludes prompt cell (handled separately).
 pub fn layout_cells(
-    mut cells: Query<(&CellPosition, &CellState, &mut TextAreaConfig), Without<PromptCell>>,
+    mut cells: Query<
+        (&CellPosition, &CellState, &mut TextAreaConfig),
+        (Without<PromptCell>, Without<MainCell>),
+    >,
     layout: Res<WorkspaceLayout>,
     windows: Query<&Window>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -596,37 +600,30 @@ pub fn handle_collapse_toggle(
 
         // Tab toggles collapse
         if event.key_code == KeyCode::Tab {
-            // Check if cell has thinking blocks to toggle
-            let has_thinking = editor
-                .blocks
+            // Find thinking blocks to toggle
+            let thinking_blocks: Vec<_> = editor
+                .blocks()
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+                .filter(|b| matches!(b.content, BlockContent::Thinking { .. }))
+                .map(|b| b.id.clone())
+                .collect();
 
-            if has_thinking {
-                // Toggle all thinking blocks
-                let mut toggled = false;
-                for block in editor.blocks.iter_mut() {
-                    if let ContentBlock::Thinking { collapsed, .. } = block {
-                        *collapsed = !*collapsed;
-                        toggled = true;
-                    }
+            if !thinking_blocks.is_empty() {
+                // Toggle all thinking blocks via the editor
+                for block_id in &thinking_blocks {
+                    editor.toggle_block_collapse(block_id);
                 }
-                if toggled {
-                    editor.dirty = true;
-                    let collapsed = editor
-                        .blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Thinking { collapsed, .. } => Some(*collapsed),
-                            _ => None,
-                        })
-                        .next()
-                        .unwrap_or(false);
-                    info!(
-                        "Thinking blocks: {}",
-                        if collapsed { "collapsed" } else { "expanded" }
-                    );
-                }
+                // Get the current collapsed state for logging
+                let collapsed = editor
+                    .blocks()
+                    .iter()
+                    .find(|b| matches!(b.content, BlockContent::Thinking { .. }))
+                    .map(|b| b.content.is_collapsed())
+                    .unwrap_or(false);
+                info!(
+                    "Thinking blocks: {}",
+                    if collapsed { "collapsed" } else { "expanded" }
+                );
             } else {
                 // Toggle whole cell collapse
                 cell_state.collapsed = !cell_state.collapsed;
@@ -872,7 +869,8 @@ pub fn update_cursor(
     *visibility = Visibility::Inherited;
 
     // Calculate cursor position from text index
-    let (row, col) = cursor_row_col(editor.text(), editor.cursor);
+    let text = editor.text();
+    let (row, col) = cursor_row_col(&text, editor.cursor_offset());
 
     // Position relative to cell bounds
     let x = config.left + (col as f32 * CHAR_WIDTH);
@@ -1032,39 +1030,49 @@ pub fn handle_prompt_submit(
     }
 }
 
-/// Create a conversation cell from a submitted prompt.
+/// Add submitted prompts as blocks in the current conversation.
+///
+/// Instead of creating separate Cell entities for each message, we now
+/// append messages as blocks to the current conversation's BlockDocument.
+/// The MainCell will render these blocks.
 pub fn handle_prompt_submitted(
-    mut commands: Commands,
     mut submit_events: MessageReader<PromptSubmitted>,
-    cells: Query<&CellPosition, (With<Cell>, Without<PromptCell>)>,
+    current_conv: Res<CurrentConversation>,
+    mut registry: ResMut<ConversationRegistry>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
+    // Get the current conversation ID
+    let Some(conv_id) = current_conv.id() else {
+        warn!("No current conversation to add message to");
+        return;
+    };
+
     for event in submit_events.read() {
-        // Find the next row for the message
-        // Note: PromptCell is already excluded by Without<PromptCell> filter
-        let next_row = cells
-            .iter()
-            .filter(|p| p.col == 0) // Only count main column cells
-            .map(|p| p.row)
-            .max()
-            .map(|max| max.saturating_add(1))
-            .unwrap_or(0);
+        // Get the conversation and add the message
+        if let Some(conv) = registry.get_mut(conv_id) {
+            // Determine the author - use the first user participant or default
+            let author = conv
+                .participants
+                .iter()
+                .find(|p| p.is_user())
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| format!("user:{}", whoami::username()));
 
-        // Create user message cell (not parented - uses absolute positioning)
-        let cell = Cell::new(CellKind::UserMessage);
-        commands.spawn((
-            cell,
-            CellEditor::default().with_text(&event.text),
-            CellState::new(),
-            CellPosition::new(0, next_row),
-            GlyphonText,
-            TextAreaConfig::default(),
-        ));
+            // Add the message as a text block with author attribution
+            if let Some(block_id) = conv.add_text_message(&author, &event.text) {
+                info!(
+                    "Added user message to conversation {}: block {}",
+                    conv_id, block_id
+                );
 
-        info!("Created user message at row {}", next_row);
-
-        // Request scroll to bottom
-        scroll_state.scroll_to_bottom = true;
+                // Request scroll to bottom
+                scroll_state.scroll_to_bottom = true;
+            } else {
+                warn!("Failed to add message to conversation {}", conv_id);
+            }
+        } else {
+            warn!("Conversation {} not found in registry", conv_id);
+        }
     }
 }
 
@@ -1144,4 +1152,178 @@ pub fn handle_scroll_input(
             // Note: gg (double tap) would need state tracking, skip for now
         }
     }
+}
+
+// ============================================================================
+// MAIN CELL SYSTEMS
+// ============================================================================
+
+/// Resource tracking the main kernel/shell cell entity.
+#[derive(Resource, Default)]
+pub struct MainCellEntity(pub Option<Entity>);
+
+/// Spawn the main kernel cell on startup.
+///
+/// This is the primary workspace cell that displays kernel output, shell interactions,
+/// and agent conversations. It fills the space between the header and prompt.
+pub fn spawn_main_cell(
+    mut commands: Commands,
+    mut main_entity: ResMut<MainCellEntity>,
+    conversation_container: Query<Entity, Added<super::components::ConversationContainer>>,
+) {
+    // Only spawn once when we see the ConversationContainer
+    if main_entity.0.is_some() {
+        return;
+    }
+
+    // Wait for conversation container to exist
+    if conversation_container.is_empty() {
+        return;
+    }
+
+    // Create the main kernel cell
+    let cell = Cell::new(CellKind::System);
+    let cell_id = cell.id.clone();
+
+    // Initial welcome message
+    let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
+
+    let entity = commands
+        .spawn((
+            cell,
+            CellEditor::default().with_text(welcome_text),
+            CellState {
+                computed_height: 400.0, // Will be updated by layout
+                min_height: 200.0,
+                collapsed: false,
+            },
+            CellPosition::new(0, 0),
+            GlyphonText,
+            TextAreaConfig::default(),
+            MainCell,
+        ))
+        .id();
+
+    main_entity.0 = Some(entity);
+    info!("Spawned main kernel cell with id {:?}", cell_id.0);
+}
+
+/// Layout the main cell to fill the space between header and prompt.
+pub fn layout_main_cell(
+    mut cells: Query<(&CellState, &mut TextAreaConfig), With<MainCell>>,
+    layout: Res<WorkspaceLayout>,
+    windows: Query<&Window>,
+) {
+    let (window_width, window_height) = windows
+        .iter()
+        .next()
+        .map(|w| (w.resolution.width(), w.resolution.height()))
+        .unwrap_or((1280.0, 800.0));
+
+    // Main cell fills from header to prompt area
+    let top = layout.workspace_margin_top;
+    let bottom = window_height - layout.prompt_area_height;
+    let height = bottom - top;
+
+    // Full width minus margins
+    let margin = layout.workspace_margin_left;
+    let width = window_width - (margin * 2.0);
+
+    for (state, mut config) in cells.iter_mut() {
+        let cell_height = height.max(state.min_height);
+
+        config.left = margin;
+        config.top = top;
+        config.scale = 1.0;
+        config.bounds = glyphon::TextBounds {
+            left: margin as i32,
+            top: top as i32,
+            right: (margin + width) as i32,
+            bottom: (top + cell_height) as i32,
+        };
+    }
+}
+
+/// Sync the MainCell's content with the current conversation.
+///
+/// This system:
+/// 1. Checks if there's a current conversation
+/// 2. Checks if the conversation's version has changed
+/// 3. If changed, rebuilds the MainCell's BlockDocument from conversation blocks
+///
+/// This provides a simple "copy on change" approach. More sophisticated CRDT
+/// sync can be added later for multi-user editing.
+pub fn sync_main_cell_to_conversation(
+    current_conv: Res<CurrentConversation>,
+    registry: Res<ConversationRegistry>,
+    main_entity: Res<MainCellEntity>,
+    mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
+    mut commands: Commands,
+) {
+    // Need both a current conversation and a main cell
+    let Some(conv_id) = current_conv.id() else {
+        return;
+    };
+    let Some(entity) = main_entity.0 else {
+        return;
+    };
+    let Some(conv) = registry.get(conv_id) else {
+        return;
+    };
+
+    // Get the main cell's editor and viewing component
+    let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
+        return;
+    };
+
+    // Check if we need to sync
+    let conv_version = conv.doc.version();
+    let needs_sync = match viewing_opt {
+        Some(ref viewing) => {
+            // Check if conversation changed or version advanced
+            viewing.conversation_id != conv_id || viewing.last_sync_version != conv_version
+        }
+        None => true, // No viewing component yet, need to initialize
+    };
+
+    if !needs_sync {
+        return;
+    }
+
+    // Rebuild the editor's BlockDocument from the conversation
+    // This is a simple approach - replace the entire document
+    let agent_id = editor.doc.agent_id().to_string();
+    let snapshot = conv.doc.snapshot();
+
+    // Create new document from snapshot
+    let new_doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, &agent_id);
+    editor.doc = new_doc;
+
+    // Update cursor to end of document
+    if let Some(last_block) = editor.blocks().last() {
+        let len = last_block.text().len();
+        editor.cursor = super::components::BlockCursor::at(last_block.id.clone(), len);
+    }
+
+    // Mark dirty so rendering updates
+    editor.dirty = true;
+
+    // Update or insert the ViewingConversation component
+    match viewing_opt {
+        Some(mut viewing) => {
+            viewing.conversation_id = conv_id.to_string();
+            viewing.last_sync_version = conv_version;
+        }
+        None => {
+            commands.entity(entity).insert(ViewingConversation {
+                conversation_id: conv_id.to_string(),
+                last_sync_version: conv_version,
+            });
+        }
+    }
+
+    debug!(
+        "Synced MainCell to conversation {} (version {})",
+        conv_id, conv_version
+    );
 }

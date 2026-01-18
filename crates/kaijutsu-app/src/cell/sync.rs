@@ -4,6 +4,8 @@
 //! - Auto-sync when attaching to a kernel
 //! - Sending local edits to the server
 //! - Receiving remote changes and applying them locally
+//!
+//! Uses block-based CRDT operations (BlockDocOp) for real-time sync.
 
 use std::collections::HashMap;
 
@@ -113,7 +115,7 @@ pub fn trigger_sync_on_attach(
                 .filter_map(|(entity, remote_id)| {
                     editors.get(*entity).ok().map(|editor| CellVersion {
                         cell_id: remote_id.clone(),
-                        version: editor.version,
+                        version: editor.version(),
                     })
                 })
                 .collect();
@@ -180,7 +182,7 @@ pub fn handle_cell_sync_result(
                                     });
                                 }
                             }
-                            editor.version = patch.to_version;
+                            // Note: We don't update version here as it's managed by the document
                         }
                     }
                 }
@@ -200,10 +202,9 @@ pub fn handle_cell_sync_result(
                     // Register the local entity with the server-assigned ID
                     registry.register(cell_state.info.id.clone(), local_entity);
 
-                    // Update the editor version
+                    // Update the editor
                     if let Ok(mut editor) = editors.get_mut(local_entity) {
-                        editor.version = cell_state.version;
-                        editor.dirty = false;
+                        editor.mark_synced();
                     }
 
                     info!(
@@ -223,8 +224,7 @@ pub fn handle_cell_sync_result(
                     if let Ok(mut editor) = editors.get_mut(entity) {
                         // Apply server-authoritative content
                         editor.apply_server_content(cell_state.content.clone());
-                        editor.version = cell_state.version;
-                        editor.dirty = false;
+                        editor.mark_synced();
                         info!(
                             "Updated cell {} to version {}",
                             cell_state.info.id, cell_state.version
@@ -249,13 +249,12 @@ pub fn handle_cell_sync_result(
 
             ConnectionEvent::CellOpApplied {
                 cell_id,
-                new_version,
+                new_version: _,
             } => {
                 if let Some(entity) = registry.get_local(cell_id) {
                     if let Ok(mut editor) = editors.get_mut(entity) {
-                        editor.version = *new_version;
-                        // Clear pending ops for this version
-                        // TODO: track more precisely
+                        // Mark as synced - version is managed by the document
+                        editor.mark_synced();
                     }
                 }
             }
@@ -333,10 +332,11 @@ fn spawn_remote_cell(
     );
 }
 
-/// System: Send pending cell operations to server.
+/// System: Send pending block operations to server.
 ///
 /// This runs every frame and sends operations for cells that have pending edits.
-pub fn send_cell_operations(
+/// Uses block-based CRDT operations for efficient delta sync.
+pub fn send_block_operations(
     mut cells: Query<(Entity, &Cell, &mut CellEditor), Changed<CellEditor>>,
     registry: Res<CellRegistry>,
     cmds: Option<Res<ConnectionCommands>>,
@@ -344,51 +344,188 @@ pub fn send_cell_operations(
     let Some(cmds) = cmds else { return };
 
     for (entity, cell, mut editor) in cells.iter_mut() {
-        if !editor.has_pending_ops() {
-            continue;
-        }
-
         // Get remote ID
         let Some(remote_id) = registry.get_remote(entity) else {
             // This is a local-only cell, not yet synced
             // Keep pending ops - they'll be sent when we get registered
             // via CellCreated event from the server
             debug!(
-                "Cell {} not registered with server, keeping {} pending ops",
+                "Cell {} not registered with server, keeping pending ops",
                 cell.id.0,
-                editor.pending_ops.len()
             );
             continue;
         };
 
-        // Take all pending operations
-        let pending = editor.take_pending_ops();
-        let version = editor.version;
+        // Take pending block operations from the editor's document
+        let pending_ops = editor.take_pending_ops();
 
-        // Send each operation
-        for local_op in pending {
-            let crdt_op = match local_op {
-                super::components::EditOp::Insert { pos, text } => CrdtOp::Insert {
-                    pos: pos as u64,
-                    text,
-                },
-                super::components::EditOp::Delete { pos, len } => CrdtOp::Delete {
-                    pos: pos as u64,
-                    len: len as u64,
-                },
-            };
-
-            let op = CellOp {
-                cell_id: remote_id.to_string(),
-                client_version: version,
-                op: crdt_op,
-            };
-
-            cmds.send(ConnectionCommand::ApplyCellOp { op });
+        if pending_ops.is_empty() {
+            continue;
         }
 
-        // Mark as no longer dirty (ops sent)
-        editor.dirty = false;
+        // Send each block operation to the server
+        for op in pending_ops {
+            cmds.send(ConnectionCommand::ApplyBlockOp {
+                cell_id: remote_id.to_string(),
+                op,
+            });
+        }
+
+        // Mark as synced
+        editor.mark_synced();
+    }
+}
+
+/// System: Send pending cell operations to server (legacy fallback).
+///
+/// This is kept as a fallback for cases where block operations aren't available.
+#[allow(dead_code)]
+pub fn send_cell_operations_legacy(
+    mut cells: Query<(Entity, &Cell, &mut CellEditor), Changed<CellEditor>>,
+    registry: Res<CellRegistry>,
+    cmds: Option<Res<ConnectionCommands>>,
+) {
+    let Some(cmds) = cmds else { return };
+
+    for (entity, cell, mut editor) in cells.iter_mut() {
+        if !editor.dirty {
+            continue;
+        }
+
+        // Get remote ID
+        let Some(remote_id) = registry.get_remote(entity) else {
+            debug!(
+                "Cell {} not registered with server, keeping pending ops",
+                cell.id.0,
+            );
+            continue;
+        };
+
+        // Send full text as a replace operation (legacy fallback)
+        let text = editor.text();
+        let version = editor.version();
+
+        let op = CellOp {
+            cell_id: remote_id.to_string(),
+            client_version: version,
+            op: CrdtOp::FullState(text.into_bytes()),
+        };
+
+        cmds.send(ConnectionCommand::ApplyCellOp { op });
+        editor.mark_synced();
+    }
+}
+
+/// System: Handle incoming block events from the server.
+///
+/// Applies remote block operations to local cell editors.
+pub fn handle_block_events(
+    mut events: MessageReader<ConnectionEvent>,
+    mut editors: Query<&mut CellEditor>,
+    registry: Res<CellRegistry>,
+) {
+    for event in events.read() {
+        match event {
+            ConnectionEvent::BlockOpApplied { cell_id, new_version } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        editor.mark_synced();
+                        debug!("Block op applied for cell {}, new version {}", cell_id, new_version);
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockInserted {
+                cell_id,
+                block_id,
+                after_id,
+                content,
+            } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        // Apply remote block insertion
+                        if let Err(e) = editor.apply_remote_block_insert(
+                            block_id.clone(),
+                            after_id.clone(),
+                            content.clone(),
+                        ) {
+                            warn!("Failed to apply remote block insert: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockDeleted { cell_id, block_id } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        if let Err(e) = editor.apply_remote_block_delete(block_id) {
+                            warn!("Failed to apply remote block delete: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockEdited {
+                cell_id,
+                block_id,
+                pos,
+                insert,
+                delete,
+            } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        if let Err(e) = editor.apply_remote_block_edit(block_id, *pos, insert, *delete) {
+                            warn!("Failed to apply remote block edit: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockCollapsed {
+                cell_id,
+                block_id,
+                collapsed,
+            } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        if let Err(e) = editor.apply_remote_block_collapsed(block_id, *collapsed) {
+                            warn!("Failed to apply remote block collapsed: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockMoved {
+                cell_id,
+                block_id,
+                after_id,
+            } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        if let Err(e) = editor.apply_remote_block_move(block_id, after_id.as_ref()) {
+                            warn!("Failed to apply remote block move: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ConnectionEvent::BlockCellState {
+                cell_id,
+                blocks,
+                version,
+            } => {
+                if let Some(entity) = registry.get_local(cell_id) {
+                    if let Ok(mut editor) = editors.get_mut(entity) {
+                        // Replace editor content with server state
+                        editor.apply_server_block_state(blocks.clone(), *version);
+                        editor.mark_synced();
+                        info!("Applied block cell state for cell {}, version {}", cell_id, version);
+                    }
+                }
+            }
+
+            _ => {}
+        }
     }
 }
 

@@ -34,6 +34,7 @@ impl Plugin for CellPlugin {
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::PromptCellEntity>()
+            .init_resource::<systems::MainCellEntity>()
             // Input and mode handling (mode_switch must run before cell_input)
             .add_systems(
                 Update,
@@ -48,12 +49,15 @@ impl Plugin for CellPlugin {
                     systems::debug_spawn_cell,
                 ),
             )
-            // Prompt cell and conversation management
+            // Main cell and prompt cell management
             .add_systems(
                 Update,
                 (
+                    systems::spawn_main_cell,
                     systems::spawn_prompt_cell,
                     systems::handle_prompt_submitted,
+                    systems::sync_main_cell_to_conversation
+                        .after(systems::handle_prompt_submitted),
                     systems::scroll_to_bottom,
                     systems::handle_scroll_input,
                 ),
@@ -68,6 +72,7 @@ impl Plugin for CellPlugin {
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
                     systems::layout_cells,
+                    systems::layout_main_cell,
                     systems::layout_prompt_cell_position,
                     systems::sync_cell_buffers
                         .after(systems::init_cell_buffers)
@@ -104,13 +109,14 @@ impl Plugin for CellPlugin {
                     systems::update_cursor,
                 ),
             )
-            // Remote sync
+            // Remote sync (block-based)
             .add_systems(
                 Update,
                 (
                     sync::trigger_sync_on_attach,
                     sync::handle_cell_sync_result,
-                    sync::send_cell_operations,
+                    sync::handle_block_events,
+                    sync::send_block_operations,
                     sync::create_remote_cell,
                     sync::delete_remote_cell,
                 ),

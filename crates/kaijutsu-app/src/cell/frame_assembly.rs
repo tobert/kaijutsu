@@ -6,6 +6,7 @@
 
 use bevy::prelude::*;
 
+use super::components::MainCell;
 use super::frame_style::{FrameStyle, FrameStyleMapping};
 use super::{Cell, CurrentMode, EditorMode, FocusedCell};
 use crate::shaders::nine_slice::{
@@ -41,9 +42,13 @@ pub struct NineSliceMarker;
 // ============================================================================
 
 /// Spawns 9-slice frame entities for new cells.
+/// Excludes MainCell - it fills the screen and doesn't need a frame.
 pub fn spawn_nine_slice_frames(
     mut commands: Commands,
-    new_cells: Query<(Entity, &Cell, &TextAreaConfig), (Added<Cell>, Without<NineSliceFrame>)>,
+    new_cells: Query<
+        (Entity, &Cell, &TextAreaConfig),
+        (Added<Cell>, Without<NineSliceFrame>, Without<MainCell>),
+    >,
     style_mapping: Option<Res<FrameStyleMapping>>,
     styles: Res<Assets<FrameStyle>>,
     mut corner_materials: ResMut<Assets<CornerMaterial>>,

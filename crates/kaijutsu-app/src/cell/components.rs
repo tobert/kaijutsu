@@ -1,7 +1,14 @@
 //! Cell components for Bevy ECS.
+//!
+//! Cells are the fundamental content primitive in Kaijutsu. Each cell contains
+//! structured content blocks (text, thinking, tool use/results) managed by CRDTs.
 
 use bevy::prelude::*;
-use serde::{Deserialize, Serialize};
+
+// Re-export CRDT types for convenience
+pub use kaijutsu_crdt::{
+    Block, BlockContent, BlockContentSnapshot, BlockDocOp, BlockDocument, BlockId, BlockType,
+};
 
 /// Unique identifier for a cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,6 +46,18 @@ pub enum CellKind {
     UserMessage,
     /// Agent/AI conversation message
     AgentMessage,
+}
+
+/// Component linking a cell to a conversation.
+///
+/// When attached to a cell (like MainCell), the cell's content
+/// is synced with the conversation's BlockDocument.
+#[derive(Component, Debug, Clone)]
+pub struct ViewingConversation {
+    /// ID of the conversation this cell is viewing.
+    pub conversation_id: String,
+    /// Last sync version to detect changes.
+    pub last_sync_version: u64,
 }
 
 /// Core cell component - the fundamental content primitive.
@@ -92,460 +111,636 @@ impl Cell {
     }
 }
 
-/// A single edit operation for CRDT sync (text-level).
+// ============================================================================
+// CURSOR TYPES
+// ============================================================================
+
+/// Cursor position within a block document.
+#[derive(Debug, Clone, Default)]
+pub struct BlockCursor {
+    /// Which block the cursor is in.
+    pub block_id: Option<BlockId>,
+    /// Character offset within the block.
+    pub offset: usize,
+}
+
+impl BlockCursor {
+    /// Create a cursor at the start of a block.
+    pub fn at_block_start(block_id: BlockId) -> Self {
+        Self {
+            block_id: Some(block_id),
+            offset: 0,
+        }
+    }
+
+    /// Create a cursor at a specific position.
+    pub fn at(block_id: BlockId, offset: usize) -> Self {
+        Self {
+            block_id: Some(block_id),
+            offset,
+        }
+    }
+}
+
+/// Selection within a block document.
 #[derive(Debug, Clone)]
-pub enum EditOp {
-    /// Insert text at position
-    Insert { pos: usize, text: String },
-    /// Delete characters at position
-    Delete { pos: usize, len: usize },
+pub struct BlockSelection {
+    /// Start of selection (anchor).
+    pub start: BlockCursor,
+    /// End of selection (head).
+    pub end: BlockCursor,
 }
 
 // ============================================================================
-// CONTENT BLOCK MODEL
+// CELL EDITOR COMPONENT
 // ============================================================================
-
-/// A block of content within a cell.
-///
-/// This mirrors Claude's API response format to support structured content
-/// display: extended thinking, tool use, text blocks, and tool results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ContentBlock {
-    /// Model's extended thinking/reasoning (collapsible when complete).
-    Thinking {
-        /// The reasoning text.
-        text: String,
-        /// Whether the block is collapsed in the UI.
-        #[serde(default)]
-        collapsed: bool,
-    },
-    /// Main text response.
-    Text(String),
-    /// Tool invocation request.
-    ToolUse {
-        /// Unique ID for this tool use.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// Tool input as JSON.
-        input: serde_json::Value,
-    },
-    /// Result from a tool execution.
-    ToolResult {
-        /// ID of the tool_use this is a result for.
-        tool_use_id: String,
-        /// Result content.
-        content: String,
-        /// Whether this result represents an error.
-        is_error: bool,
-    },
-}
-
-impl ContentBlock {
-    /// Get the text content of this block, if any.
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            ContentBlock::Text(s) => Some(s),
-            ContentBlock::Thinking { text, .. } => Some(text),
-            ContentBlock::ToolResult { content, .. } => Some(content),
-            ContentBlock::ToolUse { .. } => None,
-        }
-    }
-
-    /// Check if this is a thinking block.
-    pub fn is_thinking(&self) -> bool {
-        matches!(self, ContentBlock::Thinking { .. })
-    }
-
-    /// Check if this is a tool use block.
-    pub fn is_tool_use(&self) -> bool {
-        matches!(self, ContentBlock::ToolUse { .. })
-    }
-
-    /// Check if this block is collapsed (only applies to thinking blocks).
-    pub fn is_collapsed(&self) -> bool {
-        match self {
-            ContentBlock::Thinking { collapsed, .. } => *collapsed,
-            _ => false,
-        }
-    }
-
-    /// Create a text block.
-    pub fn text_block(text: impl Into<String>) -> Self {
-        ContentBlock::Text(text.into())
-    }
-
-    /// Create a thinking block (auto-collapses when complete).
-    pub fn thinking(text: impl Into<String>) -> Self {
-        ContentBlock::Thinking {
-            text: text.into(),
-            collapsed: true,
-        }
-    }
-}
-
-/// Operations on content blocks for CRDT sync.
-#[derive(Debug, Clone)]
-pub enum BlockOp {
-    /// Insert a new block at index.
-    InsertBlock { index: usize, block: ContentBlock },
-    /// Delete block at index.
-    DeleteBlock { index: usize },
-    /// Edit text within a block (for Text/Thinking blocks).
-    EditBlock { index: usize, op: EditOp },
-    /// Toggle thinking block collapsed state.
-    CollapseBlock { index: usize, collapsed: bool },
-    /// Replace all blocks (full sync).
-    ReplaceAll { blocks: Vec<ContentBlock> },
-}
 
 /// Text editor state for a cell.
 ///
-/// All content modifications go through CRDT operations to ensure
-/// proper synchronization across multiple clients.
-///
-/// Content is stored as structured blocks (thinking, text, tool_use, etc.).
-/// The `text_cache` field is derived from blocks and should never be set directly.
+/// The `doc` field (BlockDocument) is the single source of truth for all content.
+/// All modifications go through the BlockDocument's CRDT operations.
 #[derive(Component)]
 pub struct CellEditor {
-    /// Structured content blocks - the source of truth.
-    pub blocks: Vec<ContentBlock>,
-    /// Which block the cursor is in (0-indexed).
-    pub cursor_block: usize,
-    /// Cursor position within the current block (byte offset).
-    pub cursor_offset: usize,
-    /// Cached text representation (derived from blocks).
-    /// Private - use `text()` accessor.
-    text_cache: String,
-    /// Cursor position in the cached text (byte offset).
-    pub cursor: usize,
-    /// Selection start (byte offset, None if no selection)
-    pub selection_start: Option<usize>,
-    /// Whether content has changed since last sync
+    /// Block document - the source of truth for all content.
+    pub doc: BlockDocument,
+
+    /// Cursor position within the document.
+    pub cursor: BlockCursor,
+
+    /// Selection (if any).
+    pub selection: Option<BlockSelection>,
+
+    /// Whether content has changed since last sync.
     pub dirty: bool,
-    /// CRDT version this content is based on
-    pub version: u64,
-    /// Pending text operations to send to server.
-    pub pending_ops: Vec<EditOp>,
-    /// Pending block operations to send to server.
-    pub pending_block_ops: Vec<BlockOp>,
+
+    /// Currently streaming block (during LLM response).
+    pub streaming_block: Option<(BlockId, BlockType)>,
+
+    /// Agent ID for this editor (used for CRDT operations).
+    agent_id: String,
 }
 
 impl Default for CellEditor {
     fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            cursor_block: 0,
-            cursor_offset: 0,
-            text_cache: String::new(),
-            cursor: 0,
-            selection_start: None,
-            dirty: false,
-            version: 0,
-            pending_ops: Vec::new(),
-            pending_block_ops: Vec::new(),
-        }
+        Self::new()
     }
 }
 
 impl CellEditor {
+    /// Create a new editor with a random agent ID.
     pub fn new() -> Self {
-        Self::default()
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let cell_id = uuid::Uuid::new_v4().to_string();
+        Self {
+            doc: BlockDocument::new(&cell_id, &agent_id),
+            cursor: BlockCursor::default(),
+            selection: None,
+            dirty: false,
+            streaming_block: None,
+            agent_id,
+        }
     }
 
-    /// Builder: set initial text content.
+    /// Create an editor for a specific cell.
+    pub fn for_cell(cell_id: &str, agent_id: &str) -> Self {
+        Self {
+            doc: BlockDocument::new(cell_id, agent_id),
+            cursor: BlockCursor::default(),
+            selection: None,
+            dirty: false,
+            streaming_block: None,
+            agent_id: agent_id.to_string(),
+        }
+    }
+
+    /// Builder: set initial text content (creates a single text block).
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        self.set_text(text);
-        self
-    }
-
-    /// Create an editor with content blocks.
-    pub fn with_blocks(mut self, blocks: Vec<ContentBlock>) -> Self {
-        self.blocks = blocks;
-        self.sync_text_from_blocks();
+        let text = text.into();
+        if !text.is_empty() {
+            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
+                self.cursor = BlockCursor::at(block_id, text.len());
+            }
+        }
         self
     }
 
     /// Builder: set CRDT version.
     pub fn with_version(mut self, version: u64) -> Self {
-        self.version = version;
+        // Version is tracked in the document
+        // For initial sync, we trust the provided version
+        let _ = version; // Currently not used directly, version comes from doc
         self
     }
 
     // =========================================================================
-    // TEXT ACCESS & MUTATION
+    // TEXT ACCESS
     // =========================================================================
 
-    /// Get the full text content.
-    ///
-    /// For cells with blocks, this is the concatenated text from all blocks.
-    /// For simple text cells, this is the raw text.
-    pub fn text(&self) -> &str {
-        &self.text_cache
+    /// Get the full text content (concatenation of all blocks).
+    pub fn text(&self) -> String {
+        self.doc.full_text()
     }
 
-    /// Set the text content (CRDT-tracked).
-    ///
-    /// Creates a single Text block containing the content.
-    /// This is tracked via BlockOp for CRDT sync.
+    /// Get the current document version.
+    pub fn version(&self) -> u64 {
+        self.doc.version()
+    }
+
+    /// Check if the editor has any blocks.
+    pub fn has_blocks(&self) -> bool {
+        !self.doc.is_empty()
+    }
+
+    /// Get blocks in order.
+    pub fn blocks(&self) -> Vec<&Block> {
+        self.doc.blocks_ordered()
+    }
+
+    /// Get the current block (where cursor is).
+    pub fn current_block(&self) -> Option<&Block> {
+        self.cursor
+            .block_id
+            .as_ref()
+            .and_then(|id| self.doc.get_block(id))
+    }
+
+    // =========================================================================
+    // TEXT MUTATION
+    // =========================================================================
+
+    /// Set the text content (replaces all content with a single text block).
     pub fn set_text(&mut self, text: impl Into<String>) {
+        // Clear existing blocks
+        let block_ids: Vec<_> = self
+            .doc
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        for id in block_ids {
+            let _ = self.doc.delete_block(&id);
+        }
+
+        // Create new text block
         let text = text.into();
-        let block = ContentBlock::Text(text);
-        // Track as block operation for CRDT
-        self.pending_block_ops.push(BlockOp::ReplaceAll {
-            blocks: vec![block.clone()],
-        });
-        self.blocks = vec![block];
-        self.sync_text_from_blocks();
-        self.cursor = self.text_cache.len();
+        if !text.is_empty() {
+            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
+                self.cursor = BlockCursor::at(block_id, text.len());
+            }
+        } else {
+            self.cursor = BlockCursor::default();
+        }
         self.dirty = true;
     }
 
-    /// Apply server-authoritative content.
-    ///
-    /// This is used when receiving state from the server. It updates local
-    /// content without creating outbound CRDT operations (to avoid feedback loops).
-    /// The server is the source of truth in this case.
+    /// Apply server-authoritative content (doesn't generate ops).
     pub fn apply_server_content(&mut self, content: impl Into<String>) {
+        // For server content, we set text without marking dirty
+        // because this is already synced.
         let text = content.into();
-        self.blocks = vec![ContentBlock::Text(text)];
-        self.sync_text_from_blocks();
-        self.cursor = self.text_cache.len();
-        // Note: dirty is NOT set since this is server-authoritative
+
+        // Clear existing blocks
+        let block_ids: Vec<_> = self
+            .doc
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        for id in block_ids {
+            let _ = self.doc.delete_block(&id);
+        }
+
+        // Take any pending ops (discard them - server is authoritative)
+        let _ = self.doc.take_pending_ops();
+
+        // Create new text block
+        if !text.is_empty() {
+            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
+                self.cursor = BlockCursor::at(block_id, text.len());
+            }
+        } else {
+            self.cursor = BlockCursor::default();
+        }
+
+        // Clear pending ops again (the insert generated one)
+        let _ = self.doc.take_pending_ops();
+
+        // Not dirty - server is authoritative
+        self.dirty = false;
     }
 
     /// Clear all content.
     pub fn clear(&mut self) {
-        self.blocks.clear();
-        self.text_cache.clear();
-        self.cursor = 0;
-        self.cursor_block = 0;
-        self.cursor_offset = 0;
-        self.dirty = true;
-    }
-
-    // =========================================================================
-    // BLOCK OPERATIONS
-    // =========================================================================
-
-    /// Replace all blocks (CRDT-tracked).
-    pub fn replace_blocks(&mut self, blocks: Vec<ContentBlock>) {
-        self.pending_block_ops.push(BlockOp::ReplaceAll {
-            blocks: blocks.clone(),
-        });
-        self.blocks = blocks;
-        self.sync_text_from_blocks();
-        self.dirty = true;
-    }
-
-    /// Append a new block (CRDT-tracked).
-    pub fn append_block(&mut self, block: ContentBlock) {
-        let index = self.blocks.len();
-        self.pending_block_ops.push(BlockOp::InsertBlock {
-            index,
-            block: block.clone(),
-        });
-        self.blocks.push(block);
-        self.sync_text_from_blocks();
-        self.dirty = true;
-    }
-
-    /// Update text within a specific block.
-    pub fn update_block_text(&mut self, index: usize, new_text: String) {
-        if index >= self.blocks.len() {
-            return;
-        }
-
-        match &mut self.blocks[index] {
-            ContentBlock::Text(text) => {
-                *text = new_text;
-            }
-            ContentBlock::Thinking { text, .. } => {
-                *text = new_text;
-            }
-            ContentBlock::ToolResult { content, .. } => {
-                *content = new_text;
-            }
-            ContentBlock::ToolUse { .. } => {
-                // Tool use blocks don't have editable text
-            }
-        }
-        self.sync_text_from_blocks();
-        self.dirty = true;
-    }
-
-    /// Toggle collapse state of a thinking block.
-    pub fn toggle_block_collapse(&mut self, index: usize) {
-        if let Some(ContentBlock::Thinking { collapsed, .. }) = self.blocks.get_mut(index) {
-            *collapsed = !*collapsed;
-            self.pending_block_ops.push(BlockOp::CollapseBlock {
-                index,
-                collapsed: *collapsed,
-            });
-            self.dirty = true;
-        }
-    }
-
-    /// Check if the editor has content blocks.
-    pub fn has_blocks(&self) -> bool {
-        !self.blocks.is_empty()
-    }
-
-    /// Get block at cursor position.
-    pub fn current_block(&self) -> Option<&ContentBlock> {
-        self.blocks.get(self.cursor_block)
-    }
-
-    /// Sync the text field from blocks (for backward compatibility).
-    fn sync_text_from_blocks(&mut self) {
-        if self.blocks.is_empty() {
-            return;
-        }
-
-        self.text_cache = self
-            .blocks
+        let block_ids: Vec<_> = self
+            .doc
+            .blocks_ordered()
             .iter()
-            .filter_map(|b| b.text())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        self.cursor = self.text_cache.len();
-    }
-
-    /// Take pending block operations for sending to server.
-    pub fn take_pending_block_ops(&mut self) -> Vec<BlockOp> {
-        std::mem::take(&mut self.pending_block_ops)
-    }
-
-    /// Check if there are pending block operations to send.
-    pub fn has_pending_block_ops(&self) -> bool {
-        !self.pending_block_ops.is_empty()
+            .map(|b| b.id.clone())
+            .collect();
+        for id in block_ids {
+            let _ = self.doc.delete_block(&id);
+        }
+        self.cursor = BlockCursor::default();
+        self.dirty = true;
     }
 
     /// Insert text at cursor position.
     pub fn insert(&mut self, text: &str) {
-        let pos = self.cursor;
-        self.text_cache.insert_str(pos, text);
-        self.cursor += text.len();
-        self.dirty = true;
-        self.pending_ops.push(EditOp::Insert {
-            pos,
-            text: text.to_string(),
-        });
+        // Ensure we have a block to insert into
+        if self.cursor.block_id.is_none() {
+            // Create a new text block
+            if let Ok(block_id) = self.doc.insert_text_block(None, "") {
+                self.cursor.block_id = Some(block_id);
+                self.cursor.offset = 0;
+            } else {
+                return;
+            }
+        }
+
+        if let Some(ref block_id) = self.cursor.block_id {
+            if self
+                .doc
+                .edit_text(block_id, self.cursor.offset, text, 0)
+                .is_ok()
+            {
+                self.cursor.offset += text.len();
+                self.dirty = true;
+            }
+        }
     }
 
     /// Delete character before cursor (backspace).
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            // Find the previous character boundary
-            let mut new_cursor = self.cursor - 1;
-            while new_cursor > 0 && !self.text_cache.is_char_boundary(new_cursor) {
-                new_cursor -= 1;
+        if self.cursor.offset == 0 {
+            return; // At start, nothing to delete
+        }
+
+        if let Some(ref block_id) = self.cursor.block_id {
+            // Find previous character boundary
+            if let Some(block) = self.doc.get_block(block_id) {
+                let text = block.text();
+                let mut new_offset = self.cursor.offset.saturating_sub(1);
+                while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                    new_offset -= 1;
+                }
+                let delete_len = self.cursor.offset - new_offset;
+
+                if self
+                    .doc
+                    .edit_text(block_id, new_offset, "", delete_len)
+                    .is_ok()
+                {
+                    self.cursor.offset = new_offset;
+                    self.dirty = true;
+                }
             }
-            let deleted_len = self.cursor - new_cursor;
-            self.text_cache.drain(new_cursor..self.cursor);
-            self.cursor = new_cursor;
-            self.dirty = true;
-            self.pending_ops.push(EditOp::Delete {
-                pos: new_cursor,
-                len: deleted_len,
-            });
         }
     }
 
     /// Delete character at cursor (delete key).
     pub fn delete(&mut self) {
-        if self.cursor < self.text_cache.len() {
-            // Find the next character boundary
-            let mut end = self.cursor + 1;
-            while end < self.text_cache.len() && !self.text_cache.is_char_boundary(end) {
-                end += 1;
+        if let Some(ref block_id) = self.cursor.block_id {
+            if let Some(block) = self.doc.get_block(block_id) {
+                let text = block.text();
+                if self.cursor.offset >= text.len() {
+                    return; // At end, nothing to delete
+                }
+
+                // Find next character boundary
+                let mut end = self.cursor.offset + 1;
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                let delete_len = end - self.cursor.offset;
+
+                if self
+                    .doc
+                    .edit_text(block_id, self.cursor.offset, "", delete_len)
+                    .is_ok()
+                {
+                    self.dirty = true;
+                }
             }
-            let deleted_len = end - self.cursor;
-            self.text_cache.drain(self.cursor..end);
-            self.dirty = true;
-            self.pending_ops.push(EditOp::Delete {
-                pos: self.cursor,
-                len: deleted_len,
-            });
         }
     }
 
+    // =========================================================================
+    // CURSOR MOVEMENT
+    // =========================================================================
+
     /// Move cursor left.
     pub fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            while self.cursor > 0 && !self.text_cache.is_char_boundary(self.cursor) {
-                self.cursor -= 1;
+        if self.cursor.offset > 0 {
+            if let Some(ref block_id) = self.cursor.block_id {
+                if let Some(block) = self.doc.get_block(block_id) {
+                    let text = block.text();
+                    let mut new_offset = self.cursor.offset - 1;
+                    while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                        new_offset -= 1;
+                    }
+                    self.cursor.offset = new_offset;
+                }
             }
         }
     }
 
     /// Move cursor right.
     pub fn move_right(&mut self) {
-        if self.cursor < self.text_cache.len() {
-            self.cursor += 1;
-            while self.cursor < self.text_cache.len() && !self.text_cache.is_char_boundary(self.cursor) {
-                self.cursor += 1;
+        if let Some(ref block_id) = self.cursor.block_id {
+            if let Some(block) = self.doc.get_block(block_id) {
+                let text = block.text();
+                if self.cursor.offset < text.len() {
+                    let mut new_offset = self.cursor.offset + 1;
+                    while new_offset < text.len() && !text.is_char_boundary(new_offset) {
+                        new_offset += 1;
+                    }
+                    self.cursor.offset = new_offset;
+                }
             }
         }
     }
 
-    /// Move cursor to start of line.
+    /// Move cursor to start of current block.
     pub fn move_home(&mut self) {
-        // Find previous newline or start
-        self.cursor = self.text_cache[..self.cursor]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        if let Some(ref block_id) = self.cursor.block_id {
+            if let Some(block) = self.doc.get_block(block_id) {
+                let text = block.text();
+                // Find previous newline or start
+                let before_cursor = &text[..self.cursor.offset];
+                self.cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            }
+        }
     }
 
-    /// Move cursor to end of line.
+    /// Move cursor to end of current line.
     pub fn move_end(&mut self) {
-        // Skip current position if already at newline to avoid getting stuck
-        let search_start = if self.text_cache.get(self.cursor..self.cursor + 1) == Some("\n") {
-            self.cursor + 1
-        } else {
-            self.cursor
-        };
-        // Find next newline or end
-        self.cursor = self.text_cache[search_start..]
-            .find('\n')
-            .map(|i| search_start + i)
-            .unwrap_or(self.text_cache.len());
+        if let Some(ref block_id) = self.cursor.block_id {
+            if let Some(block) = self.doc.get_block(block_id) {
+                let text = block.text();
+                let after_cursor = &text[self.cursor.offset..];
+                self.cursor.offset = self.cursor.offset
+                    + after_cursor.find('\n').unwrap_or(after_cursor.len());
+            }
+        }
     }
 
-    /// Get selected text, if any.
-    ///
-    /// Returns None if no selection or if bounds fall on invalid UTF-8 boundaries.
-    pub fn selection(&self) -> Option<&str> {
-        self.selection_start.and_then(|start| {
-            let (a, b) = if start < self.cursor {
-                (start, self.cursor)
-            } else {
-                (self.cursor, start)
-            };
-            // Safe bounds check - prevents panic on multi-byte character boundaries
-            self.text_cache.get(a..b)
-        })
+    // =========================================================================
+    // BLOCK OPERATIONS
+    // =========================================================================
+
+    /// Toggle collapse state of a thinking block.
+    pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
+        if let Some(block) = self.doc.get_block(block_id) {
+            let new_state = !block.content.is_collapsed();
+            let _ = self.doc.set_collapsed(block_id, new_state);
+            self.dirty = true;
+        }
     }
 
-    /// Mark as synced with given version.
-    pub fn mark_synced(&mut self, version: u64) {
-        self.dirty = false;
-        self.version = version;
-        self.pending_ops.clear();
+    /// Append a text block.
+    pub fn append_text_block(&mut self, text: impl Into<String>) -> Option<BlockId> {
+        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
+        let block_id = self
+            .doc
+            .insert_text_block(last_id.as_ref(), text)
+            .ok()?;
+        self.dirty = true;
+        Some(block_id)
     }
+
+    /// Append a thinking block.
+    pub fn append_thinking_block(&mut self, text: impl Into<String>) -> Option<BlockId> {
+        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
+        let block_id = self
+            .doc
+            .insert_thinking_block(last_id.as_ref(), text)
+            .ok()?;
+        self.dirty = true;
+        Some(block_id)
+    }
+
+    /// Append text to a specific block.
+    pub fn append_to_block(&mut self, block_id: &BlockId, text: &str) {
+        let _ = self.doc.append_text(block_id, text);
+        self.dirty = true;
+    }
+
+    /// Append a tool use block.
+    pub fn append_tool_use(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Option<BlockId> {
+        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
+        let block_id = self
+            .doc
+            .insert_tool_use(last_id.as_ref(), id, name, input)
+            .ok()?;
+        self.dirty = true;
+        Some(block_id)
+    }
+
+    /// Append a tool result block.
+    pub fn append_tool_result(
+        &mut self,
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Option<BlockId> {
+        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
+        let block_id = self
+            .doc
+            .insert_tool_result(last_id.as_ref(), tool_use_id, content, is_error)
+            .ok()?;
+        self.dirty = true;
+        Some(block_id)
+    }
+
+    /// Set the collapsed state of a thinking block.
+    pub fn set_block_collapsed(&mut self, block_id: &BlockId, collapsed: bool) {
+        let _ = self.doc.set_collapsed(block_id, collapsed);
+        self.dirty = true;
+    }
+
+    // =========================================================================
+    // SYNC OPERATIONS
+    // =========================================================================
 
     /// Take pending operations for sending to server.
-    pub fn take_pending_ops(&mut self) -> Vec<EditOp> {
-        std::mem::take(&mut self.pending_ops)
+    pub fn take_pending_ops(&mut self) -> Vec<BlockDocOp> {
+        self.doc.take_pending_ops()
     }
 
-    /// Check if there are pending operations to send.
+    /// Check if there are pending operations.
     pub fn has_pending_ops(&self) -> bool {
-        !self.pending_ops.is_empty()
+        self.doc.has_pending_ops()
+    }
+
+    /// Apply a remote operation.
+    pub fn apply_remote_op(&mut self, op: &BlockDocOp) {
+        let _ = self.doc.apply_remote_op(op);
+    }
+
+    /// Mark as synced.
+    pub fn mark_synced(&mut self) {
+        self.dirty = false;
+        // Clear any remaining pending ops
+        let _ = self.doc.take_pending_ops();
+    }
+
+    /// Apply a remote block insertion.
+    pub fn apply_remote_block_insert(
+        &mut self,
+        block_id: BlockId,
+        after_id: Option<BlockId>,
+        content: BlockContentSnapshot,
+    ) -> Result<(), String> {
+        // Create the operation and apply it
+        let op = BlockDocOp::InsertBlock {
+            id: block_id,
+            after: after_id,
+            content,
+            author: "remote".to_string(), // Remote insertions
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            fugue_meta: None,
+        };
+        self.doc.apply_remote_op(&op).map_err(|e| e.to_string())
+    }
+
+    /// Apply a remote block deletion.
+    pub fn apply_remote_block_delete(&mut self, block_id: &BlockId) -> Result<(), String> {
+        let op = BlockDocOp::DeleteBlock { id: block_id.clone() };
+        self.doc.apply_remote_op(&op).map_err(|e| e.to_string())
+    }
+
+    /// Apply a remote text edit.
+    pub fn apply_remote_block_edit(
+        &mut self,
+        block_id: &BlockId,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+    ) -> Result<(), String> {
+        let op = BlockDocOp::EditBlockText {
+            id: block_id.clone(),
+            pos,
+            insert: insert.to_string(),
+            delete,
+            dt_encoded: None,
+        };
+        self.doc.apply_remote_op(&op).map_err(|e| e.to_string())
+    }
+
+    /// Apply a remote collapsed state change.
+    pub fn apply_remote_block_collapsed(
+        &mut self,
+        block_id: &BlockId,
+        collapsed: bool,
+    ) -> Result<(), String> {
+        let op = BlockDocOp::SetCollapsed {
+            id: block_id.clone(),
+            collapsed,
+        };
+        self.doc.apply_remote_op(&op).map_err(|e| e.to_string())
+    }
+
+    /// Apply a remote block move.
+    pub fn apply_remote_block_move(
+        &mut self,
+        block_id: &BlockId,
+        after_id: Option<&BlockId>,
+    ) -> Result<(), String> {
+        let op = BlockDocOp::MoveBlock {
+            id: block_id.clone(),
+            after: after_id.cloned(),
+            fugue_meta: None,
+        };
+        self.doc.apply_remote_op(&op).map_err(|e| e.to_string())
+    }
+
+    /// Apply server-authoritative block state (full replacement).
+    pub fn apply_server_block_state(
+        &mut self,
+        blocks: Vec<(BlockId, BlockContentSnapshot)>,
+        _version: u64,
+    ) {
+        // Clear existing blocks
+        let existing_ids: Vec<_> = self.doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        for id in existing_ids {
+            let _ = self.doc.delete_block(&id);
+        }
+
+        // Insert blocks from server
+        let mut prev_id: Option<BlockId> = None;
+        for (block_id, content) in blocks {
+            let op = BlockDocOp::InsertBlock {
+                id: block_id.clone(),
+                after: prev_id.clone(),
+                content,
+                author: "server".to_string(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                fugue_meta: None,
+            };
+            let _ = self.doc.apply_remote_op(&op);
+            prev_id = Some(block_id);
+        }
+
+        // Clear pending ops - server state is authoritative
+        let _ = self.doc.take_pending_ops();
+
+        // Update cursor
+        if let Some(first_block) = self.doc.blocks_ordered().first() {
+            self.cursor = BlockCursor::at(first_block.id.clone(), 0);
+        } else {
+            self.cursor = BlockCursor::default();
+        }
+    }
+
+    /// Get selected text (if any).
+    pub fn selection(&self) -> Option<String> {
+        // TODO: Implement selection across blocks
+        None
+    }
+
+    // =========================================================================
+    // LEGACY COMPATIBILITY
+    // =========================================================================
+
+    /// Legacy: Get cursor position as byte offset in full text.
+    /// Used for rendering compatibility.
+    pub fn cursor_offset(&self) -> usize {
+        if self.cursor.block_id.is_none() {
+            return 0;
+        }
+
+        let block_id = self.cursor.block_id.as_ref().unwrap();
+        let blocks = self.doc.blocks_ordered();
+
+        let mut offset = 0;
+        for (i, block) in blocks.iter().enumerate() {
+            if &block.id == block_id {
+                return offset + self.cursor.offset;
+            }
+            offset += block.text().len();
+            if i < blocks.len() - 1 {
+                offset += 2; // "\n\n" separator
+            }
+        }
+
+        offset
     }
 }
+
+// ============================================================================
+// LAYOUT AND STATE COMPONENTS
+// ============================================================================
 
 /// Position of a cell in the workspace grid.
 #[derive(Component, Default, Clone, Copy)]
@@ -582,6 +777,7 @@ impl CellState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn toggle_collapse(&mut self) {
         self.collapsed = !self.collapsed;
     }
@@ -611,6 +807,7 @@ impl EditorMode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn color_hint(&self) -> &'static str {
         match self {
             EditorMode::Normal => "blue",
