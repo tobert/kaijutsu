@@ -1769,4 +1769,34 @@ impl vfs::Server for VfsImpl {
             Ok(())
         })
     }
+
+    fn real_path(
+        self: Rc<Self>,
+        params: vfs::RealPathParams,
+        mut results: vfs::RealPathResults,
+    ) -> Promise<(), capnp::Error> {
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            match kernel.real_path(Path::new(&path)).await {
+                Ok(Some(real)) => {
+                    results.get().set_real_path(&real.to_string_lossy());
+                    Ok(())
+                }
+                Ok(None) => {
+                    // Virtual backend (MemoryBackend) - return empty string
+                    results.get().set_real_path("");
+                    Ok(())
+                }
+                Err(e) => Err(vfs_err_to_capnp(e)),
+            }
+        })
+    }
 }

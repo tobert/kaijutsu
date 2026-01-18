@@ -446,4 +446,7 @@ interface Vfs {
   # Metadata
   readOnly @13 () -> (readOnly :Bool);
   statfs @14 () -> (stat :StatFs);
+
+  # Path resolution
+  realPath @15 (path :Text) -> (realPath :Text);
 }
