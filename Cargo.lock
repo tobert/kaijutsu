@@ -2282,6 +2282,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cola"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3657ef772ec0ee8c536338acb298f3792aa1af0ce87010c58f0ce3b7f22e671"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4566,9 +4572,11 @@ dependencies = [
  "bevy",
  "bevy_brp_extras",
  "cosmic-text",
+ "dirs 5.0.1",
  "futures",
  "glyphon",
  "kaijutsu-client",
+ "kaijutsu-crdt",
  "kaijutsu-kernel",
  "log",
  "ron 0.8.1",
@@ -4592,12 +4600,26 @@ dependencies = [
  "capnpc 0.25.0",
  "env_logger",
  "futures",
+ "kaijutsu-crdt",
  "log",
  "russh",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "kaijutsu-crdt"
+version = "0.1.0"
+dependencies = [
+ "cola",
+ "diamond-types",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -4608,6 +4630,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "diamond-types",
+ "kaijutsu-crdt",
  "rhai",
  "rusqlite",
  "rustix 0.38.44",

@@ -5,7 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/cargo run --release -p kaijutsu-server --manifest-path %h/src/kaijutsu/Cargo.toml
+ExecStart=/bin/bash -c 'export ANTHROPIC_API_KEY=$(cat %h/.anthropic-key.txt) && exec cargo run --release -p kaijutsu-server --manifest-path %h/src/kaijutsu/Cargo.toml'
 WorkingDirectory=%h/src/kaijutsu
 Restart=on-failure
 RestartSec=5
