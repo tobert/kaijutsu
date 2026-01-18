@@ -22,6 +22,7 @@ use crate::kaish::KaishProcess;
 use kaijutsu_kernel::{
     CellDb, CellEditEngine, CellKind, CellListEngine, CellReadEngine, Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
+    AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
 };
 
 // ============================================================================
@@ -65,10 +66,21 @@ pub struct ServerState {
     next_kernel_id: AtomicU64,
     next_row_id: AtomicU64,
     next_exec_id: AtomicU64,
+    /// LLM provider (initialized from ANTHROPIC_API_KEY)
+    pub llm_provider: Option<Arc<AnthropicProvider>>,
 }
 
 impl ServerState {
     pub fn new(username: String) -> Self {
+        // Initialize LLM provider from environment if API key is available
+        let llm_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            log::info!("ANTHROPIC_API_KEY found, initializing LLM provider");
+            Some(Arc::new(AnthropicProvider::from_env()))
+        } else {
+            log::warn!("ANTHROPIC_API_KEY not set, LLM features disabled");
+            None
+        };
+
         Self {
             identity: Identity {
                 username: username.clone(),
@@ -78,6 +90,7 @@ impl ServerState {
             next_kernel_id: AtomicU64::new(1),
             next_row_id: AtomicU64::new(1),
             next_exec_id: AtomicU64::new(1),
+            llm_provider,
         }
     }
 
@@ -152,6 +165,8 @@ pub struct KernelState {
     pub cells: SharedBlockStore,
     /// Subscribers for cell update events
     pub cell_subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>,
+    /// Subscribers for block update events (LLM streaming)
+    pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
 }
 
 #[derive(Clone, Copy)]
@@ -286,6 +301,7 @@ impl world::Server for WorldImpl {
                         kernel: kernel_arc,
                         cells,
                         cell_subscribers: Vec::new(),
+                        block_subscribers: Vec::new(),
                     },
                 );
             }
@@ -359,6 +375,7 @@ impl world::Server for WorldImpl {
                         kernel: kernel_arc,
                         cells,
                         cell_subscribers: Vec::new(),
+                        block_subscribers: Vec::new(),
                     },
                 );
             }
@@ -1259,11 +1276,20 @@ impl kernel::Server for KernelImpl {
 
     fn subscribe_blocks(
         self: Rc<Self>,
-        _params: kernel::SubscribeBlocksParams,
+        params: kernel::SubscribeBlocksParams,
         _results: kernel::SubscribeBlocksResults,
     ) -> Promise<(), capnp::Error> {
-        // TODO: Implement block event subscription
-        log::warn!("subscribe_blocks called - stub implementation");
+        let callback = pry!(pry!(params.get()).get_callback());
+
+        let mut state = self.state.borrow_mut();
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            kernel.block_subscribers.push(callback);
+            log::debug!(
+                "Added block subscriber for kernel {} (total: {})",
+                self.kernel_id,
+                kernel.block_subscribers.len()
+            );
+        }
         Promise::ok(())
     }
 
@@ -1301,6 +1327,314 @@ impl kernel::Server for KernelImpl {
         }
 
         Promise::ok(())
+    }
+
+    // =========================================================================
+    // LLM operations
+    // =========================================================================
+
+    fn prompt(
+        self: Rc<Self>,
+        params: kernel::PromptParams,
+        mut results: kernel::PromptResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let request = pry!(params.get_request());
+        let content = pry!(pry!(request.get_content()).to_str()).to_owned();
+        let model = request.get_model().ok().and_then(|m| m.to_str().ok()).map(|s| s.to_owned());
+        let cell_id = pry!(pry!(request.get_cell_id()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            // Get LLM provider
+            let (provider, block_subscribers, cells) = {
+                let state_ref = state.borrow();
+                let provider = match &state_ref.llm_provider {
+                    Some(p) => p.clone(),
+                    None => {
+                        return Err(capnp::Error::failed("LLM provider not configured (missing ANTHROPIC_API_KEY)".into()));
+                    }
+                };
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                (provider, kernel.block_subscribers.clone(), kernel.cells.clone())
+            };
+
+            // Generate prompt ID
+            let prompt_id = uuid::Uuid::new_v4().to_string();
+
+            // Insert user message block
+            let user_block_id = {
+                let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                let cell = cells_guard.get_mut(&cell_id)
+                    .ok_or_else(|| capnp::Error::failed(format!("cell not found: {}", cell_id)))?;
+
+                // Create user message block using the helper method
+                let block_id = cell.insert_text_block(None, &content)
+                    .map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
+
+                // Broadcast user block to subscribers
+                for subscriber in &block_subscribers {
+                    let mut req = subscriber.on_block_inserted_request();
+                    {
+                        let mut params = req.get();
+                        params.set_cell_id(&cell_id);
+                        params.set_has_after_id(false);
+                        let mut block_state = params.init_block();
+                        {
+                            let mut id = block_state.reborrow().init_id();
+                            id.set_cell_id(&block_id.cell_id);
+                            id.set_agent_id(&block_id.agent_id);
+                            id.set_seq(block_id.seq);
+                        }
+                        block_state.set_author("user");
+                        block_state.set_created_at(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                        );
+                        let mut block_content = block_state.init_content();
+                        block_content.set_text(&content);
+                    }
+                    let _ = req.send(); // Fire and forget
+                }
+
+                block_id
+            };
+
+            log::info!("User message block inserted (id: {:?}), starting LLM stream", user_block_id);
+
+            // Build conversation history from cell content
+            // For now, just use the current prompt as a single message
+            let messages = vec![LlmMessage::user(&content)];
+            let model_name = model.unwrap_or_else(|| provider.default_model().to_string());
+
+            // Create streaming request
+            let stream_request = StreamRequest::new(&model_name, messages)
+                .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.")
+                .with_max_tokens(4096);
+
+            // Helper to broadcast block insertions
+            let broadcast_block_inserted = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
+                                           cell_id: &str,
+                                           block_id: &kaijutsu_crdt::BlockId,
+                                           content: &kaijutsu_crdt::BlockContentSnapshot| {
+                for subscriber in subscribers {
+                    let mut req = subscriber.on_block_inserted_request();
+                    {
+                        let mut params = req.get();
+                        params.set_cell_id(cell_id);
+                        params.set_has_after_id(false);
+                        let mut block_state = params.init_block();
+                        {
+                            let mut id = block_state.reborrow().init_id();
+                            id.set_cell_id(&block_id.cell_id);
+                            id.set_agent_id(&block_id.agent_id);
+                            id.set_seq(block_id.seq);
+                        }
+                        block_state.set_author(&block_id.agent_id);
+                        block_state.set_created_at(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                        );
+                        let mut block_content = block_state.init_content();
+                        match content {
+                            kaijutsu_crdt::BlockContentSnapshot::Text { text } => {
+                                block_content.set_text(text);
+                            }
+                            kaijutsu_crdt::BlockContentSnapshot::Thinking { text, collapsed } => {
+                                let mut t = block_content.init_thinking();
+                                t.set_text(text);
+                                t.set_collapsed(*collapsed);
+                            }
+                            kaijutsu_crdt::BlockContentSnapshot::ToolUse { id, name, input } => {
+                                let mut t = block_content.init_tool_use();
+                                t.set_id(id);
+                                t.set_name(name);
+                                t.set_input(&input.to_string());
+                            }
+                            kaijutsu_crdt::BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
+                                let mut t = block_content.init_tool_result();
+                                t.set_tool_use_id(tool_use_id);
+                                t.set_content(content);
+                                t.set_is_error(*is_error);
+                            }
+                        }
+                    }
+                    let _ = req.send();
+                }
+            };
+
+            // Helper to broadcast text appends
+            let broadcast_text_append = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
+                                         cell_id: &str,
+                                         block_id: &kaijutsu_crdt::BlockId,
+                                         text: &str| {
+                for subscriber in subscribers {
+                    let mut req = subscriber.on_block_edited_request();
+                    {
+                        let mut params = req.get();
+                        params.set_cell_id(cell_id);
+                        {
+                            let mut id = params.reborrow().init_block_id();
+                            id.set_cell_id(&block_id.cell_id);
+                            id.set_agent_id(&block_id.agent_id);
+                            id.set_seq(block_id.seq);
+                        }
+                        // For append, position is at end - we send as full text update
+                        params.set_pos(0);
+                        params.set_insert(text);
+                        params.set_delete(0);
+                    }
+                    let _ = req.send();
+                }
+            };
+
+            // Start streaming
+            let mut stream = match provider.stream(stream_request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to start LLM stream: {}", e);
+                    // Insert error block
+                    let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                    if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                        let _ = cell.insert_text_block(None, format!("❌ Error: {}", e));
+                    }
+                    return Err(capnp::Error::failed(format!("LLM stream failed: {}", e)));
+                }
+            };
+
+            // Process stream events
+            let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
+
+            while let Some(event) = stream.next_event().await {
+                match event {
+                    StreamEvent::ThinkingStart => {
+                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                            match cell.insert_thinking_block(None, "") {
+                                Ok(block_id) => {
+                                    let content = kaijutsu_crdt::BlockContentSnapshot::Thinking {
+                                        text: String::new(),
+                                        collapsed: false,
+                                    };
+                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                    current_block_id = Some(block_id);
+                                }
+                                Err(e) => log::error!("Failed to insert thinking block: {}", e),
+                            }
+                        }
+                    }
+
+                    StreamEvent::ThinkingDelta(text) => {
+                        if let Some(ref block_id) = current_block_id {
+                            let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                            if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                                if let Err(e) = cell.append_text(block_id, &text) {
+                                    log::error!("Failed to append thinking text: {}", e);
+                                } else {
+                                    broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
+                                }
+                            }
+                        }
+                    }
+
+                    StreamEvent::ThinkingEnd => {
+                        current_block_id = None;
+                    }
+
+                    StreamEvent::TextStart => {
+                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                            match cell.insert_text_block(None, "") {
+                                Ok(block_id) => {
+                                    let content = kaijutsu_crdt::BlockContentSnapshot::Text {
+                                        text: String::new(),
+                                    };
+                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                    current_block_id = Some(block_id);
+                                }
+                                Err(e) => log::error!("Failed to insert text block: {}", e),
+                            }
+                        }
+                    }
+
+                    StreamEvent::TextDelta(text) => {
+                        if let Some(ref block_id) = current_block_id {
+                            let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                            if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                                if let Err(e) = cell.append_text(block_id, &text) {
+                                    log::error!("Failed to append text: {}", e);
+                                } else {
+                                    broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
+                                }
+                            }
+                        }
+                    }
+
+                    StreamEvent::TextEnd => {
+                        current_block_id = None;
+                    }
+
+                    StreamEvent::ToolUse { id, name, input } => {
+                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                            match cell.insert_tool_use(None, &id, &name, input.clone()) {
+                                Ok(block_id) => {
+                                    let content = kaijutsu_crdt::BlockContentSnapshot::ToolUse {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        input: input.clone(),
+                                    };
+                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                }
+                                Err(e) => log::error!("Failed to insert tool use block: {}", e),
+                            }
+                        }
+                    }
+
+                    StreamEvent::ToolResult { tool_use_id, content, is_error } => {
+                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                            match cell.insert_tool_result(None, &tool_use_id, &content, is_error) {
+                                Ok(block_id) => {
+                                    let content_snap = kaijutsu_crdt::BlockContentSnapshot::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: content.clone(),
+                                        is_error,
+                                    };
+                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content_snap);
+                                }
+                                Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                            }
+                        }
+                    }
+
+                    StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
+                        log::info!(
+                            "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
+                            stop_reason, input_tokens, output_tokens
+                        );
+                    }
+
+                    StreamEvent::Error(err) => {
+                        log::error!("LLM stream error: {}", err);
+                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
+                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
+                            let _ = cell.insert_text_block(None, format!("❌ Error: {}", err));
+                        }
+                    }
+                }
+            }
+
+            results.get().set_prompt_id(&prompt_id);
+            Ok(())
+        })
     }
 }
 

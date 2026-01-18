@@ -518,6 +518,46 @@ impl KernelHandle {
 
         Ok((blocks, version))
     }
+
+    // =========================================================================
+    // LLM operations
+    // =========================================================================
+
+    /// Send a prompt to the server-side LLM
+    ///
+    /// Returns a prompt ID that can be used to track the response.
+    /// The response will be streamed via block events if subscribed.
+    pub async fn prompt(
+        &self,
+        content: &str,
+        model: Option<&str>,
+        cell_id: &str,
+    ) -> Result<String, RpcError> {
+        let mut request = self.kernel.prompt_request();
+        {
+            let mut req = request.get().init_request();
+            req.set_content(content);
+            if let Some(m) = model {
+                req.set_model(m);
+            }
+            req.set_cell_id(cell_id);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_prompt_id()?.to_string()?)
+    }
+
+    /// Subscribe to block events (for LLM streaming updates)
+    ///
+    /// The callback will receive block insertions, edits, and other events.
+    pub async fn subscribe_blocks(
+        &self,
+        callback: crate::kaijutsu_capnp::block_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_blocks_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
 }
 
 /// Helper to build block content from snapshot

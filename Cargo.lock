@@ -4657,6 +4657,7 @@ dependencies = [
  "env_logger",
  "futures",
  "kaijutsu-client",
+ "kaijutsu-crdt",
  "kaijutsu-kernel",
  "kaish-client",
  "kaish-kernel",

@@ -63,6 +63,12 @@ struct ToolSchema {
   category @3 :Text;
 }
 
+struct LlmRequest {
+  content @0 :Text;       # The prompt text
+  model @1 :Text;         # Optional model name, uses server default if empty
+  cellId @2 :Text;        # Target cell for response blocks
+}
+
 struct Completion {
   text @0 :Text;
   displayText @1 :Text;
@@ -252,6 +258,9 @@ interface Kernel {
   applyBlockOp @29 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
   subscribeBlocks @30 (callback :BlockEvents);
   getBlockCellState @31 (cellId :Text) -> (state :BlockCellState);
+
+  # LLM operations
+  prompt @32 (request :LlmRequest) -> (promptId :Text);
 }
 
 struct CellVersion {

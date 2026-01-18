@@ -69,6 +69,14 @@ pub enum ConnectionCommand {
     ApplyBlockOp { cell_id: String, op: BlockDocOp },
     /// Get block cell state
     GetBlockCellState { cell_id: String },
+
+    // LLM operations (server-side)
+    /// Send a prompt to the server-side LLM
+    Prompt {
+        content: String,
+        model: Option<String>,
+        cell_id: String,
+    },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -157,6 +165,10 @@ pub enum ConnectionEvent {
         blocks: Vec<(BlockId, BlockContentSnapshot)>,
         version: u64,
     },
+
+    // LLM events (server-side)
+    /// Prompt was sent to server-side LLM
+    PromptSent { prompt_id: String, cell_id: String },
 }
 
 /// Resource holding the command sender
@@ -744,6 +756,26 @@ async fn connection_loop(
                                 blocks,
                                 version,
                             });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
+            // LLM commands
+            ConnectionCommand::Prompt {
+                content,
+                model,
+                cell_id,
+            } => {
+                if let Some(kernel) = &current_kernel {
+                    match kernel.prompt(&content, model.as_deref(), &cell_id).await {
+                        Ok(prompt_id) => {
+                            let _ = evt_tx.send(ConnectionEvent::PromptSent { prompt_id, cell_id });
                         }
                         Err(e) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));

@@ -12,7 +12,6 @@ mod commands;
 mod connection;
 mod constants;
 mod conversation;
-mod llm;
 mod shaders;
 mod text;
 mod ui;
@@ -64,8 +63,6 @@ fn main() {
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ConnectionBridgePlugin)
-        // LLM integration (Claude API)
-        .add_plugins(llm::LlmPlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
         // Commands (vim-style : commands)

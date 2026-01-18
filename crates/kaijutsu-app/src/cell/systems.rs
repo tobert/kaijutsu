@@ -800,16 +800,21 @@ pub fn handle_prompt_submit(
     }
 }
 
-/// Add submitted prompts as blocks in the current conversation.
+/// Send submitted prompts to the server-side LLM.
 ///
-/// Instead of creating separate Cell entities for each message, we now
-/// append messages as blocks to the current conversation's BlockDocument.
-/// The MainCell will render these blocks.
+/// The server handles:
+/// 1. Adding the user message block to the conversation
+/// 2. Streaming the LLM response as blocks
+/// 3. Broadcasting block changes to all connected clients
+///
+/// We also add the user message locally for immediate feedback,
+/// then let server sync handle any conflicts.
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
     current_conv: Res<CurrentConversation>,
     mut registry: ResMut<ConversationRegistry>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    cmds: Option<Res<crate::connection::ConnectionCommands>>,
 ) {
     // Get the current conversation ID
     let Some(conv_id) = current_conv.id() else {
@@ -818,9 +823,8 @@ pub fn handle_prompt_submitted(
     };
 
     for event in submit_events.read() {
-        // Get the conversation and add the message
+        // Add user message locally for immediate feedback
         if let Some(conv) = registry.get_mut(conv_id) {
-            // Determine the author - use the first user participant or default
             let author = conv
                 .participants
                 .iter()
@@ -828,20 +832,25 @@ pub fn handle_prompt_submitted(
                 .map(|p| p.id.clone())
                 .unwrap_or_else(|| format!("user:{}", whoami::username()));
 
-            // Add the message as a text block with author attribution
             if let Some(block_id) = conv.add_text_message(&author, &event.text) {
                 info!(
-                    "Added user message to conversation {}: block {}",
+                    "Added user message locally to conversation {}: block {}",
                     conv_id, block_id
                 );
-
-                // Request scroll to bottom
                 scroll_state.scroll_to_bottom = true;
-            } else {
-                warn!("Failed to add message to conversation {}", conv_id);
             }
+        }
+
+        // Send prompt to server for LLM processing
+        if let Some(ref cmds) = cmds {
+            cmds.send(crate::connection::ConnectionCommand::Prompt {
+                content: event.text.clone(),
+                model: None, // Use server default
+                cell_id: conv_id.to_string(),
+            });
+            info!("Sent prompt to server for conversation {}", conv_id);
         } else {
-            warn!("Conversation {} not found in registry", conv_id);
+            warn!("No connection available, prompt not sent to server");
         }
     }
 }
@@ -1081,7 +1090,6 @@ pub fn sync_main_cell_to_conversation(
 
     // Check if we need to sync
     let conv_version = conv.doc.version();
-    let conv_block_count = conv.doc.block_count();
     let needs_sync = match viewing_opt {
         Some(ref viewing) => {
             // Check if conversation changed or version advanced
@@ -1089,15 +1097,6 @@ pub fn sync_main_cell_to_conversation(
         }
         None => true, // No viewing component yet, need to initialize
     };
-
-    debug!(
-        "sync_main_cell: conv={}, version={}, blocks={}, cached_version={:?}, needs_sync={}",
-        conv_id,
-        conv_version,
-        conv_block_count,
-        viewing_opt.as_ref().map(|v| v.last_sync_version),
-        needs_sync
-    );
 
     if !needs_sync {
         return;
@@ -1136,7 +1135,7 @@ pub fn sync_main_cell_to_conversation(
     }
 
     info!(
-        "Synced MainCell to conversation {} (version {}, {} blocks)",
-        conv_id, conv_version, conv_block_count
+        "Synced MainCell to conversation {} (version {})",
+        conv_id, conv_version
     );
 }
