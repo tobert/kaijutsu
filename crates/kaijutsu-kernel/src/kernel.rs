@@ -496,6 +496,10 @@ impl VfsOps for Kernel {
     async fn statfs(&self) -> VfsResult<StatFs> {
         self.vfs.statfs().await
     }
+
+    async fn real_path(&self, path: &Path) -> VfsResult<Option<std::path::PathBuf>> {
+        self.vfs.real_path(path).await
+    }
 }
 
 #[cfg(test)]

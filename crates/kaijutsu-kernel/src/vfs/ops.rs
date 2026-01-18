@@ -4,7 +4,7 @@
 //! designed for RPC (path-based, no inodes, explicit offset/size).
 
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::types::{DirEntry, FileAttr, SetAttr, StatFs};
 use super::VfsResult;
@@ -94,6 +94,13 @@ pub trait VfsOps: Send + Sync {
 
     /// Get filesystem statistics.
     async fn statfs(&self) -> VfsResult<StatFs>;
+
+    /// Resolve a virtual path to its real filesystem path.
+    ///
+    /// Returns `Ok(Some(path))` for backends backed by real files (LocalBackend).
+    /// Returns `Ok(None)` for virtual backends (MemoryBackend).
+    /// Returns `Err` if the path doesn't exist or escapes the mount root.
+    async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>>;
 
     // ========================================================================
     // Convenience methods (default implementations)

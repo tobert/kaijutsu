@@ -327,6 +327,11 @@ impl VfsOps for MountTable {
         }
         Ok(StatFs::default())
     }
+
+    async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
+        let (fs, relative) = self.find_mount(path).await?;
+        fs.real_path(&relative).await
+    }
 }
 
 #[cfg(test)]
@@ -523,5 +528,32 @@ mod tests {
 
         let result = table.rename(Path::new("/a/file.txt"), Path::new("/b/file.txt")).await;
         assert!(matches!(result, Err(VfsError::CrossDeviceLink)));
+    }
+
+    #[tokio::test]
+    async fn test_real_path_memory_returns_none() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        table.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
+
+        let real = table.real_path(Path::new("/scratch/test.txt")).await.unwrap();
+        assert!(real.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_real_path_local_returns_path() {
+        use crate::vfs::backends::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+
+        let table = MountTable::new();
+        table.mount("/mnt/project", LocalBackend::new(dir.path())).await;
+
+        let real = table.real_path(Path::new("/mnt/project/test.txt")).await.unwrap();
+        assert!(real.is_some());
+        let real = real.unwrap();
+        assert!(real.is_absolute());
+        assert!(real.ends_with("test.txt"));
     }
 }

@@ -517,6 +517,11 @@ impl VfsOps for MemoryBackend {
     async fn statfs(&self) -> VfsResult<StatFs> {
         Ok(StatFs::default())
     }
+
+    async fn real_path(&self, _path: &Path) -> VfsResult<Option<PathBuf>> {
+        // Memory backend has no real filesystem backing
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -659,5 +664,12 @@ mod tests {
         assert!(fs.getattr(Path::new("/a/b/c.txt")).await.is_ok());
         assert!(fs.getattr(Path::new("a/./b/c.txt")).await.is_ok());
         assert!(fs.getattr(Path::new("a/b/../b/c.txt")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_real_path_returns_none() {
+        let fs = MemoryBackend::new();
+        let real = fs.real_path(Path::new("anything")).await.unwrap();
+        assert!(real.is_none());
     }
 }

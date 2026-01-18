@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
+dunce = "1.0"
 
 # CRDT (text collaboration)
 diamond-types.workspace = true

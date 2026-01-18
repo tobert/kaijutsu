@@ -412,6 +412,26 @@ impl VfsOps for LocalBackend {
             Ok(StatFs::default())
         }
     }
+
+    async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
+        // Strip leading slash if present
+        let path = path.strip_prefix("/").unwrap_or(path);
+        let full = self.root.join(path);
+
+        // Use dunce for clean canonical paths (no \\?\ on Windows)
+        let canonical = dunce::canonicalize(&full).map_err(VfsError::from)?;
+
+        // Security check: ensure path is under root
+        let canonical_root = dunce::canonicalize(&self.root)
+            .unwrap_or_else(|_| self.root.clone());
+        if !canonical.starts_with(&canonical_root) {
+            return Err(VfsError::PermissionDenied(
+                format!("path escapes mount root: {}", path.display())
+            ));
+        }
+
+        Ok(Some(canonical))
+    }
 }
 
 #[cfg(test)]
@@ -563,5 +583,38 @@ mod tests {
         // Both should show nlink >= 2
         let attr = backend.getattr(Path::new("original.txt")).await.unwrap();
         assert!(attr.nlink >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_real_path() {
+        let (backend, dir) = setup().await;
+
+        // Create a file
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+
+        // Resolve it
+        let real = backend.real_path(Path::new("test.txt")).await.unwrap();
+        assert!(real.is_some());
+        let real = real.unwrap();
+        assert!(real.is_absolute());
+        assert!(real.ends_with("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_real_path_escape_prevention() {
+        let (backend, _dir) = setup().await;
+
+        // Attempt escape
+        let result = backend.real_path(Path::new("../etc/passwd")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_real_path_nonexistent() {
+        let (backend, _dir) = setup().await;
+
+        // Non-existent path should error (can't canonicalize)
+        let result = backend.real_path(Path::new("nonexistent.txt")).await;
+        assert!(result.is_err());
     }
 }
