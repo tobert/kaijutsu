@@ -585,8 +585,13 @@ fn parse_block_content(
         }),
         Which::ToolUse(tool_use) => {
             let input_str = tool_use.get_input()?.to_string()?;
-            let input: serde_json::Value =
-                serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+            let input: serde_json::Value = match serde_json::from_str(&input_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("Failed to parse block content as JSON: {}", e);
+                    serde_json::Value::Null
+                }
+            };
             Ok(BlockContentSnapshot::ToolUse {
                 id: tool_use.get_id()?.to_string()?,
                 name: tool_use.get_name()?.to_string()?,

@@ -3,6 +3,7 @@
 //! Provides typed Cap'n Proto RPC client for connecting to kaijutsu servers.
 //! Can connect via SSH (to remote servers) or Unix socket (for testing).
 
+pub mod constants;
 pub mod rpc;
 pub mod ssh;
 

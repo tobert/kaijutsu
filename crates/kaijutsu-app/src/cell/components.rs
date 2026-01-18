@@ -18,10 +18,6 @@ impl CellId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
-
-    pub fn from_str(s: &str) -> Self {
-        Self(s.to_string())
-    }
 }
 
 impl Default for CellId {
@@ -91,24 +87,6 @@ impl Cell {
             parent: None,
         }
     }
-
-    pub fn markdown() -> Self {
-        Self::new(CellKind::Markdown)
-    }
-
-    pub fn output() -> Self {
-        Self::new(CellKind::Output)
-    }
-
-    pub fn with_parent(mut self, parent: CellId) -> Self {
-        self.parent = Some(parent);
-        self
-    }
-
-    pub fn with_id(mut self, id: CellId) -> Self {
-        self.id = id;
-        self
-    }
 }
 
 // ============================================================================
@@ -125,14 +103,6 @@ pub struct BlockCursor {
 }
 
 impl BlockCursor {
-    /// Create a cursor at the start of a block.
-    pub fn at_block_start(block_id: BlockId) -> Self {
-        Self {
-            block_id: Some(block_id),
-            offset: 0,
-        }
-    }
-
     /// Create a cursor at a specific position.
     pub fn at(block_id: BlockId, offset: usize) -> Self {
         Self {
@@ -143,6 +113,9 @@ impl BlockCursor {
 }
 
 /// Selection within a block document.
+///
+/// NOTE: Currently unused - retained for planned text selection feature.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BlockSelection {
     /// Start of selection (anchor).
@@ -168,15 +141,21 @@ pub struct CellEditor {
     pub cursor: BlockCursor,
 
     /// Selection (if any).
+    /// NOTE: Currently unused - retained for planned text selection feature.
+    #[allow(dead_code)]
     pub selection: Option<BlockSelection>,
 
     /// Whether content has changed since last sync.
     pub dirty: bool,
 
     /// Currently streaming block (during LLM response).
+    /// NOTE: Currently unused - retained for planned LLM streaming feature.
+    #[allow(dead_code)]
     pub streaming_block: Option<(BlockId, BlockType)>,
 
     /// Agent ID for this editor (used for CRDT operations).
+    /// NOTE: Currently unused after construction - retained for future CRDT identity needs.
+    #[allow(dead_code)]
     agent_id: String,
 }
 

@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use kaijutsu_server::constants::{DEFAULT_BIND_ADDRESS, DEFAULT_SSH_PORT, DEFAULT_TCP_PORT};
 use kaijutsu_server::rpc::{ServerState, WorldImpl};
 use kaijutsu_server::{SshServer, SshServerConfig};
 
@@ -25,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.get(1).map(|s| s.as_str()) == Some("--ssh") {
         // SSH mode
-        let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2222);
+        let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SSH_PORT);
         log::info!("Starting kaijutsu server (SSH mode) on port {}...", port);
 
         let config = SshServerConfig::ephemeral(port);
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server.run().await?;
     } else {
         // TCP mode (default) - simple RPC server for testing
-        let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7878);
+        let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TCP_PORT);
         log::info!("Starting kaijutsu server (TCP mode) on port {}...", port);
         log::info!("Usage: kaijutsu-server [port] | kaijutsu-server --ssh [port]");
 
@@ -45,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Run a simple TCP server that exposes RPC directly (no SSH)
 async fn run_tcp_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    log::info!("Listening on 127.0.0.1:{}", port);
+    let addr = format!("{}:{}", DEFAULT_BIND_ADDRESS, port);
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!("Listening on {}", addr);
 
     // Use LocalSet for capnp-rpc
     let local = LocalSet::new();

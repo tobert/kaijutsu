@@ -5,10 +5,13 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, Duration};
+use tokio::time::sleep;
+
+use crate::constants::{KAISH_SHUTDOWN_WAIT, KAISH_SOCKET_RETRY_INTERVAL, KAISH_SOCKET_TIMEOUT};
 
 use kaish_client::{ClientError, IpcClient, KernelClient};
 use kaish_kernel::interpreter::ExecResult;
@@ -72,7 +75,7 @@ impl KaishProcess {
             .with_context(|| format!("failed to spawn kaish: {}", kaish_bin.display()))?;
 
         // Wait for the socket to appear (with timeout)
-        let client = wait_for_socket(&socket_path, Duration::from_secs(10)).await?;
+        let client = wait_for_socket(&socket_path, KAISH_SOCKET_TIMEOUT).await?;
 
         log::info!("Connected to kaish subprocess at {}", socket_path.display());
 
@@ -128,7 +131,7 @@ impl KaishProcess {
         }
 
         // Wait a bit for graceful exit
-        sleep(Duration::from_millis(100)).await;
+        sleep(KAISH_SHUTDOWN_WAIT).await;
 
         // Kill if still running
         match self.child.try_wait() {
@@ -213,7 +216,7 @@ fn find_kaish_binary() -> Result<PathBuf> {
 /// Wait for a socket to appear and connect to it.
 async fn wait_for_socket(socket_path: &PathBuf, timeout: Duration) -> Result<IpcClient> {
     let start = std::time::Instant::now();
-    let retry_interval = Duration::from_millis(50);
+    let retry_interval = KAISH_SOCKET_RETRY_INTERVAL;
 
     loop {
         if start.elapsed() > timeout {

@@ -7,12 +7,16 @@
 //! - Channel 2: events (server-pushed subscription streams)
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use russh::client::{self, Config, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PublicKey};
 use russh::{Channel, Disconnect};
+
+use crate::constants::{
+    DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SSH_INACTIVITY_TIMEOUT, SSH_KEEPALIVE_INTERVAL,
+    SSH_KEEPALIVE_MAX,
+};
 
 /// SSH connection configuration
 #[derive(Debug, Clone)]
@@ -25,8 +29,8 @@ pub struct SshConfig {
 impl Default for SshConfig {
     fn default() -> Self {
         Self {
-            host: "localhost".into(),
-            port: 2222,
+            host: DEFAULT_SSH_HOST.into(),
+            port: DEFAULT_SSH_PORT,
             username: whoami::username(),
         }
     }
@@ -45,7 +49,17 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO: Implement proper known_hosts verification
+        // ╔═══════════════════════════════════════════════════════════════════════════╗
+        // ║ SECURITY WARNING: SSH KEY VERIFICATION DISABLED                           ║
+        // ║                                                                           ║
+        // ║ This client accepts ANY server key without verification.                  ║
+        // ║ This is acceptable for local development but NOT for production.          ║
+        // ║                                                                           ║
+        // ║ TODO: Implement proper known_hosts verification before production use.    ║
+        // ║ - Parse ~/.ssh/known_hosts                                                ║
+        // ║ - Verify server key fingerprint matches                                   ║
+        // ║ - Prompt user for unknown keys                                            ║
+        // ╚═══════════════════════════════════════════════════════════════════════════╝
         log::warn!(
             "Accepting server key without verification: {}",
             server_public_key.fingerprint(HashAlg::Sha256)
@@ -95,9 +109,9 @@ impl SshClient {
         log::info!("Found {} keys in SSH agent", keys.len());
 
         let config = Config {
-            inactivity_timeout: Some(Duration::from_secs(300)),
-            keepalive_interval: Some(Duration::from_secs(30)),
-            keepalive_max: 3,
+            inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
+            keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+            keepalive_max: SSH_KEEPALIVE_MAX,
             ..<_>::default()
         };
 

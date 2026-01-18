@@ -16,11 +16,7 @@ use kaijutsu_client::{
 };
 use kaijutsu_crdt::{BlockContentSnapshot, BlockDocOp, BlockId};
 
-/// Default server address for local development
-pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7878";
-
-/// Default kernel to attach to after connecting
-pub const DEFAULT_KERNEL_ID: &str = "lobby";
+use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 
 /// Commands sent from Bevy to the connection thread
 #[derive(Debug)]
@@ -201,7 +197,7 @@ impl Default for ConnectionState {
             connected: false,
             identity: None,
             current_kernel: None,
-            target_addr: DEFAULT_SERVER_ADDR.to_string(),
+            target_addr: DEFAULT_SERVER_ADDRESS.to_string(),
             auto_reconnect: true,
             reconnect_attempt: 0,
             last_attempt: None,

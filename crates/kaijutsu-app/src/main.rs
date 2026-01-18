@@ -10,6 +10,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod cell;
 mod commands;
 mod connection;
+mod constants;
 mod conversation;
 mod llm;
 mod shaders;
@@ -38,14 +39,21 @@ fn main() {
     info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
 
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "会術 Kaijutsu".into(),
-                resolution: (1280, 800).into(),
+        .add_plugins(DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "会術 Kaijutsu".into(),
+                    resolution: (constants::DEFAULT_WINDOW_WIDTH, constants::DEFAULT_WINDOW_HEIGHT).into(),
+                    ..default()
+                }),
                 ..default()
-            }),
-            ..default()
-        }))
+            })
+            .set(AssetPlugin {
+                // Assets are at workspace root, not crate directory
+                file_path: "../../assets".into(),
+                ..default()
+            })
+        )
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
         // Text rendering (glyphon + cosmic-text)

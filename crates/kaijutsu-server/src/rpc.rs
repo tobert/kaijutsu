@@ -121,7 +121,7 @@ fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
             log::info!("Opened cell database at {:?}", db_path);
             let store = shared_block_store_with_db(db, "server");
             {
-                let mut guard = store.write().unwrap();
+                let mut guard = store.write().expect("cell store lock poisoned");
                 if let Err(e) = guard.load_from_db() {
                     log::warn!("Failed to load cells from DB: {}", e);
                 } else {
@@ -259,7 +259,7 @@ impl world::Server for WorldImpl {
 
                 // Create default cell if none exist
                 {
-                    let mut guard = cells.write().unwrap();
+                    let mut guard = cells.write().expect("cell store lock poisoned");
                     if guard.iter().next().is_none() {
                         let default_id = uuid::Uuid::new_v4().to_string();
                         log::info!("Creating default cell {} for kernel {}", default_id, id);
@@ -331,7 +331,7 @@ impl world::Server for WorldImpl {
 
             // Create default cell if none exist
             {
-                let mut guard = cells.write().unwrap();
+                let mut guard = cells.write().expect("cell store lock poisoned");
                 if guard.iter().next().is_none() {
                     let default_id = uuid::Uuid::new_v4().to_string();
                     log::info!("Creating default cell {} for new kernel {}", default_id, id);
@@ -451,7 +451,7 @@ impl kernel::Server for KernelImpl {
                 content,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("system clock before UNIX epoch")
                     .as_secs(),
             };
             if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
@@ -492,7 +492,7 @@ impl kernel::Server for KernelImpl {
                 content: full_content,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("system clock before UNIX epoch")
                     .as_secs(),
             };
             if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
@@ -571,7 +571,7 @@ impl kernel::Server for KernelImpl {
                 let row_id = state_ref.next_row_id();
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("system clock before UNIX epoch")
                     .as_secs();
 
                 if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id) {
@@ -889,7 +889,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().unwrap();
+            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
             let cells: Vec<_> = cells_guard.iter().collect();
             let mut builder = results.get().init_cells(cells.len() as u32);
             for (i, doc) in cells.iter().enumerate() {
@@ -913,7 +913,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().unwrap();
+            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
             if let Some(doc) = cells_guard.get(&cell_id) {
                 let mut cell = results.get().init_cell();
                 let mut info = cell.reborrow().init_info();
@@ -952,7 +952,7 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.write().unwrap();
+                let mut cells_guard = kernel.cells.write().expect("cell store lock poisoned");
                 if let Ok(doc) = cells_guard.create_cell(cell_id, kind, language.clone()) {
                     // Build results
                     let mut cell = results.get().init_cell();
@@ -1021,7 +1021,7 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.write().unwrap();
+                let mut cells_guard = kernel.cells.write().expect("cell store lock poisoned");
                 deleted = cells_guard.delete_cell(&cell_id).is_ok();
                 subscribers = kernel.cell_subscribers.clone();
             } else {
@@ -1062,7 +1062,7 @@ impl kernel::Server for KernelImpl {
         // Return the current version without making changes
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().unwrap();
+            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
             if let Some(doc) = cells_guard.get(&cell_id) {
                 results.get().set_new_version(doc.version());
             }
@@ -1113,7 +1113,7 @@ impl kernel::Server for KernelImpl {
             }
 
             // Collect data from cells
-            let cells_guard = kernel.cells.read().unwrap();
+            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
 
             // Store owned data for new cells: (id, kind, language, content, version)
             // Note: We return all cells the client doesn't know about, with empty encoding
@@ -1283,7 +1283,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().unwrap();
+            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
             if let Some(doc) = cells_guard.get(&cell_id) {
                 let mut cell_state = results.get().init_state();
                 {
