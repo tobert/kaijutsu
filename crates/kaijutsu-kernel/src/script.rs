@@ -6,12 +6,12 @@
 //! - Custom automation and macros
 //!
 //! Scripts run synchronously within the kernel context and have
-//! access to the CellStore for CRDT operations.
+//! access to the BlockStore for CRDT operations.
 
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use tracing::{debug, info, warn};
 
-use crate::crdt::SharedCellStore;
+use crate::block_store::SharedBlockStore;
 use crate::db::CellKind;
 
 /// A scripting engine instance for a kernel.
@@ -47,8 +47,8 @@ pub enum HookEvent {
 pub type ScriptResult<T> = Result<T, Box<EvalAltResult>>;
 
 impl ScriptEngine {
-    /// Create a new script engine with cell store access.
-    pub fn new(cell_store: SharedCellStore) -> Self {
+    /// Create a new script engine with block store access.
+    pub fn new(block_store: SharedBlockStore) -> Self {
         let mut engine = Engine::new();
         let scope = Scope::new();
         let hooks = HookRegistry::default();
@@ -62,19 +62,19 @@ impl ScriptEngine {
         engine.set_max_map_size(10_000);
 
         // Register cell manipulation functions
-        Self::register_cell_functions(&mut engine, cell_store);
+        Self::register_cell_functions(&mut engine, block_store);
 
         Self { engine, scope, hooks }
     }
 
     /// Register cell manipulation functions with the engine.
-    fn register_cell_functions(engine: &mut Engine, cell_store: SharedCellStore) {
+    fn register_cell_functions(engine: &mut Engine, block_store: SharedBlockStore) {
         // Clone Arc for each closure
-        let store_create = cell_store.clone();
-        let store_get = cell_store.clone();
-        let store_set = cell_store.clone();
-        let store_list = cell_store.clone();
-        let store_delete = cell_store.clone();
+        let store_create = block_store.clone();
+        let store_get = block_store.clone();
+        let store_set = block_store.clone();
+        let store_list = block_store.clone();
+        let store_delete = block_store.clone();
 
         // create_cell(kind: &str) -> String
         // Creates a new cell with the given kind and returns its ID
@@ -90,7 +90,7 @@ impl ScriptEngine {
             };
 
             let id = uuid::Uuid::new_v4().to_string();
-            let mut store = store_create.blocking_write();
+            let mut store = store_create.write().unwrap();
 
             match store.create_cell(id.clone(), cell_kind, None) {
                 Ok(_) => {
@@ -107,7 +107,7 @@ impl ScriptEngine {
         // get_content(cell_id: &str) -> String
         // Returns the content of a cell, or empty string if not found
         engine.register_fn("get_content", move |cell_id: String| -> String {
-            let store = store_get.blocking_read();
+            let store = store_get.read().unwrap();
             match store.get(&cell_id) {
                 Some(cell) => {
                     let content = cell.content();
@@ -122,19 +122,32 @@ impl ScriptEngine {
         });
 
         // set_content(cell_id: &str, content: &str)
-        // Replaces the entire content of a cell
+        // Replaces the entire content of a cell with a single text block
         engine.register_fn("set_content", move |cell_id: String, content: String| {
-            let mut store = store_set.blocking_write();
+            let mut store = store_set.write().unwrap();
             if let Some(cell) = store.get_mut(&cell_id) {
-                // Replace all content - delete existing, insert new
-                let len = cell.len();
-                if len > 0 {
-                    cell.delete("script", 0, len);
+                // Delete all existing blocks
+                let block_ids: Vec<_> = cell
+                    .doc
+                    .blocks_ordered()
+                    .iter()
+                    .map(|b| b.id.clone())
+                    .collect();
+                for id in block_ids {
+                    let _ = cell.delete_block(&id);
                 }
+
+                // Insert new content as a single text block
                 if !content.is_empty() {
-                    cell.insert("script", 0, &content);
+                    match cell.insert_text_block(None, &content) {
+                        Ok(_) => {
+                            debug!("Script: set_content({}, {} chars)", cell_id, content.len());
+                        }
+                        Err(e) => {
+                            warn!("Script: set_content({}) error: {}", cell_id, e);
+                        }
+                    }
                 }
-                debug!("Script: set_content({}, {} chars)", cell_id, content.len());
             } else {
                 warn!("Script: set_content({}) -> cell not found", cell_id);
             }
@@ -143,7 +156,7 @@ impl ScriptEngine {
         // cells() -> Array
         // Returns an array of all cell IDs
         engine.register_fn("cells", move || -> rhai::Array {
-            let store = store_list.blocking_read();
+            let store = store_list.read().unwrap();
             let ids: rhai::Array = store
                 .list_ids()
                 .into_iter()
@@ -156,7 +169,7 @@ impl ScriptEngine {
         // delete_cell(cell_id: &str) -> bool
         // Deletes a cell, returns true if successful
         engine.register_fn("delete_cell", move |cell_id: String| -> bool {
-            let mut store = store_delete.blocking_write();
+            let mut store = store_delete.write().unwrap();
             match store.delete_cell(&cell_id) {
                 Ok(()) => {
                     debug!("Script: delete_cell({}) -> success", cell_id);
@@ -170,15 +183,14 @@ impl ScriptEngine {
         });
 
         // Additional cell query functions
-        let store_kind = cell_store.clone();
-        let store_len = cell_store.clone();
-        let store_insert = cell_store.clone();
-        let store_delete_range = cell_store.clone();
+        let store_kind = block_store.clone();
+        let store_len = block_store.clone();
+        let store_append = block_store.clone();
 
         // get_kind(cell_id) -> String
         // Returns the kind of a cell ("code", "markdown", etc.)
         engine.register_fn("get_kind", move |cell_id: String| -> String {
-            let store = store_kind.blocking_read();
+            let store = store_kind.read().unwrap();
             match store.get(&cell_id) {
                 Some(cell) => {
                     let kind = match cell.kind {
@@ -198,39 +210,44 @@ impl ScriptEngine {
         // cell_len(cell_id) -> i64
         // Returns the length of a cell's content in characters
         engine.register_fn("cell_len", move |cell_id: String| -> i64 {
-            let store = store_len.blocking_read();
+            let store = store_len.read().unwrap();
             match store.get(&cell_id) {
-                Some(cell) => cell.len() as i64,
+                Some(cell) => cell.content().len() as i64,
                 None => -1,
             }
         });
 
-        // insert_at(cell_id, pos, text)
-        // Insert text at a specific position
-        engine.register_fn("insert_at", move |cell_id: String, pos: i64, text: String| {
-            let mut store = store_insert.blocking_write();
+        // append_text(cell_id, text)
+        // Append text to the last text block, or create a new one
+        engine.register_fn("append_text", move |cell_id: String, text: String| {
+            let text_len = text.len();
+            let mut store = store_append.write().unwrap();
             if let Some(cell) = store.get_mut(&cell_id) {
-                let pos = pos.max(0) as usize;
-                cell.insert("script", pos, &text);
-                debug!("Script: insert_at({}, {}, {} chars)", cell_id, pos, text.len());
-            } else {
-                warn!("Script: insert_at({}) -> cell not found", cell_id);
-            }
-        });
+                // Find the last text block
+                let last_text_block = cell
+                    .doc
+                    .blocks_ordered()
+                    .iter()
+                    .rev()
+                    .find(|b| matches!(b.content, kaijutsu_crdt::BlockContent::Text { .. }))
+                    .map(|b| b.id.clone());
 
-        // delete_range(cell_id, start, end)
-        // Delete text in a range [start, end)
-        engine.register_fn("delete_range", move |cell_id: String, start: i64, end: i64| {
-            let mut store = store_delete_range.blocking_write();
-            if let Some(cell) = store.get_mut(&cell_id) {
-                let start = start.max(0) as usize;
-                let end = end.max(0) as usize;
-                if start < end {
-                    cell.delete("script", start, end);
-                    debug!("Script: delete_range({}, {}, {})", cell_id, start, end);
+                match last_text_block {
+                    Some(block_id) => {
+                        if let Err(e) = cell.append_text(&block_id, &text) {
+                            warn!("Script: append_text({}) error: {}", cell_id, e);
+                        }
+                    }
+                    None => {
+                        // No text block exists, create one
+                        if let Err(e) = cell.insert_text_block(None, &text) {
+                            warn!("Script: append_text({}) - create block error: {}", cell_id, e);
+                        }
+                    }
                 }
+                debug!("Script: append_text({}, {} chars)", cell_id, text_len);
             } else {
-                warn!("Script: delete_range({}) -> cell not found", cell_id);
+                warn!("Script: append_text({}) -> cell not found", cell_id);
             }
         });
 
@@ -338,11 +355,11 @@ impl ScriptEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crdt::shared_cell_store;
+    use crate::block_store::shared_block_store;
 
     #[test]
     fn test_basic_eval() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         let result: i64 = engine.eval_as("40 + 2").unwrap();
@@ -351,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_variables() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         engine.set_var("x", 10_i64);
@@ -361,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_print_function() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         // Should not panic
@@ -370,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_create_cell_function() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store.clone());
 
         // create_cell returns a UUID string
@@ -380,23 +397,27 @@ mod tests {
         assert!(result.contains('-'));
 
         // Verify cell actually exists in store
-        let guard = store.blocking_read();
+        let guard = store.read().unwrap();
         assert!(guard.get(&result).is_some());
     }
 
     #[test]
     fn test_cell_content_roundtrip() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store.clone());
 
         // Create a cell and set its content
-        engine.run(r#"
+        engine
+            .run(
+                r#"
             let id = create_cell("markdown");
             set_content(id, "Hello World from Rhai!");
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         // Get the cell ID from the store and verify content
-        let guard = store.blocking_read();
+        let guard = store.read().unwrap();
         let ids = guard.list_ids();
         assert_eq!(ids.len(), 1);
 
@@ -406,30 +427,38 @@ mod tests {
 
     #[test]
     fn test_get_content_via_script() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         // Create cell, set content, get it back
-        let content: String = engine.eval_as(r#"
+        let content: String = engine
+            .eval_as(
+                r#"
             let id = create_cell("code");
             set_content(id, "fn main() {}");
             get_content(id)
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert_eq!(content, "fn main() {}");
     }
 
     #[test]
     fn test_cells_list() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         // Create multiple cells
-        engine.run(r#"
+        engine
+            .run(
+                r#"
             create_cell("code");
             create_cell("markdown");
             create_cell("output");
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         // Get the list
         let count: i64 = engine.eval_as("cells().len()").unwrap();
@@ -438,85 +467,89 @@ mod tests {
 
     #[test]
     fn test_delete_cell() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store.clone());
 
         // Create and then delete a cell
-        let deleted: bool = engine.eval_as(r#"
+        let deleted: bool = engine
+            .eval_as(
+                r#"
             let id = create_cell("code");
             delete_cell(id)
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert!(deleted);
 
         // Verify cell is gone
-        let guard = store.blocking_read();
+        let guard = store.read().unwrap();
         assert!(guard.list_ids().is_empty());
     }
 
     #[test]
     fn test_get_kind() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
-        let kind: String = engine.eval_as(r#"
+        let kind: String = engine
+            .eval_as(
+                r#"
             let id = create_cell("markdown");
             get_kind(id)
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert_eq!(kind, "markdown");
     }
 
     #[test]
     fn test_cell_len() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
-        let len: i64 = engine.eval_as(r#"
+        let len: i64 = engine
+            .eval_as(
+                r#"
             let id = create_cell("code");
             set_content(id, "hello");
             cell_len(id)
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert_eq!(len, 5);
     }
 
     #[test]
-    fn test_insert_at() {
-        let store = shared_cell_store();
+    fn test_append_text() {
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
-        let content: String = engine.eval_as(r#"
+        let content: String = engine
+            .eval_as(
+                r#"
             let id = create_cell("code");
-            set_content(id, "helloworld");
-            insert_at(id, 5, " ");
+            set_content(id, "hello");
+            append_text(id, " world");
             get_content(id)
-        "#).unwrap();
-
-        assert_eq!(content, "hello world");
-    }
-
-    #[test]
-    fn test_delete_range() {
-        let store = shared_cell_store();
-        let mut engine = ScriptEngine::new(store);
-
-        let content: String = engine.eval_as(r#"
-            let id = create_cell("code");
-            set_content(id, "hello cruel world");
-            delete_range(id, 5, 11);
-            get_content(id)
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
 
         assert_eq!(content, "hello world");
     }
 
     #[test]
     fn test_hook_registration() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
-        engine.register_hook("cell_created", r#"println("Cell created: " + event_cell_id);"#.to_string());
+        engine.register_hook(
+            "cell_created",
+            r#"println("Cell created: " + event_cell_id);"#.to_string(),
+        );
 
         // Fire the hook
         engine.fire_hook(HookEvent::CellCreated {
@@ -527,16 +560,18 @@ mod tests {
 
     #[test]
     fn test_script_safety_limits() {
-        let store = shared_cell_store();
+        let store = shared_block_store("test");
         let mut engine = ScriptEngine::new(store);
 
         // This should hit the operation limit
-        let result = engine.run(r#"
+        let result = engine.run(
+            r#"
             let x = 0;
             loop {
                 x += 1;
             }
-        "#);
+        "#,
+        );
 
         assert!(result.is_err());
     }

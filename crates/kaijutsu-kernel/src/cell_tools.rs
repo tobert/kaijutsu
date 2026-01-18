@@ -2,12 +2,14 @@
 //!
 //! These tools implement the ExecutionEngine trait to allow AI models
 //! to edit cells via the tool execution RPC.
+//!
+//! Uses BlockStore for block-based CRDT storage.
 
-use crate::crdt::CellStore;
+use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine};
 use async_trait::async_trait;
+use kaijutsu_crdt::BlockContentSnapshot;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 
 /// Edit operation on a cell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,14 +35,17 @@ pub struct CellEditParams {
 }
 
 /// Execution engine for cell editing operations.
+///
+/// Works with block-based cells by finding/creating a primary text block
+/// for line-based editing operations.
 pub struct CellEditEngine {
-    cells: Arc<Mutex<CellStore>>,
+    cells: SharedBlockStore,
     agent_name: String,
 }
 
 impl CellEditEngine {
     /// Create a new cell edit engine.
-    pub fn new(cells: Arc<Mutex<CellStore>>, agent_name: impl Into<String>) -> Self {
+    pub fn new(cells: SharedBlockStore, agent_name: impl Into<String>) -> Self {
         Self {
             cells,
             agent_name: agent_name.into(),
@@ -139,11 +144,11 @@ impl ExecutionEngine for CellEditEngine {
             }
         };
 
-        let mut cells = self.cells.lock().unwrap();
+        let mut store = self.cells.write().unwrap();
 
         // Get the cell
-        let doc = match cells.get_mut(&params.cell_id) {
-            Some(d) => d,
+        let cell = match store.get_mut(&params.cell_id) {
+            Some(c) => c,
             None => {
                 return Ok(ExecResult::failure(
                     1,
@@ -152,9 +157,30 @@ impl ExecutionEngine for CellEditEngine {
             }
         };
 
+        // Find the first text block, or create one if empty
+        let snapshots = cell.block_snapshots();
+        let primary_block_id = snapshots
+            .iter()
+            .find_map(|(id, snap)| {
+                if matches!(snap, BlockContentSnapshot::Text { .. }) {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            });
+
+        // If no text block exists, create one
+        let block_id = match primary_block_id {
+            Some(id) => id,
+            None => {
+                cell.insert_text_block(None, "")
+                    .map_err(|e| anyhow::anyhow!("Failed to create text block: {}", e))?
+            }
+        };
+
         // Apply operations
         for op in params.operations {
-            let content = doc.content();
+            let content = cell.content();
 
             match op {
                 EditOp::Insert { line, content: text } => {
@@ -164,7 +190,8 @@ impl ExecutionEngine for CellEditEngine {
                     } else {
                         format!("{}\n", text)
                     };
-                    doc.insert(&self.agent_name, pos, &text_with_newline);
+                    cell.edit_text(&block_id, pos, &text_with_newline, 0)
+                        .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                 }
                 EditOp::Delete {
                     start_line,
@@ -173,7 +200,8 @@ impl ExecutionEngine for CellEditEngine {
                     let start = line_to_pos(&content, start_line);
                     let end = line_end_pos(&content, end_line);
                     if start < end {
-                        doc.delete(&self.agent_name, start, end);
+                        cell.edit_text(&block_id, start, "", end - start)
+                            .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                     }
                 }
                 EditOp::Replace {
@@ -188,7 +216,8 @@ impl ExecutionEngine for CellEditEngine {
                     } else {
                         format!("{}\n", text)
                     };
-                    doc.replace(&self.agent_name, start, end, &text_with_newline);
+                    cell.edit_text(&block_id, start, &text_with_newline, end - start)
+                        .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                 }
             }
         }
@@ -196,8 +225,8 @@ impl ExecutionEngine for CellEditEngine {
         // Return success with new content
         let result = serde_json::json!({
             "cell_id": params.cell_id,
-            "content": doc.content(),
-            "version": doc.frontier_version()
+            "content": cell.content(),
+            "version": cell.version()
         });
 
         Ok(ExecResult::success(result.to_string()))
@@ -216,11 +245,11 @@ pub struct CellReadParams {
 
 /// Execution engine for reading cell content.
 pub struct CellReadEngine {
-    cells: Arc<Mutex<CellStore>>,
+    cells: SharedBlockStore,
 }
 
 impl CellReadEngine {
-    pub fn new(cells: Arc<Mutex<CellStore>>) -> Self {
+    pub fn new(cells: SharedBlockStore) -> Self {
         Self { cells }
     }
 
@@ -259,16 +288,16 @@ impl ExecutionEngine for CellReadEngine {
             }
         };
 
-        let cells = self.cells.lock().unwrap();
+        let store = self.cells.read().unwrap();
 
-        match cells.get(&params.cell_id) {
-            Some(doc) => {
+        match store.get(&params.cell_id) {
+            Some(cell) => {
                 let result = serde_json::json!({
                     "cell_id": params.cell_id,
-                    "content": doc.content(),
-                    "version": doc.frontier_version(),
-                    "kind": format!("{:?}", doc.kind),
-                    "language": doc.language
+                    "content": cell.content(),
+                    "version": cell.version(),
+                    "kind": format!("{:?}", cell.kind),
+                    "language": cell.language
                 });
                 Ok(ExecResult::success(result.to_string()))
             }
@@ -286,11 +315,11 @@ impl ExecutionEngine for CellReadEngine {
 
 /// Execution engine for listing cells.
 pub struct CellListEngine {
-    cells: Arc<Mutex<CellStore>>,
+    cells: SharedBlockStore,
 }
 
 impl CellListEngine {
-    pub fn new(cells: Arc<Mutex<CellStore>>) -> Self {
+    pub fn new(cells: SharedBlockStore) -> Self {
         Self { cells }
     }
 
@@ -314,17 +343,17 @@ impl ExecutionEngine for CellListEngine {
     }
 
     async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
-        let cells = self.cells.lock().unwrap();
+        let store = self.cells.read().unwrap();
 
-        let cell_list: Vec<serde_json::Value> = cells
+        let cell_list: Vec<serde_json::Value> = store
             .iter()
-            .map(|doc| {
+            .map(|cell| {
                 serde_json::json!({
-                    "id": doc.id,
-                    "kind": format!("{:?}", doc.kind),
-                    "language": doc.language,
-                    "length": doc.len(),
-                    "version": doc.frontier_version()
+                    "id": cell.id,
+                    "kind": format!("{:?}", cell.kind),
+                    "language": cell.language,
+                    "length": cell.content().len(),
+                    "version": cell.version()
                 })
             })
             .collect();
@@ -345,13 +374,14 @@ impl ExecutionEngine for CellListEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_store::shared_block_store;
     use crate::db::CellKind;
 
     #[tokio::test]
     async fn test_cell_edit_insert() {
-        let store = Arc::new(Mutex::new(CellStore::new()));
+        let store = shared_block_store("test-agent");
         {
-            let mut cells = store.lock().unwrap();
+            let mut cells = store.write().unwrap();
             cells
                 .create_cell("test".into(), CellKind::Code, Some("rust".into()))
                 .unwrap();
@@ -364,20 +394,20 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.lock().unwrap();
-        let doc = cells.get("test").unwrap();
-        assert_eq!(doc.content(), "hello world\n");
+        let cells = store.read().unwrap();
+        let cell = cells.get("test").unwrap();
+        assert_eq!(cell.content(), "hello world\n");
     }
 
     #[tokio::test]
     async fn test_cell_edit_delete() {
-        let store = Arc::new(Mutex::new(CellStore::new()));
+        let store = shared_block_store("test-agent");
         {
-            let mut cells = store.lock().unwrap();
-            let doc = cells
+            let mut cells = store.write().unwrap();
+            let cell = cells
                 .create_cell("test".into(), CellKind::Code, Some("rust".into()))
                 .unwrap();
-            doc.insert("setup", 0, "line1\nline2\nline3\n");
+            cell.insert_text_block(None, "line1\nline2\nline3\n").unwrap();
         }
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
@@ -388,20 +418,20 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.lock().unwrap();
-        let doc = cells.get("test").unwrap();
-        assert_eq!(doc.content(), "line1\nline3\n");
+        let cells = store.read().unwrap();
+        let cell = cells.get("test").unwrap();
+        assert_eq!(cell.content(), "line1\nline3\n");
     }
 
     #[tokio::test]
     async fn test_cell_edit_replace() {
-        let store = Arc::new(Mutex::new(CellStore::new()));
+        let store = shared_block_store("test-agent");
         {
-            let mut cells = store.lock().unwrap();
-            let doc = cells
+            let mut cells = store.write().unwrap();
+            let cell = cells
                 .create_cell("test".into(), CellKind::Code, Some("rust".into()))
                 .unwrap();
-            doc.insert("setup", 0, "line1\nline2\nline3\n");
+            cell.insert_text_block(None, "line1\nline2\nline3\n").unwrap();
         }
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
@@ -412,20 +442,20 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.lock().unwrap();
-        let doc = cells.get("test").unwrap();
-        assert_eq!(doc.content(), "replaced\nline3\n");
+        let cells = store.read().unwrap();
+        let cell = cells.get("test").unwrap();
+        assert_eq!(cell.content(), "replaced\nline3\n");
     }
 
     #[tokio::test]
     async fn test_cell_read() {
-        let store = Arc::new(Mutex::new(CellStore::new()));
+        let store = shared_block_store("test-agent");
         {
-            let mut cells = store.lock().unwrap();
-            let doc = cells
+            let mut cells = store.write().unwrap();
+            let cell = cells
                 .create_cell("test".into(), CellKind::Code, Some("rust".into()))
                 .unwrap();
-            doc.insert("setup", 0, "fn main() {}");
+            cell.insert_text_block(None, "fn main() {}").unwrap();
         }
 
         let engine = CellReadEngine::new(store.clone());
@@ -439,9 +469,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cell_list() {
-        let store = Arc::new(Mutex::new(CellStore::new()));
+        let store = shared_block_store("test-agent");
         {
-            let mut cells = store.lock().unwrap();
+            let mut cells = store.write().unwrap();
             cells
                 .create_cell("cell1".into(), CellKind::Code, Some("rust".into()))
                 .unwrap();

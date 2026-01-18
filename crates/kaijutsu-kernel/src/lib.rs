@@ -11,9 +11,11 @@
 //! - Can checkpoint (distill history into summaries)
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 
+pub mod block_store;
 pub mod cell_tools;
 pub mod control;
-pub mod crdt;
+pub mod conversation;
+pub mod conversation_db;
 pub mod db;
 pub mod kernel;
 pub mod llm;
@@ -22,9 +24,11 @@ pub mod state;
 pub mod tools;
 pub mod vfs;
 
+pub use block_store::{BlockCell, BlockStore, SharedBlockStore, shared_block_store, shared_block_store_with_db};
 pub use cell_tools::{CellEditEngine, CellListEngine, CellReadEngine};
 pub use control::{ConsentMode, ControlPlane, Lease, LeaseHolder};
-pub use crdt::{CellDoc, CellId, CellStore, SharedCellStore, shared_cell_store, shared_cell_store_with_db};
+pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
+pub use conversation_db::ConversationDb;
 pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use script::{HookEvent, HookRegistry, ScriptEngine, ScriptResult};
