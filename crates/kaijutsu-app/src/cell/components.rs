@@ -764,8 +764,6 @@ pub struct CellState {
     pub collapsed: bool,
     /// Computed height based on content (in pixels)
     pub computed_height: f32,
-    /// Minimum height for the cell
-    pub min_height: f32,
 }
 
 impl CellState {
@@ -773,7 +771,6 @@ impl CellState {
         Self {
             collapsed: false,
             computed_height: 100.0,
-            min_height: 60.0,
         }
     }
 
@@ -829,22 +826,16 @@ pub struct FocusedCell(pub Option<Entity>);
 /// Configuration for workspace layout.
 #[derive(Resource)]
 pub struct WorkspaceLayout {
-    /// Cell width in pixels
-    pub cell_width: f32,
     /// Minimum cell height
     pub min_cell_height: f32,
     /// Maximum cell height (0 = unlimited)
     pub max_cell_height: f32,
-    /// Margin between cells
-    pub cell_margin: f32,
     /// Left margin for the workspace
     pub workspace_margin_left: f32,
     /// Top margin for the workspace
     pub workspace_margin_top: f32,
     /// Line height for computing dynamic heights
     pub line_height: f32,
-    /// Height of the draggable header area at the top of each cell
-    pub drag_header_height: f32,
     /// Total height reserved for prompt area at bottom (prompt + status bar + padding)
     pub prompt_area_height: f32,
     /// Minimum height for prompt cell
@@ -856,14 +847,11 @@ pub struct WorkspaceLayout {
 impl Default for WorkspaceLayout {
     fn default() -> Self {
         Self {
-            cell_width: 700.0,
             min_cell_height: 60.0,
             max_cell_height: 400.0,
-            cell_margin: 12.0,
             workspace_margin_left: 20.0,
             workspace_margin_top: 70.0, // Space for compact header
             line_height: 20.0,
-            drag_header_height: 30.0,
             prompt_area_height: 120.0,  // Space reserved at bottom for prompt
             prompt_min_height: 50.0,    // Minimum prompt cell height
             prompt_bottom_offset: 100.0, // Prompt Y = window_height - this

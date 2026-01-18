@@ -27,8 +27,6 @@ impl Plugin for CellPlugin {
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
-            .init_resource::<systems::DragState>()
-            .init_resource::<systems::CollapsedParentsCache>()
             .init_resource::<RecentlyDeletedByServer>()
             .init_resource::<PendingCellRegistrations>()
             .init_resource::<systems::CursorEntity>()
@@ -66,30 +64,25 @@ impl Plugin for CellPlugin {
             // sync_cell_buffers must run after:
             // - init_cell_buffers (TextBuffer exists)
             // - handle_cell_input (CellEditor updated with typed text)
+            // - sync_main_cell_to_conversation (CellEditor updated from conversation)
             .add_systems(
                 Update,
                 (
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
-                    systems::layout_cells,
                     systems::layout_main_cell,
                     systems::layout_prompt_cell_position,
                     systems::sync_cell_buffers
                         .after(systems::init_cell_buffers)
-                        .after(systems::handle_cell_input),
+                        .after(systems::handle_cell_input)
+                        .after(systems::sync_main_cell_to_conversation),
                     systems::highlight_focused_cell,
                 ),
             )
-            // Collapse/expand and drag
+            // Collapse/expand for thinking blocks
             .add_systems(
                 Update,
-                (
-                    systems::handle_collapse_toggle,
-                    systems::update_collapsed_cache,
-                    systems::apply_collapse_visibility,
-                    systems::start_cell_drag,
-                    systems::update_cell_drag,
-                ),
+                systems::handle_collapse_toggle,
             )
             // 9-slice frame system
             .add_systems(

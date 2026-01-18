@@ -321,127 +321,35 @@ pub fn sync_cell_buffers(
 ///
 /// For cells with blocks, counts lines from the formatted display text.
 /// Collapsed thinking blocks contribute minimal lines.
-pub fn compute_cell_heights(
-    mut cells: Query<(&CellEditor, &mut CellState), Changed<CellEditor>>,
-    layout: Res<WorkspaceLayout>,
-) {
-    for (editor, mut state) in cells.iter_mut() {
-        let line_count = if editor.has_blocks() {
-            // Count lines from formatted blocks
-            format_blocks_for_display(&editor.blocks()).lines().count().max(1)
-        } else {
-            editor.text().lines().count().max(1)
-        };
-        state.computed_height = layout.height_for_lines(line_count);
-    }
-}
-
-/// Layout conversation cells based on grid position and computed heights.
 ///
-/// Uses a two-pass approach to properly accumulate variable cell heights.
-/// Applies scroll offset for vertical scrolling.
-/// Excludes prompt cell (handled separately).
-pub fn layout_cells(
-    mut cells: Query<
-        (&CellPosition, &CellState, &mut TextAreaConfig),
-        (Without<PromptCell>, Without<MainCell>),
-    >,
+/// For MainCell, also updates ConversationScrollState with content height.
+pub fn compute_cell_heights(
+    mut cells: Query<(&CellEditor, &mut CellState, Option<&MainCell>), Changed<CellEditor>>,
     layout: Res<WorkspaceLayout>,
-    windows: Query<&Window>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
-    use std::collections::BTreeMap;
-
-    // Get window height
-    let window_height = windows
-        .iter()
-        .next()
-        .map(|w| w.resolution.height())
-        .unwrap_or(800.0);
-
-    // Calculate visible area (between header and prompt)
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - layout.prompt_area_height;
-    let visible_height = visible_bottom - visible_top;
-
-    // Update scroll state with visible area dimensions
-    scroll_state.visible_height = visible_height;
-
-    // First pass: collect maximum height for each row
-    // Note: PromptCell is already excluded by Without<PromptCell> filter
-    let mut row_heights: BTreeMap<u32, f32> = BTreeMap::new();
-    for (position, state, _) in cells.iter() {
-        let current_max = row_heights.entry(position.row).or_insert(layout.min_cell_height);
-        *current_max = current_max.max(state.computed_height);
-    }
-
-    // Build cumulative Y offsets for each row (content coordinates, not screen)
-    let mut row_offsets: BTreeMap<u32, f32> = BTreeMap::new();
-    let mut content_y = 0.0; // Start at 0 in content space
-
-    // Handle sparse rows - iterate through the range
-    let max_row = row_heights.keys().max().copied().unwrap_or(0);
-    for row in 0..=max_row {
-        row_offsets.insert(row, content_y);
-        let row_height = row_heights
-            .get(&row)
-            .copied()
-            .unwrap_or(layout.min_cell_height);
-        content_y += row_height + layout.cell_margin;
-    }
-
-    // Total content height
-    let content_height = content_y;
-    scroll_state.content_height = content_height;
-
-    // Clamp scroll offset to valid range
-    scroll_state.clamp_offset();
-
-    // Get current scroll offset
-    let scroll_offset = scroll_state.offset;
-
-    // Second pass: apply positions with scroll offset
-    for (position, state, mut config) in cells.iter_mut() {
-        let x = layout.workspace_margin_left
-            + (position.col as f32 * (layout.cell_width + layout.cell_margin));
-
-        // Content Y position (before scroll)
-        let content_y = row_offsets
-            .get(&position.row)
-            .copied()
-            .unwrap_or(0.0);
-
-        // Screen Y position (after scroll offset, relative to visible area)
-        let screen_y = visible_top + content_y - scroll_offset;
-        let cell_bottom = screen_y + state.computed_height;
-
-        // Check if cell is visible (even partially)
-        let is_visible = cell_bottom > visible_top && screen_y < visible_bottom;
-
-        if is_visible {
-            // Clip to visible area
-            let clipped_top = screen_y.max(visible_top);
-            let clipped_bottom = cell_bottom.min(visible_bottom);
-
-            config.left = x;
-            config.top = screen_y; // Use actual position for text layout
-            config.scale = 1.0;
-            config.bounds = glyphon::TextBounds {
-                left: x as i32,
-                top: clipped_top as i32,
-                right: (x + layout.cell_width) as i32,
-                bottom: clipped_bottom as i32,
-            };
+    for (editor, mut state, main_cell) in cells.iter_mut() {
+        let display_text = if editor.has_blocks() {
+            format_blocks_for_display(&editor.blocks())
         } else {
-            // Cell is off-screen - set zero bounds to skip rendering
-            config.left = 0.0;
-            config.top = -1000.0; // Off-screen
-            config.bounds = glyphon::TextBounds {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
+            editor.text()
+        };
+        let line_count = display_text.lines().count().max(1);
+
+        // For MainCell, don't cap height - we need full content height for scrolling
+        let content_height = if main_cell.is_some() {
+            // Full height without max cap
+            (line_count as f32) * layout.line_height + 24.0
+        } else {
+            // Other cells use capped height
+            layout.height_for_lines(line_count)
+        };
+
+        state.computed_height = content_height;
+
+        // For MainCell, update scroll state with content height
+        if main_cell.is_some() {
+            scroll_state.content_height = content_height;
         }
     }
 }
@@ -640,143 +548,6 @@ pub fn handle_collapse_toggle(
     }
 }
 
-/// Cache for collapsed parent IDs to avoid rebuilding every frame.
-#[derive(Resource, Default)]
-pub struct CollapsedParentsCache {
-    /// IDs of cells that are currently collapsed
-    pub ids: std::collections::HashSet<String>,
-}
-
-/// Resource tracking drag state.
-#[derive(Resource, Default)]
-pub struct DragState {
-    /// Entity being dragged, if any.
-    pub dragging: Option<Entity>,
-    /// Original row before drag.
-    pub original_row: u32,
-    /// Mouse position when drag started.
-    pub start_y: f32,
-}
-
-/// Start dragging a cell on mouse down (in Normal mode).
-pub fn start_cell_drag(
-    mouse: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window>,
-    mode: Res<CurrentMode>,
-    mut drag: ResMut<DragState>,
-    layout: Res<WorkspaceLayout>,
-    cells: Query<(Entity, &CellPosition, &TextAreaConfig), With<Cell>>,
-) {
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    if !mouse.just_pressed(MouseButton::Left) {
-        return;
-    }
-
-    let Some(cursor_pos) = windows.iter().next().and_then(|w| w.cursor_position()) else {
-        return;
-    };
-
-    // Check if clicking on a cell header area for drag
-    for (entity, position, config) in cells.iter() {
-        let bounds = &config.bounds;
-        // Only trigger drag on the header area (configurable height)
-        if cursor_pos.x >= bounds.left as f32
-            && cursor_pos.x <= bounds.right as f32
-            && cursor_pos.y >= bounds.top as f32
-            && cursor_pos.y <= (bounds.top as f32 + layout.drag_header_height)
-        {
-            drag.dragging = Some(entity);
-            drag.original_row = position.row;
-            drag.start_y = cursor_pos.y;
-            info!("Started dragging cell at row {}", position.row);
-            return;
-        }
-    }
-}
-
-/// Update cell position while dragging.
-pub fn update_cell_drag(
-    mouse: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window>,
-    mut drag: ResMut<DragState>,
-    layout: Res<WorkspaceLayout>,
-    mut cells: Query<&mut CellPosition, With<Cell>>,
-) {
-    let Some(dragging_entity) = drag.dragging else {
-        return;
-    };
-
-    // End drag on mouse release
-    if mouse.just_released(MouseButton::Left) {
-        if let Ok(pos) = cells.get(dragging_entity) {
-            info!("Dropped cell at row {}", pos.row);
-        }
-        drag.dragging = None;
-        return;
-    }
-
-    let Some(cursor_pos) = windows.iter().next().and_then(|w| w.cursor_position()) else {
-        return;
-    };
-
-    // Calculate new row based on drag offset
-    let delta_y = cursor_pos.y - drag.start_y;
-    let row_height = layout.max_cell_height + layout.cell_margin;
-    let row_offset = (delta_y / row_height).round() as i32;
-
-    let new_row = (drag.original_row as i32 + row_offset).max(0) as u32;
-
-    if let Ok(mut position) = cells.get_mut(dragging_entity) {
-        if position.row != new_row {
-            position.row = new_row;
-        }
-    }
-}
-
-/// Update the collapsed parents cache when CellState changes.
-pub fn update_collapsed_cache(
-    mut cache: ResMut<CollapsedParentsCache>,
-    changed: Query<&Cell, Changed<CellState>>,
-    collapsed_cells: Query<(&Cell, &CellState)>,
-) {
-    // Only rebuild when something changed
-    if changed.is_empty() {
-        return;
-    }
-
-    // Rebuild the cache with current collapsed cell IDs
-    cache.ids = collapsed_cells
-        .iter()
-        .filter(|(_, state)| state.collapsed)
-        .map(|(cell, _)| cell.id.0.clone())
-        .collect();
-}
-
-/// Hide cells whose parent is collapsed.
-///
-/// Uses the cached set of collapsed parent IDs to avoid rebuilding every frame.
-pub fn apply_collapse_visibility(
-    cache: Res<CollapsedParentsCache>,
-    cells: Query<(Entity, &Cell)>,
-    mut configs: Query<&mut TextAreaConfig>,
-) {
-    // Hide children of collapsed parents
-    for (entity, cell) in cells.iter() {
-        if let Some(ref parent_id) = cell.parent {
-            if cache.ids.contains(&parent_id.0) {
-                // Hide this cell by moving it off-screen
-                if let Ok(mut config) = configs.get_mut(entity) {
-                    config.bounds.left = -10000;
-                    config.bounds.right = -9000;
-                }
-            }
-        }
-    }
-}
-
 use bevy::math::Vec4;
 
 // ============================================================================
@@ -956,7 +727,6 @@ pub fn spawn_prompt_cell(
             CellEditor::default().with_text(""),
             CellState {
                 computed_height: layout.min_cell_height,
-                min_height: 40.0,
                 collapsed: false,
             },
             // Row value is unused - PromptCell marker + Without<PromptCell> filters handle exclusion
@@ -1128,9 +898,23 @@ pub fn handle_scroll_input(
     // Handle j/k navigation in Normal mode
     if mode.0 == EditorMode::Normal {
         if keys.just_pressed(KeyCode::KeyJ) {
+            info!(
+                "scroll j: offset={} -> {}, content={}, visible={}",
+                scroll_state.offset,
+                scroll_state.offset + SCROLL_SPEED,
+                scroll_state.content_height,
+                scroll_state.visible_height
+            );
             scroll_state.scroll_by(SCROLL_SPEED);
         }
         if keys.just_pressed(KeyCode::KeyK) {
+            info!(
+                "scroll k: offset={} -> {}, content={}, visible={}",
+                scroll_state.offset,
+                scroll_state.offset - SCROLL_SPEED,
+                scroll_state.content_height,
+                scroll_state.visible_height
+            );
             scroll_state.scroll_by(-SCROLL_SPEED);
         }
         // Page down/up with Ctrl+d/u
@@ -1194,7 +978,6 @@ pub fn spawn_main_cell(
             CellEditor::default().with_text(welcome_text),
             CellState {
                 computed_height: 400.0, // Will be updated by layout
-                min_height: 200.0,
                 collapsed: false,
             },
             CellPosition::new(0, 0),
@@ -1209,10 +992,15 @@ pub fn spawn_main_cell(
 }
 
 /// Layout the main cell to fill the space between header and prompt.
+///
+/// Applies scroll offset from ConversationScrollState:
+/// - `bounds` stays fixed (the visible clipping window)
+/// - `top` offsets by negative scroll amount (content moves up)
 pub fn layout_main_cell(
     mut cells: Query<(&CellState, &mut TextAreaConfig), With<MainCell>>,
     layout: Res<WorkspaceLayout>,
     windows: Query<&Window>,
+    mut scroll_state: ResMut<ConversationScrollState>,
 ) {
     let (window_width, window_height) = windows
         .iter()
@@ -1220,26 +1008,37 @@ pub fn layout_main_cell(
         .map(|w| (w.resolution.width(), w.resolution.height()))
         .unwrap_or((1280.0, 800.0));
 
-    // Main cell fills from header to prompt area
-    let top = layout.workspace_margin_top;
-    let bottom = window_height - layout.prompt_area_height;
-    let height = bottom - top;
+    // Visible area bounds (fixed clipping window)
+    let visible_top = layout.workspace_margin_top;
+    let visible_bottom = window_height - layout.prompt_area_height;
+    let visible_height = visible_bottom - visible_top;
 
     // Full width minus margins
     let margin = layout.workspace_margin_left;
     let width = window_width - (margin * 2.0);
 
-    for (state, mut config) in cells.iter_mut() {
-        let cell_height = height.max(state.min_height);
+    // Update scroll state with visible area
+    scroll_state.visible_height = visible_height;
+    scroll_state.clamp_offset();
+
+    let scroll_offset = scroll_state.offset;
+
+    for (_state, mut config) in cells.iter_mut() {
+        // Content top position = visible top - scroll offset
+        // When scroll_offset = 0, content starts at visible_top
+        // When scroll_offset = 100, content starts 100px above visible area (scrolled down)
+        let content_top = visible_top - scroll_offset;
 
         config.left = margin;
-        config.top = top;
+        config.top = content_top;
         config.scale = 1.0;
+
+        // Bounds are fixed clipping window (what's visible)
         config.bounds = glyphon::TextBounds {
             left: margin as i32,
-            top: top as i32,
+            top: visible_top as i32,
             right: (margin + width) as i32,
-            bottom: (top + cell_height) as i32,
+            bottom: visible_bottom as i32,
         };
     }
 }
@@ -1262,22 +1061,27 @@ pub fn sync_main_cell_to_conversation(
 ) {
     // Need both a current conversation and a main cell
     let Some(conv_id) = current_conv.id() else {
+        debug!("sync_main_cell: no current conversation");
         return;
     };
     let Some(entity) = main_entity.0 else {
+        debug!("sync_main_cell: no main cell entity");
         return;
     };
     let Some(conv) = registry.get(conv_id) else {
+        debug!("sync_main_cell: conversation {} not in registry", conv_id);
         return;
     };
 
     // Get the main cell's editor and viewing component
     let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
+        debug!("sync_main_cell: couldn't get main cell editor");
         return;
     };
 
     // Check if we need to sync
     let conv_version = conv.doc.version();
+    let conv_block_count = conv.doc.block_count();
     let needs_sync = match viewing_opt {
         Some(ref viewing) => {
             // Check if conversation changed or version advanced
@@ -1285,6 +1089,15 @@ pub fn sync_main_cell_to_conversation(
         }
         None => true, // No viewing component yet, need to initialize
     };
+
+    debug!(
+        "sync_main_cell: conv={}, version={}, blocks={}, cached_version={:?}, needs_sync={}",
+        conv_id,
+        conv_version,
+        conv_block_count,
+        viewing_opt.as_ref().map(|v| v.last_sync_version),
+        needs_sync
+    );
 
     if !needs_sync {
         return;
@@ -1322,8 +1135,8 @@ pub fn sync_main_cell_to_conversation(
         }
     }
 
-    debug!(
-        "Synced MainCell to conversation {} (version {})",
-        conv_id, conv_version
+    info!(
+        "Synced MainCell to conversation {} (version {}, {} blocks)",
+        conv_id, conv_version, conv_block_count
     );
 }

@@ -214,7 +214,11 @@ fn prepare_text(
     let mut buffers: Vec<glyphon::Buffer> = Vec::new();
     for area in &extracted.areas {
         let mut buffer = glyphon::Buffer::new(&mut font_system, area.metrics);
-        buffer.set_size(&mut font_system, Some(800.0), Some(600.0));
+
+        // Use actual bounds width for wrap, unlimited height for layout
+        let wrap_width = (area.bounds.right - area.bounds.left) as f32;
+        buffer.set_size(&mut font_system, Some(wrap_width), None);
+
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
         buffer.set_text(
             &mut font_system,
