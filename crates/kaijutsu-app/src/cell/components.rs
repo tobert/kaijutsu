@@ -522,34 +522,6 @@ impl CellEditor {
             self.cursor = BlockCursor::default();
         }
     }
-
-    // =========================================================================
-    // LEGACY COMPATIBILITY
-    // =========================================================================
-
-    /// Legacy: Get cursor position as byte offset in full text.
-    /// Used for rendering compatibility.
-    pub fn cursor_offset(&self) -> usize {
-        if self.cursor.block_id.is_none() {
-            return 0;
-        }
-
-        let block_id = self.cursor.block_id.as_ref().unwrap();
-        let blocks = self.doc.blocks_ordered();
-
-        let mut offset = 0;
-        for (i, block) in blocks.iter().enumerate() {
-            if &block.id == block_id {
-                return offset + self.cursor.offset;
-            }
-            offset += block.text().len();
-            if i < blocks.len() - 1 {
-                offset += 2; // "\n\n" separator
-            }
-        }
-
-        offset
-    }
 }
 
 // ============================================================================

@@ -639,9 +639,8 @@ pub fn update_cursor(
     // Show cursor
     *visibility = Visibility::Inherited;
 
-    // Calculate cursor position from text index
-    let text = editor.text();
-    let (row, col) = cursor_row_col(&text, editor.cursor_offset());
+    // Calculate cursor position by walking blocks directly
+    let (row, col) = cursor_position(editor);
 
     // Position relative to cell bounds
     let x = config.left + (col as f32 * CHAR_WIDTH);
@@ -679,15 +678,41 @@ pub fn update_cursor(
     }
 }
 
-/// Calculate row and column from byte index in text.
-fn cursor_row_col(text: &str, cursor: usize) -> (usize, usize) {
-    let before_cursor = &text[..cursor.min(text.len())];
-    let row = before_cursor.matches('\n').count();
-    let col = before_cursor
-        .rfind('\n')
-        .map(|pos| cursor - pos - 1)
-        .unwrap_or(cursor);
-    (row, col)
+/// Calculate cursor row and column by walking blocks directly.
+fn cursor_position(editor: &CellEditor) -> (usize, usize) {
+    let Some(ref cursor_block_id) = editor.cursor.block_id else {
+        return (0, 0);
+    };
+
+    let blocks = editor.doc.blocks_ordered();
+    let mut row = 0;
+
+    for (i, block) in blocks.iter().enumerate() {
+        let text = block.text();
+
+        if &block.id == cursor_block_id {
+            // Found the cursor's block - count rows within it and compute col
+            let offset = editor.cursor.offset.min(text.len());
+            let before_cursor = &text[..offset];
+            row += before_cursor.matches('\n').count();
+            let col = before_cursor
+                .rfind('\n')
+                .map(|pos| offset - pos - 1)
+                .unwrap_or(offset);
+            return (row, col);
+        }
+
+        // Count rows in this block
+        row += text.matches('\n').count();
+
+        // Add block separator (2 newlines between blocks)
+        if i < blocks.len() - 1 {
+            row += 2;
+        }
+    }
+
+    // Cursor block not found - return end position
+    (row, 0)
 }
 
 // ============================================================================
