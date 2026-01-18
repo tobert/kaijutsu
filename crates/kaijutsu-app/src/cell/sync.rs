@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
-use kaijutsu_client::{CellKind as RemoteCellKind, CellOp, CellState, CellVersion, CrdtOp};
+use kaijutsu_client::{CellKind as RemoteCellKind, CellState, CellVersion};
 
 use super::components::{Cell, CellEditor, CellId, CellKind, CellPosition, PromptCell};
 use crate::text::{GlyphonText, TextAreaConfig};
@@ -306,9 +306,8 @@ fn spawn_remote_cell(
                 parent: state.info.parent_id.as_ref().map(|s| CellId(s.clone())),
             },
             CellEditor::default()
-                .with_text(state.content.clone())
-                .with_version(state.version),
-            CellPosition::new(0, next_row),
+                .with_text(state.content.clone()),
+            CellPosition::new(next_row),
             GlyphonText,
             TextAreaConfig {
                 left: 20.0,
@@ -372,46 +371,6 @@ pub fn send_block_operations(
         }
 
         // Mark as synced
-        editor.mark_synced();
-    }
-}
-
-/// System: Send pending cell operations to server (legacy fallback).
-///
-/// This is kept as a fallback for cases where block operations aren't available.
-#[allow(dead_code)]
-pub fn send_cell_operations_legacy(
-    mut cells: Query<(Entity, &Cell, &mut CellEditor), Changed<CellEditor>>,
-    registry: Res<CellRegistry>,
-    cmds: Option<Res<ConnectionCommands>>,
-) {
-    let Some(cmds) = cmds else { return };
-
-    for (entity, cell, mut editor) in cells.iter_mut() {
-        if !editor.dirty {
-            continue;
-        }
-
-        // Get remote ID
-        let Some(remote_id) = registry.get_remote(entity) else {
-            debug!(
-                "Cell {} not registered with server, keeping pending ops",
-                cell.id.0,
-            );
-            continue;
-        };
-
-        // Send full text as a replace operation (legacy fallback)
-        let text = editor.text();
-        let version = editor.version();
-
-        let op = CellOp {
-            cell_id: remote_id.to_string(),
-            client_version: version,
-            op: CrdtOp::FullState(text.into_bytes()),
-        };
-
-        cmds.send(ConnectionCommand::ApplyCellOp { op });
         editor.mark_synced();
     }
 }

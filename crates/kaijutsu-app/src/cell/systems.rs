@@ -469,7 +469,7 @@ pub fn debug_spawn_cell(
         spawn_cell(
             &mut commands,
             Cell::code("rust"),
-            CellPosition::new(0, next_row),
+            CellPosition::new(next_row),
             "// New cell\nfn main() {\n    println!(\"Hello!\");\n}\n",
         );
 
@@ -730,7 +730,7 @@ pub fn spawn_prompt_cell(
                 collapsed: false,
             },
             // Row value is unused - PromptCell marker + Without<PromptCell> filters handle exclusion
-            CellPosition::new(0, 0),
+            CellPosition::new(0),
             GlyphonText,
             TextAreaConfig::default(),
             PromptCell,
@@ -989,7 +989,7 @@ pub fn spawn_main_cell(
                 computed_height: 400.0, // Will be updated by layout
                 collapsed: false,
             },
-            CellPosition::new(0, 0),
+            CellPosition::new(0),
             GlyphonText,
             TextAreaConfig::default(),
             MainCell,

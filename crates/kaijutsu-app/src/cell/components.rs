@@ -112,18 +112,6 @@ impl BlockCursor {
     }
 }
 
-/// Selection within a block document.
-///
-/// NOTE: Currently unused - retained for planned text selection feature.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct BlockSelection {
-    /// Start of selection (anchor).
-    pub start: BlockCursor,
-    /// End of selection (head).
-    pub end: BlockCursor,
-}
-
 // ============================================================================
 // CELL EDITOR COMPONENT
 // ============================================================================
@@ -140,23 +128,8 @@ pub struct CellEditor {
     /// Cursor position within the document.
     pub cursor: BlockCursor,
 
-    /// Selection (if any).
-    /// NOTE: Currently unused - retained for planned text selection feature.
-    #[allow(dead_code)]
-    pub selection: Option<BlockSelection>,
-
     /// Whether content has changed since last sync.
     pub dirty: bool,
-
-    /// Currently streaming block (during LLM response).
-    /// NOTE: Currently unused - retained for planned LLM streaming feature.
-    #[allow(dead_code)]
-    pub streaming_block: Option<(BlockId, BlockType)>,
-
-    /// Agent ID for this editor (used for CRDT operations).
-    /// NOTE: Currently unused after construction - retained for future CRDT identity needs.
-    #[allow(dead_code)]
-    agent_id: String,
 }
 
 impl Default for CellEditor {
@@ -173,22 +146,7 @@ impl CellEditor {
         Self {
             doc: BlockDocument::new(&cell_id, &agent_id),
             cursor: BlockCursor::default(),
-            selection: None,
             dirty: false,
-            streaming_block: None,
-            agent_id,
-        }
-    }
-
-    /// Create an editor for a specific cell.
-    pub fn for_cell(cell_id: &str, agent_id: &str) -> Self {
-        Self {
-            doc: BlockDocument::new(cell_id, agent_id),
-            cursor: BlockCursor::default(),
-            selection: None,
-            dirty: false,
-            streaming_block: None,
-            agent_id: agent_id.to_string(),
         }
     }
 
@@ -200,14 +158,6 @@ impl CellEditor {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
         }
-        self
-    }
-
-    /// Builder: set CRDT version.
-    pub fn with_version(mut self, version: u64) -> Self {
-        // Version is tracked in the document
-        // For initial sync, we trust the provided version
-        let _ = version; // Currently not used directly, version comes from doc
         self
     }
 
@@ -235,42 +185,9 @@ impl CellEditor {
         self.doc.blocks_ordered()
     }
 
-    /// Get the current block (where cursor is).
-    pub fn current_block(&self) -> Option<&Block> {
-        self.cursor
-            .block_id
-            .as_ref()
-            .and_then(|id| self.doc.get_block(id))
-    }
-
     // =========================================================================
     // TEXT MUTATION
     // =========================================================================
-
-    /// Set the text content (replaces all content with a single text block).
-    pub fn set_text(&mut self, text: impl Into<String>) {
-        // Clear existing blocks
-        let block_ids: Vec<_> = self
-            .doc
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.id.clone())
-            .collect();
-        for id in block_ids {
-            let _ = self.doc.delete_block(&id);
-        }
-
-        // Create new text block
-        let text = text.into();
-        if !text.is_empty() {
-            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
-                self.cursor = BlockCursor::at(block_id, text.len());
-            }
-        } else {
-            self.cursor = BlockCursor::default();
-        }
-        self.dirty = true;
-    }
 
     /// Apply server-authoritative content (doesn't generate ops).
     pub fn apply_server_content(&mut self, content: impl Into<String>) {
@@ -476,72 +393,6 @@ impl CellEditor {
         }
     }
 
-    /// Append a text block.
-    pub fn append_text_block(&mut self, text: impl Into<String>) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self
-            .doc
-            .insert_text_block(last_id.as_ref(), text)
-            .ok()?;
-        self.dirty = true;
-        Some(block_id)
-    }
-
-    /// Append a thinking block.
-    pub fn append_thinking_block(&mut self, text: impl Into<String>) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self
-            .doc
-            .insert_thinking_block(last_id.as_ref(), text)
-            .ok()?;
-        self.dirty = true;
-        Some(block_id)
-    }
-
-    /// Append text to a specific block.
-    pub fn append_to_block(&mut self, block_id: &BlockId, text: &str) {
-        let _ = self.doc.append_text(block_id, text);
-        self.dirty = true;
-    }
-
-    /// Append a tool use block.
-    pub fn append_tool_use(
-        &mut self,
-        id: impl Into<String>,
-        name: impl Into<String>,
-        input: serde_json::Value,
-    ) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self
-            .doc
-            .insert_tool_use(last_id.as_ref(), id, name, input)
-            .ok()?;
-        self.dirty = true;
-        Some(block_id)
-    }
-
-    /// Append a tool result block.
-    pub fn append_tool_result(
-        &mut self,
-        tool_use_id: impl Into<String>,
-        content: impl Into<String>,
-        is_error: bool,
-    ) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self
-            .doc
-            .insert_tool_result(last_id.as_ref(), tool_use_id, content, is_error)
-            .ok()?;
-        self.dirty = true;
-        Some(block_id)
-    }
-
-    /// Set the collapsed state of a thinking block.
-    pub fn set_block_collapsed(&mut self, block_id: &BlockId, collapsed: bool) {
-        let _ = self.doc.set_collapsed(block_id, collapsed);
-        self.dirty = true;
-    }
-
     // =========================================================================
     // SYNC OPERATIONS
     // =========================================================================
@@ -549,16 +400,6 @@ impl CellEditor {
     /// Take pending operations for sending to server.
     pub fn take_pending_ops(&mut self) -> Vec<BlockDocOp> {
         self.doc.take_pending_ops()
-    }
-
-    /// Check if there are pending operations.
-    pub fn has_pending_ops(&self) -> bool {
-        self.doc.has_pending_ops()
-    }
-
-    /// Apply a remote operation.
-    pub fn apply_remote_op(&mut self, op: &BlockDocOp) {
-        let _ = self.doc.apply_remote_op(op);
     }
 
     /// Mark as synced.
@@ -682,12 +523,6 @@ impl CellEditor {
         }
     }
 
-    /// Get selected text (if any).
-    pub fn selection(&self) -> Option<String> {
-        // TODO: Implement selection across blocks
-        None
-    }
-
     // =========================================================================
     // LEGACY COMPATIBILITY
     // =========================================================================
@@ -724,15 +559,13 @@ impl CellEditor {
 /// Position of a cell in the workspace grid.
 #[derive(Component, Default, Clone, Copy)]
 pub struct CellPosition {
-    /// Column (0-indexed)
-    pub col: u32,
     /// Row (0-indexed)
     pub row: u32,
 }
 
 impl CellPosition {
-    pub fn new(col: u32, row: u32) -> Self {
-        Self { col, row }
+    pub fn new(row: u32) -> Self {
+        Self { row }
     }
 }
 
@@ -751,11 +584,6 @@ impl CellState {
             collapsed: false,
             computed_height: 100.0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn toggle_collapse(&mut self) {
-        self.collapsed = !self.collapsed;
     }
 }
 
@@ -780,16 +608,6 @@ impl EditorMode {
             EditorMode::Insert => "INSERT",
             EditorMode::Command => "COMMAND",
             EditorMode::Visual => "VISUAL",
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn color_hint(&self) -> &'static str {
-        match self {
-            EditorMode::Normal => "blue",
-            EditorMode::Insert => "green",
-            EditorMode::Command => "yellow",
-            EditorMode::Visual => "purple",
         }
     }
 }
