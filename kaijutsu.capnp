@@ -335,7 +335,7 @@ interface CellEvents {
 }
 
 # ============================================================================
-# Block-Based CRDT Types (New Architecture)
+# Block-Based CRDT Types (DAG Architecture)
 # ============================================================================
 
 # Block identifier - globally unique across all cells and agents
@@ -345,89 +345,114 @@ struct BlockId {
   seq @2 :UInt64;
 }
 
-# Block content types - supports structured response blocks
-struct BlockContent {
-  union {
-    # Extended thinking - text CRDT, collapsible
-    thinking :group {
-      text @0 :Text;
-      collapsed @1 :Bool;
-    }
-    # Main response text - text CRDT
-    text @2 :Text;
-    # Tool invocation - immutable after creation
-    toolUse :group {
-      id @3 :Text;
-      name @4 :Text;
-      input @5 :Text;         # JSON encoded
-    }
-    # Tool result - immutable after creation
-    toolResult :group {
-      toolUseId @6 :Text;
-      content @7 :Text;
-      isError @8 :Bool;
-    }
-  }
+# Role in conversation (User/Model terminology for collaborative peer model)
+enum Role {
+  user @0;
+  model @1;
+  system @2;
+  tool @3;
+}
+
+# Execution/processing status
+enum Status {
+  pending @0;
+  running @1;
+  done @2;
+  error @3;
+}
+
+# Block content type
+enum BlockKind {
+  text @0;
+  thinking @1;
+  toolCall @2;
+  toolResult @3;
+}
+
+# Flat block snapshot - all fields present, some unused depending on kind
+struct BlockSnapshot {
+  # Core identity
+  id @0 :BlockId;
+
+  # DAG structure
+  parentId @1 :BlockId;
+  hasParentId @2 :Bool;       # True if parentId is set
+
+  # Metadata
+  role @3 :Role;
+  status @4 :Status;
+  kind @5 :BlockKind;
+  author @6 :Text;
+  createdAt @7 :UInt64;       # Unix timestamp in milliseconds
+
+  # Content (all blocks)
+  content @8 :Text;           # Main text content
+  collapsed @9 :Bool;         # For thinking blocks
+
+  # Tool-specific fields (toolCall)
+  toolName @10 :Text;         # Tool name for toolCall
+  toolInput @11 :Text;        # JSON-encoded input for toolCall
+
+  # Tool-specific fields (toolResult)
+  toolCallId @12 :BlockId;    # Reference to parent toolCall block
+  hasToolCallId @13 :Bool;    # True if toolCallId is set
+  exitCode @14 :Int32;        # Exit code for toolResult
+  hasExitCode @15 :Bool;      # True if exitCode is set
+  isError @16 :Bool;          # True if toolResult is an error
 }
 
 # Operations on block documents
 struct BlockDocOp {
   union {
-    # Insert a new block after a reference block
+    # Insert a new block
     insertBlock :group {
-      id @0 :BlockId;
+      block @0 :BlockSnapshot;
       afterId @1 :BlockId;
       hasAfterId @2 :Bool;    # False = insert at start
-      content @3 :BlockContent;
-      author @14 :Text;       # Who created this block (e.g. "user:amy", "model:claude")
-      createdAt @15 :UInt64;  # Unix timestamp in milliseconds
     }
     # Delete a block
-    deleteBlock @4 :BlockId;
+    deleteBlock @3 :BlockId;
     # Edit text within a block (Thinking/Text only)
     editBlockText :group {
-      id @5 :BlockId;
-      pos @6 :UInt64;
-      insert @7 :Text;
-      delete @8 :UInt64;
+      id @4 :BlockId;
+      pos @5 :UInt64;
+      insert @6 :Text;
+      delete @7 :UInt64;
     }
     # Toggle collapsed state (Thinking only)
     setCollapsed :group {
-      id @9 :BlockId;
-      collapsed @10 :Bool;
+      id @8 :BlockId;
+      collapsed @9 :Bool;
+    }
+    # Update block status
+    setStatus :group {
+      id @10 :BlockId;
+      status @11 :Status;
     }
     # Move block to new position
     moveBlock :group {
-      id @11 :BlockId;
-      afterId @12 :BlockId;
-      hasAfterId @13 :Bool;
+      id @12 :BlockId;
+      afterId @13 :BlockId;
+      hasAfterId @14 :Bool;
     }
   }
 }
 
-# State of a single block
-struct BlockState {
-  id @0 :BlockId;
-  content @1 :BlockContent;
-  textVersion @2 :UInt64;     # Version of text CRDT (for Thinking/Text)
-  author @3 :Text;            # Who created this block
-  createdAt @4 :UInt64;       # Unix timestamp in milliseconds
-}
-
-# Full cell state with blocks (new architecture)
+# Full cell state with blocks
 struct BlockCellState {
   info @0 :CellInfo;
-  blocks @1 :List(BlockState);
+  blocks @1 :List(BlockSnapshot);
   version @2 :UInt64;
 }
 
 # Callback for receiving block updates from server
 interface BlockEvents {
-  onBlockInserted @0 (cellId :Text, block :BlockState, afterId :BlockId, hasAfterId :Bool);
+  onBlockInserted @0 (cellId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool);
   onBlockDeleted @1 (cellId :Text, blockId :BlockId);
   onBlockEdited @2 (cellId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
   onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);
   onBlockMoved @4 (cellId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
+  onBlockStatusChanged @5 (cellId :Text, blockId :BlockId, status :Status);
 }
 
 # ============================================================================
