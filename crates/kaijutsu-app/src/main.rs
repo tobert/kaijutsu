@@ -3,6 +3,10 @@
 //! A fresh implementation with cells as the universal primitive.
 //! CRDT sync via diamond-types, cosmic-text rendering.
 
+// Bevy ECS idioms that trigger these lints
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
