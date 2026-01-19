@@ -27,12 +27,14 @@
 //! - **Text**: Sequence CRDT - character-level merging with proper interleaving
 
 mod block;
+mod dag;
 mod document;
 mod error;
 mod ops;
 
-pub use block::{BlockContentSnapshot, BlockId, BlockType};
-pub use document::{BlockDocument, BlockSnapshot, DocumentSnapshot};
+pub use block::{BlockId, BlockKind, BlockSnapshot, Role, Status};
+pub use dag::ConversationDAG;
+pub use document::{BlockDocument, DocumentSnapshot};
 pub use error::CrdtError;
 pub use ops::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
@@ -47,8 +49,8 @@ mod tests {
     fn test_document_basic_operations() {
         let mut doc = BlockDocument::new("test-cell", "alice");
 
-        // Insert a text block
-        let block_id = doc.insert_text_block(None, "Hello, world!").unwrap();
+        // Insert a text block using new API
+        let block_id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!", "alice").unwrap();
         assert_eq!(doc.full_text(), "Hello, world!");
 
         // Append to the text block
@@ -65,12 +67,10 @@ mod tests {
         let mut doc = BlockDocument::new("test-cell", "alice");
 
         // Insert thinking block first
-        let thinking_id = doc.insert_thinking_block(None, "Let me think...").unwrap();
+        let thinking_id = doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Let me think...", "alice").unwrap();
 
         // Insert text block after thinking
-        let text_id = doc
-            .insert_text_block(Some(&thinking_id), "Here's my answer.")
-            .unwrap();
+        let text_id = doc.insert_block(None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer.", "alice").unwrap();
 
         // Full text concatenates blocks
         let text = doc.full_text();
@@ -91,10 +91,8 @@ mod tests {
     fn test_tool_blocks_are_editable() {
         let mut doc = BlockDocument::new("test-cell", "alice");
 
-        // Tool use is now editable (supports streaming)
-        let tool_id = doc
-            .insert_tool_use(None, "tool-123", "read_file", serde_json::json!({"path": "/test"}))
-            .unwrap();
+        // Tool call using new API
+        let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"}), "alice").unwrap();
 
         // Editing tool use content should succeed (appending to JSON)
         let result = doc.append_text(&tool_id, ", \"extra\": true}");
@@ -102,38 +100,28 @@ mod tests {
 
         // Verify the content changed
         let snapshot = doc.get_block_snapshot(&tool_id).unwrap();
-        if let BlockContentSnapshot::ToolUse { .. } = snapshot.content {
-            // The appended text modifies the JSON string in the Text CRDT
-            // Text CRDT contains the concatenated content
-            assert!(matches!(snapshot.content, BlockContentSnapshot::ToolUse { .. }));
-        } else {
-            panic!("Expected ToolUse block");
-        }
+        assert_eq!(snapshot.kind, BlockKind::ToolCall);
+        assert_eq!(snapshot.tool_name, Some("read_file".to_string()));
 
-        // Tool result is also editable (supports streaming)
-        let result_id = doc
-            .insert_tool_result(Some(&tool_id), "tool-123", "file contents", false)
-            .unwrap();
+        // Tool result using new API
+        let result_id = doc.insert_tool_result_block(&tool_id, Some(&tool_id), "file contents", false, None, "system").unwrap();
 
         // Edit tool result content
         doc.append_text(&result_id, "\nmore output").unwrap();
 
         let snapshot = doc.get_block_snapshot(&result_id).unwrap();
-        if let BlockContentSnapshot::ToolResult { content, .. } = snapshot.content {
-            assert!(content.contains("file contents"));
-            assert!(content.contains("more output"));
-        } else {
-            panic!("Expected ToolResult block");
-        }
+        assert_eq!(snapshot.kind, BlockKind::ToolResult);
+        assert!(snapshot.content.contains("file contents"));
+        assert!(snapshot.content.contains("more output"));
     }
 
     #[test]
     fn test_document_delete_block() {
         let mut doc = BlockDocument::new("test-cell", "alice");
 
-        let id1 = doc.insert_text_block(None, "First").unwrap();
-        let id2 = doc.insert_text_block(Some(&id1), "Second").unwrap();
-        let _id3 = doc.insert_text_block(Some(&id2), "Third").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", "alice").unwrap();
+        let _id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", "alice").unwrap();
 
         assert_eq!(doc.block_count(), 3);
 
@@ -155,8 +143,8 @@ mod tests {
         let mut doc1 = BlockDocument::new("test-cell", "alice");
         let mut doc2 = BlockDocument::new("test-cell", "bob");
 
-        let _alice_id = doc1.insert_text_block(None, "Alice's block").unwrap();
-        let _bob_id = doc2.insert_text_block(None, "Bob's block").unwrap();
+        let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block", "alice").unwrap();
+        let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block", "bob").unwrap();
 
         doc1.oplog.merge_ops(doc2.oplog.ops_since(&[])).unwrap();
         doc2.oplog.merge_ops(doc1.oplog.ops_since(&[])).unwrap();
@@ -177,7 +165,7 @@ mod tests {
         let mut doc1 = BlockDocument::new("test-cell", "alice");
         let mut doc2 = BlockDocument::new("test-cell", "bob");
 
-        let block_id = doc1.insert_text_block(None, "hello").unwrap();
+        let block_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "hello", "alice").unwrap();
         doc2.oplog.merge_ops(doc1.oplog.ops_since(&[])).unwrap();
 
         doc1.edit_text(&block_id, 5, " alice", 0).unwrap();
