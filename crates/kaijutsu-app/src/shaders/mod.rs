@@ -344,17 +344,6 @@ impl Default for CursorBeamMaterial {
     }
 }
 
-impl CursorBeamMaterial {
-    pub fn with_mode(mut self, mode: CursorMode) -> Self {
-        self.time.y = mode as u8 as f32;
-        self
-    }
-
-    pub fn with_blink(mut self, rate: f32) -> Self {
-        self.params.w = rate;
-        self
-    }
-}
 
 impl UiMaterial for CursorBeamMaterial {
     fn fragment_shader() -> ShaderRef {

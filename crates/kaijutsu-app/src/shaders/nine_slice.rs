@@ -53,17 +53,6 @@ impl Default for CornerMaterial {
 }
 
 impl CornerMaterial {
-    /// Create a corner with specific flip orientation
-    pub fn with_flip(mut self, flip_x: bool, flip_y: bool) -> Self {
-        self.flip = Vec4::new(
-            if flip_x { 1.0 } else { 0.0 },
-            if flip_y { 1.0 } else { 0.0 },
-            0.0,
-            0.0,
-        );
-        self
-    }
-
     /// Create a corner with specific dimensions
     pub fn with_dimensions(mut self, width: f32, height: f32, corner_size: f32) -> Self {
         self.dimensions = Vec4::new(width, height, corner_size, 1.0);
@@ -86,17 +75,6 @@ pub enum CornerPosition {
     BottomRight,
 }
 
-impl CornerPosition {
-    /// Get flip values for this corner position
-    pub fn flip(&self) -> (bool, bool) {
-        match self {
-            CornerPosition::TopLeft => (false, false),
-            CornerPosition::TopRight => (true, false),
-            CornerPosition::BottomLeft => (false, true),
-            CornerPosition::BottomRight => (true, true),
-        }
-    }
-}
 
 // ============================================================================
 // EDGE MATERIAL
@@ -137,39 +115,6 @@ impl Default for EdgeMaterial {
     }
 }
 
-impl EdgeMaterial {
-    /// Set edge to tile mode with given tile size
-    pub fn with_tile(mut self, tile_size: f32) -> Self {
-        self.tile_info.x = tile_size;
-        self.tile_info.y = 1.0; // Tile mode
-        self
-    }
-
-    /// Set edge to stretch mode
-    pub fn with_stretch(mut self) -> Self {
-        self.tile_info.y = 0.0; // Stretch mode
-        self
-    }
-
-    /// Set edge dimensions
-    pub fn with_dimensions(mut self, length: f32, thickness: f32) -> Self {
-        self.tile_info.z = length;
-        self.tile_info.w = thickness;
-        self
-    }
-
-    /// Set edge as vertical
-    pub fn vertical(mut self) -> Self {
-        self.orientation.x = 1.0;
-        self
-    }
-
-    /// Set edge as horizontal
-    pub fn horizontal(mut self) -> Self {
-        self.orientation.x = 0.0;
-        self
-    }
-}
 
 impl UiMaterial for EdgeMaterial {
     fn fragment_shader() -> ShaderRef {
@@ -184,13 +129,6 @@ pub enum EdgePosition {
     Bottom,
     Left,
     Right,
-}
-
-impl EdgePosition {
-    /// Returns true if this is a vertical edge (left/right)
-    pub fn is_vertical(&self) -> bool {
-        matches!(self, EdgePosition::Left | EdgePosition::Right)
-    }
 }
 
 // ============================================================================

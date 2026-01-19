@@ -53,44 +53,9 @@ impl TextBuffer {
         }
     }
 
-    /// Create from an existing glyphon Buffer.
-    pub fn from_buffer(buffer: Buffer) -> Self {
-        Self {
-            buffer,
-            dirty: true,
-        }
-    }
-
     /// Get a reference to the underlying buffer.
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
-    }
-
-    /// Get a mutable reference to the underlying buffer.
-    pub fn buffer_mut(&mut self) -> &mut Buffer {
-        self.dirty = true;
-        &mut self.buffer
-    }
-
-    /// Check if the buffer needs re-rendering.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Mark the buffer as clean after rendering.
-    pub fn mark_clean(&mut self) {
-        self.dirty = false;
-    }
-
-    /// Mark the buffer as dirty (needs re-rendering).
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Set the buffer size.
-    pub fn set_size(&mut self, font_system: &mut FontSystem, width: Option<f32>, height: Option<f32>) {
-        self.buffer.set_size(font_system, width, height);
-        self.dirty = true;
     }
 
     /// Set the buffer text with default attributes.

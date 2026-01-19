@@ -16,11 +16,6 @@ pub struct ConversationRegistry {
 }
 
 impl ConversationRegistry {
-    /// Create an empty registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Add a conversation to the registry.
     ///
     /// If a conversation with the same ID exists, it will be replaced.
