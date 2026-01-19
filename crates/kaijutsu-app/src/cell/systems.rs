@@ -1591,8 +1591,9 @@ pub fn layout_block_cells(
         };
 
         // Compute height from buffer line count
+        // Use uncapped height for scroll calculations - we need actual content height
         let line_count = buffer.buffer().lines.len().max(1);
-        let height = layout.height_for_lines(line_count);
+        let height = (line_count as f32) * layout.line_height + 24.0; // No max cap for scrolling
 
         block_layout.y_offset = y_offset;
         block_layout.height = height;
