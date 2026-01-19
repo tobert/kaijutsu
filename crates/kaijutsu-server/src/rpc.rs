@@ -948,7 +948,10 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
         let kind = cell_kind_from_capnp(params.get_kind().unwrap_or(crate::kaijutsu_capnp::CellKind::Code));
-        let language = params.get_language().ok().and_then(|l| l.to_str().ok()).map(|s| s.to_owned());
+        let language = params.get_language().ok()
+            .and_then(|l| l.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned());
         let _parent_id = params.get_parent_id().ok().and_then(|p| p.to_str().ok()).map(|s| s.to_owned());
 
         // Generate a new cell ID
@@ -1116,7 +1119,11 @@ impl kernel::Server for KernelImpl {
             let mut client_versions: HashMap<String, u64> = HashMap::new();
             for i in 0..from_versions.len() {
                 let v = from_versions.get(i);
-                if let Some(id) = v.get_cell_id().ok().and_then(|t| t.to_str().ok().map(|s| s.to_owned())) {
+                if let Some(id) = v.get_cell_id().ok()
+                    .and_then(|t| t.to_str().ok())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_owned())
+                {
                     client_versions.insert(id, v.get_version());
                 }
             }
