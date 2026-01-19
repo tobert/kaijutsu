@@ -48,7 +48,7 @@ cargo run -p kaijutsu-app
 | [docs/next.md](docs/next.md) | Current status, what's next |
 | [docs/05-lexicon-exploration.md](docs/05-lexicon-exploration.md) | Philosophical background, design decisions |
 
-Legacy docs (01-04) exist but are outdated. Use 06-kernel-model.md as the source of truth.
+Use 06-kernel-model.md as the authoritative source of truth.
 
 ## Core Concepts
 
@@ -59,7 +59,6 @@ The kernel is the fundamental primitive. Everything is a kernel.
 A kernel:
 - Owns `/` in its VFS (virtual filesystem)
 - Can mount worktrees, repos, other kernels at paths like `/mnt/project`
-- Has a lease (who holds "the pen" for mutations)
 - Has a consent mode (collaborative vs autonomous)
 - Can checkpoint (distill history into summaries)
 - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
@@ -69,10 +68,6 @@ See [docs/06-kernel-model.md](docs/06-kernel-model.md) for full details.
 ### Context Generation
 
 Context isn't stored, it's *generated*. When a context payload is needed (for Claude, for export), kaish walks the kernel state and mounted VFS to emit a fresh payload. Mounts determine what's visible.
-
-### Lease Model
-
-A kernel has one lease holder at a time. Human enters insert mode → acquires lease. AI generates → holds lease. Escape → releases. This prevents interleaving chaos in collaborative sessions.
 
 ### Fork vs Thread
 

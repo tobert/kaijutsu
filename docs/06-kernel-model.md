@@ -13,7 +13,7 @@
 | Server (kaijutsu-server) | 🚧 Partial |
 | Client (kaijutsu-app) | 🚧 Partial |
 | kaish integration | 🚧 kaish L0-L4 complete, embedding planned |
-| Lease system | 📋 Planned |
+| Consent modes | ✅ Implemented |
 | Checkpoint system | 📋 Planned |
 | Fork/Thread | 📋 Planned |
 
@@ -27,7 +27,7 @@
 |-----------|-------|---------|
 | `kaish.capnp::Kernel` | **kaish** | Execution: parse, eval, tools, VFS, MCP, state, blobs |
 | `kaijutsu.capnp::World` | **kaijutsu** | Multi-kernel orchestration |
-| `kaijutsu.capnp::Kernel` | **kaijutsu** | Collaboration: lease, consent, fork/thread, checkpoint, messaging |
+| `kaijutsu.capnp::Kernel` | **kaijutsu** | Collaboration: consent, fork/thread, checkpoint, messaging |
 
 ### Architecture
 
@@ -39,7 +39,6 @@
 │  └── listKernels, attachKernel, createKernel                    │
 │                                                                 │
 │  kaijutsu.capnp::Kernel (collaboration layer)                   │
-│  ├── lease: acquireLease, releaseLease, subscribeLease          │
 │  ├── consent: collaborative vs autonomous                       │
 │  ├── lifecycle: fork, thread, checkpoint, archive               │
 │  ├── messaging: send, mention, subscribe                        │
@@ -67,29 +66,21 @@
 
 When a user or AI executes code in kaijutsu:
 
-1. **Lease acquisition** — kaijutsu acquires lease for the session
-2. **Execute** — kaijutsu calls `kaish_kernel.execute(code)`
-3. **Record** — Output recorded in message DAG
-4. **Lease release** — kaijutsu releases lease
-5. **Checkpoint** — If autonomous mode, may trigger checkpoint
+1. **Execute** — kaijutsu calls `kaish_kernel.execute(code)`
+2. **Record** — Output recorded in message DAG
+3. **Checkpoint** — If autonomous mode, may trigger checkpoint
 
 ```rust
 // In kaijutsu-server kernel handler
 async fn execute(&self, code: String) -> Result<ExecId> {
-    // 1. Acquire lease
-    self.lease.acquire(holder).await?;
-
-    // 2. Execute via embedded kaish
+    // 1. Execute via embedded kaish
     let exec_id = self.next_exec_id();
     let result = self.kaish.execute(&code).await;
 
-    // 3. Record in DAG
+    // 2. Record in DAG
     self.dag.append(Row::tool_result(exec_id, &result));
 
-    // 4. Release lease
-    self.lease.release().await;
-
-    // 5. Maybe checkpoint
+    // 3. Maybe checkpoint
     if self.consent_mode == Autonomous && self.should_checkpoint() {
         self.checkpoint_auto().await?;
     }
@@ -118,7 +109,6 @@ The **kernel** is the fundamental primitive in Kaijutsu. Everything is a kernel.
 A kernel is a state holder that:
 - Owns `/` in its virtual filesystem
 - Can mount other VFS (worktrees, repos, other kernels)
-- Has a lease (who holds "the pen" for mutations)
 - Has a consent mode (collaborative vs autonomous)
 - Can checkpoint (distill history into summaries)
 - Can be forked (heavy copy) or threaded (light, shared VFS)
@@ -140,7 +130,6 @@ kernel
 └── state/
     ├── history                    # interaction history (raw)
     ├── checkpoints/               # distilled summaries
-    ├── lease                      # current: available | user:mode | agent:action
     ├── consent_mode               # collaborative | autonomous
     └── context_config             # how to generate payloads
 ```
@@ -275,52 +264,6 @@ kaish gc --dry-run  # Show what would be cleaned
 kaish gc            # Actually clean
 ```
 
-## The Lease Model
-
-A kernel has exactly one lease holder at a time (or none).
-
-```
-lease: available              # No one holding
-lease: atobey (insert)        # Human in insert mode
-lease: claude (tool_call)     # AI executing a tool
-lease: bob (typing)           # Another human typing
-```
-
-### Lease Acquisition
-
-**Automatic:**
-- Human enters insert mode → acquire if available
-- AI starts generation → acquire
-- Tool execution → acquire
-
-**Release:**
-- Human hits Escape → release (prompt persists)
-- AI finishes generation → release
-- Tool completes → release
-
-### Lease Conflicts
-
-If lease is held and another participant wants it:
-- **Warn** the requester (UI shows who has it)
-- **Queue** the request (optional)
-- **Force** (admin/emergency, breaks flow)
-
-### UI Display
-
-```
-┌─────────────────────────────────────┐
-│ 🟢 lease: available                 │
-└─────────────────────────────────────┘
-
-┌─────────────────────────────────────┐
-│ 🔵 lease: atobey (insert)           │
-└─────────────────────────────────────┘
-
-┌─────────────────────────────────────┐
-│ 🟣 lease: claude (generating)       │
-└─────────────────────────────────────┘
-```
-
 ## Consent Mode
 
 Kernels operate in one of two modes:
@@ -329,14 +272,12 @@ Kernels operate in one of two modes:
 
 - Checkpoints require human consent
 - AI suggests, human approves
-- Lease coordination is strict
 - Good for: pair programming, supervised work
 
 ### Autonomous
 
 - Kernel can self-checkpoint
 - AI manages its own lifecycle
-- Lease coordination is looser
 - Good for: background research, long-running agents, unsupervised tasks
 
 ```bash
@@ -469,31 +410,16 @@ interface Kernel {
   checkpoint @6 (summary :Text);
   archive @7 ();
 
-  # Lease
-  getLease @8 () -> (lease :LeaseInfo);
-  acquireLease @9 (mode :Text) -> (acquired :Bool);
-  releaseLease @10 ();
-  subscribeLease @11 (callback :LeaseEvents);
-
   # kaish execution
-  execute @12 (code :Text) -> (execId :UInt64);
-  interrupt @13 (execId :UInt64);
-  complete @14 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
-  subscribeOutput @15 (callback :KernelOutput);
+  execute @8 (code :Text) -> (execId :UInt64);
+  interrupt @9 (execId :UInt64);
+  complete @10 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
+  subscribeOutput @11 (callback :KernelOutput);
 
   # History & context
-  getHistory @16 (limit :UInt32) -> (entries :List(HistoryEntry));
-  getCheckpoints @17 () -> (checkpoints :List(CheckpointInfo));
-  emitContext @18 (config :ContextConfig) -> (payload :Data);
-}
-
-struct LeaseInfo {
-  holder @0 :Text;         # "available" or "user:mode" or "agent:action"
-  since @1 :Int64;         # timestamp
-}
-
-interface LeaseEvents {
-  onLeaseChange @0 (lease :LeaseInfo);
+  getHistory @12 (limit :UInt32) -> (entries :List(HistoryEntry));
+  getCheckpoints @13 () -> (checkpoints :List(CheckpointInfo));
+  emitContext @14 (config :ContextConfig) -> (payload :Data);
 }
 
 struct CheckpointInfo {
@@ -520,7 +446,6 @@ Server storage (SQLite + filesystem)
 ├── kernels/
 │   ├── <kernel-id>/
 │   │   ├── state.db          # history, checkpoints, config
-│   │   ├── lease.lock        # current lease holder
 │   │   └── scratch/          # kernel-local ephemeral files
 │   └── ...
 ├── worktrees/                 # git worktrees for VFS mounts
@@ -534,7 +459,6 @@ Server storage (SQLite + filesystem)
 1. The server generates a context payload from kernel state + mounted VFS
 2. This payload constitutes Claude's "now" for that interaction
 3. Claude's outputs become new history entries in the kernel
-4. Claude holds the lease during generation, releases on completion
 
 There is no persistent "Claude process" — each interaction is a fresh emergence from kernel state.
 
@@ -545,7 +469,6 @@ There is no persistent "Claude process" — each interaction is a fresh emergenc
 Think of a kernel like a development environment that:
 - Has a filesystem (the VFS with mounts)
 - Has memory (history, checkpoints)
-- Has a mutex (lease)
 - Can be cloned (fork) or viewed in parallel (thread)
 - Can be summarized (checkpoint) or archived
 
@@ -556,17 +479,15 @@ Think of a kernel like a development environment that:
 | Kernel owns `/` | Unix philosophy. Everything is a file. Kernels expose themselves as VFS. |
 | Context is generated, not stored | Fresh context on each interaction. Mounts shape what's visible. Enables pruning. |
 | Fork vs Thread | Maps to how humans think about branching (isolated experiment) vs parallel work (same codebase). |
-| Lease model | Explicit mutex prevents interleaving chaos in collaborative sessions. |
 | Checkpoint = distillation | Compress without forgetting. Summaries carry forward. Raw history can be archived. |
 | Consent modes | Collaborative work needs human approval. Autonomous agents need freedom. |
 
 ### Open Questions
 
-1. **Lease granularity:** Should leases be per-kernel or per-path? (Currently per-kernel)
-2. **Cross-kernel transactions:** Can a checkpoint span multiple kernels?
-3. **Kernel discovery:** How do you find kernels? Tags? Search? Hierarchy?
-4. **Garbage collection:** When is it safe to delete archived history?
-5. **Multi-model:** Can a kernel have multiple AI models attached with different roles?
+1. **Cross-kernel transactions:** Can a checkpoint span multiple kernels?
+2. **Kernel discovery:** How do you find kernels? Tags? Search? Hierarchy?
+3. **Garbage collection:** When is it safe to delete archived history?
+4. **Multi-model:** Can a kernel have multiple AI models attached with different roles?
 
 ## References
 
