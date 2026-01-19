@@ -10,6 +10,7 @@
 mod conversation;
 
 use bevy::prelude::*;
+use crate::constants::{COMMAND_OUTPUT_VISIBLE_FRAMES, COMMAND_OUTPUT_FADE_FRAMES};
 
 /// Plugin for command handling.
 pub struct CommandsPlugin;
@@ -84,14 +85,14 @@ impl CommandOutput {
     pub fn success(&mut self, msg: impl Into<String>) {
         self.message = msg.into();
         self.is_error = false;
-        self.hide_after = 180; // ~3 seconds at 60fps
+        self.hide_after = COMMAND_OUTPUT_VISIBLE_FRAMES;
     }
 
     /// Set an error message.
     pub fn error(&mut self, msg: impl Into<String>) {
         self.message = msg.into();
         self.is_error = true;
-        self.hide_after = 300; // ~5 seconds
+        self.hide_after = COMMAND_OUTPUT_FADE_FRAMES;
     }
 
     /// Clear the output.

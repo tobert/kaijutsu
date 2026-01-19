@@ -61,14 +61,14 @@ pub fn handle_conversation_commands(
     }
 
     // Check if this is a conv command
-    let parts = command_buffer.parts();
-    if parts.is_empty() || parts[0] != "conv" {
+    if command_buffer.command() != Some("conv") {
         return;
     }
 
-    let subcommand = parts.get(1).copied().unwrap_or("help");
-    let args: Vec<&str> = if parts.len() > 2 {
-        parts[2..].to_vec()
+    let cmd_args = command_buffer.args();
+    let subcommand = cmd_args.first().copied().unwrap_or("help");
+    let args: Vec<&str> = if cmd_args.len() > 1 {
+        cmd_args[1..].to_vec()
     } else {
         vec![]
     };
