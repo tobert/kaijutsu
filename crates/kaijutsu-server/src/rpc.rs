@@ -1423,38 +1423,68 @@ impl kernel::Server for KernelImpl {
         params: kernel::PromptParams,
         mut results: kernel::PromptResults,
     ) -> Promise<(), capnp::Error> {
+        log::debug!("prompt() called for kernel {}", self.kernel_id);
         let params = pry!(params.get());
         let request = pry!(params.get_request());
         let content = pry!(pry!(request.get_content()).to_str()).to_owned();
-        let model = request.get_model().ok().and_then(|m| m.to_str().ok()).map(|s| s.to_owned());
+        log::info!("Received prompt request: cell_id={}, content_len={}",
+            pry!(request.get_cell_id()).to_str().unwrap_or("?"), content.len());
+        // Note: Cap'n Proto defaults unset Text fields to "", so we filter empty strings
+        let model = request.get_model().ok()
+            .and_then(|m| m.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned());
         let cell_id = pry!(pry!(request.get_cell_id()).to_str()).to_owned();
 
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
         Promise::from_future(async move {
+            log::debug!("prompt future started for cell_id={}", cell_id);
+
             // Get LLM provider
             let (provider, block_subscribers, cells) = {
                 let state_ref = state.borrow();
                 let provider = match &state_ref.llm_provider {
                     Some(p) => p.clone(),
                     None => {
+                        log::error!("LLM provider not configured");
                         return Err(capnp::Error::failed("LLM provider not configured (missing ANTHROPIC_API_KEY)".into()));
                     }
                 };
                 let kernel = state_ref.kernels.get(&kernel_id)
-                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                    .ok_or_else(|| {
+                        log::error!("kernel {} not found", kernel_id);
+                        capnp::Error::failed("kernel not found".into())
+                    })?;
+                log::debug!("Got provider and kernel state");
                 (provider, kernel.block_subscribers.clone(), kernel.cells.clone())
             };
 
             // Generate prompt ID
             let prompt_id = uuid::Uuid::new_v4().to_string();
+            log::debug!("Generated prompt_id={}", prompt_id);
 
             // Insert user message block
             let user_block_id = {
+                // Auto-create cell if it doesn't exist (client conversation ID)
+                if cells.get(&cell_id).is_none() {
+                    log::info!("Auto-creating cell {} for prompt", cell_id);
+                    cells.create_cell(cell_id.clone(), kaijutsu_kernel::CellKind::AgentMessage, None)
+                        .map_err(|e| {
+                            log::error!("Failed to create cell: {}", e);
+                            capnp::Error::failed(format!("failed to create cell: {}", e))
+                        })?;
+                }
+
                 // Create user message block using the store's helper method
+                log::debug!("Inserting user block into cell {}", cell_id);
                 let block_id = cells.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content)
-                    .map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
+                    .map_err(|e| {
+                        log::error!("Failed to insert user block: {}", e);
+                        capnp::Error::failed(format!("failed to insert user block: {}", e))
+                    })?;
+                log::debug!("Inserted user block: {:?}", block_id);
 
                 // Broadcast user block to subscribers
                 for subscriber in &block_subscribers {
@@ -1499,7 +1529,10 @@ impl kernel::Server for KernelImpl {
             // Build conversation history from cell content
             // For now, just use the current prompt as a single message
             let messages = vec![LlmMessage::user(&content)];
-            let model_name = model.unwrap_or_else(|| provider.default_model().to_string());
+            let default_model = provider.default_model();
+            let model_name = model.as_deref().unwrap_or(default_model).to_string();
+            log::info!("Using model: {} (requested: {:?}, default: {})",
+                model_name, model, default_model);
 
             // Create streaming request
             let stream_request = StreamRequest::new(&model_name, messages)
@@ -1604,8 +1637,12 @@ impl kernel::Server for KernelImpl {
             };
 
             // Start streaming
+            log::info!("Calling Anthropic API...");
             let mut stream = match provider.stream(stream_request).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    log::info!("LLM stream started successfully");
+                    s
+                }
                 Err(e) => {
                     log::error!("Failed to start LLM stream: {}", e);
                     // Insert error block
@@ -1619,7 +1656,9 @@ impl kernel::Server for KernelImpl {
             // Track tool_use_id (string from LLM) → BlockId mapping
             let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
 
+            log::debug!("Entering stream event loop");
             while let Some(event) = stream.next_event().await {
+                log::debug!("Received stream event: {:?}", event);
                 match event {
                     StreamEvent::ThinkingStart => {
                         match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
