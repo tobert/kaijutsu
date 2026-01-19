@@ -1611,7 +1611,7 @@ pub fn apply_block_cell_positions(
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCellLayout, &mut TextAreaConfig), With<BlockCell>>,
     layout: Res<WorkspaceLayout>,
-    scroll_state: Res<ConversationScrollState>,
+    mut scroll_state: ResMut<ConversationScrollState>,
     windows: Query<&Window>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1631,9 +1631,14 @@ pub fn apply_block_cell_positions(
     // Visible area
     let visible_top = layout.workspace_margin_top;
     let visible_bottom = window_height - layout.prompt_area_height;
+    let visible_height = visible_bottom - visible_top;
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
     const INDENT_WIDTH: f32 = 32.0;
+
+    // Update scroll state with visible area and clamp offset
+    scroll_state.visible_height = visible_height;
+    scroll_state.clamp_offset();
 
     let scroll_offset = scroll_state.offset;
 
