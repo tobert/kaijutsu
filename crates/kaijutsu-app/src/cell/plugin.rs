@@ -75,13 +75,20 @@ impl Plugin for CellPlugin {
                     systems::highlight_focused_cell,
                 ),
             )
+            // Block event handling (server → client sync)
+            // Receives block events from the server and updates the MainCell's document
+            .add_systems(
+                Update,
+                systems::handle_block_events
+                    .after(systems::sync_main_cell_to_conversation),
+            )
             // Block cell systems (per-block UI rendering for conversation)
             // Each block gets its own entity with independent TextBuffer
             .add_systems(
                 Update,
                 (
                     systems::spawn_block_cells
-                        .after(systems::sync_main_cell_to_conversation),
+                        .after(systems::handle_block_events),
                     systems::init_block_cell_buffers
                         .after(systems::spawn_block_cells),
                     systems::sync_block_cell_buffers

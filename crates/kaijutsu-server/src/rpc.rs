@@ -1252,16 +1252,110 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
         let cell_id = pry!(pry!(params.get_cell_id()).to_str()).to_owned();
-        let _op = pry!(params.get_op());
+        let op = pry!(params.get_op());
 
-        // TODO: Implement full block operation handling
-        // For now, return a stub version number
-        log::warn!(
-            "apply_block_op called for cell {} - stub implementation",
-            cell_id
-        );
+        log::debug!("apply_block_op called for cell {}", cell_id);
 
-        results.get().set_new_version(1);
+        let mut state = self.state.borrow_mut();
+        let kernel = match state.kernels.get_mut(&self.kernel_id) {
+            Some(k) => k,
+            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+        };
+
+        // Handle each operation variant
+        use crate::kaijutsu_capnp::block_doc_op::Which;
+        match pry!(op.which()) {
+            Which::InsertBlock(group) => {
+                let block_reader = pry!(group.get_block());
+                let block = pry!(parse_block_snapshot(&block_reader));
+                let after_id = if group.get_has_after_id() {
+                    let after_reader = pry!(group.get_after_id());
+                    Some(kaijutsu_crdt::BlockId {
+                        cell_id: pry!(pry!(after_reader.get_cell_id()).to_str()).to_owned(),
+                        agent_id: pry!(pry!(after_reader.get_agent_id()).to_str()).to_owned(),
+                        seq: after_reader.get_seq(),
+                    })
+                } else {
+                    None
+                };
+
+                // Insert block using the snapshot data
+                if let Err(e) = kernel.cells.insert_block(
+                    &cell_id,
+                    block.parent_id.as_ref(),
+                    after_id.as_ref(),
+                    block.role,
+                    block.kind,
+                    &block.content,
+                ) {
+                    return Promise::err(capnp::Error::failed(e));
+                }
+            }
+            Which::DeleteBlock(id_result) => {
+                let id_reader = pry!(id_result);
+                let block_id = kaijutsu_crdt::BlockId {
+                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
+                    seq: id_reader.get_seq(),
+                };
+                if let Err(e) = kernel.cells.delete_block(&cell_id, &block_id) {
+                    return Promise::err(capnp::Error::failed(e));
+                }
+            }
+            Which::EditBlockText(group) => {
+                let id_reader = pry!(group.get_id());
+                let block_id = kaijutsu_crdt::BlockId {
+                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
+                    seq: id_reader.get_seq(),
+                };
+                let pos = group.get_pos() as usize;
+                let insert = pry!(pry!(group.get_insert()).to_str());
+                let delete = group.get_delete() as usize;
+                if let Err(e) = kernel.cells.edit_text(&cell_id, &block_id, pos, insert, delete) {
+                    return Promise::err(capnp::Error::failed(e));
+                }
+            }
+            Which::SetCollapsed(group) => {
+                let id_reader = pry!(group.get_id());
+                let block_id = kaijutsu_crdt::BlockId {
+                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
+                    seq: id_reader.get_seq(),
+                };
+                let collapsed = group.get_collapsed();
+                if let Err(e) = kernel.cells.set_collapsed(&cell_id, &block_id, collapsed) {
+                    return Promise::err(capnp::Error::failed(e));
+                }
+            }
+            Which::SetStatus(group) => {
+                let id_reader = pry!(group.get_id());
+                let block_id = kaijutsu_crdt::BlockId {
+                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
+                    seq: id_reader.get_seq(),
+                };
+                let status = match pry!(group.get_status()) {
+                    crate::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
+                    crate::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
+                    crate::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
+                    crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
+                };
+                if let Err(e) = kernel.cells.set_status(&cell_id, &block_id, status) {
+                    return Promise::err(capnp::Error::failed(e));
+                }
+            }
+            Which::MoveBlock(_group) => {
+                // Move operation not yet implemented in BlockStore
+                log::warn!("MoveBlock operation not yet implemented");
+            }
+        };
+
+        // Return the new version
+        let new_version = kernel.cells.get(&cell_id)
+            .map(|entry| entry.version())
+            .unwrap_or(0);
+        results.get().set_new_version(new_version);
         Promise::ok(())
     }
 
@@ -1291,12 +1385,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
 
-        // TODO: Implement full block cell state retrieval
-        // For now, return an empty state
-        log::warn!(
-            "get_block_cell_state called for cell {} - stub implementation",
-            cell_id
-        );
+        log::debug!("get_block_cell_state called for cell {}", cell_id);
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
@@ -1311,8 +1400,14 @@ impl kernel::Server for KernelImpl {
                     }
                 }
                 cell_state.reborrow().set_version(doc.version());
-                // Initialize empty blocks list for now (consumes cell_state)
-                cell_state.init_blocks(0);
+
+                // Get actual blocks from BlockDocument
+                let blocks = doc.doc.blocks_ordered();
+                let mut block_list = cell_state.init_blocks(blocks.len() as u32);
+                for (i, block) in blocks.iter().enumerate() {
+                    let mut block_builder = block_list.reborrow().get(i as u32);
+                    set_block_snapshot(&mut block_builder, block);
+                }
             }
         }
 
@@ -1645,6 +1740,163 @@ fn cell_kind_from_capnp(kind: crate::kaijutsu_capnp::CellKind) -> kaijutsu_kerne
         crate::kaijutsu_capnp::CellKind::UserMessage => kaijutsu_kernel::CellKind::UserMessage,
         crate::kaijutsu_capnp::CellKind::AgentMessage => kaijutsu_kernel::CellKind::AgentMessage,
     }
+}
+
+/// Set BlockSnapshot fields on a Cap'n Proto builder.
+fn set_block_snapshot(
+    builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
+    block: &kaijutsu_crdt::BlockSnapshot,
+) {
+    // Set ID
+    {
+        let mut id = builder.reborrow().init_id();
+        id.set_cell_id(&block.id.cell_id);
+        id.set_agent_id(&block.id.agent_id);
+        id.set_seq(block.id.seq);
+    }
+
+    // Set parent_id if present
+    if let Some(ref parent) = block.parent_id {
+        builder.set_has_parent_id(true);
+        let mut pid = builder.reborrow().init_parent_id();
+        pid.set_cell_id(&parent.cell_id);
+        pid.set_agent_id(&parent.agent_id);
+        pid.set_seq(parent.seq);
+    } else {
+        builder.set_has_parent_id(false);
+    }
+
+    // Set role
+    builder.set_role(match block.role {
+        kaijutsu_crdt::Role::User => crate::kaijutsu_capnp::Role::User,
+        kaijutsu_crdt::Role::Model => crate::kaijutsu_capnp::Role::Model,
+        kaijutsu_crdt::Role::System => crate::kaijutsu_capnp::Role::System,
+        kaijutsu_crdt::Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+    });
+
+    // Set status
+    builder.set_status(match block.status {
+        kaijutsu_crdt::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+        kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
+        kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
+        kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
+    });
+
+    // Set kind
+    builder.set_kind(match block.kind {
+        kaijutsu_crdt::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+        kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+        kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+        kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+    });
+
+    // Set basic fields
+    builder.set_content(&block.content);
+    builder.set_collapsed(block.collapsed);
+    builder.set_author(&block.author);
+    builder.set_created_at(block.created_at);
+
+    // Set tool-specific fields
+    if let Some(ref name) = block.tool_name {
+        builder.set_tool_name(name);
+    }
+    if let Some(ref input) = block.tool_input {
+        builder.set_tool_input(&input.to_string());
+    }
+    if let Some(ref tc_id) = block.tool_call_id {
+        builder.set_has_tool_call_id(true);
+        let mut tcid = builder.reborrow().init_tool_call_id();
+        tcid.set_cell_id(&tc_id.cell_id);
+        tcid.set_agent_id(&tc_id.agent_id);
+        tcid.set_seq(tc_id.seq);
+    } else {
+        builder.set_has_tool_call_id(false);
+    }
+    if let Some(code) = block.exit_code {
+        builder.set_has_exit_code(true);
+        builder.set_exit_code(code);
+    } else {
+        builder.set_has_exit_code(false);
+    }
+    builder.set_is_error(block.is_error);
+}
+
+/// Parse a BlockSnapshot from a Cap'n Proto reader.
+fn parse_block_snapshot(
+    reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockSnapshot, capnp::Error> {
+    let id_reader = reader.get_id()?;
+    let id = kaijutsu_crdt::BlockId {
+        cell_id: id_reader.get_cell_id()?.to_str()?.to_owned(),
+        agent_id: id_reader.get_agent_id()?.to_str()?.to_owned(),
+        seq: id_reader.get_seq(),
+    };
+
+    let parent_id = if reader.get_has_parent_id() {
+        let pid_reader = reader.get_parent_id()?;
+        Some(kaijutsu_crdt::BlockId {
+            cell_id: pid_reader.get_cell_id()?.to_str()?.to_owned(),
+            agent_id: pid_reader.get_agent_id()?.to_str()?.to_owned(),
+            seq: pid_reader.get_seq(),
+        })
+    } else {
+        None
+    };
+
+    let role = match reader.get_role()? {
+        crate::kaijutsu_capnp::Role::User => kaijutsu_crdt::Role::User,
+        crate::kaijutsu_capnp::Role::Model => kaijutsu_crdt::Role::Model,
+        crate::kaijutsu_capnp::Role::System => kaijutsu_crdt::Role::System,
+        crate::kaijutsu_capnp::Role::Tool => kaijutsu_crdt::Role::Tool,
+    };
+
+    let status = match reader.get_status()? {
+        crate::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
+        crate::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
+        crate::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
+        crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
+    };
+
+    let kind = match reader.get_kind()? {
+        crate::kaijutsu_capnp::BlockKind::Text => kaijutsu_crdt::BlockKind::Text,
+        crate::kaijutsu_capnp::BlockKind::Thinking => kaijutsu_crdt::BlockKind::Thinking,
+        crate::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
+        crate::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
+    };
+
+    let tool_call_id = if reader.get_has_tool_call_id() {
+        let tc_reader = reader.get_tool_call_id()?;
+        Some(kaijutsu_crdt::BlockId {
+            cell_id: tc_reader.get_cell_id()?.to_str()?.to_owned(),
+            agent_id: tc_reader.get_agent_id()?.to_str()?.to_owned(),
+            seq: tc_reader.get_seq(),
+        })
+    } else {
+        None
+    };
+
+    let tool_input = reader.get_tool_input()
+        .ok()
+        .and_then(|s| s.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    Ok(kaijutsu_crdt::BlockSnapshot {
+        id,
+        parent_id,
+        role,
+        status,
+        kind,
+        content: reader.get_content()?.to_str()?.to_owned(),
+        collapsed: reader.get_collapsed(),
+        author: reader.get_author()?.to_str()?.to_owned(),
+        created_at: reader.get_created_at(),
+        tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
+        tool_input,
+        tool_call_id,
+        exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
+        is_error: reader.get_is_error(),
+    })
 }
 
 // ============================================================================

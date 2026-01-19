@@ -630,52 +630,9 @@ pub struct BlockCellLayout {
 }
 
 // ============================================================================
-// TURN UI COMPONENTS
+// TURN UI COMPONENTS (Removed)
 // ============================================================================
-
-/// Marker for a turn header entity in the conversation view.
-///
-/// Turn headers show author information and timestamp for a group of
-/// consecutive blocks from the same participant.
-#[derive(Component, Debug)]
-pub struct TurnCell {
-    /// Display name for the author.
-    pub display_name: String,
-    /// Timestamp of the first block in this turn (Unix millis).
-    pub timestamp: u64,
-    /// Index of this turn in the conversation (0-based).
-    pub turn_index: usize,
-}
-
-impl TurnCell {
-    pub fn new(display_name: impl Into<String>, timestamp: u64, turn_index: usize) -> Self {
-        Self {
-            display_name: display_name.into(),
-            timestamp,
-            turn_index,
-        }
-    }
-
-    /// Format timestamp for display (simple HH:MM format).
-    pub fn formatted_time(&self) -> String {
-        // Convert Unix millis to seconds since epoch
-        let secs = self.timestamp / 1000;
-        // Simple UTC time (no timezone conversion to avoid chrono dependency)
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        format!("{:02}:{:02}", hours, mins)
-    }
-}
-
-/// Container tracking TurnCell entities for a conversation view.
-#[derive(Component, Debug, Default)]
-pub struct TurnCellContainer {
-    /// Ordered list of TurnCell entities.
-    pub turn_cells: Vec<Entity>,
-}
-
-impl TurnCellContainer {
-    pub fn add(&mut self, entity: Entity) {
-        self.turn_cells.push(entity);
-    }
-}
+//
+// Turn headers are now rendered inline based on role transitions.
+// The layout_block_cells system handles role transition detection and
+// reserves space for inline role headers. See systems.rs for details.

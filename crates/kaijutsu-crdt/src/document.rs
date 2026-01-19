@@ -495,6 +495,47 @@ impl BlockDocument {
         Ok(id)
     }
 
+    /// Insert a block from a complete snapshot (for remote sync).
+    ///
+    /// This is used when receiving blocks from the server via block events.
+    /// The snapshot contains all fields including the pre-assigned block ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot` - Complete block snapshot from remote source
+    /// * `after` - Block ID to insert after in document order (None for end)
+    ///
+    /// # Returns
+    ///
+    /// The block's ID on success.
+    pub fn insert_from_snapshot(
+        &mut self,
+        snapshot: BlockSnapshot,
+        after: Option<&BlockId>,
+    ) -> Result<BlockId> {
+        // Update next_seq if needed to avoid collisions
+        if snapshot.id.agent_id == self.agent_id_str {
+            self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
+        }
+
+        self.insert_block_with_id(
+            snapshot.id.clone(),
+            snapshot.parent_id.as_ref(),
+            after,
+            snapshot.role,
+            snapshot.kind,
+            snapshot.content,
+            snapshot.author,
+            snapshot.tool_name,
+            snapshot.tool_input,
+            snapshot.tool_call_id,
+            snapshot.exit_code,
+            snapshot.is_error,
+        )?;
+
+        Ok(snapshot.id)
+    }
+
     /// Internal block insertion with all fields.
     #[allow(clippy::too_many_arguments)]
     fn insert_block_with_id(

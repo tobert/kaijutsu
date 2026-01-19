@@ -33,3 +33,7 @@ log.workspace = true
 whoami.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
 dirs = "5.0"
+
+# Cap'n Proto (for block events callback)
+capnp.workspace = true
+capnp-rpc.workspace = true
