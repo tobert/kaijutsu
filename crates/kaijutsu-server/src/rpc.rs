@@ -24,6 +24,8 @@ use kaijutsu_kernel::{
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
     AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
 };
+use kaijutsu_crdt::{BlockKind, Role};
+use serde_json;
 
 // ============================================================================
 // Server State
@@ -1356,7 +1358,7 @@ impl kernel::Server for KernelImpl {
             // Insert user message block
             let user_block_id = {
                 // Create user message block using the store's helper method
-                let block_id = cells.insert_text_block(&cell_id, None, &content)
+                let block_id = cells.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content)
                     .map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
 
                 // Broadcast user block to subscribers
@@ -1380,8 +1382,16 @@ impl kernel::Server for KernelImpl {
                                 .unwrap_or_default()
                                 .as_millis() as u64
                         );
-                        let mut block_content = block_state.init_content();
-                        block_content.set_text(&content);
+                        // Flat BlockSnapshot fields
+                        block_state.set_role(crate::kaijutsu_capnp::Role::User);
+                        block_state.set_status(crate::kaijutsu_capnp::Status::Done);
+                        block_state.set_kind(crate::kaijutsu_capnp::BlockKind::Text);
+                        block_state.set_content(&content);
+                        block_state.set_collapsed(false);
+                        block_state.set_has_parent_id(false);
+                        block_state.set_has_tool_call_id(false);
+                        block_state.set_has_exit_code(false);
+                        block_state.set_is_error(false);
                     }
                     let _ = req.send(); // Fire and forget
                 }
@@ -1401,11 +1411,27 @@ impl kernel::Server for KernelImpl {
                 .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.")
                 .with_max_tokens(4096);
 
-            // Helper to broadcast block insertions
+            // Helper to convert Rust BlockKind to Cap'n Proto BlockKind
+            let to_capnp_kind = |kind: BlockKind| -> crate::kaijutsu_capnp::BlockKind {
+                match kind {
+                    BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                    BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                    BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                    BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                }
+            };
+
+            // Helper to broadcast block insertions using the flat BlockSnapshot
             let broadcast_block_inserted = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
                                            cell_id: &str,
                                            block_id: &kaijutsu_crdt::BlockId,
-                                           content: &kaijutsu_crdt::BlockContentSnapshot| {
+                                           kind: BlockKind,
+                                           content: &str,
+                                           collapsed: bool,
+                                           tool_name: Option<&str>,
+                                           tool_input: Option<&serde_json::Value>,
+                                           tool_call_id: Option<&kaijutsu_crdt::BlockId>,
+                                           is_error: bool| {
                 for subscriber in subscribers {
                     let mut req = subscriber.on_block_inserted_request();
                     {
@@ -1426,29 +1452,32 @@ impl kernel::Server for KernelImpl {
                                 .unwrap_or_default()
                                 .as_millis() as u64
                         );
-                        let mut block_content = block_state.init_content();
-                        match content {
-                            kaijutsu_crdt::BlockContentSnapshot::Text { text } => {
-                                block_content.set_text(text);
-                            }
-                            kaijutsu_crdt::BlockContentSnapshot::Thinking { text, collapsed } => {
-                                let mut t = block_content.init_thinking();
-                                t.set_text(text);
-                                t.set_collapsed(*collapsed);
-                            }
-                            kaijutsu_crdt::BlockContentSnapshot::ToolUse { id, name, input } => {
-                                let mut t = block_content.init_tool_use();
-                                t.set_id(id);
-                                t.set_name(name);
-                                t.set_input(&input.to_string());
-                            }
-                            kaijutsu_crdt::BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
-                                let mut t = block_content.init_tool_result();
-                                t.set_tool_use_id(tool_use_id);
-                                t.set_content(content);
-                                t.set_is_error(*is_error);
-                            }
+                        // Flat BlockSnapshot fields
+                        block_state.set_role(crate::kaijutsu_capnp::Role::Model);
+                        block_state.set_status(crate::kaijutsu_capnp::Status::Done);
+                        block_state.set_kind(to_capnp_kind(kind));
+                        block_state.set_content(content);
+                        block_state.set_collapsed(collapsed);
+                        block_state.set_has_parent_id(false);
+
+                        // Tool-specific fields
+                        if let Some(name) = tool_name {
+                            block_state.set_tool_name(name);
                         }
+                        if let Some(input) = tool_input {
+                            block_state.set_tool_input(&input.to_string());
+                        }
+                        if let Some(tc_id) = tool_call_id {
+                            let mut tc = block_state.reborrow().init_tool_call_id();
+                            tc.set_cell_id(&tc_id.cell_id);
+                            tc.set_agent_id(&tc_id.agent_id);
+                            tc.set_seq(tc_id.seq);
+                            block_state.set_has_tool_call_id(true);
+                        } else {
+                            block_state.set_has_tool_call_id(false);
+                        }
+                        block_state.set_has_exit_code(false);
+                        block_state.set_is_error(is_error);
                     }
                     let _ = req.send();
                 }
@@ -1485,24 +1514,23 @@ impl kernel::Server for KernelImpl {
                 Err(e) => {
                     log::error!("Failed to start LLM stream: {}", e);
                     // Insert error block
-                    let _ = cells.insert_text_block(&cell_id, None, format!("❌ Error: {}", e));
+                    let _ = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
                     return Err(capnp::Error::failed(format!("LLM stream failed: {}", e)));
                 }
             };
 
             // Process stream events
             let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
+            // Track tool_use_id (string from LLM) → BlockId mapping
+            let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
 
             while let Some(event) = stream.next_event().await {
                 match event {
                     StreamEvent::ThinkingStart => {
-                        match cells.insert_thinking_block(&cell_id, None, "") {
+                        match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
                             Ok(block_id) => {
-                                let content = kaijutsu_crdt::BlockContentSnapshot::Thinking {
-                                    text: String::new(),
-                                    collapsed: false,
-                                };
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                    BlockKind::Thinking, "", false, None, None, None, false);
                                 current_block_id = Some(block_id);
                             }
                             Err(e) => log::error!("Failed to insert thinking block: {}", e),
@@ -1524,12 +1552,10 @@ impl kernel::Server for KernelImpl {
                     }
 
                     StreamEvent::TextStart => {
-                        match cells.insert_text_block(&cell_id, None, "") {
+                        match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
                             Ok(block_id) => {
-                                let content = kaijutsu_crdt::BlockContentSnapshot::Text {
-                                    text: String::new(),
-                                };
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                    BlockKind::Text, "", false, None, None, None, false);
                                 current_block_id = Some(block_id);
                             }
                             Err(e) => log::error!("Failed to insert text block: {}", e),
@@ -1551,30 +1577,29 @@ impl kernel::Server for KernelImpl {
                     }
 
                     StreamEvent::ToolUse { id, name, input } => {
-                        match cells.insert_tool_use(&cell_id, None, &id, &name, input.clone()) {
+                        match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
                             Ok(block_id) => {
-                                let content = kaijutsu_crdt::BlockContentSnapshot::ToolUse {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                };
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                // Track the tool_use_id → BlockId mapping for later ToolResult
+                                tool_call_blocks.insert(id.clone(), block_id.clone());
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                    BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
                             }
                             Err(e) => log::error!("Failed to insert tool use block: {}", e),
                         }
                     }
 
                     StreamEvent::ToolResult { tool_use_id, content, is_error } => {
-                        match cells.insert_tool_result(&cell_id, None, &tool_use_id, &content, is_error) {
-                            Ok(block_id) => {
-                                let content_snap = kaijutsu_crdt::BlockContentSnapshot::ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    content: content.clone(),
-                                    is_error,
-                                };
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content_snap);
+                        // Look up the tool call BlockId from our tracking map
+                        if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
+                            match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &content, is_error, None) {
+                                Ok(block_id) => {
+                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                        BlockKind::ToolResult, &content, false, None, None, Some(tool_call_block_id), is_error);
+                                }
+                                Err(e) => log::error!("Failed to insert tool result block: {}", e),
                             }
-                            Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                        } else {
+                            log::error!("Tool result for unknown tool_use_id: {}", tool_use_id);
                         }
                     }
 
@@ -1587,7 +1612,7 @@ impl kernel::Server for KernelImpl {
 
                     StreamEvent::Error(err) => {
                         log::error!("LLM stream error: {}", err);
-                        let _ = cells.insert_text_block(&cell_id, None, format!("❌ Error: {}", err));
+                        let _ = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
                     }
                 }
             }

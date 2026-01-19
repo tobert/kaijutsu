@@ -403,7 +403,7 @@ impl KernelHandle {
     pub async fn get_block_cell_state(
         &self,
         cell_id: &str,
-    ) -> Result<(Vec<(kaijutsu_crdt::BlockId, kaijutsu_crdt::BlockContentSnapshot)>, u64), RpcError>
+    ) -> Result<(Vec<kaijutsu_crdt::BlockSnapshot>, u64), RpcError>
     {
         let mut request = self.kernel.get_block_cell_state_request();
         request.get().set_cell_id(cell_id);
@@ -415,9 +415,8 @@ impl KernelHandle {
         let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
 
         for block in blocks_reader.iter() {
-            let id = parse_block_id(&block.get_id()?)?;
-            let content = parse_block_content(&block.get_content()?)?;
-            blocks.push((id, content));
+            let snapshot = parse_block_snapshot(&block)?;
+            blocks.push(snapshot);
         }
 
         Ok((blocks, version))
@@ -475,46 +474,102 @@ fn parse_block_id(
     })
 }
 
-/// Helper to parse block content from Cap'n Proto
-fn parse_block_content(
-    reader: &crate::kaijutsu_capnp::block_content::Reader<'_>,
-) -> Result<kaijutsu_crdt::BlockContentSnapshot, RpcError> {
-    use crate::kaijutsu_capnp::block_content::Which;
-    use kaijutsu_crdt::BlockContentSnapshot;
+/// Helper to parse a flat BlockSnapshot from Cap'n Proto
+fn parse_block_snapshot(
+    reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockSnapshot, RpcError> {
+    use kaijutsu_crdt::{BlockKind, BlockSnapshot, Role, Status};
 
-    match reader.which()? {
-        Which::Thinking(thinking) => {
-            Ok(BlockContentSnapshot::Thinking {
-                text: thinking.get_text()?.to_string()?,
-                collapsed: thinking.get_collapsed(),
-            })
+    // Parse block ID
+    let id = parse_block_id(&reader.get_id()?)?;
+
+    // Parse parent_id if present
+    let parent_id = if reader.get_has_parent_id() {
+        Some(parse_block_id(&reader.get_parent_id()?)?)
+    } else {
+        None
+    };
+
+    // Parse role
+    let role = match reader.get_role()? {
+        crate::kaijutsu_capnp::Role::User => Role::User,
+        crate::kaijutsu_capnp::Role::Model => Role::Model,
+        crate::kaijutsu_capnp::Role::System => Role::System,
+        crate::kaijutsu_capnp::Role::Tool => Role::Tool,
+    };
+
+    // Parse status
+    let status = match reader.get_status()? {
+        crate::kaijutsu_capnp::Status::Pending => Status::Pending,
+        crate::kaijutsu_capnp::Status::Running => Status::Running,
+        crate::kaijutsu_capnp::Status::Done => Status::Done,
+        crate::kaijutsu_capnp::Status::Error => Status::Error,
+    };
+
+    // Parse kind
+    let kind = match reader.get_kind()? {
+        crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+        crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+        crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+        crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+    };
+
+    // Parse content
+    let content = reader.get_content()?.to_string()?;
+    let collapsed = reader.get_collapsed();
+    let author = reader.get_author()?.to_string()?;
+    let created_at = reader.get_created_at();
+
+    // Parse tool-specific fields
+    let tool_name = if reader.has_tool_name() {
+        Some(reader.get_tool_name()?.to_string()?)
+    } else {
+        None
+    };
+
+    let tool_input = if reader.has_tool_input() {
+        let input_str = reader.get_tool_input()?.to_string()?;
+        match serde_json::from_str(&input_str) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("Failed to parse tool_input as JSON: {}", e);
+                None
+            }
         }
-        Which::Text(text) => Ok(BlockContentSnapshot::Text {
-            text: text?.to_string()?,
-        }),
-        Which::ToolUse(tool_use) => {
-            let input_str = tool_use.get_input()?.to_string()?;
-            let input: serde_json::Value = match serde_json::from_str(&input_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("Failed to parse block content as JSON: {}", e);
-                    serde_json::Value::Null
-                }
-            };
-            Ok(BlockContentSnapshot::ToolUse {
-                id: tool_use.get_id()?.to_string()?,
-                name: tool_use.get_name()?.to_string()?,
-                input,
-            })
-        }
-        Which::ToolResult(tool_result) => {
-            Ok(BlockContentSnapshot::ToolResult {
-                tool_use_id: tool_result.get_tool_use_id()?.to_string()?,
-                content: tool_result.get_content()?.to_string()?,
-                is_error: tool_result.get_is_error(),
-            })
-        }
-    }
+    } else {
+        None
+    };
+
+    let tool_call_id = if reader.get_has_tool_call_id() {
+        Some(parse_block_id(&reader.get_tool_call_id()?)?)
+    } else {
+        None
+    };
+
+    let exit_code = if reader.get_has_exit_code() {
+        Some(reader.get_exit_code())
+    } else {
+        None
+    };
+
+    let is_error = reader.get_is_error();
+
+    Ok(BlockSnapshot {
+        id,
+        parent_id,
+        role,
+        status,
+        kind,
+        content,
+        collapsed,
+        author,
+        created_at,
+        tool_name,
+        tool_input,
+        tool_call_id,
+        exit_code,
+        is_error,
+    })
 }
 
 #[derive(Debug, Clone)]

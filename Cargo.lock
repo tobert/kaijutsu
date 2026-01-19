@@ -4667,6 +4667,7 @@ dependencies = [
  "log",
  "rand 0.8.5",
  "russh",
+ "serde_json",
  "shellexpand",
  "thiserror 2.0.17",
  "tokio",
