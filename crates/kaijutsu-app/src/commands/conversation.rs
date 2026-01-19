@@ -107,7 +107,7 @@ pub fn handle_conversation_commands(
                 handle_rename(&mut registry, &current, &new_name, store.as_deref(), &mut command_output);
             }
         }
-        "help" | "?" | _ => {
+        _ => {
             command_output.success(
                 "Conversation commands:\n\
                  :conv list           - List all conversations\n\
