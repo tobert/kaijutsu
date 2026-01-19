@@ -26,7 +26,11 @@ impl Default for CellId {
 }
 
 /// The type/kind of cell content.
+///
+/// Note: Some variants correspond to server-side cell types that aren't
+/// yet rendered in the client UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)] // Variants map to server types
 pub enum CellKind {
     /// Executable code (language specified separately)
     #[default]
@@ -644,8 +648,6 @@ pub struct BlockCellLayout {
 /// consecutive blocks from the same participant.
 #[derive(Component, Debug)]
 pub struct TurnCell {
-    /// Author ID (e.g., "user:amy", "model:claude").
-    pub author: String,
     /// Display name for the author.
     pub display_name: String,
     /// Timestamp of the first block in this turn (Unix millis).
@@ -655,9 +657,8 @@ pub struct TurnCell {
 }
 
 impl TurnCell {
-    pub fn new(author: impl Into<String>, display_name: impl Into<String>, timestamp: u64, turn_index: usize) -> Self {
+    pub fn new(display_name: impl Into<String>, timestamp: u64, turn_index: usize) -> Self {
         Self {
-            author: author.into(),
             display_name: display_name.into(),
             timestamp,
             turn_index,

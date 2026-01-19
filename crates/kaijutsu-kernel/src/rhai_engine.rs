@@ -3,7 +3,7 @@
 //! This module provides a production-ready Rhai execution engine that:
 //! - Wraps synchronous Rhai execution in `spawn_blocking` for async safety
 //! - Implements the `ExecutionEngine` trait for tool integration
-//! - Provides CRDT-aware block operations (insert_block, edit_text, set_metadata)
+//! - Provides CRDT-aware block operations (insert_block, edit_text, delete_block)
 //! - Supports execution interruption
 //!
 //! Note: Script caching is not implemented because Rhai's AST type is not

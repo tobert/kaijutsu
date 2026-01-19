@@ -279,6 +279,7 @@ pub struct HoloBorderMaterial {
 
 /// Holo border color modes
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Builder pattern for shader configuration
 pub enum HoloMode {
     Rainbow = 0,
     Cyber = 1,

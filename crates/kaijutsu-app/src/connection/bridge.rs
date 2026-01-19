@@ -45,7 +45,11 @@ pub enum ConnectionCommand {
 }
 
 /// Events sent from the connection thread to Bevy
+///
+/// Note: Some variants/fields are sent by the server but not yet handled in the UI.
+/// These are kept for completeness and future UI implementation.
 #[derive(Debug, Clone, Message)]
+#[allow(dead_code)] // TODO: Handle all variants in UI
 pub enum ConnectionEvent {
     /// Successfully connected to server
     Connected,
@@ -54,21 +58,27 @@ pub enum ConnectionEvent {
     /// Connection attempt failed
     ConnectionFailed(String),
     /// Attempting to reconnect (with attempt number)
-    Reconnecting { attempt: u32, delay_secs: u32 },
+    Reconnecting {
+        attempt: u32,
+        delay_secs: u32, // TODO: Display in UI
+    },
     /// Identity received
     Identity(Identity),
     /// Kernel list received
-    KernelList(Vec<KernelInfo>),
+    KernelList(Vec<KernelInfo>), // TODO: Display in kernel picker UI
     /// Attached to a kernel
     AttachedKernel(KernelInfo),
     /// Detached from a kernel
     DetachedKernel,
     /// Error occurred
-    Error(String),
+    Error(String), // TODO: Display in notification/toast UI
 
     // LLM events (server-side)
     /// Prompt was sent to server-side LLM
-    PromptSent { prompt_id: String, cell_id: String },
+    PromptSent {
+        prompt_id: String,
+        cell_id: String,
+    }, // TODO: Track prompt state in UI
 }
 
 /// Resource holding the command sender

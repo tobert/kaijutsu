@@ -1597,7 +1597,6 @@ pub fn spawn_turn_headers(
             let entity = commands
                 .spawn((
                     TurnCell::new(
-                        turn.author.clone(),
                         turn.display_name.clone(),
                         turn.timestamp,
                         idx,
