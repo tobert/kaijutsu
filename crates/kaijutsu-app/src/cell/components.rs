@@ -6,8 +6,8 @@
 use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
-// NOTE: Block, BlockContent, BlockDocOp, BlockType were removed in the unified CRDT refactor
-pub use kaijutsu_crdt::{BlockContentSnapshot, BlockDocument, BlockId, BlockSnapshot};
+// NOTE: BlockContentSnapshot was replaced with flat BlockSnapshot in the DAG migration
+pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, Role};
 
 /// Unique identifier for a cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -142,7 +142,7 @@ impl CellEditor {
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         if !text.is_empty()
-            && let Ok(block_id) = self.doc.insert_text_block(None, &text) {
+            && let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, &text, "user") {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
         self
@@ -196,7 +196,7 @@ impl CellEditor {
         // Ensure we have a block to insert into
         if self.cursor.block_id.is_none() {
             // Create a new text block
-            if let Ok(block_id) = self.doc.insert_text_block(None, "") {
+            if let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, "", "user") {
                 self.cursor.block_id = Some(block_id);
                 self.cursor.offset = 0;
             } else {
@@ -224,7 +224,7 @@ impl CellEditor {
         if let Some(ref block_id) = self.cursor.block_id {
             // Find previous character boundary
             if let Some(block) = self.doc.get_block_snapshot(block_id) {
-                let text = block.content.text();
+                let text = block.content.clone();
                 let mut new_offset = self.cursor.offset.saturating_sub(1);
                 while new_offset > 0 && !text.is_char_boundary(new_offset) {
                     new_offset -= 1;
@@ -247,7 +247,7 @@ impl CellEditor {
     pub fn delete(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
-                let text = block.content.text();
+                let text = block.content.clone();
                 if self.cursor.offset >= text.len() {
                     return; // At end, nothing to delete
                 }
@@ -278,7 +278,7 @@ impl CellEditor {
         if self.cursor.offset > 0
             && let Some(ref block_id) = self.cursor.block_id
                 && let Some(block) = self.doc.get_block_snapshot(block_id) {
-                    let text = block.content.text();
+                    let text = block.content.clone();
                     let mut new_offset = self.cursor.offset - 1;
                     while new_offset > 0 && !text.is_char_boundary(new_offset) {
                         new_offset -= 1;
@@ -291,7 +291,7 @@ impl CellEditor {
     pub fn move_right(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
-                let text = block.content.text();
+                let text = block.content.clone();
                 if self.cursor.offset < text.len() {
                     let mut new_offset = self.cursor.offset + 1;
                     while new_offset < text.len() && !text.is_char_boundary(new_offset) {
@@ -306,7 +306,7 @@ impl CellEditor {
     pub fn move_home(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
-                let text = block.content.text();
+                let text = block.content.clone();
                 // Find previous newline or start
                 let before_cursor = &text[..self.cursor.offset];
                 self.cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -317,7 +317,7 @@ impl CellEditor {
     pub fn move_end(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
-                let text = block.content.text();
+                let text = block.content.clone();
                 let after_cursor = &text[self.cursor.offset..];
                 self.cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
             }
@@ -330,7 +330,7 @@ impl CellEditor {
     /// Toggle collapse state of a thinking block.
     pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
         if let Some(block) = self.doc.get_block_snapshot(block_id) {
-            let new_state = !block.content.is_collapsed();
+            let new_state = !block.collapsed;
             let _ = self.doc.set_collapsed(block_id, new_state);
             self.dirty = true;
         }

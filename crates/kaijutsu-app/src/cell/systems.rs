@@ -5,7 +5,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    BlockContentSnapshot, BlockSnapshot, Cell, CellEditor, CellKind, CellPosition, CellState,
+    BlockKind, BlockSnapshot, Cell, CellEditor, CellKind, CellPosition, CellState,
     ConversationScrollState, CurrentMode, EditorMode, FocusedCell, MainCell, PromptCell,
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
@@ -244,41 +244,43 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
             output.push_str("\n\n");
         }
 
-        match &block.content {
-            BlockContentSnapshot::Thinking { collapsed, .. } => {
-                if *collapsed {
+        match block.kind {
+            BlockKind::Thinking => {
+                if block.collapsed {
                     // Collapsed: show indicator
                     output.push_str("💭 [Thinking collapsed - Tab to expand]");
                 } else {
                     // Expanded: show with dimmed header
                     output.push_str("💭 ─── Thinking ───\n");
-                    output.push_str(block.content.text());
+                    output.push_str(&block.content);
                     output.push_str("\n───────────────────");
                 }
             }
-            BlockContentSnapshot::Text { .. } => {
-                output.push_str(block.content.text());
+            BlockKind::Text => {
+                output.push_str(&block.content);
             }
-            BlockContentSnapshot::ToolUse { name, input, .. } => {
+            BlockKind::ToolCall => {
                 output.push_str("🔧 Tool: ");
-                output.push_str(name);
+                if let Some(ref name) = block.tool_name {
+                    output.push_str(name);
+                }
                 output.push('\n');
                 // Pretty-print JSON input
-                if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                    output.push_str(&pretty);
-                } else {
-                    output.push_str(&input.to_string());
+                if let Some(ref input) = block.tool_input {
+                    if let Ok(pretty) = serde_json::to_string_pretty(input) {
+                        output.push_str(&pretty);
+                    } else {
+                        output.push_str(&input.to_string());
+                    }
                 }
             }
-            BlockContentSnapshot::ToolResult {
-                content, is_error, ..
-            } => {
-                if *is_error {
+            BlockKind::ToolResult => {
+                if block.is_error {
                     output.push_str("❌ Error:\n");
                 } else {
                     output.push_str("📤 Result:\n");
                 }
-                output.push_str(content);
+                output.push_str(&block.content);
             }
         }
     }
@@ -520,7 +522,7 @@ pub fn handle_collapse_toggle(
             let thinking_blocks: Vec<_> = editor
                 .blocks()
                 .iter()
-                .filter(|b| matches!(b.content, BlockContentSnapshot::Thinking { .. }))
+                .filter(|b| matches!(b.kind, BlockKind::Thinking))
                 .map(|b| b.id.clone())
                 .collect();
 
@@ -533,8 +535,8 @@ pub fn handle_collapse_toggle(
                 let collapsed = editor
                     .blocks()
                     .iter()
-                    .find(|b| matches!(b.content, BlockContentSnapshot::Thinking { .. }))
-                    .map(|b| b.content.is_collapsed())
+                    .find(|b| matches!(b.kind, BlockKind::Thinking))
+                    .map(|b| b.collapsed)
                     .unwrap_or(false);
                 info!(
                     "Thinking blocks: {}",
@@ -696,7 +698,7 @@ fn cursor_position(editor: &CellEditor) -> (usize, usize) {
     let mut row = 0;
 
     for (i, block) in blocks.iter().enumerate() {
-        let text = block.content.text();
+        let text = &block.content;
 
         if &block.id == cursor_block_id {
             // Found the cursor's block - count rows within it and compute col
@@ -1146,7 +1148,7 @@ pub fn sync_main_cell_to_conversation(
 
     // Update cursor to end of document
     if let Some(last_block) = editor.blocks().last() {
-        let len = last_block.content.text().len();
+        let len = last_block.content.len();
         editor.cursor = super::components::BlockCursor::at(last_block.id.clone(), len);
     }
 
@@ -1177,40 +1179,41 @@ pub fn sync_main_cell_to_conversation(
 // BLOCK CELL SYSTEMS (Per-Block UI Rendering)
 // ============================================================================
 
-use super::components::{BlockCell, BlockCellContainer, BlockCellLayout, TurnCell, TurnCellContainer};
+use super::components::{BlockCell, BlockCellContainer, BlockCellLayout};
 
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
 pub fn format_single_block(block: &BlockSnapshot) -> String {
-    match &block.content {
-        BlockContentSnapshot::Thinking { collapsed, .. } => {
-            if *collapsed {
+    match block.kind {
+        BlockKind::Thinking => {
+            if block.collapsed {
                 "💭 [Thinking collapsed - Tab to expand]".to_string()
             } else {
                 format!(
                     "💭 ─── Thinking ───\n{}\n───────────────────",
-                    block.content.text()
+                    block.content
                 )
             }
         }
-        BlockContentSnapshot::Text { .. } => block.content.text().to_string(),
-        BlockContentSnapshot::ToolUse { name, input, .. } => {
+        BlockKind::Text => block.content.clone(),
+        BlockKind::ToolCall => {
+            let name = block.tool_name.as_deref().unwrap_or("unknown");
             let mut output = format!("🔧 Tool: {}\n", name);
-            if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                output.push_str(&pretty);
-            } else {
-                output.push_str(&input.to_string());
+            if let Some(ref input) = block.tool_input {
+                if let Ok(pretty) = serde_json::to_string_pretty(input) {
+                    output.push_str(&pretty);
+                } else {
+                    output.push_str(&input.to_string());
+                }
             }
             output
         }
-        BlockContentSnapshot::ToolResult {
-            content, is_error, ..
-        } => {
-            if *is_error {
-                format!("❌ Error:\n{}", content)
+        BlockKind::ToolResult => {
+            if block.is_error {
+                format!("❌ Error:\n{}", block.content)
             } else {
-                format!("📤 Result:\n{}", content)
+                format!("📤 Result:\n{}", block.content)
             }
         }
     }
@@ -1379,7 +1382,7 @@ pub fn layout_block_cells(
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &TextBuffer)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    mut registry: ResMut<ConversationRegistry>,
+    registry: Res<ConversationRegistry>,
     current: Res<CurrentConversation>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1395,58 +1398,53 @@ pub fn layout_block_cells(
     };
 
     const BLOCK_SPACING: f32 = 16.0;
-    const TURN_HEADER_HEIGHT: f32 = 28.0;
-    const TURN_HEADER_SPACING: f32 = 8.0;
+    const ROLE_HEADER_HEIGHT: f32 = 28.0;
+    const ROLE_HEADER_SPACING: f32 = 8.0;
     let mut y_offset = 0.0;
 
-    // Get blocks for tool_use_id lookup (for nesting)
+    // Get blocks for lookup
     let blocks: std::collections::HashMap<_, _> = editor
         .blocks()
         .into_iter()
         .map(|b| (b.id.clone(), b))
         .collect();
 
-    // Build a map of tool_use_id -> ToolUse block_id for nesting
-    let mut tool_use_ids: std::collections::HashMap<String, kaijutsu_crdt::BlockId> =
+    // Get blocks in order for role transition detection
+    let blocks_ordered = editor.blocks();
+
+    // Track role transitions for inline headers
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut block_is_role_transition: std::collections::HashMap<kaijutsu_crdt::BlockId, bool> =
         std::collections::HashMap::new();
-    for block in blocks.values() {
-        if let BlockContentSnapshot::ToolUse { id, .. } = &block.content {
-            tool_use_ids.insert(id.clone(), block.id.clone());
-        }
+    for block in &blocks_ordered {
+        let is_transition = prev_role.as_ref() != Some(&block.role);
+        block_is_role_transition.insert(block.id.clone(), is_transition);
+        prev_role = Some(block.role.clone());
     }
 
-    // Build turn info: map block_id to (turn_index, is_first_in_turn)
-    let mut block_turn_info: std::collections::HashMap<kaijutsu_crdt::BlockId, (usize, bool)> =
-        std::collections::HashMap::new();
-    if let Some(conv_id) = current.id()
-        && let Some(conv) = registry.get_mut(conv_id) {
-            for (turn_idx, turn) in conv.turns().iter().enumerate() {
-                for (block_idx, block_id) in turn.block_ids.iter().enumerate() {
-                    block_turn_info.insert(block_id.clone(), (turn_idx, block_idx == 0));
-                }
-            }
-        }
+    // Determine indentation: ToolResult blocks with a tool_call_id are nested
+    let _ = (&current, &registry); // suppress unused warnings
 
     for entity in &container.block_cells {
         let Ok((block_cell, mut block_layout, buffer)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
-        // Check if this is the first block of a turn - if so, add space for turn header
-        if let Some(&(_, is_first)) = block_turn_info.get(&block_cell.block_id)
-            && is_first {
-                y_offset += TURN_HEADER_HEIGHT + TURN_HEADER_SPACING;
+        // Check if this is a role transition - if so, add space for role header
+        if let Some(&is_transition) = block_is_role_transition.get(&block_cell.block_id) {
+            if is_transition {
+                y_offset += ROLE_HEADER_HEIGHT + ROLE_HEADER_SPACING;
             }
+        }
 
-        // Determine indentation level
+        // Determine indentation level based on parent_id (DAG nesting)
         let indent_level = if let Some(block) = blocks.get(&block_cell.block_id) {
-            if let BlockContentSnapshot::ToolResult { tool_use_id, .. } = &block.content {
-                // ToolResult nested under ToolUse
-                if tool_use_ids.contains_key(tool_use_id) {
-                    1
-                } else {
-                    0
-                }
+            // ToolResult blocks with a tool_call_id are nested under the tool call
+            if block.kind == BlockKind::ToolResult && block.tool_call_id.is_some() {
+                1
+            } else if block.parent_id.is_some() {
+                // Any block with a parent_id gets indented
+                1
             } else {
                 0
             }
@@ -1527,237 +1525,24 @@ pub fn apply_block_cell_positions(
 }
 
 // ============================================================================
-// TURN HEADER SYSTEMS
+// TURN/ROLE HEADER SYSTEMS (Legacy - removed in DAG migration)
 // ============================================================================
+//
+// Turn headers are now rendered inline based on role transitions.
+// The layout_block_cells system handles role transition detection and
+// reserves space for inline role headers.
+//
+// Legacy TurnCell, TurnCellContainer, and TurnCellLayout components
+// still exist in components.rs for reference but these systems are disabled.
+//
+// TODO: Implement inline role header rendering in BlockCell format_single_block
+// or as a separate UI element spawned alongside BlockCells.
 
-/// Computed layout for a turn header.
+/// Computed layout for a turn header (legacy - kept for compatibility).
 #[derive(Component, Debug, Default)]
 pub struct TurnCellLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
     /// Height of the turn header.
     pub height: f32,
-}
-
-/// Spawn or update TurnCell entities to match conversation turns.
-///
-/// Turns are computed from consecutive blocks by the same author.
-/// Each turn gets a header showing author name and timestamp.
-pub fn spawn_turn_headers(
-    mut commands: Commands,
-    main_entity: Res<MainCellEntity>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    mut turn_containers: Query<&mut TurnCellContainer>,
-    mut registry: ResMut<ConversationRegistry>,
-    current: Res<CurrentConversation>,
-    _existing_turns: Query<(Entity, &TurnCell)>,
-) {
-    let Some(main_ent) = main_entity.0 else {
-        return;
-    };
-
-    // Verify main cell exists
-    let Ok(_editor) = main_cells.get(main_ent) else {
-        return;
-    };
-
-    // Get conversation to compute turns
-    let Some(conv_id) = current.id() else {
-        return;
-    };
-    let Some(conv) = registry.get_mut(conv_id) else {
-        return;
-    };
-
-    // Get or create the TurnCellContainer
-    let mut container = if let Ok(c) = turn_containers.get_mut(main_ent) {
-        c
-    } else {
-        commands.entity(main_ent).insert(TurnCellContainer::default());
-        return; // Will run again next frame with the container
-    };
-
-    // Get turns from conversation (cached)
-    let turns = conv.turns();
-
-    // For now, simple approach: clear and rebuild if turn count changed
-    // (In future, could diff more precisely)
-    let current_count = container.turn_cells.len();
-    if current_count != turns.len() {
-        // Despawn existing turn cells
-        for entity in container.turn_cells.drain(..) {
-            commands.entity(entity).try_despawn();
-        }
-
-        // Spawn new turn cells
-        for (idx, turn) in turns.iter().enumerate() {
-            let entity = commands
-                .spawn((
-                    TurnCell::new(
-                        turn.display_name.clone(),
-                        turn.timestamp,
-                        idx,
-                    ),
-                    TurnCellLayout::default(),
-                    GlyphonText,
-                    TextAreaConfig::default(),
-                ))
-                .id();
-            container.add(entity);
-        }
-    }
-}
-
-/// Initialize TextBuffers for TurnCells that don't have one.
-pub fn init_turn_cell_buffers(
-    mut commands: Commands,
-    turn_cells: Query<(Entity, &TurnCell), (With<GlyphonText>, Without<TextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
-) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (entity, turn) in turn_cells.iter() {
-        let metrics = glyphon::Metrics::new(14.0, 18.0); // Slightly smaller for headers
-        let mut buffer = TextBuffer::new(&mut font_system, metrics);
-
-        // Format turn header: "@DisplayName  HH:MM"
-        let header_text = format!("@{} · {}", turn.display_name, turn.formatted_time());
-        let attrs = glyphon::Attrs::new()
-            .family(glyphon::Family::SansSerif)
-            .weight(glyphon::Weight::BOLD);
-        buffer.set_text(&mut font_system, &header_text, &attrs, glyphon::Shaping::Advanced);
-
-        commands.entity(entity).insert(buffer);
-    }
-}
-
-/// Layout turn headers interleaved with blocks.
-///
-/// This needs to coordinate with block layout to position turn headers
-/// above their corresponding blocks.
-pub fn layout_turn_headers(
-    main_entity: Res<MainCellEntity>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
-    turn_containers: Query<&TurnCellContainer>,
-    block_cells: Query<(&BlockCell, &BlockCellLayout)>,
-    mut turn_cells: Query<(&TurnCell, &mut TurnCellLayout)>,
-    mut registry: ResMut<ConversationRegistry>,
-    current: Res<CurrentConversation>,
-) {
-    let Some(main_ent) = main_entity.0 else {
-        return;
-    };
-
-    let Ok(_editor) = main_cells.get(main_ent) else {
-        return;
-    };
-
-    let Ok(block_container) = containers.get(main_ent) else {
-        return;
-    };
-
-    let Ok(turn_container) = turn_containers.get(main_ent) else {
-        return;
-    };
-
-    let Some(conv_id) = current.id() else {
-        return;
-    };
-    let Some(conv) = registry.get_mut(conv_id) else {
-        return;
-    };
-
-    // Get turns for block->turn mapping (cached)
-    let turns = conv.turns();
-
-    // Map block_id to turn index
-    let mut block_to_turn: std::collections::HashMap<kaijutsu_crdt::BlockId, usize> =
-        std::collections::HashMap::new();
-    for (turn_idx, turn) in turns.iter().enumerate() {
-        for block_id in &turn.block_ids {
-            block_to_turn.insert(block_id.clone(), turn_idx);
-        }
-    }
-
-    // Find the first block of each turn and position turn header just above it
-    let mut first_block_of_turn: std::collections::HashMap<usize, f32> =
-        std::collections::HashMap::new();
-
-    for entity in &block_container.block_cells {
-        let Ok((block_cell, block_layout)) = block_cells.get(*entity) else {
-            continue;
-        };
-
-        if let Some(&turn_idx) = block_to_turn.get(&block_cell.block_id) {
-            first_block_of_turn.entry(turn_idx).or_insert(block_layout.y_offset);
-        }
-    }
-
-    const TURN_HEADER_HEIGHT: f32 = 28.0;
-
-    // Position each turn header
-    for entity in &turn_container.turn_cells {
-        let Ok((turn_cell, mut turn_layout)) = turn_cells.get_mut(*entity) else {
-            continue;
-        };
-
-        if let Some(&block_y) = first_block_of_turn.get(&turn_cell.turn_index) {
-            // Position header just above the first block of this turn
-            // Note: This assumes block layout already accounts for turn header space
-            turn_layout.y_offset = block_y - TURN_HEADER_HEIGHT;
-            turn_layout.height = TURN_HEADER_HEIGHT;
-        }
-    }
-}
-
-/// Apply layout positions to TurnCell TextAreaConfig for rendering.
-pub fn apply_turn_cell_positions(
-    main_entity: Res<MainCellEntity>,
-    turn_containers: Query<&TurnCellContainer>,
-    mut turn_cells: Query<(&TurnCellLayout, &mut TextAreaConfig), With<TurnCell>>,
-    layout: Res<WorkspaceLayout>,
-    scroll_state: Res<ConversationScrollState>,
-    windows: Query<&Window>,
-) {
-    let Some(main_ent) = main_entity.0 else {
-        return;
-    };
-
-    let Ok(container) = turn_containers.get(main_ent) else {
-        return;
-    };
-
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - layout.prompt_area_height;
-    let margin = layout.workspace_margin_left;
-    let base_width = window_width - (margin * 2.0);
-    let scroll_offset = scroll_state.offset;
-
-    for entity in &container.turn_cells {
-        let Ok((turn_layout, mut config)) = turn_cells.get_mut(*entity) else {
-            continue;
-        };
-
-        let content_top = visible_top + turn_layout.y_offset - scroll_offset;
-
-        config.left = margin;
-        config.top = content_top;
-        config.scale = 1.0;
-
-        config.bounds = glyphon::TextBounds {
-            left: margin as i32,
-            top: visible_top as i32,
-            right: (margin + base_width) as i32,
-            bottom: visible_bottom as i32,
-        };
-    }
 }

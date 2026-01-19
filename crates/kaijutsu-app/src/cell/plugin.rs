@@ -93,20 +93,9 @@ impl Plugin for CellPlugin {
                         .after(systems::layout_block_cells),
                 ),
             )
-            // Turn header systems (conversation turn grouping)
-            .add_systems(
-                Update,
-                (
-                    systems::spawn_turn_headers
-                        .after(systems::spawn_block_cells),
-                    systems::init_turn_cell_buffers
-                        .after(systems::spawn_turn_headers),
-                    systems::layout_turn_headers
-                        .after(systems::layout_block_cells),
-                    systems::apply_turn_cell_positions
-                        .after(systems::layout_turn_headers),
-                ),
-            )
+            // NOTE: Turn header systems removed in DAG migration.
+            // Role transitions are now computed inline in layout_block_cells.
+            // See systems.rs for details on the new role-based layout.
             // Collapse/expand for thinking blocks
             .add_systems(
                 Update,
