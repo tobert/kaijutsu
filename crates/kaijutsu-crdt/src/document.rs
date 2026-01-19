@@ -2,6 +2,13 @@
 //!
 //! Uses the diamond-types fork (github.com/tobert/diamond-types, branch feat/maps-and-uuids)
 //! which provides unified OpLog with Map, Set, Register, and Text CRDTs.
+//!
+//! # DAG Model
+//!
+//! Blocks form a DAG via parent_id links. Each block can have:
+//! - A parent block (tool results under tool calls, responses under prompts)
+//! - Multiple children (parallel tool calls, multiple response blocks)
+//! - Role and status for conversation flow tracking
 
 use diamond_types::{
     AgentId, CRDTKind, CreateValue, OpLog, Primitive, SerializedOps, SerializedOpsOwned,
@@ -10,7 +17,7 @@ use diamond_types::{
 use diamond_types::list::operation::TextOperation;
 use smartstring::alias::String as SmartString;
 
-use crate::{BlockContentSnapshot, BlockId, CrdtError, Result};
+use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 
 /// Block document backed by unified diamond-types OpLog.
 ///
@@ -18,15 +25,24 @@ use crate::{BlockContentSnapshot, BlockId, CrdtError, Result};
 ///
 /// ```text
 /// ROOT (Map)
-/// ├── blocks (Set<string>)        - OR-Set of block ID keys
-/// ├── order:<id> -> f64           - Fractional index for ordering
-/// └── block:<id> (Map)            - Per-block data
-///     ├── kind (string)           - "thinking", "text", "tool_use", "tool_result"
-///     ├── content (Text)          - For thinking/text blocks
-///     ├── collapsed (bool)        - For thinking blocks
-///     ├── author (string)
-///     ├── created_at (i64)
-///     └── (type-specific fields)
+/// ├── blocks (Set<string>)          # OR-Set of block ID keys
+/// ├── order:<id> -> f64             # Fractional index for ordering
+/// └── block:<id> (Map)              # Per-block data
+///     ├── parent_id (Str | null)    # DAG edge - write once
+///     ├── role (Str)                # human/agent/system/tool
+///     ├── status (Str)              # pending/running/done/error (LWW)
+///     ├── kind (Str)                # text/thinking/tool_call/tool_result
+///     ├── content (Text)            # Streamable via Text CRDT
+///     ├── collapsed (Bool)          # LWW - toggleable
+///     ├── author (Str)
+///     ├── created_at (I64)
+///     │
+///     │   # Tool-specific (optional, set on creation)
+///     ├── tool_name (Str)           # For ToolCall
+///     ├── tool_input (Text)         # For ToolCall - JSON, streamable
+///     ├── tool_call_id (Str)        # For ToolResult → parent ToolCall
+///     ├── exit_code (I64)           # For ToolResult
+///     └── is_error (Bool)           # For ToolResult
 /// ```
 ///
 /// # Convergence
@@ -174,6 +190,17 @@ impl BlockDocument {
             let kind_str = map.get(&SmartString::from("kind"))
                 .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
                 .unwrap_or("text");
+            let kind = BlockKind::from_str(kind_str).unwrap_or_default();
+
+            let role_str = map.get(&SmartString::from("role"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
+                .unwrap_or("human");
+            let role = Role::from_str(role_str).unwrap_or_default();
+
+            let status_str = map.get(&SmartString::from("status"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
+                .unwrap_or("done");
+            let status = Status::from_str(status_str).unwrap_or(Status::Done);
 
             let author = map.get(&SmartString::from("author"))
                 .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
@@ -183,61 +210,49 @@ impl BlockDocument {
                 .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as u64) } else { None })
                 .unwrap_or(0);
 
-            let content = match kind_str {
-                "thinking" => {
-                    let text = map.get(&SmartString::from("content"))
-                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
-                        .unwrap_or_default();
-                    let collapsed = map.get(&SmartString::from("collapsed"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
-                        .unwrap_or(false);
-                    BlockContentSnapshot::Thinking { text, collapsed }
-                }
-                "text" => {
-                    let text = map.get(&SmartString::from("content"))
-                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
-                        .unwrap_or_default();
-                    BlockContentSnapshot::Text { text }
-                }
-                "tool_use" => {
-                    let tool_id = map.get(&SmartString::from("tool_id"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
-                        .unwrap_or_default();
-                    let name = map.get(&SmartString::from("name"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
-                        .unwrap_or_default();
-                    // Read input from Text CRDT, parse as JSON
-                    let input_text = map.get(&SmartString::from("content"))
-                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
-                        .unwrap_or_default();
-                    let input = if input_text.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::from_str(&input_text).unwrap_or(serde_json::Value::Null)
-                    };
-                    BlockContentSnapshot::ToolUse { id: tool_id, name, input }
-                }
-                "tool_result" => {
-                    let tool_use_id = map.get(&SmartString::from("tool_use_id"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
-                        .unwrap_or_default();
-                    // Read content from Text CRDT
-                    let content = map.get(&SmartString::from("content"))
-                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
-                        .unwrap_or_default();
-                    let is_error = map.get(&SmartString::from("is_error"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
-                        .unwrap_or(false);
-                    BlockContentSnapshot::ToolResult { tool_use_id, content, is_error }
-                }
-                _ => BlockContentSnapshot::Text { text: String::new() }
-            };
+            let content = map.get(&SmartString::from("content"))
+                .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
+                .unwrap_or_default();
+
+            let collapsed = map.get(&SmartString::from("collapsed"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
+                .unwrap_or(false);
+
+            let parent_id = map.get(&SmartString::from("parent_id"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { BlockId::from_key(s) } else { None });
+
+            // Tool-specific fields
+            let tool_name = map.get(&SmartString::from("tool_name"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None });
+
+            let tool_input = map.get(&SmartString::from("tool_input"))
+                .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { serde_json::from_str(s).ok() } else { None });
+
+            let tool_call_id = map.get(&SmartString::from("tool_call_id"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { BlockId::from_key(s) } else { None });
+
+            let exit_code = map.get(&SmartString::from("exit_code"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as i32) } else { None });
+
+            let is_error = map.get(&SmartString::from("is_error"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
+                .unwrap_or(false);
 
             Some(BlockSnapshot {
                 id: id.clone(),
+                parent_id,
+                role,
+                status,
+                kind,
                 content,
+                collapsed,
                 author,
                 created_at,
+                tool_name,
+                tool_input,
+                tool_call_id,
+                exit_code,
+                is_error,
             })
         } else {
             None
@@ -248,13 +263,57 @@ impl BlockDocument {
     pub fn full_text(&self) -> String {
         self.blocks_ordered()
             .into_iter()
-            .map(|b| b.content.text().to_string())
+            .map(|b| b.content.clone())
             .collect::<Vec<_>>()
             .join("\n\n")
     }
 
     // =========================================================================
-    // Block Operations
+    // DAG Operations
+    // =========================================================================
+
+    /// Get children of a block (blocks with this block as parent).
+    pub fn get_children(&self, parent_id: &BlockId) -> Vec<BlockId> {
+        self.blocks_ordered()
+            .into_iter()
+            .filter(|b| b.parent_id.as_ref() == Some(parent_id))
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Get ancestors of a block (walk up the parent chain).
+    pub fn get_ancestors(&self, id: &BlockId) -> Vec<BlockId> {
+        let mut ancestors = Vec::new();
+        let mut current = self.get_block_snapshot(id);
+
+        while let Some(block) = current {
+            if let Some(parent_id) = block.parent_id {
+                ancestors.push(parent_id.clone());
+                current = self.get_block_snapshot(&parent_id);
+            } else {
+                break;
+            }
+        }
+
+        ancestors
+    }
+
+    /// Get root blocks (blocks with no parent).
+    pub fn get_roots(&self) -> Vec<BlockId> {
+        self.blocks_ordered()
+            .into_iter()
+            .filter(|b| b.parent_id.is_none())
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Get the depth of a block in the DAG (0 for roots).
+    pub fn get_depth(&self, id: &BlockId) -> usize {
+        self.get_ancestors(id).len()
+    }
+
+    // =========================================================================
+    // Block Operations - New DAG-native API
     // =========================================================================
 
     /// Generate a new block ID.
@@ -328,120 +387,130 @@ impl BlockDocument {
         }
     }
 
-    /// Insert a text block.
-    pub fn insert_text_block(
+    /// Insert a new block with full DAG support.
+    ///
+    /// This is the primary block creation API. All legacy insert_* methods
+    /// delegate to this.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_id` - Parent block ID for DAG relationship (None for root)
+    /// * `after` - Block ID to insert after in document order (None for beginning)
+    /// * `role` - Role of the block author (Human, Agent, System, Tool)
+    /// * `kind` - Content type (Text, Thinking, ToolCall, ToolResult)
+    /// * `content` - Initial text content
+    /// * `author` - Author identifier
+    ///
+    /// # Returns
+    ///
+    /// The new block's ID on success.
+    pub fn insert_block(
         &mut self,
+        parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
-        text: impl Into<String>,
-    ) -> Result<BlockId> {
-        self.insert_text_block_with_author(after, text, self.agent_id_str.clone())
-    }
-
-    /// Insert a text block with a specific author.
-    pub fn insert_text_block_with_author(
-        &mut self,
-        after: Option<&BlockId>,
-        text: impl Into<String>,
+        role: Role,
+        kind: BlockKind,
+        content: impl Into<String>,
         author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
-        let content = BlockContentSnapshot::Text { text: text.into() };
-        self.insert_block_internal(id.clone(), after, content, author.into())?;
+        let content_str = content.into();
+        let author_str = author.into();
+
+        self.insert_block_with_id(
+            id.clone(),
+            parent_id,
+            after,
+            role,
+            kind,
+            content_str,
+            author_str,
+            None, // tool_name
+            None, // tool_input
+            None, // tool_call_id
+            None, // exit_code
+            false, // is_error
+        )?;
+
         Ok(id)
     }
 
-    /// Insert a thinking block.
-    pub fn insert_thinking_block(
+    /// Insert a tool call block.
+    pub fn insert_tool_call(
         &mut self,
+        parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
-        text: impl Into<String>,
-    ) -> Result<BlockId> {
-        self.insert_thinking_block_with_author(after, text, self.agent_id_str.clone())
-    }
-
-    /// Insert a thinking block with a specific author.
-    pub fn insert_thinking_block_with_author(
-        &mut self,
-        after: Option<&BlockId>,
-        text: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_input: serde_json::Value,
         author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
-        let content = BlockContentSnapshot::Thinking {
-            text: text.into(),
-            collapsed: false,
-        };
-        self.insert_block_internal(id.clone(), after, content, author.into())?;
-        Ok(id)
-    }
+        let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
 
-    /// Insert a tool use block.
-    pub fn insert_tool_use(
-        &mut self,
-        after: Option<&BlockId>,
-        tool_id: impl Into<String>,
-        name: impl Into<String>,
-        input: serde_json::Value,
-    ) -> Result<BlockId> {
-        self.insert_tool_use_with_author(after, tool_id, name, input, self.agent_id_str.clone())
-    }
+        self.insert_block_with_id(
+            id.clone(),
+            parent_id,
+            after,
+            Role::Model,
+            BlockKind::ToolCall,
+            input_json,
+            author.into(),
+            Some(tool_name.into()),
+            Some(tool_input),
+            None,
+            None,
+            false,
+        )?;
 
-    /// Insert a tool use block with a specific author.
-    pub fn insert_tool_use_with_author(
-        &mut self,
-        after: Option<&BlockId>,
-        tool_id: impl Into<String>,
-        name: impl Into<String>,
-        input: serde_json::Value,
-        author: impl Into<String>,
-    ) -> Result<BlockId> {
-        let id = self.new_block_id();
-        let content = BlockContentSnapshot::ToolUse {
-            id: tool_id.into(),
-            name: name.into(),
-            input,
-        };
-        self.insert_block_internal(id.clone(), after, content, author.into())?;
         Ok(id)
     }
 
     /// Insert a tool result block.
-    pub fn insert_tool_result(
+    pub fn insert_tool_result_block(
         &mut self,
+        tool_call_id: &BlockId,
         after: Option<&BlockId>,
-        tool_use_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
-    ) -> Result<BlockId> {
-        self.insert_tool_result_with_author(after, tool_use_id, content, is_error, self.agent_id_str.clone())
-    }
-
-    /// Insert a tool result block with a specific author.
-    pub fn insert_tool_result_with_author(
-        &mut self,
-        after: Option<&BlockId>,
-        tool_use_id: impl Into<String>,
-        content: impl Into<String>,
-        is_error: bool,
+        exit_code: Option<i32>,
         author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
-        let snapshot = BlockContentSnapshot::ToolResult {
-            tool_use_id: tool_use_id.into(),
-            content: content.into(),
+
+        self.insert_block_with_id(
+            id.clone(),
+            Some(tool_call_id), // Parent is the tool call
+            after,
+            Role::Tool,
+            BlockKind::ToolResult,
+            content.into(),
+            author.into(),
+            None,
+            None,
+            Some(tool_call_id.clone()),
+            exit_code,
             is_error,
-        };
-        self.insert_block_internal(id.clone(), after, snapshot, author.into())?;
+        )?;
+
         Ok(id)
     }
 
-    /// Internal block insertion.
-    fn insert_block_internal(
+    /// Internal block insertion with all fields.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_block_with_id(
         &mut self,
         id: BlockId,
+        parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
-        snapshot: BlockContentSnapshot,
+        role: Role,
+        kind: BlockKind,
+        content: String,
         author: String,
+        tool_name: Option<String>,
+        tool_input: Option<serde_json::Value>,
+        tool_call_id: Option<BlockId>,
+        exit_code: Option<i32>,
+        is_error: bool,
     ) -> Result<()> {
         let block_key = id.to_key();
 
@@ -456,6 +525,14 @@ impl BlockDocument {
             let after_key = Primitive::Str(SmartString::from(after_id.to_key().as_str()));
             if !existing.contains(&after_key) {
                 return Err(CrdtError::InvalidReference(after_id.clone()));
+            }
+        }
+
+        // Validate parent if provided
+        if let Some(parent) = parent_id {
+            let parent_key = Primitive::Str(SmartString::from(parent.to_key().as_str()));
+            if !existing.contains(&parent_key) {
+                return Err(CrdtError::InvalidReference(parent.clone()));
             }
         }
 
@@ -506,112 +583,123 @@ impl BlockDocument {
             "created_at",
             CreateValue::Primitive(Primitive::I64(created_at)),
         );
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "kind",
+            CreateValue::Primitive(Primitive::Str(SmartString::from(kind.as_str()))),
+        );
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "role",
+            CreateValue::Primitive(Primitive::Str(SmartString::from(role.as_str()))),
+        );
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "status",
+            CreateValue::Primitive(Primitive::Str(SmartString::from(Status::Done.as_str()))),
+        );
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "collapsed",
+            CreateValue::Primitive(Primitive::Bool(false)),
+        );
 
-        // Store content based on type
-        match &snapshot {
-            BlockContentSnapshot::Thinking { text, collapsed } => {
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "kind",
-                    CreateValue::Primitive(Primitive::Str("thinking".into())),
-                );
-                // Create text CRDT for content
-                let text_lv = self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "content",
-                    CreateValue::NewCRDT(CRDTKind::Text),
-                );
-                if !text.is_empty() {
-                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, text));
-                }
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "collapsed",
-                    CreateValue::Primitive(Primitive::Bool(*collapsed)),
-                );
-            }
-            BlockContentSnapshot::Text { text } => {
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "kind",
-                    CreateValue::Primitive(Primitive::Str("text".into())),
-                );
-                let text_lv = self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "content",
-                    CreateValue::NewCRDT(CRDTKind::Text),
-                );
-                if !text.is_empty() {
-                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, text));
-                }
-            }
-            BlockContentSnapshot::ToolUse { id: tool_id, name, input } => {
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "kind",
-                    CreateValue::Primitive(Primitive::Str("tool_use".into())),
-                );
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "tool_id",
-                    CreateValue::Primitive(Primitive::Str(SmartString::from(tool_id.as_str()))),
-                );
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "name",
-                    CreateValue::Primitive(Primitive::Str(SmartString::from(name.as_str()))),
-                );
-                // Store input as Text CRDT for streaming support
-                let input_json = serde_json::to_string(input).unwrap_or_default();
-                let text_lv = self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "content",
-                    CreateValue::NewCRDT(CRDTKind::Text),
-                );
-                if !input_json.is_empty() {
-                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, &input_json));
-                }
-            }
-            BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "kind",
-                    CreateValue::Primitive(Primitive::Str("tool_result".into())),
-                );
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "tool_use_id",
-                    CreateValue::Primitive(Primitive::Str(SmartString::from(tool_use_id.as_str()))),
-                );
-                // Store content as Text CRDT for streaming support
-                let text_lv = self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "content",
-                    CreateValue::NewCRDT(CRDTKind::Text),
-                );
-                if !content.is_empty() {
-                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, content));
-                }
-                self.oplog.local_map_set(
-                    self.agent,
-                    block_map_lv,
-                    "is_error",
-                    CreateValue::Primitive(Primitive::Bool(*is_error)),
-                );
+        // Store parent_id if present
+        if let Some(parent) = parent_id {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "parent_id",
+                CreateValue::Primitive(Primitive::Str(SmartString::from(parent.to_key().as_str()))),
+            );
+        }
+
+        // Create text CRDT for content
+        let text_lv = self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "content",
+            CreateValue::NewCRDT(CRDTKind::Text),
+        );
+        if !content.is_empty() {
+            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, &content));
+        }
+
+        // Tool-specific fields
+        if let Some(name) = tool_name {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "tool_name",
+                CreateValue::Primitive(Primitive::Str(SmartString::from(name.as_str()))),
+            );
+        }
+
+        if let Some(input) = tool_input {
+            // Store tool_input as Text CRDT for streaming support
+            let input_json = serde_json::to_string(&input).unwrap_or_default();
+            let input_lv = self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "tool_input",
+                CreateValue::NewCRDT(CRDTKind::Text),
+            );
+            if !input_json.is_empty() {
+                self.oplog.local_text_op(self.agent, input_lv, TextOperation::new_insert(0, &input_json));
             }
         }
+
+        if let Some(tcid) = tool_call_id {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "tool_call_id",
+                CreateValue::Primitive(Primitive::Str(SmartString::from(tcid.to_key().as_str()))),
+            );
+        }
+
+        if let Some(code) = exit_code {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "exit_code",
+                CreateValue::Primitive(Primitive::I64(code as i64)),
+            );
+        }
+
+        if is_error {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "is_error",
+                CreateValue::Primitive(Primitive::Bool(true)),
+            );
+        }
+
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the status of a block.
+    ///
+    /// Status is LWW (Last-Write-Wins) for convergence.
+    pub fn set_status(&mut self, id: &BlockId, status: Status) -> Result<()> {
+        let _snapshot = self.get_block_snapshot(id)
+            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+
+        let block_key = format!("block:{}", id.to_key());
+        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
+
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "status",
+            CreateValue::Primitive(Primitive::Str(SmartString::from(status.as_str()))),
+        );
 
         self.version += 1;
         Ok(())
@@ -662,7 +750,7 @@ impl BlockDocument {
     ///
     /// All block types support text editing via their `content` Text CRDT:
     /// - Thinking/Text: Direct text content
-    /// - ToolUse: JSON input as text (enables streaming)
+    /// - ToolCall: JSON input as text (enables streaming)
     /// - ToolResult: Result content as text (enables streaming)
     pub fn edit_text(
         &mut self,
@@ -710,7 +798,7 @@ impl BlockDocument {
         let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        let len = snapshot.content.text().len();
+        let len = snapshot.content.len();
         self.edit_text(id, len, text, 0)
     }
 
@@ -721,7 +809,7 @@ impl BlockDocument {
         let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        if !matches!(snapshot.content, BlockContentSnapshot::Thinking { .. }) {
+        if snapshot.kind != BlockKind::Thinking {
             return Err(CrdtError::UnsupportedOperation(id.clone()));
         }
 
@@ -795,11 +883,19 @@ impl BlockDocument {
 
         let mut last_id: Option<BlockId> = None;
         for block_snap in snapshot.blocks {
-            let _ = doc.insert_block_internal(
+            let _ = doc.insert_block_with_id(
                 block_snap.id.clone(),
+                block_snap.parent_id.as_ref(),
                 last_id.as_ref(),
+                block_snap.role,
+                block_snap.kind,
                 block_snap.content,
                 block_snap.author,
+                block_snap.tool_name,
+                block_snap.tool_input,
+                block_snap.tool_call_id,
+                block_snap.exit_code,
+                block_snap.is_error,
             );
             last_id = Some(block_snap.id);
         }
@@ -820,19 +916,6 @@ pub struct DocumentSnapshot {
     pub version: u64,
 }
 
-/// Snapshot of a single block.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct BlockSnapshot {
-    /// Block ID.
-    pub id: BlockId,
-    /// Content snapshot.
-    pub content: BlockContentSnapshot,
-    /// Author who created this block.
-    pub author: String,
-    /// Timestamp when block was created (Unix millis).
-    pub created_at: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,12 +930,158 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_block_new_api() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        let id1 = doc.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Hello!",
+            "user:amy",
+        ).unwrap();
+
+        let id2 = doc.insert_block(
+            Some(&id1), // Parent is id1
+            Some(&id1), // After id1
+            Role::Model,
+            BlockKind::Text,
+            "Hi there!",
+            "model:claude",
+        ).unwrap();
+
+        let blocks = doc.blocks_ordered();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].id, id1);
+        assert_eq!(blocks[0].role, Role::User);
+        assert_eq!(blocks[1].id, id2);
+        assert_eq!(blocks[1].role, Role::Model);
+        assert_eq!(blocks[1].parent_id, Some(id1.clone()));
+    }
+
+    #[test]
+    fn test_dag_operations() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        // Create a parent block
+        let parent_id = doc.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Question",
+            "user:amy",
+        ).unwrap();
+
+        // Create children
+        let child1 = doc.insert_block(
+            Some(&parent_id),
+            Some(&parent_id),
+            Role::Model,
+            BlockKind::Thinking,
+            "Thinking...",
+            "model:claude",
+        ).unwrap();
+
+        let child2 = doc.insert_block(
+            Some(&parent_id),
+            Some(&child1),
+            Role::Model,
+            BlockKind::Text,
+            "Answer",
+            "model:claude",
+        ).unwrap();
+
+        // Test get_children
+        let children = doc.get_children(&parent_id);
+        assert_eq!(children.len(), 2);
+        assert!(children.contains(&child1));
+        assert!(children.contains(&child2));
+
+        // Test get_ancestors
+        let ancestors = doc.get_ancestors(&child1);
+        assert_eq!(ancestors, vec![parent_id.clone()]);
+
+        // Test get_roots
+        let roots = doc.get_roots();
+        assert_eq!(roots, vec![parent_id.clone()]);
+
+        // Test get_depth
+        assert_eq!(doc.get_depth(&parent_id), 0);
+        assert_eq!(doc.get_depth(&child1), 1);
+    }
+
+    #[test]
+    fn test_set_status() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        let id = doc.insert_block(
+            None,
+            None,
+            Role::Model,
+            BlockKind::ToolCall,
+            "{}",
+            "model:claude",
+        ).unwrap();
+
+        // Initially status is Done
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.status, Status::Done);
+
+        // Set to Running
+        doc.set_status(&id, Status::Running).unwrap();
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.status, Status::Running);
+
+        // Set to Error
+        doc.set_status(&id, Status::Error).unwrap();
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.status, Status::Error);
+    }
+
+    #[test]
+    fn test_tool_call_and_result() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        // Create tool call
+        let tool_call_id = doc.insert_tool_call(
+            None,
+            None,
+            "read_file",
+            serde_json::json!({"path": "/etc/hosts"}),
+            "model:claude",
+        ).unwrap();
+
+        let snap = doc.get_block_snapshot(&tool_call_id).unwrap();
+        assert_eq!(snap.kind, BlockKind::ToolCall);
+        assert_eq!(snap.tool_name, Some("read_file".to_string()));
+
+        // Create tool result
+        let result_id = doc.insert_tool_result_block(
+            &tool_call_id,
+            Some(&tool_call_id),
+            "127.0.0.1 localhost",
+            false,
+            Some(0),
+            "system",
+        ).unwrap();
+
+        let snap = doc.get_block_snapshot(&result_id).unwrap();
+        assert_eq!(snap.kind, BlockKind::ToolResult);
+        assert_eq!(snap.parent_id, Some(tool_call_id.clone()));
+        assert_eq!(snap.tool_call_id, Some(tool_call_id));
+        assert!(!snap.is_error);
+        assert_eq!(snap.exit_code, Some(0));
+    }
+
+    #[test]
     fn test_insert_and_order() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        let id1 = doc.insert_text_block(None, "First").unwrap();
-        let id2 = doc.insert_text_block(Some(&id1), "Second").unwrap();
-        let id3 = doc.insert_text_block(Some(&id2), "Third").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", "alice").unwrap();
+        let id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", "alice").unwrap();
 
         let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
         assert_eq!(order, vec![id1, id2, id3]);
@@ -862,8 +1091,8 @@ mod tests {
     fn test_insert_at_beginning() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        let id1 = doc.insert_text_block(None, "First").unwrap();
-        let id2 = doc.insert_text_block(None, "Before First").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
+        let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First", "alice").unwrap();
 
         let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
         assert_eq!(order, vec![id2, id1]);
@@ -873,8 +1102,8 @@ mod tests {
     fn test_snapshot_roundtrip() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        doc.insert_thinking_block(None, "Thinking...").unwrap();
-        doc.insert_text_block(None, "Response").unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", "model:claude").unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response", "model:claude").unwrap();
 
         let snapshot = doc.snapshot();
         let restored = BlockDocument::from_snapshot(snapshot.clone(), "bob");
@@ -887,57 +1116,14 @@ mod tests {
     fn test_text_editing() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        let id = doc.insert_text_block(None, "Hello").unwrap();
+        let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello", "user:amy").unwrap();
         doc.append_text(&id, " World").unwrap();
 
-        let text = doc.get_block_snapshot(&id).unwrap().content.text().to_string();
+        let text = doc.get_block_snapshot(&id).unwrap().content;
         assert_eq!(text, "Hello World");
 
         doc.edit_text(&id, 5, ",", 0).unwrap();
-        let text = doc.get_block_snapshot(&id).unwrap().content.text().to_string();
+        let text = doc.get_block_snapshot(&id).unwrap().content;
         assert_eq!(text, "Hello, World");
-    }
-
-    #[test]
-    fn test_tool_use_block_editable() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
-
-        // Create tool use with JSON input
-        let tool_id = doc.insert_tool_use(None, "tool-1", "read_file", serde_json::json!({"path": "/foo"})).unwrap();
-
-        // Verify initial content
-        let snapshot = doc.get_block_snapshot(&tool_id).unwrap();
-        if let BlockContentSnapshot::ToolUse { input, .. } = &snapshot.content {
-            assert_eq!(input["path"], "/foo");
-        } else {
-            panic!("Expected ToolUse");
-        }
-
-        // Tool use content IS now editable (for streaming)
-        // Note: This appends to the JSON string, potentially making it invalid JSON
-        // In practice, streaming would build up valid JSON incrementally
-        let result = doc.edit_text(&tool_id, 0, "", 0); // No-op edit
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_tool_result_streaming() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
-
-        // Create empty tool result (simulating streaming start)
-        let result_id = doc.insert_tool_result(None, "tool-1", "", false).unwrap();
-
-        // Stream content incrementally
-        doc.append_text(&result_id, "Line 1\n").unwrap();
-        doc.append_text(&result_id, "Line 2\n").unwrap();
-        doc.append_text(&result_id, "Line 3").unwrap();
-
-        // Verify streamed content
-        let snapshot = doc.get_block_snapshot(&result_id).unwrap();
-        if let BlockContentSnapshot::ToolResult { content, .. } = &snapshot.content {
-            assert_eq!(content, "Line 1\nLine 2\nLine 3");
-        } else {
-            panic!("Expected ToolResult");
-        }
     }
 }
