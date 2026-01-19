@@ -1380,7 +1380,7 @@ pub fn layout_block_cells(
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &TextBuffer)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    registry: Res<ConversationRegistry>,
+    mut registry: ResMut<ConversationRegistry>,
     current: Res<CurrentConversation>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1420,8 +1420,8 @@ pub fn layout_block_cells(
     let mut block_turn_info: std::collections::HashMap<kaijutsu_crdt::BlockId, (usize, bool)> =
         std::collections::HashMap::new();
     if let Some(conv_id) = current.id() {
-        if let Some(conv) = registry.get(conv_id) {
-            for (turn_idx, turn) in conv.compute_turns().iter().enumerate() {
+        if let Some(conv) = registry.get_mut(conv_id) {
+            for (turn_idx, turn) in conv.turns().iter().enumerate() {
                 for (block_idx, block_id) in turn.block_ids.iter().enumerate() {
                     block_turn_info.insert(block_id.clone(), (turn_idx, block_idx == 0));
                 }
@@ -1551,7 +1551,7 @@ pub fn spawn_turn_headers(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut turn_containers: Query<&mut TurnCellContainer>,
-    registry: Res<ConversationRegistry>,
+    mut registry: ResMut<ConversationRegistry>,
     current: Res<CurrentConversation>,
     _existing_turns: Query<(Entity, &TurnCell)>,
 ) {
@@ -1568,7 +1568,7 @@ pub fn spawn_turn_headers(
     let Some(conv_id) = current.id() else {
         return;
     };
-    let Some(conv) = registry.get(conv_id) else {
+    let Some(conv) = registry.get_mut(conv_id) else {
         return;
     };
 
@@ -1580,8 +1580,8 @@ pub fn spawn_turn_headers(
         return; // Will run again next frame with the container
     };
 
-    // Compute turns from conversation
-    let turns = conv.compute_turns();
+    // Get turns from conversation (cached)
+    let turns = conv.turns();
 
     // For now, simple approach: clear and rebuild if turn count changed
     // (In future, could diff more precisely)
@@ -1648,7 +1648,7 @@ pub fn layout_turn_headers(
     turn_containers: Query<&TurnCellContainer>,
     block_cells: Query<(&BlockCell, &BlockCellLayout)>,
     mut turn_cells: Query<(&TurnCell, &mut TurnCellLayout)>,
-    registry: Res<ConversationRegistry>,
+    mut registry: ResMut<ConversationRegistry>,
     current: Res<CurrentConversation>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1670,12 +1670,12 @@ pub fn layout_turn_headers(
     let Some(conv_id) = current.id() else {
         return;
     };
-    let Some(conv) = registry.get(conv_id) else {
+    let Some(conv) = registry.get_mut(conv_id) else {
         return;
     };
 
-    // Compute turns to get block->turn mapping
-    let turns = conv.compute_turns();
+    // Get turns for block->turn mapping (cached)
+    let turns = conv.turns();
 
     // Map block_id to turn index
     let mut block_to_turn: std::collections::HashMap<kaijutsu_crdt::BlockId, usize> =

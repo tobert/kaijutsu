@@ -186,6 +186,8 @@ impl ConversationDb {
             mounts,
             created_at: created_at as u64,
             updated_at: updated_at as u64,
+            cached_turns: Vec::new(),
+            turns_cache_version: 0,
         }))
     }
 

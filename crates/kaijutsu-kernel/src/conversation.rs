@@ -88,6 +88,11 @@ pub struct Conversation {
     pub created_at: u64,
     /// When the conversation was last updated (Unix millis).
     pub updated_at: u64,
+
+    /// Cached turns (computed from blocks grouped by author).
+    pub(crate) cached_turns: Vec<Turn>,
+    /// Document version when turns were last computed.
+    pub(crate) turns_cache_version: u64,
 }
 
 impl std::fmt::Debug for Conversation {
@@ -123,6 +128,8 @@ impl Conversation {
             mounts: Vec::new(),
             created_at: now,
             updated_at: now,
+            cached_turns: Vec::new(),
+            turns_cache_version: 0,
         }
     }
 
@@ -144,6 +151,8 @@ impl Conversation {
             mounts: Vec::new(),
             created_at: now,
             updated_at: now,
+            cached_turns: Vec::new(),
+            turns_cache_version: 0,
         }
     }
 
@@ -294,6 +303,19 @@ impl Conversation {
     // =========================================================================
     // Turn Grouping
     // =========================================================================
+
+    /// Get turns with lazy cache invalidation.
+    ///
+    /// Returns cached turns if the document version hasn't changed,
+    /// otherwise recomputes and caches the result.
+    pub fn turns(&mut self) -> &[Turn] {
+        let current_version = self.doc.version();
+        if self.turns_cache_version != current_version {
+            self.cached_turns = self.compute_turns();
+            self.turns_cache_version = current_version;
+        }
+        &self.cached_turns
+    }
 
     /// Compute turns (groups of consecutive blocks by the same author).
     ///
@@ -602,5 +624,36 @@ mod tests {
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[2].author, "user:amy");
         assert_eq!(turns[2].block_count(), 1);
+    }
+
+    #[test]
+    fn test_turns_caching() {
+        let mut conv = Conversation::new("Test", "alice");
+        conv.add_participant(Participant::user("user:amy", "Amy"));
+
+        // Add first message
+        conv.add_text_message("user:amy", "Hello");
+        let version_after_first = conv.doc.version();
+
+        // First call computes turns
+        let turns1 = conv.turns();
+        assert_eq!(turns1.len(), 1);
+        assert_eq!(conv.turns_cache_version, version_after_first);
+
+        // Second call uses cache (same version)
+        let turns2 = conv.turns();
+        assert_eq!(turns2.len(), 1);
+        assert_eq!(conv.turns_cache_version, version_after_first);
+
+        // Adding a message changes the version
+        conv.add_text_message("user:amy", "World");
+        let version_after_second = conv.doc.version();
+        assert_ne!(version_after_first, version_after_second);
+
+        // Next call should recompute (version changed)
+        let turns3 = conv.turns();
+        assert_eq!(turns3.len(), 1); // Still 1 turn (same author)
+        assert_eq!(turns3[0].block_count(), 2); // But now 2 blocks
+        assert_eq!(conv.turns_cache_version, version_after_second);
     }
 }
