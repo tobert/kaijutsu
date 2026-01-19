@@ -464,41 +464,6 @@ impl KernelHandle {
     }
 }
 
-/// Helper to build block content from snapshot
-fn build_block_content(
-    mut builder: crate::kaijutsu_capnp::block_content::Builder<'_>,
-    content: &kaijutsu_crdt::BlockContentSnapshot,
-) {
-    use kaijutsu_crdt::BlockContentSnapshot;
-
-    match content {
-        BlockContentSnapshot::Thinking { text, collapsed } => {
-            let mut thinking = builder.init_thinking();
-            thinking.set_text(text);
-            thinking.set_collapsed(*collapsed);
-        }
-        BlockContentSnapshot::Text { text } => {
-            builder.set_text(text);
-        }
-        BlockContentSnapshot::ToolUse { id, name, input } => {
-            let mut tool_use = builder.init_tool_use();
-            tool_use.set_id(id);
-            tool_use.set_name(name);
-            tool_use.set_input(&input.to_string());
-        }
-        BlockContentSnapshot::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => {
-            let mut tool_result = builder.init_tool_result();
-            tool_result.set_tool_use_id(tool_use_id);
-            tool_result.set_content(content);
-            tool_result.set_is_error(*is_error);
-        }
-    }
-}
-
 /// Helper to parse block ID from Cap'n Proto
 fn parse_block_id(
     reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
