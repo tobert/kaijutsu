@@ -565,4 +565,181 @@ mod tests {
             _ => panic!("Expected CellCreated event"),
         }
     }
+
+    #[tokio::test]
+    async fn test_concurrent_cell_access() {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let store = Arc::new(BlockStore::new("test-agent"));
+        store
+            .create_cell("shared-cell".into(), CellKind::Code, None)
+            .unwrap();
+
+        let mut tasks = JoinSet::new();
+        let num_tasks = 4;
+        let ops_per_task = 10;
+
+        // Spawn multiple tasks that concurrently append text to the same cell
+        for i in 0..num_tasks {
+            let store_clone = Arc::clone(&store);
+            tasks.spawn(async move {
+                for j in 0..ops_per_task {
+                    // Each task inserts a uniquely identifiable block
+                    let text = format!("[task-{}-op-{}]", i, j);
+                    let _ = store_clone.insert_text_block("shared-cell", None, &text);
+                }
+            });
+        }
+
+        // Wait for all tasks to complete
+        while let Some(result) = tasks.join_next().await {
+            result.expect("Task panicked");
+        }
+
+        // Verify the cell has content from all tasks
+        let content = store.get_content("shared-cell").unwrap();
+
+        // Should have at least some content (exact ordering is non-deterministic)
+        assert!(!content.is_empty());
+
+        // Count how many blocks we have - should be num_tasks * ops_per_task
+        let snapshots = store.block_snapshots("shared-cell").unwrap();
+        assert_eq!(
+            snapshots.len(),
+            num_tasks * ops_per_task,
+            "Expected {} blocks, got {}",
+            num_tasks * ops_per_task,
+            snapshots.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_multi_cell_access() {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let store = Arc::new(BlockStore::new("test-agent"));
+
+        // Create multiple cells
+        let num_cells = 3;
+        for i in 0..num_cells {
+            store
+                .create_cell(format!("cell-{}", i), CellKind::Code, None)
+                .unwrap();
+        }
+
+        let mut tasks = JoinSet::new();
+        let num_tasks = 6;
+
+        // Each task works on different cells
+        for i in 0..num_tasks {
+            let store_clone = Arc::clone(&store);
+            let cell_id = format!("cell-{}", i % num_cells);
+            tasks.spawn(async move {
+                for j in 0..5 {
+                    let text = format!("task-{}-op-{}", i, j);
+                    let _ = store_clone.insert_text_block(&cell_id, None, &text);
+                }
+            });
+        }
+
+        // Wait for all tasks
+        while let Some(result) = tasks.join_next().await {
+            result.expect("Task panicked");
+        }
+
+        // Each cell should have content
+        for i in 0..num_cells {
+            let cell_id = format!("cell-{}", i);
+            let content = store.get_content(&cell_id).unwrap();
+            assert!(!content.is_empty(), "Cell {} should have content", cell_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_read_write() {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let store = Arc::new(BlockStore::new("test-agent"));
+        store
+            .create_cell("rw-cell".into(), CellKind::Code, None)
+            .unwrap();
+
+        // Insert initial content
+        let block_id = store
+            .insert_text_block("rw-cell", None, "initial content")
+            .unwrap();
+
+        let mut tasks = JoinSet::new();
+
+        // Spawn writer tasks
+        for i in 0..3 {
+            let store_clone = Arc::clone(&store);
+            let bid = block_id.clone();
+            tasks.spawn(async move {
+                for j in 0..5 {
+                    // Append text
+                    let text = format!(" [w{}:{}]", i, j);
+                    let _ = store_clone.append_text("rw-cell", &bid, &text);
+                }
+            });
+        }
+
+        // Spawn reader tasks
+        for _ in 0..3 {
+            let store_clone = Arc::clone(&store);
+            tasks.spawn(async move {
+                for _ in 0..10 {
+                    // Read content
+                    let _ = store_clone.get_content("rw-cell");
+                }
+            });
+        }
+
+        // Wait for all tasks
+        while let Some(result) = tasks.join_next().await {
+            result.expect("Task panicked");
+        }
+
+        // Content should still be valid
+        let content = store.get_content("rw-cell").unwrap();
+        assert!(content.starts_with("initial content"));
+    }
+
+    #[tokio::test]
+    async fn test_event_subscription_concurrent() {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let store = Arc::new(BlockStore::new("test-agent"));
+        let mut rx = store.subscribe();
+
+        let mut tasks = JoinSet::new();
+
+        // Create multiple cells concurrently
+        for i in 0..10 {
+            let store_clone = Arc::clone(&store);
+            tasks.spawn(async move {
+                store_clone
+                    .create_cell(format!("event-cell-{}", i), CellKind::Code, None)
+                    .unwrap();
+            });
+        }
+
+        // Wait for all tasks
+        while let Some(result) = tasks.join_next().await {
+            result.expect("Task panicked");
+        }
+
+        // Collect events (may not get all due to broadcast channel)
+        let mut events_received = 0;
+        while rx.try_recv().is_ok() {
+            events_received += 1;
+        }
+
+        // Should have received at least some events
+        assert!(events_received > 0, "Should have received some events");
+    }
 }

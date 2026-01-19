@@ -65,21 +65,20 @@ pub enum BlockType {
     Thinking,
     /// Main text response.
     Text,
-    /// Tool invocation - immutable.
+    /// Tool invocation - content (input JSON) is streamable via Text CRDT.
     ToolUse,
-    /// Tool result - immutable.
+    /// Tool result - content is streamable via Text CRDT.
     ToolResult,
 }
 
 impl BlockType {
-    /// Check if this block type has editable text.
+    /// Check if this block type has editable text content via Text CRDT.
+    ///
+    /// As of the block-oriented architecture, all block types support
+    /// Text CRDT for their primary content field, enabling streaming.
     pub fn has_text_crdt(&self) -> bool {
-        matches!(self, BlockType::Thinking | BlockType::Text)
-    }
-
-    /// Check if this block type is immutable after creation.
-    pub fn is_immutable(&self) -> bool {
-        matches!(self, BlockType::ToolUse | BlockType::ToolResult)
+        // All block types now support Text CRDT for streaming
+        true
     }
 }
 
@@ -156,16 +155,12 @@ mod tests {
     }
 
     #[test]
-    fn test_block_type() {
+    fn test_block_type_all_support_text_crdt() {
+        // All block types now support Text CRDT for streaming
         assert!(BlockType::Thinking.has_text_crdt());
         assert!(BlockType::Text.has_text_crdt());
-        assert!(!BlockType::ToolUse.has_text_crdt());
-        assert!(!BlockType::ToolResult.has_text_crdt());
-
-        assert!(!BlockType::Thinking.is_immutable());
-        assert!(!BlockType::Text.is_immutable());
-        assert!(BlockType::ToolUse.is_immutable());
-        assert!(BlockType::ToolResult.is_immutable());
+        assert!(BlockType::ToolUse.has_text_crdt());
+        assert!(BlockType::ToolResult.has_text_crdt());
     }
 
     #[test]
@@ -184,5 +179,14 @@ mod tests {
         assert_eq!(text.block_type(), BlockType::Text);
         assert_eq!(text.text(), "hello");
         assert!(!text.is_collapsed());
+
+        // ToolResult also has text content
+        let result = BlockContentSnapshot::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: "result content".to_string(),
+            is_error: false,
+        };
+        assert_eq!(result.block_type(), BlockType::ToolResult);
+        assert_eq!(result.text(), "result content");
     }
 }

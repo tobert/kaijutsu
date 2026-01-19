@@ -28,8 +28,43 @@
 //! conv.add_text_message("model:claude", "I can help with that!");
 //! ```
 
-use kaijutsu_crdt::{BlockDocument, BlockId};
+use kaijutsu_crdt::{BlockDocument, BlockId, BlockSnapshot};
 use serde::{Deserialize, Serialize};
+
+/// A turn is a group of consecutive blocks from the same author.
+///
+/// Turns are a derived view for UI presentation. They group messages
+/// to show conversation flow with author headers and timestamps.
+#[derive(Clone, Debug)]
+pub struct Turn {
+    /// Author ID (e.g., "user:amy", "model:claude").
+    pub author: String,
+    /// Display name for the author.
+    pub display_name: String,
+    /// Block IDs in this turn, in order.
+    pub block_ids: Vec<BlockId>,
+    /// Block snapshots in this turn (for convenience).
+    pub blocks: Vec<BlockSnapshot>,
+    /// Timestamp of the first block (Unix millis).
+    pub timestamp: u64,
+}
+
+impl Turn {
+    /// Check if this turn is from a user.
+    pub fn is_user(&self) -> bool {
+        self.author.starts_with("user:")
+    }
+
+    /// Check if this turn is from a model.
+    pub fn is_model(&self) -> bool {
+        self.author.starts_with("model:")
+    }
+
+    /// Get the number of blocks in this turn.
+    pub fn block_count(&self) -> usize {
+        self.block_ids.len()
+    }
+}
 
 /// A conversation with participants and resource access.
 ///
@@ -257,6 +292,73 @@ impl Conversation {
     }
 
     // =========================================================================
+    // Turn Grouping
+    // =========================================================================
+
+    /// Compute turns (groups of consecutive blocks by the same author).
+    ///
+    /// Turns are a derived view - they're computed from blocks, not stored.
+    /// This enables visual grouping in the UI with turn headers showing author/timestamp.
+    pub fn compute_turns(&self) -> Vec<Turn> {
+        let blocks = self.doc.blocks_ordered();
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+
+        let mut turns = Vec::new();
+        let mut current_blocks: Vec<BlockSnapshot> = Vec::new();
+        let mut current_author: Option<String> = None;
+
+        for block in blocks {
+            if current_author.as_ref() != Some(&block.author) {
+                // Author changed - finalize previous turn
+                if !current_blocks.is_empty() {
+                    if let Some(author) = current_author.take() {
+                        let display_name = self
+                            .get_participant(&author)
+                            .map(|p| p.display_name.clone())
+                            .unwrap_or_else(|| author.clone());
+                        let timestamp = current_blocks[0].created_at;
+                        let block_ids = current_blocks.iter().map(|b| b.id.clone()).collect();
+
+                        turns.push(Turn {
+                            author,
+                            display_name,
+                            block_ids,
+                            blocks: std::mem::take(&mut current_blocks),
+                            timestamp,
+                        });
+                    }
+                }
+                current_author = Some(block.author.clone());
+            }
+            current_blocks.push(block);
+        }
+
+        // Finalize last turn
+        if !current_blocks.is_empty() {
+            if let Some(author) = current_author {
+                let display_name = self
+                    .get_participant(&author)
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| author.clone());
+                let timestamp = current_blocks[0].created_at;
+                let block_ids = current_blocks.iter().map(|b| b.id.clone()).collect();
+
+                turns.push(Turn {
+                    author,
+                    display_name,
+                    block_ids,
+                    blocks: current_blocks,
+                    timestamp,
+                });
+            }
+        }
+
+        turns
+    }
+
+    // =========================================================================
     // Internal
     // =========================================================================
 
@@ -464,5 +566,41 @@ mod tests {
         conv.add_mount(Mount::read_write("kernel-789", "/project"));
         assert_eq!(conv.mounts.len(), 2);
         assert_eq!(conv.get_mount("/project").unwrap().kernel_id, "kernel-789");
+    }
+
+    #[test]
+    fn test_compute_turns() {
+        let mut conv = Conversation::new("Test", "alice");
+        conv.add_participant(Participant::user("user:amy", "Amy"));
+        conv.add_participant(Participant::model("model:claude", "Claude", "anthropic", "claude-3-opus"));
+
+        // Empty conversation has no turns
+        assert!(conv.compute_turns().is_empty());
+
+        // Single user message = 1 turn
+        conv.add_text_message("user:amy", "Hello!");
+        let turns = conv.compute_turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].author, "user:amy");
+        assert_eq!(turns[0].display_name, "Amy");
+        assert_eq!(turns[0].block_count(), 1);
+        assert!(turns[0].is_user());
+
+        // Model responds = 2 turns
+        conv.add_thinking_message("model:claude", "Thinking...");
+        conv.add_text_message("model:claude", "Hi!");
+        let turns = conv.compute_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].author, "model:claude");
+        assert_eq!(turns[1].display_name, "Claude");
+        assert_eq!(turns[1].block_count(), 2); // thinking + text
+        assert!(turns[1].is_model());
+
+        // User responds again = 3 turns
+        conv.add_text_message("user:amy", "Thanks!");
+        let turns = conv.compute_turns();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].author, "user:amy");
+        assert_eq!(turns[2].block_count(), 1);
     }
 }

@@ -638,16 +638,26 @@ impl WorkspaceLayout {
 pub struct ConversationContainer;
 
 /// Marker for the fixed prompt input area at the bottom.
+///
+/// FUTURE: The prompt might become mobile - attaching to focused BlockCells
+/// for threaded reply workflows instead of being fixed at bottom.
 #[derive(Component)]
 pub struct PromptContainer;
 
 /// Marker for the prompt input cell (the editable text input at bottom).
 /// This cell captures input in INSERT mode and submits on Enter.
+///
+/// FUTURE: Input capabilities might move to BlockCells directly, or
+/// PromptCell could "attach" to a focused block for reply-to workflows.
+/// Current implementation uses legacy GlyphonText + TextAreaConfig rendering.
 #[derive(Component)]
 pub struct PromptCell;
 
-/// Marker for the main kernel/shell cell.
-/// This is the primary workspace cell that displays kernel output and shell interactions.
+/// Marker for the main conversation view cell.
+///
+/// NOTE: MainCell no longer renders directly - it holds the CellEditor
+/// (source of truth for content) while BlockCells handle per-block rendering.
+/// Kept as the "owner" entity for BlockCellContainer and TurnCellContainer.
 #[derive(Component)]
 pub struct MainCell;
 
@@ -702,5 +712,160 @@ impl ConversationScrollState {
     /// Scroll to the bottom of the content
     pub fn scroll_to_end(&mut self) {
         self.offset = self.max_offset();
+    }
+}
+
+// ============================================================================
+// BLOCK-ORIENTED UI COMPONENTS
+// ============================================================================
+//
+// ARCHITECTURE: Each conversation block becomes its own Bevy entity.
+// This enables per-block streaming, independent collapse/expand, and
+// future features like threaded replies.
+//
+// FUTURE DIRECTION:
+// - BlockCells may become focusable for "reply to this block" workflows
+// - Input area could attach to or follow the focused BlockCell
+// - Consider: BlockCell gaining PromptCell-like input capabilities
+// - Turn headers (TurnCell) group blocks by author for visual clarity
+//
+// Current state: BlockCells render read-only content. PromptCell handles input.
+
+/// Marker for a UI entity representing a single content block.
+///
+/// Each block in a conversation gets its own entity with independent:
+/// - TextBuffer for rendering
+/// - Layout positioning
+/// - Change tracking (for efficient streaming updates)
+///
+/// FUTURE: May gain focus/input capabilities for threaded conversations.
+#[derive(Component, Debug)]
+pub struct BlockCell {
+    /// The block ID this cell represents.
+    pub block_id: BlockId,
+    /// Last known content hash/version for dirty tracking.
+    pub last_render_version: u64,
+}
+
+impl BlockCell {
+    pub fn new(block_id: BlockId) -> Self {
+        Self {
+            block_id,
+            last_render_version: 0,
+        }
+    }
+}
+
+/// Container that tracks all BlockCell entities for a conversation view.
+///
+/// Attached to the entity that owns the conversation display (e.g., MainCell parent).
+#[derive(Component, Debug, Default)]
+pub struct BlockCellContainer {
+    /// Ordered list of BlockCell entities.
+    pub block_cells: Vec<Entity>,
+    /// Map from block ID to entity for fast lookup.
+    pub block_to_entity: std::collections::HashMap<BlockId, Entity>,
+}
+
+impl BlockCellContainer {
+    /// Add a new block cell.
+    pub fn add(&mut self, block_id: BlockId, entity: Entity) {
+        self.block_cells.push(entity);
+        self.block_to_entity.insert(block_id, entity);
+    }
+
+    /// Remove a block cell by entity.
+    pub fn remove(&mut self, entity: Entity) {
+        self.block_cells.retain(|e| *e != entity);
+        self.block_to_entity.retain(|_, e| *e != entity);
+    }
+
+    /// Get entity for a block ID.
+    pub fn get_entity(&self, block_id: &BlockId) -> Option<Entity> {
+        self.block_to_entity.get(block_id).copied()
+    }
+
+    /// Check if a block ID is already tracked.
+    pub fn contains(&self, block_id: &BlockId) -> bool {
+        self.block_to_entity.contains_key(block_id)
+    }
+}
+
+/// Computed layout for a block cell.
+#[derive(Component, Debug, Default)]
+pub struct BlockCellLayout {
+    /// Y position (top) relative to conversation content start.
+    pub y_offset: f32,
+    /// Computed height based on content.
+    pub height: f32,
+    /// Indentation level (for nested tool results).
+    pub indent_level: u32,
+}
+
+// ============================================================================
+// TURN UI COMPONENTS
+// ============================================================================
+
+/// Marker for a turn header entity in the conversation view.
+///
+/// Turn headers show author information and timestamp for a group of
+/// consecutive blocks from the same participant.
+#[derive(Component, Debug)]
+pub struct TurnCell {
+    /// Author ID (e.g., "user:amy", "model:claude").
+    pub author: String,
+    /// Display name for the author.
+    pub display_name: String,
+    /// Timestamp of the first block in this turn (Unix millis).
+    pub timestamp: u64,
+    /// Index of this turn in the conversation (0-based).
+    pub turn_index: usize,
+}
+
+impl TurnCell {
+    pub fn new(author: impl Into<String>, display_name: impl Into<String>, timestamp: u64, turn_index: usize) -> Self {
+        Self {
+            author: author.into(),
+            display_name: display_name.into(),
+            timestamp,
+            turn_index,
+        }
+    }
+
+    /// Check if this turn is from a user.
+    pub fn is_user(&self) -> bool {
+        self.author.starts_with("user:")
+    }
+
+    /// Check if this turn is from a model.
+    pub fn is_model(&self) -> bool {
+        self.author.starts_with("model:")
+    }
+
+    /// Format timestamp for display (simple HH:MM format).
+    pub fn formatted_time(&self) -> String {
+        // Convert Unix millis to seconds since epoch
+        let secs = self.timestamp / 1000;
+        // Simple UTC time (no timezone conversion to avoid chrono dependency)
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        format!("{:02}:{:02}", hours, mins)
+    }
+}
+
+/// Container tracking TurnCell entities for a conversation view.
+#[derive(Component, Debug, Default)]
+pub struct TurnCellContainer {
+    /// Ordered list of TurnCell entities.
+    pub turn_cells: Vec<Entity>,
+}
+
+impl TurnCellContainer {
+    pub fn add(&mut self, entity: Entity) {
+        self.turn_cells.push(entity);
+    }
+
+    pub fn clear(&mut self) {
+        self.turn_cells.clear();
     }
 }

@@ -60,16 +60,16 @@ impl Plugin for CellPlugin {
                     systems::handle_scroll_input,
                 ),
             )
-            // Layout and rendering
-            // sync_cell_buffers must run after:
-            // - init_cell_buffers (TextBuffer exists)
-            // - handle_cell_input (CellEditor updated with typed text)
-            // - sync_main_cell_to_conversation (CellEditor updated from conversation)
+            // Layout and rendering for PromptCell
+            // NOTE: MainCell no longer uses legacy rendering - BlockCell system handles it
+            // These systems now only affect PromptCell (the input area at bottom)
             .add_systems(
                 Update,
                 (
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
+                    // layout_main_cell is dead code - MainCell has no TextAreaConfig
+                    // Kept for now in case we need it for something else
                     systems::layout_main_cell,
                     systems::layout_prompt_cell_position,
                     systems::sync_cell_buffers
@@ -77,6 +77,38 @@ impl Plugin for CellPlugin {
                         .after(systems::handle_cell_input)
                         .after(systems::sync_main_cell_to_conversation),
                     systems::highlight_focused_cell,
+                ),
+            )
+            // Block cell systems (per-block UI rendering for conversation)
+            // Each block gets its own entity with independent TextBuffer
+            .add_systems(
+                Update,
+                (
+                    systems::spawn_block_cells
+                        .after(systems::sync_main_cell_to_conversation),
+                    systems::init_block_cell_buffers
+                        .after(systems::spawn_block_cells),
+                    systems::sync_block_cell_buffers
+                        .after(systems::init_block_cell_buffers)
+                        .after(systems::handle_cell_input),
+                    systems::layout_block_cells
+                        .after(systems::sync_block_cell_buffers),
+                    systems::apply_block_cell_positions
+                        .after(systems::layout_block_cells),
+                ),
+            )
+            // Turn header systems (conversation turn grouping)
+            .add_systems(
+                Update,
+                (
+                    systems::spawn_turn_headers
+                        .after(systems::spawn_block_cells),
+                    systems::init_turn_cell_buffers
+                        .after(systems::spawn_turn_headers),
+                    systems::layout_turn_headers
+                        .after(systems::layout_block_cells),
+                    systems::apply_turn_cell_positions
+                        .after(systems::layout_turn_headers),
                 ),
             )
             // Collapse/expand for thinking blocks

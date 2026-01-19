@@ -206,19 +206,24 @@ impl BlockDocument {
                     let name = map.get(&SmartString::from("name"))
                         .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
                         .unwrap_or_default();
-                    let input = map.get(&SmartString::from("input"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() {
-                            serde_json::from_str(s).ok()
-                        } else { None })
-                        .unwrap_or(serde_json::Value::Null);
+                    // Read input from Text CRDT, parse as JSON
+                    let input_text = map.get(&SmartString::from("content"))
+                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let input = if input_text.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_str(&input_text).unwrap_or(serde_json::Value::Null)
+                    };
                     BlockContentSnapshot::ToolUse { id: tool_id, name, input }
                 }
                 "tool_result" => {
                     let tool_use_id = map.get(&SmartString::from("tool_use_id"))
                         .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
                         .unwrap_or_default();
+                    // Read content from Text CRDT
                     let content = map.get(&SmartString::from("content"))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
                         .unwrap_or_default();
                     let is_error = map.get(&SmartString::from("is_error"))
                         .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
@@ -564,13 +569,17 @@ impl BlockDocument {
                     "name",
                     CreateValue::Primitive(Primitive::Str(SmartString::from(name.as_str()))),
                 );
+                // Store input as Text CRDT for streaming support
                 let input_json = serde_json::to_string(input).unwrap_or_default();
-                self.oplog.local_map_set(
+                let text_lv = self.oplog.local_map_set(
                     self.agent,
                     block_map_lv,
-                    "input",
-                    CreateValue::Primitive(Primitive::Str(SmartString::from(input_json.as_str()))),
+                    "content",
+                    CreateValue::NewCRDT(CRDTKind::Text),
                 );
+                if !input_json.is_empty() {
+                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, &input_json));
+                }
             }
             BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
                 self.oplog.local_map_set(
@@ -585,12 +594,16 @@ impl BlockDocument {
                     "tool_use_id",
                     CreateValue::Primitive(Primitive::Str(SmartString::from(tool_use_id.as_str()))),
                 );
-                self.oplog.local_map_set(
+                // Store content as Text CRDT for streaming support
+                let text_lv = self.oplog.local_map_set(
                     self.agent,
                     block_map_lv,
                     "content",
-                    CreateValue::Primitive(Primitive::Str(SmartString::from(content.as_str()))),
+                    CreateValue::NewCRDT(CRDTKind::Text),
                 );
+                if !content.is_empty() {
+                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, content));
+                }
                 self.oplog.local_map_set(
                     self.agent,
                     block_map_lv,
@@ -646,6 +659,11 @@ impl BlockDocument {
     }
 
     /// Edit text within a block.
+    ///
+    /// All block types support text editing via their `content` Text CRDT:
+    /// - Thinking/Text: Direct text content
+    /// - ToolUse: JSON input as text (enables streaming)
+    /// - ToolResult: Result content as text (enables streaming)
     pub fn edit_text(
         &mut self,
         id: &BlockId,
@@ -653,17 +671,12 @@ impl BlockDocument {
         insert: &str,
         delete: usize,
     ) -> Result<()> {
-        // Get block type to check if editable
-        let snapshot = self.get_block_snapshot(id)
+        // Verify block exists
+        let _snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        let block_type = snapshot.content.block_type();
-        if block_type.is_immutable() {
-            return Err(CrdtError::ImmutableBlock(id.clone()));
-        }
-
         let text_lv = self.get_block_text_lv(id)
-            .ok_or_else(|| CrdtError::ImmutableBlock(id.clone()))?;
+            .ok_or_else(|| CrdtError::Internal(format!("block {} has no text CRDT", id)))?;
 
         // Get current length
         let current_text = self.oplog.checkout_text(text_lv);
@@ -702,12 +715,14 @@ impl BlockDocument {
     }
 
     /// Set collapsed state of a thinking block.
+    ///
+    /// Only Thinking blocks support the collapsed state.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
         let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
         if !matches!(snapshot.content, BlockContentSnapshot::Thinking { .. }) {
-            return Err(CrdtError::ImmutableBlock(id.clone()));
+            return Err(CrdtError::UnsupportedOperation(id.clone()));
         }
 
         let block_key = format!("block:{}", id.to_key());
@@ -886,11 +901,45 @@ mod tests {
     }
 
     #[test]
-    fn test_immutable_blocks() {
+    fn test_tool_use_block_editable() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        let tool_id = doc.insert_tool_use(None, "tool-1", "read_file", serde_json::json!({})).unwrap();
-        let result = doc.edit_text(&tool_id, 0, "edit", 0);
-        assert!(result.is_err());
+        // Create tool use with JSON input
+        let tool_id = doc.insert_tool_use(None, "tool-1", "read_file", serde_json::json!({"path": "/foo"})).unwrap();
+
+        // Verify initial content
+        let snapshot = doc.get_block_snapshot(&tool_id).unwrap();
+        if let BlockContentSnapshot::ToolUse { input, .. } = &snapshot.content {
+            assert_eq!(input["path"], "/foo");
+        } else {
+            panic!("Expected ToolUse");
+        }
+
+        // Tool use content IS now editable (for streaming)
+        // Note: This appends to the JSON string, potentially making it invalid JSON
+        // In practice, streaming would build up valid JSON incrementally
+        let result = doc.edit_text(&tool_id, 0, "", 0); // No-op edit
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tool_result_streaming() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        // Create empty tool result (simulating streaming start)
+        let result_id = doc.insert_tool_result(None, "tool-1", "", false).unwrap();
+
+        // Stream content incrementally
+        doc.append_text(&result_id, "Line 1\n").unwrap();
+        doc.append_text(&result_id, "Line 2\n").unwrap();
+        doc.append_text(&result_id, "Line 3").unwrap();
+
+        // Verify streamed content
+        let snapshot = doc.get_block_snapshot(&result_id).unwrap();
+        if let BlockContentSnapshot::ToolResult { content, .. } = &snapshot.content {
+            assert_eq!(content, "Line 1\nLine 2\nLine 3");
+        } else {
+            panic!("Expected ToolResult");
+        }
     }
 }

@@ -11,8 +11,15 @@ pub enum CrdtError {
     #[error("block not found: {0:?}")]
     BlockNotFound(BlockId),
 
-    /// Attempted to edit an immutable block type.
-    #[error("block {0:?} is immutable (ToolUse or ToolResult)")]
+    /// Operation not supported on this block type.
+    ///
+    /// For example, collapse is only supported on Thinking blocks.
+    #[error("operation not supported on block {0:?}")]
+    UnsupportedOperation(BlockId),
+
+    /// Attempted to edit a block without a Text CRDT content field.
+    #[deprecated(note = "All block types now support Text CRDT - this error should not occur")]
+    #[error("block {0:?} has no editable content")]
     ImmutableBlock(BlockId),
 
     /// Edit position out of bounds.

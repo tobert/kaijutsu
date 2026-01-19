@@ -8,15 +8,17 @@
 //! Content is structured as blocks, not flat text. This enables:
 //! - Structured streaming (thinking → text → tool_use as separate blocks)
 //! - Collapsible UI elements (thinking blocks collapse when complete)
-//! - Immutable blocks (ToolUse/ToolResult never edited after creation)
+//! - Streamable tool blocks (ToolUse/ToolResult content via Text CRDT)
 //! - Clean paragraph-level collaboration
 //!
 //! # Block Types
 //!
+//! All block types support Text CRDT for their primary content, enabling streaming:
+//!
 //! - **Thinking**: Extended reasoning with text CRDT, collapsible
 //! - **Text**: Main response text with text CRDT
-//! - **ToolUse**: Immutable tool invocation
-//! - **ToolResult**: Immutable tool result
+//! - **ToolUse**: Tool invocation with streamable JSON input
+//! - **ToolResult**: Tool result with streamable content
 //!
 //! # CRDT Semantics
 //!
@@ -86,25 +88,43 @@ mod tests {
     }
 
     #[test]
-    fn test_document_immutable_blocks() {
+    fn test_tool_blocks_are_editable() {
         let mut doc = BlockDocument::new("test-cell", "alice");
 
-        // Tool use is immutable
+        // Tool use is now editable (supports streaming)
         let tool_id = doc
             .insert_tool_use(None, "tool-123", "read_file", serde_json::json!({"path": "/test"}))
             .unwrap();
 
-        // Editing tool use should fail
-        let result = doc.edit_text(&tool_id, 0, "new text", 0);
-        assert!(result.is_err());
+        // Editing tool use content should succeed (appending to JSON)
+        let result = doc.append_text(&tool_id, ", \"extra\": true}");
+        assert!(result.is_ok());
 
-        // Tool result is also immutable
+        // Verify the content changed
+        let snapshot = doc.get_block_snapshot(&tool_id).unwrap();
+        if let BlockContentSnapshot::ToolUse { .. } = snapshot.content {
+            // The appended text modifies the JSON string in the Text CRDT
+            // Text CRDT contains the concatenated content
+            assert!(matches!(snapshot.content, BlockContentSnapshot::ToolUse { .. }));
+        } else {
+            panic!("Expected ToolUse block");
+        }
+
+        // Tool result is also editable (supports streaming)
         let result_id = doc
             .insert_tool_result(Some(&tool_id), "tool-123", "file contents", false)
             .unwrap();
 
-        let result = doc.edit_text(&result_id, 0, "new text", 0);
-        assert!(result.is_err());
+        // Edit tool result content
+        doc.append_text(&result_id, "\nmore output").unwrap();
+
+        let snapshot = doc.get_block_snapshot(&result_id).unwrap();
+        if let BlockContentSnapshot::ToolResult { content, .. } = snapshot.content {
+            assert!(content.contains("file contents"));
+            assert!(content.contains("more output"));
+        } else {
+            panic!("Expected ToolResult block");
+        }
     }
 
     #[test]

@@ -419,6 +419,14 @@ pub fn highlight_focused_cell(
 }
 
 /// Click to focus a cell.
+///
+/// FUTURE: This system will evolve to support threaded conversations:
+/// - Clicking a BlockCell could focus it for reply (input follows focus)
+/// - Input area might "attach" to the focused block or move on-screen
+/// - Consider: FocusedCell vs ActiveThread vs ReplyTarget as separate concepts
+///
+/// For now: Any cell with TextAreaConfig can receive focus.
+/// The cursor renders at the focused cell's position.
 pub fn click_to_focus(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
@@ -1006,6 +1014,9 @@ pub fn spawn_main_cell(
     // Initial welcome message
     let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
 
+    // NOTE: MainCell does NOT get GlyphonText/TextAreaConfig.
+    // The BlockCell system handles per-block rendering.
+    // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
         .spawn((
             cell,
@@ -1015,8 +1026,6 @@ pub fn spawn_main_cell(
                 collapsed: false,
             },
             CellPosition::new(0),
-            GlyphonText,
-            TextAreaConfig::default(),
             MainCell,
         ))
         .id();
@@ -1163,4 +1172,596 @@ pub fn sync_main_cell_to_conversation(
         "Synced MainCell to conversation {} (version {})",
         conv_id, conv_version
     );
+}
+
+// ============================================================================
+// BLOCK CELL SYSTEMS (Per-Block UI Rendering)
+// ============================================================================
+
+use super::components::{BlockCell, BlockCellContainer, BlockCellLayout, TurnCell, TurnCellContainer};
+
+/// Format a single block for display.
+///
+/// Returns the formatted text for one block, including visual markers.
+pub fn format_single_block(block: &BlockSnapshot) -> String {
+    match &block.content {
+        BlockContentSnapshot::Thinking { collapsed, .. } => {
+            if *collapsed {
+                "💭 [Thinking collapsed - Tab to expand]".to_string()
+            } else {
+                format!(
+                    "💭 ─── Thinking ───\n{}\n───────────────────",
+                    block.content.text()
+                )
+            }
+        }
+        BlockContentSnapshot::Text { .. } => block.content.text().to_string(),
+        BlockContentSnapshot::ToolUse { name, input, .. } => {
+            let mut output = format!("🔧 Tool: {}\n", name);
+            if let Ok(pretty) = serde_json::to_string_pretty(input) {
+                output.push_str(&pretty);
+            } else {
+                output.push_str(&input.to_string());
+            }
+            output
+        }
+        BlockContentSnapshot::ToolResult {
+            content, is_error, ..
+        } => {
+            if *is_error {
+                format!("❌ Error:\n{}", content)
+            } else {
+                format!("📤 Result:\n{}", content)
+            }
+        }
+    }
+}
+
+/// Spawn or update BlockCell entities to match the MainCell's BlockDocument.
+///
+/// This system diffs the current block IDs against existing BlockCell entities:
+/// - Spawns new BlockCells for added blocks
+/// - Despawns BlockCells for removed blocks
+/// - Maintains order in BlockCellContainer
+pub fn spawn_block_cells(
+    mut commands: Commands,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    mut containers: Query<&mut BlockCellContainer>,
+    block_cells: Query<(Entity, &BlockCell)>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    // Get or create the BlockCellContainer
+    let mut container = if let Ok(c) = containers.get_mut(main_ent) {
+        c
+    } else {
+        // Add container to the main cell
+        commands.entity(main_ent).insert(BlockCellContainer::default());
+        return; // Will run again next frame with the container
+    };
+
+    // Get current block IDs from the document
+    let current_blocks: Vec<_> = editor.blocks().iter().map(|b| b.id.clone()).collect();
+    let current_ids: std::collections::HashSet<_> = current_blocks.iter().collect();
+
+    // Find blocks to remove (in container but not in document)
+    let to_remove: Vec<_> = container
+        .block_to_entity
+        .iter()
+        .filter(|(id, _)| !current_ids.contains(id))
+        .map(|(_, e)| *e)
+        .collect();
+
+    for entity in to_remove {
+        commands.entity(entity).try_despawn();
+        container.remove(entity);
+    }
+
+    // Find blocks to add (in document but not in container)
+    for block_id in &current_blocks {
+        if !container.contains(block_id) {
+            // Spawn new BlockCell
+            let entity = commands
+                .spawn((
+                    BlockCell::new(block_id.clone()),
+                    BlockCellLayout::default(),
+                    GlyphonText,
+                    TextAreaConfig::default(),
+                ))
+                .id();
+            container.add(block_id.clone(), entity);
+        }
+    }
+
+    // Reorder container.block_cells to match document order
+    let mut new_order = Vec::with_capacity(current_blocks.len());
+    for block_id in &current_blocks {
+        if let Some(entity) = container.get_entity(block_id) {
+            new_order.push(entity);
+        }
+    }
+    container.block_cells = new_order;
+}
+
+/// Initialize TextBuffers for BlockCells that don't have one.
+pub fn init_block_cell_buffers(
+    mut commands: Commands,
+    block_cells: Query<Entity, (With<BlockCell>, With<GlyphonText>, Without<TextBuffer>)>,
+    font_system: Res<SharedFontSystem>,
+) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    for entity in block_cells.iter() {
+        let metrics = glyphon::Metrics::new(16.0, 20.0);
+        let buffer = TextBuffer::new(&mut font_system, metrics);
+        commands.entity(entity).insert(buffer);
+    }
+}
+
+/// Sync BlockCell TextBuffers with their corresponding block content.
+///
+/// Only updates cells whose content has changed (tracked via version).
+pub fn sync_block_cell_buffers(
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, (With<MainCell>, Changed<CellEditor>)>,
+    containers: Query<&BlockCellContainer>,
+    mut block_cells: Query<(&mut BlockCell, &mut TextBuffer)>,
+    font_system: Res<SharedFontSystem>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    // Only run when the main cell editor changes
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    let doc_version = editor.version();
+
+    // Get all blocks for lookup
+    let blocks: std::collections::HashMap<_, _> = editor
+        .blocks()
+        .into_iter()
+        .map(|b| (b.id.clone(), b))
+        .collect();
+
+    for entity in &container.block_cells {
+        let Ok((mut block_cell, mut buffer)) = block_cells.get_mut(*entity) else {
+            continue;
+        };
+
+        // Check if this block needs updating
+        if block_cell.last_render_version >= doc_version {
+            continue;
+        }
+
+        let Some(block) = blocks.get(&block_cell.block_id) else {
+            continue;
+        };
+
+        // Format and update the buffer
+        let text = format_single_block(block);
+        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        buffer.set_text(&mut font_system, &text, &attrs, glyphon::Shaping::Advanced);
+
+        block_cell.last_render_version = doc_version;
+    }
+}
+
+/// Layout BlockCells vertically within the conversation area.
+///
+/// Computes heights and positions for each block, accounting for:
+/// - Block content height
+/// - Spacing between blocks
+/// - Indentation for nested tool results
+/// - Space for turn headers before first block of each turn
+pub fn layout_block_cells(
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &TextBuffer)>,
+    layout: Res<WorkspaceLayout>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+    registry: Res<ConversationRegistry>,
+    current: Res<CurrentConversation>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    const BLOCK_SPACING: f32 = 16.0;
+    const TURN_HEADER_HEIGHT: f32 = 28.0;
+    const TURN_HEADER_SPACING: f32 = 8.0;
+    let mut y_offset = 0.0;
+
+    // Get blocks for tool_use_id lookup (for nesting)
+    let blocks: std::collections::HashMap<_, _> = editor
+        .blocks()
+        .into_iter()
+        .map(|b| (b.id.clone(), b))
+        .collect();
+
+    // Build a map of tool_use_id -> ToolUse block_id for nesting
+    let mut tool_use_ids: std::collections::HashMap<String, kaijutsu_crdt::BlockId> =
+        std::collections::HashMap::new();
+    for block in blocks.values() {
+        if let BlockContentSnapshot::ToolUse { id, .. } = &block.content {
+            tool_use_ids.insert(id.clone(), block.id.clone());
+        }
+    }
+
+    // Build turn info: map block_id to (turn_index, is_first_in_turn)
+    let mut block_turn_info: std::collections::HashMap<kaijutsu_crdt::BlockId, (usize, bool)> =
+        std::collections::HashMap::new();
+    if let Some(conv_id) = current.id() {
+        if let Some(conv) = registry.get(conv_id) {
+            for (turn_idx, turn) in conv.compute_turns().iter().enumerate() {
+                for (block_idx, block_id) in turn.block_ids.iter().enumerate() {
+                    block_turn_info.insert(block_id.clone(), (turn_idx, block_idx == 0));
+                }
+            }
+        }
+    }
+
+    for entity in &container.block_cells {
+        let Ok((block_cell, mut block_layout, buffer)) = block_cells.get_mut(*entity) else {
+            continue;
+        };
+
+        // Check if this is the first block of a turn - if so, add space for turn header
+        if let Some(&(_, is_first)) = block_turn_info.get(&block_cell.block_id) {
+            if is_first {
+                y_offset += TURN_HEADER_HEIGHT + TURN_HEADER_SPACING;
+            }
+        }
+
+        // Determine indentation level
+        let indent_level = if let Some(block) = blocks.get(&block_cell.block_id) {
+            if let BlockContentSnapshot::ToolResult { tool_use_id, .. } = &block.content {
+                // ToolResult nested under ToolUse
+                if tool_use_ids.contains_key(tool_use_id) {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Compute height from buffer line count
+        let line_count = buffer.buffer().lines.len().max(1);
+        let height = layout.height_for_lines(line_count);
+
+        block_layout.y_offset = y_offset;
+        block_layout.height = height;
+        block_layout.indent_level = indent_level;
+
+        y_offset += height + BLOCK_SPACING;
+    }
+
+    // Update scroll state with total content height
+    scroll_state.content_height = y_offset;
+}
+
+/// Apply layout positions to BlockCell TextAreaConfig for rendering.
+pub fn apply_block_cell_positions(
+    main_entity: Res<MainCellEntity>,
+    containers: Query<&BlockCellContainer>,
+    mut block_cells: Query<(&BlockCellLayout, &mut TextAreaConfig), With<BlockCell>>,
+    layout: Res<WorkspaceLayout>,
+    scroll_state: Res<ConversationScrollState>,
+    windows: Query<&Window>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let (window_width, window_height) = windows
+        .iter()
+        .next()
+        .map(|w| (w.resolution.width(), w.resolution.height()))
+        .unwrap_or((1280.0, 800.0));
+
+    // Visible area
+    let visible_top = layout.workspace_margin_top;
+    let visible_bottom = window_height - layout.prompt_area_height;
+    let margin = layout.workspace_margin_left;
+    let base_width = window_width - (margin * 2.0);
+    const INDENT_WIDTH: f32 = 32.0;
+
+    let scroll_offset = scroll_state.offset;
+
+    for entity in &container.block_cells {
+        let Ok((block_layout, mut config)) = block_cells.get_mut(*entity) else {
+            continue;
+        };
+
+        // Calculate actual position with scroll
+        let indent = block_layout.indent_level as f32 * INDENT_WIDTH;
+        let left = margin + indent;
+        let width = base_width - indent;
+        let content_top = visible_top + block_layout.y_offset - scroll_offset;
+
+        config.left = left;
+        config.top = content_top;
+        config.scale = 1.0;
+
+        // Bounds are the fixed visible clipping window
+        config.bounds = glyphon::TextBounds {
+            left: left as i32,
+            top: visible_top as i32,
+            right: (left + width) as i32,
+            bottom: visible_bottom as i32,
+        };
+    }
+}
+
+// ============================================================================
+// TURN HEADER SYSTEMS
+// ============================================================================
+
+/// Computed layout for a turn header.
+#[derive(Component, Debug, Default)]
+pub struct TurnCellLayout {
+    /// Y position (top) relative to conversation content start.
+    pub y_offset: f32,
+    /// Height of the turn header.
+    pub height: f32,
+}
+
+/// Spawn or update TurnCell entities to match conversation turns.
+///
+/// Turns are computed from consecutive blocks by the same author.
+/// Each turn gets a header showing author name and timestamp.
+pub fn spawn_turn_headers(
+    mut commands: Commands,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    mut turn_containers: Query<&mut TurnCellContainer>,
+    registry: Res<ConversationRegistry>,
+    current: Res<CurrentConversation>,
+    _existing_turns: Query<(Entity, &TurnCell)>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    // Verify main cell exists
+    let Ok(_editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    // Get conversation to compute turns
+    let Some(conv_id) = current.id() else {
+        return;
+    };
+    let Some(conv) = registry.get(conv_id) else {
+        return;
+    };
+
+    // Get or create the TurnCellContainer
+    let mut container = if let Ok(c) = turn_containers.get_mut(main_ent) {
+        c
+    } else {
+        commands.entity(main_ent).insert(TurnCellContainer::default());
+        return; // Will run again next frame with the container
+    };
+
+    // Compute turns from conversation
+    let turns = conv.compute_turns();
+
+    // For now, simple approach: clear and rebuild if turn count changed
+    // (In future, could diff more precisely)
+    let current_count = container.turn_cells.len();
+    if current_count != turns.len() {
+        // Despawn existing turn cells
+        for entity in container.turn_cells.drain(..) {
+            commands.entity(entity).try_despawn();
+        }
+
+        // Spawn new turn cells
+        for (idx, turn) in turns.iter().enumerate() {
+            let entity = commands
+                .spawn((
+                    TurnCell::new(
+                        turn.author.clone(),
+                        turn.display_name.clone(),
+                        turn.timestamp,
+                        idx,
+                    ),
+                    TurnCellLayout::default(),
+                    GlyphonText,
+                    TextAreaConfig::default(),
+                ))
+                .id();
+            container.add(entity);
+        }
+    }
+}
+
+/// Initialize TextBuffers for TurnCells that don't have one.
+pub fn init_turn_cell_buffers(
+    mut commands: Commands,
+    turn_cells: Query<(Entity, &TurnCell), (With<GlyphonText>, Without<TextBuffer>)>,
+    font_system: Res<SharedFontSystem>,
+) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    for (entity, turn) in turn_cells.iter() {
+        let metrics = glyphon::Metrics::new(14.0, 18.0); // Slightly smaller for headers
+        let mut buffer = TextBuffer::new(&mut font_system, metrics);
+
+        // Format turn header: "@DisplayName  HH:MM"
+        let header_text = format!("@{} · {}", turn.display_name, turn.formatted_time());
+        let attrs = glyphon::Attrs::new()
+            .family(glyphon::Family::SansSerif)
+            .weight(glyphon::Weight::BOLD);
+        buffer.set_text(&mut font_system, &header_text, &attrs, glyphon::Shaping::Advanced);
+
+        commands.entity(entity).insert(buffer);
+    }
+}
+
+/// Layout turn headers interleaved with blocks.
+///
+/// This needs to coordinate with block layout to position turn headers
+/// above their corresponding blocks.
+pub fn layout_turn_headers(
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+    turn_containers: Query<&TurnCellContainer>,
+    block_cells: Query<(&BlockCell, &BlockCellLayout)>,
+    mut turn_cells: Query<(&TurnCell, &mut TurnCellLayout)>,
+    registry: Res<ConversationRegistry>,
+    current: Res<CurrentConversation>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(_editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Ok(block_container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let Ok(turn_container) = turn_containers.get(main_ent) else {
+        return;
+    };
+
+    let Some(conv_id) = current.id() else {
+        return;
+    };
+    let Some(conv) = registry.get(conv_id) else {
+        return;
+    };
+
+    // Compute turns to get block->turn mapping
+    let turns = conv.compute_turns();
+
+    // Map block_id to turn index
+    let mut block_to_turn: std::collections::HashMap<kaijutsu_crdt::BlockId, usize> =
+        std::collections::HashMap::new();
+    for (turn_idx, turn) in turns.iter().enumerate() {
+        for block_id in &turn.block_ids {
+            block_to_turn.insert(block_id.clone(), turn_idx);
+        }
+    }
+
+    // Find the first block of each turn and position turn header just above it
+    let mut first_block_of_turn: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
+
+    for entity in &block_container.block_cells {
+        let Ok((block_cell, block_layout)) = block_cells.get(*entity) else {
+            continue;
+        };
+
+        if let Some(&turn_idx) = block_to_turn.get(&block_cell.block_id) {
+            first_block_of_turn.entry(turn_idx).or_insert(block_layout.y_offset);
+        }
+    }
+
+    const TURN_HEADER_HEIGHT: f32 = 28.0;
+
+    // Position each turn header
+    for entity in &turn_container.turn_cells {
+        let Ok((turn_cell, mut turn_layout)) = turn_cells.get_mut(*entity) else {
+            continue;
+        };
+
+        if let Some(&block_y) = first_block_of_turn.get(&turn_cell.turn_index) {
+            // Position header just above the first block of this turn
+            // Note: This assumes block layout already accounts for turn header space
+            turn_layout.y_offset = block_y - TURN_HEADER_HEIGHT;
+            turn_layout.height = TURN_HEADER_HEIGHT;
+        }
+    }
+}
+
+/// Apply layout positions to TurnCell TextAreaConfig for rendering.
+pub fn apply_turn_cell_positions(
+    main_entity: Res<MainCellEntity>,
+    turn_containers: Query<&TurnCellContainer>,
+    mut turn_cells: Query<(&TurnCellLayout, &mut TextAreaConfig), With<TurnCell>>,
+    layout: Res<WorkspaceLayout>,
+    scroll_state: Res<ConversationScrollState>,
+    windows: Query<&Window>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(container) = turn_containers.get(main_ent) else {
+        return;
+    };
+
+    let (window_width, window_height) = windows
+        .iter()
+        .next()
+        .map(|w| (w.resolution.width(), w.resolution.height()))
+        .unwrap_or((1280.0, 800.0));
+
+    let visible_top = layout.workspace_margin_top;
+    let visible_bottom = window_height - layout.prompt_area_height;
+    let margin = layout.workspace_margin_left;
+    let base_width = window_width - (margin * 2.0);
+    let scroll_offset = scroll_state.offset;
+
+    for entity in &container.turn_cells {
+        let Ok((turn_layout, mut config)) = turn_cells.get_mut(*entity) else {
+            continue;
+        };
+
+        let content_top = visible_top + turn_layout.y_offset - scroll_offset;
+
+        config.left = margin;
+        config.top = content_top;
+        config.scale = 1.0;
+
+        config.bounds = glyphon::TextBounds {
+            left: margin as i32,
+            top: visible_top as i32,
+            right: (margin + base_width) as i32,
+            bottom: visible_bottom as i32,
+        };
+    }
 }
