@@ -28,43 +28,8 @@
 //! conv.add_text_message("model:claude", "I can help with that!");
 //! ```
 
-use kaijutsu_crdt::{BlockDocument, BlockId, BlockSnapshot};
+use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, Role};
 use serde::{Deserialize, Serialize};
-
-/// A turn is a group of consecutive blocks from the same author.
-///
-/// Turns are a derived view for UI presentation. They group messages
-/// to show conversation flow with author headers and timestamps.
-#[derive(Clone, Debug)]
-pub struct Turn {
-    /// Author ID (e.g., "user:amy", "model:claude").
-    pub author: String,
-    /// Display name for the author.
-    pub display_name: String,
-    /// Block IDs in this turn, in order.
-    pub block_ids: Vec<BlockId>,
-    /// Block snapshots in this turn (for convenience).
-    pub blocks: Vec<BlockSnapshot>,
-    /// Timestamp of the first block (Unix millis).
-    pub timestamp: u64,
-}
-
-impl Turn {
-    /// Check if this turn is from a user.
-    pub fn is_user(&self) -> bool {
-        self.author.starts_with("user:")
-    }
-
-    /// Check if this turn is from a model.
-    pub fn is_model(&self) -> bool {
-        self.author.starts_with("model:")
-    }
-
-    /// Get the number of blocks in this turn.
-    pub fn block_count(&self) -> usize {
-        self.block_ids.len()
-    }
-}
 
 /// A conversation with participants and resource access.
 ///
@@ -88,11 +53,6 @@ pub struct Conversation {
     pub created_at: u64,
     /// When the conversation was last updated (Unix millis).
     pub updated_at: u64,
-
-    /// Cached turns (computed from blocks grouped by author).
-    pub(crate) cached_turns: Vec<Turn>,
-    /// Document version when turns were last computed.
-    pub(crate) turns_cache_version: u64,
 }
 
 impl std::fmt::Debug for Conversation {
@@ -128,8 +88,6 @@ impl Conversation {
             mounts: Vec::new(),
             created_at: now,
             updated_at: now,
-            cached_turns: Vec::new(),
-            turns_cache_version: 0,
         }
     }
 
@@ -151,8 +109,6 @@ impl Conversation {
             mounts: Vec::new(),
             created_at: now,
             updated_at: now,
-            cached_turns: Vec::new(),
-            turns_cache_version: 0,
         }
     }
 
@@ -217,8 +173,9 @@ impl Conversation {
     /// The author must be a participant in the conversation.
     pub fn add_text_message(&mut self, author: &str, text: impl Into<String>) -> Option<BlockId> {
         let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
+        let role = if author.starts_with("user:") { Role::User } else { Role::Model };
         let block_id = self.doc
-            .insert_text_block_with_author(last_id.as_ref(), text, author)
+            .insert_block(None, last_id.as_ref(), role, BlockKind::Text, text, author)
             .ok()?;
         self.touch();
         Some(block_id)
@@ -228,39 +185,41 @@ impl Conversation {
     pub fn add_thinking_message(&mut self, author: &str, text: impl Into<String>) -> Option<BlockId> {
         let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
         let block_id = self.doc
-            .insert_thinking_block_with_author(last_id.as_ref(), text, author)
+            .insert_block(None, last_id.as_ref(), Role::Model, BlockKind::Thinking, text, author)
             .ok()?;
         self.touch();
         Some(block_id)
     }
 
-    /// Add a tool use block to the conversation.
-    pub fn add_tool_use(
+    /// Add a tool call block to the conversation.
+    pub fn add_tool_call(
         &mut self,
         author: &str,
-        tool_id: impl Into<String>,
         name: impl Into<String>,
         input: serde_json::Value,
     ) -> Option<BlockId> {
         let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
         let block_id = self.doc
-            .insert_tool_use_with_author(last_id.as_ref(), tool_id, name, input, author)
+            .insert_tool_call(None, last_id.as_ref(), name, input, author)
             .ok()?;
         self.touch();
         Some(block_id)
     }
 
     /// Add a tool result block to the conversation.
+    ///
+    /// The tool_call_id should be the BlockId of the tool call this is a result for.
     pub fn add_tool_result(
         &mut self,
-        author: &str,
-        tool_use_id: impl Into<String>,
+        tool_call_id: &BlockId,
         content: impl Into<String>,
         is_error: bool,
+        exit_code: Option<i32>,
+        author: &str,
     ) -> Option<BlockId> {
         let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
         let block_id = self.doc
-            .insert_tool_result_with_author(last_id.as_ref(), tool_use_id, content, is_error, author)
+            .insert_tool_result_block(tool_call_id, last_id.as_ref(), content, is_error, exit_code, author)
             .ok()?;
         self.touch();
         Some(block_id)
@@ -298,84 +257,6 @@ impl Conversation {
     /// Get the full text content of the conversation.
     pub fn full_text(&self) -> String {
         self.doc.full_text()
-    }
-
-    // =========================================================================
-    // Turn Grouping
-    // =========================================================================
-
-    /// Get turns with lazy cache invalidation.
-    ///
-    /// Returns cached turns if the document version hasn't changed,
-    /// otherwise recomputes and caches the result.
-    pub fn turns(&mut self) -> &[Turn] {
-        let current_version = self.doc.version();
-        if self.turns_cache_version != current_version {
-            self.cached_turns = self.compute_turns();
-            self.turns_cache_version = current_version;
-        }
-        &self.cached_turns
-    }
-
-    /// Compute turns (groups of consecutive blocks by the same author).
-    ///
-    /// Turns are a derived view - they're computed from blocks, not stored.
-    /// This enables visual grouping in the UI with turn headers showing author/timestamp.
-    pub fn compute_turns(&self) -> Vec<Turn> {
-        let blocks = self.doc.blocks_ordered();
-        if blocks.is_empty() {
-            return Vec::new();
-        }
-
-        let mut turns = Vec::new();
-        let mut current_blocks: Vec<BlockSnapshot> = Vec::new();
-        let mut current_author: Option<String> = None;
-
-        for block in blocks {
-            if current_author.as_ref() != Some(&block.author) {
-                // Author changed - finalize previous turn
-                if !current_blocks.is_empty()
-                    && let Some(author) = current_author.take() {
-                        let display_name = self
-                            .get_participant(&author)
-                            .map(|p| p.display_name.clone())
-                            .unwrap_or_else(|| author.clone());
-                        let timestamp = current_blocks[0].created_at;
-                        let block_ids = current_blocks.iter().map(|b| b.id.clone()).collect();
-
-                        turns.push(Turn {
-                            author,
-                            display_name,
-                            block_ids,
-                            blocks: std::mem::take(&mut current_blocks),
-                            timestamp,
-                        });
-                    }
-                current_author = Some(block.author.clone());
-            }
-            current_blocks.push(block);
-        }
-
-        // Finalize last turn
-        if !current_blocks.is_empty()
-            && let Some(author) = current_author {
-                let display_name = self
-                    .get_participant(&author)
-                    .map(|p| p.display_name.clone())
-                    .unwrap_or_else(|| author.clone());
-                let timestamp = current_blocks[0].created_at;
-                let block_ids = current_blocks.iter().map(|b| b.id.clone()).collect();
-
-                turns.push(Turn {
-                    author,
-                    display_name,
-                    block_ids,
-                    blocks: current_blocks,
-                    timestamp,
-                });
-            }
-
-        turns
     }
 
     // =========================================================================
@@ -588,70 +469,4 @@ mod tests {
         assert_eq!(conv.get_mount("/project").unwrap().kernel_id, "kernel-789");
     }
 
-    #[test]
-    fn test_compute_turns() {
-        let mut conv = Conversation::new("Test", "alice");
-        conv.add_participant(Participant::user("user:amy", "Amy"));
-        conv.add_participant(Participant::model("model:claude", "Claude", "anthropic", "claude-3-opus"));
-
-        // Empty conversation has no turns
-        assert!(conv.compute_turns().is_empty());
-
-        // Single user message = 1 turn
-        conv.add_text_message("user:amy", "Hello!");
-        let turns = conv.compute_turns();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].author, "user:amy");
-        assert_eq!(turns[0].display_name, "Amy");
-        assert_eq!(turns[0].block_count(), 1);
-        assert!(turns[0].is_user());
-
-        // Model responds = 2 turns
-        conv.add_thinking_message("model:claude", "Thinking...");
-        conv.add_text_message("model:claude", "Hi!");
-        let turns = conv.compute_turns();
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[1].author, "model:claude");
-        assert_eq!(turns[1].display_name, "Claude");
-        assert_eq!(turns[1].block_count(), 2); // thinking + text
-        assert!(turns[1].is_model());
-
-        // User responds again = 3 turns
-        conv.add_text_message("user:amy", "Thanks!");
-        let turns = conv.compute_turns();
-        assert_eq!(turns.len(), 3);
-        assert_eq!(turns[2].author, "user:amy");
-        assert_eq!(turns[2].block_count(), 1);
-    }
-
-    #[test]
-    fn test_turns_caching() {
-        let mut conv = Conversation::new("Test", "alice");
-        conv.add_participant(Participant::user("user:amy", "Amy"));
-
-        // Add first message
-        conv.add_text_message("user:amy", "Hello");
-        let version_after_first = conv.doc.version();
-
-        // First call computes turns
-        let turns1 = conv.turns();
-        assert_eq!(turns1.len(), 1);
-        assert_eq!(conv.turns_cache_version, version_after_first);
-
-        // Second call uses cache (same version)
-        let turns2 = conv.turns();
-        assert_eq!(turns2.len(), 1);
-        assert_eq!(conv.turns_cache_version, version_after_first);
-
-        // Adding a message changes the version
-        conv.add_text_message("user:amy", "World");
-        let version_after_second = conv.doc.version();
-        assert_ne!(version_after_first, version_after_second);
-
-        // Next call should recompute (version changed)
-        let turns3 = conv.turns();
-        assert_eq!(turns3.len(), 1); // Still 1 turn (same author)
-        assert_eq!(turns3[0].block_count(), 2); // But now 2 blocks
-        assert_eq!(conv.turns_cache_version, version_after_second);
-    }
 }

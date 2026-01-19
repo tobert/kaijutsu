@@ -17,7 +17,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use kaijutsu_crdt::{
-    BlockDocument, BlockId, BlockSnapshot, SerializedOps, SerializedOpsOwned, LV,
+    BlockDocument, BlockId, BlockKind, BlockSnapshot, Role, SerializedOps, SerializedOpsOwned,
+    Status, LV,
 };
 
 use crate::db::{CellDb, CellKind, CellMeta};
@@ -241,49 +242,51 @@ impl BlockStore {
     }
 
     // =========================================================================
-    // Block Operations (convenience methods)
+    // Block Operations
     // =========================================================================
 
-    /// Insert a text block into a cell.
-    pub fn insert_text_block(
+    /// Insert a block into a cell.
+    ///
+    /// This is the primary block creation API.
+    ///
+    /// # Arguments
+    ///
+    /// * `cell_id` - The cell to insert into
+    /// * `parent_id` - Parent block ID for DAG relationship (None for root)
+    /// * `after` - Block ID to insert after in document order (None for beginning)
+    /// * `role` - Role of the block author (Human, Agent, System, Tool)
+    /// * `kind` - Content type (Text, Thinking, ToolCall, ToolResult)
+    /// * `content` - Initial text content
+    pub fn insert_block(
         &self,
         cell_id: &str,
+        parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
-        text: impl Into<String>,
+        role: Role,
+        kind: BlockKind,
+        content: impl Into<String>,
     ) -> Result<BlockId, String> {
         let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
         let agent_id = self.agent_id();
-        let result = entry.doc.insert_text_block(after, text).map_err(|e| e.to_string())?;
+        let result = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
+            .map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
         Ok(result)
     }
 
-    /// Insert a thinking block into a cell.
-    pub fn insert_thinking_block(
+    /// Insert a tool call block into a cell.
+    pub fn insert_tool_call(
         &self,
         cell_id: &str,
+        parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
-        text: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
         let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
         let agent_id = self.agent_id();
-        let result = entry.doc.insert_thinking_block(after, text).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
-        Ok(result)
-    }
-
-    /// Insert a tool use block into a cell.
-    pub fn insert_tool_use(
-        &self,
-        cell_id: &str,
-        after: Option<&BlockId>,
-        tool_id: impl Into<String>,
-        name: impl Into<String>,
-        input: serde_json::Value,
-    ) -> Result<BlockId, String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        let result = entry.doc.insert_tool_use(after, tool_id, name, input).map_err(|e| e.to_string())?;
+        let result = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
+            .map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
         Ok(result)
     }
@@ -292,16 +295,32 @@ impl BlockStore {
     pub fn insert_tool_result(
         &self,
         cell_id: &str,
+        tool_call_id: &BlockId,
         after: Option<&BlockId>,
-        tool_use_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
+        exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
         let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
         let agent_id = self.agent_id();
-        let result = entry.doc.insert_tool_result(after, tool_use_id, content, is_error).map_err(|e| e.to_string())?;
+        let result = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
+            .map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
         Ok(result)
+    }
+
+    /// Set the status of a block.
+    pub fn set_status(
+        &self,
+        cell_id: &str,
+        block_id: &BlockId,
+        status: Status,
+    ) -> Result<(), String> {
+        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+        let agent_id = self.agent_id();
+        entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
+        entry.touch(&agent_id);
+        Ok(())
     }
 
     /// Edit text within a block.
@@ -451,7 +470,6 @@ pub fn shared_block_store_with_db(db: CellDb, agent_id: impl Into<String>) -> Sh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::BlockContentSnapshot;
 
     #[test]
     fn test_block_store_basic_ops() {
@@ -459,8 +477,8 @@ mod tests {
 
         store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
 
-        // Insert a text block
-        let block_id = store.insert_text_block("test", None, "hello world").unwrap();
+        // Insert a text block using new API
+        let block_id = store.insert_block("test", None, None, Role::User, BlockKind::Text, "hello world").unwrap();
         assert_eq!(store.get_content("test").unwrap(), "hello world");
 
         // Append to the block
@@ -479,10 +497,10 @@ mod tests {
         store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
 
         // Insert thinking block
-        let thinking_id = store.insert_thinking_block("test", None, "Let me think...").unwrap();
+        let thinking_id = store.insert_block("test", None, None, Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
 
-        // Insert text block after thinking
-        let text_id = store.insert_text_block("test", Some(&thinking_id), "Here's my answer").unwrap();
+        // Insert text block after thinking (as child of root, after thinking in order)
+        let text_id = store.insert_block("test", None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer").unwrap();
 
         // Should have both blocks
         let content = store.get_content("test").unwrap();
@@ -505,7 +523,7 @@ mod tests {
 
         store.create_cell("cell-1".into(), CellKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_text_block("cell-1", None, "fn main() {}").unwrap();
+        store.insert_block("cell-1", None, None, Role::User, BlockKind::Text, "fn main() {}").unwrap();
 
         assert_eq!(store.get_content("cell-1").unwrap(), "fn main() {}");
 
@@ -519,24 +537,24 @@ mod tests {
 
         store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
 
-        let thinking_id = store.insert_thinking_block("test", None, "thinking...").unwrap();
-        store.insert_text_block("test", Some(&thinking_id), "response").unwrap();
+        let thinking_id = store.insert_block("test", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block("test", None, Some(&thinking_id), Role::Model, BlockKind::Text, "response").unwrap();
 
         let snapshots = store.block_snapshots("test").unwrap();
         assert_eq!(snapshots.len(), 2);
 
-        // Check snapshot types
+        // Check snapshot types using new flat struct
         let mut has_thinking = false;
         let mut has_text = false;
 
         for snapshot in &snapshots {
-            match &snapshot.content {
-                BlockContentSnapshot::Thinking { text, .. } => {
-                    assert_eq!(text, "thinking...");
+            match snapshot.kind {
+                BlockKind::Thinking => {
+                    assert_eq!(snapshot.content, "thinking...");
                     has_thinking = true;
                 }
-                BlockContentSnapshot::Text { text } => {
-                    assert_eq!(text, "response");
+                BlockKind::Text => {
+                    assert_eq!(snapshot.content, "response");
                     has_text = true;
                 }
                 _ => {}
@@ -545,6 +563,27 @@ mod tests {
 
         assert!(has_thinking, "Expected a thinking block");
         assert!(has_text, "Expected a text block");
+    }
+
+    #[test]
+    fn test_set_status() {
+        let store = BlockStore::new("agent");
+
+        store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
+
+        let block_id = store.insert_block("test", None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
+
+        // Set status to Running
+        store.set_status("test", &block_id, Status::Running).unwrap();
+
+        let snapshots = store.block_snapshots("test").unwrap();
+        assert_eq!(snapshots[0].status, Status::Running);
+
+        // Set status to Done
+        store.set_status("test", &block_id, Status::Done).unwrap();
+
+        let snapshots = store.block_snapshots("test").unwrap();
+        assert_eq!(snapshots[0].status, Status::Done);
     }
 
     #[tokio::test]
@@ -580,14 +619,14 @@ mod tests {
         let num_tasks = 4;
         let ops_per_task = 10;
 
-        // Spawn multiple tasks that concurrently append text to the same cell
+        // Spawn multiple tasks that concurrently insert blocks to the same cell
         for i in 0..num_tasks {
             let store_clone = Arc::clone(&store);
             tasks.spawn(async move {
                 for j in 0..ops_per_task {
                     // Each task inserts a uniquely identifiable block
                     let text = format!("[task-{}-op-{}]", i, j);
-                    let _ = store_clone.insert_text_block("shared-cell", None, &text);
+                    let _ = store_clone.insert_block("shared-cell", None, None, Role::User, BlockKind::Text, &text);
                 }
             });
         }
@@ -639,7 +678,7 @@ mod tests {
             tasks.spawn(async move {
                 for j in 0..5 {
                     let text = format!("task-{}-op-{}", i, j);
-                    let _ = store_clone.insert_text_block(&cell_id, None, &text);
+                    let _ = store_clone.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &text);
                 }
             });
         }
@@ -668,9 +707,7 @@ mod tests {
             .unwrap();
 
         // Insert initial content
-        let block_id = store
-            .insert_text_block("rw-cell", None, "initial content")
-            .unwrap();
+        let block_id = store.insert_block("rw-cell", None, None, Role::User, BlockKind::Text, "initial content").unwrap();
 
         let mut tasks = JoinSet::new();
 

@@ -24,6 +24,7 @@ use crate::block_store::SharedBlockStore;
 use crate::db::CellKind;
 use crate::tools::{ExecResult, ExecutionEngine};
 use async_trait::async_trait;
+use kaijutsu_crdt::{BlockKind, Role};
 use rhai::{Dynamic, Engine, Scope};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -142,7 +143,7 @@ impl RhaiEngine {
 
             // Insert new content as a single text block
             if !content.is_empty() {
-                match store_set.insert_text_block(&cell_id, None, &content) {
+                match store_set.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content) {
                     Ok(_) => {
                         debug!("Rhai: set_content({}, {} chars)", cell_id, content.len());
                     }
@@ -229,17 +230,24 @@ impl RhaiEngine {
                 let after_ref = after.as_ref();
 
                 let result = match kind.as_str() {
-                    "text" => store_insert.insert_text_block(&cell_id, after_ref, &content),
-                    "thinking" => store_insert.insert_thinking_block(&cell_id, after_ref, &content),
-                    "tool_use" => {
+                    "text" => store_insert.insert_block(&cell_id, None, after_ref, Role::User, BlockKind::Text, &content),
+                    "thinking" => store_insert.insert_block(&cell_id, None, after_ref, Role::Model, BlockKind::Thinking, &content),
+                    "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
                         let input = serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
-                        store_insert.insert_tool_use(&cell_id, after_ref, "unknown", "unknown", input)
+                        store_insert.insert_tool_call(&cell_id, None, after_ref, "unknown", input)
                     }
                     "tool_result" => {
-                        store_insert.insert_tool_result(&cell_id, after_ref, "unknown", &content, false)
+                        // For tool_result, we need a tool_call_id. Use after_ref if available.
+                        let tool_call_id = after.as_ref();
+                        if let Some(tc_id) = tool_call_id {
+                            store_insert.insert_tool_result(&cell_id, tc_id, after_ref, &content, false, None)
+                        } else {
+                            // Fallback to text if no tool_call_id
+                            store_insert.insert_block(&cell_id, None, after_ref, Role::Tool, BlockKind::Text, &content)
+                        }
                     }
-                    _ => store_insert.insert_text_block(&cell_id, after_ref, &content),
+                    _ => store_insert.insert_block(&cell_id, None, after_ref, Role::User, BlockKind::Text, &content),
                 };
 
                 match result {
@@ -380,7 +388,7 @@ impl RhaiEngine {
                         .blocks_ordered()
                         .iter()
                         .find(|b| b.id == target_bid)
-                        .map(|b| b.content.text().to_string())
+                        .map(|b| b.content.clone())
                         .unwrap_or_default(),
                     None => String::new(),
                 }

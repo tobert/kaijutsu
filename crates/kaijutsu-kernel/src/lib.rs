@@ -26,8 +26,8 @@ pub mod vfs;
 
 pub use block_store::{BlockEvent, BlockStore, CellEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
 pub use cell_tools::{CellEditEngine, CellListEngine, CellReadEngine};
-pub use control::{ConsentMode, ControlPlane, Lease, LeaseHolder};
-pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind, Turn};
+pub use control::ConsentMode;
+pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
 pub use conversation_db::ConversationDb;
 pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;

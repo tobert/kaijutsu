@@ -8,7 +8,7 @@
 use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine};
 use async_trait::async_trait;
-use kaijutsu_crdt::BlockContentSnapshot;
+use kaijutsu_crdt::{BlockKind, Role};
 use serde::{Deserialize, Serialize};
 
 /// Edit operation on a cell.
@@ -159,7 +159,7 @@ impl ExecutionEngine for CellEditEngine {
         let primary_block_id = cell.doc.blocks_ordered()
             .iter()
             .find_map(|snap| {
-                if matches!(snap.content, BlockContentSnapshot::Text { .. }) {
+                if snap.kind == BlockKind::Text {
                     Some(snap.id.clone())
                 } else {
                     None
@@ -170,7 +170,7 @@ impl ExecutionEngine for CellEditEngine {
         let block_id = match primary_block_id {
             Some(id) => id,
             None => {
-                cell.doc.insert_text_block(None, "")
+                cell.doc.insert_block(None, None, Role::User, BlockKind::Text, "", &self._agent_name)
                     .map_err(|e| anyhow::anyhow!("Failed to create text block: {}", e))?
             }
         };
@@ -393,7 +393,7 @@ mod tests {
     async fn test_cell_edit_delete() {
         let store = shared_block_store("test-agent");
         store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
-        store.insert_text_block("test", None, "line1\nline2\nline3\n").unwrap();
+        store.insert_block("test", None, None, Role::User, BlockKind::Text, "line1\nline2\nline3\n").unwrap();
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
 
@@ -411,7 +411,7 @@ mod tests {
     async fn test_cell_edit_replace() {
         let store = shared_block_store("test-agent");
         store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
-        store.insert_text_block("test", None, "line1\nline2\nline3\n").unwrap();
+        store.insert_block("test", None, None, Role::User, BlockKind::Text, "line1\nline2\nline3\n").unwrap();
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
 
@@ -429,7 +429,7 @@ mod tests {
     async fn test_cell_read() {
         let store = shared_block_store("test-agent");
         store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
-        store.insert_text_block("test", None, "fn main() {}").unwrap();
+        store.insert_block("test", None, None, Role::User, BlockKind::Text, "fn main() {}").unwrap();
 
         let engine = CellReadEngine::new(store.clone());
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::control::{ConsentMode, ControlPlane, LeaseError, LeaseHolder};
+use crate::control::ConsentMode;
 use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmRegistry, LlmResult};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
@@ -26,7 +26,6 @@ use crate::vfs::{
 /// Everything is a kernel. A kernel:
 /// - Owns `/` in its VFS
 /// - Can mount worktrees, repos, other kernels
-/// - Has a lease (who holds "the pen")
 /// - Has a consent mode (collaborative vs autonomous)
 /// - Can checkpoint, fork, and thread
 pub struct Kernel {
@@ -38,8 +37,8 @@ pub struct Kernel {
     tools: RwLock<ToolRegistry>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
-    /// Control plane (behind RwLock for interior mutability).
-    control: RwLock<ControlPlane>,
+    /// Consent mode (collaborative vs autonomous).
+    consent_mode: RwLock<ConsentMode>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -49,7 +48,7 @@ impl std::fmt::Debug for Kernel {
             .field("state", &"<locked>")
             .field("tools", &"<locked>")
             .field("llm", &"<locked>")
-            .field("control", &"<locked>")
+            .field("consent_mode", &"<locked>")
             .finish()
     }
 }
@@ -70,7 +69,7 @@ impl Kernel {
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
-            control: RwLock::new(ControlPlane::new()),
+            consent_mode: RwLock::new(ConsentMode::default()),
         }
     }
 
@@ -85,7 +84,7 @@ impl Kernel {
             state: RwLock::new(KernelState::with_id(id, &name)),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
-            control: RwLock::new(ControlPlane::new()),
+            consent_mode: RwLock::new(ConsentMode::default()),
         }
     }
 
@@ -347,37 +346,17 @@ impl Kernel {
     }
 
     // ========================================================================
-    // Control Plane
+    // Consent Mode
     // ========================================================================
 
     /// Get the current consent mode.
     pub async fn consent_mode(&self) -> ConsentMode {
-        self.control.read().await.consent_mode()
+        *self.consent_mode.read().await
     }
 
     /// Set the consent mode.
     pub async fn set_consent_mode(&self, mode: ConsentMode) {
-        self.control.write().await.set_consent_mode(mode);
-    }
-
-    /// Try to acquire the lease.
-    pub async fn acquire_lease(&self, holder: LeaseHolder) -> Result<(), LeaseError> {
-        self.control.write().await.acquire_lease(holder)
-    }
-
-    /// Release the lease.
-    pub async fn release_lease(&self, holder: &LeaseHolder) -> Result<(), LeaseError> {
-        self.control.write().await.release_lease(holder)
-    }
-
-    /// Check if a holder has the lease.
-    pub async fn has_lease(&self, holder: &LeaseHolder) -> bool {
-        self.control.read().await.has_lease(holder)
-    }
-
-    /// Check if the lease is available.
-    pub async fn lease_available(&self) -> bool {
-        self.control.read().await.lease_available()
+        *self.consent_mode.write().await = mode;
     }
 
     // ========================================================================
@@ -405,7 +384,7 @@ impl Kernel {
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
-            control: RwLock::new(ControlPlane::new()),
+            consent_mode: RwLock::new(ConsentMode::default()),
         }
     }
 
@@ -425,7 +404,7 @@ impl Kernel {
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
-            control: RwLock::new(ControlPlane::new()),
+            consent_mode: RwLock::new(ConsentMode::default()),
         }
     }
 }
@@ -599,23 +578,6 @@ mod tests {
         let result = kernel.execute("hello").await.unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("hello"));
-    }
-
-    #[tokio::test]
-    async fn test_lease() {
-        let kernel = Kernel::new("test").await;
-
-        let holder = LeaseHolder::Human {
-            username: "amy".into(),
-        };
-
-        assert!(kernel.lease_available().await);
-        kernel.acquire_lease(holder.clone()).await.unwrap();
-        assert!(!kernel.lease_available().await);
-        assert!(kernel.has_lease(&holder).await);
-
-        kernel.release_lease(&holder).await.unwrap();
-        assert!(kernel.lease_available().await);
     }
 
     #[tokio::test]
