@@ -141,11 +141,10 @@ impl CellEditor {
     /// Builder: set initial text content (creates a single text block).
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
-        if !text.is_empty() {
-            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
+        if !text.is_empty()
+            && let Ok(block_id) = self.doc.insert_text_block(None, &text) {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
-        }
         self
     }
 
@@ -205,8 +204,8 @@ impl CellEditor {
             }
         }
 
-        if let Some(ref block_id) = self.cursor.block_id {
-            if self
+        if let Some(ref block_id) = self.cursor.block_id
+            && self
                 .doc
                 .edit_text(block_id, self.cursor.offset, text, 0)
                 .is_ok()
@@ -214,7 +213,6 @@ impl CellEditor {
                 self.cursor.offset += text.len();
                 self.dirty = true;
             }
-        }
     }
 
     /// Delete character before cursor (backspace).
@@ -247,8 +245,8 @@ impl CellEditor {
 
     /// Delete character at cursor (delete key).
     pub fn delete(&mut self) {
-        if let Some(ref block_id) = self.cursor.block_id {
-            if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id) {
                 let text = block.content.text();
                 if self.cursor.offset >= text.len() {
                     return; // At end, nothing to delete
@@ -269,7 +267,6 @@ impl CellEditor {
                     self.dirty = true;
                 }
             }
-        }
     }
 
     // =========================================================================
@@ -278,9 +275,9 @@ impl CellEditor {
 
     /// Move cursor left.
     pub fn move_left(&mut self) {
-        if self.cursor.offset > 0 {
-            if let Some(ref block_id) = self.cursor.block_id {
-                if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if self.cursor.offset > 0
+            && let Some(ref block_id) = self.cursor.block_id
+                && let Some(block) = self.doc.get_block_snapshot(block_id) {
                     let text = block.content.text();
                     let mut new_offset = self.cursor.offset - 1;
                     while new_offset > 0 && !text.is_char_boundary(new_offset) {
@@ -288,14 +285,12 @@ impl CellEditor {
                     }
                     self.cursor.offset = new_offset;
                 }
-            }
-        }
     }
 
     /// Move cursor right.
     pub fn move_right(&mut self) {
-        if let Some(ref block_id) = self.cursor.block_id {
-            if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id) {
                 let text = block.content.text();
                 if self.cursor.offset < text.len() {
                     let mut new_offset = self.cursor.offset + 1;
@@ -305,31 +300,27 @@ impl CellEditor {
                     self.cursor.offset = new_offset;
                 }
             }
-        }
     }
 
     /// Move cursor to start of current block.
     pub fn move_home(&mut self) {
-        if let Some(ref block_id) = self.cursor.block_id {
-            if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id) {
                 let text = block.content.text();
                 // Find previous newline or start
                 let before_cursor = &text[..self.cursor.offset];
                 self.cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
             }
-        }
     }
 
     /// Move cursor to end of current line.
     pub fn move_end(&mut self) {
-        if let Some(ref block_id) = self.cursor.block_id {
-            if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id) {
                 let text = block.content.text();
                 let after_cursor = &text[self.cursor.offset..];
-                self.cursor.offset = self.cursor.offset
-                    + after_cursor.find('\n').unwrap_or(after_cursor.len());
+                self.cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
             }
-        }
     }
 
     // =========================================================================

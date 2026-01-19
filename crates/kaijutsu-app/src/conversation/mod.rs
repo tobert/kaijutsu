@@ -35,20 +35,18 @@ pub struct ConversationStore {
 impl ConversationStore {
     /// Save a conversation to the database.
     pub fn save(&self, conv: &Conversation) {
-        if let Ok(db) = self.db.lock() {
-            if let Err(e) = db.save(conv) {
+        if let Ok(db) = self.db.lock()
+            && let Err(e) = db.save(conv) {
                 error!("Failed to save conversation {}: {}", conv.id, e);
             }
-        }
     }
 
     /// Delete a conversation from the database.
     pub fn delete(&self, id: &str) {
-        if let Ok(db) = self.db.lock() {
-            if let Err(e) = db.delete(id) {
+        if let Ok(db) = self.db.lock()
+            && let Err(e) = db.delete(id) {
                 error!("Failed to delete conversation {}: {}", id, e);
             }
-        }
     }
 }
 
@@ -65,11 +63,10 @@ fn setup_store(mut commands: Commands) {
     let db_path = default_db_path();
 
     // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+    if let Some(parent) = db_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent) {
             error!("Failed to create data directory: {}", e);
         }
-    }
 
     match ConversationDb::open(&db_path) {
         Ok(db) => {
@@ -103,8 +100,8 @@ fn load_or_create_conversations(
         .unwrap_or_else(|_| whoami::username());
 
     // Try to load from database
-    if let Some(ref store) = store {
-        if let Ok(db) = store.db.lock() {
+    if let Some(ref store) = store
+        && let Ok(db) = store.db.lock() {
             match db.load_all() {
                 Ok(conversations) if !conversations.is_empty() => {
                     info!("Loaded {} conversations from database", conversations.len());
@@ -126,7 +123,6 @@ fn load_or_create_conversations(
                 }
             }
         }
-    }
 
     // Create a default conversation
     let mut conv = Conversation::new("Main", &agent_id);

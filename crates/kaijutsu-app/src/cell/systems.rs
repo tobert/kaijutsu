@@ -970,13 +970,12 @@ pub fn handle_scroll_input(
             }
         }
         // G to go to bottom, gg to go to top
-        if keys.just_pressed(KeyCode::KeyG) {
-            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        if keys.just_pressed(KeyCode::KeyG)
+            && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)) {
                 // Shift+G = go to bottom
                 scroll_state.scroll_to_end();
             }
             // Note: gg (double tap) would need state tracking, skip for now
-        }
     }
 }
 
@@ -1419,15 +1418,14 @@ pub fn layout_block_cells(
     // Build turn info: map block_id to (turn_index, is_first_in_turn)
     let mut block_turn_info: std::collections::HashMap<kaijutsu_crdt::BlockId, (usize, bool)> =
         std::collections::HashMap::new();
-    if let Some(conv_id) = current.id() {
-        if let Some(conv) = registry.get_mut(conv_id) {
+    if let Some(conv_id) = current.id()
+        && let Some(conv) = registry.get_mut(conv_id) {
             for (turn_idx, turn) in conv.turns().iter().enumerate() {
                 for (block_idx, block_id) in turn.block_ids.iter().enumerate() {
                     block_turn_info.insert(block_id.clone(), (turn_idx, block_idx == 0));
                 }
             }
         }
-    }
 
     for entity in &container.block_cells {
         let Ok((block_cell, mut block_layout, buffer)) = block_cells.get_mut(*entity) else {
@@ -1435,11 +1433,10 @@ pub fn layout_block_cells(
         };
 
         // Check if this is the first block of a turn - if so, add space for turn header
-        if let Some(&(_, is_first)) = block_turn_info.get(&block_cell.block_id) {
-            if is_first {
+        if let Some(&(_, is_first)) = block_turn_info.get(&block_cell.block_id)
+            && is_first {
                 y_offset += TURN_HEADER_HEIGHT + TURN_HEADER_SPACING;
             }
-        }
 
         // Determine indentation level
         let indent_level = if let Some(block) = blocks.get(&block_cell.block_id) {

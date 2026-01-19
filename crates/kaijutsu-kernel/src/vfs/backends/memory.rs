@@ -169,9 +169,9 @@ impl VfsOps for MemoryBackend {
 
         let mut result = Vec::new();
         for (entry_path, entry) in entries.iter() {
-            if let Some(parent) = entry_path.parent() {
-                if parent == prefix && entry_path != &normalized {
-                    if let Some(name) = entry_path.file_name() {
+            if let Some(parent) = entry_path.parent()
+                && parent == prefix && entry_path != &normalized
+                    && let Some(name) = entry_path.file_name() {
                         let kind = match entry {
                             Entry::File { .. } => FileType::File,
                             Entry::Directory { .. } => FileType::Directory,
@@ -182,8 +182,6 @@ impl VfsOps for MemoryBackend {
                             kind,
                         });
                     }
-                }
-            }
         }
 
         // Sort for consistent ordering
@@ -447,12 +445,11 @@ impl VfsOps for MemoryBackend {
             .ok_or_else(|| VfsError::not_found(Self::path_str(&normalized)))?;
 
         // Handle size change (requires access to data for files)
-        if let Some(size) = set.size {
-            if let Entry::File { data, attr } = entry {
+        if let Some(size) = set.size
+            && let Entry::File { data, attr } = entry {
                 data.resize(size as usize, 0);
                 attr.size = size;
             }
-        }
 
         // Handle other attribute changes
         let attr = entry.attr_mut();

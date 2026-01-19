@@ -439,11 +439,10 @@ pub fn layout_nine_slice_frames(
                 node.height = Val::Px(corner_size);
 
                 // Update material dimensions
-                if let Ok(mat_node) = corner_entities.get(corner_entity) {
-                    if let Some(mat) = corner_materials.get_mut(&mat_node.0) {
+                if let Ok(mat_node) = corner_entities.get(corner_entity)
+                    && let Some(mat) = corner_materials.get_mut(&mat_node.0) {
                         mat.dimensions = Vec4::new(corner_size, corner_size, corner_size, 1.0);
                     }
-                }
             }
         }
 
@@ -494,11 +493,10 @@ pub fn layout_nine_slice_frames(
                 node.height = Val::Px(h);
 
                 // Update material tile_info with new length
-                if let Ok(mat_node) = edge_entities.get(*edge_entity) {
-                    if let Some(mat) = edge_materials.get_mut(&mat_node.0) {
+                if let Ok(mat_node) = edge_entities.get(*edge_entity)
+                    && let Some(mat) = edge_materials.get_mut(&mat_node.0) {
                         mat.tile_info.z = length; // Update length
                     }
-                }
             }
         }
     }
@@ -561,12 +559,11 @@ pub fn update_nine_slice_state(
 
         // Update corner materials
         for &corner_entity in &frame.corners {
-            if let Ok(mat_node) = corner_entities.get(corner_entity) {
-                if let Some(mat) = corner_materials.get_mut(&mat_node.0) {
+            if let Ok(mat_node) = corner_entities.get(corner_entity)
+                && let Some(mat) = corner_materials.get_mut(&mat_node.0) {
                     mat.color = final_color;
                     mat.params = final_params;
                 }
-            }
         }
 
         // Update edge materials (with edge-specific color from style)
@@ -592,12 +589,11 @@ pub fn update_nine_slice_state(
                 continue;
             };
 
-            if let Ok(mat_node) = edge_entities.get(*edge_entity) {
-                if let Some(mat) = edge_materials.get_mut(&mat_node.0) {
+            if let Ok(mat_node) = edge_entities.get(*edge_entity)
+                && let Some(mat) = edge_materials.get_mut(&mat_node.0) {
                     mat.color = final_edge_color;
                     mat.params = final_edge_params;
                 }
-            }
         }
     }
 }
@@ -620,10 +616,8 @@ pub fn cleanup_nine_slice_frames(
             }
 
             // Despawn all edges
-            for edge_opt in &frame.edges {
-                if let Some(edge) = edge_opt {
-                    commands.entity(*edge).try_despawn();
-                }
+            for edge in frame.edges.iter().flatten() {
+                commands.entity(*edge).try_despawn();
             }
         }
     }

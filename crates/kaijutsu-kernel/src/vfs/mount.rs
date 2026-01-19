@@ -175,15 +175,14 @@ impl MountTable {
             let mount_str = mount_path.to_string_lossy();
             if mount_str == "/" {
                 // Root mount: list its contents directly
-                if let Some(fs) = mounts.get(mount_path) {
-                    if let Ok(root_entries) = fs.readdir(Path::new("")).await {
+                if let Some(fs) = mounts.get(mount_path)
+                    && let Ok(root_entries) = fs.readdir(Path::new("")).await {
                         for entry in root_entries {
                             if seen_names.insert(entry.name.clone()) {
                                 entries.push(entry);
                             }
                         }
                     }
-                }
             } else {
                 // Non-root mount: extract first path component
                 let first_component = mount_str

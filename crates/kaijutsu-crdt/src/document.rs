@@ -334,7 +334,7 @@ impl BlockDocument {
         after: Option<&BlockId>,
         text: impl Into<String>,
     ) -> Result<BlockId> {
-        self.insert_text_block_with_author(after, text, &self.agent_id_str.clone())
+        self.insert_text_block_with_author(after, text, self.agent_id_str.clone())
     }
 
     /// Insert a text block with a specific author.
@@ -356,7 +356,7 @@ impl BlockDocument {
         after: Option<&BlockId>,
         text: impl Into<String>,
     ) -> Result<BlockId> {
-        self.insert_thinking_block_with_author(after, text, &self.agent_id_str.clone())
+        self.insert_thinking_block_with_author(after, text, self.agent_id_str.clone())
     }
 
     /// Insert a thinking block with a specific author.
@@ -383,7 +383,7 @@ impl BlockDocument {
         name: impl Into<String>,
         input: serde_json::Value,
     ) -> Result<BlockId> {
-        self.insert_tool_use_with_author(after, tool_id, name, input, &self.agent_id_str.clone())
+        self.insert_tool_use_with_author(after, tool_id, name, input, self.agent_id_str.clone())
     }
 
     /// Insert a tool use block with a specific author.
@@ -413,7 +413,7 @@ impl BlockDocument {
         content: impl Into<String>,
         is_error: bool,
     ) -> Result<BlockId> {
-        self.insert_tool_result_with_author(after, tool_use_id, content, is_error, &self.agent_id_str.clone())
+        self.insert_tool_result_with_author(after, tool_use_id, content, is_error, self.agent_id_str.clone())
     }
 
     /// Insert a tool result block with a specific author.
@@ -759,13 +759,11 @@ impl BlockDocument {
         // Update next_seq if needed
         let blocks = self.oplog.checkout_set(self.blocks_set_lv);
         for p in blocks.iter() {
-            if let Primitive::Str(key) = p {
-                if let Some(block_id) = BlockId::from_key(key) {
-                    if block_id.agent_id == self.agent_id_str {
+            if let Primitive::Str(key) = p
+                && let Some(block_id) = BlockId::from_key(key)
+                    && block_id.agent_id == self.agent_id_str {
                         self.next_seq = self.next_seq.max(block_id.seq + 1);
                     }
-                }
-            }
         }
 
         self.version += 1;

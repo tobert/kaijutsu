@@ -334,8 +334,8 @@ impl Conversation {
         for block in blocks {
             if current_author.as_ref() != Some(&block.author) {
                 // Author changed - finalize previous turn
-                if !current_blocks.is_empty() {
-                    if let Some(author) = current_author.take() {
+                if !current_blocks.is_empty()
+                    && let Some(author) = current_author.take() {
                         let display_name = self
                             .get_participant(&author)
                             .map(|p| p.display_name.clone())
@@ -351,15 +351,14 @@ impl Conversation {
                             timestamp,
                         });
                     }
-                }
                 current_author = Some(block.author.clone());
             }
             current_blocks.push(block);
         }
 
         // Finalize last turn
-        if !current_blocks.is_empty() {
-            if let Some(author) = current_author {
+        if !current_blocks.is_empty()
+            && let Some(author) = current_author {
                 let display_name = self
                     .get_participant(&author)
                     .map(|p| p.display_name.clone())
@@ -375,7 +374,6 @@ impl Conversation {
                     timestamp,
                 });
             }
-        }
 
         turns
     }

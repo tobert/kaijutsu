@@ -34,19 +34,19 @@ pub fn handle_conversation_commands(
             if keys.just_pressed(KeyCode::Digit1) && !ids.is_empty() {
                 current.0 = Some(ids[0].clone());
                 registry.move_to_front(&ids[0]);
-                command_output.success(format!("Switched to conversation 1"));
+                command_output.success("Switched to conversation 1".to_string());
                 return;
             }
             if keys.just_pressed(KeyCode::Digit2) && ids.len() > 1 {
                 current.0 = Some(ids[1].clone());
                 registry.move_to_front(&ids[1]);
-                command_output.success(format!("Switched to conversation 2"));
+                command_output.success("Switched to conversation 2".to_string());
                 return;
             }
             if keys.just_pressed(KeyCode::Digit3) && ids.len() > 2 {
                 current.0 = Some(ids[2].clone());
                 registry.move_to_front(&ids[2]);
-                command_output.success(format!("Switched to conversation 3"));
+                command_output.success("Switched to conversation 3".to_string());
                 return;
             }
         }
