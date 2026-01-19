@@ -1683,7 +1683,7 @@ impl kernel::Server for KernelImpl {
                             // Get current length before append for correct broadcast position
                             let pos = cells.get(&cell_id)
                                 .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                                .map(|s| s.content.len() as u64)
+                                .map(|s| s.content.chars().count() as u64)
                                 .unwrap_or(0);
                             if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
                                 log::error!("Failed to append thinking text: {}", e);
@@ -1713,7 +1713,7 @@ impl kernel::Server for KernelImpl {
                             // Get current length before append for correct broadcast position
                             let pos = cells.get(&cell_id)
                                 .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                                .map(|s| s.content.len() as u64)
+                                .map(|s| s.content.chars().count() as u64)
                                 .unwrap_or(0);
                             if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
                                 log::error!("Failed to append text: {}", e);

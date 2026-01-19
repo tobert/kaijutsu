@@ -839,7 +839,8 @@ impl BlockDocument {
         let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        let len = snapshot.content.len();
+        // Use chars().count() for UTF-8 safety - edit_text uses character positions
+        let len = snapshot.content.chars().count();
         self.edit_text(id, len, text, 0)
     }
 
