@@ -19,14 +19,8 @@ mod components;
 pub mod frame_assembly;
 pub mod frame_style;
 pub mod plugin;
-mod sync;
 mod systems;
 
 // Re-export public API
-pub use components::{
-    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellKind, ConversationContainer,
-    CurrentMode, EditorMode, FocusedCell, PromptContainer, PromptSubmitted, TurnCell,
-    TurnCellContainer,
-};
+pub use components::{Cell, CellKind, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer};
 pub use plugin::CellPlugin;
-pub use systems::format_single_block;

@@ -7,7 +7,6 @@ use super::components::{
 };
 use super::frame_assembly;
 use super::frame_style::{FrameStyle, FrameStyleLoader, FrameStyleMapping};
-use super::sync::{self, CellRegistry, PendingCellRegistrations, RecentlyDeletedByServer};
 use super::systems;
 
 /// Plugin that enables cell-based editing in the workspace.
@@ -23,12 +22,9 @@ impl Plugin for CellPlugin {
         app.add_message::<PromptSubmitted>();
 
         app.init_resource::<FocusedCell>()
-            .init_resource::<CellRegistry>()
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
-            .init_resource::<RecentlyDeletedByServer>()
-            .init_resource::<PendingCellRegistrations>()
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::PromptCellEntity>()
@@ -132,18 +128,6 @@ impl Plugin for CellPlugin {
                 (
                     systems::spawn_cursor,
                     systems::update_cursor,
-                ),
-            )
-            // Remote sync (block-based)
-            .add_systems(
-                Update,
-                (
-                    sync::trigger_sync_on_attach,
-                    sync::handle_cell_sync_result,
-                    sync::handle_block_events,
-                    sync::send_block_operations,
-                    sync::create_remote_cell,
-                    sync::delete_remote_cell,
                 ),
             );
     }
