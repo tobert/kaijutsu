@@ -20,7 +20,6 @@ pub mod db;
 pub mod kernel;
 pub mod llm;
 pub mod rhai_engine;
-pub mod script;
 pub mod state;
 pub mod tools;
 pub mod vfs;
@@ -33,7 +32,6 @@ pub use conversation_db::ConversationDb;
 pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
-pub use script::{HookEvent, HookRegistry, ScriptEngine, ScriptResult};
 pub use state::KernelState;
 pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use llm::{
