@@ -7,11 +7,12 @@ repository.workspace = true
 description = "Block-based CRDT document model for Kaijutsu"
 
 [dependencies]
-# Fugue implementation for block ordering
-cola = "0.2"
+# Unified CRDT library with Map/Set/Register/Text support
+# Provides all CRDT types needed for block document model
+diamond-types.workspace = true
 
-# Text CRDT for within-block editing
-diamond-types = "1.0"
+# SmartString (same as diamond-types uses)
+smartstring = "1.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

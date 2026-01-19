@@ -1,6 +1,8 @@
 //! Block types and identifiers.
+//!
+//! Simplified version that works with the unified diamond-types CRDT.
+//! Text CRDTs are now managed internally by diamond-types OpLog.
 
-use diamond_types::list::ListCRDT;
 use serde::{Deserialize, Serialize};
 
 /// Globally unique block identifier.
@@ -81,136 +83,13 @@ impl BlockType {
     }
 }
 
-/// Block content - either with CRDT text or immutable data.
-pub enum BlockContent {
-    /// Extended thinking with CRDT text.
-    Thinking {
-        /// Text CRDT for concurrent editing.
-        crdt: ListCRDT,
-        /// Whether the block is collapsed in UI.
-        collapsed: bool,
-    },
-
-    /// Main text response with CRDT.
-    Text {
-        /// Text CRDT for concurrent editing.
-        crdt: ListCRDT,
-    },
-
-    /// Tool invocation - immutable after creation.
-    ToolUse {
-        /// Unique tool use ID.
-        id: String,
-        /// Tool name.
-        name: String,
-        /// Tool input as JSON.
-        input: serde_json::Value,
-    },
-
-    /// Tool result - immutable after creation.
-    ToolResult {
-        /// ID of the tool_use this is a result for.
-        tool_use_id: String,
-        /// Result content.
-        content: String,
-        /// Whether this result represents an error.
-        is_error: bool,
-    },
-}
-
-impl BlockContent {
-    /// Get the block type.
-    pub fn block_type(&self) -> BlockType {
-        match self {
-            BlockContent::Thinking { .. } => BlockType::Thinking,
-            BlockContent::Text { .. } => BlockType::Text,
-            BlockContent::ToolUse { .. } => BlockType::ToolUse,
-            BlockContent::ToolResult { .. } => BlockType::ToolResult,
-        }
-    }
-
-    /// Get the text content of this block.
-    pub fn text(&self) -> String {
-        match self {
-            BlockContent::Thinking { crdt, .. } => crdt.branch.content().to_string(),
-            BlockContent::Text { crdt } => crdt.branch.content().to_string(),
-            BlockContent::ToolResult { content, .. } => content.clone(),
-            BlockContent::ToolUse { name, input, .. } => {
-                format!("{}({})", name, input)
-            }
-        }
-    }
-
-    /// Get mutable reference to text CRDT if this block has one.
-    pub fn text_crdt_mut(&mut self) -> Option<&mut ListCRDT> {
-        match self {
-            BlockContent::Thinking { crdt, .. } => Some(crdt),
-            BlockContent::Text { crdt } => Some(crdt),
-            _ => None,
-        }
-    }
-
-    /// Get reference to text CRDT if this block has one.
-    pub fn text_crdt(&self) -> Option<&ListCRDT> {
-        match self {
-            BlockContent::Thinking { crdt, .. } => Some(crdt),
-            BlockContent::Text { crdt } => Some(crdt),
-            _ => None,
-        }
-    }
-
-    /// Check if this content is collapsed (only for Thinking blocks).
-    pub fn is_collapsed(&self) -> bool {
-        match self {
-            BlockContent::Thinking { collapsed, .. } => *collapsed,
-            _ => false,
-        }
-    }
-
-    /// Set collapsed state (only for Thinking blocks).
-    pub fn set_collapsed(&mut self, value: bool) -> bool {
-        if let BlockContent::Thinking { collapsed, .. } = self {
-            *collapsed = value;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Create a snapshot of this content (serializable, no CRDT state).
-    pub fn snapshot(&self) -> BlockContentSnapshot {
-        match self {
-            BlockContent::Thinking { crdt, collapsed } => BlockContentSnapshot::Thinking {
-                text: crdt.branch.content().to_string(),
-                collapsed: *collapsed,
-            },
-            BlockContent::Text { crdt } => BlockContentSnapshot::Text {
-                text: crdt.branch.content().to_string(),
-            },
-            BlockContent::ToolUse { id, name, input } => BlockContentSnapshot::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            },
-            BlockContent::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => BlockContentSnapshot::ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                content: content.clone(),
-                is_error: *is_error,
-            },
-        }
-    }
-}
-
 /// Serializable snapshot of block content (no CRDT state).
 ///
 /// Used for:
 /// - Initial block creation
 /// - Full state sync
 /// - Wire protocol serialization
+/// - Reading current block state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BlockContentSnapshot {
     /// Thinking block snapshot.
@@ -255,105 +134,12 @@ impl BlockContentSnapshot {
         }
     }
 
-    /// Convert snapshot to full content with CRDT.
-    pub fn into_content(self, agent_id: &str) -> BlockContent {
+    /// Check if this content is collapsed (only for Thinking blocks).
+    pub fn is_collapsed(&self) -> bool {
         match self {
-            BlockContentSnapshot::Thinking { text, collapsed } => {
-                let mut crdt = ListCRDT::new();
-                if !text.is_empty() {
-                    let agent = crdt.oplog.get_or_create_agent_id(agent_id);
-                    crdt.insert(agent, 0, &text);
-                }
-                BlockContent::Thinking { crdt, collapsed }
-            }
-            BlockContentSnapshot::Text { text } => {
-                let mut crdt = ListCRDT::new();
-                if !text.is_empty() {
-                    let agent = crdt.oplog.get_or_create_agent_id(agent_id);
-                    crdt.insert(agent, 0, &text);
-                }
-                BlockContent::Text { crdt }
-            }
-            BlockContentSnapshot::ToolUse { id, name, input } => {
-                BlockContent::ToolUse { id, name, input }
-            }
-            BlockContentSnapshot::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => BlockContent::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            },
+            BlockContentSnapshot::Thinking { collapsed, .. } => *collapsed,
+            _ => false,
         }
-    }
-}
-
-/// A block in the document.
-pub struct Block {
-    /// Globally unique identifier.
-    pub id: BlockId,
-    /// Block content.
-    pub content: BlockContent,
-    /// Author who created this block (participant id like "user:amy" or "model:claude").
-    pub author: String,
-    /// Timestamp when block was created (Unix millis).
-    pub created_at: u64,
-}
-
-impl Block {
-    /// Create a new block with author and timestamp.
-    pub fn new(id: BlockId, content: BlockContent, author: impl Into<String>) -> Self {
-        Self {
-            id,
-            content,
-            author: author.into(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        }
-    }
-
-    /// Create a new block with explicit timestamp (for restoring from snapshot).
-    pub fn with_timestamp(
-        id: BlockId,
-        content: BlockContent,
-        author: impl Into<String>,
-        created_at: u64,
-    ) -> Self {
-        Self {
-            id,
-            content,
-            author: author.into(),
-            created_at,
-        }
-    }
-
-    /// Get the block type.
-    pub fn block_type(&self) -> BlockType {
-        self.content.block_type()
-    }
-
-    /// Get text content.
-    pub fn text(&self) -> String {
-        self.content.text()
-    }
-
-    /// Get mutable reference to text CRDT.
-    pub fn text_crdt_mut(&mut self) -> Option<&mut ListCRDT> {
-        self.content.text_crdt_mut()
-    }
-
-    /// Get reference to text CRDT.
-    pub fn text_crdt(&self) -> Option<&ListCRDT> {
-        self.content.text_crdt()
-    }
-
-    /// Create a snapshot of this block.
-    pub fn snapshot(&self) -> BlockContentSnapshot {
-        self.content.snapshot()
     }
 }
 
@@ -370,47 +156,33 @@ mod tests {
     }
 
     #[test]
-    fn test_block_content_text() {
-        let mut content = BlockContent::Text {
-            crdt: ListCRDT::new(),
-        };
+    fn test_block_type() {
+        assert!(BlockType::Thinking.has_text_crdt());
+        assert!(BlockType::Text.has_text_crdt());
+        assert!(!BlockType::ToolUse.has_text_crdt());
+        assert!(!BlockType::ToolResult.has_text_crdt());
 
-        if let Some(crdt) = content.text_crdt_mut() {
-            let agent = crdt.oplog.get_or_create_agent_id("alice");
-            crdt.insert(agent, 0, "hello");
-        }
-
-        assert_eq!(content.text(), "hello");
-        assert!(!content.is_collapsed());
+        assert!(!BlockType::Thinking.is_immutable());
+        assert!(!BlockType::Text.is_immutable());
+        assert!(BlockType::ToolUse.is_immutable());
+        assert!(BlockType::ToolResult.is_immutable());
     }
 
     #[test]
-    fn test_block_content_thinking_collapsed() {
-        let mut content = BlockContent::Thinking {
-            crdt: ListCRDT::new(),
-            collapsed: false,
+    fn test_content_snapshot() {
+        let thinking = BlockContentSnapshot::Thinking {
+            text: "thinking...".to_string(),
+            collapsed: true,
         };
+        assert_eq!(thinking.block_type(), BlockType::Thinking);
+        assert_eq!(thinking.text(), "thinking...");
+        assert!(thinking.is_collapsed());
 
-        assert!(!content.is_collapsed());
-        content.set_collapsed(true);
-        assert!(content.is_collapsed());
-    }
-
-    #[test]
-    fn test_snapshot_roundtrip() {
-        let snapshot = BlockContentSnapshot::Text {
-            text: "hello world".to_string(),
+        let text = BlockContentSnapshot::Text {
+            text: "hello".to_string(),
         };
-
-        let content = snapshot.clone().into_content("alice");
-        assert_eq!(content.text(), "hello world");
-
-        let snapshot2 = content.snapshot();
-        match (snapshot, snapshot2) {
-            (BlockContentSnapshot::Text { text: t1 }, BlockContentSnapshot::Text { text: t2 }) => {
-                assert_eq!(t1, t2);
-            }
-            _ => panic!("type mismatch"),
-        }
+        assert_eq!(text.block_type(), BlockType::Text);
+        assert_eq!(text.text(), "hello");
+        assert!(!text.is_collapsed());
     }
 }

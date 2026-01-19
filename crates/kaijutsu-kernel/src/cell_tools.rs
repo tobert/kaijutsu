@@ -40,7 +40,7 @@ pub struct CellEditParams {
 /// for line-based editing operations.
 pub struct CellEditEngine {
     cells: SharedBlockStore,
-    agent_name: String,
+    _agent_name: String,
 }
 
 impl CellEditEngine {
@@ -48,7 +48,7 @@ impl CellEditEngine {
     pub fn new(cells: SharedBlockStore, agent_name: impl Into<String>) -> Self {
         Self {
             cells,
-            agent_name: agent_name.into(),
+            _agent_name: agent_name.into(),
         }
     }
 
@@ -144,10 +144,8 @@ impl ExecutionEngine for CellEditEngine {
             }
         };
 
-        let mut store = self.cells.write().unwrap();
-
         // Get the cell
-        let cell = match store.get_mut(&params.cell_id) {
+        let mut cell = match self.cells.get_mut(&params.cell_id) {
             Some(c) => c,
             None => {
                 return Ok(ExecResult::failure(
@@ -158,12 +156,11 @@ impl ExecutionEngine for CellEditEngine {
         };
 
         // Find the first text block, or create one if empty
-        let snapshots = cell.block_snapshots();
-        let primary_block_id = snapshots
+        let primary_block_id = cell.doc.blocks_ordered()
             .iter()
-            .find_map(|(id, snap)| {
-                if matches!(snap, BlockContentSnapshot::Text { .. }) {
-                    Some(id.clone())
+            .find_map(|snap| {
+                if matches!(snap.content, BlockContentSnapshot::Text { .. }) {
+                    Some(snap.id.clone())
                 } else {
                     None
                 }
@@ -173,7 +170,7 @@ impl ExecutionEngine for CellEditEngine {
         let block_id = match primary_block_id {
             Some(id) => id,
             None => {
-                cell.insert_text_block(None, "")
+                cell.doc.insert_text_block(None, "")
                     .map_err(|e| anyhow::anyhow!("Failed to create text block: {}", e))?
             }
         };
@@ -190,7 +187,7 @@ impl ExecutionEngine for CellEditEngine {
                     } else {
                         format!("{}\n", text)
                     };
-                    cell.edit_text(&block_id, pos, &text_with_newline, 0)
+                    cell.doc.edit_text(&block_id, pos, &text_with_newline, 0)
                         .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                 }
                 EditOp::Delete {
@@ -200,7 +197,7 @@ impl ExecutionEngine for CellEditEngine {
                     let start = line_to_pos(&content, start_line);
                     let end = line_end_pos(&content, end_line);
                     if start < end {
-                        cell.edit_text(&block_id, start, "", end - start)
+                        cell.doc.edit_text(&block_id, start, "", end - start)
                             .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                     }
                 }
@@ -216,7 +213,7 @@ impl ExecutionEngine for CellEditEngine {
                     } else {
                         format!("{}\n", text)
                     };
-                    cell.edit_text(&block_id, start, &text_with_newline, end - start)
+                    cell.doc.edit_text(&block_id, start, &text_with_newline, end - start)
                         .map_err(|e| anyhow::anyhow!("Edit failed: {}", e))?;
                 }
             }
@@ -288,9 +285,7 @@ impl ExecutionEngine for CellReadEngine {
             }
         };
 
-        let store = self.cells.read().unwrap();
-
-        match store.get(&params.cell_id) {
+        match self.cells.get(&params.cell_id) {
             Some(cell) => {
                 let result = serde_json::json!({
                     "cell_id": params.cell_id,
@@ -343,17 +338,18 @@ impl ExecutionEngine for CellListEngine {
     }
 
     async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
-        let store = self.cells.read().unwrap();
-
-        let cell_list: Vec<serde_json::Value> = store
+        let ids = self.cells.list_ids();
+        let cell_list: Vec<serde_json::Value> = ids
             .iter()
-            .map(|cell| {
-                serde_json::json!({
-                    "id": cell.id,
-                    "kind": format!("{:?}", cell.kind),
-                    "language": cell.language,
-                    "length": cell.content().len(),
-                    "version": cell.version()
+            .filter_map(|id| {
+                self.cells.get(id).map(|cell| {
+                    serde_json::json!({
+                        "id": id,
+                        "kind": format!("{:?}", cell.kind),
+                        "language": cell.language,
+                        "length": cell.content().len(),
+                        "version": cell.version()
+                    })
                 })
             })
             .collect();
@@ -380,12 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_cell_edit_insert() {
         let store = shared_block_store("test-agent");
-        {
-            let mut cells = store.write().unwrap();
-            cells
-                .create_cell("test".into(), CellKind::Code, Some("rust".into()))
-                .unwrap();
-        }
+        store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
 
@@ -394,21 +385,15 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.read().unwrap();
-        let cell = cells.get("test").unwrap();
+        let cell = store.get("test").unwrap();
         assert_eq!(cell.content(), "hello world\n");
     }
 
     #[tokio::test]
     async fn test_cell_edit_delete() {
         let store = shared_block_store("test-agent");
-        {
-            let mut cells = store.write().unwrap();
-            let cell = cells
-                .create_cell("test".into(), CellKind::Code, Some("rust".into()))
-                .unwrap();
-            cell.insert_text_block(None, "line1\nline2\nline3\n").unwrap();
-        }
+        store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.insert_text_block("test", None, "line1\nline2\nline3\n").unwrap();
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
 
@@ -418,21 +403,15 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.read().unwrap();
-        let cell = cells.get("test").unwrap();
+        let cell = store.get("test").unwrap();
         assert_eq!(cell.content(), "line1\nline3\n");
     }
 
     #[tokio::test]
     async fn test_cell_edit_replace() {
         let store = shared_block_store("test-agent");
-        {
-            let mut cells = store.write().unwrap();
-            let cell = cells
-                .create_cell("test".into(), CellKind::Code, Some("rust".into()))
-                .unwrap();
-            cell.insert_text_block(None, "line1\nline2\nline3\n").unwrap();
-        }
+        store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.insert_text_block("test", None, "line1\nline2\nline3\n").unwrap();
 
         let engine = CellEditEngine::new(store.clone(), "test-agent");
 
@@ -442,21 +421,15 @@ mod tests {
 
         assert!(result.success);
 
-        let cells = store.read().unwrap();
-        let cell = cells.get("test").unwrap();
+        let cell = store.get("test").unwrap();
         assert_eq!(cell.content(), "replaced\nline3\n");
     }
 
     #[tokio::test]
     async fn test_cell_read() {
         let store = shared_block_store("test-agent");
-        {
-            let mut cells = store.write().unwrap();
-            let cell = cells
-                .create_cell("test".into(), CellKind::Code, Some("rust".into()))
-                .unwrap();
-            cell.insert_text_block(None, "fn main() {}").unwrap();
-        }
+        store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.insert_text_block("test", None, "fn main() {}").unwrap();
 
         let engine = CellReadEngine::new(store.clone());
 
@@ -470,15 +443,8 @@ mod tests {
     #[tokio::test]
     async fn test_cell_list() {
         let store = shared_block_store("test-agent");
-        {
-            let mut cells = store.write().unwrap();
-            cells
-                .create_cell("cell1".into(), CellKind::Code, Some("rust".into()))
-                .unwrap();
-            cells
-                .create_cell("cell2".into(), CellKind::Markdown, None)
-                .unwrap();
-        }
+        store.create_cell("cell1".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.create_cell("cell2".into(), CellKind::Markdown, None).unwrap();
 
         let engine = CellListEngine::new(store.clone());
 

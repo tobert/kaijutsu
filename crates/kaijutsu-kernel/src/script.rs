@@ -90,9 +90,8 @@ impl ScriptEngine {
             };
 
             let id = uuid::Uuid::new_v4().to_string();
-            let mut store = store_create.write().unwrap();
 
-            match store.create_cell(id.clone(), cell_kind, None) {
+            match store_create.create_cell(id.clone(), cell_kind, None) {
                 Ok(_) => {
                     debug!("Script: created cell {} ({:?})", id, cell_kind);
                     id
@@ -107,8 +106,7 @@ impl ScriptEngine {
         // get_content(cell_id: &str) -> String
         // Returns the content of a cell, or empty string if not found
         engine.register_fn("get_content", move |cell_id: String| -> String {
-            let store = store_get.read().unwrap();
-            match store.get(&cell_id) {
+            match store_get.get(&cell_id) {
                 Some(cell) => {
                     let content = cell.content();
                     debug!("Script: get_content({}) -> {} chars", cell_id, content.len());
@@ -124,40 +122,34 @@ impl ScriptEngine {
         // set_content(cell_id: &str, content: &str)
         // Replaces the entire content of a cell with a single text block
         engine.register_fn("set_content", move |cell_id: String, content: String| {
-            let mut store = store_set.write().unwrap();
-            if let Some(cell) = store.get_mut(&cell_id) {
-                // Delete all existing blocks
-                let block_ids: Vec<_> = cell
-                    .doc
-                    .blocks_ordered()
-                    .iter()
-                    .map(|b| b.id.clone())
-                    .collect();
-                for id in block_ids {
-                    let _ = cell.delete_block(&id);
-                }
+            // Get block IDs to delete
+            let block_ids: Vec<_> = store_set
+                .get(&cell_id)
+                .map(|cell| cell.doc.blocks_ordered().iter().map(|b| b.id.clone()).collect())
+                .unwrap_or_default();
 
-                // Insert new content as a single text block
-                if !content.is_empty() {
-                    match cell.insert_text_block(None, &content) {
-                        Ok(_) => {
-                            debug!("Script: set_content({}, {} chars)", cell_id, content.len());
-                        }
-                        Err(e) => {
-                            warn!("Script: set_content({}) error: {}", cell_id, e);
-                        }
+            // Delete all existing blocks
+            for id in block_ids {
+                let _ = store_set.delete_block(&cell_id, &id);
+            }
+
+            // Insert new content as a single text block
+            if !content.is_empty() {
+                match store_set.insert_text_block(&cell_id, None, &content) {
+                    Ok(_) => {
+                        debug!("Script: set_content({}, {} chars)", cell_id, content.len());
+                    }
+                    Err(e) => {
+                        warn!("Script: set_content({}) error: {}", cell_id, e);
                     }
                 }
-            } else {
-                warn!("Script: set_content({}) -> cell not found", cell_id);
             }
         });
 
         // cells() -> Array
         // Returns an array of all cell IDs
         engine.register_fn("cells", move || -> rhai::Array {
-            let store = store_list.read().unwrap();
-            let ids: rhai::Array = store
+            let ids: rhai::Array = store_list
                 .list_ids()
                 .into_iter()
                 .map(|id| Dynamic::from(id))
@@ -169,8 +161,7 @@ impl ScriptEngine {
         // delete_cell(cell_id: &str) -> bool
         // Deletes a cell, returns true if successful
         engine.register_fn("delete_cell", move |cell_id: String| -> bool {
-            let mut store = store_delete.write().unwrap();
-            match store.delete_cell(&cell_id) {
+            match store_delete.delete_cell(&cell_id) {
                 Ok(()) => {
                     debug!("Script: delete_cell({}) -> success", cell_id);
                     true
@@ -190,8 +181,7 @@ impl ScriptEngine {
         // get_kind(cell_id) -> String
         // Returns the kind of a cell ("code", "markdown", etc.)
         engine.register_fn("get_kind", move |cell_id: String| -> String {
-            let store = store_kind.read().unwrap();
-            match store.get(&cell_id) {
+            match store_kind.get(&cell_id) {
                 Some(cell) => {
                     let kind = match cell.kind {
                         CellKind::Code => "code",
@@ -210,8 +200,7 @@ impl ScriptEngine {
         // cell_len(cell_id) -> i64
         // Returns the length of a cell's content in characters
         engine.register_fn("cell_len", move |cell_id: String| -> i64 {
-            let store = store_len.read().unwrap();
-            match store.get(&cell_id) {
+            match store_len.get(&cell_id) {
                 Some(cell) => cell.content().len() as i64,
                 None => -1,
             }
@@ -221,34 +210,33 @@ impl ScriptEngine {
         // Append text to the last text block, or create a new one
         engine.register_fn("append_text", move |cell_id: String, text: String| {
             let text_len = text.len();
-            let mut store = store_append.write().unwrap();
-            if let Some(cell) = store.get_mut(&cell_id) {
-                // Find the last text block
-                let last_text_block = cell
-                    .doc
-                    .blocks_ordered()
-                    .iter()
-                    .rev()
-                    .find(|b| matches!(b.content, kaijutsu_crdt::BlockContent::Text { .. }))
-                    .map(|b| b.id.clone());
 
-                match last_text_block {
-                    Some(block_id) => {
-                        if let Err(e) = cell.append_text(&block_id, &text) {
-                            warn!("Script: append_text({}) error: {}", cell_id, e);
-                        }
-                    }
-                    None => {
-                        // No text block exists, create one
-                        if let Err(e) = cell.insert_text_block(None, &text) {
-                            warn!("Script: append_text({}) - create block error: {}", cell_id, e);
-                        }
+            // Find the last text block
+            let last_text_block = store_append
+                .get(&cell_id)
+                .and_then(|cell| {
+                    cell.doc
+                        .blocks_ordered()
+                        .iter()
+                        .rev()
+                        .find(|b| matches!(b.content, kaijutsu_crdt::BlockContentSnapshot::Text { .. }))
+                        .map(|b| b.id.clone())
+                });
+
+            match last_text_block {
+                Some(block_id) => {
+                    if let Err(e) = store_append.append_text(&cell_id, &block_id, &text) {
+                        warn!("Script: append_text({}) error: {}", cell_id, e);
                     }
                 }
-                debug!("Script: append_text({}, {} chars)", cell_id, text_len);
-            } else {
-                warn!("Script: append_text({}) -> cell not found", cell_id);
+                None => {
+                    // No text block exists, create one
+                    if let Err(e) = store_append.insert_text_block(&cell_id, None, &text) {
+                        warn!("Script: append_text({}) - create block error: {}", cell_id, e);
+                    }
+                }
             }
+            debug!("Script: append_text({}, {} chars)", cell_id, text_len);
         });
 
         // Utility functions - use 'println' to avoid conflict with Rhai's built-in 'print'
@@ -397,8 +385,7 @@ mod tests {
         assert!(result.contains('-'));
 
         // Verify cell actually exists in store
-        let guard = store.read().unwrap();
-        assert!(guard.get(&result).is_some());
+        assert!(store.get(&result).is_some());
     }
 
     #[test]
@@ -417,11 +404,10 @@ mod tests {
             .unwrap();
 
         // Get the cell ID from the store and verify content
-        let guard = store.read().unwrap();
-        let ids = guard.list_ids();
+        let ids = store.list_ids();
         assert_eq!(ids.len(), 1);
 
-        let cell = guard.get(&ids[0]).unwrap();
+        let cell = store.get(&ids[0]).unwrap();
         assert_eq!(cell.content(), "Hello World from Rhai!");
     }
 
@@ -483,8 +469,7 @@ mod tests {
         assert!(deleted);
 
         // Verify cell is gone
-        let guard = store.read().unwrap();
-        assert!(guard.list_ids().is_empty());
+        assert!(store.list_ids().is_empty());
     }
 
     #[test]

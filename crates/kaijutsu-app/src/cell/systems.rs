@@ -5,7 +5,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    Block, BlockContent, Cell, CellEditor, CellKind, CellPosition, CellState,
+    BlockContentSnapshot, BlockSnapshot, Cell, CellEditor, CellKind, CellPosition, CellState,
     ConversationScrollState, CurrentMode, EditorMode, FocusedCell, MainCell, PromptCell,
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
@@ -232,7 +232,7 @@ pub fn init_cell_buffers(
 ///
 /// This produces a text representation with visual markers for different block types.
 /// Collapsed thinking blocks are shown as a single line.
-fn format_blocks_for_display(blocks: &[&Block]) -> String {
+fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
     if blocks.is_empty() {
         return String::new();
     }
@@ -245,21 +245,21 @@ fn format_blocks_for_display(blocks: &[&Block]) -> String {
         }
 
         match &block.content {
-            BlockContent::Thinking { collapsed, .. } => {
+            BlockContentSnapshot::Thinking { collapsed, .. } => {
                 if *collapsed {
                     // Collapsed: show indicator
                     output.push_str("💭 [Thinking collapsed - Tab to expand]");
                 } else {
                     // Expanded: show with dimmed header
                     output.push_str("💭 ─── Thinking ───\n");
-                    output.push_str(&block.text());
+                    output.push_str(block.content.text());
                     output.push_str("\n───────────────────");
                 }
             }
-            BlockContent::Text { .. } => {
-                output.push_str(&block.text());
+            BlockContentSnapshot::Text { .. } => {
+                output.push_str(block.content.text());
             }
-            BlockContent::ToolUse { name, input, .. } => {
+            BlockContentSnapshot::ToolUse { name, input, .. } => {
                 output.push_str("🔧 Tool: ");
                 output.push_str(name);
                 output.push('\n');
@@ -270,7 +270,7 @@ fn format_blocks_for_display(blocks: &[&Block]) -> String {
                     output.push_str(&input.to_string());
                 }
             }
-            BlockContent::ToolResult {
+            BlockContentSnapshot::ToolResult {
                 content, is_error, ..
             } => {
                 if *is_error {
@@ -512,7 +512,7 @@ pub fn handle_collapse_toggle(
             let thinking_blocks: Vec<_> = editor
                 .blocks()
                 .iter()
-                .filter(|b| matches!(b.content, BlockContent::Thinking { .. }))
+                .filter(|b| matches!(b.content, BlockContentSnapshot::Thinking { .. }))
                 .map(|b| b.id.clone())
                 .collect();
 
@@ -525,7 +525,7 @@ pub fn handle_collapse_toggle(
                 let collapsed = editor
                     .blocks()
                     .iter()
-                    .find(|b| matches!(b.content, BlockContent::Thinking { .. }))
+                    .find(|b| matches!(b.content, BlockContentSnapshot::Thinking { .. }))
                     .map(|b| b.content.is_collapsed())
                     .unwrap_or(false);
                 info!(
@@ -688,7 +688,7 @@ fn cursor_position(editor: &CellEditor) -> (usize, usize) {
     let mut row = 0;
 
     for (i, block) in blocks.iter().enumerate() {
-        let text = block.text();
+        let text = block.content.text();
 
         if &block.id == cursor_block_id {
             // Found the cursor's block - count rows within it and compute col
@@ -1138,7 +1138,7 @@ pub fn sync_main_cell_to_conversation(
 
     // Update cursor to end of document
     if let Some(last_block) = editor.blocks().last() {
-        let len = last_block.text().len();
+        let len = last_block.content.text().len();
         editor.cursor = super::components::BlockCursor::at(last_block.id.clone(), len);
     }
 

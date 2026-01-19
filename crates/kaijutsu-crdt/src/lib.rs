@@ -1,8 +1,7 @@
 //! Block-based CRDT document model for Kaijutsu.
 //!
-//! Two-level CRDT architecture:
-//! - **Block ordering**: Fugue (via `cola`) for concurrent insert/delete/move
-//! - **Block content**: `diamond-types` ListCRDT for text within editable blocks
+//! Uses the unified diamond-types fork with Map, Set, Register, and Text CRDTs.
+//! All CRDT operations go through a single OpLog for guaranteed convergence.
 //!
 //! # Design Philosophy
 //!
@@ -18,16 +17,22 @@
 //! - **Text**: Main response text with text CRDT
 //! - **ToolUse**: Immutable tool invocation
 //! - **ToolResult**: Immutable tool result
+//!
+//! # CRDT Semantics
+//!
+//! - **Maps**: Last-Write-Wins (LWW) - most recent write wins by Lamport timestamp
+//! - **Sets**: OR-Set (add-wins) - concurrent add and remove both succeed, add wins
+//! - **Text**: Sequence CRDT - character-level merging with proper interleaving
 
 mod block;
 mod document;
 mod error;
 mod ops;
 
-pub use block::{Block, BlockContent, BlockContentSnapshot, BlockId, BlockType};
+pub use block::{BlockContentSnapshot, BlockId, BlockType};
 pub use document::{BlockDocument, BlockSnapshot, DocumentSnapshot};
 pub use error::CrdtError;
-pub use ops::BlockDocOp;
+pub use ops::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
 /// Result type for CRDT operations.
 pub type Result<T> = std::result::Result<T, CrdtError>;
@@ -119,87 +124,56 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires full Fugue state sharing between replicas - tracked for Phase 2"]
+    #[ignore = "Multi-client sync requires shared initial state - handled by BlockStore in Phase 2"]
     fn test_concurrent_block_insertion() {
-        // Simulate two agents inserting blocks concurrently
-        // NOTE: Full convergence requires sharing Fugue replica state, not just ops.
-        // Current implementation tracks block order locally and merges ops optimistically.
+        // NOTE: This test requires documents to share a common initial OpLog state.
+        // Independent documents create different CRDT IDs for their "blocks" Sets.
+        // The BlockStore in Phase 2 will handle proper multi-client sync by:
+        // 1. Having a single canonical OpLog per cell
+        // 2. Syncing deltas via SerializedOps
+        // 3. Ensuring all clients operate on the same CRDT structure
         let mut doc1 = BlockDocument::new("test-cell", "alice");
         let mut doc2 = BlockDocument::new("test-cell", "bob");
 
-        // Both insert at the beginning
         let _alice_id = doc1.insert_text_block(None, "Alice's block").unwrap();
         let _bob_id = doc2.insert_text_block(None, "Bob's block").unwrap();
 
-        // Get ops from each
-        let alice_ops = doc1.take_pending_ops();
-        let bob_ops = doc2.take_pending_ops();
+        doc1.oplog.merge_ops(doc2.oplog.ops_since(&[])).unwrap();
+        doc2.oplog.merge_ops(doc1.oplog.ops_since(&[])).unwrap();
 
-        // Apply ops to each other's document
-        for op in alice_ops {
-            doc2.apply_remote_op(&op).unwrap();
-        }
-        for op in bob_ops {
-            doc1.apply_remote_op(&op).unwrap();
-        }
-
-        // Both should have 2 blocks and converge to same order
         assert_eq!(doc1.block_count(), 2);
         assert_eq!(doc2.block_count(), 2);
 
-        // CRDT guarantee: both documents converge to same order
-        // The specific order depends on agent IDs and insertion context
         let doc1_order: Vec<_> = doc1.blocks_ordered().iter().map(|b| b.id.clone()).collect();
         let doc2_order: Vec<_> = doc2.blocks_ordered().iter().map(|b| b.id.clone()).collect();
-        assert_eq!(doc1_order, doc2_order, "Documents must converge to same block order");
-
-        // Full text must also match
-        assert_eq!(doc1.full_text(), doc2.full_text());
+        assert_eq!(doc1_order, doc2_order);
     }
 
     #[test]
-    #[ignore = "Requires diamond-types oplog sharing between replicas - tracked for Phase 2"]
+    #[ignore = "Multi-client sync requires shared initial state - handled by BlockStore in Phase 2"]
     fn test_concurrent_text_editing() {
-        // NOTE: Full text convergence requires merging diamond-types oplogs, not just
-        // replaying insert/delete ops. Current implementation applies ops optimistically.
+        // NOTE: Same issue as above - independent documents have different CRDT structures.
+        // For proper convergence, clients must start from the same OpLog state.
         let mut doc1 = BlockDocument::new("test-cell", "alice");
         let mut doc2 = BlockDocument::new("test-cell", "bob");
 
-        // Alice creates a block
         let block_id = doc1.insert_text_block(None, "hello").unwrap();
+        doc2.oplog.merge_ops(doc1.oplog.ops_since(&[])).unwrap();
 
-        // Sync to bob
-        let ops = doc1.take_pending_ops();
-        for op in ops {
-            doc2.apply_remote_op(&op).unwrap();
-        }
+        doc1.edit_text(&block_id, 5, " alice", 0).unwrap();
+        doc2.edit_text(&block_id, 5, " bob", 0).unwrap();
 
-        // Both edit concurrently at the same position
-        doc1.edit_text(&block_id, 5, " alice", 0).unwrap(); // "hello alice"
-        doc2.edit_text(&block_id, 5, " bob", 0).unwrap(); // "hello bob"
+        let doc1_frontier = doc1.frontier();
+        let doc2_frontier = doc2.frontier();
 
-        // Exchange ops
-        let alice_ops = doc1.take_pending_ops();
-        let bob_ops = doc2.take_pending_ops();
+        doc1.oplog.merge_ops(doc2.oplog.ops_since(&doc1_frontier)).unwrap();
+        doc2.oplog.merge_ops(doc1.oplog.ops_since(&doc2_frontier)).unwrap();
 
-        for op in alice_ops {
-            doc2.apply_remote_op(&op).unwrap();
-        }
-        for op in bob_ops {
-            doc1.apply_remote_op(&op).unwrap();
-        }
+        assert_eq!(doc1.full_text(), doc2.full_text());
 
-        // CRDT guarantee: both documents converge to same text
-        assert_eq!(
-            doc1.full_text(),
-            doc2.full_text(),
-            "Documents must converge to same text"
-        );
-
-        // Should contain both additions (order determined by CRDT)
         let text = doc1.full_text();
-        assert!(text.contains("alice"), "Text should contain 'alice'");
-        assert!(text.contains("bob"), "Text should contain 'bob'");
-        assert!(text.contains("hello"), "Text should contain 'hello'");
+        assert!(text.contains("alice"));
+        assert!(text.contains("bob"));
+        assert!(text.contains("hello"));
     }
 }

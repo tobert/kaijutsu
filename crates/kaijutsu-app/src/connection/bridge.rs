@@ -14,7 +14,7 @@ use kaijutsu_client::{
     CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, Identity, KernelConfig,
     KernelHandle, KernelInfo, Row, RpcClient, SshConfig,
 };
-use kaijutsu_crdt::{BlockContentSnapshot, BlockDocOp, BlockId};
+use kaijutsu_crdt::{BlockContentSnapshot, BlockId};
 
 use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 
@@ -65,8 +65,7 @@ pub enum ConnectionCommand {
     SyncCells { versions: Vec<CellVersion> },
 
     // Block-based CRDT operations (new architecture)
-    /// Apply a block operation to a cell
-    ApplyBlockOp { cell_id: String, op: BlockDocOp },
+    // NOTE: ApplyBlockOp was removed - the unified CRDT model uses SerializedOps.
     /// Get block cell state
     GetBlockCellState { cell_id: String },
 
@@ -731,21 +730,7 @@ async fn connection_loop(
             }
 
             // Block-based CRDT commands
-            ConnectionCommand::ApplyBlockOp { cell_id, op } => {
-                if let Some(kernel) = &current_kernel {
-                    match kernel.apply_block_op(&cell_id, op).await {
-                        Ok(new_version) => {
-                            let _ = evt_tx
-                                .send(ConnectionEvent::BlockOpApplied { cell_id, new_version });
-                        }
-                        Err(e) => {
-                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
-                }
-            }
+            // NOTE: ApplyBlockOp was removed - unified CRDT model uses SerializedOps
 
             ConnectionCommand::GetBlockCellState { cell_id } => {
                 if let Some(kernel) = &current_kernel {

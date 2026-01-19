@@ -61,8 +61,8 @@ glyphon = { path = "../glyphon" }
 cosmic-text = "0.16"
 
 # CRDT + Persistence
-diamond-types = "1.0"
-cola = "0.2"
+# Using forked diamond-types with Map/Set/Register support
+diamond-types = { git = "https://github.com/tobert/diamond-types", branch = "feat/maps-and-uuids", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting

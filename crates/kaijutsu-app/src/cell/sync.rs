@@ -333,46 +333,23 @@ fn spawn_remote_cell(
 
 /// System: Send pending block operations to server.
 ///
-/// This runs every frame and sends operations for cells that have pending edits.
-/// Uses block-based CRDT operations for efficient delta sync.
+/// NOTE: This function was previously using the old BlockDocOp sync model.
+/// The new unified CRDT uses frontier-based sync with SerializedOps.
+/// For now, the server pushes updates to clients via the block event stream.
+/// TODO: Implement frontier-based sync for client -> server updates.
 pub fn send_block_operations(
-    mut cells: Query<(Entity, &Cell, &mut CellEditor), Changed<CellEditor>>,
-    registry: Res<CellRegistry>,
-    cmds: Option<Res<ConnectionCommands>>,
+    _cells: Query<(Entity, &Cell, &mut CellEditor), Changed<CellEditor>>,
+    _registry: Res<CellRegistry>,
+    _cmds: Option<Res<ConnectionCommands>>,
 ) {
-    let Some(cmds) = cmds else { return };
-
-    for (entity, cell, mut editor) in cells.iter_mut() {
-        // Get remote ID
-        let Some(remote_id) = registry.get_remote(entity) else {
-            // This is a local-only cell, not yet synced
-            // Keep pending ops - they'll be sent when we get registered
-            // via CellCreated event from the server
-            debug!(
-                "Cell {} not registered with server, keeping pending ops",
-                cell.id.0,
-            );
-            continue;
-        };
-
-        // Take pending block operations from the editor's document
-        let pending_ops = editor.take_pending_ops();
-
-        if pending_ops.is_empty() {
-            continue;
-        }
-
-        // Send each block operation to the server
-        for op in pending_ops {
-            cmds.send(ConnectionCommand::ApplyBlockOp {
-                cell_id: remote_id.to_string(),
-                op,
-            });
-        }
-
-        // Mark as synced
-        editor.mark_synced();
-    }
+    // The old implementation used take_pending_ops() and ApplyBlockOp.
+    // The new architecture uses:
+    // - ops_since(frontier) to get changes since last sync
+    // - merge_ops() to apply remote changes
+    // - Server event stream for real-time updates
+    //
+    // For now, sync is server-authoritative via events.
+    // Client -> server edits need the new API to be fully implemented.
 }
 
 /// System: Handle incoming block events from the server.

@@ -247,7 +247,7 @@ impl Conversation {
     }
 
     /// Get all messages in order.
-    pub fn messages(&self) -> Vec<&kaijutsu_crdt::Block> {
+    pub fn messages(&self) -> Vec<kaijutsu_crdt::BlockSnapshot> {
         self.doc.blocks_ordered()
     }
 

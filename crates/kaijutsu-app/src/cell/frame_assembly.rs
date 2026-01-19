@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use super::components::MainCell;
+use super::components::PromptCell;
 use super::frame_style::{FrameStyle, FrameStyleMapping};
 use super::{Cell, CurrentMode, EditorMode, FocusedCell};
 use crate::shaders::nine_slice::{
@@ -15,8 +15,9 @@ use crate::shaders::nine_slice::{
 };
 use crate::text::TextAreaConfig;
 
-/// Padding around cells for the frame (matches CELL_FRAME_PADDING in systems.rs)
-pub const FRAME_PADDING: f32 = 24.0;
+/// Padding around cells for the frame.
+/// Reduced to 20.0 to match workspace_margin_left and prevent frames extending off-screen.
+pub const FRAME_PADDING: f32 = 20.0;
 
 // ============================================================================
 // FRAME ENTITY TRACKING
@@ -42,12 +43,13 @@ pub struct NineSliceMarker;
 // ============================================================================
 
 /// Spawns 9-slice frame entities for new cells.
-/// Excludes MainCell - it fills the screen and doesn't need a frame.
+/// Currently only spawns for PromptCell - MainCell fills the screen and other cells
+/// are rendered inline within the MainCell's content.
 pub fn spawn_nine_slice_frames(
     mut commands: Commands,
     new_cells: Query<
         (Entity, &Cell, &TextAreaConfig),
-        (Added<Cell>, Without<NineSliceFrame>, Without<MainCell>),
+        (Added<Cell>, Without<NineSliceFrame>, With<PromptCell>),
     >,
     style_mapping: Option<Res<FrameStyleMapping>>,
     styles: Res<Assets<FrameStyle>>,

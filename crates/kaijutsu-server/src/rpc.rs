@@ -133,14 +133,10 @@ fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
         Ok(db) => {
             log::info!("Opened cell database at {:?}", db_path);
             let store = shared_block_store_with_db(db, "server");
-            {
-                let mut guard = store.write().expect("cell store lock poisoned");
-                if let Err(e) = guard.load_from_db() {
-                    log::warn!("Failed to load cells from DB: {}", e);
-                } else {
-                    let count = guard.iter().count();
-                    log::info!("Loaded {} cells from database", count);
-                }
+            if let Err(e) = store.load_from_db() {
+                log::warn!("Failed to load cells from DB: {}", e);
+            } else {
+                log::info!("Loaded {} cells from database", store.len());
             }
             store
         }
@@ -273,14 +269,11 @@ impl world::Server for WorldImpl {
                 let cells = create_block_store_with_db(&id);
 
                 // Create default cell if none exist
-                {
-                    let mut guard = cells.write().expect("cell store lock poisoned");
-                    if guard.iter().next().is_none() {
-                        let default_id = uuid::Uuid::new_v4().to_string();
-                        log::info!("Creating default cell {} for kernel {}", default_id, id);
-                        if let Err(e) = guard.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                            log::warn!("Failed to create default cell: {}", e);
-                        }
+                if cells.is_empty() {
+                    let default_id = uuid::Uuid::new_v4().to_string();
+                    log::info!("Creating default cell {} for kernel {}", default_id, id);
+                    if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                        log::warn!("Failed to create default cell: {}", e);
                     }
                 }
 
@@ -346,14 +339,11 @@ impl world::Server for WorldImpl {
             let cells = create_block_store_with_db(&id);
 
             // Create default cell if none exist
-            {
-                let mut guard = cells.write().expect("cell store lock poisoned");
-                if guard.iter().next().is_none() {
-                    let default_id = uuid::Uuid::new_v4().to_string();
-                    log::info!("Creating default cell {} for new kernel {}", default_id, id);
-                    if let Err(e) = guard.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                        log::warn!("Failed to create default cell: {}", e);
-                    }
+            if cells.is_empty() {
+                let default_id = uuid::Uuid::new_v4().to_string();
+                log::info!("Creating default cell {} for new kernel {}", default_id, id);
+                if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
+                    log::warn!("Failed to create default cell: {}", e);
                 }
             }
 
@@ -906,15 +896,16 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
-            let cells: Vec<_> = cells_guard.iter().collect();
-            let mut builder = results.get().init_cells(cells.len() as u32);
-            for (i, doc) in cells.iter().enumerate() {
-                let mut c = builder.reborrow().get(i as u32);
-                c.set_id(&doc.id);
-                c.set_kind(cell_kind_to_capnp(doc.kind));
-                if let Some(ref lang) = doc.language {
-                    c.set_language(lang);
+            let ids = kernel.cells.list_ids();
+            let mut builder = results.get().init_cells(ids.len() as u32);
+            for (i, id) in ids.iter().enumerate() {
+                if let Some(doc) = kernel.cells.get(id) {
+                    let mut c = builder.reborrow().get(i as u32);
+                    c.set_id(id);
+                    c.set_kind(cell_kind_to_capnp(doc.kind));
+                    if let Some(ref lang) = doc.language {
+                        c.set_language(lang);
+                    }
                 }
             }
         }
@@ -930,11 +921,10 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
-            if let Some(doc) = cells_guard.get(&cell_id) {
+            if let Some(doc) = kernel.cells.get(&cell_id) {
                 let mut cell = results.get().init_cell();
                 let mut info = cell.reborrow().init_info();
-                info.set_id(&doc.id);
+                info.set_id(&cell_id);
                 info.set_kind(cell_kind_to_capnp(doc.kind));
                 if let Some(ref lang) = doc.language {
                     info.set_language(lang);
@@ -969,29 +959,31 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.write().expect("cell store lock poisoned");
-                if let Ok(doc) = cells_guard.create_cell(cell_id, kind, language.clone()) {
-                    // Build results
-                    let mut cell = results.get().init_cell();
-                    let mut info = cell.reborrow().init_info();
-                    info.set_id(&doc.id);
-                    info.set_kind(cell_kind_to_capnp(doc.kind));
-                    if let Some(ref lang) = doc.language {
-                        info.set_language(lang);
-                    }
-                    cell.set_content(&doc.content());
-                    cell.set_version(doc.version());
+                if kernel.cells.create_cell(cell_id.clone(), kind, language.clone()).is_ok() {
+                    // Get the created cell to build results
+                    if let Some(doc) = kernel.cells.get(&cell_id) {
+                        let mut cell = results.get().init_cell();
+                        let mut info = cell.reborrow().init_info();
+                        info.set_id(&cell_id);
+                        info.set_kind(cell_kind_to_capnp(doc.kind));
+                        if let Some(ref lang) = doc.language {
+                            info.set_language(lang);
+                        }
+                        cell.set_content(&doc.content());
+                        cell.set_version(doc.version());
 
-                    // Collect data for notification
-                    // Note: encode_full() doesn't exist in BlockStore, using empty placeholder
-                    cell_data = Some((
-                        doc.id.clone(),
-                        doc.kind,
-                        doc.language.clone(),
-                        doc.content(),
-                        doc.version(),
-                        Vec::new(), // TODO: Implement block-based encoding
-                    ));
+                        // Collect data for notification
+                        cell_data = Some((
+                            cell_id.clone(),
+                            doc.kind,
+                            doc.language.clone(),
+                            doc.content(),
+                            doc.version(),
+                            Vec::new(), // TODO: Implement block-based encoding
+                        ));
+                    } else {
+                        cell_data = None;
+                    }
                 } else {
                     cell_data = None;
                 }
@@ -1038,8 +1030,7 @@ impl kernel::Server for KernelImpl {
         {
             let state = self.state.borrow();
             if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                let mut cells_guard = kernel.cells.write().expect("cell store lock poisoned");
-                deleted = cells_guard.delete_cell(&cell_id).is_ok();
+                deleted = kernel.cells.delete_cell(&cell_id).is_ok();
                 subscribers = kernel.cell_subscribers.clone();
             } else {
                 deleted = false;
@@ -1079,8 +1070,7 @@ impl kernel::Server for KernelImpl {
         // Return the current version without making changes
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
-            if let Some(doc) = cells_guard.get(&cell_id) {
+            if let Some(doc) = kernel.cells.get(&cell_id) {
                 results.get().set_new_version(doc.version());
             }
         }
@@ -1130,27 +1120,26 @@ impl kernel::Server for KernelImpl {
             }
 
             // Collect data from cells
-            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
-
             // Store owned data for new cells: (id, kind, language, content, version)
             // Note: We return all cells the client doesn't know about, with empty encoding
             let mut new_cells: Vec<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64)> = Vec::new();
 
-            for doc in cells_guard.iter() {
-                if !client_versions.contains_key(&doc.id) {
+            for cell_id in kernel.cells.list_ids() {
+                if !client_versions.contains_key(&cell_id) {
                     // Client doesn't have this cell - send cell info (content-based, no CRDT encoding)
-                    new_cells.push((
-                        doc.id.clone(),
-                        doc.kind,
-                        doc.language.clone(),
-                        doc.content(),
-                        doc.version(),
-                    ));
+                    if let Some(doc) = kernel.cells.get(&cell_id) {
+                        new_cells.push((
+                            cell_id,
+                            doc.kind,
+                            doc.language.clone(),
+                            doc.content(),
+                            doc.version(),
+                        ));
+                    }
                 }
                 // Note: Patches (delta sync) are not supported in the transitional API.
                 // Clients should use block-based sync for incremental updates.
             }
-            drop(cells_guard);
 
             // No patches in transitional API
             let _ = results.get().init_patches(0);
@@ -1309,12 +1298,11 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let cells_guard = kernel.cells.read().expect("cell store lock poisoned");
-            if let Some(doc) = cells_guard.get(&cell_id) {
+            if let Some(doc) = kernel.cells.get(&cell_id) {
                 let mut cell_state = results.get().init_state();
                 {
                     let mut info = cell_state.reborrow().init_info();
-                    info.set_id(&doc.id);
+                    info.set_id(&cell_id);
                     info.set_kind(cell_kind_to_capnp(doc.kind));
                     if let Some(ref lang) = doc.language {
                         info.set_language(lang);
@@ -1367,12 +1355,8 @@ impl kernel::Server for KernelImpl {
 
             // Insert user message block
             let user_block_id = {
-                let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                let cell = cells_guard.get_mut(&cell_id)
-                    .ok_or_else(|| capnp::Error::failed(format!("cell not found: {}", cell_id)))?;
-
-                // Create user message block using the helper method
-                let block_id = cell.insert_text_block(None, &content)
+                // Create user message block using the store's helper method
+                let block_id = cells.insert_text_block(&cell_id, None, &content)
                     .map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
 
                 // Broadcast user block to subscribers
@@ -1501,10 +1485,7 @@ impl kernel::Server for KernelImpl {
                 Err(e) => {
                     log::error!("Failed to start LLM stream: {}", e);
                     // Insert error block
-                    let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                    if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                        let _ = cell.insert_text_block(None, format!("❌ Error: {}", e));
-                    }
+                    let _ = cells.insert_text_block(&cell_id, None, format!("❌ Error: {}", e));
                     return Err(capnp::Error::failed(format!("LLM stream failed: {}", e)));
                 }
             };
@@ -1515,31 +1496,25 @@ impl kernel::Server for KernelImpl {
             while let Some(event) = stream.next_event().await {
                 match event {
                     StreamEvent::ThinkingStart => {
-                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                            match cell.insert_thinking_block(None, "") {
-                                Ok(block_id) => {
-                                    let content = kaijutsu_crdt::BlockContentSnapshot::Thinking {
-                                        text: String::new(),
-                                        collapsed: false,
-                                    };
-                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
-                                    current_block_id = Some(block_id);
-                                }
-                                Err(e) => log::error!("Failed to insert thinking block: {}", e),
+                        match cells.insert_thinking_block(&cell_id, None, "") {
+                            Ok(block_id) => {
+                                let content = kaijutsu_crdt::BlockContentSnapshot::Thinking {
+                                    text: String::new(),
+                                    collapsed: false,
+                                };
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                current_block_id = Some(block_id);
                             }
+                            Err(e) => log::error!("Failed to insert thinking block: {}", e),
                         }
                     }
 
                     StreamEvent::ThinkingDelta(text) => {
                         if let Some(ref block_id) = current_block_id {
-                            let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                            if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                                if let Err(e) = cell.append_text(block_id, &text) {
-                                    log::error!("Failed to append thinking text: {}", e);
-                                } else {
-                                    broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
-                                }
+                            if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                                log::error!("Failed to append thinking text: {}", e);
+                            } else {
+                                broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
                             }
                         }
                     }
@@ -1549,30 +1524,24 @@ impl kernel::Server for KernelImpl {
                     }
 
                     StreamEvent::TextStart => {
-                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                            match cell.insert_text_block(None, "") {
-                                Ok(block_id) => {
-                                    let content = kaijutsu_crdt::BlockContentSnapshot::Text {
-                                        text: String::new(),
-                                    };
-                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
-                                    current_block_id = Some(block_id);
-                                }
-                                Err(e) => log::error!("Failed to insert text block: {}", e),
+                        match cells.insert_text_block(&cell_id, None, "") {
+                            Ok(block_id) => {
+                                let content = kaijutsu_crdt::BlockContentSnapshot::Text {
+                                    text: String::new(),
+                                };
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
+                                current_block_id = Some(block_id);
                             }
+                            Err(e) => log::error!("Failed to insert text block: {}", e),
                         }
                     }
 
                     StreamEvent::TextDelta(text) => {
                         if let Some(ref block_id) = current_block_id {
-                            let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                            if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                                if let Err(e) = cell.append_text(block_id, &text) {
-                                    log::error!("Failed to append text: {}", e);
-                                } else {
-                                    broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
-                                }
+                            if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                                log::error!("Failed to append text: {}", e);
+                            } else {
+                                broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
                             }
                         }
                     }
@@ -1582,36 +1551,30 @@ impl kernel::Server for KernelImpl {
                     }
 
                     StreamEvent::ToolUse { id, name, input } => {
-                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                            match cell.insert_tool_use(None, &id, &name, input.clone()) {
-                                Ok(block_id) => {
-                                    let content = kaijutsu_crdt::BlockContentSnapshot::ToolUse {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        input: input.clone(),
-                                    };
-                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
-                                }
-                                Err(e) => log::error!("Failed to insert tool use block: {}", e),
+                        match cells.insert_tool_use(&cell_id, None, &id, &name, input.clone()) {
+                            Ok(block_id) => {
+                                let content = kaijutsu_crdt::BlockContentSnapshot::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                };
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content);
                             }
+                            Err(e) => log::error!("Failed to insert tool use block: {}", e),
                         }
                     }
 
                     StreamEvent::ToolResult { tool_use_id, content, is_error } => {
-                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                            match cell.insert_tool_result(None, &tool_use_id, &content, is_error) {
-                                Ok(block_id) => {
-                                    let content_snap = kaijutsu_crdt::BlockContentSnapshot::ToolResult {
-                                        tool_use_id: tool_use_id.clone(),
-                                        content: content.clone(),
-                                        is_error,
-                                    };
-                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content_snap);
-                                }
-                                Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                        match cells.insert_tool_result(&cell_id, None, &tool_use_id, &content, is_error) {
+                            Ok(block_id) => {
+                                let content_snap = kaijutsu_crdt::BlockContentSnapshot::ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    content: content.clone(),
+                                    is_error,
+                                };
+                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, &content_snap);
                             }
+                            Err(e) => log::error!("Failed to insert tool result block: {}", e),
                         }
                     }
 
@@ -1624,10 +1587,7 @@ impl kernel::Server for KernelImpl {
 
                     StreamEvent::Error(err) => {
                         log::error!("LLM stream error: {}", err);
-                        let mut cells_guard = cells.write().expect("cell store lock poisoned");
-                        if let Some(cell) = cells_guard.get_mut(&cell_id) {
-                            let _ = cell.insert_text_block(None, format!("❌ Error: {}", err));
-                        }
+                        let _ = cells.insert_text_block(&cell_id, None, format!("❌ Error: {}", err));
                     }
                 }
             }

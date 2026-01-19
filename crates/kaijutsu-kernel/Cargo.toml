@@ -15,9 +15,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 dunce = "1.0"
 
-# CRDT (text collaboration)
+# CRDT (unified diamond-types with Map/Set/Register/Text)
 diamond-types.workspace = true
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
+
+# Concurrency
+dashmap = "6"
+parking_lot = "0.12"
 
 # Persistence
 rusqlite.workspace = true

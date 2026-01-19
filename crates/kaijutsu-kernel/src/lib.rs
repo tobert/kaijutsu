@@ -24,7 +24,7 @@ pub mod state;
 pub mod tools;
 pub mod vfs;
 
-pub use block_store::{BlockCell, BlockStore, SharedBlockStore, shared_block_store, shared_block_store_with_db};
+pub use block_store::{BlockEvent, BlockStore, CellEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
 pub use cell_tools::{CellEditEngine, CellListEngine, CellReadEngine};
 pub use control::{ConsentMode, ControlPlane, Lease, LeaseHolder};
 pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};

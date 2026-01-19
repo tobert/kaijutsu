@@ -1,78 +1,88 @@
-//! Block document with CRDT ordering and per-block text CRDTs.
+//! Block document with unified CRDT using diamond-types.
+//!
+//! Uses the diamond-types fork (github.com/tobert/diamond-types, branch feat/maps-and-uuids)
+//! which provides unified OpLog with Map, Set, Register, and Text CRDTs.
 
-use std::collections::HashMap;
-
-use cola::Replica;
-
-use crate::{
-    Block, BlockContent, BlockContentSnapshot, BlockDocOp, BlockId, CrdtError, Result,
+use diamond_types::{
+    AgentId, CRDTKind, CreateValue, OpLog, Primitive, SerializedOps, SerializedOpsOwned,
+    ROOT_CRDT_ID, LV,
 };
+use diamond_types::list::operation::TextOperation;
+use smartstring::alias::String as SmartString;
 
-/// Block document with Fugue ordering and per-block CRDTs.
+use crate::{BlockContentSnapshot, BlockId, CrdtError, Result};
+
+/// Block document backed by unified diamond-types OpLog.
 ///
-/// # Two-Level CRDT
+/// # Document Structure
 ///
-/// 1. **Block ordering**: Uses `cola::Replica` (Fugue CRDT) for concurrent
-///    block insertion, deletion, and reordering. This ensures all agents
-///    converge to the same block order.
-///
-/// 2. **Block content**: Each editable block (Thinking, Text) has its own
-///    `diamond_types::ListCRDT` for concurrent text editing within that block.
-///
-/// # Usage
-///
+/// ```text
+/// ROOT (Map)
+/// ├── blocks (Set<string>)        - OR-Set of block ID keys
+/// ├── order:<id> -> f64           - Fractional index for ordering
+/// └── block:<id> (Map)            - Per-block data
+///     ├── kind (string)           - "thinking", "text", "tool_use", "tool_result"
+///     ├── content (Text)          - For thinking/text blocks
+///     ├── collapsed (bool)        - For thinking blocks
+///     ├── author (string)
+///     ├── created_at (i64)
+///     └── (type-specific fields)
 /// ```
-/// use kaijutsu_crdt::BlockDocument;
 ///
-/// let mut doc = BlockDocument::new("cell-1", "alice");
+/// # Convergence
 ///
-/// // Insert a text block
-/// let block_id = doc.insert_text_block(None, "Hello").unwrap();
-///
-/// // Edit the block
-/// doc.append_text(&block_id, ", world!").unwrap();
-///
-/// // Get pending ops to send to server
-/// let ops = doc.take_pending_ops();
-/// ```
+/// All operations go through the unified OpLog, ensuring:
+/// - Maps use LWW (Last-Write-Wins) semantics
+/// - Sets use OR-Set (add-wins) semantics
+/// - Text uses sequence CRDT for character-level merging
+/// - All peers converge to identical state after sync
 pub struct BlockDocument {
     /// Cell ID this document belongs to.
     cell_id: String,
 
-    /// Agent ID for this instance.
-    agent_id: String,
+    /// Agent ID string for this instance.
+    agent_id_str: String,
 
-    /// Fugue replica for block ordering.
-    ordering: Replica,
+    /// Agent ID (numeric) in the OpLog.
+    agent: AgentId,
 
-    /// Blocks by ID.
-    blocks: HashMap<BlockId, Block>,
+    /// Unified operation log for all CRDT operations.
+    pub oplog: OpLog,
 
-    /// Ordered list of block IDs (derived from Fugue).
-    /// This is the linearization of the Fugue tree.
-    block_order: Vec<BlockId>,
+    /// LV (Local Version) of the blocks Set CRDT.
+    blocks_set_lv: LV,
 
-    /// Next sequence number for block IDs.
+    /// Next sequence number for block IDs (agent-local).
     next_seq: u64,
 
-    /// Pending operations to send to server.
-    pending_ops: Vec<BlockDocOp>,
-
-    /// Document version (incremented on each operation).
+    /// Document version (incremented on each local operation).
     version: u64,
 }
 
 impl BlockDocument {
     /// Create a new empty document.
     pub fn new(cell_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        let cell_id = cell_id.into();
+        let agent_id_str = agent_id.into();
+
+        let mut oplog = OpLog::new();
+        let agent = oplog.cg.get_or_create_agent_id(&agent_id_str);
+
+        // Create the blocks Set at ROOT_CRDT_ID["blocks"]
+        let blocks_set_lv = oplog.local_map_set(
+            agent,
+            ROOT_CRDT_ID,
+            "blocks",
+            CreateValue::NewCRDT(CRDTKind::Set),
+        );
+
         Self {
-            cell_id: cell_id.into(),
-            agent_id: agent_id.into(),
-            ordering: Replica::new(1, 0), // Start with ID 1
-            blocks: HashMap::new(),
-            block_order: Vec::new(),
+            cell_id,
+            agent_id_str,
+            agent,
+            oplog,
+            blocks_set_lv,
             next_seq: 0,
-            pending_ops: Vec::new(),
             version: 0,
         }
     }
@@ -88,7 +98,7 @@ impl BlockDocument {
 
     /// Get the agent ID.
     pub fn agent_id(&self) -> &str {
-        &self.agent_id
+        &self.agent_id_str
     }
 
     /// Get the current version.
@@ -98,37 +108,142 @@ impl BlockDocument {
 
     /// Get the number of blocks.
     pub fn block_count(&self) -> usize {
-        self.blocks.len()
+        self.oplog.checkout_set(self.blocks_set_lv).len()
     }
 
     /// Check if the document is empty.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.block_count() == 0
     }
 
-    /// Get a block by ID.
-    pub fn get_block(&self, id: &BlockId) -> Option<&Block> {
-        self.blocks.get(id)
-    }
+    /// Get block IDs in document order.
+    fn block_ids_ordered(&self) -> Vec<BlockId> {
+        // Get all block IDs from the Set
+        let block_keys = self.oplog.checkout_set(self.blocks_set_lv);
 
-    /// Get a mutable block by ID.
-    pub fn get_block_mut(&mut self, id: &BlockId) -> Option<&mut Block> {
-        self.blocks.get_mut(id)
+        // Collect (order_value, block_id) pairs
+        let mut ordered: Vec<(f64, BlockId)> = block_keys
+            .iter()
+            .filter_map(|p| {
+                if let Primitive::Str(key) = p {
+                    let block_id = BlockId::from_key(key)?;
+                    let order_key = format!("order:{}", key);
+
+                    // Get order value from map
+                    let checkout = self.oplog.checkout();
+                    let order_val = checkout.get(&SmartString::from(order_key.as_str()))
+                        .and_then(|v| {
+                            if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() {
+                                Some(*n as f64 / 1_000_000.0)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0.0);
+
+                    Some((order_val, block_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by order value
+        ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        ordered.into_iter().map(|(_, id)| id).collect()
     }
 
     /// Get blocks in document order.
-    pub fn blocks_ordered(&self) -> Vec<&Block> {
-        self.block_order
-            .iter()
-            .filter_map(|id| self.blocks.get(id))
+    pub fn blocks_ordered(&self) -> Vec<BlockSnapshot> {
+        self.block_ids_ordered()
+            .into_iter()
+            .filter_map(|id| self.get_block_snapshot(&id))
             .collect()
+    }
+
+    /// Get a block snapshot by ID.
+    pub fn get_block_snapshot(&self, id: &BlockId) -> Option<BlockSnapshot> {
+        let block_key = format!("block:{}", id.to_key());
+        let checkout = self.oplog.checkout();
+
+        let block_map = checkout.get(&SmartString::from(block_key.as_str()))?;
+
+        if let diamond_types::DTValue::Map(map) = block_map.as_ref() {
+            // Extract fields from the block map
+            let kind_str = map.get(&SmartString::from("kind"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
+                .unwrap_or("text");
+
+            let author = map.get(&SmartString::from("author"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                .unwrap_or_default();
+
+            let created_at = map.get(&SmartString::from("created_at"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as u64) } else { None })
+                .unwrap_or(0);
+
+            let content = match kind_str {
+                "thinking" => {
+                    let text = map.get(&SmartString::from("content"))
+                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let collapsed = map.get(&SmartString::from("collapsed"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
+                        .unwrap_or(false);
+                    BlockContentSnapshot::Thinking { text, collapsed }
+                }
+                "text" => {
+                    let text = map.get(&SmartString::from("content"))
+                        .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    BlockContentSnapshot::Text { text }
+                }
+                "tool_use" => {
+                    let tool_id = map.get(&SmartString::from("tool_id"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                        .unwrap_or_default();
+                    let name = map.get(&SmartString::from("name"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                        .unwrap_or_default();
+                    let input = map.get(&SmartString::from("input"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() {
+                            serde_json::from_str(s).ok()
+                        } else { None })
+                        .unwrap_or(serde_json::Value::Null);
+                    BlockContentSnapshot::ToolUse { id: tool_id, name, input }
+                }
+                "tool_result" => {
+                    let tool_use_id = map.get(&SmartString::from("tool_use_id"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                        .unwrap_or_default();
+                    let content = map.get(&SmartString::from("content"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
+                        .unwrap_or_default();
+                    let is_error = map.get(&SmartString::from("is_error"))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
+                        .unwrap_or(false);
+                    BlockContentSnapshot::ToolResult { tool_use_id, content, is_error }
+                }
+                _ => BlockContentSnapshot::Text { text: String::new() }
+            };
+
+            Some(BlockSnapshot {
+                id: id.clone(),
+                content,
+                author,
+                created_at,
+            })
+        } else {
+            None
+        }
     }
 
     /// Get full text content (concatenation of all blocks).
     pub fn full_text(&self) -> String {
         self.blocks_ordered()
             .into_iter()
-            .map(|b| b.text())
+            .map(|b| b.content.text().to_string())
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -139,9 +254,73 @@ impl BlockDocument {
 
     /// Generate a new block ID.
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(&self.cell_id, &self.agent_id, self.next_seq);
+        let id = BlockId::new(&self.cell_id, &self.agent_id_str, self.next_seq);
         self.next_seq += 1;
         id
+    }
+
+    /// Calculate fractional index for insertion.
+    fn calc_order_index(&self, after: Option<&BlockId>) -> f64 {
+        let ordered = self.block_ids_ordered();
+
+        match after {
+            None => {
+                // Insert at beginning
+                if ordered.is_empty() {
+                    1.0
+                } else {
+                    // Get order of first block and go before it
+                    let first_key = ordered[0].to_key();
+                    let order_key = format!("order:{}", first_key);
+                    let checkout = self.oplog.checkout();
+                    let first_order = checkout.get(&SmartString::from(order_key.as_str()))
+                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                        .unwrap_or(1.0);
+                    first_order / 2.0
+                }
+            }
+            Some(after_id) => {
+                // Find position of after_id
+                let after_idx = ordered.iter().position(|id| id == after_id);
+                match after_idx {
+                    Some(idx) => {
+                        let after_key = ordered[idx].to_key();
+                        let order_key = format!("order:{}", after_key);
+                        let checkout = self.oplog.checkout();
+                        let after_order = checkout.get(&SmartString::from(order_key.as_str()))
+                            .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                            .unwrap_or(1.0);
+
+                        if idx + 1 < ordered.len() {
+                            // There's a next block
+                            let next_key = ordered[idx + 1].to_key();
+                            let next_order_key = format!("order:{}", next_key);
+                            let next_order = checkout.get(&SmartString::from(next_order_key.as_str()))
+                                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                                .unwrap_or(after_order + 2.0);
+                            (after_order + next_order) / 2.0
+                        } else {
+                            // Insert at end
+                            after_order + 1.0
+                        }
+                    }
+                    None => {
+                        // after_id not found, insert at end
+                        if let Some(last) = ordered.last() {
+                            let last_key = last.to_key();
+                            let order_key = format!("order:{}", last_key);
+                            let checkout = self.oplog.checkout();
+                            let last_order = checkout.get(&SmartString::from(order_key.as_str()))
+                                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                                .unwrap_or(1.0);
+                            last_order + 1.0
+                        } else {
+                            1.0
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Insert a text block.
@@ -150,7 +329,7 @@ impl BlockDocument {
         after: Option<&BlockId>,
         text: impl Into<String>,
     ) -> Result<BlockId> {
-        self.insert_text_block_with_author(after, text, &self.agent_id.clone())
+        self.insert_text_block_with_author(after, text, &self.agent_id_str.clone())
     }
 
     /// Insert a text block with a specific author.
@@ -162,7 +341,7 @@ impl BlockDocument {
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let content = BlockContentSnapshot::Text { text: text.into() };
-        self.insert_block_internal(id.clone(), after.cloned(), content, author.into())?;
+        self.insert_block_internal(id.clone(), after, content, author.into())?;
         Ok(id)
     }
 
@@ -172,7 +351,7 @@ impl BlockDocument {
         after: Option<&BlockId>,
         text: impl Into<String>,
     ) -> Result<BlockId> {
-        self.insert_thinking_block_with_author(after, text, &self.agent_id.clone())
+        self.insert_thinking_block_with_author(after, text, &self.agent_id_str.clone())
     }
 
     /// Insert a thinking block with a specific author.
@@ -187,7 +366,7 @@ impl BlockDocument {
             text: text.into(),
             collapsed: false,
         };
-        self.insert_block_internal(id.clone(), after.cloned(), content, author.into())?;
+        self.insert_block_internal(id.clone(), after, content, author.into())?;
         Ok(id)
     }
 
@@ -199,7 +378,7 @@ impl BlockDocument {
         name: impl Into<String>,
         input: serde_json::Value,
     ) -> Result<BlockId> {
-        self.insert_tool_use_with_author(after, tool_id, name, input, &self.agent_id.clone())
+        self.insert_tool_use_with_author(after, tool_id, name, input, &self.agent_id_str.clone())
     }
 
     /// Insert a tool use block with a specific author.
@@ -217,7 +396,7 @@ impl BlockDocument {
             name: name.into(),
             input,
         };
-        self.insert_block_internal(id.clone(), after.cloned(), content, author.into())?;
+        self.insert_block_internal(id.clone(), after, content, author.into())?;
         Ok(id)
     }
 
@@ -229,7 +408,7 @@ impl BlockDocument {
         content: impl Into<String>,
         is_error: bool,
     ) -> Result<BlockId> {
-        self.insert_tool_result_with_author(after, tool_use_id, content, is_error, &self.agent_id.clone())
+        self.insert_tool_result_with_author(after, tool_use_id, content, is_error, &self.agent_id_str.clone())
     }
 
     /// Insert a tool result block with a specific author.
@@ -247,7 +426,7 @@ impl BlockDocument {
             content: content.into(),
             is_error,
         };
-        self.insert_block_internal(id.clone(), after.cloned(), snapshot, author.into())?;
+        self.insert_block_internal(id.clone(), after, snapshot, author.into())?;
         Ok(id)
     }
 
@@ -255,86 +434,216 @@ impl BlockDocument {
     fn insert_block_internal(
         &mut self,
         id: BlockId,
-        after: Option<BlockId>,
+        after: Option<&BlockId>,
         snapshot: BlockContentSnapshot,
         author: String,
     ) -> Result<()> {
-        if self.blocks.contains_key(&id) {
+        let block_key = id.to_key();
+
+        // Check for duplicate
+        let existing = self.oplog.checkout_set(self.blocks_set_lv);
+        if existing.contains(&Primitive::Str(SmartString::from(block_key.as_str()))) {
             return Err(CrdtError::DuplicateBlock(id));
         }
 
         // Validate reference if provided
-        if let Some(ref after_id) = after {
-            if !self.blocks.contains_key(after_id) {
+        if let Some(after_id) = after {
+            let after_key = Primitive::Str(SmartString::from(after_id.to_key().as_str()));
+            if !existing.contains(&after_key) {
                 return Err(CrdtError::InvalidReference(after_id.clone()));
             }
         }
 
-        // Determine insertion index in block_order
-        let insert_idx = match &after {
-            Some(after_id) => self
-                .block_order
-                .iter()
-                .position(|id| id == after_id)
-                .map(|i| i + 1)
-                .unwrap_or(self.block_order.len()),
-            None => 0,
-        };
+        // Calculate order index
+        let order_index = self.calc_order_index(after);
 
-        // Insert into Fugue (cola)
-        // For cola, we need to convert our position to their offset
-        let _ = self.ordering.inserted(insert_idx, 1);
+        // Add block ID to the blocks Set
+        self.oplog.local_set_add(
+            self.agent,
+            self.blocks_set_lv,
+            Primitive::Str(SmartString::from(block_key.as_str())),
+        );
 
-        // Create the block with author
-        let content = snapshot.clone().into_content(&self.agent_id);
-        let block = Block::new(id.clone(), content, &author);
-        let created_at = block.created_at;
+        // Store order index (as i64 scaled by 1M for precision)
+        let order_key = format!("order:{}", block_key);
+        self.oplog.local_map_set(
+            self.agent,
+            ROOT_CRDT_ID,
+            &order_key,
+            CreateValue::Primitive(Primitive::I64((order_index * 1_000_000.0) as i64)),
+        );
 
-        // Update state
-        self.blocks.insert(id.clone(), block);
-        self.block_order.insert(insert_idx, id.clone());
+        // Create block map
+        let block_map_key = format!("block:{}", block_key);
+        let block_map_lv = self.oplog.local_map_set(
+            self.agent,
+            ROOT_CRDT_ID,
+            &block_map_key,
+            CreateValue::NewCRDT(CRDTKind::Map),
+        );
+
+        // Get timestamp
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // Store block metadata
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "author",
+            CreateValue::Primitive(Primitive::Str(SmartString::from(author.as_str()))),
+        );
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "created_at",
+            CreateValue::Primitive(Primitive::I64(created_at)),
+        );
+
+        // Store content based on type
+        match &snapshot {
+            BlockContentSnapshot::Thinking { text, collapsed } => {
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "kind",
+                    CreateValue::Primitive(Primitive::Str("thinking".into())),
+                );
+                // Create text CRDT for content
+                let text_lv = self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "content",
+                    CreateValue::NewCRDT(CRDTKind::Text),
+                );
+                if !text.is_empty() {
+                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, text));
+                }
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "collapsed",
+                    CreateValue::Primitive(Primitive::Bool(*collapsed)),
+                );
+            }
+            BlockContentSnapshot::Text { text } => {
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "kind",
+                    CreateValue::Primitive(Primitive::Str("text".into())),
+                );
+                let text_lv = self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "content",
+                    CreateValue::NewCRDT(CRDTKind::Text),
+                );
+                if !text.is_empty() {
+                    self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, text));
+                }
+            }
+            BlockContentSnapshot::ToolUse { id: tool_id, name, input } => {
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "kind",
+                    CreateValue::Primitive(Primitive::Str("tool_use".into())),
+                );
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "tool_id",
+                    CreateValue::Primitive(Primitive::Str(SmartString::from(tool_id.as_str()))),
+                );
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "name",
+                    CreateValue::Primitive(Primitive::Str(SmartString::from(name.as_str()))),
+                );
+                let input_json = serde_json::to_string(input).unwrap_or_default();
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "input",
+                    CreateValue::Primitive(Primitive::Str(SmartString::from(input_json.as_str()))),
+                );
+            }
+            BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "kind",
+                    CreateValue::Primitive(Primitive::Str("tool_result".into())),
+                );
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "tool_use_id",
+                    CreateValue::Primitive(Primitive::Str(SmartString::from(tool_use_id.as_str()))),
+                );
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "content",
+                    CreateValue::Primitive(Primitive::Str(SmartString::from(content.as_str()))),
+                );
+                self.oplog.local_map_set(
+                    self.agent,
+                    block_map_lv,
+                    "is_error",
+                    CreateValue::Primitive(Primitive::Bool(*is_error)),
+                );
+            }
+        }
+
         self.version += 1;
-
-        // Queue operation
-        self.pending_ops.push(BlockDocOp::InsertBlock {
-            id,
-            after,
-            content: snapshot,
-            author,
-            created_at,
-            fugue_meta: None, // TODO: capture Fugue metadata
-        });
-
         Ok(())
     }
 
     /// Delete a block.
     pub fn delete_block(&mut self, id: &BlockId) -> Result<()> {
-        if !self.blocks.contains_key(id) {
+        let block_key = id.to_key();
+        let key_primitive = Primitive::Str(SmartString::from(block_key.as_str()));
+
+        // Check if block exists
+        let existing = self.oplog.checkout_set(self.blocks_set_lv);
+        if !existing.contains(&key_primitive) {
             return Err(CrdtError::BlockNotFound(id.clone()));
         }
 
-        // Find position in order
-        if let Some(idx) = self.block_order.iter().position(|bid| bid == id) {
-            // Update Fugue
-            let _ = self.ordering.deleted(idx..idx + 1);
+        // Remove from blocks Set
+        self.oplog.local_set_remove(self.agent, self.blocks_set_lv, key_primitive);
 
-            // Remove from state
-            self.block_order.remove(idx);
-        }
+        // Note: The block map and order entries remain in the oplog but are
+        // effectively orphaned. This is fine for CRDT semantics.
 
-        self.blocks.remove(id);
         self.version += 1;
-
-        // Queue operation
-        self.pending_ops.push(BlockDocOp::DeleteBlock { id: id.clone() });
-
         Ok(())
     }
 
     // =========================================================================
     // Text Operations
     // =========================================================================
+
+    /// Get the text CRDT LV for a block (if it has one).
+    fn get_block_text_lv(&self, id: &BlockId) -> Option<LV> {
+        let block_key = format!("block:{}", id.to_key());
+
+        // Navigate to block:id/content
+        let path = [block_key.as_str(), "content"];
+
+        // Check if this path exists and is a Text CRDT
+        let (kind, lv) = self.oplog.crdt_at_path(&path);
+        if kind == CRDTKind::Text {
+            Some(lv)
+        } else {
+            None
+        }
+    }
 
     /// Edit text within a block.
     pub fn edit_text(
@@ -344,22 +653,23 @@ impl BlockDocument {
         insert: &str,
         delete: usize,
     ) -> Result<()> {
-        let block = self
-            .blocks
-            .get_mut(id)
+        // Get block type to check if editable
+        let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        // Check if block is editable
-        if block.block_type().is_immutable() {
+        let block_type = snapshot.content.block_type();
+        if block_type.is_immutable() {
             return Err(CrdtError::ImmutableBlock(id.clone()));
         }
 
-        let crdt = block
-            .text_crdt_mut()
+        let text_lv = self.get_block_text_lv(id)
             .ok_or_else(|| CrdtError::ImmutableBlock(id.clone()))?;
 
+        // Get current length
+        let current_text = self.oplog.checkout_text(text_lv);
+        let len = current_text.len_chars();
+
         // Validate position
-        let len = crdt.branch.content().len_chars();
         if pos > len {
             return Err(CrdtError::PositionOutOfBounds { pos, len });
         }
@@ -370,62 +680,47 @@ impl BlockDocument {
             });
         }
 
-        // Apply to CRDT
-        let agent = crdt.oplog.get_or_create_agent_id(&self.agent_id);
-
+        // Apply operations
         if delete > 0 {
-            crdt.delete_without_content(agent, pos..pos + delete);
+            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_delete(pos..pos + delete));
         }
         if !insert.is_empty() {
-            crdt.insert(agent, pos, insert);
+            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(pos, insert));
         }
 
         self.version += 1;
-
-        // Queue operation
-        self.pending_ops.push(BlockDocOp::EditBlockText {
-            id: id.clone(),
-            pos,
-            insert: insert.to_string(),
-            delete,
-            dt_encoded: None, // TODO: encode diamond-types op
-        });
-
         Ok(())
     }
 
     /// Append text to a block.
     pub fn append_text(&mut self, id: &BlockId, text: &str) -> Result<()> {
-        let block = self
-            .blocks
-            .get(id)
+        let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        let len = block.text_crdt().map(|c| c.branch.content().len_chars()).unwrap_or(0);
-
+        let len = snapshot.content.text().len();
         self.edit_text(id, len, text, 0)
     }
 
     /// Set collapsed state of a thinking block.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
-        let block = self
-            .blocks
-            .get_mut(id)
+        let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        if !matches!(block.content, BlockContent::Thinking { .. }) {
+        if !matches!(snapshot.content, BlockContentSnapshot::Thinking { .. }) {
             return Err(CrdtError::ImmutableBlock(id.clone()));
         }
 
-        block.content.set_collapsed(collapsed);
+        let block_key = format!("block:{}", id.to_key());
+        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
+
+        self.oplog.local_map_set(
+            self.agent,
+            block_map_lv,
+            "collapsed",
+            CreateValue::Primitive(Primitive::Bool(collapsed)),
+        );
+
         self.version += 1;
-
-        // Queue operation
-        self.pending_ops.push(BlockDocOp::SetCollapsed {
-            id: id.clone(),
-            collapsed,
-        });
-
         Ok(())
     }
 
@@ -433,202 +728,38 @@ impl BlockDocument {
     // Sync Operations
     // =========================================================================
 
-    /// Take pending operations for sending to server.
-    pub fn take_pending_ops(&mut self) -> Vec<BlockDocOp> {
-        std::mem::take(&mut self.pending_ops)
+    /// Get operations since a frontier for replication.
+    pub fn ops_since(&self, frontier: &[LV]) -> SerializedOpsOwned {
+        self.oplog.ops_since(frontier).into()
     }
 
-    /// Check if there are pending operations.
-    pub fn has_pending_ops(&self) -> bool {
-        !self.pending_ops.is_empty()
-    }
+    /// Merge remote operations.
+    ///
+    /// Accepts borrowed `SerializedOps` to avoid lifetime conversion issues.
+    /// Use `ops_since()` to get operations, and pass them directly here.
+    pub fn merge_ops(&mut self, ops: SerializedOps<'_>) -> Result<()> {
+        self.oplog.merge_ops(ops)
+            .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
 
-    /// Apply a remote operation.
-    pub fn apply_remote_op(&mut self, op: &BlockDocOp) -> Result<()> {
-        match op {
-            BlockDocOp::InsertBlock {
-                id,
-                after,
-                content,
-                author,
-                created_at,
-                fugue_meta: _,
-            } => {
-                self.apply_remote_insert(id.clone(), after.clone(), content.clone(), author.clone(), *created_at)
+        // Update next_seq if needed
+        let blocks = self.oplog.checkout_set(self.blocks_set_lv);
+        for p in blocks.iter() {
+            if let Primitive::Str(key) = p {
+                if let Some(block_id) = BlockId::from_key(key) {
+                    if block_id.agent_id == self.agent_id_str {
+                        self.next_seq = self.next_seq.max(block_id.seq + 1);
+                    }
+                }
             }
-            BlockDocOp::DeleteBlock { id } => self.apply_remote_delete(id),
-            BlockDocOp::EditBlockText {
-                id,
-                pos,
-                insert,
-                delete,
-                dt_encoded: _,
-            } => self.apply_remote_edit(id, *pos, insert, *delete),
-            BlockDocOp::SetCollapsed { id, collapsed } => {
-                self.apply_remote_collapsed(id, *collapsed)
-            }
-            BlockDocOp::MoveBlock {
-                id,
-                after,
-                fugue_meta: _,
-            } => self.apply_remote_move(id, after.as_ref()),
-        }
-    }
-
-    /// Apply remote block insertion.
-    fn apply_remote_insert(
-        &mut self,
-        id: BlockId,
-        after: Option<BlockId>,
-        snapshot: BlockContentSnapshot,
-        author: String,
-        created_at: u64,
-    ) -> Result<()> {
-        // Skip if we already have this block (idempotent)
-        if self.blocks.contains_key(&id) {
-            return Ok(());
-        }
-
-        // Find insertion index
-        let insert_idx = match &after {
-            Some(after_id) => self
-                .block_order
-                .iter()
-                .position(|bid| bid == after_id)
-                .map(|i| i + 1)
-                .unwrap_or(self.block_order.len()),
-            None => 0,
-        };
-
-        // Update Fugue
-        let _ = self.ordering.inserted(insert_idx, 1);
-
-        // Create block with content from remote agent and explicit timestamp
-        let content = snapshot.into_content(&id.agent_id);
-        let block = Block::with_timestamp(id.clone(), content, author, created_at);
-
-        // Update state
-        self.blocks.insert(id.clone(), block);
-        self.block_order.insert(insert_idx, id);
-        self.version += 1;
-
-        // Update sequence counter if needed
-        if let Some(seq) = self.blocks.keys().filter(|bid| bid.agent_id == self.agent_id).map(|bid| bid.seq).max() {
-            self.next_seq = self.next_seq.max(seq + 1);
-        }
-
-        Ok(())
-    }
-
-    /// Apply remote block deletion.
-    fn apply_remote_delete(&mut self, id: &BlockId) -> Result<()> {
-        // Skip if block doesn't exist (idempotent)
-        if !self.blocks.contains_key(id) {
-            return Ok(());
-        }
-
-        // Find position
-        if let Some(idx) = self.block_order.iter().position(|bid| bid == id) {
-            let _ = self.ordering.deleted(idx..idx + 1);
-            self.block_order.remove(idx);
-        }
-
-        self.blocks.remove(id);
-        self.version += 1;
-
-        Ok(())
-    }
-
-    /// Apply remote text edit.
-    fn apply_remote_edit(
-        &mut self,
-        id: &BlockId,
-        pos: usize,
-        insert: &str,
-        delete: usize,
-    ) -> Result<()> {
-        let block = match self.blocks.get_mut(id) {
-            Some(b) => b,
-            None => return Ok(()), // Block may have been deleted
-        };
-
-        // Skip if immutable
-        if block.block_type().is_immutable() {
-            return Ok(());
-        }
-
-        let crdt = match block.text_crdt_mut() {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        // Apply to CRDT using remote agent ID
-        let agent = crdt.oplog.get_or_create_agent_id(&id.agent_id);
-
-        // Bounds check with current length
-        let len = crdt.branch.content().len_chars();
-        let pos = pos.min(len);
-        let delete = delete.min(len.saturating_sub(pos));
-
-        if delete > 0 {
-            crdt.delete_without_content(agent, pos..pos + delete);
-        }
-        if !insert.is_empty() {
-            crdt.insert(agent, pos, insert);
         }
 
         self.version += 1;
-
         Ok(())
     }
 
-    /// Apply remote collapsed state change.
-    fn apply_remote_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
-        let block = match self.blocks.get_mut(id) {
-            Some(b) => b,
-            None => return Ok(()), // Block may have been deleted
-        };
-
-        block.content.set_collapsed(collapsed);
-        self.version += 1;
-
-        Ok(())
-    }
-
-    /// Apply remote move operation.
-    fn apply_remote_move(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
-        // Skip if block doesn't exist
-        if !self.blocks.contains_key(id) {
-            return Ok(());
-        }
-
-        // Find current position
-        let current_idx = match self.block_order.iter().position(|bid| bid == id) {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
-
-        // Remove from current position
-        let _ = self.ordering.deleted(current_idx..current_idx + 1);
-        self.block_order.remove(current_idx);
-
-        // Find new position
-        let insert_idx = match after {
-            Some(after_id) => self
-                .block_order
-                .iter()
-                .position(|bid| bid == after_id)
-                .map(|i| i + 1)
-                .unwrap_or(self.block_order.len()),
-            None => 0,
-        };
-
-        // Insert at new position
-        let _ = self.ordering.inserted(insert_idx, 1);
-        self.block_order.insert(insert_idx, id.clone());
-        self.version += 1;
-
-        Ok(())
+    /// Get the current frontier (version) for sync.
+    pub fn frontier(&self) -> Vec<LV> {
+        self.oplog.cg.version.as_ref().to_vec()
     }
 
     // =========================================================================
@@ -639,18 +770,7 @@ impl BlockDocument {
     pub fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
             cell_id: self.cell_id.clone(),
-            blocks: self
-                .block_order
-                .iter()
-                .filter_map(|id| {
-                    self.blocks.get(id).map(|b| BlockSnapshot {
-                        id: id.clone(),
-                        content: b.snapshot(),
-                        author: b.author.clone(),
-                        created_at: b.created_at,
-                    })
-                })
-                .collect(),
+            blocks: self.blocks_ordered(),
             version: self.version,
         }
     }
@@ -660,27 +780,18 @@ impl BlockDocument {
         let agent_id = agent_id.into();
         let mut doc = Self::new(&snapshot.cell_id, &agent_id);
 
+        let mut last_id: Option<BlockId> = None;
         for block_snap in snapshot.blocks {
-            let content = block_snap.content.into_content(&block_snap.id.agent_id);
-            let block = Block::with_timestamp(
+            let _ = doc.insert_block_internal(
                 block_snap.id.clone(),
-                content,
+                last_id.as_ref(),
+                block_snap.content,
                 block_snap.author,
-                block_snap.created_at,
             );
-
-            doc.block_order.push(block_snap.id.clone());
-            let _ = doc.ordering.inserted(doc.block_order.len() - 1, 1);
-            doc.blocks.insert(block_snap.id, block);
+            last_id = Some(block_snap.id);
         }
 
         doc.version = snapshot.version;
-
-        // Find max seq for our agent
-        if let Some(max_seq) = doc.blocks.keys().filter(|id| id.agent_id == agent_id).map(|id| id.seq).max() {
-            doc.next_seq = max_seq + 1;
-        }
-
         doc
     }
 }
@@ -730,8 +841,8 @@ mod tests {
         let id2 = doc.insert_text_block(Some(&id1), "Second").unwrap();
         let id3 = doc.insert_text_block(Some(&id2), "Third").unwrap();
 
-        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| &b.id).collect();
-        assert_eq!(order, vec![&id1, &id2, &id3]);
+        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        assert_eq!(order, vec![id1, id2, id3]);
     }
 
     #[test]
@@ -741,8 +852,8 @@ mod tests {
         let id1 = doc.insert_text_block(None, "First").unwrap();
         let id2 = doc.insert_text_block(None, "Before First").unwrap();
 
-        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| &b.id).collect();
-        assert_eq!(order, vec![&id2, &id1]);
+        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        assert_eq!(order, vec![id2, id1]);
     }
 
     #[test]
@@ -760,17 +871,26 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_ops() {
+    fn test_text_editing() {
         let mut doc = BlockDocument::new("cell-1", "alice");
 
-        assert!(!doc.has_pending_ops());
+        let id = doc.insert_text_block(None, "Hello").unwrap();
+        doc.append_text(&id, " World").unwrap();
 
-        doc.insert_text_block(None, "Hello").unwrap();
+        let text = doc.get_block_snapshot(&id).unwrap().content.text().to_string();
+        assert_eq!(text, "Hello World");
 
-        assert!(doc.has_pending_ops());
+        doc.edit_text(&id, 5, ",", 0).unwrap();
+        let text = doc.get_block_snapshot(&id).unwrap().content.text().to_string();
+        assert_eq!(text, "Hello, World");
+    }
 
-        let ops = doc.take_pending_ops();
-        assert_eq!(ops.len(), 1);
-        assert!(!doc.has_pending_ops());
+    #[test]
+    fn test_immutable_blocks() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        let tool_id = doc.insert_tool_use(None, "tool-1", "read_file", serde_json::json!({})).unwrap();
+        let result = doc.edit_text(&tool_id, 0, "edit", 0);
+        assert!(result.is_err());
     }
 }
