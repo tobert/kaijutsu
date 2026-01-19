@@ -1176,6 +1176,144 @@ pub fn sync_main_cell_to_conversation(
 }
 
 // ============================================================================
+// BLOCK EVENT HANDLING (Server → Client Block Sync)
+// ============================================================================
+
+use crate::connection::ConnectionEvent;
+
+/// Handle block events from the server and update the MainCell's BlockDocument.
+///
+/// This system processes streamed block events (inserted, edited, deleted, etc.)
+/// from the server and applies them to the local document for live updates.
+pub fn handle_block_events(
+    mut events: MessageReader<ConnectionEvent>,
+    mut main_cells: Query<&mut CellEditor, With<MainCell>>,
+) {
+    let Ok(mut editor) = main_cells.single_mut() else {
+        return;
+    };
+
+    for event in events.read() {
+        match event {
+            ConnectionEvent::BlockInserted { cell_id, block } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    // Event for different cell - skip (future: route to correct cell)
+                    continue;
+                }
+
+                // Skip if block already exists (idempotent)
+                if editor.doc.get_block_snapshot(&block.id).is_some() {
+                    continue;
+                }
+
+                // Find insertion point: after parent (if exists), otherwise by timestamp
+                let after_id = if let Some(ref parent_id) = block.parent_id {
+                    // Insert after parent block
+                    Some(parent_id.clone())
+                } else {
+                    // No parent - find position by timestamp among root blocks
+                    editor.doc.blocks_ordered()
+                        .iter()
+                        .filter(|b| b.parent_id.is_none() && b.created_at <= block.created_at)
+                        .last()
+                        .map(|b| b.id.clone())
+                };
+
+                match editor.doc.insert_from_snapshot((**block).clone(), after_id.as_ref()) {
+                    Ok(id) => {
+                        info!("Inserted block from server: {:?}", id);
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to insert block from server: {}", e);
+                    }
+                }
+            }
+            ConnectionEvent::BlockEdited {
+                cell_id,
+                block_id,
+                pos,
+                insert,
+                delete,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                match editor.doc.edit_text(block_id, *pos as usize, insert, *delete as usize) {
+                    Ok(()) => {
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to apply block edit: {}", e);
+                    }
+                }
+            }
+            ConnectionEvent::BlockStatusChanged {
+                cell_id,
+                block_id,
+                status,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                match editor.doc.set_status(block_id, *status) {
+                    Ok(()) => {
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to update block status: {}", e);
+                    }
+                }
+            }
+            ConnectionEvent::BlockDeleted {
+                cell_id,
+                block_id,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                match editor.doc.delete_block(block_id) {
+                    Ok(()) => {
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to delete block: {}", e);
+                    }
+                }
+            }
+            ConnectionEvent::BlockCollapsedChanged {
+                cell_id,
+                block_id,
+                collapsed,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                match editor.doc.set_collapsed(block_id, *collapsed) {
+                    Ok(()) => {
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to update block collapsed state: {}", e);
+                    }
+                }
+            }
+            // Ignore other connection events - they're handled elsewhere
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
 // BLOCK CELL SYSTEMS (Per-Block UI Rendering)
 // ============================================================================
 
@@ -1525,24 +1663,12 @@ pub fn apply_block_cell_positions(
 }
 
 // ============================================================================
-// TURN/ROLE HEADER SYSTEMS (Legacy - removed in DAG migration)
+// TURN/ROLE HEADER SYSTEMS (Removed in DAG migration)
 // ============================================================================
 //
 // Turn headers are now rendered inline based on role transitions.
 // The layout_block_cells system handles role transition detection and
 // reserves space for inline role headers.
 //
-// Legacy TurnCell, TurnCellContainer, and TurnCellLayout components
-// still exist in components.rs for reference but these systems are disabled.
-//
 // TODO: Implement inline role header rendering in BlockCell format_single_block
 // or as a separate UI element spawned alongside BlockCells.
-
-/// Computed layout for a turn header (legacy - kept for compatibility).
-#[derive(Component, Debug, Default)]
-pub struct TurnCellLayout {
-    /// Y position (top) relative to conversation content start.
-    pub y_offset: f32,
-    /// Height of the turn header.
-    pub height: f32,
-}

@@ -79,6 +79,38 @@ pub enum ConnectionEvent {
         prompt_id: String,
         cell_id: String,
     }, // TODO: Track prompt state in UI
+
+    // Block streaming events (from server-side LLM processing)
+    /// A block was inserted into a cell
+    BlockInserted {
+        cell_id: String,
+        block: Box<kaijutsu_crdt::BlockSnapshot>,
+    },
+    /// A block's text content was edited
+    BlockEdited {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+        pos: u64,
+        insert: String,
+        delete: u64,
+    },
+    /// A block's status changed
+    BlockStatusChanged {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+        status: kaijutsu_crdt::Status,
+    },
+    /// A block was deleted
+    BlockDeleted {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+    },
+    /// A block's collapsed state changed
+    BlockCollapsedChanged {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+        collapsed: bool,
+    },
 }
 
 /// Resource holding the command sender
@@ -410,6 +442,17 @@ async fn connection_loop(
                     match rpc.attach_kernel(&id).await {
                         Ok(kernel) => match kernel.get_info().await {
                             Ok(info) => {
+                                // Subscribe to block events for real-time streaming updates
+                                let callback = BlockEventsCallback {
+                                    evt_tx: evt_tx.clone(),
+                                };
+                                let client = capnp_rpc::new_client(callback);
+                                if let Err(e) = kernel.subscribe_blocks(client).await {
+                                    log::warn!("Block subscription failed: {}", e);
+                                } else {
+                                    log::info!("Subscribed to block events for kernel {}", id);
+                                }
+
                                 current_kernel = Some(kernel);
                                 let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
                             }
@@ -431,6 +474,18 @@ async fn connection_loop(
                     match rpc.create_kernel(config).await {
                         Ok(kernel) => match kernel.get_info().await {
                             Ok(info) => {
+                                // Subscribe to block events for real-time streaming updates
+                                // (same as AttachKernel)
+                                let callback = BlockEventsCallback {
+                                    evt_tx: evt_tx.clone(),
+                                };
+                                let client = capnp_rpc::new_client(callback);
+                                if let Err(e) = kernel.subscribe_blocks(client).await {
+                                    log::warn!("Block subscription failed: {}", e);
+                                } else {
+                                    log::info!("Subscribed to block events for new kernel {}", info.id);
+                                }
+
                                 current_kernel = Some(kernel);
                                 let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
                             }
@@ -475,4 +530,308 @@ async fn connection_loop(
             }
         }
     }
+}
+
+// ============================================================================
+// Block Events Callback
+// ============================================================================
+
+use std::rc::Rc;
+use capnp::capability::Promise;
+use kaijutsu_client::kaijutsu_capnp::block_events;
+
+/// Callback struct for receiving block events from the server.
+/// Note: Uses mpsc channel which is Send, so we can clone and send from Rc<Self>
+struct BlockEventsCallback {
+    evt_tx: mpsc::UnboundedSender<ConnectionEvent>,
+}
+
+#[allow(refining_impl_trait)]
+impl block_events::Server for BlockEventsCallback {
+    fn on_block_inserted(
+        self: Rc<Self>,
+        params: block_events::OnBlockInsertedParams,
+        _results: block_events::OnBlockInsertedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block = match params.get_block() {
+            Ok(b) => match parse_block_snapshot(&b) {
+                Ok(block) => block,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockInserted { cell_id, block: Box::new(block) });
+        Promise::ok(())
+    }
+
+    fn on_block_deleted(
+        self: Rc<Self>,
+        params: block_events::OnBlockDeletedParams,
+        _results: block_events::OnBlockDeletedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockDeleted { cell_id, block_id });
+        Promise::ok(())
+    }
+
+    fn on_block_edited(
+        self: Rc<Self>,
+        params: block_events::OnBlockEditedParams,
+        _results: block_events::OnBlockEditedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let pos = params.get_pos();
+        let insert = match params.get_insert() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let delete = params.get_delete();
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockEdited {
+            cell_id,
+            block_id,
+            pos,
+            insert,
+            delete,
+        });
+        Promise::ok(())
+    }
+
+    fn on_block_collapsed(
+        self: Rc<Self>,
+        params: block_events::OnBlockCollapsedParams,
+        _results: block_events::OnBlockCollapsedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let collapsed = params.get_collapsed();
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockCollapsedChanged {
+            cell_id,
+            block_id,
+            collapsed,
+        });
+        Promise::ok(())
+    }
+
+    fn on_block_moved(
+        self: Rc<Self>,
+        _params: block_events::OnBlockMovedParams,
+        _results: block_events::OnBlockMovedResults,
+    ) -> Promise<(), capnp::Error> {
+        // TODO: Implement block move handling
+        log::error!("Block move event received but not implemented - client state may diverge");
+        Promise::ok(())
+    }
+
+    fn on_block_status_changed(
+        self: Rc<Self>,
+        params: block_events::OnBlockStatusChangedParams,
+        _results: block_events::OnBlockStatusChangedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let status = match params.get_status() {
+            Ok(s) => match s {
+                kaijutsu_client::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
+                kaijutsu_client::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
+                kaijutsu_client::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
+                kaijutsu_client::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
+            },
+            Err(e) => return Promise::err(e.into()),
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockStatusChanged {
+            cell_id,
+            block_id,
+            status,
+        });
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Block Snapshot Parser Helpers
+// ============================================================================
+
+fn parse_block_id(
+    reader: &kaijutsu_client::kaijutsu_capnp::block_id::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
+    Ok(kaijutsu_crdt::BlockId {
+        cell_id: reader.get_cell_id()?.to_str()?.to_owned(),
+        agent_id: reader.get_agent_id()?.to_str()?.to_owned(),
+        seq: reader.get_seq(),
+    })
+}
+
+fn parse_block_snapshot(
+    reader: &kaijutsu_client::kaijutsu_capnp::block_snapshot::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockSnapshot, capnp::Error> {
+    let id_reader = reader.get_id()?;
+    let id = kaijutsu_crdt::BlockId {
+        cell_id: id_reader.get_cell_id()?.to_str()?.to_owned(),
+        agent_id: id_reader.get_agent_id()?.to_str()?.to_owned(),
+        seq: id_reader.get_seq(),
+    };
+
+    let parent_id = if reader.get_has_parent_id() {
+        let pid_reader = reader.get_parent_id()?;
+        Some(kaijutsu_crdt::BlockId {
+            cell_id: pid_reader.get_cell_id()?.to_str()?.to_owned(),
+            agent_id: pid_reader.get_agent_id()?.to_str()?.to_owned(),
+            seq: pid_reader.get_seq(),
+        })
+    } else {
+        None
+    };
+
+    let role = match reader.get_role()? {
+        kaijutsu_client::kaijutsu_capnp::Role::User => kaijutsu_crdt::Role::User,
+        kaijutsu_client::kaijutsu_capnp::Role::Model => kaijutsu_crdt::Role::Model,
+        kaijutsu_client::kaijutsu_capnp::Role::System => kaijutsu_crdt::Role::System,
+        kaijutsu_client::kaijutsu_capnp::Role::Tool => kaijutsu_crdt::Role::Tool,
+    };
+
+    let status = match reader.get_status()? {
+        kaijutsu_client::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
+        kaijutsu_client::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
+        kaijutsu_client::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
+        kaijutsu_client::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
+    };
+
+    let kind = match reader.get_kind()? {
+        kaijutsu_client::kaijutsu_capnp::BlockKind::Text => kaijutsu_crdt::BlockKind::Text,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::Thinking => kaijutsu_crdt::BlockKind::Thinking,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
+    };
+
+    let tool_call_id = if reader.get_has_tool_call_id() {
+        let tc_reader = reader.get_tool_call_id()?;
+        Some(kaijutsu_crdt::BlockId {
+            cell_id: tc_reader.get_cell_id()?.to_str()?.to_owned(),
+            agent_id: tc_reader.get_agent_id()?.to_str()?.to_owned(),
+            seq: tc_reader.get_seq(),
+        })
+    } else {
+        None
+    };
+
+    let tool_input = reader.get_tool_input()
+        .ok()
+        .and_then(|s| s.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    Ok(kaijutsu_crdt::BlockSnapshot {
+        id,
+        parent_id,
+        role,
+        status,
+        kind,
+        content: reader.get_content()?.to_str()?.to_owned(),
+        collapsed: reader.get_collapsed(),
+        author: reader.get_author()?.to_str()?.to_owned(),
+        created_at: reader.get_created_at(),
+        tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
+        tool_input,
+        tool_call_id,
+        exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
+        is_error: reader.get_is_error(),
+    })
 }
