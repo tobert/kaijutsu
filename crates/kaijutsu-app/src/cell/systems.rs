@@ -476,7 +476,7 @@ pub fn debug_spawn_cell(
 
         spawn_cell(
             &mut commands,
-            Cell::code("rust"),
+            Cell::new(CellKind::Code),
             CellPosition::new(next_row),
             "// New cell\nfn main() {\n    println!(\"Hello!\");\n}\n",
         );
@@ -1228,7 +1228,7 @@ pub fn spawn_block_cells(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
-    block_cells: Query<(Entity, &BlockCell)>,
+    _block_cells: Query<(Entity, &BlockCell)>,
 ) {
     let Some(main_ent) = main_entity.0 else {
         return;

@@ -6,6 +6,5 @@ pub mod bridge;
 
 pub use bridge::{
     ConnectionBridgePlugin, ConnectionCommand, ConnectionCommands, ConnectionEvent,
-    ConnectionState,
 };
 

@@ -14,7 +14,6 @@ use kaijutsu_client::{
     CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, Identity, KernelConfig,
     KernelHandle, KernelInfo, Row, RpcClient, SshConfig,
 };
-use kaijutsu_crdt::{BlockContentSnapshot, BlockId};
 
 use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 
@@ -63,11 +62,6 @@ pub enum ConnectionCommand {
     ApplyCellOp { op: CellOp },
     /// Sync all cells (on connect or reconnect)
     SyncCells { versions: Vec<CellVersion> },
-
-    // Block-based CRDT operations (new architecture)
-    // NOTE: ApplyBlockOp was removed - the unified CRDT model uses SerializedOps.
-    /// Get block cell state
-    GetBlockCellState { cell_id: String },
 
     // LLM operations (server-side)
     /// Send a prompt to the server-side LLM
@@ -124,45 +118,6 @@ pub enum ConnectionEvent {
     CellSyncResult {
         patches: Vec<CellPatch>,
         new_cells: Vec<CellState>,
-    },
-
-    // Block-based CRDT events (new architecture)
-    /// Block operation applied successfully
-    BlockOpApplied { cell_id: String, new_version: u64 },
-    /// Block was inserted
-    BlockInserted {
-        cell_id: String,
-        block_id: BlockId,
-        after_id: Option<BlockId>,
-        content: BlockContentSnapshot,
-    },
-    /// Block was deleted
-    BlockDeleted { cell_id: String, block_id: BlockId },
-    /// Block text was edited
-    BlockEdited {
-        cell_id: String,
-        block_id: BlockId,
-        pos: usize,
-        insert: String,
-        delete: usize,
-    },
-    /// Block collapsed state changed
-    BlockCollapsed {
-        cell_id: String,
-        block_id: BlockId,
-        collapsed: bool,
-    },
-    /// Block was moved
-    BlockMoved {
-        cell_id: String,
-        block_id: BlockId,
-        after_id: Option<BlockId>,
-    },
-    /// Block cell state received
-    BlockCellState {
-        cell_id: String,
-        blocks: Vec<(BlockId, BlockContentSnapshot)>,
-        version: u64,
     },
 
     // LLM events (server-side)
@@ -731,25 +686,6 @@ async fn connection_loop(
 
             // Block-based CRDT commands
             // NOTE: ApplyBlockOp was removed - unified CRDT model uses SerializedOps
-
-            ConnectionCommand::GetBlockCellState { cell_id } => {
-                if let Some(kernel) = &current_kernel {
-                    match kernel.get_block_cell_state(&cell_id).await {
-                        Ok((blocks, version)) => {
-                            let _ = evt_tx.send(ConnectionEvent::BlockCellState {
-                                cell_id,
-                                blocks,
-                                version,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
-                        }
-                    }
-                } else {
-                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
-                }
-            }
 
             // LLM commands
             ConnectionCommand::Prompt {

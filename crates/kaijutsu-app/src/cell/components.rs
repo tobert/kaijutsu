@@ -62,10 +62,6 @@ pub struct Cell {
     pub id: CellId,
     /// What kind of content this cell holds
     pub kind: CellKind,
-    /// Programming language (for code cells)
-    pub language: Option<String>,
-    /// Parent cell (for nesting, e.g., tool calls under messages)
-    pub parent: Option<CellId>,
 }
 
 impl Cell {
@@ -73,17 +69,6 @@ impl Cell {
         Self {
             id: CellId::new(),
             kind,
-            language: None,
-            parent: None,
-        }
-    }
-
-    pub fn code(language: impl Into<String>) -> Self {
-        Self {
-            id: CellId::new(),
-            kind: CellKind::Code,
-            language: Some(language.into()),
-            parent: None,
         }
     }
 }
@@ -187,36 +172,6 @@ impl CellEditor {
     // =========================================================================
     // TEXT MUTATION
     // =========================================================================
-
-    /// Apply server-authoritative content (doesn't generate ops).
-    pub fn apply_server_content(&mut self, content: impl Into<String>) {
-        // For server content, we set text without marking dirty
-        // because this is already synced.
-        let text = content.into();
-
-        // Clear existing blocks
-        let block_ids: Vec<_> = self
-            .doc
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.id.clone())
-            .collect();
-        for id in block_ids {
-            let _ = self.doc.delete_block(&id);
-        }
-
-        // Create new text block
-        if !text.is_empty() {
-            if let Ok(block_id) = self.doc.insert_text_block(None, &text) {
-                self.cursor = BlockCursor::at(block_id, text.len());
-            }
-        } else {
-            self.cursor = BlockCursor::default();
-        }
-
-        // Not dirty - server is authoritative
-        self.dirty = false;
-    }
 
     /// Clear all content.
     pub fn clear(&mut self) {
@@ -386,129 +341,6 @@ impl CellEditor {
         }
     }
 
-    // =========================================================================
-    // SYNC OPERATIONS (Updated for unified CRDT)
-    // =========================================================================
-
-    /// Mark as synced.
-    pub fn mark_synced(&mut self) {
-        self.dirty = false;
-    }
-
-    /// Apply a remote block insertion.
-    /// With the unified CRDT, we use direct document methods.
-    pub fn apply_remote_block_insert(
-        &mut self,
-        _block_id: BlockId,
-        after_id: Option<BlockId>,
-        content: BlockContentSnapshot,
-    ) -> Result<(), String> {
-        // With the unified CRDT, remote insertions are handled differently.
-        // The server sends us serialized ops which we merge.
-        // For backwards compatibility, we can directly insert using doc methods.
-        match content {
-            BlockContentSnapshot::Text { text } => {
-                self.doc.insert_text_block(after_id.as_ref(), text)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
-            BlockContentSnapshot::Thinking { text, .. } => {
-                self.doc.insert_thinking_block(after_id.as_ref(), text)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
-            BlockContentSnapshot::ToolUse { id, name, input } => {
-                self.doc.insert_tool_use(after_id.as_ref(), id, name, input)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
-            BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
-                self.doc.insert_tool_result(after_id.as_ref(), tool_use_id, content, is_error)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// Apply a remote block deletion.
-    pub fn apply_remote_block_delete(&mut self, block_id: &BlockId) -> Result<(), String> {
-        self.doc.delete_block(block_id).map_err(|e| e.to_string())
-    }
-
-    /// Apply a remote text edit.
-    pub fn apply_remote_block_edit(
-        &mut self,
-        block_id: &BlockId,
-        pos: usize,
-        insert: &str,
-        delete: usize,
-    ) -> Result<(), String> {
-        self.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())
-    }
-
-    /// Apply a remote collapsed state change.
-    pub fn apply_remote_block_collapsed(
-        &mut self,
-        block_id: &BlockId,
-        collapsed: bool,
-    ) -> Result<(), String> {
-        self.doc.set_collapsed(block_id, collapsed).map_err(|e| e.to_string())
-    }
-
-    /// Apply a remote block move.
-    /// NOTE: Block moving via the old API is not supported in the unified CRDT.
-    /// Block ordering is managed by the OpLog.
-    pub fn apply_remote_block_move(
-        &mut self,
-        _block_id: &BlockId,
-        _after_id: Option<&BlockId>,
-    ) -> Result<(), String> {
-        // Block ordering is handled by the OpLog in the unified CRDT
-        // This method is a no-op for backwards compatibility
-        Ok(())
-    }
-
-    /// Apply server-authoritative block state (full replacement).
-    pub fn apply_server_block_state(
-        &mut self,
-        blocks: Vec<(BlockId, BlockContentSnapshot)>,
-        _version: u64,
-    ) {
-        // Clear existing blocks
-        let existing_ids: Vec<_> = self.doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
-        for id in existing_ids {
-            let _ = self.doc.delete_block(&id);
-        }
-
-        // Insert blocks from server
-        let mut prev_id: Option<BlockId> = None;
-        for (_block_id, content) in blocks {
-            let result = match content {
-                BlockContentSnapshot::Text { text } => {
-                    self.doc.insert_text_block(prev_id.as_ref(), text)
-                }
-                BlockContentSnapshot::Thinking { text, .. } => {
-                    self.doc.insert_thinking_block(prev_id.as_ref(), text)
-                }
-                BlockContentSnapshot::ToolUse { id, name, input } => {
-                    self.doc.insert_tool_use(prev_id.as_ref(), id, name, input)
-                }
-                BlockContentSnapshot::ToolResult { tool_use_id, content, is_error } => {
-                    self.doc.insert_tool_result(prev_id.as_ref(), tool_use_id, content, is_error)
-                }
-            };
-            if let Ok(new_id) = result {
-                prev_id = Some(new_id);
-            }
-        }
-
-        // Update cursor
-        if let Some(first_block) = self.doc.blocks_ordered().first() {
-            self.cursor = BlockCursor::at(first_block.id.clone(), 0);
-        } else {
-            self.cursor = BlockCursor::default();
-        }
-    }
 }
 
 // ============================================================================
@@ -832,16 +664,6 @@ impl TurnCell {
         }
     }
 
-    /// Check if this turn is from a user.
-    pub fn is_user(&self) -> bool {
-        self.author.starts_with("user:")
-    }
-
-    /// Check if this turn is from a model.
-    pub fn is_model(&self) -> bool {
-        self.author.starts_with("model:")
-    }
-
     /// Format timestamp for display (simple HH:MM format).
     pub fn formatted_time(&self) -> String {
         // Convert Unix millis to seconds since epoch
@@ -863,9 +685,5 @@ pub struct TurnCellContainer {
 impl TurnCellContainer {
     pub fn add(&mut self, entity: Entity) {
         self.turn_cells.push(entity);
-    }
-
-    pub fn clear(&mut self) {
-        self.turn_cells.clear();
     }
 }
