@@ -1622,6 +1622,7 @@ impl kernel::Server for KernelImpl {
             let broadcast_text_append = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
                                          cell_id: &str,
                                          block_id: &kaijutsu_crdt::BlockId,
+                                         pos: u64,
                                          text: &str| {
                 for subscriber in subscribers {
                     let mut req = subscriber.on_block_edited_request();
@@ -1634,8 +1635,7 @@ impl kernel::Server for KernelImpl {
                             id.set_agent_id(&block_id.agent_id);
                             id.set_seq(block_id.seq);
                         }
-                        // For append, position is at end - we send as full text update
-                        params.set_pos(0);
+                        params.set_pos(pos);
                         params.set_insert(text);
                         params.set_delete(0);
                     }
@@ -1680,10 +1680,15 @@ impl kernel::Server for KernelImpl {
 
                     StreamEvent::ThinkingDelta(text) => {
                         if let Some(ref block_id) = current_block_id {
+                            // Get current length before append for correct broadcast position
+                            let pos = cells.get(&cell_id)
+                                .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                                .map(|s| s.content.len() as u64)
+                                .unwrap_or(0);
                             if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
                                 log::error!("Failed to append thinking text: {}", e);
                             } else {
-                                broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
+                                broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
                             }
                         }
                     }
@@ -1705,10 +1710,15 @@ impl kernel::Server for KernelImpl {
 
                     StreamEvent::TextDelta(text) => {
                         if let Some(ref block_id) = current_block_id {
+                            // Get current length before append for correct broadcast position
+                            let pos = cells.get(&cell_id)
+                                .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                                .map(|s| s.content.len() as u64)
+                                .unwrap_or(0);
                             if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
                                 log::error!("Failed to append text: {}", e);
                             } else {
-                                broadcast_text_append(&block_subscribers, &cell_id, block_id, &text);
+                                broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
                             }
                         }
                     }
