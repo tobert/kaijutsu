@@ -42,6 +42,10 @@ pub struct TextRenderResources {
 pub struct TextBuffer {
     buffer: Buffer,
     dirty: bool,
+    /// Cached visual line count (after text wrapping).
+    cached_visual_lines: usize,
+    /// The wrap width used for the cached visual line count.
+    cached_wrap_width: f32,
 }
 
 impl TextBuffer {
@@ -50,12 +54,19 @@ impl TextBuffer {
         Self {
             buffer: Buffer::new(font_system, metrics),
             dirty: true,
+            cached_visual_lines: 1,
+            cached_wrap_width: 0.0,
         }
     }
 
     /// Get a reference to the underlying buffer.
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// Get a mutable reference to the underlying buffer.
+    pub fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffer
     }
 
     /// Set the buffer text with default attributes.
@@ -78,6 +89,26 @@ impl TextBuffer {
             .map(|line| line.text())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Get the visual line count after text wrapping.
+    ///
+    /// This shapes the buffer if the content or wrap width has changed,
+    /// then returns the cached visual line count. The visual line count
+    /// reflects actual wrapped lines, not just explicit newlines.
+    pub fn visual_line_count(&mut self, font_system: &mut FontSystem, wrap_width: f32) -> usize {
+        // Reshape if dirty or wrap width changed significantly
+        let width_changed = (self.cached_wrap_width - wrap_width).abs() > 1.0;
+
+        if self.dirty || width_changed {
+            self.buffer.set_size(font_system, Some(wrap_width), None);
+            self.buffer.shape_until_scroll(font_system, false);
+            self.cached_visual_lines = self.buffer.layout_runs().count().max(1);
+            self.cached_wrap_width = wrap_width;
+            self.dirty = false;
+        }
+
+        self.cached_visual_lines
     }
 }
 

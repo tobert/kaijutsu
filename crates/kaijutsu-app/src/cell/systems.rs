@@ -1509,7 +1509,7 @@ pub fn sync_block_cell_buffers(
 /// Layout BlockCells vertically within the conversation area.
 ///
 /// Computes heights and positions for each block, accounting for:
-/// - Block content height
+/// - Block content height (using visual line count after wrapping)
 /// - Spacing between blocks
 /// - Indentation for nested tool results
 /// - Space for turn headers before first block of each turn
@@ -1517,11 +1517,13 @@ pub fn layout_block_cells(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &TextBuffer)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut TextBuffer)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     registry: Res<ConversationRegistry>,
     current: Res<CurrentConversation>,
+    font_system: Res<SharedFontSystem>,
+    windows: Query<&Window>,
 ) {
     let Some(main_ent) = main_entity.0 else {
         return;
@@ -1538,7 +1540,20 @@ pub fn layout_block_cells(
     const BLOCK_SPACING: f32 = 16.0;
     const ROLE_HEADER_HEIGHT: f32 = 28.0;
     const ROLE_HEADER_SPACING: f32 = 8.0;
+    const INDENT_WIDTH: f32 = 32.0;
     let mut y_offset = 0.0;
+
+    // Get window size for wrap width calculation
+    let window_width = windows
+        .iter()
+        .next()
+        .map(|w| w.resolution.width())
+        .unwrap_or(1280.0);
+    let margin = layout.workspace_margin_left;
+    let base_width = window_width - (margin * 2.0);
+
+    // Lock font system for shaping
+    let mut font_system = font_system.0.lock().unwrap();
 
     // Get blocks for lookup
     let blocks: std::collections::HashMap<_, _> = editor
@@ -1564,7 +1579,7 @@ pub fn layout_block_cells(
     let _ = (&current, &registry); // suppress unused warnings
 
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, buffer)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout, mut buffer)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -1590,9 +1605,13 @@ pub fn layout_block_cells(
             0
         };
 
-        // Compute height from buffer line count
-        // Use uncapped height for scroll calculations - we need actual content height
-        let line_count = buffer.buffer().lines.len().max(1);
+        // Calculate wrap width accounting for indentation
+        let indent = indent_level as f32 * INDENT_WIDTH;
+        let wrap_width = base_width - indent;
+
+        // Compute height from visual line count (after text wrapping)
+        // This shapes the buffer if needed and returns accurate wrapped line count
+        let line_count = buffer.visual_line_count(&mut font_system, wrap_width);
         let height = (line_count as f32) * layout.line_height + 24.0; // No max cap for scrolling
 
         block_layout.y_offset = y_offset;

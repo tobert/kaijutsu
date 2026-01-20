@@ -8,9 +8,16 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 // Use types from the client library
 use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, RpcClient, SshConfig};
+
+/// Default timeout for RPC operations (short ops like attach, list)
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for LLM prompt operations (can take minutes with extended thinking)
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
 use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 
@@ -439,29 +446,42 @@ async fn connection_loop(
 
             ConnectionCommand::AttachKernel { id } => {
                 if let Some(rpc) = &rpc_client {
-                    match rpc.attach_kernel(&id).await {
-                        Ok(kernel) => match kernel.get_info().await {
-                            Ok(info) => {
-                                // Subscribe to block events for real-time streaming updates
-                                let callback = BlockEventsCallback {
-                                    evt_tx: evt_tx.clone(),
-                                };
-                                let client = capnp_rpc::new_client(callback);
-                                if let Err(e) = kernel.subscribe_blocks(client).await {
-                                    log::warn!("Block subscription failed: {}", e);
-                                } else {
-                                    log::info!("Subscribed to block events for kernel {}", id);
-                                }
+                    let attach_result = timeout(RPC_TIMEOUT, async {
+                        let kernel = rpc.attach_kernel(&id).await?;
+                        let info = kernel.get_info().await?;
+                        Ok::<_, kaijutsu_client::RpcError>((kernel, info))
+                    }).await;
 
-                                current_kernel = Some(kernel);
-                                let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
+                    match attach_result {
+                        Ok(Ok((kernel, info))) => {
+                            // Subscribe to block events for real-time streaming updates
+                            let callback = BlockEventsCallback {
+                                evt_tx: evt_tx.clone(),
+                            };
+                            let client = capnp_rpc::new_client(callback);
+                            if let Err(e) = kernel.subscribe_blocks(client).await {
+                                log::warn!("Block subscription failed: {}", e);
+                            } else {
+                                log::info!("Subscribed to block events for kernel {}", id);
                             }
-                            Err(e) => {
-                                let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+
+                            current_kernel = Some(kernel);
+                            let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during attach: {}", err_str);
+                                rpc_client = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::Error(err_str));
                             }
-                        },
-                        Err(e) => {
-                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        }
+                        Err(_) => {
+                            log::warn!("Attach kernel RPC timed out");
+                            rpc_client = None;
+                            let _ = evt_tx.send(ConnectionEvent::Disconnected);
                         }
                     }
                 } else {
@@ -516,12 +536,28 @@ async fn connection_loop(
                 cell_id,
             } => {
                 if let Some(kernel) = &current_kernel {
-                    match kernel.prompt(&content, model.as_deref(), &cell_id).await {
-                        Ok(prompt_id) => {
+                    match timeout(PROMPT_TIMEOUT, kernel.prompt(&content, model.as_deref(), &cell_id)).await {
+                        Ok(Ok(prompt_id)) => {
                             let _ = evt_tx.send(ConnectionEvent::PromptSent { prompt_id, cell_id });
                         }
-                        Err(e) => {
-                            let _ = evt_tx.send(ConnectionEvent::Error(e.to_string()));
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            // Check for connection-related errors
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during prompt: {}", err_str);
+                                rpc_client = None;
+                                current_kernel = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::Error(err_str));
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Prompt RPC timed out after {:?}", PROMPT_TIMEOUT);
+                            // Timeout likely means connection is dead
+                            rpc_client = None;
+                            current_kernel = None;
+                            let _ = evt_tx.send(ConnectionEvent::Disconnected);
                         }
                     }
                 } else {
@@ -530,6 +566,17 @@ async fn connection_loop(
             }
         }
     }
+}
+
+/// Check if an error string indicates a connection problem
+fn is_connection_error(err: &str) -> bool {
+    let err_lower = err.to_lowercase();
+    err_lower.contains("disconnected")
+        || err_lower.contains("connection")
+        || err_lower.contains("broken pipe")
+        || err_lower.contains("reset by peer")
+        || err_lower.contains("eof")
+        || err_lower.contains("not connected")
 }
 
 // ============================================================================
