@@ -3,3 +3,4 @@ typescript
 run.log
 *.log
 incoming-assets/
+screenshot*.png
