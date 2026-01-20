@@ -869,6 +869,44 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Move a block to a new position in the ordering.
+    ///
+    /// The block will be placed immediately after `after_id`, or at the
+    /// beginning if `after_id` is None.
+    pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
+        let block_key = id.to_key();
+        let key_primitive = Primitive::Str(SmartString::from(block_key.as_str()));
+
+        // Check if block exists
+        let existing = self.oplog.checkout_set(self.blocks_set_lv);
+        if !existing.contains(&key_primitive) {
+            return Err(CrdtError::BlockNotFound(id.clone()));
+        }
+
+        // Validate reference if provided
+        if let Some(after_id) = after {
+            let after_key = Primitive::Str(SmartString::from(after_id.to_key().as_str()));
+            if !existing.contains(&after_key) {
+                return Err(CrdtError::InvalidReference(after_id.clone()));
+            }
+        }
+
+        // Calculate new order index
+        let order_index = self.calc_order_index(after);
+
+        // Update order key
+        let order_key = format!("order:{}", block_key);
+        self.oplog.local_map_set(
+            self.agent,
+            ROOT_CRDT_ID,
+            &order_key,
+            CreateValue::Primitive(Primitive::I64((order_index * 1_000_000.0) as i64)),
+        );
+
+        self.version += 1;
+        Ok(())
+    }
+
     // =========================================================================
     // Sync Operations
     // =========================================================================
@@ -1167,5 +1205,43 @@ mod tests {
         doc.edit_text(&id, 5, ",", 0).unwrap();
         let text = doc.get_block_snapshot(&id).unwrap().content;
         assert_eq!(text, "Hello, World");
+    }
+
+    #[test]
+    fn test_move_block() {
+        let mut doc = BlockDocument::new("cell-1", "alice");
+
+        // Insert three blocks: A, B, C
+        let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A", "user").unwrap();
+        let b = doc.insert_block(None, Some(&a), Role::User, BlockKind::Text, "B", "user").unwrap();
+        let c = doc.insert_block(None, Some(&b), Role::User, BlockKind::Text, "C", "user").unwrap();
+
+        // Initial order should be A, B, C
+        let ordered = doc.blocks_ordered();
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, a);
+        assert_eq!(ordered[1].id, b);
+        assert_eq!(ordered[2].id, c);
+
+        // Move C to the beginning (before A)
+        doc.move_block(&c, None).unwrap();
+        let ordered = doc.blocks_ordered();
+        assert_eq!(ordered[0].id, c, "C should be first after moving to beginning");
+        assert_eq!(ordered[1].id, a);
+        assert_eq!(ordered[2].id, b);
+
+        // Move A after B (to the end)
+        doc.move_block(&a, Some(&b)).unwrap();
+        let ordered = doc.blocks_ordered();
+        assert_eq!(ordered[0].id, c);
+        assert_eq!(ordered[1].id, b);
+        assert_eq!(ordered[2].id, a, "A should be last after moving after B");
+
+        // Moving non-existent block should fail
+        let fake_id = BlockId::new("cell-1", "fake", 999);
+        assert!(doc.move_block(&fake_id, None).is_err());
+
+        // Moving after non-existent block should fail
+        assert!(doc.move_block(&a, Some(&fake_id)).is_err());
     }
 }

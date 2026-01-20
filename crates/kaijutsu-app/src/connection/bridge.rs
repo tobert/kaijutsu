@@ -118,6 +118,12 @@ pub enum ConnectionEvent {
         block_id: kaijutsu_crdt::BlockId,
         collapsed: bool,
     },
+    /// A block was moved to a new position
+    BlockMoved {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+        after_id: Option<kaijutsu_crdt::BlockId>,
+    },
 }
 
 /// Resource holding the command sender
@@ -739,11 +745,47 @@ impl block_events::Server for BlockEventsCallback {
 
     fn on_block_moved(
         self: Rc<Self>,
-        _params: block_events::OnBlockMovedParams,
+        params: block_events::OnBlockMovedParams,
         _results: block_events::OnBlockMovedResults,
     ) -> Promise<(), capnp::Error> {
-        // TODO: Implement block move handling
-        log::error!("Block move event received but not implemented - client state may diverge");
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let after_id = if params.get_has_after_id() {
+            match params.get_after_id() {
+                Ok(b) => match parse_block_id(&b) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Promise::err(e),
+                },
+                Err(e) => return Promise::err(e),
+            }
+        } else {
+            None
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockMoved {
+            cell_id,
+            block_id,
+            after_id,
+        });
         Promise::ok(())
     }
 

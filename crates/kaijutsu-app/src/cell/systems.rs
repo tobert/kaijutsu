@@ -1290,6 +1290,25 @@ pub fn handle_block_events(
                     }
                 }
             }
+            ConnectionEvent::BlockMoved {
+                cell_id,
+                block_id,
+                after_id,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                match editor.doc.move_block(block_id, after_id.as_ref()) {
+                    Ok(()) => {
+                        editor.dirty = true;
+                    }
+                    Err(e) => {
+                        warn!("Failed to move block: {}", e);
+                    }
+                }
+            }
             // Ignore other connection events - they're handled elsewhere
             _ => {}
         }
