@@ -4637,6 +4637,7 @@ dependencies = [
  "dunce",
  "kaijutsu-crdt",
  "parking_lot",
+ "regex",
  "rhai",
  "rusqlite",
  "rustix 0.38.44",

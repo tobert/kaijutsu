@@ -20,9 +20,12 @@ use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
 use kaijutsu_kernel::{
-    CellDb, CellEditEngine, CellKind, CellListEngine, CellReadEngine, Kernel,
+    CellDb, CellKind, Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
     AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
+    // Block tools
+    BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -31,34 +34,88 @@ use serde_json;
 // Server State
 // ============================================================================
 
-/// Register cell editing tools with a kernel.
-async fn register_cell_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
-    // Register cell.edit tool
+/// Register block tools with a kernel.
+async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
+    // block.create - Create a new block
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("cell.edit", "Line-based cell editing", "cell"),
-            Arc::new(CellEditEngine::new(cells.clone(), "server")),
+            ToolInfo::new("block.create", "Create a new block with role, kind, content", "block"),
+            Arc::new(BlockCreateEngine::new(cells.clone(), "server")),
         )
         .await;
-    kernel.equip("cell.edit").await;
+    kernel.equip("block.create").await;
 
-    // Register cell.read tool
+    // block.append - Append text to a block (streaming-optimized)
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("cell.read", "Read cell content by ID", "cell"),
-            Arc::new(CellReadEngine::new(cells.clone())),
+            ToolInfo::new("block.append", "Append text to a block", "block"),
+            Arc::new(BlockAppendEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("cell.read").await;
+    kernel.equip("block.append").await;
 
-    // Register cell.list tool
+    // block.edit - Line-based editing with atomic operations and CAS
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("cell.list", "List all cells with metadata", "cell"),
-            Arc::new(CellListEngine::new(cells)),
+            ToolInfo::new("block.edit", "Line-based editing with atomic ops and CAS validation", "block"),
+            Arc::new(BlockEditEngine::new(cells.clone(), "server")),
         )
         .await;
-    kernel.equip("cell.list").await;
+    kernel.equip("block.edit").await;
+
+    // block.splice - Character-based editing for programmatic tools
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block.splice", "Character-based splice editing", "block"),
+            Arc::new(BlockSpliceEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("block.splice").await;
+
+    // block.read - Read block content with line numbers and ranges
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block.read", "Read block content with optional line numbers", "block"),
+            Arc::new(BlockReadEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("block.read").await;
+
+    // block.search - Search within a block using regex
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block.search", "Search within a block using regex", "block"),
+            Arc::new(BlockSearchEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("block.search").await;
+
+    // block.list - List blocks with filters
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block.list", "List blocks with optional filters", "block"),
+            Arc::new(BlockListEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("block.list").await;
+
+    // block.status - Set block status
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block.status", "Set block status", "block"),
+            Arc::new(BlockStatusEngine::new(cells.clone())),
+        )
+        .await;
+    kernel.equip("block.status").await;
+
+    // kernel.search - Cross-block grep
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("kernel.search", "Search across blocks using regex", "kernel"),
+            Arc::new(KernelSearchEngine::new(cells)),
+        )
+        .await;
+    kernel.equip("kernel.search").await;
 }
 
 /// Server state shared across all capabilities
@@ -279,9 +336,9 @@ impl world::Server for WorldImpl {
                     }
                 }
 
-                // Register cell tools
+                // Register block tools
                 let kernel_arc = Arc::new(kernel);
-                register_cell_tools(&kernel_arc, cells.clone()).await;
+                register_block_tools(&kernel_arc, cells.clone()).await;
 
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
@@ -349,9 +406,9 @@ impl world::Server for WorldImpl {
                 }
             }
 
-            // Register cell tools
+            // Register block tools
             let kernel_arc = Arc::new(kernel);
-            register_cell_tools(&kernel_arc, cells.clone()).await;
+            register_block_tools(&kernel_arc, cells.clone()).await;
 
             {
                 let mut state_ref = state.borrow_mut();

@@ -12,7 +12,7 @@
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 
 pub mod block_store;
-pub mod cell_tools;
+pub mod block_tools;
 pub mod control;
 pub mod conversation;
 pub mod conversation_db;
@@ -25,7 +25,15 @@ pub mod tools;
 pub mod vfs;
 
 pub use block_store::{BlockEvent, BlockStore, CellEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
-pub use cell_tools::{CellEditEngine, CellListEngine, CellReadEngine};
+pub use block_tools::{
+    BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
+    EditError, EditOp,
+    // Batching
+    AppendBatcher, BatchConfig, BatcherStats,
+    // Cursor tracking
+    CursorEvent, CursorPosition, CursorTracker,
+};
 pub use control::ConsentMode;
 pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
 pub use conversation_db::ConversationDb;
