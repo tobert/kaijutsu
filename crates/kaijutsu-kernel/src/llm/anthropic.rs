@@ -20,7 +20,7 @@ use super::{
 };
 
 /// Default model to use when none specified.
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
