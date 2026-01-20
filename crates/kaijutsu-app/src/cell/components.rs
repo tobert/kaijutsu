@@ -561,7 +561,7 @@ impl ConversationScrollState {
 /// Marker for a UI entity representing a single content block.
 ///
 /// Each block in a conversation gets its own entity with independent:
-/// - TextBuffer for rendering
+/// - GlyphonTextBuffer for rendering
 /// - Layout positioning
 /// - Change tracking (for efficient streaming updates)
 ///

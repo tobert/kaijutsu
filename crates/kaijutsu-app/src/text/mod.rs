@@ -8,4 +8,7 @@ mod render;
 mod resources;
 
 pub use plugin::TextRenderPlugin;
-pub use resources::{GlyphonText, SharedFontSystem, TextAreaConfig, TextBuffer};
+pub use resources::{
+    bevy_to_glyphon_color, GlyphonText, GlyphonUiText, SharedFontSystem, TextAreaConfig,
+    GlyphonTextBuffer, UiTextPositionCache,
+};

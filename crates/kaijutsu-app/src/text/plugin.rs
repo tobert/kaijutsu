@@ -8,6 +8,7 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
     Extract, Render, RenderApp,
 };
+use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;
 use glyphon::{Cache, Resolution, TextAtlas, TextRenderer, Viewport};
 
@@ -23,7 +24,9 @@ impl Plugin for TextRenderPlugin {
         app.init_resource::<SharedFontSystem>()
             .init_resource::<SharedSwashCache>()
             .init_resource::<TextResolution>()
-            .add_systems(Update, update_text_resolution);
+            .add_systems(Update, update_text_resolution)
+            // Sync UI text positions after Bevy UI layout computes positions
+            .add_systems(PostUpdate, sync_ui_text_positions.after(UiSystems::Layout));
 
         // Render world setup
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -76,6 +79,7 @@ pub struct ExtractedTextArea {
     pub bounds: glyphon::TextBounds,
     pub color: glyphon::Color,
     pub metrics: glyphon::Metrics,
+    pub family: glyphon::Family<'static>,
 }
 
 /// Update the text resolution when the window resizes.
@@ -94,21 +98,52 @@ fn update_text_resolution(
     }
 }
 
+/// Sync UI text positions from Bevy UI layout to UiTextPositionCache.
+fn sync_ui_text_positions(
+    mut query: Query<
+        (&ComputedNode, &UiGlobalTransform, &mut UiTextPositionCache),
+        With<GlyphonUiText>,
+    >,
+) {
+    for (computed, global_transform, mut cache) in query.iter_mut() {
+        // UiGlobalTransform gives us the center position in screen space
+        // (origin at top-left, Y increases downward).
+        // Convert to top-left corner for glyphon.
+        let (_, _, translation) = global_transform.to_scale_angle_translation();
+        let size = computed.size();
+
+        // Translation is the center of the node, convert to top-left corner
+        cache.left = translation.x - size.x / 2.0;
+        cache.top = translation.y - size.y / 2.0;
+        cache.width = size.x;
+        cache.height = size.y;
+    }
+}
+
 /// Extract text areas from the main world to the render world.
 fn extract_text_areas(
     mut commands: Commands,
-    query: Extract<Query<(&TextBuffer, &TextAreaConfig), With<GlyphonText>>>,
+    // Existing GlyphonTextBuffer + TextAreaConfig query (for cells)
+    buffer_query: Extract<Query<(&GlyphonTextBuffer, &TextAreaConfig), With<GlyphonText>>>,
+    // New GlyphonUiText query (for UI labels)
+    ui_text_query: Extract<Query<(&GlyphonUiText, &UiTextPositionCache)>>,
     resolution: Extract<Res<TextResolution>>,
 ) {
     let mut areas = Vec::new();
 
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    for (buffer, config) in query.iter() {
+    // Extract GlyphonTextBuffer areas (cells use monospace)
+    for (buffer, config) in buffer_query.iter() {
         let text = buffer.text();
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            info!("First text extraction: {} chars at ({}, {}) bounds: {:?}",
-                  text.len(), config.left, config.top, config.bounds);
+            info!(
+                "First text extraction: {} chars at ({}, {}) bounds: {:?}",
+                text.len(),
+                config.left,
+                config.top,
+                config.bounds
+            );
         }
         areas.push(ExtractedTextArea {
             text,
@@ -117,11 +152,33 @@ fn extract_text_areas(
             scale: config.scale,
             bounds: config.bounds,
             color: config.default_color,
-            metrics: glyphon::Metrics::new(14.0, 20.0), // Default metrics
+            metrics: glyphon::Metrics::new(14.0, 20.0), // Default metrics for cells
+            family: glyphon::Family::Monospace,
         });
     }
 
-    // Removed per-frame debug logging - too verbose
+    // Extract GlyphonUiText areas (UI labels)
+    for (ui_text, position) in ui_text_query.iter() {
+        // Skip empty text
+        if ui_text.text.is_empty() {
+            continue;
+        }
+        areas.push(ExtractedTextArea {
+            text: ui_text.text.clone(),
+            left: position.left,
+            top: position.top,
+            scale: 1.0,
+            bounds: glyphon::TextBounds {
+                left: position.left as i32,
+                top: position.top as i32,
+                right: (position.left + position.width.max(800.0)) as i32,
+                bottom: (position.top + position.height.max(100.0)) as i32,
+            },
+            color: ui_text.color,
+            metrics: ui_text.metrics,
+            family: ui_text.family,
+        });
+    }
 
     commands.insert_resource(ExtractedTextAreas { areas });
     commands.insert_resource(TextResolution(resolution.0));
@@ -219,7 +276,8 @@ fn prepare_text(
         let wrap_width = (area.bounds.right - area.bounds.left) as f32;
         buffer.set_size(&mut font_system, Some(wrap_width), None);
 
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        // Use per-area font family
+        let attrs = glyphon::Attrs::new().family(area.family);
         buffer.set_text(
             &mut font_system,
             &area.text,
@@ -230,10 +288,13 @@ fn prepare_text(
         buffer.shape_until_scroll(&mut font_system, false);
 
         // Debug: check if buffer has layout runs
-        static LOGGED_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static LOGGED_LAYOUT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if !LOGGED_LAYOUT.swap(true, std::sync::atomic::Ordering::Relaxed) {
             let line_count = buffer.lines.len();
-            let total_glyphs: usize = buffer.lines.iter()
+            let total_glyphs: usize = buffer
+                .lines
+                .iter()
                 .filter_map(|line| line.layout_opt())
                 .flat_map(|layout| layout.iter())
                 .map(|run| run.glyphs.len())

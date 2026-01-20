@@ -10,7 +10,7 @@ use super::components::{
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
-use crate::text::{GlyphonText, SharedFontSystem, TextAreaConfig, TextBuffer};
+use crate::text::{GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
 
 /// Spawn a new cell entity with all required components.
 pub fn spawn_cell(
@@ -199,10 +199,10 @@ pub fn handle_cell_input(
     }
 }
 
-/// Initialize TextBuffer for cells that don't have one yet.
+/// Initialize GlyphonTextBuffer for cells that don't have one yet.
 pub fn init_cell_buffers(
     mut commands: Commands,
-    cells_without_buffer: Query<(Entity, &CellEditor), (With<GlyphonText>, Without<TextBuffer>)>,
+    cells_without_buffer: Query<(Entity, &CellEditor), (With<GlyphonText>, Without<GlyphonTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -212,7 +212,7 @@ pub fn init_cell_buffers(
     for (entity, editor) in cells_without_buffer.iter() {
         // Create a new buffer with default metrics
         let metrics = glyphon::Metrics::new(16.0, 20.0);
-        let mut buffer = TextBuffer::new(&mut font_system, metrics);
+        let mut buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
 
         // Initialize with current editor text
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
@@ -224,7 +224,7 @@ pub fn init_cell_buffers(
         );
 
         commands.entity(entity).insert(buffer);
-        info!("Initialized TextBuffer for entity {:?}", entity);
+        info!("Initialized GlyphonTextBuffer for entity {:?}", entity);
     }
 }
 
@@ -288,12 +288,12 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
     output
 }
 
-/// Update TextBuffer from CellEditor when dirty.
+/// Update GlyphonTextBuffer from CellEditor when dirty.
 ///
 /// For cells with content blocks, formats them with visual markers.
 /// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut TextBuffer), Changed<CellEditor>>,
+    mut cells: Query<(&CellEditor, &mut GlyphonTextBuffer), Changed<CellEditor>>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -1432,10 +1432,10 @@ pub fn spawn_block_cells(
     container.block_cells = new_order;
 }
 
-/// Initialize TextBuffers for BlockCells that don't have one.
+/// Initialize GlyphonTextBuffers for BlockCells that don't have one.
 pub fn init_block_cell_buffers(
     mut commands: Commands,
-    block_cells: Query<Entity, (With<BlockCell>, With<GlyphonText>, Without<TextBuffer>)>,
+    block_cells: Query<Entity, (With<BlockCell>, With<GlyphonText>, Without<GlyphonTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -1444,19 +1444,19 @@ pub fn init_block_cell_buffers(
 
     for entity in block_cells.iter() {
         let metrics = glyphon::Metrics::new(16.0, 20.0);
-        let buffer = TextBuffer::new(&mut font_system, metrics);
+        let buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
         commands.entity(entity).insert(buffer);
     }
 }
 
-/// Sync BlockCell TextBuffers with their corresponding block content.
+/// Sync BlockCell GlyphonTextBuffers with their corresponding block content.
 ///
 /// Only updates cells whose content has changed (tracked via version).
 pub fn sync_block_cell_buffers(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, (With<MainCell>, Changed<CellEditor>)>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut TextBuffer)>,
+    mut block_cells: Query<(&mut BlockCell, &mut GlyphonTextBuffer)>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1519,7 +1519,7 @@ pub fn layout_block_cells(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut TextBuffer)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut GlyphonTextBuffer)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     registry: Res<ConversationRegistry>,

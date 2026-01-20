@@ -83,7 +83,7 @@ impl Plugin for CellPlugin {
                     .after(systems::sync_main_cell_to_conversation),
             )
             // Block cell systems (per-block UI rendering for conversation)
-            // Each block gets its own entity with independent TextBuffer
+            // Each block gets its own entity with independent GlyphonTextBuffer
             .add_systems(
                 Update,
                 (

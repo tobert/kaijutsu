@@ -149,25 +149,31 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                 BorderColor::all(theme.border),
             ))
             .with_children(|header| {
-                // Left: Title
+                // Left: Title (uses glyphon for CJK support)
                 header.spawn((
-                    Text::new("会術 Kaijutsu"),
-                    TextFont {
-                        font_size: 24.0,
+                    text::GlyphonUiText::new("会術 Kaijutsu")
+                        .with_font_size(24.0)
+                        .with_color(theme.accent),
+                    text::UiTextPositionCache::default(),
+                    Node {
+                        min_width: Val::Px(180.0),
+                        min_height: Val::Px(30.0),
                         ..default()
                     },
-                    TextColor(theme.accent),
                 ));
 
-                // Right: Connection status
+                // Right: Connection status (uses glyphon)
                 header.spawn((
                     StatusText,
-                    Text::new("Connecting..."),
-                    TextFont {
-                        font_size: 14.0,
+                    text::GlyphonUiText::new("Connecting...")
+                        .with_font_size(14.0)
+                        .with_color(theme.fg_dim),
+                    text::UiTextPositionCache::default(),
+                    Node {
+                        min_width: Val::Px(250.0),
+                        min_height: Val::Px(20.0),
                         ..default()
                     },
-                    TextColor(theme.fg_dim),
                 ));
             });
 
@@ -204,15 +210,18 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                 BorderColor::all(theme.border),
             ))
             .with_children(|prompt_area| {
-                // Subtle hint text aligned to the right
+                // Subtle hint text aligned to the right (uses glyphon)
                 prompt_area.spawn((
                     PromptHint,
-                    Text::new("'i' to type"),
-                    TextFont {
-                        font_size: 11.0,
+                    text::GlyphonUiText::new("'i' to type")
+                        .with_font_size(11.0)
+                        .with_color(Color::srgba(0.4, 0.4, 0.4, 0.6)), // Very dim
+                    text::UiTextPositionCache::default(),
+                    Node {
+                        min_width: Val::Px(80.0),
+                        min_height: Val::Px(16.0),
                         ..default()
                     },
-                    TextColor(Color::srgba(0.4, 0.4, 0.4, 0.6)), // Very dim
                 ));
             });
 
@@ -231,23 +240,23 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             ))
             .with_children(|status_bar| {
                 // Left: Mode indicator placeholder (actual mode indicator is in ui::mode_indicator)
-                status_bar.spawn((
-                    Text::new(""),
-                    TextFont {
-                        font_size: 12.0,
-                        ..default()
-                    },
-                    TextColor(theme.fg_dim),
-                ));
+                // Empty node for layout purposes - flex_grow pushes key hints to the right
+                status_bar.spawn(Node {
+                    flex_grow: 1.0,
+                    ..default()
+                });
 
-                // Right: Key hints
+                // Right: Key hints (uses glyphon)
                 status_bar.spawn((
-                    Text::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode"),
-                    TextFont {
-                        font_size: 11.0,
+                    text::GlyphonUiText::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode")
+                        .with_font_size(11.0)
+                        .with_color(theme.fg_dim),
+                    text::UiTextPositionCache::default(),
+                    Node {
+                        min_width: Val::Px(450.0),
+                        min_height: Val::Px(16.0),
                         ..default()
                     },
-                    TextColor(theme.fg_dim),
                 ));
             });
         });
@@ -264,33 +273,33 @@ struct StatusText;
 /// Convert connection events to UI updates
 fn handle_connection_events(
     mut conn_events: MessageReader<connection::ConnectionEvent>,
-    mut status_text: Query<(&mut Text, &mut TextColor), With<StatusText>>,
+    mut status_text: Query<&mut text::GlyphonUiText, With<StatusText>>,
     theme: Res<ui::theme::Theme>,
 ) {
     use connection::ConnectionEvent;
 
     for event in conn_events.read() {
-        for (mut text, mut color) in status_text.iter_mut() {
+        for mut ui_text in status_text.iter_mut() {
             match event {
                 ConnectionEvent::Connected => {
-                    text.0 = "✓ Connected to server".into();
-                    *color = TextColor(theme.row_result);
+                    ui_text.text = "✓ Connected to server".into();
+                    ui_text.color = text::bevy_to_glyphon_color(theme.row_result);
                 }
                 ConnectionEvent::Disconnected => {
-                    text.0 = "⚡ Disconnected (reconnecting...)".into();
-                    *color = TextColor(theme.row_tool);
+                    ui_text.text = "⚡ Disconnected (reconnecting...)".into();
+                    ui_text.color = text::bevy_to_glyphon_color(theme.row_tool);
                 }
                 ConnectionEvent::ConnectionFailed(err) => {
-                    text.0 = format!("✗ {}", err);
-                    *color = TextColor(theme.accent2);
+                    ui_text.text = format!("✗ {}", err);
+                    ui_text.color = text::bevy_to_glyphon_color(theme.accent2);
                 }
                 ConnectionEvent::Reconnecting { attempt, .. } => {
-                    text.0 = format!("⟳ Reconnecting (attempt {})...", attempt);
-                    *color = TextColor(theme.fg_dim);
+                    ui_text.text = format!("⟳ Reconnecting (attempt {})...", attempt);
+                    ui_text.color = text::bevy_to_glyphon_color(theme.fg_dim);
                 }
                 ConnectionEvent::AttachedKernel(info) => {
-                    text.0 = format!("✓ Attached to kernel: {}", info.name);
-                    *color = TextColor(theme.row_result);
+                    ui_text.text = format!("✓ Attached to kernel: {}", info.name);
+                    ui_text.color = text::bevy_to_glyphon_color(theme.row_result);
                 }
                 _ => {}
             }

@@ -6,6 +6,68 @@ use glyphon::{
 };
 use std::sync::{Arc, Mutex};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// UI Text Components (for simple text rendered via glyphon)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// UI text rendered via glyphon (simpler than GlyphonTextBuffer).
+/// Use this for static or dynamic labels, titles, status text, etc.
+#[derive(Component, Clone)]
+pub struct GlyphonUiText {
+    pub text: String,
+    pub metrics: Metrics,
+    pub family: glyphon::Family<'static>,
+    pub color: glyphon::Color,
+}
+
+impl GlyphonUiText {
+    /// Create new UI text with default settings (14px SansSerif, light gray).
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            metrics: Metrics::new(14.0, 20.0),
+            family: glyphon::Family::SansSerif,
+            color: glyphon::Color::rgb(220, 220, 240),
+        }
+    }
+
+    /// Set font size (adjusts both font_size and line_height).
+    pub fn with_font_size(mut self, size: f32) -> Self {
+        self.metrics = Metrics::new(size, size * 1.4);
+        self
+    }
+
+    /// Set text color from a Bevy Color.
+    pub fn with_color(mut self, color: Color) -> Self {
+        self.color = bevy_to_glyphon_color(color);
+        self
+    }
+}
+
+/// Caches computed screen position from Bevy UI layout.
+#[derive(Component, Default, Clone)]
+pub struct UiTextPositionCache {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Convert Bevy Color to glyphon Color.
+pub fn bevy_to_glyphon_color(color: Color) -> glyphon::Color {
+    let linear = color.to_linear();
+    glyphon::Color::rgba(
+        (linear.red * 255.0) as u8,
+        (linear.green * 255.0) as u8,
+        (linear.blue * 255.0) as u8,
+        (linear.alpha * 255.0) as u8,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared Resources
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Shared font system for all text rendering.
 /// Wrapped in Arc<Mutex> because FontSystem isn't Send+Sync but we need to share it.
 #[derive(Resource, Clone)]
@@ -40,7 +102,7 @@ pub struct TextRenderResources {
 /// A text buffer wrapper that can be used as a Bevy component.
 /// Wraps a glyphon Buffer for use with the cosmic-text Editor.
 #[derive(Component)]
-pub struct TextBuffer {
+pub struct GlyphonTextBuffer {
     buffer: Buffer,
     dirty: bool,
     /// Cached visual line count (after text wrapping).
@@ -49,7 +111,7 @@ pub struct TextBuffer {
     cached_wrap_width: f32,
 }
 
-impl TextBuffer {
+impl GlyphonTextBuffer {
     /// Create a new text buffer with the given metrics.
     pub fn new(font_system: &mut FontSystem, metrics: Metrics) -> Self {
         Self {
