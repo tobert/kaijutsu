@@ -21,7 +21,7 @@
 //! ```
 
 use crate::block_store::SharedBlockStore;
-use crate::db::CellKind;
+use crate::db::DocumentKind;
 use crate::tools::{ExecResult, ExecutionEngine};
 use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role};
@@ -82,26 +82,25 @@ impl RhaiEngine {
         let store_len = block_store.clone();
 
         // create_cell(kind: &str) -> String
+        // Note: Keeps old function name for Rhai script compatibility
         engine.register_fn("create_cell", move |kind: String| -> String {
-            let cell_kind = match kind.as_str() {
-                "code" => CellKind::Code,
-                "markdown" => CellKind::Markdown,
-                "output" => CellKind::Output,
-                "system" => CellKind::System,
-                "user_message" => CellKind::UserMessage,
-                "agent_message" => CellKind::AgentMessage,
-                _ => CellKind::Code,
+            let doc_kind = match kind.as_str() {
+                "code" => DocumentKind::Code,
+                "markdown" | "text" => DocumentKind::Text,
+                // Legacy kinds map to Conversation
+                "output" | "system" | "user_message" | "agent_message" | "conversation" => DocumentKind::Conversation,
+                _ => DocumentKind::Code,
             };
 
             let id = uuid::Uuid::new_v4().to_string();
 
-            match store_create.create_cell(id.clone(), cell_kind, None) {
+            match store_create.create_document(id.clone(), doc_kind, None) {
                 Ok(_) => {
-                    debug!("Rhai: created cell {} ({:?})", id, cell_kind);
+                    debug!("Rhai: created document {} ({:?})", id, doc_kind);
                     id
                 }
                 Err(e) => {
-                    warn!("Rhai: failed to create cell: {}", e);
+                    warn!("Rhai: failed to create document: {}", e);
                     String::new()
                 }
             }
@@ -110,13 +109,13 @@ impl RhaiEngine {
         // get_content(cell_id: &str) -> String
         engine.register_fn("get_content", move |cell_id: String| -> String {
             match store_get.get(&cell_id) {
-                Some(cell) => {
-                    let content = cell.content();
+                Some(doc) => {
+                    let content = doc.content();
                     debug!("Rhai: get_content({}) -> {} chars", cell_id, content.len());
                     content
                 }
                 None => {
-                    debug!("Rhai: get_content({}) -> cell not found", cell_id);
+                    debug!("Rhai: get_content({}) -> document not found", cell_id);
                     String::new()
                 }
             }
@@ -166,8 +165,9 @@ impl RhaiEngine {
         });
 
         // delete_cell(cell_id: &str) -> bool
+        // Note: Keeps old function name for Rhai script compatibility
         engine.register_fn("delete_cell", move |cell_id: String| -> bool {
-            match store_delete.delete_cell(&cell_id) {
+            match store_delete.delete_document(&cell_id) {
                 Ok(()) => {
                     debug!("Rhai: delete_cell({}) -> success", cell_id);
                     true
@@ -182,17 +182,7 @@ impl RhaiEngine {
         // get_kind(cell_id) -> String
         engine.register_fn("get_kind", move |cell_id: String| -> String {
             match store_kind.get(&cell_id) {
-                Some(cell) => {
-                    let kind = match cell.kind {
-                        CellKind::Code => "code",
-                        CellKind::Markdown => "markdown",
-                        CellKind::Output => "output",
-                        CellKind::System => "system",
-                        CellKind::UserMessage => "user_message",
-                        CellKind::AgentMessage => "agent_message",
-                    };
-                    kind.to_string()
-                }
+                Some(doc) => doc.kind.as_str().to_string(),
                 None => String::new(),
             }
         });
@@ -200,7 +190,7 @@ impl RhaiEngine {
         // cell_len(cell_id) -> i64
         engine.register_fn("cell_len", move |cell_id: String| -> i64 {
             match store_len.get(&cell_id) {
-                Some(cell) => cell.content().len() as i64,
+                Some(doc) => doc.content().len() as i64,
                 None => -1,
             }
         });

@@ -160,7 +160,7 @@ pub struct BlockStatusParams {
 // Helper Functions
 // ============================================================================
 
-/// Parse a block ID from string key format (cell_id/agent_id/seq).
+/// Parse a block ID from string key format (document_id/agent_id/seq).
 fn parse_block_id(s: &str) -> Result<BlockId> {
     BlockId::from_key(s).ok_or_else(|| {
         EditError::InvalidParams(format!("invalid block_id format: {}", s))
@@ -200,16 +200,16 @@ fn parse_status(s: &str) -> Result<Status> {
     }
 }
 
-/// Find a block by ID string, checking all cells.
-/// Returns (cell_id, BlockId) if found.
-fn find_block(cells: &SharedBlockStore, block_id_str: &str) -> Result<(String, BlockId)> {
+/// Find a block by ID string, checking all documents.
+/// Returns (document_id, BlockId) if found.
+fn find_block(documents: &SharedBlockStore, block_id_str: &str) -> Result<(String, BlockId)> {
     let block_id = parse_block_id(block_id_str)?;
 
-    for cell_id in cells.list_ids() {
-        if let Some(entry) = cells.get(&cell_id) {
+    for document_id in documents.list_ids() {
+        if let Some(entry) = documents.get(&document_id) {
             for snapshot in entry.doc.blocks_ordered() {
                 if snapshot.id == block_id {
-                    return Ok((cell_id, block_id));
+                    return Ok((document_id.to_string(), block_id));
                 }
             }
         }
@@ -223,12 +223,12 @@ fn find_block(cells: &SharedBlockStore, block_id_str: &str) -> Result<(String, B
 
 /// Execution engine for creating blocks.
 pub struct BlockCreateEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockCreateEngine {
-    pub fn new(cells: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -274,15 +274,15 @@ impl BlockCreateEngine {
             .map(|s| parse_block_id(s))
             .transpose()?;
 
-        // For now, create blocks in a default cell or first available cell
-        let cell_id = self.cells.list_ids().into_iter().next().ok_or_else(|| {
-            EditError::StoreError("no cells available, create a cell first".into())
+        // For now, create blocks in a default document or first available document
+        let document_id = self.documents.list_ids().into_iter().next().ok_or_else(|| {
+            EditError::StoreError("no documents available, create a document first".into())
         })?;
 
         let block_id = self
-            .cells
+            .documents
             .insert_block(
-                &cell_id,
+                &document_id,
                 parent_id.as_ref(),
                 None, // after
                 role,
@@ -292,8 +292,8 @@ impl BlockCreateEngine {
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
-            .cells
-            .get(&cell_id)
+            .documents
+            .get(&document_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -341,12 +341,12 @@ impl ExecutionEngine for BlockCreateEngine {
 ///
 /// This is optimized for streaming model output.
 pub struct BlockAppendEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockAppendEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -367,15 +367,15 @@ impl BlockAppendEngine {
     }
 
     fn execute_inner(&self, params: BlockAppendParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
-        self.cells
-            .append_text(&cell_id, &block_id, &params.text)
+        self.documents
+            .append_text(&document_id, &block_id, &params.text)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
-            .cells
-            .get(&cell_id)
+            .documents
+            .get(&document_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -422,12 +422,12 @@ impl ExecutionEngine for BlockAppendEngine {
 ///
 /// Supports atomic batches of insert, delete, and replace operations.
 pub struct BlockEditEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockEditEngine {
-    pub fn new(cells: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -481,20 +481,20 @@ impl BlockEditEngine {
     }
 
     fn execute_inner(&self, params: BlockEditParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         // Apply operations atomically
         // Note: For true atomicity, we'd need to validate all operations first
         // then apply them. For now, we apply one by one but the design doc
         // specifies atomic semantics.
         for (idx, op) in params.operations.into_iter().enumerate() {
-            self.apply_op(&cell_id, &block_id, op)
+            self.apply_op(&document_id, &block_id, op)
                 .map_err(|e| e.in_batch(idx))?;
         }
 
         let version = self
-            .cells
-            .get(&cell_id)
+            .documents
+            .get(&document_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -503,13 +503,13 @@ impl BlockEditEngine {
         }))
     }
 
-    fn apply_op(&self, cell_id: &str, block_id: &BlockId, op: EditOp) -> Result<()> {
+    fn apply_op(&self, document_id: &str, block_id: &BlockId, op: EditOp) -> Result<()> {
         // Get current content
         let content = {
             let entry = self
-                .cells
-                .get(cell_id)
-                .ok_or_else(|| EditError::StoreError("cell not found".into()))?;
+                .documents
+                .get(document_id)
+                .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
             // Find the block and get its content
             entry
@@ -527,8 +527,8 @@ impl BlockEditEngine {
                 } else {
                     format!("{}\n", text)
                 };
-                self.cells
-                    .edit_text(cell_id, block_id, pos, &text_with_newline, 0)
+                self.documents
+                    .edit_text(document_id, block_id, pos, &text_with_newline, 0)
                     .map_err(|e| EditError::StoreError(e))?;
             }
             EditOp::Delete {
@@ -537,8 +537,8 @@ impl BlockEditEngine {
             } => {
                 let (start, end) = line_range_to_byte_range(&content, start_line, end_line)?;
                 if start < end {
-                    self.cells
-                        .edit_text(cell_id, block_id, start, "", end - start)
+                    self.documents
+                        .edit_text(document_id, block_id, start, "", end - start)
                         .map_err(|e| EditError::StoreError(e))?;
                 }
             }
@@ -559,8 +559,8 @@ impl BlockEditEngine {
                 } else {
                     format!("{}\n", text)
                 };
-                self.cells
-                    .edit_text(cell_id, block_id, start, &text_with_newline, end - start)
+                self.documents
+                    .edit_text(document_id, block_id, start, &text_with_newline, end - start)
                     .map_err(|e| EditError::StoreError(e))?;
             }
         }
@@ -606,12 +606,12 @@ impl ExecutionEngine for BlockEditEngine {
 ///
 /// For programmatic/refactoring tools, not LLMs.
 pub struct BlockSpliceEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockSpliceEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -642,17 +642,17 @@ impl BlockSpliceEngine {
     }
 
     fn execute_inner(&self, params: BlockSpliceParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let insert = params.insert.unwrap_or_default();
 
-        self.cells
-            .edit_text(&cell_id, &block_id, params.offset, &insert, params.delete_count)
+        self.documents
+            .edit_text(&document_id, &block_id, params.offset, &insert, params.delete_count)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
-            .cells
-            .get(&cell_id)
+            .documents
+            .get(&document_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -697,12 +697,12 @@ impl ExecutionEngine for BlockSpliceEngine {
 
 /// Execution engine for reading block content.
 pub struct BlockReadEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockReadEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -731,12 +731,12 @@ impl BlockReadEngine {
     }
 
     fn execute_inner(&self, params: BlockReadParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let entry = self
-            .cells
-            .get(&cell_id)
-            .ok_or_else(|| EditError::StoreError("cell not found".into()))?;
+            .documents
+            .get(&document_id)
+            .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
         let snapshot = entry
             .doc
@@ -823,12 +823,12 @@ pub struct SearchMatch {
 
 /// Execution engine for searching within a block.
 pub struct BlockSearchEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockSearchEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -861,12 +861,12 @@ impl BlockSearchEngine {
     }
 
     fn execute_inner(&self, params: BlockSearchParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let entry = self
-            .cells
-            .get(&cell_id)
-            .ok_or_else(|| EditError::StoreError("cell not found".into()))?;
+            .documents
+            .get(&document_id)
+            .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
         let snapshot = entry
             .doc
@@ -955,12 +955,12 @@ impl ExecutionEngine for BlockSearchEngine {
 
 /// Execution engine for listing blocks.
 pub struct BlockListEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockListEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -1002,9 +1002,13 @@ impl BlockListEngine {
 
         let mut blocks = Vec::new();
 
-        for cell_id in self.cells.list_ids() {
-            if let Some(entry) = self.cells.get(&cell_id) {
-                for snapshot in entry.doc.blocks_ordered() {
+        let document_ids = self.documents.list_ids();
+        tracing::info!("block_list: found {} documents", document_ids.len());
+        for document_id in document_ids {
+            if let Some(entry) = self.documents.get(&document_id) {
+                let doc_blocks = entry.doc.blocks_ordered();
+                tracing::debug!("block_list: document {} has {} blocks", document_id, doc_blocks.len());
+                for snapshot in doc_blocks {
                     // Apply filters
                     if let Some(ref parent_id) = parent_id_filter {
                         if snapshot.parent_id.as_ref() != Some(parent_id) {
@@ -1088,12 +1092,12 @@ impl ExecutionEngine for BlockListEngine {
 
 /// Execution engine for setting block status.
 pub struct BlockStatusEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl BlockStatusEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -1115,17 +1119,17 @@ impl BlockStatusEngine {
     }
 
     fn execute_inner(&self, params: BlockStatusParams) -> Result<serde_json::Value> {
-        let (cell_id, block_id) = find_block(&self.cells, &params.block_id)?;
+        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let status = parse_status(&params.status)?;
 
-        self.cells
-            .set_status(&cell_id, &block_id, status)
+        self.documents
+            .set_status(&document_id, &block_id, status)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
-            .cells
-            .get(&cell_id)
+            .documents
+            .get(&document_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -1173,8 +1177,8 @@ impl ExecutionEngine for BlockStatusEngine {
 pub struct KernelSearchParams {
     /// Regex pattern to search for.
     pub query: String,
-    /// Optional cell ID to limit search to.
-    pub cell_id: Option<String>,
+    /// Optional document ID to limit search to.
+    pub document_id: Option<String>,
     /// Optional block kind filter (text, thinking, tool_call, tool_result).
     pub kind: Option<String>,
     /// Optional role filter (user, model, system, tool).
@@ -1189,8 +1193,8 @@ pub struct KernelSearchParams {
 /// A match from kernel_search.
 #[derive(Debug, Serialize)]
 pub struct KernelSearchMatch {
-    /// The cell containing the match.
-    pub cell_id: String,
+    /// The document containing the match.
+    pub document_id: String,
     /// The block containing the match.
     pub block_id: String,
     /// Line number of match (0-indexed).
@@ -1205,12 +1209,12 @@ pub struct KernelSearchMatch {
 
 /// Cross-block regex search.
 pub struct KernelSearchEngine {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
 }
 
 impl KernelSearchEngine {
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self { cells }
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self { documents }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -1221,9 +1225,9 @@ impl KernelSearchEngine {
                     "type": "string",
                     "description": "Regex pattern to search for"
                 },
-                "cell_id": {
+                "document_id": {
                     "type": "string",
-                    "description": "Limit search to this cell"
+                    "description": "Limit search to this document"
                 },
                 "kind": {
                     "type": "string",
@@ -1258,19 +1262,19 @@ impl KernelSearchEngine {
         let max_matches = params.max_matches.unwrap_or(100);
         let mut matches = Vec::new();
 
-        // Get cells to search
-        let cell_ids: Vec<String> = if let Some(ref cell_id) = params.cell_id {
-            if self.cells.contains(cell_id) {
-                vec![cell_id.clone()]
+        // Get documents to search
+        let document_ids: Vec<String> = if let Some(ref document_id) = params.document_id {
+            if self.documents.contains(document_id) {
+                vec![document_id.clone()]
             } else {
                 vec![]
             }
         } else {
-            self.cells.list_ids()
+            self.documents.list_ids()
         };
 
-        'outer: for cell_id in cell_ids {
-            let snapshots = match self.cells.block_snapshots(&cell_id) {
+        'outer: for document_id in document_ids {
+            let snapshots = match self.documents.block_snapshots(&document_id) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -1313,7 +1317,7 @@ impl KernelSearchEngine {
                             .collect();
 
                         matches.push(KernelSearchMatch {
-                            cell_id: cell_id.clone(),
+                            document_id: document_id.clone(),
                             block_id: snapshot.id.to_key(),
                             line: line_idx as u32,
                             content: line.to_string(),
@@ -1370,11 +1374,11 @@ impl ExecutionEngine for KernelSearchEngine {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::db::CellKind;
+    use crate::db::DocumentKind;
 
     fn setup_test_store() -> SharedBlockStore {
         let store = shared_block_store("test-agent");
-        store.create_cell("test-cell".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.create_document("test-doc".into(), DocumentKind::Code, Some("rust".into())).unwrap();
         store
     }
 
@@ -1397,7 +1401,7 @@ mod tests {
         let store = setup_test_store();
 
         // Create a block first
-        let block_id = store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello").unwrap();
 
         let engine = BlockAppendEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
@@ -1406,7 +1410,7 @@ mod tests {
         assert!(result.success, "append failed: {}", result.stderr);
 
         // Verify content
-        let content = store.get_content("test-cell").unwrap();
+        let content = store.get_content("test-doc").unwrap();
         assert_eq!(content, "hello world");
     }
 
@@ -1414,7 +1418,7 @@ mod tests {
     async fn test_block_edit_insert() {
         let store = setup_test_store();
 
-        let block_id = store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
 
         let engine = BlockEditEngine::new(store.clone(), "test-agent");
         let params = format!(
@@ -1426,7 +1430,7 @@ mod tests {
         assert!(result.success, "edit insert failed: {}", result.stderr);
 
         // Verify content
-        let entry = store.get("test-cell").unwrap();
+        let entry = store.get("test-doc").unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "line1\nline2\nline3\n");
     }
@@ -1435,7 +1439,7 @@ mod tests {
     async fn test_block_edit_replace_with_cas() {
         let store = setup_test_store();
 
-        let block_id = store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
 
         let engine = BlockEditEngine::new(store.clone(), "test-agent");
 
@@ -1461,7 +1465,7 @@ mod tests {
     async fn test_block_read() {
         let store = setup_test_store();
 
-        let block_id = store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
@@ -1477,7 +1481,7 @@ mod tests {
     async fn test_block_search() {
         let store = setup_test_store();
 
-        let block_id = store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
 
         let engine = BlockSearchEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#, block_id.to_key());
@@ -1493,8 +1497,8 @@ mod tests {
     async fn test_block_list() {
         let store = setup_test_store();
 
-        store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block("test-cell", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "user message").unwrap();
+        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
@@ -1509,8 +1513,8 @@ mod tests {
     async fn test_block_list_with_filter() {
         let store = setup_test_store();
 
-        store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block("test-cell", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "user message").unwrap();
+        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
@@ -1525,7 +1529,7 @@ mod tests {
     async fn test_block_status() {
         let store = setup_test_store();
 
-        let block_id = store.insert_block("test-cell", None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
+        let block_id = store.insert_block("test-doc", None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
 
         let engine = BlockStatusEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "status": "running"}}"#, block_id.to_key());
@@ -1534,7 +1538,7 @@ mod tests {
         assert!(result.success, "status update failed: {}", result.stderr);
 
         // Verify status
-        let entry = store.get("test-cell").unwrap();
+        let entry = store.get("test-doc").unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.status, Status::Running);
     }
@@ -1543,12 +1547,12 @@ mod tests {
     async fn test_kernel_search() {
         let store = setup_test_store();
 
-        // Create blocks in different cells
-        store.create_cell("cell2".into(), CellKind::Code, Some("rust".into())).unwrap();
+        // Create blocks in different documents
+        store.create_document("doc2".into(), DocumentKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_block("test-cell", None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz").unwrap();
-        store.insert_block("test-cell", None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux").unwrap();
-        store.insert_block("cell2", None, None, Role::User, BlockKind::Text, "hello python\nbar baz").unwrap();
+        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz").unwrap();
+        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux").unwrap();
+        store.insert_block("doc2", None, None, Role::User, BlockKind::Text, "hello python\nbar baz").unwrap();
 
         let engine = KernelSearchEngine::new(store.clone());
 
@@ -1560,11 +1564,11 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 3, "should find 3 matches for 'hello'");
 
-        // Search with cell filter
-        let params = r#"{"query": "hello", "cell_id": "test-cell"}"#;
+        // Search with document filter
+        let params = r#"{"query": "hello", "document_id": "test-doc"}"#;
         let result = engine.execute(params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-        assert_eq!(response["total"], 2, "should find 2 matches in test-cell");
+        assert_eq!(response["total"], 2, "should find 2 matches in test-doc");
 
         // Search with role filter
         let params = r#"{"query": "hello", "role": "model"}"#;

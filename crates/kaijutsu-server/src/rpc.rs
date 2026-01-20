@@ -20,7 +20,7 @@ use crate::kaijutsu_capnp::*;
 use crate::kaish::KaishProcess;
 
 use kaijutsu_kernel::{
-    CellDb, CellKind, Kernel,
+    DocumentDb, DocumentKind, Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
     AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
@@ -35,12 +35,12 @@ use serde_json;
 // ============================================================================
 
 /// Register block tools with a kernel.
-async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
+async fn register_block_tools(kernel: &Arc<Kernel>, documents: SharedBlockStore) {
     // block_create - Create a new block
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
-            Arc::new(BlockCreateEngine::new(cells.clone(), "server")),
+            Arc::new(BlockCreateEngine::new(documents.clone(), "server")),
         )
         .await;
     kernel.equip("block_create").await;
@@ -49,7 +49,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_append", "Append text to a block", "block"),
-            Arc::new(BlockAppendEngine::new(cells.clone())),
+            Arc::new(BlockAppendEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_append").await;
@@ -58,7 +58,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
-            Arc::new(BlockEditEngine::new(cells.clone(), "server")),
+            Arc::new(BlockEditEngine::new(documents.clone(), "server")),
         )
         .await;
     kernel.equip("block_edit").await;
@@ -67,7 +67,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_splice", "Character-based splice editing", "block"),
-            Arc::new(BlockSpliceEngine::new(cells.clone())),
+            Arc::new(BlockSpliceEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_splice").await;
@@ -76,7 +76,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_read", "Read block content with optional line numbers", "block"),
-            Arc::new(BlockReadEngine::new(cells.clone())),
+            Arc::new(BlockReadEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_read").await;
@@ -85,7 +85,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_search", "Search within a block using regex", "block"),
-            Arc::new(BlockSearchEngine::new(cells.clone())),
+            Arc::new(BlockSearchEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_search").await;
@@ -94,7 +94,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_list", "List blocks with optional filters", "block"),
-            Arc::new(BlockListEngine::new(cells.clone())),
+            Arc::new(BlockListEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_list").await;
@@ -103,7 +103,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("block_status", "Set block status", "block"),
-            Arc::new(BlockStatusEngine::new(cells.clone())),
+            Arc::new(BlockStatusEngine::new(documents.clone())),
         )
         .await;
     kernel.equip("block_status").await;
@@ -112,7 +112,7 @@ async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
     kernel
         .register_tool_with_engine(
             ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
-            Arc::new(KernelSearchEngine::new(cells)),
+            Arc::new(KernelSearchEngine::new(documents)),
         )
         .await;
     kernel.equip("kernel_search").await;
@@ -182,19 +182,19 @@ fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
 /// Open or create a BlockStore with database persistence for a kernel.
 fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
     let db_path = kernel_data_dir(kernel_id).join("data.db");
-    match CellDb::open(&db_path) {
+    match DocumentDb::open(&db_path) {
         Ok(db) => {
-            log::info!("Opened cell database at {:?}", db_path);
+            log::info!("Opened document database at {:?}", db_path);
             let store = shared_block_store_with_db(db, "server");
             if let Err(e) = store.load_from_db() {
-                log::warn!("Failed to load cells from DB: {}", e);
+                log::warn!("Failed to load documents from DB: {}", e);
             } else {
-                log::info!("Loaded {} cells from database", store.len());
+                log::info!("Loaded {} documents from database", store.len());
             }
             store
         }
         Err(e) => {
-            log::warn!("Failed to open cell database at {:?}: {}, using in-memory", db_path, e);
+            log::warn!("Failed to open document database at {:?}: {}, using in-memory", db_path, e);
             shared_block_store("server")
         }
     }
@@ -210,7 +210,7 @@ pub struct KernelState {
     /// The kernel (VFS, state, tools, control plane)
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
-    pub cells: SharedBlockStore,
+    pub documents: SharedBlockStore,
     /// Subscribers for block update events (LLM streaming)
     pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
 }
@@ -306,20 +306,20 @@ impl world::Server for WorldImpl {
                 }
 
                 // Create block store with database persistence
-                let cells = create_block_store_with_db(&id);
+                let documents = create_block_store_with_db(&id);
 
-                // Create default cell if none exist
-                if cells.is_empty() {
+                // Create default document if none exist
+                if documents.is_empty() {
                     let default_id = uuid::Uuid::new_v4().to_string();
-                    log::info!("Creating default cell {} for kernel {}", default_id, id);
-                    if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                        log::warn!("Failed to create default cell: {}", e);
+                    log::info!("Creating default document {} for kernel {}", default_id, id);
+                    if let Err(e) = documents.create_document(default_id.clone(), DocumentKind::Code, Some("rust".into())) {
+                        log::warn!("Failed to create default document: {}", e);
                     }
                 }
 
                 // Register block tools
                 let kernel_arc = Arc::new(kernel);
-                register_block_tools(&kernel_arc, cells.clone()).await;
+                register_block_tools(&kernel_arc, documents.clone()).await;
 
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
@@ -331,7 +331,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
-                        cells,
+                        documents,
                         block_subscribers: Vec::new(),
                     },
                 );
@@ -374,20 +374,20 @@ impl world::Server for WorldImpl {
             }
 
             // Create block store with database persistence
-            let cells = create_block_store_with_db(&id);
+            let documents = create_block_store_with_db(&id);
 
-            // Create default cell if none exist
-            if cells.is_empty() {
+            // Create default document if none exist
+            if documents.is_empty() {
                 let default_id = uuid::Uuid::new_v4().to_string();
-                log::info!("Creating default cell {} for new kernel {}", default_id, id);
-                if let Err(e) = cells.create_cell(default_id.clone(), CellKind::Code, Some("rust".into())) {
-                    log::warn!("Failed to create default cell: {}", e);
+                log::info!("Creating default document {} for new kernel {}", default_id, id);
+                if let Err(e) = documents.create_document(default_id.clone(), DocumentKind::Code, Some("rust".into())) {
+                    log::warn!("Failed to create default document: {}", e);
                 }
             }
 
             // Register block tools
             let kernel_arc = Arc::new(kernel);
-            register_block_tools(&kernel_arc, cells.clone()).await;
+            register_block_tools(&kernel_arc, documents.clone()).await;
 
             {
                 let mut state_ref = state.borrow_mut();
@@ -400,7 +400,7 @@ impl world::Server for WorldImpl {
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
-                        cells,
+                        documents,
                         block_subscribers: Vec::new(),
                     },
                 );
@@ -906,7 +906,7 @@ impl kernel::Server for KernelImpl {
                 };
 
                 // Insert block using the snapshot data
-                if let Err(e) = kernel.cells.insert_block(
+                if let Err(e) = kernel.documents.insert_block(
                     &cell_id,
                     block.parent_id.as_ref(),
                     after_id.as_ref(),
@@ -924,7 +924,7 @@ impl kernel::Server for KernelImpl {
                     agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
                     seq: id_reader.get_seq(),
                 };
-                if let Err(e) = kernel.cells.delete_block(&cell_id, &block_id) {
+                if let Err(e) = kernel.documents.delete_block(&cell_id, &block_id) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -938,7 +938,7 @@ impl kernel::Server for KernelImpl {
                 let pos = group.get_pos() as usize;
                 let insert = pry!(pry!(group.get_insert()).to_str());
                 let delete = group.get_delete() as usize;
-                if let Err(e) = kernel.cells.edit_text(&cell_id, &block_id, pos, insert, delete) {
+                if let Err(e) = kernel.documents.edit_text(&cell_id, &block_id, pos, insert, delete) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -950,7 +950,7 @@ impl kernel::Server for KernelImpl {
                     seq: id_reader.get_seq(),
                 };
                 let collapsed = group.get_collapsed();
-                if let Err(e) = kernel.cells.set_collapsed(&cell_id, &block_id, collapsed) {
+                if let Err(e) = kernel.documents.set_collapsed(&cell_id, &block_id, collapsed) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -967,7 +967,7 @@ impl kernel::Server for KernelImpl {
                     crate::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
                     crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
                 };
-                if let Err(e) = kernel.cells.set_status(&cell_id, &block_id, status) {
+                if let Err(e) = kernel.documents.set_status(&cell_id, &block_id, status) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -978,7 +978,7 @@ impl kernel::Server for KernelImpl {
         };
 
         // Return the new version
-        let new_version = kernel.cells.get(&cell_id)
+        let new_version = kernel.documents.get(&cell_id)
             .map(|entry| entry.version())
             .unwrap_or(0);
         results.get().set_new_version(new_version);
@@ -1015,7 +1015,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            if let Some(doc) = kernel.cells.get(&cell_id) {
+            if let Some(doc) = kernel.documents.get(&cell_id) {
                 let mut cell_state = results.get().init_state();
                 cell_state.set_cell_id(&cell_id);
                 cell_state.reborrow().set_version(doc.version());
@@ -1062,7 +1062,7 @@ impl kernel::Server for KernelImpl {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
             // Get LLM provider and kernel references
-            let (provider, block_subscribers, cells, kernel_arc) = {
+            let (provider, block_subscribers, documents, kernel_arc) = {
                 let state_ref = state.borrow();
                 let provider = match &state_ref.llm_provider {
                     Some(p) => p.clone(),
@@ -1078,7 +1078,7 @@ impl kernel::Server for KernelImpl {
                     })?;
                 log::debug!("Got provider and kernel state");
 
-                (provider, kernel_state.block_subscribers.clone(), kernel_state.cells.clone(), kernel_state.kernel.clone())
+                (provider, kernel_state.block_subscribers.clone(), kernel_state.documents.clone(), kernel_state.kernel.clone())
             };
 
             // Build tool definitions from equipped tools (async)
@@ -1090,19 +1090,19 @@ impl kernel::Server for KernelImpl {
 
             // Insert user message block
             {
-                // Auto-create cell if it doesn't exist (client conversation ID)
-                if cells.get(&cell_id).is_none() {
-                    log::info!("Auto-creating cell {} for prompt", cell_id);
-                    cells.create_cell(cell_id.clone(), kaijutsu_kernel::CellKind::AgentMessage, None)
+                // Auto-create document if it doesn't exist (client conversation ID)
+                if documents.get(&cell_id).is_none() {
+                    log::info!("Auto-creating document {} for prompt", cell_id);
+                    documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
                         .map_err(|e| {
-                            log::error!("Failed to create cell: {}", e);
-                            capnp::Error::failed(format!("failed to create cell: {}", e))
+                            log::error!("Failed to create document: {}", e);
+                            capnp::Error::failed(format!("failed to create document: {}", e))
                         })?;
                 }
 
                 // Create user message block using the store's helper method
-                log::debug!("Inserting user block into cell {}", cell_id);
-                let block_id = cells.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content)
+                log::debug!("Inserting user block into document {}", cell_id);
+                let block_id = documents.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content)
                     .map_err(|e| {
                         log::error!("Failed to insert user block: {}", e);
                         capnp::Error::failed(format!("failed to insert user block: {}", e))
@@ -1157,7 +1157,7 @@ impl kernel::Server for KernelImpl {
             // NOTE: Using spawn_local because block_events::Client is !Send (uses Rc internally)
             tokio::task::spawn_local(process_llm_stream(
                 provider,
-                cells,
+                documents,
                 block_subscribers,
                 cell_id,
                 content,
@@ -1489,7 +1489,7 @@ fn broadcast_text_append(
 /// This function handles all stream events, executes tools, and loops until done.
 async fn process_llm_stream(
     provider: Arc<AnthropicProvider>,
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
     block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
     cell_id: String,
     content: String,
@@ -1509,7 +1509,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
+            if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
                 broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, "⚠️ Maximum tool iterations reached", false, None, None, None, true);
             }
             break;
@@ -1531,7 +1531,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
+                if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
                     broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", e), false, None, None, None, true);
                 }
                 return;
@@ -1554,7 +1554,7 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
+                    match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
                         Ok(block_id) => {
                             broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
                                 BlockKind::Thinking, "", false, None, None, None, false);
@@ -1566,11 +1566,11 @@ async fn process_llm_stream(
 
                 StreamEvent::ThinkingDelta(text) => {
                     if let Some(ref block_id) = current_block_id {
-                        let pos = cells.get(&cell_id)
+                        let pos = documents.get(&cell_id)
                             .and_then(|cell| cell.doc.get_block_snapshot(block_id))
                             .map(|s| s.content.chars().count() as u64)
                             .unwrap_or(0);
-                        if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
                             log::error!("Failed to append thinking text: {}", e);
                         } else {
                             broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
@@ -1583,7 +1583,7 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
+                    match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
                         Ok(block_id) => {
                             broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
                                 BlockKind::Text, "", false, None, None, None, false);
@@ -1598,11 +1598,11 @@ async fn process_llm_stream(
                     assistant_text.push_str(&text);
 
                     if let Some(ref block_id) = current_block_id {
-                        let pos = cells.get(&cell_id)
+                        let pos = documents.get(&cell_id)
                             .and_then(|cell| cell.doc.get_block_snapshot(block_id))
                             .map(|s| s.content.chars().count() as u64)
                             .unwrap_or(0);
-                        if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
                             log::error!("Failed to append text: {}", e);
                         } else {
                             broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
@@ -1619,7 +1619,7 @@ async fn process_llm_stream(
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
 
                     // Insert block and track it
-                    match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
+                    match documents.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
                         Ok(block_id) => {
                             tool_call_blocks.insert(id.clone(), block_id.clone());
                             broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
@@ -1644,7 +1644,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
+                    if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
                         broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", err), false, None, None, None, true);
                     }
                     return;
@@ -1694,7 +1694,7 @@ async fn process_llm_stream(
 
             // Insert tool result block and broadcast
             if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
+                match documents.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
                     Ok(block_id) => {
                         broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
                             BlockKind::ToolResult, &result_content, false, None, None, Some(tool_call_block_id), is_error);
@@ -1724,7 +1724,7 @@ async fn process_llm_stream(
     }
 
     // Save final state after streaming completes
-    if let Err(e) = cells.save_snapshot(&cell_id) {
+    if let Err(e) = documents.save_snapshot(&cell_id) {
         log::warn!("Failed to save snapshot for cell {}: {}", cell_id, e);
     }
 

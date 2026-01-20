@@ -86,22 +86,22 @@ impl AppendBuffer {
 
 /// Manages batched appends across multiple blocks.
 pub struct AppendBatcher {
-    cells: SharedBlockStore,
+    documents: SharedBlockStore,
     config: BatchConfig,
-    /// Buffers keyed by block key (cell_id/agent_id/seq).
+    /// Buffers keyed by block key (document_id/agent_id/seq).
     buffers: Arc<Mutex<HashMap<String, AppendBuffer>>>,
 }
 
 impl AppendBatcher {
     /// Create a new batcher with default config.
-    pub fn new(cells: SharedBlockStore) -> Self {
-        Self::with_config(cells, BatchConfig::default())
+    pub fn new(documents: SharedBlockStore) -> Self {
+        Self::with_config(documents, BatchConfig::default())
     }
 
     /// Create a new batcher with custom config.
-    pub fn with_config(cells: SharedBlockStore, config: BatchConfig) -> Self {
+    pub fn with_config(documents: SharedBlockStore, config: BatchConfig) -> Self {
         Self {
-            cells,
+            documents,
             config,
             buffers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -152,7 +152,7 @@ impl AppendBatcher {
 
         if let Some((cell_id, block_id, content)) = buffer_content {
             // Append to the CRDT
-            let _ = self.cells.append_text(&cell_id, &block_id, &content);
+            let _ = self.documents.append_text(&cell_id, &block_id, &content);
         }
     }
 
@@ -213,19 +213,19 @@ pub struct BatcherStats {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::db::CellKind;
+    use crate::db::DocumentKind;
     use kaijutsu_crdt::{BlockKind, Role};
 
     fn setup_test_store() -> SharedBlockStore {
         let store = shared_block_store("test-agent");
-        store.create_cell("test-cell".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.create_document("test-doc".into(), DocumentKind::Code, Some("rust".into())).unwrap();
         store
     }
 
     #[tokio::test]
     async fn test_batch_on_newline() {
         let cells = setup_test_store();
-        let cell_id = "test-cell";
+        let cell_id = "test-doc";
 
         // Create a block
         let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
@@ -249,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_on_size() {
         let cells = setup_test_store();
-        let cell_id = "test-cell";
+        let cell_id = "test-doc";
 
         let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 
@@ -277,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_all() {
         let cells = setup_test_store();
-        let cell_id = "test-cell";
+        let cell_id = "test-doc";
 
         let block1 = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
         let block2 = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn test_finalize_removes_buffer() {
         let cells = setup_test_store();
-        let cell_id = "test-cell";
+        let cell_id = "test-doc";
 
         let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 

@@ -24,7 +24,7 @@ pub mod state;
 pub mod tools;
 pub mod vfs;
 
-pub use block_store::{BlockEvent, BlockStore, CellEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
+pub use block_store::{BlockEvent, BlockStore, DocumentEntry, DocumentId, SharedBlockStore, shared_block_store, shared_block_store_with_db};
 pub use block_tools::{
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
@@ -37,7 +37,7 @@ pub use block_tools::{
 pub use control::ConsentMode;
 pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
 pub use conversation_db::ConversationDb;
-pub use db::{CellDb, CellKind, CellMeta, OpRecord, Snapshot};
+pub use db::{DocumentDb, DocumentKind, DocumentMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;

@@ -1,11 +1,11 @@
 //! Block-based CRDT storage using kaijutsu-crdt.
 //!
-//! Each cell has a BlockDocument backed by diamond-types OpLog.
+//! Each document has a BlockDocument backed by diamond-types OpLog.
 //! Multi-client sync is handled via SerializedOps exchange.
 //!
 //! # Concurrency Model
 //!
-//! - DashMap for per-cell concurrent access
+//! - DashMap for per-document concurrent access
 //! - Event broadcasting for real-time updates
 //! - parking_lot for efficient locking
 
@@ -21,42 +21,42 @@ use kaijutsu_crdt::{
     SerializedOpsOwned, Status, LV,
 };
 
-use crate::db::{CellDb, CellKind, CellMeta};
+use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
 
 /// Thread-safe database handle.
-type DbHandle = Arc<std::sync::Mutex<CellDb>>;
+type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
 
-/// Unique identifier for a cell.
-pub type CellId = String;
+/// Unique identifier for a document.
+pub type DocumentId = String;
 
-/// Events broadcast when cells change.
+/// Events broadcast when documents change.
 #[derive(Clone, Debug)]
 pub enum BlockEvent {
-    /// Operations applied to a cell's OpLog.
+    /// Operations applied to a document's OpLog.
     OpsApplied {
-        cell_id: String,
+        document_id: String,
         ops: SerializedOpsOwned,
         agent_id: String,
     },
-    /// A new cell was created.
-    CellCreated {
-        cell_id: String,
-        kind: CellKind,
+    /// A new document was created.
+    DocumentCreated {
+        document_id: String,
+        kind: DocumentKind,
         agent_id: String,
     },
-    /// A cell was deleted.
-    CellDeleted {
-        cell_id: String,
+    /// A document was deleted.
+    DocumentDeleted {
+        document_id: String,
         agent_id: String,
     },
 }
 
-/// Entry for a cell in the store.
-pub struct CellEntry {
+/// Entry for a document in the store.
+pub struct DocumentEntry {
     /// The block document (owns OpLog).
     pub doc: BlockDocument,
-    /// Cell metadata.
-    pub kind: CellKind,
+    /// Document metadata.
+    pub kind: DocumentKind,
     /// Programming language (if code).
     pub language: Option<String>,
     /// Version counter (incremented on each modification).
@@ -65,9 +65,9 @@ pub struct CellEntry {
     last_agent: RwLock<String>,
 }
 
-impl CellEntry {
-    /// Create a new cell entry.
-    fn new(id: &str, kind: CellKind, language: Option<String>, agent_id: &str) -> Self {
+impl DocumentEntry {
+    /// Create a new document entry.
+    fn new(id: &str, kind: DocumentKind, language: Option<String>, agent_id: &str) -> Self {
         Self {
             doc: BlockDocument::new(id, agent_id),
             kind,
@@ -77,10 +77,10 @@ impl CellEntry {
         }
     }
 
-    /// Create a cell entry from a document snapshot.
+    /// Create a document entry from a snapshot.
     fn from_snapshot(
         snapshot: DocumentSnapshot,
-        kind: CellKind,
+        kind: DocumentKind,
         language: Option<String>,
         agent_id: &str,
     ) -> Self {
@@ -116,10 +116,10 @@ impl CellEntry {
     }
 }
 
-/// Store for block-based cell documents with per-cell locking.
+/// Store for block-based documents with per-document locking.
 pub struct BlockStore {
-    /// Concurrent cell storage.
-    cells: DashMap<CellId, CellEntry>,
+    /// Concurrent document storage.
+    documents: DashMap<DocumentId, DocumentEntry>,
     /// Database for persistence.
     db: Option<DbHandle>,
     /// Default agent ID for this store.
@@ -133,7 +133,7 @@ impl BlockStore {
     pub fn new(agent_id: impl Into<String>) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         Self {
-            cells: DashMap::new(),
+            documents: DashMap::new(),
             db: None,
             agent_id: RwLock::new(agent_id.into()),
             event_tx,
@@ -141,10 +141,10 @@ impl BlockStore {
     }
 
     /// Create a block store with SQLite persistence.
-    pub fn with_db(db: CellDb, agent_id: impl Into<String>) -> Self {
+    pub fn with_db(db: DocumentDb, agent_id: impl Into<String>) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         Self {
-            cells: DashMap::new(),
+            documents: DashMap::new(),
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id.into()),
             event_tx,
@@ -166,41 +166,41 @@ impl BlockStore {
         *self.agent_id.write() = agent_id.into();
     }
 
-    /// Create a new cell.
-    pub fn create_cell(
+    /// Create a new document.
+    pub fn create_document(
         &self,
-        id: CellId,
-        kind: CellKind,
+        id: DocumentId,
+        kind: DocumentKind,
         language: Option<String>,
     ) -> Result<(), String> {
-        if self.cells.contains_key(&id) {
-            return Err(format!("Cell {} already exists", id));
+        if self.documents.contains_key(&id) {
+            return Err(format!("Document {} already exists", id));
         }
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
-            let meta = CellMeta {
+            let meta = DocumentMeta {
                 id: id.clone(),
                 kind,
                 language: language.clone(),
                 position_col: None,
                 position_row: None,
-                parent_cell: None,
+                parent_document: None,
                 created_at: 0,
             };
             db_guard
-                .create_cell(&meta)
+                .create_document(&meta)
                 .map_err(|e| format!("DB error: {}", e))?;
         }
 
         let agent_id = self.agent_id();
-        let entry = CellEntry::new(&id, kind, language, &agent_id);
-        self.cells.insert(id.clone(), entry);
+        let entry = DocumentEntry::new(&id, kind, language, &agent_id);
+        self.documents.insert(id.clone(), entry);
 
         // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::CellCreated {
-            cell_id: id,
+        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
+            document_id: id,
             kind,
             agent_id,
         });
@@ -208,40 +208,40 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Get a cell for reading.
-    pub fn get(&self, id: &str) -> Option<dashmap::mapref::one::Ref<'_, CellId, CellEntry>> {
-        self.cells.get(id)
+    /// Get a document for reading.
+    pub fn get(&self, id: &str) -> Option<dashmap::mapref::one::Ref<'_, DocumentId, DocumentEntry>> {
+        self.documents.get(id)
     }
 
-    /// Get a cell for writing.
-    pub fn get_mut(&self, id: &str) -> Option<dashmap::mapref::one::RefMut<'_, CellId, CellEntry>> {
-        self.cells.get_mut(id)
+    /// Get a document for writing.
+    pub fn get_mut(&self, id: &str) -> Option<dashmap::mapref::one::RefMut<'_, DocumentId, DocumentEntry>> {
+        self.documents.get_mut(id)
     }
 
-    /// List all cell IDs.
-    pub fn list_ids(&self) -> Vec<CellId> {
-        self.cells.iter().map(|r| r.key().clone()).collect()
+    /// List all document IDs.
+    pub fn list_ids(&self) -> Vec<DocumentId> {
+        self.documents.iter().map(|r| r.key().clone()).collect()
     }
 
-    /// Check if a cell exists.
+    /// Check if a document exists.
     pub fn contains(&self, id: &str) -> bool {
-        self.cells.contains_key(id)
+        self.documents.contains_key(id)
     }
 
-    /// Delete a cell.
-    pub fn delete_cell(&self, id: &str) -> Result<(), String> {
+    /// Delete a document.
+    pub fn delete_document(&self, id: &str) -> Result<(), String> {
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
             db_guard
-                .delete_cell(id)
+                .delete_document(id)
                 .map_err(|e| format!("DB error: {}", e))?;
         }
 
-        self.cells.remove(id);
+        self.documents.remove(id);
 
         // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::CellDeleted {
-            cell_id: id.to_string(),
+        let _ = self.event_tx.send(BlockEvent::DocumentDeleted {
+            document_id: id.to_string(),
             agent_id: self.agent_id(),
         });
 
@@ -250,12 +250,12 @@ impl BlockStore {
 
     /// Check if the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.documents.is_empty()
     }
 
-    /// Get the number of cells.
+    /// Get the number of documents.
     pub fn len(&self) -> usize {
-        self.cells.len()
+        self.documents.len()
     }
 
     // =========================================================================
@@ -264,21 +264,21 @@ impl BlockStore {
 
     /// Auto-save snapshot if database is configured.
     /// Logs warnings on failure but doesn't propagate errors.
-    fn auto_save(&self, cell_id: &str) {
+    fn auto_save(&self, document_id: &str) {
         if self.db.is_some() {
-            if let Err(e) = self.save_snapshot(cell_id) {
-                tracing::warn!(cell_id = %cell_id, error = %e, "Failed to auto-save snapshot");
+            if let Err(e) = self.save_snapshot(document_id) {
+                tracing::warn!(document_id = %document_id, error = %e, "Failed to auto-save snapshot");
             }
         }
     }
 
-    /// Insert a block into a cell.
+    /// Insert a block into a document.
     ///
     /// This is the primary block creation API.
     ///
     /// # Arguments
     ///
-    /// * `cell_id` - The cell to insert into
+    /// * `document_id` - The document to insert into
     /// * `parent_id` - Parent block ID for DAG relationship (None for root)
     /// * `after` - Block ID to insert after in document order (None for beginning)
     /// * `role` - Role of the block author (Human, Agent, System, Tool)
@@ -286,7 +286,7 @@ impl BlockStore {
     /// * `content` - Initial text content
     pub fn insert_block(
         &self,
-        cell_id: &str,
+        document_id: &str,
         parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
         role: Role,
@@ -294,42 +294,42 @@ impl BlockStore {
         content: impl Into<String>,
     ) -> Result<BlockId, String> {
         let result = {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             let result = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
                 .map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
             result
         };
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(result)
     }
 
-    /// Insert a tool call block into a cell.
+    /// Insert a tool call block into a document.
     pub fn insert_tool_call(
         &self,
-        cell_id: &str,
+        document_id: &str,
         parent_id: Option<&BlockId>,
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
         let result = {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             let result = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
                 .map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
             result
         };
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(result)
     }
 
-    /// Insert a tool result block into a cell.
+    /// Insert a tool result block into a document.
     pub fn insert_tool_result(
         &self,
-        cell_id: &str,
+        document_id: &str,
         tool_call_id: &BlockId,
         after: Option<&BlockId>,
         content: impl Into<String>,
@@ -337,31 +337,31 @@ impl BlockStore {
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
         let result = {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             let result = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
                 .map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
             result
         };
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(result)
     }
 
     /// Set the status of a block.
     pub fn set_status(
         &self,
-        cell_id: &str,
+        document_id: &str,
         block_id: &BlockId,
         status: Status,
     ) -> Result<(), String> {
         {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
         }
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(())
     }
 
@@ -371,13 +371,13 @@ impl BlockStore {
     /// Call `save_snapshot()` explicitly when editing is complete.
     pub fn edit_text(
         &self,
-        cell_id: &str,
+        document_id: &str,
         block_id: &BlockId,
         pos: usize,
         insert: &str,
         delete: usize,
     ) -> Result<(), String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         let agent_id = self.agent_id();
         entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
@@ -389,8 +389,8 @@ impl BlockStore {
     ///
     /// Note: Does not auto-save to avoid excessive I/O during streaming.
     /// Call `save_snapshot()` explicitly when streaming is complete.
-    pub fn append_text(&self, cell_id: &str, block_id: &BlockId, text: &str) -> Result<(), String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    pub fn append_text(&self, document_id: &str, block_id: &BlockId, text: &str) -> Result<(), String> {
+        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         let agent_id = self.agent_id();
         entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
@@ -399,26 +399,26 @@ impl BlockStore {
     }
 
     /// Set collapsed state for a thinking block.
-    pub fn set_collapsed(&self, cell_id: &str, block_id: &BlockId, collapsed: bool) -> Result<(), String> {
+    pub fn set_collapsed(&self, document_id: &str, block_id: &BlockId, collapsed: bool) -> Result<(), String> {
         {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             entry.doc.set_collapsed(block_id, collapsed).map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
         }
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(())
     }
 
-    /// Delete a block from a cell.
-    pub fn delete_block(&self, cell_id: &str, block_id: &BlockId) -> Result<(), String> {
+    /// Delete a block from a document.
+    pub fn delete_block(&self, document_id: &str, block_id: &BlockId) -> Result<(), String> {
         {
-            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             entry.doc.delete_block(block_id).map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
         }
-        self.auto_save(cell_id);
+        self.auto_save(document_id);
         Ok(())
     }
 
@@ -426,24 +426,24 @@ impl BlockStore {
     // Sync Operations
     // =========================================================================
 
-    /// Get operations since a frontier for a cell.
-    pub fn ops_since(&self, cell_id: &str, frontier: &[LV]) -> Result<SerializedOpsOwned, String> {
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    /// Get operations since a frontier for a document.
+    pub fn ops_since(&self, document_id: &str, frontier: &[LV]) -> Result<SerializedOpsOwned, String> {
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.doc.ops_since(frontier))
     }
 
-    /// Merge remote operations into a cell.
-    pub fn merge_ops(&self, cell_id: &str, ops: SerializedOps<'_>) -> Result<u64, String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    /// Merge remote operations into a document.
+    pub fn merge_ops(&self, document_id: &str, ops: SerializedOps<'_>) -> Result<u64, String> {
+        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         entry.doc.merge_ops(ops).map_err(|e| e.to_string())?;
         let version = entry.doc.version();
         entry.version.store(version, Ordering::SeqCst);
         Ok(version)
     }
 
-    /// Get the current frontier for a cell.
-    pub fn frontier(&self, cell_id: &str) -> Result<Vec<LV>, String> {
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    /// Get the current frontier for a document.
+    pub fn frontier(&self, document_id: &str) -> Result<Vec<LV>, String> {
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.doc.frontier())
     }
 
@@ -451,24 +451,24 @@ impl BlockStore {
     // Query Operations
     // =========================================================================
 
-    /// Get block snapshots for a cell.
-    pub fn block_snapshots(&self, cell_id: &str) -> Result<Vec<BlockSnapshot>, String> {
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    /// Get block snapshots for a document.
+    pub fn block_snapshots(&self, document_id: &str) -> Result<Vec<BlockSnapshot>, String> {
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.doc.blocks_ordered())
     }
 
-    /// Get the full text content of a cell.
-    pub fn get_content(&self, cell_id: &str) -> Result<String, String> {
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+    /// Get the full text content of a document.
+    pub fn get_content(&self, document_id: &str) -> Result<String, String> {
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.content())
     }
 
-    /// Get cell metadata and version.
-    pub fn get_cell_state(
+    /// Get document metadata and version.
+    pub fn get_document_state(
         &self,
-        cell_id: &str,
-    ) -> Result<(CellKind, Option<String>, Vec<BlockSnapshot>, u64), String> {
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+        document_id: &str,
+    ) -> Result<(DocumentKind, Option<String>, Vec<BlockSnapshot>, u64), String> {
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok((
             entry.kind,
             entry.language.clone(),
@@ -481,64 +481,64 @@ impl BlockStore {
     // Persistence
     // =========================================================================
 
-    /// Load cells from database on startup.
+    /// Load documents from database on startup.
     ///
-    /// For each cell, loads both metadata and content from the snapshot table.
+    /// For each document, loads both metadata and content from the snapshot table.
     /// The `oplog_bytes` column stores JSON-encoded DocumentSnapshot.
     pub fn load_from_db(&self) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
         let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
 
-        let cell_metas = db_guard
-            .list_cells()
+        let document_metas = db_guard
+            .list_documents()
             .map_err(|e| format!("DB error: {}", e))?;
 
         let agent_id = self.agent_id();
-        for meta in cell_metas {
-            // Try to load snapshot for this cell
+        for meta in document_metas {
+            // Try to load snapshot for this document
             let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
                 // oplog_bytes contains JSON-encoded DocumentSnapshot
                 if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
                     match serde_json::from_slice::<DocumentSnapshot>(&oplog_bytes) {
                         Ok(doc_snapshot) => {
                             tracing::debug!(
-                                cell_id = %meta.id,
+                                document_id = %meta.id,
                                 blocks = doc_snapshot.blocks.len(),
-                                "Restored cell from snapshot"
+                                "Restored document from snapshot"
                             );
-                            CellEntry::from_snapshot(doc_snapshot, meta.kind, meta.language.clone(), &agent_id)
+                            DocumentEntry::from_snapshot(doc_snapshot, meta.kind, meta.language.clone(), &agent_id)
                         }
                         Err(e) => {
                             tracing::warn!(
-                                cell_id = %meta.id,
+                                document_id = %meta.id,
                                 error = %e,
                                 "Failed to deserialize snapshot, starting empty"
                             );
-                            CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                            DocumentEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
                         }
                     }
                 } else {
                     // Snapshot exists but no oplog_bytes, start empty
-                    CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                    DocumentEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
                 }
             } else {
                 // No snapshot, start empty
-                CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                DocumentEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
             };
 
-            self.cells.insert(meta.id, entry);
+            self.documents.insert(meta.id, entry);
         }
 
         Ok(())
     }
 
-    /// Save a cell's content to the database as a snapshot.
+    /// Save a document's content to the database as a snapshot.
     ///
     /// Stores the DocumentSnapshot as JSON in the `oplog_bytes` column.
-    pub fn save_snapshot(&self, cell_id: &str) -> Result<(), String> {
+    pub fn save_snapshot(&self, document_id: &str) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
 
-        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+        let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         let snapshot = entry.doc.snapshot();
         let version = entry.version() as i64;
         let content = entry.content();
@@ -551,7 +551,7 @@ impl BlockStore {
 
         let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
         db_guard
-            .save_snapshot(cell_id, version, &content, Some(&oplog_bytes))
+            .save_snapshot(document_id, version, &content, Some(&oplog_bytes))
             .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(())
@@ -574,7 +574,7 @@ pub fn shared_block_store(agent_id: impl Into<String>) -> SharedBlockStore {
 }
 
 /// Create a shared block store with database persistence.
-pub fn shared_block_store_with_db(db: CellDb, agent_id: impl Into<String>) -> SharedBlockStore {
+pub fn shared_block_store_with_db(db: DocumentDb, agent_id: impl Into<String>) -> SharedBlockStore {
     Arc::new(BlockStore::with_db(db, agent_id))
 }
 
@@ -586,7 +586,7 @@ mod tests {
     fn test_block_store_basic_ops() {
         let store = BlockStore::new("alice");
 
-        store.create_cell("test".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.create_document("test".into(), DocumentKind::Code, Some("rust".into())).unwrap();
 
         // Insert a text block using new API
         let block_id = store.insert_block("test", None, None, Role::User, BlockKind::Text, "hello world").unwrap();
@@ -605,7 +605,7 @@ mod tests {
     fn test_block_store_multiple_blocks() {
         let store = BlockStore::new("agent");
 
-        store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
+        store.create_document("test".into(), DocumentKind::Conversation, None).unwrap();
 
         // Insert thinking block
         let thinking_id = store.insert_block("test", None, None, Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
@@ -632,21 +632,21 @@ mod tests {
     fn test_block_store_crud() {
         let store = BlockStore::new("server");
 
-        store.create_cell("cell-1".into(), CellKind::Code, Some("rust".into())).unwrap();
+        store.create_document("doc-1".into(), DocumentKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_block("cell-1", None, None, Role::User, BlockKind::Text, "fn main() {}").unwrap();
+        store.insert_block("doc-1", None, None, Role::User, BlockKind::Text, "fn main() {}").unwrap();
 
-        assert_eq!(store.get_content("cell-1").unwrap(), "fn main() {}");
+        assert_eq!(store.get_content("doc-1").unwrap(), "fn main() {}");
 
-        store.delete_cell("cell-1").unwrap();
-        assert!(store.get("cell-1").is_none());
+        store.delete_document("doc-1").unwrap();
+        assert!(store.get("doc-1").is_none());
     }
 
     #[test]
     fn test_block_snapshots() {
         let store = BlockStore::new("agent");
 
-        store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
+        store.create_document("test".into(), DocumentKind::Conversation, None).unwrap();
 
         let thinking_id = store.insert_block("test", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
         store.insert_block("test", None, Some(&thinking_id), Role::Model, BlockKind::Text, "response").unwrap();
@@ -680,7 +680,7 @@ mod tests {
     fn test_set_status() {
         let store = BlockStore::new("agent");
 
-        store.create_cell("test".into(), CellKind::AgentMessage, None).unwrap();
+        store.create_document("test".into(), DocumentKind::Conversation, None).unwrap();
 
         let block_id = store.insert_block("test", None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
 
@@ -702,42 +702,42 @@ mod tests {
         let store = BlockStore::new("alice");
         let mut rx = store.subscribe();
 
-        store.create_cell("test".into(), CellKind::Code, None).unwrap();
+        store.create_document("test".into(), DocumentKind::Code, None).unwrap();
 
-        // Should receive CellCreated event
+        // Should receive DocumentCreated event
         let event = rx.try_recv().unwrap();
         match event {
-            BlockEvent::CellCreated { cell_id, kind, agent_id } => {
-                assert_eq!(cell_id, "test");
-                assert_eq!(kind, CellKind::Code);
+            BlockEvent::DocumentCreated { document_id, kind, agent_id } => {
+                assert_eq!(document_id, "test");
+                assert_eq!(kind, DocumentKind::Code);
                 assert_eq!(agent_id, "alice");
             }
-            _ => panic!("Expected CellCreated event"),
+            _ => panic!("Expected DocumentCreated event"),
         }
     }
 
     #[tokio::test]
-    async fn test_concurrent_cell_access() {
+    async fn test_concurrent_document_access() {
         use std::sync::Arc;
         use tokio::task::JoinSet;
 
         let store = Arc::new(BlockStore::new("test-agent"));
         store
-            .create_cell("shared-cell".into(), CellKind::Code, None)
+            .create_document("shared-doc".into(), DocumentKind::Code, None)
             .unwrap();
 
         let mut tasks = JoinSet::new();
         let num_tasks = 4;
         let ops_per_task = 10;
 
-        // Spawn multiple tasks that concurrently insert blocks to the same cell
+        // Spawn multiple tasks that concurrently insert blocks to the same document
         for i in 0..num_tasks {
             let store_clone = Arc::clone(&store);
             tasks.spawn(async move {
                 for j in 0..ops_per_task {
                     // Each task inserts a uniquely identifiable block
                     let text = format!("[task-{}-op-{}]", i, j);
-                    let _ = store_clone.insert_block("shared-cell", None, None, Role::User, BlockKind::Text, &text);
+                    let _ = store_clone.insert_block("shared-doc", None, None, Role::User, BlockKind::Text, &text);
                 }
             });
         }
@@ -747,14 +747,14 @@ mod tests {
             result.expect("Task panicked");
         }
 
-        // Verify the cell has content from all tasks
-        let content = store.get_content("shared-cell").unwrap();
+        // Verify the document has content from all tasks
+        let content = store.get_content("shared-doc").unwrap();
 
         // Should have at least some content (exact ordering is non-deterministic)
         assert!(!content.is_empty());
 
         // Count how many blocks we have - should be num_tasks * ops_per_task
-        let snapshots = store.block_snapshots("shared-cell").unwrap();
+        let snapshots = store.block_snapshots("shared-doc").unwrap();
         assert_eq!(
             snapshots.len(),
             num_tasks * ops_per_task,
@@ -765,31 +765,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_multi_cell_access() {
+    async fn test_concurrent_multi_document_access() {
         use std::sync::Arc;
         use tokio::task::JoinSet;
 
         let store = Arc::new(BlockStore::new("test-agent"));
 
-        // Create multiple cells
-        let num_cells = 3;
-        for i in 0..num_cells {
+        // Create multiple documents
+        let num_docs = 3;
+        for i in 0..num_docs {
             store
-                .create_cell(format!("cell-{}", i), CellKind::Code, None)
+                .create_document(format!("doc-{}", i), DocumentKind::Code, None)
                 .unwrap();
         }
 
         let mut tasks = JoinSet::new();
         let num_tasks = 6;
 
-        // Each task works on different cells
+        // Each task works on different documents
         for i in 0..num_tasks {
             let store_clone = Arc::clone(&store);
-            let cell_id = format!("cell-{}", i % num_cells);
+            let doc_id = format!("doc-{}", i % num_docs);
             tasks.spawn(async move {
                 for j in 0..5 {
                     let text = format!("task-{}-op-{}", i, j);
-                    let _ = store_clone.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &text);
+                    let _ = store_clone.insert_block(&doc_id, None, None, Role::User, BlockKind::Text, &text);
                 }
             });
         }
@@ -799,11 +799,11 @@ mod tests {
             result.expect("Task panicked");
         }
 
-        // Each cell should have content
-        for i in 0..num_cells {
-            let cell_id = format!("cell-{}", i);
-            let content = store.get_content(&cell_id).unwrap();
-            assert!(!content.is_empty(), "Cell {} should have content", cell_id);
+        // Each document should have content
+        for i in 0..num_docs {
+            let doc_id = format!("doc-{}", i);
+            let content = store.get_content(&doc_id).unwrap();
+            assert!(!content.is_empty(), "Document {} should have content", doc_id);
         }
     }
 
@@ -814,11 +814,11 @@ mod tests {
 
         let store = Arc::new(BlockStore::new("test-agent"));
         store
-            .create_cell("rw-cell".into(), CellKind::Code, None)
+            .create_document("rw-doc".into(), DocumentKind::Code, None)
             .unwrap();
 
         // Insert initial content
-        let block_id = store.insert_block("rw-cell", None, None, Role::User, BlockKind::Text, "initial content").unwrap();
+        let block_id = store.insert_block("rw-doc", None, None, Role::User, BlockKind::Text, "initial content").unwrap();
 
         let mut tasks = JoinSet::new();
 
@@ -830,7 +830,7 @@ mod tests {
                 for j in 0..5 {
                     // Append text
                     let text = format!(" [w{}:{}]", i, j);
-                    let _ = store_clone.append_text("rw-cell", &bid, &text);
+                    let _ = store_clone.append_text("rw-doc", &bid, &text);
                 }
             });
         }
@@ -841,7 +841,7 @@ mod tests {
             tasks.spawn(async move {
                 for _ in 0..10 {
                     // Read content
-                    let _ = store_clone.get_content("rw-cell");
+                    let _ = store_clone.get_content("rw-doc");
                 }
             });
         }
@@ -852,7 +852,7 @@ mod tests {
         }
 
         // Content should still be valid
-        let content = store.get_content("rw-cell").unwrap();
+        let content = store.get_content("rw-doc").unwrap();
         assert!(content.starts_with("initial content"));
     }
 
@@ -866,12 +866,12 @@ mod tests {
 
         let mut tasks = JoinSet::new();
 
-        // Create multiple cells concurrently
+        // Create multiple documents concurrently
         for i in 0..10 {
             let store_clone = Arc::clone(&store);
             tasks.spawn(async move {
                 store_clone
-                    .create_cell(format!("event-cell-{}", i), CellKind::Code, None)
+                    .create_document(format!("event-doc-{}", i), DocumentKind::Code, None)
                     .unwrap();
             });
         }
