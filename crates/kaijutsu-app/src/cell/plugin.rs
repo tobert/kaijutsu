@@ -145,7 +145,6 @@ pub fn setup_frame_styles(
         markdown: cyberpunk.clone(),
         system: minimal.clone(),
         user_message: cyberpunk.clone(),
-        agent_message: cyberpunk.clone(),
-        default: cyberpunk,
+        agent_message: cyberpunk,
     });
 }

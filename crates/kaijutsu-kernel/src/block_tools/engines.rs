@@ -224,15 +224,11 @@ fn find_block(cells: &SharedBlockStore, block_id_str: &str) -> Result<(String, B
 /// Execution engine for creating blocks.
 pub struct BlockCreateEngine {
     cells: SharedBlockStore,
-    agent_name: String,
 }
 
 impl BlockCreateEngine {
-    pub fn new(cells: SharedBlockStore, agent_name: impl Into<String>) -> Self {
-        Self {
-            cells,
-            agent_name: agent_name.into(),
-        }
+    pub fn new(cells: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+        Self { cells }
     }
 
     pub fn schema() -> serde_json::Value {
@@ -427,15 +423,11 @@ impl ExecutionEngine for BlockAppendEngine {
 /// Supports atomic batches of insert, delete, and replace operations.
 pub struct BlockEditEngine {
     cells: SharedBlockStore,
-    agent_name: String,
 }
 
 impl BlockEditEngine {
-    pub fn new(cells: SharedBlockStore, agent_name: impl Into<String>) -> Self {
-        Self {
-            cells,
-            agent_name: agent_name.into(),
-        }
+    pub fn new(cells: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+        Self { cells }
     }
 
     pub fn schema() -> serde_json::Value {

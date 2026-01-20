@@ -30,7 +30,8 @@ impl Default for SharedSwashCache {
 /// Core text rendering resources managed by the render world.
 /// These are created during render app setup and accessed by the render node.
 pub struct TextRenderResources {
-    pub cache: Cache,
+    /// Kept alive for glyphon internals (viewport/atlas reference it)
+    pub _cache: Cache,
     pub viewport: Viewport,
     pub atlas: TextAtlas,
     pub renderer: TextRenderer,
@@ -57,16 +58,6 @@ impl TextBuffer {
             cached_visual_lines: 1,
             cached_wrap_width: 0.0,
         }
-    }
-
-    /// Get a reference to the underlying buffer.
-    pub fn buffer(&self) -> &Buffer {
-        &self.buffer
-    }
-
-    /// Get a mutable reference to the underlying buffer.
-    pub fn buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffer
     }
 
     /// Set the buffer text with default attributes.

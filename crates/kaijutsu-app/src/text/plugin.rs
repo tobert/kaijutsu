@@ -166,7 +166,7 @@ fn prepare_text(
             );
 
             render_resources.0 = Some(TextRenderResources {
-                cache,
+                _cache: cache,
                 viewport,
                 atlas,
                 renderer,

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 ///
 /// Loaded from RON files in `assets/frames/`.
 #[derive(Asset, TypePath, Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields loaded from RON config, used for future shader system
 pub struct FrameStyle {
     /// Human-readable name for this style
     pub name: String,
@@ -86,6 +87,7 @@ impl Default for FrameStyle {
 
 /// Defines shader parameters for a frame piece.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields loaded from RON config, used for future shader system
 pub struct ShaderDef {
     /// Path to the shader file (relative to assets/)
     #[serde(default = "default_corner_shader")]
@@ -271,8 +273,6 @@ pub struct FrameStyleMapping {
     pub user_message: Handle<FrameStyle>,
     /// Style for agent messages
     pub agent_message: Handle<FrameStyle>,
-    /// Fallback default style
-    pub default: Handle<FrameStyle>,
 }
 
 impl FrameStyleMapping {
