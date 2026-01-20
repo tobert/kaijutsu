@@ -7,14 +7,14 @@
 //!
 //! | Tool | Purpose |
 //! |------|---------|
-//! | `block.create` | Create a new block with role, kind, content |
-//! | `block.append` | Append text to a block (streaming-optimized) |
-//! | `block.edit` | Line-based editing with atomic operations and CAS |
-//! | `block.splice` | Character-based editing for programmatic tools |
-//! | `block.read` | Read block content with line numbers and ranges |
-//! | `block.search` | Search within a block using regex |
-//! | `block.list` | List blocks with filters |
-//! | `block.status` | Set block status |
+//! | `block_create` | Create a new block with role, kind, content |
+//! | `block_append` | Append text to a block (streaming-optimized) |
+//! | `block_edit` | Line-based editing with atomic operations and CAS |
+//! | `block_splice` | Character-based editing for programmatic tools |
+//! | `block_read` | Read block content with line numbers and ranges |
+//! | `block_search` | Search within a block using regex |
+//! | `block_list` | List blocks with filters |
+//! | `block_status` | Set block status |
 //!
 //! # Architecture
 //!

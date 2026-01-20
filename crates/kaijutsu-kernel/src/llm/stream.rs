@@ -152,6 +152,8 @@ pub struct StreamRequest {
     pub thinking_enabled: bool,
     /// Token budget for thinking (if enabled).
     pub thinking_budget: Option<u32>,
+    /// Tools available for the model to use.
+    pub tools: Option<Vec<super::ToolDefinition>>,
 }
 
 impl StreamRequest {
@@ -165,6 +167,7 @@ impl StreamRequest {
             temperature: None,
             thinking_enabled: false,
             thinking_budget: None,
+            tools: None,
         }
     }
 
@@ -190,6 +193,12 @@ impl StreamRequest {
     pub fn with_thinking(mut self, budget: u32) -> Self {
         self.thinking_enabled = true;
         self.thinking_budget = Some(budget);
+        self
+    }
+
+    /// Set tools available for the model.
+    pub fn with_tools(mut self, tools: Vec<super::ToolDefinition>) -> Self {
+        self.tools = Some(tools);
         self
     }
 }

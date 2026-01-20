@@ -29,31 +29,99 @@ pub enum Role {
     Assistant,
 }
 
+/// Content block for structured message content (agentic loops).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContentBlock {
+    /// Plain text content.
+    Text { text: String },
+    /// Tool use request from the model.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool result for returning execution results.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+/// Message content - either simple text or structured blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageContent {
+    /// Simple text content.
+    Text(String),
+    /// Structured content blocks (for tool use/result).
+    Blocks(Vec<ContentBlock>),
+}
+
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Who sent this message.
     pub role: Role,
-    /// Message content.
-    pub content: String,
+    /// Message content (text or blocks).
+    pub content: MessageContent,
 }
 
 impl Message {
-    /// Create a user message.
+    /// Create a user message with text content.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
 
-    /// Create an assistant message.
+    /// Create an assistant message with text content.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
+
+    /// Create a user message with tool results.
+    pub fn tool_results(results: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content: MessageContent::Blocks(results),
+        }
+    }
+
+    /// Create an assistant message with tool uses.
+    pub fn with_tool_uses(text: Option<String>, tool_uses: Vec<ContentBlock>) -> Self {
+        let mut blocks = Vec::new();
+        if let Some(t) = text {
+            blocks.push(ContentBlock::Text { text: t });
+        }
+        blocks.extend(tool_uses);
+        Self {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    /// Get text content if this is a simple text message.
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.content {
+            MessageContent::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Tool definition for LLM API requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool name (e.g., "block.create").
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON Schema for input parameters.
+    pub input_schema: serde_json::Value,
 }
 
 /// A block of content in an LLM response.
@@ -351,10 +419,29 @@ mod tests {
     fn test_message_constructors() {
         let user = Message::user("hello");
         assert_eq!(user.role, Role::User);
-        assert_eq!(user.content, "hello");
+        assert_eq!(user.as_text(), Some("hello"));
 
         let assistant = Message::assistant("hi there");
         assert_eq!(assistant.role, Role::Assistant);
+        assert_eq!(assistant.as_text(), Some("hi there"));
+    }
+
+    #[test]
+    fn test_message_tool_results() {
+        let results = vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: "result".to_string(),
+            is_error: false,
+        }];
+        let msg = Message::tool_results(results);
+        assert_eq!(msg.role, Role::User);
+        assert!(msg.as_text().is_none());
+        match &msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+            }
+            _ => panic!("Expected blocks"),
+        }
     }
 
     #[test]

@@ -36,86 +36,86 @@ use serde_json;
 
 /// Register block tools with a kernel.
 async fn register_block_tools(kernel: &Arc<Kernel>, cells: SharedBlockStore) {
-    // block.create - Create a new block
+    // block_create - Create a new block
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.create", "Create a new block with role, kind, content", "block"),
+            ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
             Arc::new(BlockCreateEngine::new(cells.clone(), "server")),
         )
         .await;
-    kernel.equip("block.create").await;
+    kernel.equip("block_create").await;
 
-    // block.append - Append text to a block (streaming-optimized)
+    // block_append - Append text to a block (streaming-optimized)
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.append", "Append text to a block", "block"),
+            ToolInfo::new("block_append", "Append text to a block", "block"),
             Arc::new(BlockAppendEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.append").await;
+    kernel.equip("block_append").await;
 
-    // block.edit - Line-based editing with atomic operations and CAS
+    // block_edit - Line-based editing with atomic operations and CAS
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.edit", "Line-based editing with atomic ops and CAS validation", "block"),
+            ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
             Arc::new(BlockEditEngine::new(cells.clone(), "server")),
         )
         .await;
-    kernel.equip("block.edit").await;
+    kernel.equip("block_edit").await;
 
-    // block.splice - Character-based editing for programmatic tools
+    // block_splice - Character-based editing for programmatic tools
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.splice", "Character-based splice editing", "block"),
+            ToolInfo::new("block_splice", "Character-based splice editing", "block"),
             Arc::new(BlockSpliceEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.splice").await;
+    kernel.equip("block_splice").await;
 
-    // block.read - Read block content with line numbers and ranges
+    // block_read - Read block content with line numbers and ranges
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.read", "Read block content with optional line numbers", "block"),
+            ToolInfo::new("block_read", "Read block content with optional line numbers", "block"),
             Arc::new(BlockReadEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.read").await;
+    kernel.equip("block_read").await;
 
-    // block.search - Search within a block using regex
+    // block_search - Search within a block using regex
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.search", "Search within a block using regex", "block"),
+            ToolInfo::new("block_search", "Search within a block using regex", "block"),
             Arc::new(BlockSearchEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.search").await;
+    kernel.equip("block_search").await;
 
-    // block.list - List blocks with filters
+    // block_list - List blocks with filters
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.list", "List blocks with optional filters", "block"),
+            ToolInfo::new("block_list", "List blocks with optional filters", "block"),
             Arc::new(BlockListEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.list").await;
+    kernel.equip("block_list").await;
 
-    // block.status - Set block status
+    // block_status - Set block status
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("block.status", "Set block status", "block"),
+            ToolInfo::new("block_status", "Set block status", "block"),
             Arc::new(BlockStatusEngine::new(cells.clone())),
         )
         .await;
-    kernel.equip("block.status").await;
+    kernel.equip("block_status").await;
 
-    // kernel.search - Cross-block grep
+    // kernel_search - Cross-block grep
     kernel
         .register_tool_with_engine(
-            ToolInfo::new("kernel.search", "Search across blocks using regex", "kernel"),
+            ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
             Arc::new(KernelSearchEngine::new(cells)),
         )
         .await;
-    kernel.equip("kernel.search").await;
+    kernel.equip("kernel_search").await;
 }
 
 /// Server state shared across all capabilities
@@ -1506,8 +1506,8 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
-            // Get LLM provider
-            let (provider, block_subscribers, cells) = {
+            // Get LLM provider and kernel references
+            let (provider, block_subscribers, cells, kernel_arc) = {
                 let state_ref = state.borrow();
                 let provider = match &state_ref.llm_provider {
                     Some(p) => p.clone(),
@@ -1516,14 +1516,18 @@ impl kernel::Server for KernelImpl {
                         return Err(capnp::Error::failed("LLM provider not configured (missing ANTHROPIC_API_KEY)".into()));
                     }
                 };
-                let kernel = state_ref.kernels.get(&kernel_id)
+                let kernel_state = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| {
                         log::error!("kernel {} not found", kernel_id);
                         capnp::Error::failed("kernel not found".into())
                     })?;
                 log::debug!("Got provider and kernel state");
-                (provider, kernel.block_subscribers.clone(), kernel.cells.clone())
+
+                (provider, kernel_state.block_subscribers.clone(), kernel_state.cells.clone(), kernel_state.kernel.clone())
             };
+
+            // Build tool definitions from equipped tools (async)
+            let tools = build_tool_definitions(&kernel_arc).await;
 
             // Generate prompt ID
             let prompt_id = uuid::Uuid::new_v4().to_string();
@@ -1594,7 +1598,7 @@ impl kernel::Server for KernelImpl {
             log::info!("Using model: {} (requested: {:?}, default: {})",
                 model_name, model, default_model);
 
-            // Spawn LLM streaming in background task
+            // Spawn LLM streaming in background task with agentic loop
             // NOTE: Using spawn_local because block_events::Client is !Send (uses Rc internally)
             tokio::task::spawn_local(process_llm_stream(
                 provider,
@@ -1603,6 +1607,8 @@ impl kernel::Server for KernelImpl {
                 cell_id,
                 content,
                 model_name,
+                kernel_arc,
+                tools,
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -1616,6 +1622,212 @@ impl kernel::Server for KernelImpl {
 // ============================================================================
 // LLM Stream Helpers
 // ============================================================================
+
+use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
+
+/// Build tool definitions from equipped tools in the kernel.
+async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
+    let equipped = kernel.list_equipped().await;
+
+    equipped
+        .into_iter()
+        .map(|info| {
+            let input_schema = get_tool_schema(&info.name);
+            ToolDefinition {
+                name: info.name.clone(),
+                description: info.description.clone(),
+                input_schema,
+            }
+        })
+        .collect()
+}
+
+/// Get JSON schema for a tool.
+/// Schemas must be valid JSON Schema with `type: "object"` and `required` array.
+fn get_tool_schema(tool_name: &str) -> serde_json::Value {
+    match tool_name {
+        "block_create" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ["user", "model"],
+                    "description": "Role of the block creator"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["text", "thinking", "tool_call", "tool_result"],
+                    "description": "Type of block"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Initial content of the block"
+                },
+                "parent_id": {
+                    "type": "string",
+                    "description": "Parent block ID (optional)"
+                }
+            },
+            "required": ["role", "kind", "content"]
+        }),
+        "block_append" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID to append to (format: cell_id:agent_id:seq)"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to append"
+                }
+            },
+            "required": ["block_id", "text"]
+        }),
+        "block_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID to edit (format: cell_id:agent_id:seq)"
+                },
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": { "type": "string", "enum": ["replace", "insert", "delete"], "description": "Operation type" },
+                            "line": { "type": "integer", "description": "Line number (1-indexed)" },
+                            "text": { "type": "string", "description": "Text for replace/insert" }
+                        },
+                        "required": ["op", "line"]
+                    },
+                    "description": "Edit operations to apply atomically"
+                }
+            },
+            "required": ["block_id", "operations"]
+        }),
+        "block_read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID to read (format: cell_id:agent_id:seq)"
+                },
+                "line_numbers": {
+                    "type": "boolean",
+                    "description": "Include line numbers in output (default: false)"
+                }
+            },
+            "required": ["block_id"]
+        }),
+        "block_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID to search within"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for"
+                }
+            },
+            "required": ["block_id", "pattern"]
+        }),
+        "block_list" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ["user", "model"],
+                    "description": "Filter by role"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["text", "thinking", "tool_call", "tool_result"],
+                    "description": "Filter by kind"
+                }
+            },
+            "required": []
+        }),
+        "block_status" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "streaming", "done", "error"],
+                    "description": "New status"
+                }
+            },
+            "required": ["block_id", "status"]
+        }),
+        "block_splice" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "block_id": {
+                    "type": "string",
+                    "description": "Block ID to splice"
+                },
+                "pos": {
+                    "type": "integer",
+                    "description": "Character position (0-indexed)"
+                },
+                "delete": {
+                    "type": "integer",
+                    "description": "Number of characters to delete (default: 0)"
+                },
+                "insert": {
+                    "type": "string",
+                    "description": "Text to insert (default: empty)"
+                }
+            },
+            "required": ["block_id", "pos"]
+        }),
+        "kernel_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Regex pattern to search across all blocks"
+                },
+                "cell_id": {
+                    "type": "string",
+                    "description": "Limit search to this cell"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["text", "thinking", "tool_call", "tool_result"],
+                    "description": "Filter by block kind"
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["user", "model", "system", "tool"],
+                    "description": "Filter by block role"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Lines of context around matches (default: 0)"
+                },
+                "max_matches": {
+                    "type": "integer",
+                    "description": "Maximum matches to return (default: 100)"
+                }
+            },
+            "required": ["query"]
+        }),
+        // Default schema for unknown tools - minimal valid schema
+        _ => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    }
+}
 
 /// Convert Rust BlockKind to Cap'n Proto BlockKind
 fn block_kind_to_capnp(kind: BlockKind) -> crate::kaijutsu_capnp::BlockKind {
@@ -1718,8 +1930,8 @@ fn broadcast_text_append(
     }
 }
 
-/// Process LLM streaming in a background task.
-/// This function handles all stream events and broadcasts updates to subscribers.
+/// Process LLM streaming in a background task with agentic loop.
+/// This function handles all stream events, executes tools, and loops until done.
 async fn process_llm_stream(
     provider: Arc<AnthropicProvider>,
     cells: SharedBlockStore,
@@ -1727,143 +1939,235 @@ async fn process_llm_stream(
     cell_id: String,
     content: String,
     model_name: String,
+    kernel: Arc<Kernel>,
+    tools: Vec<ToolDefinition>,
 ) {
-    // Build conversation messages
-    let messages = vec![LlmMessage::user(&content)];
+    // Build initial conversation messages
+    let mut messages: Vec<LlmMessage> = vec![LlmMessage::user(&content)];
 
-    // Create streaming request
-    let stream_request = StreamRequest::new(&model_name, messages)
-        .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.")
-        .with_max_tokens(4096);
+    // Track total iterations to prevent infinite loops
+    let max_iterations = 20;
+    let mut iteration = 0;
 
-    // Start streaming
-    log::info!("Calling Anthropic API...");
-    let mut stream = match provider.stream(stream_request).await {
-        Ok(s) => {
-            log::info!("LLM stream started successfully");
-            s
+    // Agentic loop - continue until model is done or max iterations
+    loop {
+        iteration += 1;
+        if iteration > max_iterations {
+            log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
+            if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
+                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, "⚠️ Maximum tool iterations reached", false, None, None, None, true);
+            }
+            break;
         }
-        Err(e) => {
-            log::error!("Failed to start LLM stream: {}", e);
-            // Insert error block and broadcast it
-            if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
-                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", e), false, None, None, None, true);
+
+        log::info!("Agentic loop iteration {} with {} messages, {} tools", iteration, messages.len(), tools.len());
+
+        // Create streaming request with tools
+        let stream_request = StreamRequest::new(&model_name, messages.clone())
+            .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. You have access to tools for manipulating blocks of content. Be concise and helpful.")
+            .with_max_tokens(4096)
+            .with_tools(tools.clone());
+
+        // Start streaming
+        let mut stream = match provider.stream(stream_request).await {
+            Ok(s) => {
+                log::info!("LLM stream started successfully");
+                s
             }
-            return;
-        }
-    };
-
-    // Process stream events
-    let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
-    // Track tool_use_id (string from LLM) → BlockId mapping
-    let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
-
-    log::debug!("Entering stream event loop");
-    while let Some(event) = stream.next_event().await {
-        log::debug!("Received stream event: {:?}", event);
-        match event {
-            StreamEvent::ThinkingStart => {
-                match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
-                    Ok(block_id) => {
-                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                            BlockKind::Thinking, "", false, None, None, None, false);
-                        current_block_id = Some(block_id);
-                    }
-                    Err(e) => log::error!("Failed to insert thinking block: {}", e),
+            Err(e) => {
+                log::error!("Failed to start LLM stream: {}", e);
+                if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
+                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", e), false, None, None, None, true);
                 }
+                return;
             }
+        };
 
-            StreamEvent::ThinkingDelta(text) => {
-                if let Some(ref block_id) = current_block_id {
-                    // Get current length before append for correct broadcast position
-                    let pos = cells.get(&cell_id)
-                        .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                        .map(|s| s.content.chars().count() as u64)
-                        .unwrap_or(0);
-                    if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
-                        log::error!("Failed to append thinking text: {}", e);
-                    } else {
-                        broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
-                    }
-                }
-            }
+        // Process stream events
+        let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
+        // Collect tool calls for this iteration
+        let mut tool_calls: Vec<(String, String, serde_json::Value)> = vec![]; // (id, name, input)
+        // Track tool_use_id → BlockId mapping for CRDT
+        let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
+        // Collect text output for conversation history
+        let mut assistant_text = String::new();
+        // Track stop reason
+        let mut stop_reason: Option<String> = None;
 
-            StreamEvent::ThinkingEnd => {
-                current_block_id = None;
-            }
-
-            StreamEvent::TextStart => {
-                match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
-                    Ok(block_id) => {
-                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                            BlockKind::Text, "", false, None, None, None, false);
-                        current_block_id = Some(block_id);
-                    }
-                    Err(e) => log::error!("Failed to insert text block: {}", e),
-                }
-            }
-
-            StreamEvent::TextDelta(text) => {
-                if let Some(ref block_id) = current_block_id {
-                    // Get current length before append for correct broadcast position
-                    let pos = cells.get(&cell_id)
-                        .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                        .map(|s| s.content.chars().count() as u64)
-                        .unwrap_or(0);
-                    if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
-                        log::error!("Failed to append text: {}", e);
-                    } else {
-                        broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
-                    }
-                }
-            }
-
-            StreamEvent::TextEnd => {
-                current_block_id = None;
-            }
-
-            StreamEvent::ToolUse { id, name, input } => {
-                match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
-                    Ok(block_id) => {
-                        // Track the tool_use_id → BlockId mapping for later ToolResult
-                        tool_call_blocks.insert(id.clone(), block_id.clone());
-                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                            BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
-                    }
-                    Err(e) => log::error!("Failed to insert tool use block: {}", e),
-                }
-            }
-
-            StreamEvent::ToolResult { tool_use_id, content, is_error } => {
-                // Look up the tool call BlockId from our tracking map
-                if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                    match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &content, is_error, None) {
+        log::debug!("Entering stream event loop");
+        while let Some(event) = stream.next_event().await {
+            log::debug!("Received stream event: {:?}", event);
+            match event {
+                StreamEvent::ThinkingStart => {
+                    match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
                         Ok(block_id) => {
                             broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                BlockKind::ToolResult, &content, false, None, None, Some(tool_call_block_id), is_error);
+                                BlockKind::Thinking, "", false, None, None, None, false);
+                            current_block_id = Some(block_id);
                         }
-                        Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                        Err(e) => log::error!("Failed to insert thinking block: {}", e),
                     }
-                } else {
-                    log::error!("Tool result for unknown tool_use_id: {}", tool_use_id);
                 }
-            }
 
-            StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
-                log::info!(
-                    "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
-                    stop_reason, input_tokens, output_tokens
-                );
-            }
+                StreamEvent::ThinkingDelta(text) => {
+                    if let Some(ref block_id) = current_block_id {
+                        let pos = cells.get(&cell_id)
+                            .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                            .map(|s| s.content.chars().count() as u64)
+                            .unwrap_or(0);
+                        if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                            log::error!("Failed to append thinking text: {}", e);
+                        } else {
+                            broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
+                        }
+                    }
+                }
 
-            StreamEvent::Error(err) => {
-                log::error!("LLM stream error: {}", err);
-                if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
-                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", err), false, None, None, None, true);
+                StreamEvent::ThinkingEnd => {
+                    current_block_id = None;
+                }
+
+                StreamEvent::TextStart => {
+                    match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
+                        Ok(block_id) => {
+                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                BlockKind::Text, "", false, None, None, None, false);
+                            current_block_id = Some(block_id);
+                        }
+                        Err(e) => log::error!("Failed to insert text block: {}", e),
+                    }
+                }
+
+                StreamEvent::TextDelta(text) => {
+                    // Collect text for conversation history
+                    assistant_text.push_str(&text);
+
+                    if let Some(ref block_id) = current_block_id {
+                        let pos = cells.get(&cell_id)
+                            .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                            .map(|s| s.content.chars().count() as u64)
+                            .unwrap_or(0);
+                        if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                            log::error!("Failed to append text: {}", e);
+                        } else {
+                            broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
+                        }
+                    }
+                }
+
+                StreamEvent::TextEnd => {
+                    current_block_id = None;
+                }
+
+                StreamEvent::ToolUse { id, name, input } => {
+                    // Store for later execution
+                    tool_calls.push((id.clone(), name.clone(), input.clone()));
+
+                    // Insert block and track it
+                    match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
+                        Ok(block_id) => {
+                            tool_call_blocks.insert(id.clone(), block_id.clone());
+                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
+                        }
+                        Err(e) => log::error!("Failed to insert tool use block: {}", e),
+                    }
+                }
+
+                StreamEvent::ToolResult { .. } => {
+                    // This shouldn't happen during streaming - tool results are generated by us
+                    log::warn!("Unexpected ToolResult event during streaming");
+                }
+
+                StreamEvent::Done { stop_reason: sr, input_tokens, output_tokens } => {
+                    log::info!(
+                        "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
+                        sr, input_tokens, output_tokens
+                    );
+                    stop_reason = sr;
+                }
+
+                StreamEvent::Error(err) => {
+                    log::error!("LLM stream error: {}", err);
+                    if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
+                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", err), false, None, None, None, true);
+                    }
+                    return;
                 }
             }
         }
+
+        // Check if we need to execute tools
+        if stop_reason.as_deref() != Some("tool_use") || tool_calls.is_empty() {
+            log::info!("Agentic loop complete - no more tool calls (stop_reason={:?})", stop_reason);
+            break;
+        }
+
+        // Execute tools and collect results
+        log::info!("Executing {} tool calls", tool_calls.len());
+        let mut tool_results: Vec<ContentBlock> = vec![];
+        let mut assistant_tool_uses: Vec<ContentBlock> = vec![];
+
+        for (tool_use_id, tool_name, input) in tool_calls {
+            // Build tool uses for assistant message
+            assistant_tool_uses.push(ContentBlock::ToolUse {
+                id: tool_use_id.clone(),
+                name: tool_name.clone(),
+                input: input.clone(),
+            });
+
+            // Execute the tool
+            let params = input.to_string();
+            log::info!("Executing tool: {} with params: {}", tool_name, params);
+
+            let result = kernel.execute_with(&tool_name, &params).await;
+
+            let (result_content, is_error) = match result {
+                Ok(r) if r.success => {
+                    log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
+                    (r.stdout, false)
+                }
+                Ok(r) => {
+                    log::warn!("Tool {} failed: {}", tool_name, r.stderr);
+                    (format!("Error: {}", r.stderr), true)
+                }
+                Err(e) => {
+                    log::error!("Tool {} execution error: {}", tool_name, e);
+                    (format!("Execution error: {}", e), true)
+                }
+            };
+
+            // Insert tool result block and broadcast
+            if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
+                match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
+                    Ok(block_id) => {
+                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                            BlockKind::ToolResult, &result_content, false, None, None, Some(tool_call_block_id), is_error);
+                    }
+                    Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                }
+            }
+
+            // Collect result for conversation
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id,
+                content: result_content,
+                is_error,
+            });
+        }
+
+        // Add assistant message with tool uses to conversation
+        messages.push(LlmMessage::with_tool_uses(
+            if assistant_text.is_empty() { None } else { Some(assistant_text) },
+            assistant_tool_uses,
+        ));
+
+        // Add user message with tool results
+        messages.push(LlmMessage::tool_results(tool_results));
+
+        // Loop continues - re-prompt with tool results
     }
+
     log::info!("LLM stream processing complete for cell {}", cell_id);
 }
 

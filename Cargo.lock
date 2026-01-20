@@ -266,8 +266,6 @@ dependencies = [
 [[package]]
 name = "anthropic-api"
 version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ef729ad2443434e6509070cf37086329f1fa41d3ed57ae2ebbe84d62013358"
 dependencies = [
  "anyhow",
  "derive_builder",
@@ -277,6 +275,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

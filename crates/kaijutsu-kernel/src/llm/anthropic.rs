@@ -5,7 +5,8 @@ use anthropic_api::{
     messages::{
         ContentBlockDelta, ContentBlockStart, Message as ApiMessage,
         MessageContent as ApiMessageContent, MessageRole as ApiMessageRole, MessagesBuilder,
-        ResponseContentBlock, StreamEvent as ApiStreamEvent, Thinking, ThinkingType,
+        RequestContentBlock, ResponseContentBlock, StreamEvent as ApiStreamEvent,
+        Thinking, ThinkingType, Tool as ApiTool,
     },
     models::ModelList,
     Credentials,
@@ -15,8 +16,8 @@ use tokio::sync::RwLock;
 
 use super::stream::{LlmStream, StreamEvent, StreamRequest, StreamingBlockType};
 use super::{
-    CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmResult, Message, ResponseBlock,
-    Role, Usage,
+    CompletionRequest, CompletionResponse, ContentBlock, LlmError, LlmProvider, LlmResult,
+    Message, MessageContent, ResponseBlock, Role, Usage,
 };
 
 /// Default model to use when none specified.
@@ -112,13 +113,41 @@ impl AnthropicProvider {
 
     /// Convert our Message to the API's Message type.
     fn convert_message(msg: &Message) -> ApiMessage {
-        ApiMessage {
-            role: match msg.role {
-                Role::User => ApiMessageRole::User,
-                Role::Assistant => ApiMessageRole::Assistant,
-            },
-            content: ApiMessageContent::Text(msg.content.clone()),
-        }
+        let role = match msg.role {
+            Role::User => ApiMessageRole::User,
+            Role::Assistant => ApiMessageRole::Assistant,
+        };
+
+        let content = match &msg.content {
+            MessageContent::Text(text) => ApiMessageContent::Text(text.clone()),
+            MessageContent::Blocks(blocks) => {
+                let api_blocks: Vec<RequestContentBlock> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => {
+                            Some(RequestContentBlock::Text { text: text.clone() })
+                        }
+                        ContentBlock::ToolUse { .. } => {
+                            // Tool use blocks from assistant are handled differently
+                            // (they're in ResponseContentBlock, not RequestContentBlock)
+                            None
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => Some(RequestContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content.clone(),
+                            is_error: if *is_error { Some(true) } else { None },
+                        }),
+                    })
+                    .collect();
+                ApiMessageContent::ContentBlocks(api_blocks)
+            }
+        };
+
+        ApiMessage { role, content }
     }
 
     /// Convert API response blocks to our ResponseBlock type.
@@ -265,6 +294,19 @@ impl AnthropicProvider {
             });
         }
 
+        // Add tools if provided
+        if let Some(ref tools) = request.tools {
+            let api_tools: Vec<ApiTool> = tools
+                .iter()
+                .map(|t| ApiTool {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                })
+                .collect();
+            builder = builder.tools(api_tools);
+        }
+
         let receiver = builder.create_stream().await.map_err(|e| {
             LlmError::NetworkError(format!("Failed to create stream: {}", e))
         })?;
@@ -278,6 +320,7 @@ impl AnthropicProvider {
             input_tokens: None,
             output_tokens: None,
             tool_use_buffer: None,
+            stop_reason: None,
         })
     }
 }
@@ -303,6 +346,8 @@ pub struct AnthropicStream {
     output_tokens: Option<u32>,
     /// Buffer for tool use JSON (built incrementally).
     tool_use_buffer: Option<ToolUseBuffer>,
+    /// Stop reason captured from MessageDelta.
+    stop_reason: Option<String>,
 }
 
 /// Buffer for building tool use input incrementally.
@@ -332,19 +377,19 @@ impl LlmStream for AnthropicStream {
 
                     match content_block {
                         ContentBlockStart::Text { text: _ } => {
-                            // Check if this might be a thinking block
-                            // Unfortunately the anthropic-api crate's ContentBlockStart
-                            // doesn't distinguish thinking from text at the struct level,
-                            // but we can infer from context or just treat as text
-                            // TODO: Check if thinking blocks come through differently
                             self.current_block = Some(StreamingBlockType::Text);
                             return Some(StreamEvent::TextStart);
                         }
-                        ContentBlockStart::ToolUse { id, name, input } => {
+                        ContentBlockStart::Thinking { thinking: _ } => {
+                            self.current_block = Some(StreamingBlockType::Thinking);
+                            return Some(StreamEvent::ThinkingStart);
+                        }
+                        ContentBlockStart::ToolUse { id, name, input: _ } => {
+                            // Note: initial `input` is always {} - actual params come via input_json_delta
                             self.tool_use_buffer = Some(ToolUseBuffer {
                                 id: id.clone(),
                                 name: name.clone(),
-                                input_json: serde_json::to_string(&input).unwrap_or_default(),
+                                input_json: String::new(), // Built up from deltas
                             });
                             // Don't emit yet - we'll emit when the block is complete
                             continue;
@@ -360,16 +405,11 @@ impl LlmStream for AnthropicStream {
                     }
 
                     match delta {
-                        ContentBlockDelta::Text { text } => {
-                            // Check what type of block we're in
-                            match self.current_block {
-                                Some(StreamingBlockType::Thinking) => {
-                                    return Some(StreamEvent::ThinkingDelta(text));
-                                }
-                                Some(StreamingBlockType::Text) | None => {
-                                    return Some(StreamEvent::TextDelta(text));
-                                }
-                            }
+                        ContentBlockDelta::TextDelta { text } => {
+                            return Some(StreamEvent::TextDelta(text));
+                        }
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            return Some(StreamEvent::ThinkingDelta(thinking));
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
                             // Append to tool use buffer
@@ -396,8 +436,10 @@ impl LlmStream for AnthropicStream {
 
                     // If we have a tool use buffer, emit it now
                     if let Some(buffer) = self.tool_use_buffer.take() {
-                        let input = serde_json::from_str(&buffer.input_json)
-                            .unwrap_or(serde_json::Value::Null);
+                        // Default to empty object if no deltas received (tools with no required params)
+                        let input_str = if buffer.input_json.is_empty() { "{}" } else { &buffer.input_json };
+                        let input = serde_json::from_str(input_str)
+                            .unwrap_or(serde_json::json!({}));
                         return Some(StreamEvent::ToolUse {
                             id: buffer.id,
                             name: buffer.name,
@@ -409,17 +451,16 @@ impl LlmStream for AnthropicStream {
                 }
 
                 ApiStreamEvent::MessageDelta { delta, usage } => {
-                    // Capture usage stats
+                    // Capture usage stats and stop reason
                     self.output_tokens = Some(usage.output_tokens);
-                    // input_tokens comes with message_start, not delta
-                    let _ = delta; // stop_reason captured in MessageStop
+                    self.stop_reason = delta.stop_reason.clone();
                     continue;
                 }
 
                 ApiStreamEvent::MessageStop => {
                     self.finished = true;
                     return Some(StreamEvent::Done {
-                        stop_reason: Some("end_turn".to_string()),
+                        stop_reason: self.stop_reason.take(),
                         input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
                     });
@@ -453,12 +494,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_convert_message() {
+    fn test_convert_message_text() {
         let msg = Message::user("hello");
         let api_msg = AnthropicProvider::convert_message(&msg);
 
         assert!(matches!(api_msg.role, ApiMessageRole::User));
         assert!(matches!(api_msg.content, ApiMessageContent::Text(ref t) if t == "hello"));
+    }
+
+    #[test]
+    fn test_convert_message_tool_result() {
+        let msg = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: "result text".to_string(),
+            is_error: false,
+        }]);
+        let api_msg = AnthropicProvider::convert_message(&msg);
+
+        assert!(matches!(api_msg.role, ApiMessageRole::User));
+        match api_msg.content {
+            ApiMessageContent::ContentBlocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    RequestContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        assert_eq!(tool_use_id, "tool_123");
+                        assert_eq!(content, "result text");
+                        assert_eq!(*is_error, None);
+                    }
+                    _ => panic!("Expected ToolResult"),
+                }
+            }
+            _ => panic!("Expected ContentBlocks"),
+        }
     }
 
     #[test]

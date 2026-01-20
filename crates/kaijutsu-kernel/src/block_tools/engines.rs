@@ -46,7 +46,7 @@ pub enum EditOp {
     },
 }
 
-/// Parameters for block.create tool.
+/// Parameters for block_create tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockCreateParams {
     /// Parent block ID for DAG relationship (None for root).
@@ -63,21 +63,21 @@ pub struct BlockCreateParams {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Parameters for block.append tool.
+/// Parameters for block_append tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockAppendParams {
     pub block_id: String,
     pub text: String,
 }
 
-/// Parameters for block.edit tool.
+/// Parameters for block_edit tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockEditParams {
     pub block_id: String,
     pub operations: Vec<EditOp>,
 }
 
-/// Parameters for block.splice tool.
+/// Parameters for block_splice tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockSpliceParams {
     pub block_id: String,
@@ -87,7 +87,7 @@ pub struct BlockSpliceParams {
     pub insert: Option<String>,
 }
 
-/// Parameters for block.read tool.
+/// Parameters for block_read tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockReadParams {
     pub block_id: String,
@@ -103,7 +103,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Parameters for block.search tool.
+/// Parameters for block_search tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockSearchParams {
     pub block_id: String,
@@ -125,7 +125,7 @@ fn default_max_matches() -> u32 {
     20
 }
 
-/// Parameters for block.list tool.
+/// Parameters for block_list tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockListParams {
     /// Filter by parent block ID.
@@ -149,7 +149,7 @@ fn default_depth() -> u32 {
     1
 }
 
-/// Parameters for block.status tool.
+/// Parameters for block_status tool.
 #[derive(Debug, Deserialize)]
 pub struct BlockStatusParams {
     pub block_id: String,
@@ -311,7 +311,7 @@ impl BlockCreateEngine {
 #[async_trait]
 impl ExecutionEngine for BlockCreateEngine {
     fn name(&self) -> &str {
-        "block.create"
+        "block_create"
     }
 
     fn description(&self) -> &str {
@@ -392,7 +392,7 @@ impl BlockAppendEngine {
 #[async_trait]
 impl ExecutionEngine for BlockAppendEngine {
     fn name(&self) -> &str {
-        "block.append"
+        "block_append"
     }
 
     fn description(&self) -> &str {
@@ -580,7 +580,7 @@ impl BlockEditEngine {
 #[async_trait]
 impl ExecutionEngine for BlockEditEngine {
     fn name(&self) -> &str {
-        "block.edit"
+        "block_edit"
     }
 
     fn description(&self) -> &str {
@@ -673,7 +673,7 @@ impl BlockSpliceEngine {
 #[async_trait]
 impl ExecutionEngine for BlockSpliceEngine {
     fn name(&self) -> &str {
-        "block.splice"
+        "block_splice"
     }
 
     fn description(&self) -> &str {
@@ -790,7 +790,7 @@ impl BlockReadEngine {
 #[async_trait]
 impl ExecutionEngine for BlockReadEngine {
     fn name(&self) -> &str {
-        "block.read"
+        "block_read"
     }
 
     fn description(&self) -> &str {
@@ -931,7 +931,7 @@ impl BlockSearchEngine {
 #[async_trait]
 impl ExecutionEngine for BlockSearchEngine {
     fn name(&self) -> &str {
-        "block.search"
+        "block_search"
     }
 
     fn description(&self) -> &str {
@@ -1064,7 +1064,7 @@ impl BlockListEngine {
 #[async_trait]
 impl ExecutionEngine for BlockListEngine {
     fn name(&self) -> &str {
-        "block.list"
+        "block_list"
     }
 
     fn description(&self) -> &str {
@@ -1146,7 +1146,7 @@ impl BlockStatusEngine {
 #[async_trait]
 impl ExecutionEngine for BlockStatusEngine {
     fn name(&self) -> &str {
-        "block.status"
+        "block_status"
     }
 
     fn description(&self) -> &str {
@@ -1173,10 +1173,10 @@ impl ExecutionEngine for BlockStatusEngine {
 }
 
 // ============================================================================
-// kernel.search - Cross-block grep
+// kernel_search - Cross-block grep
 // ============================================================================
 
-/// Parameters for kernel.search.
+/// Parameters for kernel_search.
 #[derive(Debug, Deserialize)]
 pub struct KernelSearchParams {
     /// Regex pattern to search for.
@@ -1194,7 +1194,7 @@ pub struct KernelSearchParams {
     pub max_matches: Option<usize>,
 }
 
-/// A match from kernel.search.
+/// A match from kernel_search.
 #[derive(Debug, Serialize)]
 pub struct KernelSearchMatch {
     /// The cell containing the match.
@@ -1348,7 +1348,7 @@ impl KernelSearchEngine {
 #[async_trait]
 impl ExecutionEngine for KernelSearchEngine {
     fn name(&self) -> &str {
-        "kernel.search"
+        "kernel_search"
     }
 
     fn description(&self) -> &str {

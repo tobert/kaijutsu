@@ -68,5 +68,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Scripting
 rhai = "1.21"
 
-# LLM providers
-anthropic-api = "0.0.5"
+# LLM providers (using local fork for ToolResult support)
+anthropic-api = { path = "../anthropic-api" }
