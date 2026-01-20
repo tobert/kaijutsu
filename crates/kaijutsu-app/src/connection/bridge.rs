@@ -16,8 +16,8 @@ use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, RpcClien
 /// Default timeout for RPC operations (short ops like attach, list)
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout for LLM prompt operations (can take minutes with extended thinking)
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
+/// Timeout for LLM prompt operations (now returns immediately, streaming happens async)
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 

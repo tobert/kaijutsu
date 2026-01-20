@@ -1473,7 +1473,7 @@ impl kernel::Server for KernelImpl {
             log::debug!("Generated prompt_id={}", prompt_id);
 
             // Insert user message block
-            let user_block_id = {
+            {
                 // Auto-create cell if it doesn't exist (client conversation ID)
                 if cells.get(&cell_id).is_none() {
                     log::info!("Auto-creating cell {} for prompt", cell_id);
@@ -1527,252 +1527,292 @@ impl kernel::Server for KernelImpl {
                     }
                     let _ = req.send(); // Fire and forget
                 }
-
-                block_id
             };
 
-            log::info!("User message block inserted (id: {:?}), starting LLM stream", user_block_id);
+            log::info!("User message block inserted, spawning LLM stream task");
 
-            // Build conversation history from cell content
-            // For now, just use the current prompt as a single message
-            let messages = vec![LlmMessage::user(&content)];
+            // Determine model name
             let default_model = provider.default_model();
             let model_name = model.as_deref().unwrap_or(default_model).to_string();
             log::info!("Using model: {} (requested: {:?}, default: {})",
                 model_name, model, default_model);
 
-            // Create streaming request
-            let stream_request = StreamRequest::new(&model_name, messages)
-                .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.")
-                .with_max_tokens(4096);
+            // Spawn LLM streaming in background task
+            // NOTE: Using spawn_local because block_events::Client is !Send (uses Rc internally)
+            tokio::task::spawn_local(process_llm_stream(
+                provider,
+                cells,
+                block_subscribers,
+                cell_id,
+                content,
+                model_name,
+            ));
 
-            // Helper to convert Rust BlockKind to Cap'n Proto BlockKind
-            let to_capnp_kind = |kind: BlockKind| -> crate::kaijutsu_capnp::BlockKind {
-                match kind {
-                    BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-                    BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-                    BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-                    BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-                }
-            };
-
-            // Helper to broadcast block insertions using the flat BlockSnapshot
-            let broadcast_block_inserted = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
-                                           cell_id: &str,
-                                           block_id: &kaijutsu_crdt::BlockId,
-                                           kind: BlockKind,
-                                           content: &str,
-                                           collapsed: bool,
-                                           tool_name: Option<&str>,
-                                           tool_input: Option<&serde_json::Value>,
-                                           tool_call_id: Option<&kaijutsu_crdt::BlockId>,
-                                           is_error: bool| {
-                for subscriber in subscribers {
-                    let mut req = subscriber.on_block_inserted_request();
-                    {
-                        let mut params = req.get();
-                        params.set_cell_id(cell_id);
-                        params.set_has_after_id(false);
-                        let mut block_state = params.init_block();
-                        {
-                            let mut id = block_state.reborrow().init_id();
-                            id.set_cell_id(&block_id.cell_id);
-                            id.set_agent_id(&block_id.agent_id);
-                            id.set_seq(block_id.seq);
-                        }
-                        block_state.set_author(&block_id.agent_id);
-                        block_state.set_created_at(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64
-                        );
-                        // Flat BlockSnapshot fields
-                        block_state.set_role(crate::kaijutsu_capnp::Role::Model);
-                        block_state.set_status(crate::kaijutsu_capnp::Status::Done);
-                        block_state.set_kind(to_capnp_kind(kind));
-                        block_state.set_content(content);
-                        block_state.set_collapsed(collapsed);
-                        block_state.set_has_parent_id(false);
-
-                        // Tool-specific fields
-                        if let Some(name) = tool_name {
-                            block_state.set_tool_name(name);
-                        }
-                        if let Some(input) = tool_input {
-                            block_state.set_tool_input(&input.to_string());
-                        }
-                        if let Some(tc_id) = tool_call_id {
-                            let mut tc = block_state.reborrow().init_tool_call_id();
-                            tc.set_cell_id(&tc_id.cell_id);
-                            tc.set_agent_id(&tc_id.agent_id);
-                            tc.set_seq(tc_id.seq);
-                            block_state.set_has_tool_call_id(true);
-                        } else {
-                            block_state.set_has_tool_call_id(false);
-                        }
-                        block_state.set_has_exit_code(false);
-                        block_state.set_is_error(is_error);
-                    }
-                    let _ = req.send();
-                }
-            };
-
-            // Helper to broadcast text appends
-            let broadcast_text_append = |subscribers: &[crate::kaijutsu_capnp::block_events::Client],
-                                         cell_id: &str,
-                                         block_id: &kaijutsu_crdt::BlockId,
-                                         pos: u64,
-                                         text: &str| {
-                for subscriber in subscribers {
-                    let mut req = subscriber.on_block_edited_request();
-                    {
-                        let mut params = req.get();
-                        params.set_cell_id(cell_id);
-                        {
-                            let mut id = params.reborrow().init_block_id();
-                            id.set_cell_id(&block_id.cell_id);
-                            id.set_agent_id(&block_id.agent_id);
-                            id.set_seq(block_id.seq);
-                        }
-                        params.set_pos(pos);
-                        params.set_insert(text);
-                        params.set_delete(0);
-                    }
-                    let _ = req.send();
-                }
-            };
-
-            // Start streaming
-            log::info!("Calling Anthropic API...");
-            let mut stream = match provider.stream(stream_request).await {
-                Ok(s) => {
-                    log::info!("LLM stream started successfully");
-                    s
-                }
-                Err(e) => {
-                    log::error!("Failed to start LLM stream: {}", e);
-                    // Insert error block
-                    let _ = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
-                    return Err(capnp::Error::failed(format!("LLM stream failed: {}", e)));
-                }
-            };
-
-            // Process stream events
-            let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
-            // Track tool_use_id (string from LLM) → BlockId mapping
-            let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
-
-            log::debug!("Entering stream event loop");
-            while let Some(event) = stream.next_event().await {
-                log::debug!("Received stream event: {:?}", event);
-                match event {
-                    StreamEvent::ThinkingStart => {
-                        match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
-                            Ok(block_id) => {
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                    BlockKind::Thinking, "", false, None, None, None, false);
-                                current_block_id = Some(block_id);
-                            }
-                            Err(e) => log::error!("Failed to insert thinking block: {}", e),
-                        }
-                    }
-
-                    StreamEvent::ThinkingDelta(text) => {
-                        if let Some(ref block_id) = current_block_id {
-                            // Get current length before append for correct broadcast position
-                            let pos = cells.get(&cell_id)
-                                .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                                .map(|s| s.content.chars().count() as u64)
-                                .unwrap_or(0);
-                            if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
-                                log::error!("Failed to append thinking text: {}", e);
-                            } else {
-                                broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
-                            }
-                        }
-                    }
-
-                    StreamEvent::ThinkingEnd => {
-                        current_block_id = None;
-                    }
-
-                    StreamEvent::TextStart => {
-                        match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
-                            Ok(block_id) => {
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                    BlockKind::Text, "", false, None, None, None, false);
-                                current_block_id = Some(block_id);
-                            }
-                            Err(e) => log::error!("Failed to insert text block: {}", e),
-                        }
-                    }
-
-                    StreamEvent::TextDelta(text) => {
-                        if let Some(ref block_id) = current_block_id {
-                            // Get current length before append for correct broadcast position
-                            let pos = cells.get(&cell_id)
-                                .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                                .map(|s| s.content.chars().count() as u64)
-                                .unwrap_or(0);
-                            if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
-                                log::error!("Failed to append text: {}", e);
-                            } else {
-                                broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
-                            }
-                        }
-                    }
-
-                    StreamEvent::TextEnd => {
-                        current_block_id = None;
-                    }
-
-                    StreamEvent::ToolUse { id, name, input } => {
-                        match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
-                            Ok(block_id) => {
-                                // Track the tool_use_id → BlockId mapping for later ToolResult
-                                tool_call_blocks.insert(id.clone(), block_id.clone());
-                                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                    BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
-                            }
-                            Err(e) => log::error!("Failed to insert tool use block: {}", e),
-                        }
-                    }
-
-                    StreamEvent::ToolResult { tool_use_id, content, is_error } => {
-                        // Look up the tool call BlockId from our tracking map
-                        if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                            match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &content, is_error, None) {
-                                Ok(block_id) => {
-                                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                        BlockKind::ToolResult, &content, false, None, None, Some(tool_call_block_id), is_error);
-                                }
-                                Err(e) => log::error!("Failed to insert tool result block: {}", e),
-                            }
-                        } else {
-                            log::error!("Tool result for unknown tool_use_id: {}", tool_use_id);
-                        }
-                    }
-
-                    StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
-                        log::info!(
-                            "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
-                            stop_reason, input_tokens, output_tokens
-                        );
-                    }
-
-                    StreamEvent::Error(err) => {
-                        log::error!("LLM stream error: {}", err);
-                        let _ = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
-                    }
-                }
-            }
-
+            // Return immediately with prompt_id - streaming happens in background
             results.get().set_prompt_id(&prompt_id);
+            log::debug!("prompt() returning immediately with prompt_id={}", prompt_id);
             Ok(())
         })
     }
 }
+
+// ============================================================================
+// LLM Stream Helpers
+// ============================================================================
+
+/// Convert Rust BlockKind to Cap'n Proto BlockKind
+fn block_kind_to_capnp(kind: BlockKind) -> crate::kaijutsu_capnp::BlockKind {
+    match kind {
+        BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+        BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+        BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+        BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+    }
+}
+
+/// Broadcast a block insertion to all subscribers
+fn broadcast_block_inserted(
+    subscribers: &[crate::kaijutsu_capnp::block_events::Client],
+    cell_id: &str,
+    block_id: &kaijutsu_crdt::BlockId,
+    kind: BlockKind,
+    content: &str,
+    collapsed: bool,
+    tool_name: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+    tool_call_id: Option<&kaijutsu_crdt::BlockId>,
+    is_error: bool,
+) {
+    for subscriber in subscribers {
+        let mut req = subscriber.on_block_inserted_request();
+        {
+            let mut params = req.get();
+            params.set_cell_id(cell_id);
+            params.set_has_after_id(false);
+            let mut block_state = params.init_block();
+            {
+                let mut id = block_state.reborrow().init_id();
+                id.set_cell_id(&block_id.cell_id);
+                id.set_agent_id(&block_id.agent_id);
+                id.set_seq(block_id.seq);
+            }
+            block_state.set_author(&block_id.agent_id);
+            block_state.set_created_at(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            );
+            // Flat BlockSnapshot fields
+            block_state.set_role(crate::kaijutsu_capnp::Role::Model);
+            block_state.set_status(crate::kaijutsu_capnp::Status::Done);
+            block_state.set_kind(block_kind_to_capnp(kind));
+            block_state.set_content(content);
+            block_state.set_collapsed(collapsed);
+            block_state.set_has_parent_id(false);
+
+            // Tool-specific fields
+            if let Some(name) = tool_name {
+                block_state.set_tool_name(name);
+            }
+            if let Some(input) = tool_input {
+                block_state.set_tool_input(&input.to_string());
+            }
+            if let Some(tc_id) = tool_call_id {
+                let mut tc = block_state.reborrow().init_tool_call_id();
+                tc.set_cell_id(&tc_id.cell_id);
+                tc.set_agent_id(&tc_id.agent_id);
+                tc.set_seq(tc_id.seq);
+                block_state.set_has_tool_call_id(true);
+            } else {
+                block_state.set_has_tool_call_id(false);
+            }
+            block_state.set_has_exit_code(false);
+            block_state.set_is_error(is_error);
+        }
+        let _ = req.send();
+    }
+}
+
+/// Broadcast a text append (edit) to all subscribers
+fn broadcast_text_append(
+    subscribers: &[crate::kaijutsu_capnp::block_events::Client],
+    cell_id: &str,
+    block_id: &kaijutsu_crdt::BlockId,
+    pos: u64,
+    text: &str,
+) {
+    for subscriber in subscribers {
+        let mut req = subscriber.on_block_edited_request();
+        {
+            let mut params = req.get();
+            params.set_cell_id(cell_id);
+            {
+                let mut id = params.reborrow().init_block_id();
+                id.set_cell_id(&block_id.cell_id);
+                id.set_agent_id(&block_id.agent_id);
+                id.set_seq(block_id.seq);
+            }
+            params.set_pos(pos);
+            params.set_insert(text);
+            params.set_delete(0);
+        }
+        let _ = req.send();
+    }
+}
+
+/// Process LLM streaming in a background task.
+/// This function handles all stream events and broadcasts updates to subscribers.
+async fn process_llm_stream(
+    provider: Arc<AnthropicProvider>,
+    cells: SharedBlockStore,
+    block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
+    cell_id: String,
+    content: String,
+    model_name: String,
+) {
+    // Build conversation messages
+    let messages = vec![LlmMessage::user(&content)];
+
+    // Create streaming request
+    let stream_request = StreamRequest::new(&model_name, messages)
+        .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. Be concise and helpful.")
+        .with_max_tokens(4096);
+
+    // Start streaming
+    log::info!("Calling Anthropic API...");
+    let mut stream = match provider.stream(stream_request).await {
+        Ok(s) => {
+            log::info!("LLM stream started successfully");
+            s
+        }
+        Err(e) => {
+            log::error!("Failed to start LLM stream: {}", e);
+            // Insert error block and broadcast it
+            if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
+                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", e), false, None, None, None, true);
+            }
+            return;
+        }
+    };
+
+    // Process stream events
+    let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
+    // Track tool_use_id (string from LLM) → BlockId mapping
+    let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
+
+    log::debug!("Entering stream event loop");
+    while let Some(event) = stream.next_event().await {
+        log::debug!("Received stream event: {:?}", event);
+        match event {
+            StreamEvent::ThinkingStart => {
+                match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
+                    Ok(block_id) => {
+                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                            BlockKind::Thinking, "", false, None, None, None, false);
+                        current_block_id = Some(block_id);
+                    }
+                    Err(e) => log::error!("Failed to insert thinking block: {}", e),
+                }
+            }
+
+            StreamEvent::ThinkingDelta(text) => {
+                if let Some(ref block_id) = current_block_id {
+                    // Get current length before append for correct broadcast position
+                    let pos = cells.get(&cell_id)
+                        .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                        .map(|s| s.content.chars().count() as u64)
+                        .unwrap_or(0);
+                    if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                        log::error!("Failed to append thinking text: {}", e);
+                    } else {
+                        broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
+                    }
+                }
+            }
+
+            StreamEvent::ThinkingEnd => {
+                current_block_id = None;
+            }
+
+            StreamEvent::TextStart => {
+                match cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
+                    Ok(block_id) => {
+                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                            BlockKind::Text, "", false, None, None, None, false);
+                        current_block_id = Some(block_id);
+                    }
+                    Err(e) => log::error!("Failed to insert text block: {}", e),
+                }
+            }
+
+            StreamEvent::TextDelta(text) => {
+                if let Some(ref block_id) = current_block_id {
+                    // Get current length before append for correct broadcast position
+                    let pos = cells.get(&cell_id)
+                        .and_then(|cell| cell.doc.get_block_snapshot(block_id))
+                        .map(|s| s.content.chars().count() as u64)
+                        .unwrap_or(0);
+                    if let Err(e) = cells.append_text(&cell_id, block_id, &text) {
+                        log::error!("Failed to append text: {}", e);
+                    } else {
+                        broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
+                    }
+                }
+            }
+
+            StreamEvent::TextEnd => {
+                current_block_id = None;
+            }
+
+            StreamEvent::ToolUse { id, name, input } => {
+                match cells.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
+                    Ok(block_id) => {
+                        // Track the tool_use_id → BlockId mapping for later ToolResult
+                        tool_call_blocks.insert(id.clone(), block_id.clone());
+                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                            BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
+                    }
+                    Err(e) => log::error!("Failed to insert tool use block: {}", e),
+                }
+            }
+
+            StreamEvent::ToolResult { tool_use_id, content, is_error } => {
+                // Look up the tool call BlockId from our tracking map
+                if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
+                    match cells.insert_tool_result(&cell_id, tool_call_block_id, None, &content, is_error, None) {
+                        Ok(block_id) => {
+                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
+                                BlockKind::ToolResult, &content, false, None, None, Some(tool_call_block_id), is_error);
+                        }
+                        Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                    }
+                } else {
+                    log::error!("Tool result for unknown tool_use_id: {}", tool_use_id);
+                }
+            }
+
+            StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
+                log::info!(
+                    "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
+                    stop_reason, input_tokens, output_tokens
+                );
+            }
+
+            StreamEvent::Error(err) => {
+                log::error!("LLM stream error: {}", err);
+                if let Ok(block_id) = cells.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
+                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", err), false, None, None, None, true);
+                }
+            }
+        }
+    }
+    log::info!("LLM stream processing complete for cell {}", cell_id);
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
 
 /// Convert kernel CellKind to capnp CellKind
 fn cell_kind_to_capnp(kind: kaijutsu_kernel::CellKind) -> crate::kaijutsu_capnp::CellKind {
