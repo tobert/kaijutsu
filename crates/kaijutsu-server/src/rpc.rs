@@ -211,6 +211,8 @@ pub struct KernelState {
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
     pub documents: SharedBlockStore,
+    /// Main document ID for this kernel (deterministic: {kernel_id}:main)
+    pub main_document_id: String,
     /// Subscribers for block update events (LLM streaming)
     pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
 }
@@ -308,12 +310,12 @@ impl world::Server for WorldImpl {
                 // Create block store with database persistence
                 let documents = create_block_store_with_db(&id);
 
-                // Create default document if none exist
-                if documents.is_empty() {
-                    let default_id = uuid::Uuid::new_v4().to_string();
-                    log::info!("Creating default document {} for kernel {}", default_id, id);
-                    if let Err(e) = documents.create_document(default_id.clone(), DocumentKind::Code, Some("rust".into())) {
-                        log::warn!("Failed to create default document: {}", e);
+                // Ensure main document exists (deterministic ID)
+                let main_document_id = format!("{}:main", id);
+                if !documents.contains(&main_document_id) {
+                    log::info!("Creating main document {} for kernel {}", main_document_id, id);
+                    if let Err(e) = documents.create_document(main_document_id.clone(), DocumentKind::Conversation, None) {
+                        log::warn!("Failed to create main document: {}", e);
                     }
                 }
 
@@ -332,6 +334,7 @@ impl world::Server for WorldImpl {
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
                         documents,
+                        main_document_id,
                         block_subscribers: Vec::new(),
                     },
                 );
@@ -376,12 +379,12 @@ impl world::Server for WorldImpl {
             // Create block store with database persistence
             let documents = create_block_store_with_db(&id);
 
-            // Create default document if none exist
-            if documents.is_empty() {
-                let default_id = uuid::Uuid::new_v4().to_string();
-                log::info!("Creating default document {} for new kernel {}", default_id, id);
-                if let Err(e) = documents.create_document(default_id.clone(), DocumentKind::Code, Some("rust".into())) {
-                    log::warn!("Failed to create default document: {}", e);
+            // Ensure main document exists (deterministic ID)
+            let main_document_id = format!("{}:main", id);
+            if !documents.contains(&main_document_id) {
+                log::info!("Creating main document {} for new kernel {}", main_document_id, id);
+                if let Err(e) = documents.create_document(main_document_id.clone(), DocumentKind::Conversation, None) {
+                    log::warn!("Failed to create main document: {}", e);
                 }
             }
 
@@ -401,6 +404,7 @@ impl world::Server for WorldImpl {
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
                         documents,
+                        main_document_id,
                         block_subscribers: Vec::new(),
                     },
                 );
