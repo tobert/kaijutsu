@@ -31,10 +31,7 @@ fn main() {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            // Default to info for our crates, warn for others
-            "kaijutsu_app=debug,kaijutsu_client=debug,warn".into()
-        }))
+        .with(EnvFilter::new("warn,kaijutsu_app=debug,kaijutsu_client=debug"))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
@@ -56,6 +53,8 @@ fn main() {
                 file_path: "../../assets".into(),
                 ..default()
             })
+            // Disable Bevy's LogPlugin - we set up our own tracing subscriber
+            .disable::<bevy::log::LogPlugin>()
         )
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
