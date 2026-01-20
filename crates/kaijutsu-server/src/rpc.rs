@@ -2168,6 +2168,11 @@ async fn process_llm_stream(
         // Loop continues - re-prompt with tool results
     }
 
+    // Save final state after streaming completes
+    if let Err(e) = cells.save_snapshot(&cell_id) {
+        log::warn!("Failed to save snapshot for cell {}: {}", cell_id, e);
+    }
+
     log::info!("LLM stream processing complete for cell {}", cell_id);
 }
 

@@ -17,8 +17,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use kaijutsu_crdt::{
-    BlockDocument, BlockId, BlockKind, BlockSnapshot, Role, SerializedOps, SerializedOpsOwned,
-    Status, LV,
+    BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Role, SerializedOps,
+    SerializedOpsOwned, Status, LV,
 };
 
 use crate::db::{CellDb, CellKind, CellMeta};
@@ -73,6 +73,23 @@ impl CellEntry {
             kind,
             language,
             version: AtomicU64::new(0),
+            last_agent: RwLock::new(agent_id.to_string()),
+        }
+    }
+
+    /// Create a cell entry from a document snapshot.
+    fn from_snapshot(
+        snapshot: DocumentSnapshot,
+        kind: CellKind,
+        language: Option<String>,
+        agent_id: &str,
+    ) -> Self {
+        let version = snapshot.version;
+        Self {
+            doc: BlockDocument::from_snapshot(snapshot, agent_id),
+            kind,
+            language,
+            version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id.to_string()),
         }
     }
@@ -245,6 +262,16 @@ impl BlockStore {
     // Block Operations
     // =========================================================================
 
+    /// Auto-save snapshot if database is configured.
+    /// Logs warnings on failure but doesn't propagate errors.
+    fn auto_save(&self, cell_id: &str) {
+        if self.db.is_some() {
+            if let Err(e) = self.save_snapshot(cell_id) {
+                tracing::warn!(cell_id = %cell_id, error = %e, "Failed to auto-save snapshot");
+            }
+        }
+    }
+
     /// Insert a block into a cell.
     ///
     /// This is the primary block creation API.
@@ -266,11 +293,15 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
     ) -> Result<BlockId, String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        let result = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
-            .map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        let result = {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            let result = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
+                .map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+            result
+        };
+        self.auto_save(cell_id);
         Ok(result)
     }
 
@@ -283,11 +314,15 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        let result = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
-            .map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        let result = {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            let result = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
+                .map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+            result
+        };
+        self.auto_save(cell_id);
         Ok(result)
     }
 
@@ -301,11 +336,15 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        let result = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
-            .map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        let result = {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            let result = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
+                .map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+            result
+        };
+        self.auto_save(cell_id);
         Ok(result)
     }
 
@@ -316,14 +355,20 @@ impl BlockStore {
         block_id: &BlockId,
         status: Status,
     ) -> Result<(), String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+        }
+        self.auto_save(cell_id);
         Ok(())
     }
 
     /// Edit text within a block.
+    ///
+    /// Note: Does not auto-save to avoid excessive I/O during streaming.
+    /// Call `save_snapshot()` explicitly when editing is complete.
     pub fn edit_text(
         &self,
         cell_id: &str,
@@ -336,33 +381,44 @@ impl BlockStore {
         let agent_id = self.agent_id();
         entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
+        // Note: No auto-save for text edits (high frequency during streaming)
         Ok(())
     }
 
     /// Append text to a block.
+    ///
+    /// Note: Does not auto-save to avoid excessive I/O during streaming.
+    /// Call `save_snapshot()` explicitly when streaming is complete.
     pub fn append_text(&self, cell_id: &str, block_id: &BlockId, text: &str) -> Result<(), String> {
         let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
         let agent_id = self.agent_id();
         entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
         entry.touch(&agent_id);
+        // Note: No auto-save for text appends (high frequency during streaming)
         Ok(())
     }
 
     /// Set collapsed state for a thinking block.
     pub fn set_collapsed(&self, cell_id: &str, block_id: &BlockId, collapsed: bool) -> Result<(), String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.set_collapsed(block_id, collapsed).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            entry.doc.set_collapsed(block_id, collapsed).map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+        }
+        self.auto_save(cell_id);
         Ok(())
     }
 
     /// Delete a block from a cell.
     pub fn delete_block(&self, cell_id: &str, block_id: &BlockId) -> Result<(), String> {
-        let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.delete_block(block_id).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        {
+            let mut entry = self.get_mut(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+            let agent_id = self.agent_id();
+            entry.doc.delete_block(block_id).map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+        }
+        self.auto_save(cell_id);
         Ok(())
     }
 
@@ -426,7 +482,9 @@ impl BlockStore {
     // =========================================================================
 
     /// Load cells from database on startup.
-    /// Note: Currently only loads cell metadata, not block content.
+    ///
+    /// For each cell, loads both metadata and content from the snapshot table.
+    /// The `oplog_bytes` column stores JSON-encoded DocumentSnapshot.
     pub fn load_from_db(&self) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
         let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
@@ -437,11 +495,64 @@ impl BlockStore {
 
         let agent_id = self.agent_id();
         for meta in cell_metas {
-            let entry = CellEntry::new(&meta.id, meta.kind, meta.language, &agent_id);
-            // TODO: Load block content from database
-            // For now, cells start empty after restart
+            // Try to load snapshot for this cell
+            let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
+                // oplog_bytes contains JSON-encoded DocumentSnapshot
+                if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
+                    match serde_json::from_slice::<DocumentSnapshot>(&oplog_bytes) {
+                        Ok(doc_snapshot) => {
+                            tracing::debug!(
+                                cell_id = %meta.id,
+                                blocks = doc_snapshot.blocks.len(),
+                                "Restored cell from snapshot"
+                            );
+                            CellEntry::from_snapshot(doc_snapshot, meta.kind, meta.language.clone(), &agent_id)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                cell_id = %meta.id,
+                                error = %e,
+                                "Failed to deserialize snapshot, starting empty"
+                            );
+                            CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                        }
+                    }
+                } else {
+                    // Snapshot exists but no oplog_bytes, start empty
+                    CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                }
+            } else {
+                // No snapshot, start empty
+                CellEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+            };
+
             self.cells.insert(meta.id, entry);
         }
+
+        Ok(())
+    }
+
+    /// Save a cell's content to the database as a snapshot.
+    ///
+    /// Stores the DocumentSnapshot as JSON in the `oplog_bytes` column.
+    pub fn save_snapshot(&self, cell_id: &str) -> Result<(), String> {
+        let db = self.db.as_ref().ok_or("No database configured")?;
+
+        let entry = self.get(cell_id).ok_or_else(|| format!("Cell {} not found", cell_id))?;
+        let snapshot = entry.doc.snapshot();
+        let version = entry.version() as i64;
+        let content = entry.content();
+
+        // Serialize snapshot as JSON
+        let oplog_bytes = serde_json::to_vec(&snapshot)
+            .map_err(|e| format!("Failed to serialize snapshot: {}", e))?;
+
+        drop(entry); // Release the read lock before acquiring DB lock
+
+        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+        db_guard
+            .save_snapshot(cell_id, version, &content, Some(&oplog_bytes))
+            .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(())
     }

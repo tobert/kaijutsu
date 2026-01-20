@@ -842,12 +842,11 @@ pub fn handle_prompt_submit(
 /// 2. Streaming the LLM response as blocks
 /// 3. Broadcasting block changes to all connected clients
 ///
-/// We also add the user message locally for immediate feedback,
-/// then let server sync handle any conflicts.
+/// Note: We don't add the user message locally - the server adds it and broadcasts
+/// back to us. This avoids duplicate messages.
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
     current_conv: Res<CurrentConversation>,
-    mut registry: ResMut<ConversationRegistry>,
     mut scroll_state: ResMut<ConversationScrollState>,
     cmds: Option<Res<crate::connection::ConnectionCommands>>,
 ) {
@@ -858,25 +857,8 @@ pub fn handle_prompt_submitted(
     };
 
     for event in submit_events.read() {
-        // Add user message locally for immediate feedback
-        if let Some(conv) = registry.get_mut(conv_id) {
-            let author = conv
-                .participants
-                .iter()
-                .find(|p| p.is_user())
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| format!("user:{}", whoami::username()));
-
-            if let Some(block_id) = conv.add_text_message(&author, &event.text) {
-                info!(
-                    "Added user message locally to conversation {}: block {}",
-                    conv_id, block_id
-                );
-                scroll_state.scroll_to_bottom = true;
-            }
-        }
-
         // Send prompt to server for LLM processing
+        // Server will add the user block and broadcast it back to us
         if let Some(ref cmds) = cmds {
             cmds.send(crate::connection::ConnectionCommand::Prompt {
                 content: event.text.clone(),
@@ -884,6 +866,7 @@ pub fn handle_prompt_submitted(
                 cell_id: conv_id.to_string(),
             });
             info!("Sent prompt to server for conversation {}", conv_id);
+            scroll_state.scroll_to_bottom = true;
         } else {
             warn!("No connection available, prompt not sent to server");
         }

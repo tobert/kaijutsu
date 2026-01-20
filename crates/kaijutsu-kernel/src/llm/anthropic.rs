@@ -127,10 +127,14 @@ impl AnthropicProvider {
                         ContentBlock::Text { text } => {
                             Some(RequestContentBlock::Text { text: text.clone() })
                         }
-                        ContentBlock::ToolUse { .. } => {
-                            // Tool use blocks from assistant are handled differently
-                            // (they're in ResponseContentBlock, not RequestContentBlock)
-                            None
+                        ContentBlock::ToolUse { id, name, input } => {
+                            // Tool use blocks from assistant messages need to be included
+                            // so the model can understand the context when we send tool results
+                            Some(RequestContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            })
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,
