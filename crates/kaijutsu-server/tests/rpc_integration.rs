@@ -119,43 +119,6 @@ fn test_kernel_appears_in_list() {
 }
 
 #[test]
-fn test_send_message() {
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
-
-        let kernel = client.attach_kernel("chat-kernel").await.unwrap();
-        let row = kernel.send("Hello, world!").await.unwrap();
-
-        assert!(row.id > 0);
-        assert_eq!(row.content, "Hello, world!");
-        assert_eq!(row.sender, "test_user");
-    });
-}
-
-#[test]
-fn test_get_history() {
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
-
-        let kernel = client.attach_kernel("history-kernel").await.unwrap();
-
-        // Send some messages
-        kernel.send("Message 1").await.unwrap();
-        kernel.send("Message 2").await.unwrap();
-        kernel.send("Message 3").await.unwrap();
-
-        // Get history
-        let history = kernel.get_history(10, 0).await.unwrap();
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0].content, "Message 1");
-        assert_eq!(history[1].content, "Message 2");
-        assert_eq!(history[2].content, "Message 3");
-    });
-}
-
-#[test]
 fn test_create_kernel_with_config() {
     run_local(async {
         let addr = start_server().await;
@@ -173,19 +136,5 @@ fn test_create_kernel_with_config() {
     });
 }
 
-#[test]
-fn test_mention_agent() {
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
-
-        let kernel = client.attach_kernel("agent-kernel").await.unwrap();
-        let row = kernel.mention("claude", "help me write tests").await.unwrap();
-
-        assert!(row.content.contains("@claude"));
-        assert!(row.content.contains("help me write tests"));
-    });
-}
-
-// NOTE: Tests for execute() and command_history() removed - they require kaish binary
+// NOTE: Tests for execute() and command_history() require kaish binary
 // which is not currently available. Re-add when kaish is integrated.

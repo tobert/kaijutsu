@@ -89,28 +89,6 @@ struct HistoryEntry {
 }
 
 # ============================================================================
-# Message DAG Types
-# ============================================================================
-
-struct Row {
-  id @0 :UInt64;
-  parentId @1 :UInt64;          # 0 = root level
-  rowType @2 :RowType;
-  sender @3 :Text;
-  content @4 :Text;
-  timestamp @5 :UInt64;
-  metadata @6 :Text;            # JSON for extensibility
-}
-
-enum RowType {
-  chat @0;
-  agentResponse @1;
-  toolCall @2;
-  toolResult @3;
-  systemMessage @4;
-}
-
-# ============================================================================
 # VFS Types
 # ============================================================================
 
@@ -180,14 +158,6 @@ struct OutputEvent {
 # Event Callbacks (Client implements these)
 # ============================================================================
 
-interface KernelEvents {
-  onRow @0 (row :Row);
-  onUserJoin @1 (username :Text);
-  onUserLeave @2 (username :Text);
-  onAgentStatus @3 (agent :Text, status :Text);
-  # Future: onLeaseChange, onCheckpoint
-}
-
 interface KernelOutput {
   onOutput @0 (event :KernelOutputEvent);
 }
@@ -209,129 +179,41 @@ interface World {
 interface Kernel {
   # Info
   getInfo @0 () -> (info :KernelInfo);
-  getHistory @1 (limit :UInt32, beforeId :UInt64) -> (rows :List(Row));
 
-  # Messaging
-  send @2 (content :Text) -> (row :Row);
-  mention @3 (agent :Text, content :Text) -> (row :Row);
-  subscribe @4 (callback :KernelEvents);
-
-  # kaish execution (directly on Kernel, no indirection)
-  execute @5 (code :Text) -> (execId :UInt64);
-  interrupt @6 (execId :UInt64);
-  complete @7 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
-  subscribeOutput @8 (callback :KernelOutput);
-  getCommandHistory @9 (limit :UInt32) -> (entries :List(HistoryEntry));
+  # kaish execution
+  execute @1 (code :Text) -> (execId :UInt64);
+  interrupt @2 (execId :UInt64);
+  complete @3 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
+  subscribeOutput @4 (callback :KernelOutput);
+  getCommandHistory @5 (limit :UInt32) -> (entries :List(HistoryEntry));
 
   # Equipment
-  listEquipment @10 () -> (tools :List(ToolInfo));
-  equip @11 (tool :Text);
-  unequip @12 (tool :Text);
+  listEquipment @6 () -> (tools :List(ToolInfo));
+  equip @7 (tool :Text);
+  unequip @8 (tool :Text);
 
   # Lifecycle
-  fork @13 (name :Text) -> (kernel :Kernel);
-  thread @14 (name :Text) -> (kernel :Kernel);
-  detach @15 ();
+  fork @9 (name :Text) -> (kernel :Kernel);
+  thread @10 (name :Text) -> (kernel :Kernel);
+  detach @11 ();
 
   # VFS
-  vfs @16 () -> (vfs :Vfs);
-  listMounts @17 () -> (mounts :List(MountInfo));
-  mount @18 (path :Text, source :Text, writable :Bool);
-  unmount @19 (path :Text) -> (success :Bool);
-
-  # Cell CRDT sync
-  listCells @20 () -> (cells :List(CellInfo));
-  getCell @21 (cellId :Text) -> (cell :CellState);
-  createCell @22 (kind :CellKind, language :Text, parentId :Text) -> (cell :CellState);
-  deleteCell @23 (cellId :Text);
-  applyOp @24 (op :CellOp) -> (newVersion :UInt64);
-  subscribeCells @25 (callback :CellEvents);
-
-  # Bulk sync for initial load / reconnect
-  syncCells @26 (fromVersions :List(CellVersion)) -> (patches :List(CellPatch), newCells :List(CellState));
+  vfs @12 () -> (vfs :Vfs);
+  listMounts @13 () -> (mounts :List(MountInfo));
+  mount @14 (path :Text, source :Text, writable :Bool);
+  unmount @15 (path :Text) -> (success :Bool);
 
   # Tool execution
-  executeTool @27 (call :ToolCall) -> (result :ToolResult);
-  getToolSchemas @28 () -> (schemas :List(ToolSchema));
+  executeTool @16 (call :ToolCall) -> (result :ToolResult);
+  getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
-  # Block-based CRDT operations (new architecture)
-  applyBlockOp @29 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
-  subscribeBlocks @30 (callback :BlockEvents);
-  getBlockCellState @31 (cellId :Text) -> (state :BlockCellState);
+  # Block-based CRDT operations
+  applyBlockOp @18 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  subscribeBlocks @19 (callback :BlockEvents);
+  getBlockCellState @20 (cellId :Text) -> (state :BlockCellState);
 
   # LLM operations
-  prompt @32 (request :LlmRequest) -> (promptId :Text);
-}
-
-struct CellVersion {
-  cellId @0 :Text;
-  version @1 :UInt64;
-}
-
-# ============================================================================
-# Cell CRDT Types
-# ============================================================================
-
-enum CellKind {
-  code @0;
-  markdown @1;
-  output @2;
-  system @3;
-  userMessage @4;
-  agentMessage @5;
-}
-
-struct CellInfo {
-  id @0 :Text;
-  kind @1 :CellKind;
-  language @2 :Text;          # For code cells, e.g. "rust", "python"
-  parentId @3 :Text;          # For nested cells (tool calls under messages)
-}
-
-# Legacy CellOp - kept for transitional sync (will be removed)
-struct CellOp {
-  cellId @0 :Text;
-  clientVersion @1 :UInt64;   # Client's version before this op
-  op @2 :CrdtOp;
-}
-
-# Legacy CrdtOp - kept for transitional sync (will be removed)
-struct CrdtOp {
-  union {
-    insert :group {
-      pos @0 :UInt64;
-      text @1 :Text;
-    }
-    delete :group {
-      pos @2 :UInt64;
-      len @3 :UInt64;
-    }
-    # Full state sync (for initial load or recovery)
-    fullState @4 :Data;       # Encoded diamond-types document
-  }
-}
-
-# Legacy CellState - kept for transitional sync
-struct CellState {
-  info @0 :CellInfo;
-  content @1 :Text;           # Current text content
-  version @2 :UInt64;         # Server's CRDT version
-  encodedDoc @3 :Data;        # Optional: full diamond-types doc for sync
-}
-
-# Legacy CellPatch - kept for transitional sync
-struct CellPatch {
-  cellId @0 :Text;
-  fromVersion @1 :UInt64;     # Version patch is based on
-  toVersion @2 :UInt64;       # Version after applying patch
-  ops @3 :Data;               # Encoded diamond-types patch
-}
-
-# Callback for receiving cell updates from server
-interface CellEvents {
-  onCellCreated @0 (cell :CellState);
-  onCellUpdated @1 (patch :CellPatch);
-  onCellDeleted @2 (cellId :Text);
+  prompt @21 (request :LlmRequest) -> (promptId :Text);
 }
 
 # ============================================================================
@@ -440,7 +322,7 @@ struct BlockDocOp {
 
 # Full cell state with blocks
 struct BlockCellState {
-  info @0 :CellInfo;
+  cellId @0 :Text;
   blocks @1 :List(BlockSnapshot);
   version @2 :UInt64;
 }

@@ -123,7 +123,6 @@ pub struct ServerState {
     pub identity: Identity,
     pub kernels: HashMap<String, KernelState>,
     next_kernel_id: AtomicU64,
-    next_row_id: AtomicU64,
     next_exec_id: AtomicU64,
     /// LLM provider (initialized from ANTHROPIC_API_KEY)
     pub llm_provider: Option<Arc<AnthropicProvider>>,
@@ -147,7 +146,6 @@ impl ServerState {
             },
             kernels: HashMap::new(),
             next_kernel_id: AtomicU64::new(1),
-            next_row_id: AtomicU64::new(1),
             next_exec_id: AtomicU64::new(1),
             llm_provider,
         }
@@ -155,10 +153,6 @@ impl ServerState {
 
     fn next_kernel_id(&self) -> String {
         format!("kernel-{}", self.next_kernel_id.fetch_add(1, Ordering::SeqCst))
-    }
-
-    fn next_row_id(&self) -> u64 {
-        self.next_row_id.fetch_add(1, Ordering::SeqCst)
     }
 
     fn next_exec_id(&self) -> u64 {
@@ -210,7 +204,6 @@ pub struct KernelState {
     pub id: String,
     pub name: String,
     pub consent_mode: ConsentMode,
-    pub rows: Vec<RowData>,
     pub command_history: Vec<CommandEntry>,
     /// Kaish subprocess for execution (spawned lazily)
     pub kaish: Option<Rc<KaishProcess>>,
@@ -218,8 +211,6 @@ pub struct KernelState {
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
     pub cells: SharedBlockStore,
-    /// Subscribers for cell update events
-    pub cell_subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>,
     /// Subscribers for block update events (LLM streaming)
     pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
 }
@@ -228,16 +219,6 @@ pub struct KernelState {
 pub enum ConsentMode {
     Collaborative,
     Autonomous,
-}
-
-#[derive(Clone)]
-pub struct RowData {
-    pub id: u64,
-    pub parent_id: u64,
-    pub row_type: RowType,
-    pub sender: String,
-    pub content: String,
-    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -347,12 +328,10 @@ impl world::Server for WorldImpl {
                         id: id.clone(),
                         name: id.clone(),
                         consent_mode: ConsentMode::Collaborative,
-                        rows: Vec::new(),
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
                         cells,
-                        cell_subscribers: Vec::new(),
                         block_subscribers: Vec::new(),
                     },
                 );
@@ -418,12 +397,10 @@ impl world::Server for WorldImpl {
                         id: id.clone(),
                         name,
                         consent_mode,
-                        rows: Vec::new(),
                         command_history: Vec::new(),
                         kaish: None, // Spawned lazily
                         kernel: kernel_arc,
                         cells,
-                        cell_subscribers: Vec::new(),
                         block_subscribers: Vec::new(),
                     },
                 );
@@ -468,123 +445,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn get_history(
-        self: Rc<Self>,
-        params: kernel::GetHistoryParams,
-        mut results: kernel::GetHistoryResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = pry!(params.get());
-        let limit = params.get_limit() as usize;
-        let before_id = params.get_before_id();
-
-        let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let rows: Vec<_> = kernel.rows.iter()
-                .filter(|r| before_id == 0 || r.id < before_id)
-                .take(limit)
-                .collect();
-
-            let mut result_rows = results.get().init_rows(rows.len() as u32);
-            for (i, row) in rows.iter().enumerate() {
-                let mut r = result_rows.reborrow().get(i as u32);
-                r.set_id(row.id);
-                r.set_parent_id(row.parent_id);
-                r.set_row_type(row.row_type);
-                r.set_sender(&row.sender);
-                r.set_content(&row.content);
-                r.set_timestamp(row.timestamp);
-            }
-        }
-        Promise::ok(())
-    }
-
-    fn send(
-        self: Rc<Self>,
-        params: kernel::SendParams,
-        mut results: kernel::SendResults,
-    ) -> Promise<(), capnp::Error> {
-        let content = pry!(pry!(pry!(params.get()).get_content()).to_str()).to_owned();
-
-        let row = {
-            let mut state = self.state.borrow_mut();
-            let id = state.next_row_id();
-            let sender = state.identity.username.clone();
-            let row = RowData {
-                id,
-                parent_id: 0,
-                row_type: RowType::Chat,
-                sender,
-                content,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_secs(),
-            };
-            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-                kernel.rows.push(row.clone());
-            }
-            row
-        };
-
-        let mut r = results.get().init_row();
-        r.set_id(row.id);
-        r.set_parent_id(row.parent_id);
-        r.set_row_type(row.row_type);
-        r.set_sender(&row.sender);
-        r.set_content(&row.content);
-        r.set_timestamp(row.timestamp);
-        Promise::ok(())
-    }
-
-    fn mention(
-        self: Rc<Self>,
-        params: kernel::MentionParams,
-        mut results: kernel::MentionResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = pry!(params.get());
-        let agent = pry!(pry!(params.get_agent()).to_str()).to_owned();
-        let content = pry!(pry!(params.get_content()).to_str()).to_owned();
-        let full_content = format!("@{} {}", agent, content);
-
-        let row = {
-            let mut state = self.state.borrow_mut();
-            let id = state.next_row_id();
-            let sender = state.identity.username.clone();
-            let row = RowData {
-                id,
-                parent_id: 0,
-                row_type: RowType::Chat,
-                sender,
-                content: full_content,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_secs(),
-            };
-            if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-                kernel.rows.push(row.clone());
-            }
-            row
-        };
-
-        let mut r = results.get().init_row();
-        r.set_id(row.id);
-        r.set_parent_id(row.parent_id);
-        r.set_row_type(row.row_type);
-        r.set_sender(&row.sender);
-        r.set_content(&row.content);
-        r.set_timestamp(row.timestamp);
-        Promise::ok(())
-    }
-
-    fn subscribe(
-        self: Rc<Self>,
-        _params: kernel::SubscribeParams,
-        _results: kernel::SubscribeResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
-    }
-
     // kaish execution methods
 
     fn execute(
@@ -621,7 +481,7 @@ impl kernel::Server for KernelImpl {
             };
 
             // Execute code via kaish subprocess
-            let exec_result = match kaish.execute(&code).await {
+            let _exec_result = match kaish.execute(&code).await {
                 Ok(result) => result,
                 Err(e) => {
                     log::error!("kaish execute error: {}", e);
@@ -633,8 +493,6 @@ impl kernel::Server for KernelImpl {
             {
                 let mut state_ref = state.borrow_mut();
                 let exec_id = state_ref.next_exec_id();
-                let sender = state_ref.identity.username.clone();
-                let row_id = state_ref.next_row_id();
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("system clock before UNIX epoch")
@@ -645,21 +503,6 @@ impl kernel::Server for KernelImpl {
                     kernel.command_history.push(CommandEntry {
                         id: exec_id,
                         code: code.clone(),
-                        timestamp,
-                    });
-
-                    // Always add a tool result row (even if empty, so history fetch works)
-                    let content = if !exec_result.ok() {
-                        format!("Error: {}", exec_result.err)
-                    } else {
-                        exec_result.out.clone() // May be empty string
-                    };
-                    kernel.rows.push(RowData {
-                        id: row_id,
-                        parent_id: 0,
-                        row_type: RowType::ToolResult,
-                        sender,
-                        content,
                         timestamp,
                     });
                 }
@@ -946,287 +789,6 @@ impl kernel::Server for KernelImpl {
         })
     }
 
-    // Cell CRDT methods
-
-    fn list_cells(
-        self: Rc<Self>,
-        _params: kernel::ListCellsParams,
-        mut results: kernel::ListCellsResults,
-    ) -> Promise<(), capnp::Error> {
-        let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            let ids = kernel.cells.list_ids();
-            let mut builder = results.get().init_cells(ids.len() as u32);
-            for (i, id) in ids.iter().enumerate() {
-                if let Some(doc) = kernel.cells.get(id) {
-                    let mut c = builder.reborrow().get(i as u32);
-                    c.set_id(id);
-                    c.set_kind(cell_kind_to_capnp(doc.kind));
-                    if let Some(ref lang) = doc.language {
-                        c.set_language(lang);
-                    }
-                }
-            }
-        }
-        Promise::ok(())
-    }
-
-    fn get_cell(
-        self: Rc<Self>,
-        params: kernel::GetCellParams,
-        mut results: kernel::GetCellResults,
-    ) -> Promise<(), capnp::Error> {
-        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
-
-        let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            if let Some(doc) = kernel.cells.get(&cell_id) {
-                let mut cell = results.get().init_cell();
-                let mut info = cell.reborrow().init_info();
-                info.set_id(&cell_id);
-                info.set_kind(cell_kind_to_capnp(doc.kind));
-                if let Some(ref lang) = doc.language {
-                    info.set_language(lang);
-                }
-                cell.set_content(&doc.content());
-                cell.set_version(doc.version());
-                // TODO: Implement block-based encoding for sync
-                // The old flat-text CRDT encoding is being replaced with block ops
-                cell.set_encoded_doc(&[]);
-            }
-        }
-        Promise::ok(())
-    }
-
-    fn create_cell(
-        self: Rc<Self>,
-        params: kernel::CreateCellParams,
-        mut results: kernel::CreateCellResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = pry!(params.get());
-        let kind = cell_kind_from_capnp(params.get_kind().unwrap_or(crate::kaijutsu_capnp::CellKind::Code));
-        let language = params.get_language().ok()
-            .and_then(|l| l.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
-        let _parent_id = params.get_parent_id().ok().and_then(|p| p.to_str().ok()).map(|s| s.to_owned());
-
-        // Generate a new cell ID
-        let cell_id = uuid::Uuid::new_v4().to_string();
-
-        // Collect data for notification before releasing the borrow
-        let cell_data: Option<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64, Vec<u8>)>;
-        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
-
-        {
-            let state = self.state.borrow();
-            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                if kernel.cells.create_cell(cell_id.clone(), kind, language.clone()).is_ok() {
-                    // Get the created cell to build results
-                    if let Some(doc) = kernel.cells.get(&cell_id) {
-                        let mut cell = results.get().init_cell();
-                        let mut info = cell.reborrow().init_info();
-                        info.set_id(&cell_id);
-                        info.set_kind(cell_kind_to_capnp(doc.kind));
-                        if let Some(ref lang) = doc.language {
-                            info.set_language(lang);
-                        }
-                        cell.set_content(&doc.content());
-                        cell.set_version(doc.version());
-
-                        // Collect data for notification
-                        cell_data = Some((
-                            cell_id.clone(),
-                            doc.kind,
-                            doc.language.clone(),
-                            doc.content(),
-                            doc.version(),
-                            Vec::new(), // TODO: Implement block-based encoding
-                        ));
-                    } else {
-                        cell_data = None;
-                    }
-                } else {
-                    cell_data = None;
-                }
-                subscribers = kernel.cell_subscribers.clone();
-            } else {
-                cell_data = None;
-                subscribers = Vec::new();
-            }
-        }
-
-        // Notify subscribers (outside of borrow scope)
-        if let Some((id, cell_kind, lang, content, version, encoded_doc)) = cell_data {
-            for subscriber in subscribers {
-                let mut req = subscriber.on_cell_created_request();
-                {
-                    let mut cell = req.get().init_cell();
-                    let mut info = cell.reborrow().init_info();
-                    info.set_id(&id);
-                    info.set_kind(cell_kind_to_capnp(cell_kind));
-                    if let Some(ref l) = lang {
-                        info.set_language(l);
-                    }
-                    cell.set_content(&content);
-                    cell.set_version(version);
-                    cell.set_encoded_doc(&encoded_doc);
-                }
-                let _ = req.send(); // Fire and forget
-            }
-        }
-
-        Promise::ok(())
-    }
-
-    fn delete_cell(
-        self: Rc<Self>,
-        params: kernel::DeleteCellParams,
-        _results: kernel::DeleteCellResults,
-    ) -> Promise<(), capnp::Error> {
-        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
-
-        let subscribers: Vec<crate::kaijutsu_capnp::cell_events::Client>;
-        let deleted: bool;
-
-        {
-            let state = self.state.borrow();
-            if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-                deleted = kernel.cells.delete_cell(&cell_id).is_ok();
-                subscribers = kernel.cell_subscribers.clone();
-            } else {
-                deleted = false;
-                subscribers = Vec::new();
-            }
-        }
-
-        // Notify subscribers
-        if deleted {
-            for subscriber in subscribers {
-                let mut req = subscriber.on_cell_deleted_request();
-                req.get().set_cell_id(&cell_id);
-                let _ = req.send(); // Fire and forget
-            }
-        }
-
-        Promise::ok(())
-    }
-
-    fn apply_op(
-        self: Rc<Self>,
-        params: kernel::ApplyOpParams,
-        mut results: kernel::ApplyOpResults,
-    ) -> Promise<(), capnp::Error> {
-        // NOTE: The old flat-text CRDT ops (Insert, Delete, FullState) are being replaced
-        // with block-based operations. This method is a no-op stub during the transition.
-        // Use the block-based API (apply_block_op) instead.
-        let params = pry!(params.get());
-        let op = pry!(params.get_op());
-        let cell_id = pry!(pry!(op.get_cell_id()).to_str()).to_owned();
-
-        log::warn!(
-            "apply_op called with old CRDT op for cell '{}' - this API is deprecated, use block ops",
-            cell_id
-        );
-
-        // Return the current version without making changes
-        let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            if let Some(doc) = kernel.cells.get(&cell_id) {
-                results.get().set_new_version(doc.version());
-            }
-        }
-
-        Promise::ok(())
-    }
-
-    fn subscribe_cells(
-        self: Rc<Self>,
-        params: kernel::SubscribeCellsParams,
-        _results: kernel::SubscribeCellsResults,
-    ) -> Promise<(), capnp::Error> {
-        let callback = pry!(pry!(params.get()).get_callback());
-
-        let mut state = self.state.borrow_mut();
-        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-            kernel.cell_subscribers.push(callback);
-            log::debug!(
-                "Added cell subscriber for kernel {} (total: {})",
-                self.kernel_id,
-                kernel.cell_subscribers.len()
-            );
-        }
-        Promise::ok(())
-    }
-
-    fn sync_cells(
-        self: Rc<Self>,
-        params: kernel::SyncCellsParams,
-        mut results: kernel::SyncCellsResults,
-    ) -> Promise<(), capnp::Error> {
-        // NOTE: The old flat-text CRDT sync is being replaced with block-based operations.
-        // This method now returns cells with content but empty encoding.
-        // Full sync will use the block-based protocol.
-        let params = pry!(params.get());
-        let from_versions = pry!(params.get_from_versions());
-
-        let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            // Build map of client versions
-            let mut client_versions: HashMap<String, u64> = HashMap::new();
-            for i in 0..from_versions.len() {
-                let v = from_versions.get(i);
-                if let Some(id) = v.get_cell_id().ok()
-                    .and_then(|t| t.to_str().ok())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_owned())
-                {
-                    client_versions.insert(id, v.get_version());
-                }
-            }
-
-            // Collect data from cells
-            // Store owned data for new cells: (id, kind, language, content, version)
-            // Note: We return all cells the client doesn't know about, with empty encoding
-            let mut new_cells: Vec<(String, kaijutsu_kernel::CellKind, Option<String>, String, u64)> = Vec::new();
-
-            for cell_id in kernel.cells.list_ids() {
-                if !client_versions.contains_key(&cell_id) {
-                    // Client doesn't have this cell - send cell info (content-based, no CRDT encoding)
-                    if let Some(doc) = kernel.cells.get(&cell_id) {
-                        new_cells.push((
-                            cell_id,
-                            doc.kind,
-                            doc.language.clone(),
-                            doc.content(),
-                            doc.version(),
-                        ));
-                    }
-                }
-                // Note: Patches (delta sync) are not supported in the transitional API.
-                // Clients should use block-based sync for incremental updates.
-            }
-
-            // No patches in transitional API
-            let _ = results.get().init_patches(0);
-
-            let mut new_cells_builder = results.get().init_new_cells(new_cells.len() as u32);
-            for (i, (id, kind, language, content, version)) in new_cells.iter().enumerate() {
-                let mut c = new_cells_builder.reborrow().get(i as u32);
-                let mut info = c.reborrow().init_info();
-                info.set_id(id);
-                info.set_kind(cell_kind_to_capnp(*kind));
-                if let Some(lang) = language {
-                    info.set_language(lang);
-                }
-                c.set_content(content);
-                c.set_version(*version);
-                c.set_encoded_doc(&[]); // Empty encoding - use block-based sync instead
-            }
-        }
-        Promise::ok(())
-    }
-
     // Tool execution
 
     fn execute_tool(
@@ -1455,14 +1017,7 @@ impl kernel::Server for KernelImpl {
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
             if let Some(doc) = kernel.cells.get(&cell_id) {
                 let mut cell_state = results.get().init_state();
-                {
-                    let mut info = cell_state.reborrow().init_info();
-                    info.set_id(&cell_id);
-                    info.set_kind(cell_kind_to_capnp(doc.kind));
-                    if let Some(ref lang) = doc.language {
-                        info.set_language(lang);
-                    }
-                }
+                cell_state.set_cell_id(&cell_id);
                 cell_state.reborrow().set_version(doc.version());
 
                 // Get actual blocks from BlockDocument
@@ -2179,30 +1734,6 @@ async fn process_llm_stream(
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Convert kernel CellKind to capnp CellKind
-fn cell_kind_to_capnp(kind: kaijutsu_kernel::CellKind) -> crate::kaijutsu_capnp::CellKind {
-    match kind {
-        kaijutsu_kernel::CellKind::Code => crate::kaijutsu_capnp::CellKind::Code,
-        kaijutsu_kernel::CellKind::Markdown => crate::kaijutsu_capnp::CellKind::Markdown,
-        kaijutsu_kernel::CellKind::Output => crate::kaijutsu_capnp::CellKind::Output,
-        kaijutsu_kernel::CellKind::System => crate::kaijutsu_capnp::CellKind::System,
-        kaijutsu_kernel::CellKind::UserMessage => crate::kaijutsu_capnp::CellKind::UserMessage,
-        kaijutsu_kernel::CellKind::AgentMessage => crate::kaijutsu_capnp::CellKind::AgentMessage,
-    }
-}
-
-/// Convert capnp CellKind to kernel CellKind
-fn cell_kind_from_capnp(kind: crate::kaijutsu_capnp::CellKind) -> kaijutsu_kernel::CellKind {
-    match kind {
-        crate::kaijutsu_capnp::CellKind::Code => kaijutsu_kernel::CellKind::Code,
-        crate::kaijutsu_capnp::CellKind::Markdown => kaijutsu_kernel::CellKind::Markdown,
-        crate::kaijutsu_capnp::CellKind::Output => kaijutsu_kernel::CellKind::Output,
-        crate::kaijutsu_capnp::CellKind::System => kaijutsu_kernel::CellKind::System,
-        crate::kaijutsu_capnp::CellKind::UserMessage => kaijutsu_kernel::CellKind::UserMessage,
-        crate::kaijutsu_capnp::CellKind::AgentMessage => kaijutsu_kernel::CellKind::AgentMessage,
-    }
-}
 
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
 fn set_block_snapshot(

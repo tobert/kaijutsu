@@ -13,9 +13,8 @@ pub mod kaijutsu_capnp {
 }
 
 pub use rpc::{
-    CellInfo, CellKind, CellOp, CellPatch, CellState, CellVersion, Completion, CompletionKind,
-    ConsentMode, CrdtOp, HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo, MountSpec,
-    Row, RowType, RpcClient, RpcError,
+    BlockCellState, Completion, CompletionKind, ConsentMode, HistoryEntry, Identity, KernelConfig,
+    KernelHandle, KernelInfo, MountSpec, RpcClient, RpcError,
 };
 pub use ssh::{SshChannels, SshClient, SshConfig, SshError};
 
