@@ -1003,7 +1003,7 @@ impl BlockListEngine {
         let mut blocks = Vec::new();
 
         let document_ids = self.documents.list_ids();
-        tracing::info!("block_list: found {} documents", document_ids.len());
+        tracing::debug!("block_list: found {} documents", document_ids.len());
         for document_id in document_ids {
             if let Some(entry) = self.documents.get(&document_id) {
                 let doc_blocks = entry.doc.blocks_ordered();
@@ -1031,8 +1031,10 @@ impl BlockListEngine {
                     // TODO: path_prefix filter for file blocks
 
                     // Create summary (first 100 chars or line count)
-                    let summary = if snapshot.content.len() > 100 {
-                        format!("{}... ({} lines)", &snapshot.content[..100], line_count(&snapshot.content))
+                    // Use .chars().take() for UTF-8 safe truncation (byte slicing can panic on multi-byte chars)
+                    let summary = if snapshot.content.chars().count() > 100 {
+                        let truncated: String = snapshot.content.chars().take(100).collect();
+                        format!("{}... ({} lines)", truncated, line_count(&snapshot.content))
                     } else {
                         snapshot.content.clone()
                     };

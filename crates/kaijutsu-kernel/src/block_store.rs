@@ -187,7 +187,7 @@ impl BlockStore {
                 position_col: None,
                 position_row: None,
                 parent_document: None,
-                created_at: 0,
+                created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
             };
             db_guard
                 .create_document(&meta)
