@@ -117,6 +117,28 @@ impl RpcClient {
 
         Ok(KernelHandle { kernel })
     }
+
+    /// List user's active seats across all kernels
+    pub async fn list_my_seats(&self) -> Result<Vec<SeatInfo>, RpcError> {
+        let request = self.world.list_my_seats_request();
+        let response = request.send().promise.await?;
+        let seats = response.get()?.get_seats()?;
+
+        let mut result = Vec::with_capacity(seats.len() as usize);
+        for seat in seats.iter() {
+            let id_reader = seat.get_id()?;
+            result.push(SeatInfo {
+                id: SeatId {
+                    nick: id_reader.get_nick()?.to_string()?,
+                    instance: id_reader.get_instance()?.to_string()?,
+                    kernel: id_reader.get_kernel()?.to_string()?,
+                    context: id_reader.get_context()?.to_string()?,
+                },
+                owner: seat.get_owner()?.to_string()?,
+            });
+        }
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -340,6 +362,56 @@ impl KernelHandle {
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.subscribe_blocks_request();
         request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Context & Seat operations
+    // =========================================================================
+
+    /// List contexts in this kernel
+    pub async fn list_contexts(&self) -> Result<Vec<Context>, RpcError> {
+        let request = self.kernel.list_contexts_request();
+        let response = request.send().promise.await?;
+        let contexts = response.get()?.get_contexts()?;
+
+        let mut result = Vec::with_capacity(contexts.len() as usize);
+        for ctx in contexts.iter() {
+            result.push(Context {
+                name: ctx.get_name()?.to_string()?,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Join a context (creates a seat)
+    pub async fn join_context(
+        &self,
+        context_name: &str,
+        instance: &str,
+    ) -> Result<SeatInfo, RpcError> {
+        let mut request = self.kernel.join_context_request();
+        request.get().set_context_name(context_name);
+        request.get().set_instance(instance);
+        let response = request.send().promise.await?;
+        let seat = response.get()?.get_seat()?;
+        let id_reader = seat.get_id()?;
+
+        Ok(SeatInfo {
+            id: SeatId {
+                nick: id_reader.get_nick()?.to_string()?,
+                instance: id_reader.get_instance()?.to_string()?,
+                kernel: id_reader.get_kernel()?.to_string()?,
+                context: id_reader.get_context()?.to_string()?,
+            },
+            owner: seat.get_owner()?.to_string()?,
+        })
+    }
+
+    /// Leave current seat
+    pub async fn leave_seat(&self) -> Result<(), RpcError> {
+        let request = self.kernel.leave_seat_request();
         request.send().promise.await?;
         Ok(())
     }

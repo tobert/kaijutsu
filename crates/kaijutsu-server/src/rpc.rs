@@ -118,6 +118,63 @@ async fn register_block_tools(kernel: &Arc<Kernel>, documents: SharedBlockStore)
     kernel.equip("kernel_search").await;
 }
 
+// ============================================================================
+// Seat & Context Types (Rust-side mirrors of Cap'n Proto types)
+// ============================================================================
+
+/// Unique identifier for a seat
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SeatId {
+    pub nick: String,
+    pub instance: String,
+    pub kernel: String,
+    pub context: String,
+}
+
+impl SeatId {
+    /// Create a string key for HashMap lookup
+    pub fn key(&self) -> String {
+        format!("@{}:{}@{}:{}", self.nick, self.instance, self.kernel, self.context)
+    }
+}
+
+/// Seat status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeatStatus {
+    #[default]
+    Active,
+    Idle,
+    Away,
+}
+
+/// Information about a seat
+#[derive(Debug, Clone)]
+pub struct SeatInfo {
+    pub id: SeatId,
+    pub owner: String,
+    pub status: SeatStatus,
+    pub last_activity: u64,
+    pub cursor_block: Option<String>,
+}
+
+/// A context within a kernel
+#[derive(Debug, Clone)]
+pub struct ContextState {
+    pub name: String,
+    pub documents: Vec<String>,  // Document IDs attached to this context
+    pub seats: Vec<SeatId>,      // Seats currently in this context
+}
+
+impl ContextState {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            documents: Vec::new(),
+            seats: Vec::new(),
+        }
+    }
+}
+
 /// Server state shared across all capabilities
 pub struct ServerState {
     pub identity: Identity,
@@ -126,6 +183,10 @@ pub struct ServerState {
     next_exec_id: AtomicU64,
     /// LLM provider (initialized from ANTHROPIC_API_KEY)
     pub llm_provider: Option<Arc<AnthropicProvider>>,
+    /// User's active seats across all kernels
+    pub my_seats: HashMap<String, SeatInfo>,  // key is SeatId::key()
+    /// Currently active seat for this connection (if any)
+    pub current_seat: Option<SeatId>,
 }
 
 impl ServerState {
@@ -148,6 +209,8 @@ impl ServerState {
             next_kernel_id: AtomicU64::new(1),
             next_exec_id: AtomicU64::new(1),
             llm_provider,
+            my_seats: HashMap::new(),
+            current_seat: None,
         }
     }
 
@@ -231,6 +294,8 @@ pub struct KernelState {
     pub main_document_id: String,
     /// Subscribers for block update events (LLM streaming)
     pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
+    /// Contexts within this kernel (for seat management)
+    pub contexts: HashMap<String, ContextState>,
 }
 
 #[derive(Clone, Copy)]
@@ -333,6 +398,10 @@ impl world::Server for WorldImpl {
                 let kernel_arc = Arc::new(kernel);
                 register_block_tools(&kernel_arc, documents.clone()).await;
 
+                // Create default context
+                let mut contexts = HashMap::new();
+                contexts.insert("default".to_string(), ContextState::new("default".to_string()));
+
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
                     id.clone(),
@@ -346,6 +415,7 @@ impl world::Server for WorldImpl {
                         documents,
                         main_document_id,
                         block_subscribers: Vec::new(),
+                        contexts,
                     },
                 );
             }
@@ -396,6 +466,10 @@ impl world::Server for WorldImpl {
             let kernel_arc = Arc::new(kernel);
             register_block_tools(&kernel_arc, documents.clone()).await;
 
+            // Create default context
+            let mut contexts = HashMap::new();
+            contexts.insert("default".to_string(), ContextState::new("default".to_string()));
+
             {
                 let mut state_ref = state.borrow_mut();
                 state_ref.kernels.insert(
@@ -410,6 +484,7 @@ impl world::Server for WorldImpl {
                         documents,
                         main_document_id,
                         block_subscribers: Vec::new(),
+                        contexts,
                     },
                 );
             }
@@ -418,6 +493,38 @@ impl world::Server for WorldImpl {
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
             Ok(())
         })
+    }
+
+    fn list_my_seats(
+        self: Rc<Self>,
+        _params: world::ListMySeatsParams,
+        mut results: world::ListMySeatsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.borrow();
+        let seats: Vec<_> = state.my_seats.values().collect();
+        let mut seat_list = results.get().init_seats(seats.len() as u32);
+
+        for (i, seat) in seats.iter().enumerate() {
+            let mut s = seat_list.reborrow().get(i as u32);
+            let mut id = s.reborrow().init_id();
+            id.set_nick(&seat.id.nick);
+            id.set_instance(&seat.id.instance);
+            id.set_kernel(&seat.id.kernel);
+            id.set_context(&seat.id.context);
+
+            s.set_owner(&seat.owner);
+            s.set_status(match seat.status {
+                SeatStatus::Active => crate::kaijutsu_capnp::SeatStatus::Active,
+                SeatStatus::Idle => crate::kaijutsu_capnp::SeatStatus::Idle,
+                SeatStatus::Away => crate::kaijutsu_capnp::SeatStatus::Away,
+            });
+            s.set_last_activity(seat.last_activity);
+            if let Some(ref cursor) = seat.cursor_block {
+                s.set_cursor_block(cursor);
+            }
+        }
+
+        Promise::ok(())
     }
 }
 
@@ -1179,6 +1286,125 @@ impl kernel::Server for KernelImpl {
             log::debug!("prompt() returning immediately with prompt_id={}", prompt_id);
             Ok(())
         })
+    }
+
+    // =========================================================================
+    // Context & Seat operations
+    // =========================================================================
+
+    fn list_contexts(
+        self: Rc<Self>,
+        _params: kernel::ListContextsParams,
+        mut results: kernel::ListContextsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.borrow();
+        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
+            let contexts: Vec<_> = kernel.contexts.values().collect();
+            let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
+
+            for (i, ctx) in contexts.iter().enumerate() {
+                let mut c = ctx_list.reborrow().get(i as u32);
+                c.set_name(&ctx.name);
+                c.set_document_count(ctx.documents.len() as u32);
+                c.set_seat_count(ctx.seats.len() as u32);
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn join_context(
+        self: Rc<Self>,
+        params: kernel::JoinContextParams,
+        mut results: kernel::JoinContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let context_name = pry!(pry!(params.get_context_name()).to_str()).to_owned();
+        let instance = pry!(pry!(params.get_instance()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        // Get username for the seat
+        let nick = {
+            let state_ref = state.borrow();
+            state_ref.identity.username.clone()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_millis() as u64;
+
+        let seat_id = SeatId {
+            nick: nick.clone(),
+            instance: instance.clone(),
+            kernel: kernel_id.clone(),
+            context: context_name.clone(),
+        };
+
+        let seat_info = SeatInfo {
+            id: seat_id.clone(),
+            owner: nick.clone(),
+            status: SeatStatus::Active,
+            last_activity: now,
+            cursor_block: None,
+        };
+
+        // Update state
+        {
+            let mut state_ref = state.borrow_mut();
+
+            // Ensure context exists (create if not)
+            if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id) {
+                kernel.contexts
+                    .entry(context_name.clone())
+                    .or_insert_with(|| ContextState::new(context_name.clone()))
+                    .seats.push(seat_id.clone());
+            }
+
+            // Track seat in user's seats
+            state_ref.my_seats.insert(seat_id.key(), seat_info.clone());
+            state_ref.current_seat = Some(seat_id);
+        }
+
+        // Build result
+        {
+            let mut seat = results.get().init_seat();
+            let mut id = seat.reborrow().init_id();
+            id.set_nick(&seat_info.id.nick);
+            id.set_instance(&seat_info.id.instance);
+            id.set_kernel(&seat_info.id.kernel);
+            id.set_context(&seat_info.id.context);
+
+            seat.set_owner(&seat_info.owner);
+            seat.set_status(crate::kaijutsu_capnp::SeatStatus::Active);
+            seat.set_last_activity(seat_info.last_activity);
+        }
+
+        Promise::ok(())
+    }
+
+    fn leave_seat(
+        self: Rc<Self>,
+        _params: kernel::LeaveSeatParams,
+        _results: kernel::LeaveSeatResults,
+    ) -> Promise<(), capnp::Error> {
+        let mut state_ref = self.state.borrow_mut();
+        let kernel_id = &self.kernel_id;
+
+        if let Some(seat_id) = state_ref.current_seat.take() {
+            // Remove from kernel's context
+            if let Some(kernel) = state_ref.kernels.get_mut(kernel_id) {
+                if let Some(context) = kernel.contexts.get_mut(&seat_id.context) {
+                    context.seats.retain(|s| s != &seat_id);
+                }
+            }
+
+            // Remove from user's seats
+            state_ref.my_seats.remove(&seat_id.key());
+        }
+
+        Promise::ok(())
     }
 }
 

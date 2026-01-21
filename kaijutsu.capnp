@@ -89,6 +89,40 @@ struct HistoryEntry {
 }
 
 # ============================================================================
+# Seat & Context Types
+# ============================================================================
+
+# Unique identifier for a seat - the 4-tuple that identifies a user's position
+struct SeatId {
+  nick @0 :Text;              # Display name (user-chosen): "amy", "refactor-bot"
+  instance @1 :Text;          # Device/model variant: "laptop", "haiku"
+  kernel @2 :Text;            # Kernel name: "kaijutsu-dev"
+  context @3 :Text;           # Context within the kernel: "refactor", "planning"
+}
+
+enum SeatStatus {
+  active @0;
+  idle @1;
+  away @2;
+}
+
+# Information about a seat (occupied position in a kernel/context)
+struct SeatInfo {
+  id @0 :SeatId;
+  owner @1 :Text;             # Strong identity: username from SSH auth
+  status @2 :SeatStatus;
+  lastActivity @3 :UInt64;    # Unix timestamp in milliseconds
+  cursorBlock @4 :Text;       # Which block they're focused on (optional)
+}
+
+# A context within a kernel - a collection of documents with a focus scope
+struct Context {
+  name @0 :Text;
+  documentCount @1 :UInt32;   # Number of documents attached
+  seatCount @2 :UInt32;       # Number of active seats
+}
+
+# ============================================================================
 # VFS Types
 # ============================================================================
 
@@ -174,6 +208,9 @@ interface World {
   listKernels @1 () -> (kernels :List(KernelInfo));
   attachKernel @2 (id :Text) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
+
+  # Seat management (cross-kernel)
+  listMySeats @4 () -> (seats :List(SeatInfo));
 }
 
 interface Kernel {
@@ -214,6 +251,11 @@ interface Kernel {
 
   # LLM operations
   prompt @21 (request :LlmRequest) -> (promptId :Text);
+
+  # Context & seat management
+  listContexts @22 () -> (contexts :List(Context));
+  joinContext @23 (contextName :Text, instance :Text) -> (seat :SeatInfo);
+  leaveSeat @24 ();
 }
 
 # ============================================================================

@@ -600,68 +600,114 @@ async fn connection_loop(
                 }
             }
 
-            // Seat/context commands (stubs - server support not implemented yet)
+            // Seat/context commands
             ConnectionCommand::ListContexts => {
-                // Stub: return empty list for now
-                // TODO: Implement when server has context support
-                let _ = evt_tx.send(ConnectionEvent::ContextsList(vec![
-                    Context { name: "default".into() },
-                ]));
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.list_contexts()).await {
+                        Ok(Ok(contexts)) => {
+                            let _ = evt_tx.send(ConnectionEvent::ContextsList(contexts));
+                        }
+                        Ok(Err(e)) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to list contexts: {}", e)));
+                        }
+                        Err(_) => {
+                            log::warn!("ListContexts RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::Error("List contexts timed out".into()));
+                        }
+                    }
+                } else {
+                    // Return empty list if not attached
+                    let _ = evt_tx.send(ConnectionEvent::ContextsList(vec![]));
+                }
             }
 
             ConnectionCommand::ListMySeats => {
-                // Stub: return empty list for now
-                // TODO: Implement when server has seat tracking
-                let _ = evt_tx.send(ConnectionEvent::MySeatsList(vec![]));
+                if let Some(client) = &rpc_client {
+                    match timeout(RPC_TIMEOUT, client.list_my_seats()).await {
+                        Ok(Ok(seats)) => {
+                            let _ = evt_tx.send(ConnectionEvent::MySeatsList(seats));
+                        }
+                        Ok(Err(e)) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to list seats: {}", e)));
+                        }
+                        Err(_) => {
+                            log::warn!("ListMySeats RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::Error("List seats timed out".into()));
+                        }
+                    }
+                } else {
+                    // Return empty list if not connected
+                    let _ = evt_tx.send(ConnectionEvent::MySeatsList(vec![]));
+                }
             }
 
             ConnectionCommand::JoinContext { context, instance } => {
-                // Stub: pretend we joined successfully
-                // TODO: Implement when server has seat support
-                use kaijutsu_client::SeatId;
-                let nick = std::env::var("USER")
-                    .or_else(|_| std::env::var("USERNAME"))
-                    .unwrap_or_else(|_| "user".to_string());
-                let kernel = current_kernel
-                    .as_ref()
-                    .map(|_| "lobby".to_string()) // Placeholder
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let seat = SeatInfo {
-                    id: SeatId {
-                        nick,
-                        instance,
-                        kernel,
-                        context,
-                    },
-                    owner: "local".to_string(),
-                };
-                let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
+                        Ok(Ok(seat)) => {
+                            let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                        }
+                        Ok(Err(e)) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to join context: {}", e)));
+                        }
+                        Err(_) => {
+                            log::warn!("JoinContext RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::Error("Join context timed out".into()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
             }
 
             ConnectionCommand::LeaveSeat => {
-                // Stub: just send the event
-                let _ = evt_tx.send(ConnectionEvent::SeatLeft);
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.leave_seat()).await {
+                        Ok(Ok(())) => {
+                            let _ = evt_tx.send(ConnectionEvent::SeatLeft);
+                        }
+                        Ok(Err(e)) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to leave seat: {}", e)));
+                        }
+                        Err(_) => {
+                            log::warn!("LeaveSeat RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::Error("Leave seat timed out".into()));
+                        }
+                    }
+                } else {
+                    // If not attached, just send the event
+                    let _ = evt_tx.send(ConnectionEvent::SeatLeft);
+                }
             }
 
             ConnectionCommand::TakeSeat {
-                nick,
+                nick: _,
                 instance,
-                kernel,
+                kernel: kernel_name,
                 context,
             } => {
-                // Stub: pretend we switched to this seat
-                use kaijutsu_client::SeatId;
-                let seat = SeatInfo {
-                    id: SeatId {
-                        nick,
-                        instance,
-                        kernel,
-                        context,
-                    },
-                    owner: "local".to_string(),
-                };
-                let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                // TakeSeat is a convenience that attaches to kernel + joins context
+                // For now, we just join the context if already attached to the right kernel
+                if let Some(kernel) = &current_kernel {
+                    // TODO: Check if we need to switch kernels first
+                    // For now, just join the context with the given instance
+                    match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
+                        Ok(Ok(seat)) => {
+                            let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                        }
+                        Ok(Err(e)) => {
+                            let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to take seat: {}", e)));
+                        }
+                        Err(_) => {
+                            log::warn!("TakeSeat RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::Error("Take seat timed out".into()));
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error(
+                        format!("Not attached to kernel '{}' - attach first", kernel_name)
+                    ));
+                }
             }
         }
     }
