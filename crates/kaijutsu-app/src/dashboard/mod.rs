@@ -38,6 +38,10 @@ impl Plugin for DashboardPlugin {
                     handle_kernel_selection,
                     handle_context_selection,
                     handle_take_seat,
+                    // List rebuild systems
+                    rebuild_kernel_list,
+                    rebuild_context_list,
+                    rebuild_seats_list,
                     // Seat selector systems
                     seat_selector::update_seat_selector,
                     seat_selector::handle_seat_selector_click,
@@ -333,10 +337,14 @@ fn handle_dashboard_events(
                 state.visible = true;
             }
             ConnectionEvent::Connected => {
-                // Request kernel list on connect
+                // Just mark visible - kernel list will be requested after attach
+                state.visible = true;
+            }
+            ConnectionEvent::AttachedKernel(_) => {
+                // Now that we're attached, request kernel list and contexts
                 conn.send(ConnectionCommand::ListKernels);
                 conn.send(ConnectionCommand::ListMySeats);
-                state.visible = true;
+                conn.send(ConnectionCommand::ListContexts);
             }
             ConnectionEvent::Disconnected => {
                 state.kernels.clear();
@@ -441,4 +449,201 @@ fn setup_seat_selector_ui(
 
     // Spawn the dropdown at root level (absolute positioned)
     spawn_seat_dropdown(&mut commands, &theme);
+}
+
+// ============================================================================
+// List Rebuild Systems
+// ============================================================================
+
+/// Rebuild kernel list when state changes
+fn rebuild_kernel_list(
+    mut commands: Commands,
+    state: Res<DashboardState>,
+    theme: Res<Theme>,
+    list_query: Query<Entity, With<KernelList>>,
+    item_query: Query<Entity, With<KernelListItem>>,
+) {
+    if !state.is_changed() {
+        return;
+    }
+
+    // Despawn existing items
+    for entity in item_query.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Spawn new items
+    let Ok(list_entity) = list_query.single() else {
+        return;
+    };
+
+    commands.entity(list_entity).with_children(|parent| {
+        for (index, kernel) in state.kernels.iter().enumerate() {
+            let is_selected = state.selected_kernel == Some(index);
+            let bg_color = if is_selected {
+                theme.selection_bg
+            } else {
+                Color::NONE
+            };
+
+            parent
+                .spawn((
+                    KernelListItem { index },
+                    Button,
+                    Node {
+                        width: Val::Percent(100.0),
+                        padding: UiRect::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(bg_color),
+                ))
+                .with_children(|item| {
+                    let display = format!(
+                        "{} ({} users)",
+                        kernel.name,
+                        kernel.user_count
+                    );
+                    item.spawn((
+                        GlyphonUiText::new(&display)
+                            .with_font_size(14.0)
+                            .with_color(theme.fg),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(150.0),
+                            min_height: Val::Px(20.0),
+                            ..default()
+                        },
+                    ));
+                });
+        }
+    });
+}
+
+/// Rebuild context list when state changes
+fn rebuild_context_list(
+    mut commands: Commands,
+    state: Res<DashboardState>,
+    theme: Res<Theme>,
+    list_query: Query<Entity, With<ContextList>>,
+    item_query: Query<Entity, With<ContextListItem>>,
+) {
+    if !state.is_changed() {
+        return;
+    }
+
+    // Despawn existing items
+    for entity in item_query.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Spawn new items
+    let Ok(list_entity) = list_query.single() else {
+        return;
+    };
+
+    commands.entity(list_entity).with_children(|parent| {
+        for (index, context) in state.contexts.iter().enumerate() {
+            let is_selected = state.selected_context == Some(index);
+            let bg_color = if is_selected {
+                theme.selection_bg
+            } else {
+                Color::NONE
+            };
+
+            parent
+                .spawn((
+                    ContextListItem { index },
+                    Button,
+                    Node {
+                        width: Val::Percent(100.0),
+                        padding: UiRect::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(bg_color),
+                ))
+                .with_children(|item| {
+                    item.spawn((
+                        GlyphonUiText::new(&context.name)
+                            .with_font_size(14.0)
+                            .with_color(theme.fg),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(150.0),
+                            min_height: Val::Px(20.0),
+                            ..default()
+                        },
+                    ));
+                });
+        }
+    });
+}
+
+/// Rebuild seats list when state changes
+fn rebuild_seats_list(
+    mut commands: Commands,
+    state: Res<DashboardState>,
+    theme: Res<Theme>,
+    list_query: Query<Entity, With<SeatsList>>,
+    item_query: Query<Entity, With<SeatListItem>>,
+) {
+    if !state.is_changed() {
+        return;
+    }
+
+    // Despawn existing items
+    for entity in item_query.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Spawn new items
+    let Ok(list_entity) = list_query.single() else {
+        return;
+    };
+
+    commands.entity(list_entity).with_children(|parent| {
+        for (index, seat) in state.my_seats.iter().enumerate() {
+            parent
+                .spawn((
+                    SeatListItem { index },
+                    Button,
+                    Node {
+                        width: Val::Percent(100.0),
+                        padding: UiRect::all(Val::Px(8.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                ))
+                .with_children(|item| {
+                    // Nick and instance
+                    let nick_text = format!("@{}:{}", seat.id.nick, seat.id.instance);
+                    item.spawn((
+                        GlyphonUiText::new(&nick_text)
+                            .with_font_size(14.0)
+                            .with_color(theme.fg),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(150.0),
+                            min_height: Val::Px(18.0),
+                            ..default()
+                        },
+                    ));
+
+                    // Context and kernel
+                    let context_text = format!("  :{}@{}", seat.id.context, seat.id.kernel);
+                    item.spawn((
+                        GlyphonUiText::new(&context_text)
+                            .with_font_size(12.0)
+                            .with_color(theme.fg_dim),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(150.0),
+                            min_height: Val::Px(16.0),
+                            ..default()
+                        },
+                    ));
+                });
+        }
+    });
 }
