@@ -16,6 +16,7 @@ mod commands;
 mod connection;
 mod constants;
 mod conversation;
+mod dashboard;
 mod shaders;
 mod text;
 mod ui;
@@ -68,6 +69,8 @@ fn main() {
         .add_plugins(connection::ConnectionBridgePlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
+        // Dashboard/lobby experience
+        .add_plugins(dashboard::DashboardPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
         // Resources
@@ -137,6 +140,7 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             // HEADER SECTION
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
+                HeaderContainer,
                 Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
@@ -269,6 +273,10 @@ struct PromptHint;
 /// Marker for status text
 #[derive(Component)]
 struct StatusText;
+
+/// Marker for the header container (used by dashboard to attach seat selector)
+#[derive(Component)]
+pub struct HeaderContainer;
 
 /// Convert connection events to UI updates
 fn handle_connection_events(

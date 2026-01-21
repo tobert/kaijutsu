@@ -137,6 +137,37 @@ pub struct KernelInfo {
     pub agent_count: u32,
 }
 
+// ============================================================================
+// Seat & Context Types (client-side stubs for dashboard wiring)
+// ============================================================================
+
+/// Unique identifier for a seat - the 4-tuple that identifies a user's position
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatId {
+    /// Display name (user-chosen): "amy", "refactor-bot"
+    pub nick: String,
+    /// Device/model variant: "laptop", "haiku"
+    pub instance: String,
+    /// Kernel name: "kaijutsu-dev"
+    pub kernel: String,
+    /// Context within the kernel: "refactor", "planning"
+    pub context: String,
+}
+
+/// Information about a seat (occupied position in a kernel/context)
+#[derive(Debug, Clone)]
+pub struct SeatInfo {
+    pub id: SeatId,
+    /// Strong identity: username from SSH auth
+    pub owner: String,
+}
+
+/// A context within a kernel - a collection of documents with a focus scope
+#[derive(Debug, Clone)]
+pub struct Context {
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct KernelConfig {
     pub name: String,

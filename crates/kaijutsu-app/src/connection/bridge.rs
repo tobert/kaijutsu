@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 // Use types from the client library
-use kaijutsu_client::{Identity, KernelConfig, KernelHandle, KernelInfo, RpcClient, SshConfig};
+use kaijutsu_client::{
+    Context, Identity, KernelConfig, KernelHandle, KernelInfo, RpcClient, SeatInfo, SshConfig,
+};
 
 /// Default timeout for RPC operations (short ops like attach, list)
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,6 +43,23 @@ pub enum ConnectionCommand {
     CreateKernel { config: KernelConfig },
     /// Detach from current kernel
     DetachKernel,
+
+    // Seat/context operations (for dashboard)
+    /// List contexts in the current kernel
+    ListContexts,
+    /// List user's active seats across all kernels
+    ListMySeats,
+    /// Join a context (creates a seat)
+    JoinContext { context: String, instance: String },
+    /// Leave the current seat
+    LeaveSeat,
+    /// Take an existing seat (switch to it)
+    TakeSeat {
+        nick: String,
+        instance: String,
+        kernel: String,
+        context: String,
+    },
 
     // LLM operations (server-side)
     /// Send a prompt to the server-side LLM
@@ -79,6 +98,16 @@ pub enum ConnectionEvent {
     DetachedKernel,
     /// Error occurred
     Error(String), // TODO: Display in notification/toast UI
+
+    // Seat/context events (for dashboard)
+    /// List of contexts in the current kernel
+    ContextsList(Vec<Context>),
+    /// List of user's active seats
+    MySeatsList(Vec<SeatInfo>),
+    /// User took a seat
+    SeatTaken { seat: SeatInfo },
+    /// User left their seat
+    SeatLeft,
 
     // LLM events (server-side)
     /// Prompt was sent to server-side LLM
@@ -569,6 +598,70 @@ async fn connection_loop(
                 } else {
                     let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
                 }
+            }
+
+            // Seat/context commands (stubs - server support not implemented yet)
+            ConnectionCommand::ListContexts => {
+                // Stub: return empty list for now
+                // TODO: Implement when server has context support
+                let _ = evt_tx.send(ConnectionEvent::ContextsList(vec![
+                    Context { name: "default".into() },
+                ]));
+            }
+
+            ConnectionCommand::ListMySeats => {
+                // Stub: return empty list for now
+                // TODO: Implement when server has seat tracking
+                let _ = evt_tx.send(ConnectionEvent::MySeatsList(vec![]));
+            }
+
+            ConnectionCommand::JoinContext { context, instance } => {
+                // Stub: pretend we joined successfully
+                // TODO: Implement when server has seat support
+                use kaijutsu_client::SeatId;
+                let nick = std::env::var("USER")
+                    .or_else(|_| std::env::var("USERNAME"))
+                    .unwrap_or_else(|_| "user".to_string());
+                let kernel = current_kernel
+                    .as_ref()
+                    .map(|_| "lobby".to_string()) // Placeholder
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let seat = SeatInfo {
+                    id: SeatId {
+                        nick,
+                        instance,
+                        kernel,
+                        context,
+                    },
+                    owner: "local".to_string(),
+                };
+                let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+            }
+
+            ConnectionCommand::LeaveSeat => {
+                // Stub: just send the event
+                let _ = evt_tx.send(ConnectionEvent::SeatLeft);
+            }
+
+            ConnectionCommand::TakeSeat {
+                nick,
+                instance,
+                kernel,
+                context,
+            } => {
+                // Stub: pretend we switched to this seat
+                use kaijutsu_client::SeatId;
+                let seat = SeatInfo {
+                    id: SeatId {
+                        nick,
+                        instance,
+                        kernel,
+                        context,
+                    },
+                    owner: "local".to_string(),
+                };
+                let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
             }
         }
     }
