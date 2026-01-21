@@ -40,17 +40,22 @@ impl ViewNode for TextRenderNode {
             return Ok(());
         };
 
-        // Get the render target view
-        let color_attachment = view_target.get_color_attachment();
+        // Get the final output texture (after upscaling, non-MSAA)
+        //
+        // Why out_texture() instead of get_color_attachment()?
+        // get_color_attachment() returns the MSAA texture even after post-processing,
+        // causing an MSAA mismatch panic (RenderPass expects 4 samples, pipeline has 1).
+        // out_texture() gives us the actual swap chain target that gets displayed.
+        let out_texture = view_target.out_texture();
 
-        // Create a render pass
+        // Create a render pass targeting the final output
         let mut render_pass = render_context
             .command_encoder()
             .begin_render_pass(&RenderPassDescriptor {
                 label: Some("glyphon_text_render_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: color_attachment.view,
-                    resolve_target: color_attachment.resolve_target,
+                    view: out_texture,
+                    resolve_target: None, // No MSAA resolve needed
                     ops: Operations {
                         load: LoadOp::Load, // Don't clear - render on top
                         store: StoreOp::Store,

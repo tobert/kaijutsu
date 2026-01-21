@@ -37,11 +37,17 @@ impl Plugin for TextRenderPlugin {
             .add_systems(ExtractSchedule, extract_text_areas)
             .add_systems(Render, prepare_text);
 
-        // Add render node to the graph - after EndMainPass (still MSAA)
+        // Add render node to the graph - after Upscaling (final post-processing step)
+        //
+        // Why after Upscaling instead of EndMainPass?
+        // The Core2d render graph runs: MainPass -> EndMainPass -> Tonemapping -> Upscaling
+        // If we render after EndMainPass, our text gets overwritten by post-processing.
+        // By rendering after Upscaling, we draw directly to the final swap chain texture.
+        // This also means we use MSAA=1 since the output is non-MSAA (see prepare_text).
         use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
         render_app
             .add_render_graph_node::<ViewNodeRunner<TextRenderNode>>(Core2d, TextRenderNode::NAME)
-            .add_render_graph_edges(Core2d, (Node2d::EndMainPass, TextRenderNode::NAME));
+            .add_render_graph_edges(Core2d, (Node2d::Upscaling, TextRenderNode::NAME));
     }
 
     fn finish(&self, app: &mut App) {
@@ -210,9 +216,10 @@ fn prepare_text(
             let cache = Cache::new(device.wgpu_device());
             let viewport = Viewport::new(device.wgpu_device(), &cache);
             let mut atlas = TextAtlas::new(device.wgpu_device(), queue.0.as_ref(), &cache, format);
-            // EndMainPass is still MSAA (4x)
+            // MSAA=1 because we render after Upscaling to the final swap chain (non-MSAA).
+            // See the render graph setup in build() for why we chose this approach.
             let multisample = bevy::render::render_resource::MultisampleState {
-                count: 4,
+                count: 1,
                 ..default()
             };
             let renderer = TextRenderer::new(
