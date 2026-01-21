@@ -12,15 +12,14 @@
 //! ## 9-Slice Frame System
 //!
 //! Cells are rendered with a 9-slice frame system that uses procedural shaders
-//! for ornate cyberpunk borders. Frame styles are configured via RON files
-//! in `assets/frames/`.
+//! for ornate cyberpunk borders. Frame configuration (colors, sizes, shader params)
+//! comes from the Theme resource, loaded from ~/.config/kaijutsu/theme.rhai.
 
 mod components;
 pub mod frame_assembly;
-pub mod frame_style;
 pub mod plugin;
 mod systems;
 
 // Re-export public API
-pub use components::{Cell, CellKind, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer};
+pub use components::{Cell, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer};
 pub use plugin::CellPlugin;

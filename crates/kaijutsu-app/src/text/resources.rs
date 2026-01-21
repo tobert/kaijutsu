@@ -12,7 +12,11 @@ use std::sync::{Arc, Mutex};
 
 /// UI text rendered via glyphon (simpler than GlyphonTextBuffer).
 /// Use this for static or dynamic labels, titles, status text, etc.
+///
+/// Automatically requires `Visibility` so text participates in Bevy's
+/// visibility system (respects parent `Visibility::Hidden`).
 #[derive(Component, Clone)]
+#[require(Visibility)]
 pub struct GlyphonUiText {
     pub text: String,
     pub metrics: Metrics,
@@ -54,13 +58,15 @@ pub struct UiTextPositionCache {
 }
 
 /// Convert Bevy Color to glyphon Color.
+///
+/// Uses sRGB color space - glyphon expects 0-255 sRGB values.
 pub fn bevy_to_glyphon_color(color: Color) -> glyphon::Color {
-    let linear = color.to_linear();
+    let srgba = color.to_srgba();
     glyphon::Color::rgba(
-        (linear.red * 255.0) as u8,
-        (linear.green * 255.0) as u8,
-        (linear.blue * 255.0) as u8,
-        (linear.alpha * 255.0) as u8,
+        (srgba.red * 255.0) as u8,
+        (srgba.green * 255.0) as u8,
+        (srgba.blue * 255.0) as u8,
+        (srgba.alpha * 255.0) as u8,
     )
 }
 
@@ -193,7 +199,11 @@ impl Default for TextAreaConfig {
 }
 
 /// Marker component for entities that should be rendered with glyphon.
+///
+/// Automatically requires `Visibility` so text participates in Bevy's
+/// visibility system.
 #[derive(Component)]
+#[require(Visibility)]
 pub struct GlyphonText;
 
 /// Current screen resolution for text rendering.

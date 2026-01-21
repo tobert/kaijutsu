@@ -6,7 +6,6 @@ use super::components::{
     ConversationScrollState, CurrentMode, FocusedCell, PromptSubmitted, WorkspaceLayout,
 };
 use super::frame_assembly;
-use super::frame_style::{FrameStyle, FrameStyleLoader, FrameStyleMapping};
 use super::systems;
 
 /// Plugin that enables cell-based editing in the workspace.
@@ -14,10 +13,6 @@ pub struct CellPlugin;
 
 impl Plugin for CellPlugin {
     fn build(&self, app: &mut App) {
-        // Register FrameStyle asset type and loader
-        app.init_asset::<FrameStyle>()
-            .init_asset_loader::<FrameStyleLoader>();
-
         // Register messages
         app.add_message::<PromptSubmitted>();
 
@@ -65,9 +60,6 @@ impl Plugin for CellPlugin {
                 (
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
-                    // layout_main_cell is dead code - MainCell has no TextAreaConfig
-                    // Kept for now in case we need it for something else
-                    systems::layout_main_cell,
                     systems::layout_prompt_cell_position,
                     systems::sync_cell_buffers
                         .after(systems::init_cell_buffers)
@@ -135,24 +127,4 @@ impl Plugin for CellPlugin {
                 ),
             );
     }
-}
-
-/// System to load frame styles and initialize FrameStyleMapping resource.
-pub fn setup_frame_styles(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    // Load frame styles
-    let cyberpunk: Handle<FrameStyle> = asset_server.load("frames/cyberpunk.frame.ron");
-    let minimal: Handle<FrameStyle> = asset_server.load("frames/minimal.frame.ron");
-
-    // Set up style mapping - different cell types get different styles
-    commands.insert_resource(FrameStyleMapping {
-        code: cyberpunk.clone(),
-        output: minimal.clone(),
-        markdown: cyberpunk.clone(),
-        system: minimal.clone(),
-        user_message: cyberpunk.clone(),
-        agent_message: cyberpunk,
-    });
 }

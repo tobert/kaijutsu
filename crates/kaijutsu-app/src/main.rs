@@ -2,6 +2,15 @@
 //!
 //! A fresh implementation with cells as the universal primitive.
 //! CRDT sync via diamond-types, cosmic-text rendering.
+//!
+//! ## UI Architecture
+//!
+//! The UI uses Bevy's state system for screen transitions:
+//! - `AppScreen::Dashboard` - Kernel/Context/Seat selection
+//! - `AppScreen::Conversation` - Active conversation view
+//!
+//! Chrome (header, status bar) is always visible. Content area switches
+//! between views using `Display::None` for efficient layout.
 
 // Bevy ECS idioms that trigger these lints
 #![allow(clippy::too_many_arguments)]
@@ -39,6 +48,9 @@ fn main() {
 
     info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
 
+    // Load theme from ~/.config/kaijutsu/theme.rhai (or use defaults)
+    let theme = ui::theme_loader::load_theme();
+
     App::new()
         .add_plugins(DefaultPlugins
             .set(WindowPlugin {
@@ -69,19 +81,19 @@ fn main() {
         .add_plugins(connection::ConnectionBridgePlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
+        // App screen state management (Dashboard vs Conversation)
+        .add_plugins(ui::state::AppScreenPlugin)
         // Dashboard/lobby experience
         .add_plugins(dashboard::DashboardPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
-        // Resources
-        .init_resource::<ui::theme::Theme>()
+        // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
+        .insert_resource(theme)
         // Startup
         .add_systems(Startup, (
             setup_camera,
-            setup_placeholder_ui,
+            setup_ui,
             ui::debug::setup_debug_overlay,
-            ui::mode_indicator::setup_mode_indicator,
-            cell::plugin::setup_frame_styles,
         ))
         // Update
         .add_systems(Update, (
@@ -105,25 +117,35 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     ));
 }
 
-/// Set up the main conversation UI layout.
+/// Set up the main UI layout with state-driven screens.
 ///
-/// Layout structure:
+/// ## Architecture
+///
 /// ```text
+/// Z-LAYER 0: CHROME (always visible)
 /// ┌─────────────────────────────────────────────────────┐
-/// │ 会術 Kaijutsu                    [status: kernel]   │  ← Header
+/// │ 会術 Kaijutsu    [status]           [Seat Selector] │  ← Header
 /// ├─────────────────────────────────────────────────────┤
-/// │ ┌─────────────────────────────────────────────────┐ │
-/// │ │  (scrollable conversation messages)             │ │  ← Conversation
-/// │ │                                               ▼ │ │    Container
-/// │ └─────────────────────────────────────────────────┘ │
+/// │ Z-LAYER 10: CONTENT AREA (state-driven)             │
+/// │                                                     │
+/// │   ┌─ AppScreen::Dashboard ────────────────────────┐ │
+/// │   │ KERNELS │ CONTEXTS │ YOUR SEATS               │ │
+/// │   │ [lobby] │ [default]│                          │ │
+/// │   └───────────────────────────────────────────────┘ │
+/// │                                                     │
+/// │   ┌─ AppScreen::Conversation ─────────────────────┐ │
+/// │   │ (scrollable conversation messages)            │ │
+/// │   │ ───────────────────────────────────────────── │ │
+/// │   │ [Prompt input area]                           │ │
+/// │   └───────────────────────────────────────────────┘ │
+/// │                                                     │
 /// ├─────────────────────────────────────────────────────┤
-/// │ ┌─────────────────────────────────────────────────┐ │
-/// │ │ Type your message...                            │ │  ← Prompt
-/// │ └─────────────────────────────────────────────────┘ │    Container
-/// │ [NORMAL]                              [Ctrl+Enter] │  ← Status bar
+/// │ [NORMAL]               Enter: submit │ Esc: normal │  ← Status bar
 /// └─────────────────────────────────────────────────────┘
+///
+/// Z-LAYER 100: MODALS (seat dropdown, command palette)
 /// ```
-fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
+fn setup_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     // Root container - fills window, flex column layout
     commands
         .spawn((
@@ -137,7 +159,7 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
         ))
         .with_children(|root| {
             // ═══════════════════════════════════════════════════════════════
-            // HEADER SECTION
+            // CHROME: HEADER (always visible, Z-LAYER 0)
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
                 HeaderContainer,
@@ -182,75 +204,129 @@ fn setup_placeholder_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             });
 
             // ═══════════════════════════════════════════════════════════════
-            // CONVERSATION CONTAINER (scrollable)
+            // CONTENT AREA (state-driven, Z-LAYER 10)
+            // Contains both Dashboard and Conversation views
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
-                cell::ConversationContainer,
+                ui::state::ContentArea,
                 Node {
                     flex_grow: 1.0,
                     flex_direction: FlexDirection::Column,
-                    overflow: Overflow::scroll_y(),
-                    padding: UiRect::axes(Val::Px(20.0), Val::Px(12.0)),
                     ..default()
                 },
-            ));
-
-            // ═══════════════════════════════════════════════════════════════
-            // PROMPT CONTAINER (fixed at bottom)
-            // ═══════════════════════════════════════════════════════════════
-            root.spawn((
-                cell::PromptContainer,
-                Node {
-                    width: Val::Percent(100.0),
-                    min_height: Val::Px(70.0),
-                    max_height: Val::Px(150.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::FlexEnd,
-                    align_items: AlignItems::FlexStart,
-                    padding: UiRect::new(Val::Px(12.0), Val::Px(12.0), Val::Px(8.0), Val::Px(4.0)),
-                    border: UiRect::top(Val::Px(1.0)),
-                    ..default()
-                },
-                BorderColor::all(theme.border),
+                ZIndex(10),
             ))
-            .with_children(|prompt_area| {
-                // Subtle hint text aligned to the right (uses glyphon)
-                prompt_area.spawn((
-                    PromptHint,
-                    text::GlyphonUiText::new("'i' to type")
-                        .with_font_size(11.0)
-                        .with_color(Color::srgba(0.4, 0.4, 0.4, 0.6)), // Very dim
-                    text::UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(80.0),
-                        min_height: Val::Px(16.0),
-                        ..default()
-                    },
-                ));
+            .with_children(|content| {
+                // ───────────────────────────────────────────────────────────
+                // CONVERSATION VIEW (hidden when in Dashboard state)
+                // ───────────────────────────────────────────────────────────
+                content
+                    .spawn((
+                        ui::state::ConversationRoot,
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            display: Display::None, // Hidden by default, shown via state transition
+                            ..default()
+                        },
+                        Visibility::Hidden, // Hidden by default (glyphon needs this too)
+                    ))
+                    .with_children(|conv| {
+                        // Scrollable conversation area
+                        conv.spawn((
+                            cell::ConversationContainer,
+                            Node {
+                                flex_grow: 1.0,
+                                flex_direction: FlexDirection::Column,
+                                overflow: Overflow::scroll_y(),
+                                padding: UiRect::axes(Val::Px(20.0), Val::Px(12.0)),
+                                ..default()
+                            },
+                        ));
+
+                        // Prompt input area
+                        conv.spawn((
+                            cell::PromptContainer,
+                            Node {
+                                width: Val::Percent(100.0),
+                                min_height: Val::Px(70.0),
+                                max_height: Val::Px(150.0),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::FlexEnd,
+                                align_items: AlignItems::FlexStart,
+                                padding: UiRect::new(
+                                    Val::Px(12.0),
+                                    Val::Px(12.0),
+                                    Val::Px(8.0),
+                                    Val::Px(4.0),
+                                ),
+                                border: UiRect::top(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(theme.border),
+                        ))
+                        .with_children(|prompt_area| {
+                            // Subtle hint text
+                            prompt_area.spawn((
+                                PromptHint,
+                                text::GlyphonUiText::new("'i' to type")
+                                    .with_font_size(11.0)
+                                    .with_color(Color::srgba(0.4, 0.4, 0.4, 0.6)),
+                                text::UiTextPositionCache::default(),
+                                Node {
+                                    min_width: Val::Px(80.0),
+                                    min_height: Val::Px(16.0),
+                                    ..default()
+                                },
+                            ));
+                        });
+                    });
+
+                // Dashboard view is spawned by DashboardPlugin in setup_dashboard
+                // It will be a child of the same parent (ContentArea) with Display::Flex by default
             });
 
             // ═══════════════════════════════════════════════════════════════
-            // STATUS BAR (bottom)
+            // CHROME: STATUS BAR (always visible, Z-LAYER 0)
+            // Contains mode indicator integrated as flex child
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
+                ui::state::StatusBar,
                 Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
                     justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
                     padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
                     ..default()
                 },
                 BackgroundColor(theme.panel_bg),
             ))
             .with_children(|status_bar| {
-                // Left: Mode indicator placeholder (actual mode indicator is in ui::mode_indicator)
-                // Empty node for layout purposes - flex_grow pushes key hints to the right
+                // Left: Mode indicator (spawned as flex child, not absolute)
+                status_bar.spawn((
+                    ui::mode_indicator::ModeIndicator,
+                    text::GlyphonUiText::new("NORMAL")
+                        .with_font_size(14.0)
+                        .with_color(theme.fg_dim),
+                    text::UiTextPositionCache::default(),
+                    Node {
+                        padding: UiRect::all(Val::Px(8.0)),
+                        min_width: Val::Px(80.0),
+                        min_height: Val::Px(20.0),
+                        ..default()
+                    },
+                    BackgroundColor(theme.panel_bg),
+                ));
+
+                // Spacer
                 status_bar.spawn(Node {
                     flex_grow: 1.0,
                     ..default()
                 });
 
-                // Right: Key hints (uses glyphon)
+                // Right: Key hints
                 status_bar.spawn((
                     text::GlyphonUiText::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode")
                         .with_font_size(11.0)

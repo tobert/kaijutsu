@@ -129,6 +129,7 @@ pub fn spawn_seat_dropdown(commands: &mut Commands, theme: &Theme) -> Entity {
             BorderColor::all(theme.border),
             BackgroundColor(theme.panel_bg),
             ZIndex(200), // Above everything
+            Visibility::Hidden, // Also hide for glyphon text rendering
         ))
         .with_children(|dropdown| {
             // Dashboard option (always visible)
@@ -207,7 +208,6 @@ pub fn handle_seat_selector_click(
     for interaction in interaction.iter() {
         if *interaction == Interaction::Pressed {
             for mut node in dropdown.iter_mut() {
-                // Toggle visibility
                 node.display = if node.display == Display::None {
                     Display::Flex
                 } else {
@@ -221,17 +221,18 @@ pub fn handle_seat_selector_click(
 /// Handle clicking on the Dashboard button
 pub fn handle_dashboard_click(
     interaction: Query<&Interaction, (Changed<Interaction>, With<DashboardButton>)>,
-    mut state: ResMut<DashboardState>,
+    state: Res<DashboardState>,
+    mut next_screen: ResMut<NextState<crate::ui::state::AppScreen>>,
     mut dropdown: Query<&mut Node, With<SeatDropdown>>,
     conn: Res<ConnectionCommands>,
 ) {
     for interaction in interaction.iter() {
         if *interaction == Interaction::Pressed {
-            // Leave current seat and show dashboard
+            // Leave current seat and transition to Dashboard screen
             if state.current_seat.is_some() {
                 conn.send(ConnectionCommand::LeaveSeat);
             }
-            state.visible = true;
+            next_screen.set(crate::ui::state::AppScreen::Dashboard);
 
             // Hide dropdown
             for mut node in dropdown.iter_mut() {
@@ -249,20 +250,20 @@ pub fn handle_seat_option_click(
     conn: Res<ConnectionCommands>,
 ) {
     for (interaction, option) in interaction.iter() {
-        if *interaction == Interaction::Pressed {
-            if let Some(seat_info) = state.my_seats.get(option.index) {
-                // Switch to this seat
-                conn.send(ConnectionCommand::TakeSeat {
-                    nick: seat_info.id.nick.clone(),
-                    instance: seat_info.id.instance.clone(),
-                    kernel: seat_info.id.kernel.clone(),
-                    context: seat_info.id.context.clone(),
-                });
+        if *interaction == Interaction::Pressed
+            && let Some(seat_info) = state.my_seats.get(option.index)
+        {
+            // Switch to this seat
+            conn.send(ConnectionCommand::TakeSeat {
+                nick: seat_info.id.nick.clone(),
+                instance: seat_info.id.instance.clone(),
+                kernel: seat_info.id.kernel.clone(),
+                context: seat_info.id.context.clone(),
+            });
 
-                // Hide dropdown
-                for mut node in dropdown.iter_mut() {
-                    node.display = Display::None;
-                }
+            // Hide dropdown
+            for mut node in dropdown.iter_mut() {
+                node.display = Display::None;
             }
         }
     }
@@ -314,10 +315,10 @@ pub fn rebuild_seat_options(
         commands.entity(dropdown_entity).with_children(|dropdown| {
             for (i, seat) in state.my_seats.iter().enumerate() {
                 // Skip current seat
-                if let Some(current) = &state.current_seat {
-                    if seat.id == current.id {
-                        continue;
-                    }
+                if let Some(current) = &state.current_seat
+                    && seat.id == current.id
+                {
+                    continue;
                 }
 
                 dropdown
@@ -349,5 +350,21 @@ pub fn rebuild_seat_options(
                     });
             }
         });
+    }
+}
+
+/// Sync Visibility with Display for dropdown.
+///
+/// Glyphon text doesn't respect Display::None, only Visibility::Hidden.
+/// This system keeps them in sync so we only need to set Display in toggle code.
+pub fn sync_dropdown_visibility(
+    mut query: Query<(&Node, &mut Visibility), (With<SeatDropdown>, Changed<Node>)>,
+) {
+    for (node, mut vis) in query.iter_mut() {
+        *vis = if node.display == Display::None {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
     }
 }

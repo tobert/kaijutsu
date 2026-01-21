@@ -10,7 +10,7 @@ use super::components::{
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
-use crate::text::{GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
+use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
 
 /// Spawn a new cell entity with all required components.
 pub fn spawn_cell(
@@ -408,15 +408,7 @@ pub fn highlight_focused_cell(
         } else {
             theme.fg_dim
         };
-
-        // NOTE: Bevy srgba returns f32 0.0-1.0, glyphon expects u8 0-255
-        let srgba = color.to_srgba();
-        config.default_color = glyphon::Color::rgba(
-            (srgba.red * 255.0) as u8,
-            (srgba.green * 255.0) as u8,
-            (srgba.blue * 255.0) as u8,
-            (srgba.alpha * 255.0) as u8,
-        );
+        config.default_color = bevy_to_glyphon_color(color);
     }
 }
 
@@ -583,13 +575,14 @@ pub fn spawn_cursor(
     mut commands: Commands,
     mut cursor_entity: ResMut<CursorEntity>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
+    theme: Res<crate::ui::theme::Theme>,
 ) {
     if cursor_entity.0.is_some() {
         return;
     }
 
-    // Wandering spirit cursor
-    let color = Vec4::new(1.0, 0.5, 0.75, 0.95); // Hot pink
+    // Use theme cursor color (defaults to cursor_normal)
+    let color = theme.cursor_normal;
 
     let material = cursor_materials.add(CursorBeamMaterial {
         color,
@@ -626,6 +619,7 @@ pub fn update_cursor(
     cells: Query<(&CellEditor, &TextAreaConfig)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
+    theme: Res<crate::ui::theme::Theme>,
 ) {
     let Some(cursor_ent) = cursor_entity.0 else {
         return;
@@ -669,12 +663,12 @@ pub fn update_cursor(
         };
         material.time.y = cursor_mode as u8 as f32;
 
-        // Soft, muted colors - aesthetic terminal style
+        // Cursor colors from theme
         let color = match mode.0 {
-            EditorMode::Insert => Vec4::new(1.0, 0.5, 0.75, 0.95),   // Hot pink 🌸
-            EditorMode::Normal => Vec4::new(0.85, 0.92, 1.0, 0.85),  // Soft ice blue
-            EditorMode::Visual => Vec4::new(0.95, 0.85, 0.6, 0.9),   // Warm gold
-            EditorMode::Command => Vec4::new(0.7, 1.0, 0.8, 0.9),    // Soft mint
+            EditorMode::Normal => theme.cursor_normal,
+            EditorMode::Insert => theme.cursor_insert,
+            EditorMode::Command => theme.cursor_command,
+            EditorMode::Visual => theme.cursor_visual,
         };
         material.color = color;
 
@@ -1045,58 +1039,6 @@ pub fn spawn_main_cell(
     info!("Spawned main kernel cell with id {:?}", cell_id.0);
 }
 
-/// Layout the main cell to fill the space between header and prompt.
-///
-/// Applies scroll offset from ConversationScrollState:
-/// - `bounds` stays fixed (the visible clipping window)
-/// - `top` offsets by negative scroll amount (content moves up)
-pub fn layout_main_cell(
-    mut cells: Query<(&CellState, &mut TextAreaConfig), With<MainCell>>,
-    layout: Res<WorkspaceLayout>,
-    windows: Query<&Window>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-) {
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    // Visible area bounds (fixed clipping window)
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - layout.prompt_area_height;
-    let visible_height = visible_bottom - visible_top;
-
-    // Full width minus margins
-    let margin = layout.workspace_margin_left;
-    let width = window_width - (margin * 2.0);
-
-    // Update scroll state with visible area
-    scroll_state.visible_height = visible_height;
-    scroll_state.clamp_target();
-
-    let scroll_offset = scroll_state.offset;
-
-    for (_state, mut config) in cells.iter_mut() {
-        // Content top position = visible top - scroll offset
-        // When scroll_offset = 0, content starts at visible_top
-        // When scroll_offset = 100, content starts 100px above visible area (scrolled down)
-        let content_top = visible_top - scroll_offset;
-
-        config.left = margin;
-        config.top = content_top;
-        config.scale = 1.0;
-
-        // Bounds are fixed clipping window (what's visible)
-        config.bounds = glyphon::TextBounds {
-            left: margin as i32,
-            top: visible_top as i32,
-            right: (margin + width) as i32,
-            bottom: visible_bottom as i32,
-        };
-    }
-}
-
 /// Sync the MainCell's content with the current conversation.
 ///
 /// This system:
@@ -1234,7 +1176,7 @@ pub fn handle_block_events(
                     editor.doc.blocks_ordered()
                         .iter()
                         .filter(|b| b.parent_id.is_none() && b.created_at <= block.created_at)
-                        .last()
+                        .next_back()
                         .map(|b| b.id.clone())
                 };
 
@@ -1619,9 +1561,9 @@ pub fn layout_block_cells(
     let mut block_is_role_transition: std::collections::HashMap<kaijutsu_crdt::BlockId, bool> =
         std::collections::HashMap::new();
     for block in &blocks_ordered {
-        let is_transition = prev_role.as_ref() != Some(&block.role);
+        let is_transition = prev_role != Some(block.role);
         block_is_role_transition.insert(block.id.clone(), is_transition);
-        prev_role = Some(block.role.clone());
+        prev_role = Some(block.role); // Role is Copy, no clone needed
     }
 
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
@@ -1633,10 +1575,8 @@ pub fn layout_block_cells(
         };
 
         // Check if this is a role transition - if so, add space for role header
-        if let Some(&is_transition) = block_is_role_transition.get(&block_cell.block_id) {
-            if is_transition {
-                y_offset += ROLE_HEADER_HEIGHT + ROLE_HEADER_SPACING;
-            }
+        if block_is_role_transition.get(&block_cell.block_id) == Some(&true) {
+            y_offset += ROLE_HEADER_HEIGHT + ROLE_HEADER_SPACING;
         }
 
         // Determine indentation level based on parent_id (DAG nesting)

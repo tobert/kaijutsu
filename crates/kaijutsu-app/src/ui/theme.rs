@@ -1,7 +1,77 @@
+//! Theme system for Kaijutsu
+//!
+//! Provides a scriptable theming system via Rhai, inspired by the
+//! Tokyo-midnight palette from nvim/wezterm configurations.
+
+use bevy::math::Vec4;
 use bevy::prelude::*;
 
-#[derive(Resource)]
+/// ANSI 16-color palette for terminal/syntax rendering.
+///
+/// Standard ANSI colors (0-7 normal, 8-15 bright):
+/// - 0/8: Black/Bright Black (gray)
+/// - 1/9: Red/Bright Red
+/// - 2/10: Green/Bright Green
+/// - 3/11: Yellow/Bright Yellow
+/// - 4/12: Blue/Bright Blue
+/// - 5/13: Magenta/Bright Magenta
+/// - 6/14: Cyan/Bright Cyan
+/// - 7/15: White/Bright White
+#[derive(Clone, Debug)]
+pub struct AnsiColors {
+    pub black: Color,
+    pub red: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub blue: Color,
+    pub magenta: Color,
+    pub cyan: Color,
+    pub white: Color,
+    // Bright variants (8-15)
+    pub bright_black: Color,
+    pub bright_red: Color,
+    pub bright_green: Color,
+    pub bright_yellow: Color,
+    pub bright_blue: Color,
+    pub bright_magenta: Color,
+    pub bright_cyan: Color,
+    pub bright_white: Color,
+}
+
+impl Default for AnsiColors {
+    fn default() -> Self {
+        // Tokyo Night inspired ANSI palette
+        Self {
+            black: Color::srgb(0.10, 0.11, 0.15),         // #1a1b26
+            red: Color::srgb(0.97, 0.38, 0.45),           // #f7616a
+            green: Color::srgb(0.62, 0.81, 0.42),         // #9ece6a
+            yellow: Color::srgb(0.89, 0.79, 0.49),        // #e0c97d
+            blue: Color::srgb(0.48, 0.64, 0.97),          // #7aa2f7
+            magenta: Color::srgb(0.73, 0.47, 0.91),       // #bb79e8
+            cyan: Color::srgb(0.49, 0.85, 0.82),          // #7dd9d1
+            white: Color::srgb(0.78, 0.80, 0.85),         // #c8ccd9
+            // Bright variants
+            bright_black: Color::srgb(0.27, 0.29, 0.35),  // #444b59
+            bright_red: Color::srgb(1.00, 0.53, 0.58),    // #ff8894
+            bright_green: Color::srgb(0.72, 0.91, 0.52),  // #b8e885
+            bright_yellow: Color::srgb(1.00, 0.89, 0.59), // #ffe397
+            bright_blue: Color::srgb(0.58, 0.74, 1.00),   // #94bdff
+            bright_magenta: Color::srgb(0.83, 0.57, 1.00),// #d491ff
+            bright_cyan: Color::srgb(0.59, 0.95, 0.92),   // #96f2eb
+            bright_white: Color::srgb(0.90, 0.90, 0.90),  // #e5e5e5
+        }
+    }
+}
+
+/// Application theme resource.
+///
+/// Contains all colors used throughout the application, from base UI
+/// to vim-style mode colors and cursor colors.
+#[derive(Resource, Clone)]
 pub struct Theme {
+    // ═══════════════════════════════════════════════════════════════════════
+    // Base UI colors
+    // ═══════════════════════════════════════════════════════════════════════
     pub bg: Color,
     pub panel_bg: Color,
     pub fg: Color,
@@ -10,14 +80,71 @@ pub struct Theme {
     pub accent2: Color,
     pub border: Color,
     pub selection_bg: Color,
-    // Row type colors
+
+    // Row type colors (left border accents)
     pub row_tool: Color,
     pub row_result: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Semantic colors
+    // ═══════════════════════════════════════════════════════════════════════
+    pub error: Color,
+    pub warning: Color,
+    pub success: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Mode colors (vim-style, for mode indicator)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub mode_normal: Color,
+    pub mode_insert: Color,
+    pub mode_command: Color,
+    pub mode_visual: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Cursor colors (shader Vec4: [r, g, b, a])
+    // ═══════════════════════════════════════════════════════════════════════
+    pub cursor_normal: Vec4,
+    pub cursor_insert: Vec4,
+    pub cursor_command: Vec4,
+    pub cursor_visual: Vec4,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ANSI palette (for future terminal/syntax use)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub ansi: AnsiColors,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Frame Configuration (9-slice system)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Frame structure
+    pub frame_corner_size: f32,
+    pub frame_edge_thickness: f32,
+    pub frame_content_padding: f32,
+
+    // Frame colors (per-state)
+    pub frame_base: Color,      // Default frame color
+    pub frame_focused: Color,   // When focused in normal mode
+    pub frame_insert: Color,    // Insert mode
+    pub frame_command: Color,   // Command mode
+    pub frame_visual: Color,    // Visual mode
+    pub frame_unfocused: Color, // Lost focus
+    pub frame_edge: Color,      // Edge color (usually dimmer)
+
+    // Frame shader params [glow_radius, intensity, pulse_speed, bracket_length]
+    pub frame_params_base: Vec4,
+    pub frame_params_focused: Vec4,
+    pub frame_params_unfocused: Vec4,
+
+    // Edge dimming multipliers (applied to edge colors for visual hierarchy)
+    pub frame_edge_dim_unfocused: Vec4, // Color multiplier when unfocused
+    pub frame_edge_dim_focused: Vec4,   // Color multiplier when focused
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            // Base UI - Tokyo Night inspired
             bg: Color::srgb(0.05, 0.07, 0.09),
             panel_bg: Color::srgba(0.05, 0.07, 0.09, 0.9),
             fg: Color::srgb(0.9, 0.9, 0.9),
@@ -25,10 +152,60 @@ impl Default for Theme {
             accent: Color::srgb(0.34, 0.65, 1.0),
             accent2: Color::srgb(0.97, 0.47, 0.73),
             border: Color::srgb(0.19, 0.21, 0.24),
-            selection_bg: Color::srgba(0.34, 0.65, 1.0, 0.2), // Accent with low alpha
-            // Row type colors - left border accents
+            selection_bg: Color::srgba(0.34, 0.65, 1.0, 0.2),
+
+            // Row type colors
             row_tool: Color::srgb(0.83, 0.6, 0.13),    // Orange - tool calls
             row_result: Color::srgb(0.25, 0.73, 0.31), // Green - tool results
+
+            // Semantic
+            error: Color::srgb(0.97, 0.38, 0.45),     // Red
+            warning: Color::srgb(0.89, 0.79, 0.49),   // Yellow
+            success: Color::srgb(0.62, 0.81, 0.42),   // Green
+
+            // Mode colors (vim-style)
+            mode_normal: Color::srgb(0.5, 0.5, 0.5),  // Dim gray (matches fg_dim)
+            mode_insert: Color::srgb(0.4, 0.8, 0.4),  // Green
+            mode_command: Color::srgb(0.9, 0.7, 0.2), // Yellow/orange
+            mode_visual: Color::srgb(0.7, 0.4, 0.9),  // Purple
+
+            // Cursor colors - soft aesthetic terminal style
+            cursor_normal: Vec4::new(0.85, 0.92, 1.0, 0.85),  // Soft ice blue
+            cursor_insert: Vec4::new(1.0, 0.5, 0.75, 0.95),   // Hot pink
+            cursor_command: Vec4::new(0.7, 1.0, 0.8, 0.9),    // Soft mint
+            cursor_visual: Vec4::new(0.95, 0.85, 0.6, 0.9),   // Warm gold
+
+            // ANSI palette
+            ansi: AnsiColors::default(),
+
+            // Frame configuration - cyberpunk style defaults
+            frame_corner_size: 48.0,
+            frame_edge_thickness: 6.0,
+            frame_content_padding: 8.0,
+
+            // Frame colors - soft purple base (Tokyo Night aesthetic)
+            frame_base: Color::srgb(0.73, 0.60, 0.97),      // #bb9af7 soft purple
+            frame_focused: Color::srgb(0.73, 0.60, 0.97),   // Same as base when focused
+            frame_insert: Color::srgb(0.62, 0.81, 0.42),    // #9ece6a green - reuse mode color
+            frame_command: Color::srgb(0.88, 0.69, 0.41),   // #e0af68 amber - reuse mode color
+            frame_visual: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue - reuse accent
+            frame_unfocused: Color::srgba(0.34, 0.37, 0.54, 0.6), // #565f89 dimmed
+            frame_edge: Color::srgba(0.73, 0.60, 0.97, 0.5), // Dimmer purple
+
+            // Frame shader params: [glow_radius, intensity, pulse_speed, bracket_length]
+            frame_params_base: Vec4::new(0.15, 1.2, 1.5, 0.7),
+            frame_params_focused: Vec4::new(0.2, 1.5, 2.0, 0.7),
+            frame_params_unfocused: Vec4::new(0.1, 0.6, 0.8, 0.7),
+
+            // Edge dimming: [r_mult, g_mult, b_mult, a_mult]
+            frame_edge_dim_unfocused: Vec4::new(0.5, 0.5, 0.5, 0.6),
+            frame_edge_dim_focused: Vec4::new(0.7, 0.7, 0.7, 0.8),
         }
     }
+}
+
+/// Helper to convert Bevy Color to Vec4 (for shader uniforms).
+pub fn color_to_vec4(color: Color) -> Vec4 {
+    let srgba = color.to_srgba();
+    Vec4::new(srgba.red, srgba.green, srgba.blue, srgba.alpha)
 }
