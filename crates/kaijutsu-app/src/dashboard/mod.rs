@@ -323,7 +323,12 @@ fn handle_dashboard_events(
             }
             ConnectionEvent::ContextsList(contexts) => {
                 state.contexts = contexts.clone();
-                state.selected_context = None;
+                // Auto-select first context if available
+                if !state.contexts.is_empty() {
+                    state.selected_context = Some(0);
+                } else {
+                    state.selected_context = None;
+                }
             }
             ConnectionEvent::MySeatsList(seats) => {
                 state.my_seats = seats.clone();
