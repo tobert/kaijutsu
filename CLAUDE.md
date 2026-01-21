@@ -142,7 +142,55 @@ RUST_LOG=debug cargo run -p kaijutsu-app
 
 # Check Bevy 0.18 examples
 cd ~/src/bevy && cargo run --example standard_widgets
+
 ```
+
+## Autonomous Development Loop
+
+The Bevy client requires a graphical session (Wayland/X11), but Claude typically runs in a headless terminal. This setup enables autonomous iteration:
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  Graphical Session      │     │  Headless Terminal      │
+│  (Moonlight/Konsole)    │     │  (SSH/WezTerm)          │
+│                         │     │                         │
+│  kaijutsu-runner.sh     │◄────│  Claude edits code      │
+│    └─ cargo watch       │     │    └─ ./contrib/kj      │
+│        └─ kaijutsu-app  │────►│        └─ BRP tools     │
+└─────────────────────────┘     └─────────────────────────┘
+      user starts this              Claude works here
+```
+
+### Setup
+
+User starts the runner in the graphical session:
+```bash
+./contrib/kaijutsu-runner.sh        # or --release for optimized builds
+```
+
+### Claude's Workflow
+
+1. **Check status**: `./contrib/kj status`
+2. **Edit code** with Edit/Write tools → cargo watch auto-rebuilds
+3. **Inspect app** via BRP: `mcp__bevy_brp__*` tools
+4. **Screenshot**: `mcp__bevy_brp__brp_extras_screenshot`
+5. **If build fails**: `./contrib/kj tail` to see errors
+
+### Control Commands
+
+| Command | Effect |
+|---------|--------|
+| `./contrib/kj status` | Check runner state |
+| `./contrib/kj tail` | Follow build output |
+| `./contrib/kj pause` | Stop watching (batch edits) |
+| `./contrib/kj resume` | Resume watching |
+| `./contrib/kj rebuild` | Force clean rebuild |
+| `./contrib/kj restart` | Restart cargo watch |
+
+### Output Files
+
+- `/tmp/kj.status` — current state (quick check)
+- `/tmp/kaijutsu-runner.typescript` — full output via `script(1)`, captures crashes
 
 ## Git Conventions
 

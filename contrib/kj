@@ -1,0 +1,39 @@
+#!/bin/bash
+# Quick control for kaijutsu-runner from any terminal
+#
+# ═══════════════════════════════════════════════════════════════════
+# FOR CLAUDE: This is your primary interface to the dev loop
+# ═══════════════════════════════════════════════════════════════════
+#
+# COMMANDS YOU'LL USE MOST:
+#   ./contrib/kj status   - "is it running? what state?"
+#   ./contrib/kj tail     - "show me build output" (Ctrl+C to exit)
+#   ./contrib/kj rebuild  - "clean rebuild everything"
+#   ./contrib/kj pause    - "stop rebuilding, I'm making multiple edits"
+#   ./contrib/kj resume   - "ok done editing, rebuild now"
+#
+# TYPICAL WORKFLOW:
+#   1. Check status:     ./contrib/kj status
+#   2. Edit files with Edit/Write tools (cargo watch auto-rebuilds)
+#   3. If build fails:   ./contrib/kj tail  (check errors)
+#   4. Fix errors, save → auto rebuild
+#   5. Use BRP tools to inspect running app
+#
+# FOR MULTIPLE EDITS (avoid repeated rebuilds):
+#   ./contrib/kj pause
+#   <make several edits>
+#   ./contrib/kj resume
+#
+# ═══════════════════════════════════════════════════════════════════
+
+case "${1:-status}" in
+    pause)   touch /tmp/kj.pause   && echo "⏸️  Paused" ;;
+    resume)  rm -f /tmp/kj.pause   && echo "▶️  Resumed" ;;
+    rebuild) touch /tmp/kj.rebuild && echo "🔨 Rebuild triggered" ;;
+    restart) touch /tmp/kj.restart && echo "🔄 Restart triggered" ;;
+    stop)    touch /tmp/kj.stop    && echo "🛑 Stop triggered" ;;
+    status)  cat /tmp/kj.status 2>/dev/null || echo "Runner not active" ;;
+    log)     cat /tmp/kaijutsu-runner.typescript ;;
+    tail)    tail -f /tmp/kaijutsu-runner.typescript ;;
+    *)       echo "Usage: kj [pause|resume|rebuild|restart|stop|status|log|tail]" ;;
+esac
