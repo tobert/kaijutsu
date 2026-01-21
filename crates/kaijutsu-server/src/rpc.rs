@@ -200,6 +200,22 @@ fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
     }
 }
 
+/// Ensure main document exists for a kernel. Returns the main document ID.
+/// Uses `@` separator (invalid in UUIDs, unlikely in kernel names) for clear visual distinction.
+fn ensure_main_document(
+    documents: &SharedBlockStore,
+    kernel_id: &str,
+) -> Result<String, capnp::Error> {
+    let main_document_id = format!("{}@main", kernel_id);
+    if !documents.contains(&main_document_id) {
+        log::info!("Creating main document {} for kernel {}", main_document_id, kernel_id);
+        documents
+            .create_document(main_document_id.clone(), DocumentKind::Conversation, None)
+            .map_err(|e| capnp::Error::failed(e))?;
+    }
+    Ok(main_document_id)
+}
+
 pub struct KernelState {
     pub id: String,
     pub name: String,
@@ -211,7 +227,7 @@ pub struct KernelState {
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
     pub documents: SharedBlockStore,
-    /// Main document ID for this kernel (deterministic: {kernel_id}:main)
+    /// Main document ID for this kernel (convention: {kernel_id}@main)
     pub main_document_id: String,
     /// Subscribers for block update events (LLM streaming)
     pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
@@ -310,14 +326,8 @@ impl world::Server for WorldImpl {
                 // Create block store with database persistence
                 let documents = create_block_store_with_db(&id);
 
-                // Ensure main document exists (deterministic ID)
-                let main_document_id = format!("{}:main", id);
-                if !documents.contains(&main_document_id) {
-                    log::info!("Creating main document {} for kernel {}", main_document_id, id);
-                    if let Err(e) = documents.create_document(main_document_id.clone(), DocumentKind::Conversation, None) {
-                        log::warn!("Failed to create main document: {}", e);
-                    }
-                }
+                // Ensure main document exists (convention ID)
+                let main_document_id = ensure_main_document(&documents, &id)?;
 
                 // Register block tools
                 let kernel_arc = Arc::new(kernel);
@@ -379,14 +389,8 @@ impl world::Server for WorldImpl {
             // Create block store with database persistence
             let documents = create_block_store_with_db(&id);
 
-            // Ensure main document exists (deterministic ID)
-            let main_document_id = format!("{}:main", id);
-            if !documents.contains(&main_document_id) {
-                log::info!("Creating main document {} for new kernel {}", main_document_id, id);
-                if let Err(e) = documents.create_document(main_document_id.clone(), DocumentKind::Conversation, None) {
-                    log::warn!("Failed to create main document: {}", e);
-                }
-            }
+            // Ensure main document exists (convention ID)
+            let main_document_id = ensure_main_document(&documents, &id)?;
 
             // Register block tools
             let kernel_arc = Arc::new(kernel);
