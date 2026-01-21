@@ -52,7 +52,8 @@ impl Plugin for CellPlugin {
                     systems::handle_prompt_submitted,
                     systems::sync_main_cell_to_conversation
                         .after(systems::handle_prompt_submitted),
-                    systems::scroll_to_bottom,
+                    // scroll_input sets target, but smooth_scroll must run AFTER layout
+                    // (layout updates content_height, smooth_scroll depends on it)
                     systems::handle_scroll_input,
                 ),
             )
@@ -84,6 +85,11 @@ impl Plugin for CellPlugin {
             )
             // Block cell systems (per-block UI rendering for conversation)
             // Each block gets its own entity with independent GlyphonTextBuffer
+            //
+            // Critical ordering for smooth scroll:
+            //   1. layout_block_cells → computes heights, updates content_height
+            //   2. smooth_scroll → updates offset using new content_height
+            //   3. apply_block_cell_positions → positions blocks using new offset
             .add_systems(
                 Update,
                 (
@@ -96,8 +102,10 @@ impl Plugin for CellPlugin {
                         .after(systems::handle_cell_input),
                     systems::layout_block_cells
                         .after(systems::sync_block_cell_buffers),
-                    systems::apply_block_cell_positions
+                    systems::smooth_scroll
                         .after(systems::layout_block_cells),
+                    systems::apply_block_cell_positions
+                        .after(systems::smooth_scroll),
                 ),
             )
             // NOTE: Turn header systems removed in DAG migration.

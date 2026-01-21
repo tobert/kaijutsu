@@ -609,7 +609,7 @@ pub fn spawn_cursor(
             },
             BackgroundColor(Color::NONE),  // Explicit transparent - let shader handle all rendering
             MaterialNode(material),
-            ZIndex(10), // Above text
+            ZIndex(20), // Above text, below modals
             Visibility::Hidden, // Start hidden until we have a focused cell
         ))
         .id();
@@ -866,7 +866,8 @@ pub fn handle_prompt_submitted(
                 cell_id: conv_id.to_string(),
             });
             info!("Sent prompt to server for conversation {}", conv_id);
-            scroll_state.scroll_to_bottom = true;
+            // Enable follow mode to smoothly track streaming response
+            scroll_state.start_following();
         } else {
             warn!("No connection available, prompt not sent to server");
         }
@@ -892,16 +893,42 @@ pub fn auto_focus_prompt(
     }
 }
 
-/// Scroll conversation to bottom when requested (e.g., after new message).
-pub fn scroll_to_bottom(
+/// Smooth scroll interpolation system.
+///
+/// Runs every frame to smoothly interpolate scroll position toward target.
+///
+/// Key insight: In follow mode, we lock directly to bottom (no interpolation).
+/// Interpolation is only used for manual scrolling and transitions INTO follow mode.
+/// This prevents the "chasing a moving target" stutter during streaming.
+pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
+    time: Res<Time>,
 ) {
-    if !scroll_state.scroll_to_bottom {
+    let max = scroll_state.max_offset();
+
+    // In follow mode, lock directly to bottom - no interpolation needed
+    // This is how terminals work: content grows, viewport stays anchored
+    if scroll_state.following {
+        scroll_state.offset = max;
+        scroll_state.target_offset = max;
         return;
     }
 
-    scroll_state.scroll_to_end();
-    scroll_state.scroll_to_bottom = false;
+    // Not following: smooth interpolation toward target
+    scroll_state.clamp_target();
+
+    // Exponential decay interpolation (frame-rate independent)
+    const SMOOTHING: f32 = 12.0;
+    let t = 1.0 - (-SMOOTHING * time.delta_secs()).exp();
+
+    let current = scroll_state.offset;
+    let target = scroll_state.target_offset;
+    scroll_state.offset = current + (target - current) * t;
+
+    // Snap when close (avoid micro-jitter)
+    if (scroll_state.offset - scroll_state.target_offset).abs() < 0.5 {
+        scroll_state.offset = scroll_state.target_offset;
+    }
 }
 
 /// Handle mouse wheel scrolling for the conversation area.
@@ -1046,7 +1073,7 @@ pub fn layout_main_cell(
 
     // Update scroll state with visible area
     scroll_state.visible_height = visible_height;
-    scroll_state.clamp_offset();
+    scroll_state.clamp_target();
 
     let scroll_offset = scroll_state.offset;
 
@@ -1168,13 +1195,21 @@ use crate::connection::ConnectionEvent;
 ///
 /// This system processes streamed block events (inserted, edited, deleted, etc.)
 /// from the server and applies them to the local document for live updates.
+///
+/// Implements terminal-like auto-scroll: if the user is at the bottom when
+/// new content arrives, we stay at the bottom. If they've scrolled up to
+/// read history, we don't interrupt them.
 pub fn handle_block_events(
     mut events: MessageReader<ConnectionEvent>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
+    mut scroll_state: ResMut<ConversationScrollState>,
 ) {
     let Ok(mut editor) = main_cells.single_mut() else {
         return;
     };
+
+    // Check if we're at the bottom before processing events (for auto-scroll)
+    let was_at_bottom = scroll_state.is_at_bottom();
 
     for event in events.read() {
         match event {
@@ -1312,6 +1347,13 @@ pub fn handle_block_events(
             // Ignore other connection events - they're handled elsewhere
             _ => {}
         }
+    }
+
+    // Terminal-like auto-scroll: if we were at the bottom before processing
+    // events and content changed, enable follow mode to smoothly track new content.
+    // If user had scrolled up, we don't interrupt them.
+    if was_at_bottom && editor.dirty {
+        scroll_state.start_following();
     }
 }
 
@@ -1545,14 +1587,19 @@ pub fn layout_block_cells(
     const INDENT_WIDTH: f32 = 32.0;
     let mut y_offset = 0.0;
 
-    // Get window size for wrap width calculation
-    let window_width = windows
+    // Get window size for wrap width and visible height calculation
+    let (window_width, window_height) = windows
         .iter()
         .next()
-        .map(|w| w.resolution.width())
-        .unwrap_or(1280.0);
+        .map(|w| (w.resolution.width(), w.resolution.height()))
+        .unwrap_or((1280.0, 800.0));
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
+
+    // Update visible_height early so smooth_scroll has correct max_offset
+    let visible_top = layout.workspace_margin_top;
+    let visible_bottom = window_height - layout.prompt_area_height;
+    scroll_state.visible_height = visible_bottom - visible_top;
 
     // Lock font system for shaping
     let mut font_system = font_system.0.lock().unwrap();
@@ -1660,7 +1707,7 @@ pub fn apply_block_cell_positions(
 
     // Update scroll state with visible area and clamp offset
     scroll_state.visible_height = visible_height;
-    scroll_state.clamp_offset();
+    scroll_state.clamp_target();
 
     let scroll_offset = scroll_state.offset;
 

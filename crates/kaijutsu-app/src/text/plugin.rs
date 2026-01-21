@@ -61,6 +61,7 @@ impl Plugin for TextRenderPlugin {
 
         // Initialize with None - will be lazily created when we know the surface format
         render_app.insert_resource(RenderTextResources(None));
+        render_app.insert_resource(RenderTextBufferCache::default());
         render_app.insert_resource(font_system);
         render_app.insert_resource(swash_cache);
     }
@@ -78,6 +79,8 @@ pub struct ExtractedTextAreas {
 
 /// A single extracted text area.
 pub struct ExtractedTextArea {
+    /// Entity ID for stable caching (enables buffer reuse across frames)
+    pub entity: Entity,
     pub text: String,
     pub left: f32,
     pub top: f32,
@@ -86,6 +89,54 @@ pub struct ExtractedTextArea {
     pub color: glyphon::Color,
     pub metrics: glyphon::Metrics,
     pub family: glyphon::Family<'static>,
+}
+
+// ============================================================================
+// BUFFER CACHE (Performance Optimization)
+// ============================================================================
+//
+// Per-frame buffer allocation was causing performance issues:
+// - Every frame: allocate new Buffer for each text area
+// - Call set_text() + shape_until_scroll() (expensive shaping)
+// - With 20 visible texts = 20 allocations/frame
+//
+// Solution: Cache buffers keyed by Entity ID, reuse when text/metrics unchanged.
+
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+/// Cached buffer with metadata for invalidation checking.
+struct CachedBuffer {
+    buffer: glyphon::Buffer,
+    /// Hash of text content for invalidation detection
+    text_hash: u64,
+    /// Metrics used when creating the buffer
+    metrics: glyphon::Metrics,
+    /// Wrap width used for this buffer
+    wrap_width: f32,
+}
+
+/// Cache for glyphon text buffers, keyed by entity ID.
+///
+/// This dramatically reduces per-frame allocations by reusing buffers
+/// when text content and metrics haven't changed.
+#[derive(Resource, Default)]
+pub struct RenderTextBufferCache {
+    buffers: HashMap<Entity, CachedBuffer>,
+}
+
+/// Hash text content for cache invalidation.
+fn hash_text(text: &str) -> u64 {
+    use std::hash::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compare metrics for equality (glyphon::Metrics doesn't implement Eq).
+fn metrics_equal(a: &glyphon::Metrics, b: &glyphon::Metrics) -> bool {
+    (a.font_size - b.font_size).abs() < f32::EPSILON
+        && (a.line_height - b.line_height).abs() < f32::EPSILON
 }
 
 /// Update the text resolution when the window resizes.
@@ -127,12 +178,19 @@ fn sync_ui_text_positions(
 }
 
 /// Extract text areas from the main world to the render world.
+///
+/// Only extracts text entities that are visible according to Bevy's visibility system.
+/// This respects parent Visibility::Hidden propagation through InheritedVisibility.
+///
+/// Note: We use InheritedVisibility (not ViewVisibility) because our glyphon text
+/// uses a custom renderer that bypasses Bevy's camera visibility checking. ViewVisibility
+/// is only set to true by camera frustum culling systems, which don't know about our text.
 fn extract_text_areas(
     mut commands: Commands,
     // Existing GlyphonTextBuffer + TextAreaConfig query (for cells)
-    buffer_query: Extract<Query<(&GlyphonTextBuffer, &TextAreaConfig), With<GlyphonText>>>,
+    buffer_query: Extract<Query<(Entity, &GlyphonTextBuffer, &TextAreaConfig, &InheritedVisibility), With<GlyphonText>>>,
     // New GlyphonUiText query (for UI labels)
-    ui_text_query: Extract<Query<(&GlyphonUiText, &UiTextPositionCache)>>,
+    ui_text_query: Extract<Query<(Entity, &GlyphonUiText, &UiTextPositionCache, &InheritedVisibility)>>,
     resolution: Extract<Res<TextResolution>>,
 ) {
     let mut areas = Vec::new();
@@ -140,7 +198,12 @@ fn extract_text_areas(
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     // Extract GlyphonTextBuffer areas (cells use monospace)
-    for (buffer, config) in buffer_query.iter() {
+    for (entity, buffer, config, inherited_visibility) in buffer_query.iter() {
+        // Skip entities that aren't visible (respects parent Visibility::Hidden)
+        if !inherited_visibility.get() {
+            continue;
+        }
+
         let text = buffer.text();
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             info!(
@@ -152,6 +215,7 @@ fn extract_text_areas(
             );
         }
         areas.push(ExtractedTextArea {
+            entity,
             text,
             left: config.left,
             top: config.top,
@@ -164,12 +228,18 @@ fn extract_text_areas(
     }
 
     // Extract GlyphonUiText areas (UI labels)
-    for (ui_text, position) in ui_text_query.iter() {
+    for (entity, ui_text, position, inherited_visibility) in ui_text_query.iter() {
+        // Skip entities that aren't visible (respects parent Visibility::Hidden)
+        if !inherited_visibility.get() {
+            continue;
+        }
+
         // Skip empty text
         if ui_text.text.is_empty() {
             continue;
         }
         areas.push(ExtractedTextArea {
+            entity,
             text: ui_text.text.clone(),
             left: position.left,
             top: position.top,
@@ -195,6 +265,7 @@ fn prepare_text(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut render_resources: ResMut<RenderTextResources>,
+    mut buffer_cache: ResMut<RenderTextBufferCache>,
     extracted: Option<Res<ExtractedTextAreas>>,
     resolution: Option<Res<TextResolution>>,
     font_system: Res<SharedFontSystem>,
@@ -274,57 +345,96 @@ fn prepare_text(
         return;
     };
 
-    // Create temporary buffers for each text area
-    let mut buffers: Vec<glyphon::Buffer> = Vec::new();
+    // ========================================================================
+    // BUFFER CACHE: Reuse buffers when text/metrics unchanged
+    // ========================================================================
+    //
+    // Instead of allocating new buffers every frame, we cache them by entity.
+    // This dramatically reduces per-frame allocations and expensive shaping.
+
+    // Track which entities we see this frame for stale entry cleanup
+    let mut seen_entities: HashSet<Entity> = HashSet::with_capacity(extracted.areas.len());
+
+    // Phase 1: Update cache (all mutations happen here)
     for area in &extracted.areas {
-        let mut buffer = glyphon::Buffer::new(&mut font_system, area.metrics);
+        seen_entities.insert(area.entity);
 
-        // Use actual bounds width for wrap, unlimited height for layout
         let wrap_width = (area.bounds.right - area.bounds.left) as f32;
-        buffer.set_size(&mut font_system, Some(wrap_width), None);
+        let text_hash = hash_text(&area.text);
 
-        // Use per-area font family
-        let attrs = glyphon::Attrs::new().family(area.family);
-        buffer.set_text(
-            &mut font_system,
-            &area.text,
-            &attrs,
-            glyphon::Shaping::Advanced,
-            None, // align
-        );
-        buffer.shape_until_scroll(&mut font_system, false);
+        // Check if we have a valid cached buffer
+        let needs_rebuild = buffer_cache
+            .buffers
+            .get(&area.entity)
+            .map(|cached| {
+                cached.text_hash != text_hash
+                    || !metrics_equal(&cached.metrics, &area.metrics)
+                    || (cached.wrap_width - wrap_width).abs() > 1.0 // Allow small float variance
+            })
+            .unwrap_or(true); // No cache entry = needs rebuild
 
-        // Debug: check if buffer has layout runs
-        static LOGGED_LAYOUT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED_LAYOUT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let line_count = buffer.lines.len();
-            let total_glyphs: usize = buffer
-                .lines
-                .iter()
-                .filter_map(|line| line.layout_opt())
-                .flat_map(|layout| layout.iter())
-                .map(|run| run.glyphs.len())
-                .sum();
-            info!("Buffer has {} lines, {} total glyphs", line_count, total_glyphs);
+        if needs_rebuild {
+            // Create new buffer
+            let mut buffer = glyphon::Buffer::new(&mut font_system, area.metrics);
+            buffer.set_size(&mut font_system, Some(wrap_width), None);
+
+            let attrs = glyphon::Attrs::new().family(area.family);
+            buffer.set_text(
+                &mut font_system,
+                &area.text,
+                &attrs,
+                glyphon::Shaping::Advanced,
+                None,
+            );
+            buffer.shape_until_scroll(&mut font_system, false);
+
+            // Debug logging for first buffer
+            static LOGGED_LAYOUT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_LAYOUT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let line_count = buffer.lines.len();
+                let total_glyphs: usize = buffer
+                    .lines
+                    .iter()
+                    .filter_map(|line| line.layout_opt())
+                    .flat_map(|layout| layout.iter())
+                    .map(|run| run.glyphs.len())
+                    .sum();
+                info!("Buffer has {} lines, {} total glyphs (cache miss)", line_count, total_glyphs);
+            }
+
+            // Store in cache
+            buffer_cache.buffers.insert(
+                area.entity,
+                CachedBuffer {
+                    buffer,
+                    text_hash,
+                    metrics: area.metrics,
+                    wrap_width,
+                },
+            );
         }
-
-        buffers.push(buffer);
     }
 
-    // Build text areas for rendering
+    // Remove stale cache entries (entities that weren't seen this frame)
+    buffer_cache.buffers.retain(|entity, _| seen_entities.contains(entity));
+
+    // Phase 2: Build text areas referencing cached buffers (immutable borrow)
     let text_areas: Vec<glyphon::TextArea> = extracted
         .areas
         .iter()
-        .zip(buffers.iter())
-        .map(|(area, buffer)| glyphon::TextArea {
-            buffer,
-            left: area.left,
-            top: area.top,
-            scale: area.scale,
-            bounds: area.bounds,
-            default_color: area.color,
-            custom_glyphs: &[],
+        .filter_map(|area| {
+            buffer_cache.buffers.get(&area.entity).map(|cached| {
+                glyphon::TextArea {
+                    buffer: &cached.buffer,
+                    left: area.left,
+                    top: area.top,
+                    scale: area.scale,
+                    bounds: area.bounds,
+                    default_color: area.color,
+                    custom_glyphs: &[],
+                }
+            })
         })
         .collect();
 

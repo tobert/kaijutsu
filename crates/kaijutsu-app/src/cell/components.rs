@@ -496,49 +496,89 @@ pub struct PromptSubmitted {
 }
 
 /// Resource tracking the conversation scroll position.
+///
+/// Implements terminal-style smooth scrolling:
+/// - `offset` is the current rendered position
+/// - `target_offset` is where we're scrolling toward
+/// - `following` enables auto-tracking bottom during streaming
 #[derive(Resource)]
 pub struct ConversationScrollState {
-    /// Current scroll offset (pixels from top, 0 = at top)
+    /// Current scroll offset (pixels from top, 0 = at top).
+    /// This is the rendered position, interpolated toward target_offset.
     pub offset: f32,
+    /// Target scroll offset we're smoothly scrolling toward.
+    pub target_offset: f32,
     /// Total content height (computed from all cells)
     pub content_height: f32,
     /// Visible height of the conversation area
     pub visible_height: f32,
-    /// Whether we should auto-scroll to bottom on next frame.
-    pub scroll_to_bottom: bool,
+    /// Follow mode: continuously track bottom during streaming.
+    /// When true, target_offset auto-updates to max_offset each frame.
+    /// Set to false when user manually scrolls up.
+    pub following: bool,
 }
 
 impl Default for ConversationScrollState {
     fn default() -> Self {
         Self {
             offset: 0.0,
+            target_offset: 0.0,
             content_height: 0.0,
             visible_height: 600.0, // Will be updated by layout system
-            scroll_to_bottom: false,
+            following: true, // Start in follow mode
         }
     }
 }
 
 impl ConversationScrollState {
+    /// Check if scroll position is at (or near) the bottom.
+    /// Used to determine if we should enter/stay in follow mode.
+    pub fn is_at_bottom(&self) -> bool {
+        // Within 50px of max scroll counts as "at bottom"
+        const THRESHOLD: f32 = 50.0;
+        self.target_offset >= self.max_offset() - THRESHOLD
+    }
+
     /// Maximum scroll offset (can't scroll past content)
     pub fn max_offset(&self) -> f32 {
         (self.content_height - self.visible_height).max(0.0)
     }
 
-    /// Clamp the current offset to valid bounds
-    pub fn clamp_offset(&mut self) {
-        self.offset = self.offset.clamp(0.0, self.max_offset());
+    /// Clamp a value to valid scroll bounds
+    fn clamp_to_bounds(&self, value: f32) -> f32 {
+        value.clamp(0.0, self.max_offset())
     }
 
-    /// Scroll by a delta amount (positive = scroll down)
+    /// Clamp target offset to valid bounds
+    pub fn clamp_target(&mut self) {
+        self.target_offset = self.clamp_to_bounds(self.target_offset);
+    }
+
+    /// Scroll by a delta amount (positive = scroll down).
+    /// Disables follow mode since user is manually scrolling.
     pub fn scroll_by(&mut self, delta: f32) {
-        self.offset += delta;
-        self.clamp_offset();
+        self.target_offset += delta;
+        self.clamp_target();
+
+        // If scrolling up, disable follow mode
+        if delta < 0.0 {
+            self.following = false;
+        }
+        // If scrolling down and we hit bottom, re-enable follow mode
+        if self.is_at_bottom() {
+            self.following = true;
+        }
     }
 
-    /// Scroll to the bottom of the content
+    /// Set target to bottom and enable follow mode.
     pub fn scroll_to_end(&mut self) {
-        self.offset = self.max_offset();
+        self.target_offset = self.max_offset();
+        self.following = true;
+    }
+
+    /// Enable follow mode (will smoothly scroll to and track bottom).
+    pub fn start_following(&mut self) {
+        self.following = true;
     }
 }
 
