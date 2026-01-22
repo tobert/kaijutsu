@@ -11,6 +11,7 @@ use super::components::{
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
+use crate::ui::state::{InputPosition, InputShadowHeight};
 
 /// Spawn a new cell entity with all required components.
 pub fn spawn_cell(
@@ -36,20 +37,26 @@ pub fn spawn_cell(
 #[derive(Resource, Default)]
 pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
 
-/// Handle vim-style mode switching.
+/// Handle vim-style mode switching with input presence transitions.
+///
+/// Key bindings:
+/// - `i` in Normal → Insert mode + Docked presence (expand from minimized)
+/// - `Space` in Normal → Insert mode + Overlay presence (summon floating)
+/// - `Escape` in Insert → Normal mode + Minimized presence (collapse)
+/// - `:` in Normal → Command mode (no presence change)
 pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
-    focused: Res<FocusedCell>,
+    mut presence: ResMut<InputPresence>,
+    prompt_cells: Query<&CellEditor, With<PromptCell>>,
 ) {
     // Clear consumed keys from last frame
     consumed.0.clear();
 
-    // Only handle mode switches when a cell is focused
-    if focused.0.is_none() {
-        return;
-    }
+    // Mode switching works globally - no focus required.
+    // Focus determines which cell receives text input, not mode switching.
+    // This allows Space to summon the input from anywhere in the conversation.
 
     for event in key_events.read() {
         if !event.state.is_pressed() {
@@ -58,12 +65,21 @@ pub fn handle_mode_switch(
 
         match mode.0 {
             EditorMode::Normal => {
-                // In normal mode, i enters insert, : enters command, v enters visual
+                // In normal mode, i enters insert (docked), Space enters insert (overlay),
+                // : enters command, v enters visual
                 match event.key_code {
                     KeyCode::KeyI => {
                         mode.0 = EditorMode::Insert;
+                        presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::KeyI);
-                        info!("Mode: INSERT");
+                        info!("Mode: INSERT, Presence: DOCKED");
+                    }
+                    KeyCode::Space => {
+                        // Space summons the overlay input
+                        mode.0 = EditorMode::Insert;
+                        presence.0 = InputPresenceKind::Overlay;
+                        consumed.0.insert(KeyCode::Space);
+                        info!("Mode: INSERT, Presence: OVERLAY");
                     }
                     KeyCode::Semicolon if event.text.as_deref() == Some(":") => {
                         mode.0 = EditorMode::Command;
@@ -83,7 +99,22 @@ pub fn handle_mode_switch(
                 if event.key_code == KeyCode::Escape {
                     mode.0 = EditorMode::Normal;
                     consumed.0.insert(KeyCode::Escape);
-                    info!("Mode: NORMAL");
+
+                    // Set presence based on prompt content
+                    // If prompt is empty, minimize. If has content, stay docked.
+                    let prompt_empty = prompt_cells
+                        .iter()
+                        .next()
+                        .map(|editor| editor.text().trim().is_empty())
+                        .unwrap_or(true);
+
+                    if prompt_empty {
+                        presence.0 = InputPresenceKind::Minimized;
+                        info!("Mode: NORMAL, Presence: MINIMIZED");
+                    } else {
+                        presence.0 = InputPresenceKind::Docked;
+                        info!("Mode: NORMAL, Presence: DOCKED (draft preserved)");
+                    }
                 }
             }
         }
@@ -360,33 +391,27 @@ pub fn compute_cell_heights(
 /// Uses full window width minus margins for a wide input area.
 pub fn layout_prompt_cell_position(
     mut cells: Query<(&CellState, &mut TextAreaConfig), With<PromptCell>>,
+    pos: Res<InputPosition>,
     layout: Res<WorkspaceLayout>,
-    windows: Query<&Window>,
 ) {
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    // Position prompt at bottom of window (above status bar)
-    let prompt_y = window_height - layout.prompt_bottom_offset;
-
-    // Full width minus margins on both sides
-    let margin = layout.workspace_margin_left;
-    let prompt_width = window_width - (margin * 2.0);
+    // Use InputPosition for positioning (computed from presence/dock/window)
+    // Add padding inside the frame for the text
+    let padding = 20.0;
+    let text_left = pos.x + padding;
+    let text_top = pos.y + padding * 0.5;
+    let text_width = pos.width - (padding * 2.0);
 
     for (state, mut config) in cells.iter_mut() {
         let height = state.computed_height.max(layout.prompt_min_height);
 
-        config.left = margin;
-        config.top = prompt_y;
+        config.left = text_left;
+        config.top = text_top;
         config.scale = 1.0;
         config.bounds = glyphon::TextBounds {
-            left: margin as i32,
-            top: prompt_y as i32,
-            right: (margin + prompt_width) as i32,
-            bottom: (prompt_y + height) as i32,
+            left: text_left as i32,
+            top: text_top as i32,
+            right: (text_left + text_width) as i32,
+            bottom: (text_top + height) as i32,
         };
     }
 }
@@ -772,14 +797,20 @@ pub fn spawn_prompt_cell(
 }
 
 /// Handle prompt submission (Enter key in INSERT mode while focused on PromptCell).
+///
+/// After submission:
+/// - Editor is cleared
+/// - Mode returns to Normal
+/// - Presence set to Minimized (just the chasing line)
 pub fn handle_prompt_submit(
     mut key_events: MessageReader<KeyboardInput>,
     focused: Res<FocusedCell>,
-    mode: Res<CurrentMode>,
+    mut mode: ResMut<CurrentMode>,
     keys: Res<ButtonInput<KeyCode>>,
     mut editors: Query<&mut CellEditor>,
     prompt_cells: Query<Entity, With<PromptCell>>,
     mut submit_events: MessageWriter<PromptSubmitted>,
+    mut presence: ResMut<InputPresence>,
 ) {
     // Only handle in Insert mode
     if mode.0 != EditorMode::Insert {
@@ -825,6 +856,11 @@ pub fn handle_prompt_submit(
 
             // Clear the editor (CRDT-tracked)
             editor.clear();
+
+            // After submit: return to Normal mode and minimize input
+            mode.0 = EditorMode::Normal;
+            presence.0 = InputPresenceKind::Minimized;
+            info!("Prompt submitted, Mode: NORMAL, Presence: MINIMIZED");
         }
     }
 }
@@ -896,7 +932,6 @@ pub fn auto_focus_prompt(
 /// This prevents the "chasing a moving target" stutter during streaming.
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
-    time: Res<Time>,
 ) {
     let max = scroll_state.max_offset();
 
@@ -908,21 +943,9 @@ pub fn smooth_scroll(
         return;
     }
 
-    // Not following: smooth interpolation toward target
+    // Not following: immediate scroll (no smoothing for now)
     scroll_state.clamp_target();
-
-    // Exponential decay interpolation (frame-rate independent)
-    const SMOOTHING: f32 = 12.0;
-    let t = 1.0 - (-SMOOTHING * time.delta_secs()).exp();
-
-    let current = scroll_state.offset;
-    let target = scroll_state.target_offset;
-    scroll_state.offset = current + (target - current) * t;
-
-    // Snap when close (avoid micro-jitter)
-    if (scroll_state.offset - scroll_state.target_offset).abs() < 0.5 {
-        scroll_state.offset = scroll_state.target_offset;
-    }
+    scroll_state.offset = scroll_state.target_offset;
 }
 
 /// Handle mouse wheel scrolling for the conversation area.
@@ -1506,6 +1529,7 @@ pub fn layout_block_cells(
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut GlyphonTextBuffer)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    shadow_height: Res<InputShadowHeight>,
     registry: Res<ConversationRegistry>,
     current: Res<CurrentConversation>,
     font_system: Res<SharedFontSystem>,
@@ -1539,8 +1563,11 @@ pub fn layout_block_cells(
     let base_width = window_width - (margin * 2.0);
 
     // Update visible_height early so smooth_scroll has correct max_offset
+    // Use InputShadowHeight (0 when minimized, docked_height when visible)
+    // Plus status bar height (always 24px)
+    const STATUS_BAR_HEIGHT: f32 = 24.0;
     let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - layout.prompt_area_height;
+    let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
     scroll_state.visible_height = visible_bottom - visible_top;
 
     // Lock font system for shaping
@@ -1621,6 +1648,7 @@ pub fn apply_block_cell_positions(
     mut block_cells: Query<(&BlockCellLayout, &mut TextAreaConfig), With<BlockCell>>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    shadow_height: Res<InputShadowHeight>,
     windows: Query<&Window>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1637,9 +1665,10 @@ pub fn apply_block_cell_positions(
         .map(|w| (w.resolution.width(), w.resolution.height()))
         .unwrap_or((1280.0, 800.0));
 
-    // Visible area
+    // Visible area (use shadow_height, 0 when minimized)
+    const STATUS_BAR_HEIGHT: f32 = 24.0;
     let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - layout.prompt_area_height;
+    let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
     let visible_height = visible_bottom - visible_top;
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
@@ -1686,3 +1715,221 @@ pub fn apply_block_cell_positions(
 //
 // TODO: Implement inline role header rendering in BlockCell format_single_block
 // or as a separate UI element spawned alongside BlockCells.
+
+// ============================================================================
+// INPUT AREA POSITION SYSTEMS
+// ============================================================================
+
+use crate::ui::state::{
+    InputBackdrop, InputDock, InputDockKind, InputFrame, InputLayer, InputPresence,
+    InputPresenceKind, InputShadow,
+};
+use crate::ui::theme::Theme;
+
+/// Compute the input position based on presence, dock, and window size.
+///
+/// This is the single source of truth for input area positioning.
+/// Runs whenever presence, dock, or window changes.
+pub fn compute_input_position(
+    presence: Res<InputPresence>,
+    dock: Res<InputDock>,
+    theme: Res<Theme>,
+    window: Query<&Window>,
+    mut pos: ResMut<InputPosition>,
+) {
+    // Only recompute when relevant resources change
+    if !presence.is_changed() && !dock.is_changed() && !theme.is_changed() {
+        // Window size changes need to be checked
+        // (Query change detection handles this implicitly)
+    }
+
+    let Ok(win) = window.single() else {
+        return;
+    };
+
+    let win_width = win.width();
+    let win_height = win.height();
+
+    match presence.0 {
+        InputPresenceKind::Overlay => {
+            // Centered, 60% width (from theme), content-height
+            let width = win_width * theme.input_overlay_width_pct;
+            pos.x = (win_width - width) * 0.5;
+            pos.y = win_height * 0.3; // Upper-center
+            pos.width = width;
+            pos.height = theme.input_docked_height * 1.2; // Slightly taller in overlay
+            pos.show_backdrop = true;
+            pos.show_frame = true;
+        }
+        InputPresenceKind::Docked => {
+            match dock.0 {
+                InputDockKind::Bottom => {
+                    pos.x = 0.0;
+                    pos.y = win_height - theme.input_docked_height;
+                    pos.width = win_width;
+                    pos.height = theme.input_docked_height;
+                }
+                InputDockKind::BottomRight => {
+                    pos.x = win_width * 0.6;
+                    pos.y = win_height - theme.input_docked_height * 0.75;
+                    pos.width = win_width * 0.38;
+                    pos.height = theme.input_docked_height * 0.75;
+                }
+                InputDockKind::BottomLeft => {
+                    pos.x = win_width * 0.02;
+                    pos.y = win_height - theme.input_docked_height * 0.75;
+                    pos.width = win_width * 0.38;
+                    pos.height = theme.input_docked_height * 0.75;
+                }
+            }
+            pos.show_backdrop = false;
+            pos.show_frame = true;
+        }
+        InputPresenceKind::Minimized => {
+            // Full-width thin line at bottom
+            pos.x = 0.0;
+            pos.y = win_height - theme.input_minimized_height;
+            pos.width = win_width;
+            pos.height = theme.input_minimized_height;
+            pos.show_backdrop = false;
+            pos.show_frame = false;
+        }
+        InputPresenceKind::Hidden => {
+            pos.height = 0.0;
+            pos.show_backdrop = false;
+            pos.show_frame = false;
+        }
+    }
+}
+
+/// Sync InputLayer visibility based on InputPresence.
+///
+/// The InputLayer is visible when presence is Docked or Overlay.
+/// It's hidden when Minimized (only shadow line shows) or Hidden (dashboard).
+pub fn sync_input_layer_visibility(
+    presence: Res<InputPresence>,
+    mut layer_query: Query<&mut Visibility, With<InputLayer>>,
+) {
+    if !presence.is_changed() {
+        return;
+    }
+
+    let target = if presence.is_visible() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
+    for mut vis in layer_query.iter_mut() {
+        *vis = target;
+    }
+}
+
+/// Sync InputBackdrop visibility based on InputPresence.
+///
+/// The backdrop is only visible in Overlay mode.
+pub fn sync_backdrop_visibility(
+    presence: Res<InputPresence>,
+    mut backdrop_query: Query<&mut Visibility, With<InputBackdrop>>,
+) {
+    if !presence.is_changed() {
+        return;
+    }
+
+    let target = if presence.shows_backdrop() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
+    for mut vis in backdrop_query.iter_mut() {
+        *vis = target;
+    }
+}
+
+/// Apply computed InputPosition to the InputFrame node.
+///
+/// Updates the InputFrame's position and size based on InputPosition.
+pub fn apply_input_position(
+    pos: Res<InputPosition>,
+    mut frame_query: Query<(&mut Node, &mut Visibility), With<InputFrame>>,
+) {
+    if !pos.is_changed() {
+        return;
+    }
+
+    for (mut node, mut vis) in frame_query.iter_mut() {
+        // Update position and size
+        node.left = Val::Px(pos.x);
+        node.top = Val::Px(pos.y);
+        node.width = Val::Px(pos.width);
+        node.height = Val::Px(pos.height);
+
+        // Frame visibility based on show_frame flag
+        *vis = if pos.show_frame {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+/// Sync InputShadow height based on presence.
+///
+/// When docked, the shadow reserves full docked height.
+/// When minimized/hidden, it's just the line height.
+pub fn sync_input_shadow_height(
+    presence: Res<InputPresence>,
+    theme: Res<Theme>,
+    mut shadow_query: Query<&mut Node, With<InputShadow>>,
+    mut shadow_height: ResMut<InputShadowHeight>,
+) {
+    if !presence.is_changed() && !theme.is_changed() {
+        return;
+    }
+
+    let new_height = match presence.0 {
+        InputPresenceKind::Docked => theme.input_docked_height,
+        InputPresenceKind::Overlay => 0.0,   // Overlay floats, no space reserved
+        InputPresenceKind::Minimized => 0.0, // Hidden completely
+        InputPresenceKind::Hidden => 0.0,
+    };
+
+    shadow_height.0 = new_height;
+
+    for mut node in shadow_query.iter_mut() {
+        node.min_height = Val::Px(new_height);
+        node.height = Val::Px(new_height);
+    }
+}
+
+use crate::ui::state::AppScreen;
+
+/// Sync InputPresence with AppScreen state.
+///
+/// When transitioning to Dashboard, hide the input.
+/// When transitioning to Conversation, show docked (unless already in a valid state).
+pub fn sync_presence_with_screen(
+    screen: Res<State<AppScreen>>,
+    mut presence: ResMut<InputPresence>,
+) {
+    if !screen.is_changed() {
+        return;
+    }
+
+    match screen.get() {
+        AppScreen::Dashboard => {
+            // Hide input when on dashboard
+            presence.0 = InputPresenceKind::Hidden;
+            info!("AppScreen::Dashboard -> Presence: HIDDEN");
+        }
+        AppScreen::Conversation => {
+            // Show minimized when entering conversation (user can expand with i/Space)
+            // Only change if currently hidden - don't override if already docked/overlay
+            if matches!(presence.0, InputPresenceKind::Hidden) {
+                presence.0 = InputPresenceKind::Minimized;
+                info!("AppScreen::Conversation -> Presence: MINIMIZED");
+            }
+        }
+    }
+}

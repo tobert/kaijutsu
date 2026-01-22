@@ -555,15 +555,18 @@ impl ConversationScrollState {
     }
 
     /// Scroll by a delta amount (positive = scroll down).
-    /// Disables follow mode since user is manually scrolling.
+    /// Instant - sets both offset and target for zero-frame-delay.
     pub fn scroll_by(&mut self, delta: f32) {
-        self.target_offset += delta;
-        self.clamp_target();
-
         // If scrolling up, disable follow mode
         if delta < 0.0 {
             self.following = false;
         }
+
+        // Set both for instant response
+        self.target_offset += delta;
+        self.clamp_target();
+        self.offset = self.target_offset;
+
         // If scrolling down and we hit bottom, re-enable follow mode
         if self.is_at_bottom() {
             self.following = true;
