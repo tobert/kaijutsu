@@ -150,6 +150,13 @@ pub struct Theme {
     pub effect_sheen_sparkle_threshold: f32,
     pub effect_breathe_speed: f32,
     pub effect_breathe_amplitude: f32,
+
+    // Chasing border effect parameters
+    pub effect_chase_speed: f32,
+    pub effect_chase_width: f32,
+    pub effect_chase_glow_radius: f32,
+    pub effect_chase_glow_intensity: f32,
+    pub effect_chase_color_cycle: f32, // 0 = static color, >0 = rainbow cycle speed
 }
 
 impl Default for Theme {
@@ -220,6 +227,13 @@ impl Default for Theme {
             effect_sheen_sparkle_threshold: 0.92,
             effect_breathe_speed: 1.9,
             effect_breathe_amplitude: 0.1,
+
+            // Chasing border defaults
+            effect_chase_speed: 0.25,
+            effect_chase_width: 0.10,
+            effect_chase_glow_radius: 0.08,
+            effect_chase_glow_intensity: 0.6,
+            effect_chase_color_cycle: 0.15, // Rainbow cycle speed
         }
     }
 }

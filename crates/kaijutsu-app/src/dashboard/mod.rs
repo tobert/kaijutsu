@@ -5,8 +5,15 @@
 //! - Contexts within selected kernel (middle)
 //! - User's seats (right)
 //!
-//! It's shown when no seats are active. Once a seat is taken,
-//! the conversation view is shown instead.
+//! ## State-Driven Visibility
+//!
+//! The dashboard's visibility is controlled by `AppScreen` state:
+//! - `AppScreen::Dashboard` → Dashboard visible, Conversation hidden
+//! - `AppScreen::Conversation` → Dashboard hidden, Conversation visible
+//!
+//! State transitions are triggered by:
+//! - `SeatTaken` event → switch to `AppScreen::Conversation`
+//! - `SeatLeft` event → switch to `AppScreen::Dashboard`
 
 pub mod seat_selector;
 
@@ -14,7 +21,9 @@ use bevy::prelude::*;
 use kaijutsu_client::{Context, KernelInfo, SeatInfo};
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
+use crate::shaders::nine_slice::{ChasingBorder, ChasingBorderMaterial};
 use crate::text::{GlyphonUiText, UiTextPositionCache};
+use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
 use crate::HeaderContainer;
 
@@ -26,15 +35,13 @@ pub struct DashboardPlugin;
 impl Plugin for DashboardPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DashboardState>()
-            .add_systems(Startup, setup_dashboard)
-            // PostStartup ensures header exists before we add seat selector to it
-            .add_systems(PostStartup, setup_seat_selector_ui)
+            // PostStartup ensures ContentArea and header exist before we add dashboard to them
+            .add_systems(PostStartup, (setup_dashboard, setup_seat_selector_ui).chain())
             .add_systems(
                 Update,
                 (
                     // Dashboard systems
                     handle_dashboard_events,
-                    update_dashboard_visibility,
                     handle_kernel_selection,
                     handle_context_selection,
                     handle_take_seat,
@@ -49,12 +56,15 @@ impl Plugin for DashboardPlugin {
                     seat_selector::handle_seat_option_click,
                     seat_selector::close_dropdown_on_outside_click,
                     seat_selector::rebuild_seat_options,
+                    seat_selector::sync_dropdown_visibility,
                 ),
             );
     }
 }
 
 /// State for the dashboard
+///
+/// Note: Visibility is now controlled by `AppScreen` state, not a field here.
 #[derive(Resource, Default)]
 pub struct DashboardState {
     /// Available kernels
@@ -67,8 +77,6 @@ pub struct DashboardState {
     pub selected_context: Option<usize>,
     /// User's active seats across all kernels
     pub my_seats: Vec<SeatInfo>,
-    /// Whether dashboard is visible
-    pub visible: bool,
     /// Current seat (if any)
     pub current_seat: Option<SeatInfo>,
 }
@@ -131,47 +139,45 @@ pub struct TakeSeatButton;
 // Setup
 // ============================================================================
 
-fn setup_dashboard(mut commands: Commands, theme: Res<Theme>) {
-    // Root container - hidden by default, shown when no seat is active
-    commands
+fn setup_dashboard(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
+    content_area: Query<Entity, With<crate::ui::state::ContentArea>>,
+) {
+    // Get the ContentArea entity to parent the dashboard under
+    let Ok(content_entity) = content_area.single() else {
+        warn!("ContentArea not found - dashboard cannot be attached");
+        return;
+    };
+
+    // Pre-create chasing border materials for each column
+    // Sharp cyan border with rainbow cycling chase - parameters from theme
+    let column_border_material = chasing_materials.add(
+        ChasingBorderMaterial::from_theme(theme.accent, Color::WHITE)
+            .with_thickness(1.0)
+            .with_glow(theme.effect_chase_glow_radius, theme.effect_chase_glow_intensity)
+            .with_chase_speed(theme.effect_chase_speed)
+            .with_chase_width(theme.effect_chase_width)
+            .with_color_cycle(theme.effect_chase_color_cycle),
+    );
+
+    // Root container - flex child in ContentArea
+    // Visibility controlled by AppScreen state transitions (Display::Flex by default)
+    let dashboard = commands
         .spawn((
             DashboardRoot,
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
-                position_type: PositionType::Absolute,
                 flex_direction: FlexDirection::Column,
-                display: Display::None, // Hidden by default
+                display: Display::Flex, // Visible by default (Dashboard is initial state)
                 ..default()
             },
             BackgroundColor(theme.bg),
-            ZIndex(100), // Above conversation
+            Visibility::Inherited, // Visible by default, state transitions toggle this
         ))
         .with_children(|root| {
-            // Header
-            root.spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    padding: UiRect::all(Val::Px(20.0)),
-                    border: UiRect::bottom(Val::Px(1.0)),
-                    ..default()
-                },
-                BorderColor::all(theme.border),
-            ))
-            .with_children(|header| {
-                header.spawn((
-                    GlyphonUiText::new("会術 Kaijutsu Dashboard")
-                        .with_font_size(24.0)
-                        .with_color(theme.accent),
-                    UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(300.0),
-                        min_height: Val::Px(30.0),
-                        ..default()
-                    },
-                ));
-            });
-
             // Main content - 3 columns
             root.spawn((Node {
                 width: Val::Percent(100.0),
@@ -183,13 +189,13 @@ fn setup_dashboard(mut commands: Commands, theme: Res<Theme>) {
             },))
                 .with_children(|content| {
                     // Column 1: Kernels
-                    spawn_dashboard_column(content, &theme, "KERNELS", KernelList);
+                    spawn_dashboard_column_with_border(content, &theme, "KERNELS", KernelList, column_border_material.clone());
 
                     // Column 2: Contexts
-                    spawn_dashboard_column(content, &theme, "CONTEXTS", ContextList);
+                    spawn_dashboard_column_with_border(content, &theme, "CONTEXTS", ContextList, column_border_material.clone());
 
                     // Column 3: Your Seats
-                    spawn_dashboard_column(content, &theme, "YOUR SEATS", SeatsList);
+                    spawn_dashboard_column_with_border(content, &theme, "YOUR SEATS", SeatsList, column_border_material.clone());
                 });
 
             // Footer with "Take Seat" input
@@ -243,7 +249,11 @@ fn setup_dashboard(mut commands: Commands, theme: Res<Theme>) {
                         ));
                     });
             });
-        });
+        })
+        .id();
+
+    // Attach dashboard to ContentArea
+    commands.entity(content_entity).add_child(dashboard);
 }
 
 /// Spawn a dashboard column - uses macro to avoid ChildBuilder type issues
@@ -300,6 +310,71 @@ fn spawn_dashboard_column<M: Component>(
     spawn_dashboard_column_impl!(parent, theme, title, marker);
 }
 
+/// Spawn a dashboard column with chasing neon border effect
+fn spawn_dashboard_column_with_border<M: Component>(
+    parent: &mut ChildSpawnerCommands,
+    theme: &Theme,
+    title: &str,
+    marker: M,
+    border_material: Handle<ChasingBorderMaterial>,
+) {
+    // Outer container with chasing border material
+    parent
+        .spawn((
+            ChasingBorder,
+            Node {
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Column,
+                // Small padding to create space between border and content
+                padding: UiRect::all(Val::Px(4.0)),
+                ..default()
+            },
+            // The material renders the animated border
+            MaterialNode(border_material),
+        ))
+        .with_children(|outer| {
+            // Inner content area with background
+            outer
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        padding: UiRect::all(Val::Px(12.0)),
+                        ..default()
+                    },
+                    BackgroundColor(theme.panel_bg),
+                ))
+                .with_children(|col| {
+                    // Column header
+                    col.spawn((
+                        GlyphonUiText::new(title)
+                            .with_font_size(12.0)
+                            .with_color(theme.fg_dim),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(100.0),
+                            min_height: Val::Px(16.0),
+                            margin: UiRect::bottom(Val::Px(12.0)),
+                            ..default()
+                        },
+                    ));
+
+                    // Content area (scrollable)
+                    col.spawn((
+                        marker,
+                        Node {
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Column,
+                            overflow: Overflow::scroll_y(),
+                            row_gap: Val::Px(4.0),
+                            ..default()
+                        },
+                    ));
+                });
+        });
+}
+
 // ============================================================================
 // Systems
 // ============================================================================
@@ -308,6 +383,7 @@ fn spawn_dashboard_column<M: Component>(
 fn handle_dashboard_events(
     mut events: MessageReader<ConnectionEvent>,
     mut state: ResMut<DashboardState>,
+    mut next_screen: ResMut<NextState<AppScreen>>,
     conn: Res<ConnectionCommands>,
 ) {
     for event in events.read() {
@@ -335,15 +411,16 @@ fn handle_dashboard_events(
             }
             ConnectionEvent::SeatTaken { seat } => {
                 state.current_seat = Some(seat.clone());
-                state.visible = false;
+                // Transition to Conversation screen
+                next_screen.set(AppScreen::Conversation);
             }
             ConnectionEvent::SeatLeft => {
                 state.current_seat = None;
-                state.visible = true;
+                // Transition to Dashboard screen
+                next_screen.set(AppScreen::Dashboard);
             }
             ConnectionEvent::Connected => {
-                // Just mark visible - kernel list will be requested after attach
-                state.visible = true;
+                // Stay on Dashboard - kernel list will be requested after attach
             }
             ConnectionEvent::AttachedKernel(_) => {
                 // Now that we're attached, request kernel list and contexts
@@ -356,24 +433,10 @@ fn handle_dashboard_events(
                 state.contexts.clear();
                 state.my_seats.clear();
                 state.current_seat = None;
+                // Return to Dashboard on disconnect
+                next_screen.set(AppScreen::Dashboard);
             }
             _ => {}
-        }
-    }
-}
-
-/// Update dashboard visibility based on seat state
-fn update_dashboard_visibility(
-    state: Res<DashboardState>,
-    mut query: Query<&mut Node, With<DashboardRoot>>,
-) {
-    if state.is_changed() {
-        for mut node in query.iter_mut() {
-            node.display = if state.visible && state.current_seat.is_none() {
-                Display::Flex
-            } else {
-                Display::None
-            };
         }
     }
 }

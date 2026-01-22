@@ -67,7 +67,8 @@ impl UiMaterial for CornerMaterial {
 }
 
 /// Helper to identify which corner this entity represents
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+#[reflect(Component)]
 pub enum CornerPosition {
     TopLeft,
     TopRight,
@@ -123,7 +124,8 @@ impl UiMaterial for EdgeMaterial {
 }
 
 /// Helper to identify edge position
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+#[reflect(Component)]
 pub enum EdgePosition {
     Top,
     Bottom,
@@ -168,13 +170,111 @@ impl UiMaterial for ErrorFrameMaterial {
 // ============================================================================
 
 /// Marker component for any frame piece (corner or edge)
-#[derive(Component, Debug)]
+#[derive(Component, Debug, Reflect)]
+#[reflect(Component)]
 pub struct FramePiece;
 
 /// Marker for corner pieces specifically
-#[derive(Component, Debug)]
+#[derive(Component, Debug, Reflect)]
+#[reflect(Component)]
 pub struct CornerMarker;
 
 /// Marker for edge pieces specifically
-#[derive(Component, Debug)]
+#[derive(Component, Debug, Reflect)]
+#[reflect(Component)]
 pub struct EdgeMarker;
+
+// ============================================================================
+// CHASING BORDER MATERIAL
+// ============================================================================
+
+/// Single-node border with traveling neon light effect.
+///
+/// Unlike the 9-slice frame system (which uses 8 child nodes), this material
+/// creates a complete animated border in a single node. Ideal for containers
+/// like dashboard columns where you want the "chasing light" effect.
+///
+/// The chase light travels around the perimeter in a continuous loop.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct ChasingBorderMaterial {
+    /// Base border color (RGBA)
+    #[uniform(0)]
+    pub color: Vec4,
+    /// Parameters: x=border_thickness, y=glow_radius, z=glow_intensity, w=chase_speed
+    #[uniform(1)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time
+    #[uniform(2)]
+    pub time: Vec4,
+    /// Chase params: x=chase_width (0-1), y=chase_intensity, z=chase_tail_length, w=_
+    #[uniform(3)]
+    pub chase: Vec4,
+    /// Secondary color for the chase highlight (can be accent2 for hot pink on cyan)
+    #[uniform(4)]
+    pub chase_color: Vec4,
+}
+
+impl Default for ChasingBorderMaterial {
+    fn default() -> Self {
+        Self {
+            color: Vec4::new(0.0, 1.0, 1.0, 0.8),          // Cyan border
+            params: Vec4::new(2.0, 0.3, 1.0, 0.5),         // 2px thick, medium glow, speed 0.5
+            time: Vec4::ZERO,
+            chase: Vec4::new(0.15, 2.0, 0.3, 0.0),         // 15% width, 2x intensity, tail
+            chase_color: Vec4::new(1.0, 0.0, 0.5, 1.0),    // Hot pink chase
+        }
+    }
+}
+
+impl ChasingBorderMaterial {
+    /// Create from theme colors
+    pub fn from_theme(border_color: Color, chase_color: Color) -> Self {
+        Self {
+            color: border_color.to_linear().to_vec4(),
+            chase_color: chase_color.to_linear().to_vec4(),
+            ..default()
+        }
+    }
+
+    /// Set border thickness in pixels (will be converted to UV space in shader)
+    pub fn with_thickness(mut self, pixels: f32) -> Self {
+        self.params.x = pixels;
+        self
+    }
+
+    /// Set chase animation speed (cycles per second)
+    pub fn with_chase_speed(mut self, speed: f32) -> Self {
+        self.params.w = speed;
+        self
+    }
+
+    /// Set glow parameters
+    pub fn with_glow(mut self, radius: f32, intensity: f32) -> Self {
+        self.params.y = radius;
+        self.params.z = intensity;
+        self
+    }
+
+    /// Set chase width (0-1, portion of perimeter the chase covers)
+    pub fn with_chase_width(mut self, width: f32) -> Self {
+        self.chase.x = width;
+        self
+    }
+
+    /// Set color cycle speed (0 = static white, >0 = rainbow cycle speed)
+    pub fn with_color_cycle(mut self, speed: f32) -> Self {
+        self.chase_color.w = speed;
+        self
+    }
+}
+
+impl UiMaterial for ChasingBorderMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/chasing_border.wgsl".into()
+    }
+}
+
+/// Marker component for entities using the chasing border
+#[derive(Component, Debug, Reflect)]
+#[reflect(Component)]
+pub struct ChasingBorder;

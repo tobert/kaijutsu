@@ -44,8 +44,8 @@ use bevy::{
 };
 
 use nine_slice::{
-    CornerMarker, CornerMaterial, CornerPosition, EdgeMarker, EdgeMaterial, EdgePosition,
-    ErrorFrameMaterial, FramePiece,
+    ChasingBorder, ChasingBorderMaterial, CornerMarker, CornerMaterial, CornerPosition, EdgeMarker,
+    EdgeMaterial, EdgePosition, ErrorFrameMaterial, FramePiece,
 };
 
 /// Plugin that registers all shader effect materials.
@@ -67,6 +67,8 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<CornerMaterial>::default(),
             UiMaterialPlugin::<EdgeMaterial>::default(),
             UiMaterialPlugin::<ErrorFrameMaterial>::default(),
+            // Chasing border effect
+            UiMaterialPlugin::<ChasingBorderMaterial>::default(),
             // Text effects
             UiMaterialPlugin::<TextGlowMaterial>::default(),
         ))
@@ -76,6 +78,7 @@ impl Plugin for ShaderFxPlugin {
         .register_type::<EdgeMarker>()
         .register_type::<CornerPosition>()
         .register_type::<EdgePosition>()
+        .register_type::<ChasingBorder>()
         .add_systems(Update, (
             update_shader_time,
             sync_effect_context_to_text_glow,
@@ -96,6 +99,7 @@ fn update_shader_time(
     mut corner_materials: ResMut<Assets<CornerMaterial>>,
     mut edge_materials: ResMut<Assets<EdgeMaterial>>,
     mut error_materials: ResMut<Assets<ErrorFrameMaterial>>,
+    mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
     mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
 ) {
     let t = time.elapsed_secs();
@@ -128,6 +132,9 @@ fn update_shader_time(
         mat.time.x = t;
     }
     for (_, mat) in error_materials.iter_mut() {
+        mat.time.x = t;
+    }
+    for (_, mat) in chasing_materials.iter_mut() {
         mat.time.x = t;
     }
 

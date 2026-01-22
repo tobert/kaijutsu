@@ -305,6 +305,23 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.effect_breathe_amplitude = v;
     }
 
+    // Chasing border effect parameters
+    if let Some(v) = get_float(&scope, "effect_chase_speed") {
+        theme.effect_chase_speed = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_chase_width") {
+        theme.effect_chase_width = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_chase_glow_radius") {
+        theme.effect_chase_glow_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_chase_glow_intensity") {
+        theme.effect_chase_glow_intensity = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_chase_color_cycle") {
+        theme.effect_chase_color_cycle = v;
+    }
+
     Ok(theme)
 }
 
