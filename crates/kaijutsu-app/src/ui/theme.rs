@@ -139,6 +139,17 @@ pub struct Theme {
     // Edge dimming multipliers (applied to edge colors for visual hierarchy)
     pub frame_edge_dim_unfocused: Vec4, // Color multiplier when unfocused
     pub frame_edge_dim_focused: Vec4,   // Color multiplier when focused
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Shader Effect Parameters (GPU-reactive via ShaderEffectContext)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub effect_glow_radius: f32,
+    pub effect_glow_intensity: f32,
+    pub effect_glow_falloff: f32,
+    pub effect_sheen_speed: f32,
+    pub effect_sheen_sparkle_threshold: f32,
+    pub effect_breathe_speed: f32,
+    pub effect_breathe_amplitude: f32,
 }
 
 impl Default for Theme {
@@ -200,6 +211,15 @@ impl Default for Theme {
             // Edge dimming: [r_mult, g_mult, b_mult, a_mult]
             frame_edge_dim_unfocused: Vec4::new(0.5, 0.5, 0.5, 0.6),
             frame_edge_dim_focused: Vec4::new(0.7, 0.7, 0.7, 0.8),
+
+            // Shader effect parameters - cyberpunk defaults
+            effect_glow_radius: 0.3,
+            effect_glow_intensity: 0.5,
+            effect_glow_falloff: 2.5,
+            effect_sheen_speed: 0.15,
+            effect_sheen_sparkle_threshold: 0.92,
+            effect_breathe_speed: 1.9,
+            effect_breathe_amplitude: 0.1,
         }
     }
 }
@@ -208,4 +228,10 @@ impl Default for Theme {
 pub fn color_to_vec4(color: Color) -> Vec4 {
     let srgba = color.to_srgba();
     Vec4::new(srgba.red, srgba.green, srgba.blue, srgba.alpha)
+}
+
+/// Helper to convert Bevy Color to linear Vec4 (for GPU storage buffers).
+pub fn color_to_linear_vec4(color: Color) -> Vec4 {
+    let linear = color.to_linear();
+    Vec4::new(linear.red, linear.green, linear.blue, linear.alpha)
 }

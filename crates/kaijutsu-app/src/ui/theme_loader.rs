@@ -280,6 +280,31 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.frame_edge_dim_focused = v;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Shader effect parameters (GPU-reactive)
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(v) = get_float(&scope, "effect_glow_radius") {
+        theme.effect_glow_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_glow_intensity") {
+        theme.effect_glow_intensity = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_glow_falloff") {
+        theme.effect_glow_falloff = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_sheen_speed") {
+        theme.effect_sheen_speed = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_sheen_sparkle_threshold") {
+        theme.effect_sheen_sparkle_threshold = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_breathe_speed") {
+        theme.effect_breathe_speed = v;
+    }
+    if let Some(v) = get_float(&scope, "effect_breathe_amplitude") {
+        theme.effect_breathe_amplitude = v;
+    }
+
     Ok(theme)
 }
 

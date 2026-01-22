@@ -7,6 +7,16 @@
 //! - `ScanlinesMaterial` - Subtle CRT/cyberpunk scanlines
 //! - `HoloBorderMaterial` - Rainbow/gradient animated border
 //! - `CornerMaterial` / `EdgeMaterial` - 9-slice frame system (new)
+//! - `TextGlowMaterial` - Luminous backing for text with theme-reactive effects
+//!
+//! # Theme-Reactive Shaders
+//!
+//! The `ShaderEffectContext` resource syncs theme configuration to shaders.
+//! Materials that want theme-reactive behavior read from this context.
+//!
+//! ```text
+//! theme.rhai → Theme → ShaderEffectContext → Material uniforms → GPU
+//! ```
 //!
 //! # Usage
 //!
@@ -22,7 +32,10 @@
 //! ));
 //! ```
 
+pub mod context;
 pub mod nine_slice;
+
+pub use context::{ShaderEffectContext, ShaderEffectContextPlugin};
 
 use bevy::{
     prelude::*,
@@ -30,7 +43,10 @@ use bevy::{
     shader::ShaderRef,
 };
 
-use nine_slice::{CornerMaterial, EdgeMaterial, ErrorFrameMaterial};
+use nine_slice::{
+    CornerMarker, CornerMaterial, CornerPosition, EdgeMarker, EdgeMaterial, EdgePosition,
+    ErrorFrameMaterial, FramePiece,
+};
 
 /// Plugin that registers all shader effect materials.
 pub struct ShaderFxPlugin;
@@ -38,6 +54,8 @@ pub struct ShaderFxPlugin;
 impl Plugin for ShaderFxPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
+            // Shared effect context (theme → GPU)
+            ShaderEffectContextPlugin,
             // Legacy materials
             UiMaterialPlugin::<GlowBorderMaterial>::default(),
             UiMaterialPlugin::<ShimmerMaterial>::default(),
@@ -49,8 +67,16 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<CornerMaterial>::default(),
             UiMaterialPlugin::<EdgeMaterial>::default(),
             UiMaterialPlugin::<ErrorFrameMaterial>::default(),
+            // Text effects
+            UiMaterialPlugin::<TextGlowMaterial>::default(),
         ))
-        .add_systems(Update, update_shader_time);
+        // Register frame types for BRP reflection
+        .register_type::<FramePiece>()
+        .register_type::<CornerMarker>()
+        .register_type::<EdgeMarker>()
+        .register_type::<CornerPosition>()
+        .register_type::<EdgePosition>()
+        .add_systems(Update, (update_shader_time, sync_effect_context_to_text_glow));
     }
 }
 
@@ -66,6 +92,7 @@ fn update_shader_time(
     mut corner_materials: ResMut<Assets<CornerMaterial>>,
     mut edge_materials: ResMut<Assets<EdgeMaterial>>,
     mut error_materials: ResMut<Assets<ErrorFrameMaterial>>,
+    mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -97,6 +124,11 @@ fn update_shader_time(
         mat.time.x = t;
     }
     for (_, mat) in error_materials.iter_mut() {
+        mat.time.x = t;
+    }
+
+    // Text effects
+    for (_, mat) in text_glow_materials.iter_mut() {
         mat.time.x = t;
     }
 }
@@ -349,5 +381,166 @@ impl Default for CursorBeamMaterial {
 impl UiMaterial for CursorBeamMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/cursor_beam.wgsl".into()
+    }
+}
+
+// ============================================================================
+// TEXT GLOW MATERIAL
+// ============================================================================
+
+/// Subtle luminous backing for text - increases contrast and perceived sharpness.
+///
+/// Now theme-reactive: effect parameters come from `ShaderEffectContext` which
+/// syncs from `theme.rhai`. The shader reads these from the `effect` uniform.
+///
+/// Renders behind text to create:
+/// - Soft center glow (backlight effect)
+/// - Optional edge enhancement (sharpening)
+/// - Subtle top-light gradient (improves readability)
+///
+/// # Theme Configuration
+///
+/// In `theme.rhai`:
+/// ```rhai
+/// let effect_glow_radius = 0.3;
+/// let effect_glow_intensity = 0.5;
+/// let effect_breathe_speed = 1.9;
+/// // ... etc
+/// ```
+///
+/// # Usage
+///
+/// Spawn a Node with this material BEHIND your text (ZIndex(-1)):
+/// ```ignore
+/// // Glow backing
+/// commands.spawn((
+///     Node { width: Val::Px(200.0), height: Val::Px(30.0), ..default() },
+///     MaterialNode(materials.add(TextGlowMaterial::subtle(theme.accent))),
+///     ZIndex(-1),
+/// ));
+/// // Text on top (ZIndex 0, default)
+/// commands.spawn((GlyphonUiText::new("Hello"), ...));
+/// ```
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct TextGlowMaterial {
+    /// Glow color (RGBA) - typically matches or complements text color
+    #[uniform(0)]
+    pub color: Vec4,
+    /// Parameters: x=radius (0.1-0.5), y=intensity (0.5-2.0), z=falloff (1.0-4.0), w=mode (0=glow, >0.5=icy)
+    #[uniform(1)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time (updated by update_shader_time system)
+    #[uniform(2)]
+    pub time: Vec4,
+    /// Effect context from theme: [glow_radius, glow_intensity, glow_falloff, sheen_speed]
+    #[uniform(3)]
+    pub effect_glow: Vec4,
+    /// Effect context from theme: [sparkle_threshold, breathe_speed, breathe_amplitude, _reserved]
+    #[uniform(4)]
+    pub effect_anim: Vec4,
+    /// Theme colors: accent (linear space)
+    #[uniform(5)]
+    pub theme_accent: Vec4,
+}
+
+impl Default for TextGlowMaterial {
+    fn default() -> Self {
+        Self {
+            color: Vec4::new(0.5, 0.6, 0.9, 0.3), // Soft blue, low alpha
+            params: Vec4::new(0.3, 0.8, 2.0, 0.0), // radius, intensity, falloff, mode
+            time: Vec4::ZERO,
+            // Defaults match Theme::default() effect params
+            effect_glow: Vec4::new(0.3, 0.5, 2.5, 0.15),   // radius, intensity, falloff, sheen_speed
+            effect_anim: Vec4::new(0.92, 1.9, 0.1, 0.0),   // sparkle_threshold, breathe_speed, breathe_amplitude
+            theme_accent: Vec4::new(0.34, 0.65, 1.0, 1.0), // Default accent
+        }
+    }
+}
+
+impl TextGlowMaterial {
+    /// Create a subtle glow with given color (good for body text)
+    pub fn subtle(color: Color) -> Self {
+        let c = color.to_linear();
+        Self {
+            color: Vec4::new(c.red, c.green, c.blue, 0.25),
+            params: Vec4::new(0.25, 0.6, 2.5, 0.0), // mode=0 (glow)
+            ..Default::default()
+        }
+    }
+
+    /// Create a prominent glow (good for headers/titles)
+    pub fn prominent(color: Color) -> Self {
+        let c = color.to_linear();
+        Self {
+            color: Vec4::new(c.red, c.green, c.blue, 0.15),
+            params: Vec4::new(0.4, 0.5, 3.0, 0.0), // mode=0 (glow)
+            ..Default::default()
+        }
+    }
+
+    /// Create an intense "neon" glow effect
+    pub fn neon(color: Color) -> Self {
+        let c = color.to_linear();
+        Self {
+            color: Vec4::new(c.red, c.green, c.blue, 0.6),
+            params: Vec4::new(0.4, 1.8, 1.5, 0.0), // mode=0 (glow)
+            ..Default::default()
+        }
+    }
+
+    /// Create an icy sheen effect (cool reflective plane)
+    /// Uses params.w > 0.5 to signal "icy mode" to shader
+    pub fn icy_sheen(color: Color) -> Self {
+        let c = color.to_linear();
+        Self {
+            color: Vec4::new(
+                c.red * 0.7 + 0.3,
+                c.green * 0.7 + 0.3,
+                c.blue * 0.8 + 0.2,
+                0.25,
+            ),
+            params: Vec4::new(0.8, 0.6, 2.0, 1.0), // mode=1 (icy)
+            ..Default::default()
+        }
+    }
+}
+
+impl UiMaterial for TextGlowMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/text_glow.wgsl".into()
+    }
+}
+
+/// System: sync ShaderEffectContext → TextGlowMaterial uniforms
+///
+/// Updates all text glow materials with the current effect context from the theme.
+/// This provides theme-reactive behavior without requiring material recreation.
+fn sync_effect_context_to_text_glow(
+    ctx: Res<ShaderEffectContext>,
+    mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
+) {
+    // Only update if context changed
+    if !ctx.is_changed() {
+        return;
+    }
+
+    // Pack effect params into Vec4s for uniform binding
+    let effect_glow = Vec4::new(
+        ctx.glow_radius,
+        ctx.glow_intensity,
+        ctx.glow_falloff,
+        ctx.sheen_speed,
+    );
+    let effect_anim = Vec4::new(
+        ctx.sparkle_threshold,
+        ctx.breathe_speed,
+        ctx.breathe_amplitude,
+        0.0, // reserved
+    );
+
+    for (_, mat) in text_glow_materials.iter_mut() {
+        mat.effect_glow = effect_glow;
+        mat.effect_anim = effect_anim;
+        mat.theme_accent = ctx.accent;
     }
 }
