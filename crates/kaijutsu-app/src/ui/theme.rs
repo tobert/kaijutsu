@@ -157,6 +157,19 @@ pub struct Theme {
     pub effect_chase_glow_radius: f32,
     pub effect_chase_glow_intensity: f32,
     pub effect_chase_color_cycle: f32, // 0 = static color, >0 = rainbow cycle speed
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Input Area Configuration
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Height of the minimized chasing line (default: 6px)
+    pub input_minimized_height: f32,
+    /// Default height when docked (default: 80px)
+    pub input_docked_height: f32,
+    /// Overlay width as percentage of window width (default: 0.6 = 60%)
+    pub input_overlay_width_pct: f32,
+    /// Backdrop color when in overlay mode
+    pub input_backdrop_color: Color,
 }
 
 impl Default for Theme {
@@ -234,6 +247,12 @@ impl Default for Theme {
             effect_chase_glow_radius: 0.08,
             effect_chase_glow_intensity: 0.6,
             effect_chase_color_cycle: 0.15, // Rainbow cycle speed
+
+            // Input area defaults
+            input_minimized_height: 6.0,
+            input_docked_height: 80.0,
+            input_overlay_width_pct: 0.6,
+            input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
         }
     }
 }

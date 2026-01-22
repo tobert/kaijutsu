@@ -322,6 +322,22 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.effect_chase_color_cycle = v;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Input area configuration
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(v) = get_float(&scope, "input_minimized_height") {
+        theme.input_minimized_height = v;
+    }
+    if let Some(v) = get_float(&scope, "input_docked_height") {
+        theme.input_docked_height = v;
+    }
+    if let Some(v) = get_float(&scope, "input_overlay_width_pct") {
+        theme.input_overlay_width_pct = v;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "input_backdrop_color") {
+        theme.input_backdrop_color = c;
+    }
+
     Ok(theme)
 }
 

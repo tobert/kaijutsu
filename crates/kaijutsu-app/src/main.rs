@@ -93,6 +93,7 @@ fn main() {
         .add_systems(Startup, (
             setup_camera,
             setup_ui,
+            setup_input_layer,
             ui::debug::setup_debug_overlay,
         ))
         // Update
@@ -149,6 +150,7 @@ fn setup_ui(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,
     mut text_glow_materials: ResMut<Assets<shaders::TextGlowMaterial>>,
+    mut chasing_materials: ResMut<Assets<shaders::nine_slice::ChasingBorderMaterial>>,
 ) {
     // Root container - fills window, flex column layout
     commands
@@ -257,49 +259,36 @@ fn setup_ui(
                         Visibility::Hidden, // Hidden by default (glyphon needs this too)
                     ))
                     .with_children(|conv| {
-                        // Scrollable conversation area
+                        // Conversation area - content clips but scroll handled by custom system
+                        // (Overflow::scroll_y() consumes wheel events, we want our own handler)
                         conv.spawn((
                             cell::ConversationContainer,
                             Node {
                                 flex_grow: 1.0,
                                 flex_direction: FlexDirection::Column,
-                                overflow: Overflow::scroll_y(),
-                                padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)), // Tighter
+                                overflow: Overflow::clip(),
+                                padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
                                 ..default()
                             },
                         ));
 
-                        // Prompt input area
+                        // ─────────────────────────────────────────────────────
+                        // INPUT SHADOW - reserves space at bottom for docked input
+                        // When minimized, this has 0 height (input hidden completely)
+                        // When docked, this reserves space and the 9-slice frame floats over it
+                        // ─────────────────────────────────────────────────────
                         conv.spawn((
+                            ui::state::InputShadow,
+                            // Also keep PromptContainer marker for backwards compat
                             cell::PromptContainer,
                             Node {
                                 width: Val::Percent(100.0),
-                                min_height: Val::Px(48.0),  // Tighter
-                                max_height: Val::Px(120.0), // Tighter
-                                flex_direction: FlexDirection::Row,
-                                justify_content: JustifyContent::FlexEnd,
-                                align_items: AlignItems::FlexStart,
-                                padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)), // Tighter
-                                border: UiRect::top(Val::Px(1.0)),
+                                // Height controlled by sync_input_shadow_height system
+                                // 0 when minimized, docked_height when docked
+                                min_height: Val::Px(0.0),
                                 ..default()
                             },
-                            BorderColor::all(theme.border),
-                        ))
-                        .with_children(|prompt_area| {
-                            // Subtle hint text
-                            prompt_area.spawn((
-                                PromptHint,
-                                text::GlyphonUiText::new("'i' to type")
-                                    .with_font_size(11.0)
-                                    .with_color(Color::srgba(0.4, 0.4, 0.4, 0.6)),
-                                text::UiTextPositionCache::default(),
-                                Node {
-                                    min_width: Val::Px(80.0),
-                                    min_height: Val::Px(16.0),
-                                    ..default()
-                                },
-                            ));
-                        });
+                        ));
                     });
 
                 // Dashboard view is spawned by DashboardPlugin in setup_dashboard
@@ -361,9 +350,64 @@ fn setup_ui(
         });
 }
 
-/// Marker for the prompt hint text (shows when prompt is empty).
-#[derive(Component)]
-struct PromptHint;
+/// Spawn the InputLayer - world-level floating container for the input area.
+///
+/// The InputLayer floats over the InputShadow and contains:
+/// - Backdrop (dim overlay, visible when presence=Overlay)
+/// - Input frame content (the 9-slice frame and text are positioned here)
+///
+/// This is spawned at ZIndex(100) so it floats above all conversation content.
+fn setup_input_layer(
+    mut commands: Commands,
+    theme: Res<ui::theme::Theme>,
+) {
+    // Spawn the InputLayer at world level (not parented to any UI tree)
+    commands.spawn((
+        ui::state::InputLayer,
+        Node {
+            position_type: PositionType::Absolute,
+            // Position will be updated by compute_input_position system
+            left: Val::Px(0.0),
+            top: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            // No layout - children use absolute positioning
+            ..default()
+        },
+        ZIndex(100),
+        // Start hidden - visibility controlled by InputPresence
+        Visibility::Hidden,
+    ))
+    .with_children(|layer| {
+        // Backdrop - dim overlay behind centered input (only visible in Overlay mode)
+        layer.spawn((
+            ui::state::InputBackdrop,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            BackgroundColor(theme.input_backdrop_color),
+            Visibility::Hidden, // Toggled by sync_backdrop_visibility
+        ));
+
+        // InputFrame container - the 9-slice frame pieces are spawned as children
+        // by the frame_assembly system when it sees an InputFrame marker
+        layer.spawn((
+            ui::state::InputFrame,
+            Node {
+                position_type: PositionType::Absolute,
+                // Position/size updated by apply_input_position system
+                ..default()
+            },
+            // No background - frame pieces render the border
+        ));
+    });
+}
+
 
 /// Marker for status text
 #[derive(Component)]

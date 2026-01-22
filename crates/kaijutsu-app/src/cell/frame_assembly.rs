@@ -578,29 +578,44 @@ pub fn update_nine_slice_state(
 // VISIBILITY SYNC SYSTEM
 // ============================================================================
 
-/// Syncs frame visibility with AppScreen state.
+use crate::ui::state::{InputPresence, InputPresenceKind};
+
+/// Syncs frame visibility with AppScreen state and InputPresence.
 ///
 /// Frames are spawned at world level with absolute positioning, so they don't
-/// inherit visibility from ConversationRoot. This system hides them when
-/// we're in Dashboard state.
+/// inherit visibility from ConversationRoot. This system hides them when:
+/// - We're in Dashboard state
+/// - InputPresence is Minimized or Hidden (only chasing line should show)
 ///
 /// Runs when:
 /// - AppScreen state changes
+/// - InputPresence changes
 /// - New frames are spawned (Added<NineSliceFrame>)
 pub fn sync_frame_visibility(
     screen: Res<State<AppScreen>>,
+    presence: Res<InputPresence>,
     new_frames: Query<&NineSliceFrame, Added<NineSliceFrame>>,
     all_frames: Query<&NineSliceFrame>,
     mut corners: Query<&mut Visibility, With<CornerMarker>>,
     mut edges: Query<&mut Visibility, (With<EdgeMarker>, Without<CornerMarker>)>,
 ) {
+    // Frame visibility depends on both screen state and input presence
+    // Hidden when: Dashboard, or Minimized/Hidden presence
     let target_visibility = match screen.get() {
         AppScreen::Dashboard => Visibility::Hidden,
-        AppScreen::Conversation => Visibility::Inherited,
+        AppScreen::Conversation => {
+            // In conversation, visibility depends on presence
+            match presence.0 {
+                InputPresenceKind::Docked | InputPresenceKind::Overlay => Visibility::Inherited,
+                InputPresenceKind::Minimized | InputPresenceKind::Hidden => Visibility::Hidden,
+            }
+        }
     };
 
     // Determine which frames need updating
-    let frames_to_update: Box<dyn Iterator<Item = &NineSliceFrame>> = if screen.is_changed() {
+    let frames_to_update: Box<dyn Iterator<Item = &NineSliceFrame>> = if screen.is_changed()
+        || presence.is_changed()
+    {
         // State changed - update all frames
         Box::new(all_frames.iter())
     } else if !new_frames.is_empty() {

@@ -7,6 +7,7 @@ use super::components::{
 };
 use super::frame_assembly;
 use super::systems;
+use crate::ui::state::{InputDock, InputPosition, InputPresence, InputShadowHeight};
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -24,6 +25,11 @@ impl Plugin for CellPlugin {
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::PromptCellEntity>()
             .init_resource::<systems::MainCellEntity>()
+            // Input area state resources
+            .init_resource::<InputPresence>()
+            .init_resource::<InputDock>()
+            .init_resource::<InputPosition>()
+            .init_resource::<InputShadowHeight>()
             // Input and mode handling (mode_switch must run before cell_input)
             .add_systems(
                 Update,
@@ -125,6 +131,18 @@ impl Plugin for CellPlugin {
                 (
                     systems::spawn_cursor,
                     systems::update_cursor,
+                ),
+            )
+            // Input area positioning and visibility
+            .add_systems(
+                Update,
+                (
+                    systems::sync_presence_with_screen,
+                    systems::compute_input_position.after(systems::sync_presence_with_screen),
+                    systems::sync_input_layer_visibility.after(systems::compute_input_position),
+                    systems::sync_backdrop_visibility.after(systems::compute_input_position),
+                    systems::apply_input_position.after(systems::compute_input_position),
+                    systems::sync_input_shadow_height.after(systems::sync_presence_with_screen),
                 ),
             );
     }
