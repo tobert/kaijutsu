@@ -88,36 +88,85 @@ pub fn sync_theme_to_context(theme: Res<Theme>, mut ctx: ResMut<ShaderEffectCont
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Text Geometry Buffer (Phase 3 - for future use)
+// Text Geometry Components (for per-material geometry sync)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Per-text-element geometry data for shaders.
+/// Links a TextGlowMaterial to a text entity for geometry sync.
 ///
-/// This allows shaders to know text bounds and metrics for effects
-/// like per-glyph animations or baseline-aware glow.
+/// Spawn this component alongside a MaterialNode<TextGlowMaterial> to
+/// automatically receive geometry updates from the target text entity.
+///
+/// # Example
+///
+/// ```ignore
+/// // Text entity
+/// let text_entity = commands.spawn((
+///     GlyphonUiText::new("Hello"),
+///     Node { ... },
+/// )).id();
+///
+/// // Glow backing linked to text
+/// commands.spawn((
+///     Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() },
+///     MaterialNode(materials.add(TextGlowMaterial::subtle(theme.accent))),
+///     TextGlowTarget(text_entity),
+///     ZIndex(-1),
+/// ));
+/// ```
+#[derive(Component, Clone, Copy, Debug)]
+pub struct TextGlowTarget(pub Entity);
+
+/// Computed text geometry for shader use.
+///
+/// This is populated by the sync system from UiTextPositionCache and text metrics.
+/// Can be queried directly or used as intermediate storage.
 #[derive(Clone, Default, Debug)]
 pub struct TextGeometry {
-    /// Bounding box: x, y, width, height
+    /// Bounding box: x, y, width, height (screen pixels)
     pub bounds: Vec4,
-    /// Baseline Y position within the element
+    /// Baseline Y position relative to top (estimated from metrics)
     pub baseline: f32,
-    /// Line height
+    /// Line height from text metrics
     pub line_height: f32,
-    /// Maximum ascent (above baseline)
+    /// Font size from text metrics
+    pub font_size: f32,
+    /// Ascent estimate (above baseline, typically ~0.8 * font_size)
     pub ascent: f32,
-    /// Maximum descent (below baseline)
-    pub descent: f32,
 }
 
-/// Resource holding text geometry data.
-///
-/// This is populated by the text rendering system when buffers are rebuilt,
-/// following the "eventually consistent" pattern - updates happen when text
-/// changes, not every frame.
-#[derive(Resource, Default)]
-pub struct TextGeometryBuffer {
-    /// Geometry entries indexed by some identifier (entity, etc.)
-    pub entries: Vec<TextGeometry>,
-    /// Whether buffer needs GPU upload
-    pub dirty: bool,
+impl TextGeometry {
+    /// Create geometry from position cache and metrics.
+    pub fn from_position_and_metrics(
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        font_size: f32,
+        line_height: f32,
+    ) -> Self {
+        // Estimate ascent as ~80% of font size (typical for Latin fonts)
+        let ascent = font_size * 0.8;
+        // Baseline is ascent distance from top of first line
+        let baseline = top + ascent;
+
+        Self {
+            bounds: Vec4::new(left, top, width, height),
+            baseline,
+            line_height,
+            font_size,
+            ascent,
+        }
+    }
+
+    /// Pack geometry into Vec4s for shader uniforms.
+    ///
+    /// Returns (bounds, metrics) where:
+    /// - bounds = [x, y, width, height]
+    /// - metrics = [baseline, line_height, font_size, ascent]
+    pub fn to_shader_vecs(&self) -> (Vec4, Vec4) {
+        (
+            self.bounds,
+            Vec4::new(self.baseline, self.line_height, self.font_size, self.ascent),
+        )
+    }
 }

@@ -35,7 +35,7 @@
 pub mod context;
 pub mod nine_slice;
 
-pub use context::{ShaderEffectContext, ShaderEffectContextPlugin};
+pub use context::{ShaderEffectContext, ShaderEffectContextPlugin, TextGeometry, TextGlowTarget};
 
 use bevy::{
     prelude::*,
@@ -76,7 +76,11 @@ impl Plugin for ShaderFxPlugin {
         .register_type::<EdgeMarker>()
         .register_type::<CornerPosition>()
         .register_type::<EdgePosition>()
-        .add_systems(Update, (update_shader_time, sync_effect_context_to_text_glow));
+        .add_systems(Update, (
+            update_shader_time,
+            sync_effect_context_to_text_glow,
+            sync_text_geometry_to_materials,
+        ));
     }
 }
 
@@ -441,6 +445,12 @@ pub struct TextGlowMaterial {
     /// Theme colors: accent (linear space)
     #[uniform(5)]
     pub theme_accent: Vec4,
+    /// Text geometry: bounds [x, y, width, height] in screen pixels
+    #[uniform(6)]
+    pub text_bounds: Vec4,
+    /// Text geometry: metrics [baseline, line_height, font_size, ascent]
+    #[uniform(7)]
+    pub text_metrics: Vec4,
 }
 
 impl Default for TextGlowMaterial {
@@ -453,6 +463,9 @@ impl Default for TextGlowMaterial {
             effect_glow: Vec4::new(0.3, 0.5, 2.5, 0.15),   // radius, intensity, falloff, sheen_speed
             effect_anim: Vec4::new(0.92, 1.9, 0.1, 0.0),   // sparkle_threshold, breathe_speed, breathe_amplitude
             theme_accent: Vec4::new(0.34, 0.65, 1.0, 1.0), // Default accent
+            // Geometry defaults (will be populated by sync system if TextGlowTarget present)
+            text_bounds: Vec4::new(0.0, 0.0, 100.0, 20.0), // Placeholder bounds
+            text_metrics: Vec4::new(11.2, 20.0, 14.0, 11.2), // baseline, line_height, font_size, ascent
         }
     }
 }
@@ -542,5 +555,43 @@ fn sync_effect_context_to_text_glow(
         mat.effect_glow = effect_glow;
         mat.effect_anim = effect_anim;
         mat.theme_accent = ctx.accent;
+    }
+}
+
+/// System: sync text geometry → TextGlowMaterial uniforms
+///
+/// For each entity with a TextGlowTarget, looks up the target text entity's
+/// position and metrics, then updates the material's geometry uniforms.
+/// This enables position-aware shader effects (baseline glow, per-line effects, etc.)
+fn sync_text_geometry_to_materials(
+    glow_query: Query<(&TextGlowTarget, &MaterialNode<TextGlowMaterial>)>,
+    text_query: Query<(&crate::text::UiTextPositionCache, &crate::text::GlyphonUiText)>,
+    mut materials: ResMut<Assets<TextGlowMaterial>>,
+) {
+    for (target, material_node) in glow_query.iter() {
+        // Look up the target text entity
+        let Ok((position, ui_text)) = text_query.get(target.0) else {
+            continue;
+        };
+
+        // Get the material handle and update
+        let Some(mat) = materials.get_mut(material_node.0.id()) else {
+            continue;
+        };
+
+        // Build geometry from position cache and text metrics
+        let geometry = TextGeometry::from_position_and_metrics(
+            position.left,
+            position.top,
+            position.width,
+            position.height,
+            ui_text.metrics.font_size,
+            ui_text.metrics.line_height,
+        );
+
+        // Update material uniforms
+        let (bounds, metrics) = geometry.to_shader_vecs();
+        mat.text_bounds = bounds;
+        mat.text_metrics = metrics;
     }
 }
