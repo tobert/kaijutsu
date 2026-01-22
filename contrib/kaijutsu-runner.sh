@@ -28,9 +28,12 @@
 #   - cat /tmp/kj.status    - quick state check
 #
 # IF APP CRASHES:
-#   - cargo watch auto-restarts it
-#   - if watch itself dies, outer loop restarts it in 2s
+#   - cargo watch auto-restarts after 2s delay
 #   - all output captured in /tmp/kaijutsu-runner.typescript
+#
+# IF USER QUITS (q):
+#   - Creates /tmp/kj.noloop to prevent auto-restart
+#   - Use ./contrib/kj restart to start again
 #
 # ═══════════════════════════════════════════════════════════════════
 #
@@ -41,6 +44,7 @@
 #   /tmp/kj.rebuild  - force full rebuild (clean + build)
 #   /tmp/kj.restart  - restart cargo watch loop
 #   /tmp/kj.stop     - stop everything and exit
+#   /tmp/kj.noloop   - auto-created on clean exit, blocks auto-restart
 #
 # Output captured to /tmp/kaijutsu-runner.typescript via script(1)
 
@@ -50,6 +54,7 @@ CTRL_PAUSE="/tmp/kj.pause"
 CTRL_REBUILD="/tmp/kj.rebuild"
 CTRL_RESTART="/tmp/kj.restart"
 CTRL_STOP="/tmp/kj.stop"
+CTRL_NOLOOP="/tmp/kj.noloop"
 STATUS_FILE="/tmp/kj.status"
 TYPESCRIPT="/tmp/kaijutsu-runner.typescript"
 PROJECT_DIR="/home/atobey/src/kaijutsu"
@@ -82,7 +87,7 @@ cleanup() {
     log "🧹 Cleaning up..."
     [[ -n "$WATCH_PID" ]] && kill "$WATCH_PID" 2>/dev/null
     pkill -f "target/$PROFILE/kaijutsu-app" 2>/dev/null || true
-    rm -f "$CTRL_PAUSE" "$CTRL_REBUILD" "$CTRL_RESTART" "$CTRL_STOP"
+    rm -f "$CTRL_PAUSE" "$CTRL_REBUILD" "$CTRL_RESTART" "$CTRL_STOP" "$CTRL_NOLOOP"
     status "stopped" "Runner exited"
     exit 0
 }
@@ -121,7 +126,7 @@ full_rebuild() {
     cargo clean -p kaijutsu-app
     cargo build -p kaijutsu-app $CARGO_PROFILE_FLAG
 
-    rm -f "$CTRL_REBUILD"
+    rm -f "$CTRL_REBUILD" "$CTRL_NOLOOP"
     start_watch
 }
 
@@ -137,10 +142,11 @@ log "     touch $CTRL_PAUSE   → pause"
 log "     touch $CTRL_REBUILD → clean rebuild"
 log "     touch $CTRL_RESTART → restart watch"
 log "     touch $CTRL_STOP    → stop & exit"
+log "   On clean exit (q), creates $CTRL_NOLOOP to prevent auto-restart"
 log "═══════════════════════════════════════════════════════════════"
 
 # Clear old control files
-rm -f "$CTRL_PAUSE" "$CTRL_REBUILD" "$CTRL_RESTART" "$CTRL_STOP"
+rm -f "$CTRL_PAUSE" "$CTRL_REBUILD" "$CTRL_RESTART" "$CTRL_STOP" "$CTRL_NOLOOP"
 
 start_watch
 
@@ -160,7 +166,7 @@ while true; do
     # Restart watch requested?
     if [[ -f "$CTRL_RESTART" ]]; then
         log "🔄 Restart requested"
-        rm -f "$CTRL_RESTART"
+        rm -f "$CTRL_RESTART" "$CTRL_NOLOOP"
         start_watch
     fi
 
@@ -182,12 +188,28 @@ while true; do
         fi
     fi
 
-    # Check if cargo watch died unexpectedly
+    # Check if cargo watch exited
     if [[ -n "$WATCH_PID" ]] && ! kill -0 "$WATCH_PID" 2>/dev/null; then
-        log "⚠️  cargo watch exited, restarting in 2s..."
-        status "restarting" "Watch crashed, restarting"
-        sleep 2
-        start_watch
+        wait "$WATCH_PID" 2>/dev/null
+        EXIT_CODE=$?
+        WATCH_PID=""
+
+        if [[ -f "$CTRL_NOLOOP" ]]; then
+            log "🛑 Noloop set, staying stopped (rm $CTRL_NOLOOP to allow restart)"
+            status "stopped" "Noloop active"
+        elif [[ $EXIT_CODE -eq 0 ]]; then
+            # Clean exit (user quit with 'q') - pause and wait
+            log "✅ App exited cleanly (code 0)"
+            log "   → touch $CTRL_RESTART to restart, or $CTRL_STOP to exit"
+            touch "$CTRL_NOLOOP"
+            status "stopped" "Clean exit, touch /tmp/kj.restart to restart"
+        else
+            # Crash or error - auto restart after delay
+            log "⚠️  cargo watch exited with code $EXIT_CODE, restarting in 2s..."
+            status "restarting" "Watch crashed (code $EXIT_CODE), restarting"
+            sleep 2
+            start_watch
+        fi
     fi
 
     sleep 1

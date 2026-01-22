@@ -24,13 +24,17 @@
 #   <make several edits>
 #   ./contrib/kj resume
 #
+# AFTER USER QUITS (q):
+#   - Runner stops and won't auto-restart (noloop flag set)
+#   - ./contrib/kj restart   to start again
+#
 # ═══════════════════════════════════════════════════════════════════
 
 case "${1:-status}" in
     pause)   touch /tmp/kj.pause   && echo "⏸️  Paused" ;;
     resume)  rm -f /tmp/kj.pause   && echo "▶️  Resumed" ;;
     rebuild) touch /tmp/kj.rebuild && echo "🔨 Rebuild triggered" ;;
-    restart) touch /tmp/kj.restart && echo "🔄 Restart triggered" ;;
+    restart) rm -f /tmp/kj.noloop && touch /tmp/kj.restart && echo "🔄 Restart triggered" ;;
     stop)    touch /tmp/kj.stop    && echo "🛑 Stop triggered" ;;
     status)  cat /tmp/kj.status 2>/dev/null || echo "Runner not active" ;;
     log)     cat /tmp/kaijutsu-runner.typescript ;;
