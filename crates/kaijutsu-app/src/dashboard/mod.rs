@@ -45,6 +45,7 @@ impl Plugin for DashboardPlugin {
                     handle_kernel_selection,
                     handle_context_selection,
                     handle_take_seat,
+                    handle_dashboard_keyboard,
                     // List rebuild systems
                     rebuild_kernel_list,
                     rebuild_context_list,
@@ -499,6 +500,45 @@ fn handle_take_seat(
                     instance,
                 });
             }
+        }
+    }
+}
+
+/// Handle keyboard input on the Dashboard.
+/// Enter takes you into the selected context (or default if nothing selected).
+fn handle_dashboard_keyboard(
+    keys: Res<ButtonInput<KeyCode>>,
+    screen: Res<State<AppScreen>>,
+    mut state: ResMut<DashboardState>,
+    conn: Res<ConnectionCommands>,
+) {
+    // Only handle keys when on Dashboard
+    if *screen.get() != AppScreen::Dashboard {
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Enter) {
+        // Auto-select defaults if nothing selected
+        if state.selected_kernel.is_none() && !state.kernels.is_empty() {
+            state.selected_kernel = Some(0);
+        }
+        if state.selected_context.is_none() && !state.contexts.is_empty() {
+            state.selected_context = Some(0);
+        }
+
+        // Take seat with selected context
+        if let (Some(_kernel), Some(context)) =
+            (state.selected_kernel(), state.selected_context())
+        {
+            let instance = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "default".to_string());
+
+            info!("Enter pressed - taking seat in context: {}", context.name);
+            conn.send(ConnectionCommand::JoinContext {
+                context: context.name.clone(),
+                instance,
+            });
         }
     }
 }
