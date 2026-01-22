@@ -16,6 +16,7 @@ use crate::shaders::nine_slice::{
     FramePiece,
 };
 use crate::text::TextAreaConfig;
+use crate::ui::state::AppScreen;
 use crate::ui::theme::{color_to_vec4, Theme};
 
 /// Padding around cells for the frame.
@@ -53,9 +54,15 @@ pub fn spawn_nine_slice_frames(
         (Added<Cell>, Without<NineSliceFrame>, With<PromptCell>),
     >,
     theme: Res<Theme>,
+    screen: Res<State<AppScreen>>,
     mut corner_materials: ResMut<Assets<CornerMaterial>>,
     mut edge_materials: ResMut<Assets<EdgeMaterial>>,
 ) {
+    // Determine initial visibility based on current screen state
+    let initial_visibility = match screen.get() {
+        AppScreen::Dashboard => Visibility::Hidden,
+        AppScreen::Conversation => Visibility::Inherited,
+    };
     for (cell_entity, _cell, text_config) in new_cells.iter() {
         // Calculate frame bounds (TextBounds uses i32, convert to f32)
         // Use saturating_sub to prevent overflow when bounds are invalid (right < left)
@@ -86,6 +93,7 @@ pub fn spawn_nine_slice_frames(
             frame_width,
             frame_height,
             corner_size,
+            initial_visibility,
         );
 
         // Spawn edges using theme colors
@@ -99,6 +107,7 @@ pub fn spawn_nine_slice_frames(
             frame_height,
             corner_size,
             edge_thickness,
+            initial_visibility,
         );
 
         // Add frame tracking component to cell
@@ -119,6 +128,7 @@ fn spawn_corners(
     frame_width: f32,
     frame_height: f32,
     corner_size: f32,
+    initial_visibility: Visibility,
 ) -> [Entity; 4] {
     let color = color_to_vec4(theme.frame_base);
     let params = theme.frame_params_base;
@@ -182,6 +192,7 @@ fn spawn_corners(
                 FramePiece,
                 CornerMarker,
                 pos,
+                initial_visibility,
                 Name::new(format!("Corner_{:?}", pos)),
             ))
             .id();
@@ -203,6 +214,7 @@ fn spawn_edges(
     frame_height: f32,
     corner_size: f32,
     edge_thickness: f32,
+    initial_visibility: Visibility,
 ) -> [Option<Entity>; 4] {
     let mut edges = [None; 4];
 
@@ -240,6 +252,7 @@ fn spawn_edges(
                 FramePiece,
                 EdgeMarker,
                 EdgePosition::Top,
+                initial_visibility,
                 Name::new("Edge_Top"),
             ))
             .id();
@@ -272,6 +285,7 @@ fn spawn_edges(
                 FramePiece,
                 EdgeMarker,
                 EdgePosition::Bottom,
+                initial_visibility,
                 Name::new("Edge_Bottom"),
             ))
             .id();
@@ -307,6 +321,7 @@ fn spawn_edges(
                 FramePiece,
                 EdgeMarker,
                 EdgePosition::Left,
+                initial_visibility,
                 Name::new("Edge_Left"),
             ))
             .id();
@@ -339,6 +354,7 @@ fn spawn_edges(
                 FramePiece,
                 EdgeMarker,
                 EdgePosition::Right,
+                initial_visibility,
                 Name::new("Edge_Right"),
             ))
             .id();
@@ -554,6 +570,62 @@ pub fn update_nine_slice_state(
                     mat.color = final_edge_color;
                     mat.params = final_edge_params;
                 }
+        }
+    }
+}
+
+// ============================================================================
+// VISIBILITY SYNC SYSTEM
+// ============================================================================
+
+/// Syncs frame visibility with AppScreen state.
+///
+/// Frames are spawned at world level with absolute positioning, so they don't
+/// inherit visibility from ConversationRoot. This system hides them when
+/// we're in Dashboard state.
+///
+/// Runs when:
+/// - AppScreen state changes
+/// - New frames are spawned (Added<NineSliceFrame>)
+pub fn sync_frame_visibility(
+    screen: Res<State<AppScreen>>,
+    new_frames: Query<&NineSliceFrame, Added<NineSliceFrame>>,
+    all_frames: Query<&NineSliceFrame>,
+    mut corners: Query<&mut Visibility, With<CornerMarker>>,
+    mut edges: Query<&mut Visibility, (With<EdgeMarker>, Without<CornerMarker>)>,
+) {
+    let target_visibility = match screen.get() {
+        AppScreen::Dashboard => Visibility::Hidden,
+        AppScreen::Conversation => Visibility::Inherited,
+    };
+
+    // Determine which frames need updating
+    let frames_to_update: Box<dyn Iterator<Item = &NineSliceFrame>> = if screen.is_changed() {
+        // State changed - update all frames
+        Box::new(all_frames.iter())
+    } else if !new_frames.is_empty() {
+        // New frames spawned - only update those
+        Box::new(new_frames.iter())
+    } else {
+        // Nothing to do
+        return;
+    };
+
+    for frame in frames_to_update {
+        // Update corners
+        for &corner_entity in &frame.corners {
+            if let Ok(mut vis) = corners.get_mut(corner_entity) {
+                *vis = target_visibility;
+            }
+        }
+
+        // Update edges
+        for edge_opt in &frame.edges {
+            if let Some(edge_entity) = edge_opt {
+                if let Ok(mut vis) = edges.get_mut(*edge_entity) {
+                    *vis = target_visibility;
+                }
+            }
         }
     }
 }

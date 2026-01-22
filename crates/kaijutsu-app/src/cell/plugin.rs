@@ -115,6 +115,7 @@ impl Plugin for CellPlugin {
                     frame_assembly::spawn_nine_slice_frames,
                     frame_assembly::layout_nine_slice_frames,
                     frame_assembly::update_nine_slice_state,
+                    frame_assembly::sync_frame_visibility,
                     frame_assembly::cleanup_nine_slice_frames,
                 ),
             )

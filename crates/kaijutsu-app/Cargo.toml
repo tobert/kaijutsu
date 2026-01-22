@@ -37,3 +37,6 @@ dirs = "5.0"
 # Cap'n Proto (for block events callback)
 capnp.workspace = true
 capnp-rpc.workspace = true
+
+# Scripting (for theme system)
+rhai.workspace = true
