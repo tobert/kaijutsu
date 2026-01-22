@@ -1,6 +1,6 @@
 //! Debug tools for UI development
 //!
-//! - F1: Toggle debug overlay OFF (ON by default during development)
+//! - F1: Toggle debug overlay (OFF by default)
 //! - F12: Save screenshot to design/screenshots/
 //! - q: Quit (only in Normal mode)
 
@@ -10,9 +10,9 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use crate::cell::{CurrentMode, EditorMode};
 
-/// Enable the UI debug overlay by default for development
+/// Configure UI debug overlay (OFF by default, F1 to toggle)
 pub fn setup_debug_overlay(mut debug_options: ResMut<UiDebugOptions>) {
-    debug_options.enabled = true;
+    debug_options.enabled = false;
     debug_options.line_width = 1.0;
     debug_options.show_hidden = false;
     debug_options.show_clipped = true;

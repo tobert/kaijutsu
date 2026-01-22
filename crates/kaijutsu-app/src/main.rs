@@ -145,7 +145,11 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
 ///
 /// Z-LAYER 100: MODALS (seat dropdown, command palette)
 /// ```
-fn setup_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
+fn setup_ui(
+    mut commands: Commands,
+    theme: Res<ui::theme::Theme>,
+    mut text_glow_materials: ResMut<Assets<shaders::TextGlowMaterial>>,
+) {
     // Root container - fills window, flex column layout
     commands
         .spawn((
@@ -168,25 +172,45 @@ fn setup_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                     flex_direction: FlexDirection::Row,
                     justify_content: JustifyContent::SpaceBetween,
                     align_items: AlignItems::Center,
-                    padding: UiRect::all(Val::Px(16.0)),
+                    padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)), // Tighter vertical
                     border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
                 BorderColor::all(theme.border),
             ))
             .with_children(|header| {
-                // Left: Title (uses glyphon for CJK support)
-                header.spawn((
-                    text::GlyphonUiText::new("会術 Kaijutsu")
-                        .with_font_size(24.0)
-                        .with_color(theme.accent),
-                    text::UiTextPositionCache::default(),
-                    Node {
+                // Left: Title with icy sheen plane underneath (absolute positioned)
+                header
+                    .spawn(Node {
                         min_width: Val::Px(180.0),
-                        min_height: Val::Px(30.0),
+                        min_height: Val::Px(36.0),
                         ..default()
-                    },
-                ));
+                    })
+                    .with_children(|title_container| {
+                        // Title text (normal flow)
+                        title_container.spawn((
+                            text::GlyphonUiText::new("会術 Kaijutsu")
+                                .with_font_size(24.0)
+                                .with_color(theme.accent),
+                            text::UiTextPositionCache::default(),
+                            Node::default(),
+                        ));
+
+                        // Icy sheen plane - absolute positioned below text
+                        title_container.spawn((
+                            MaterialNode(text_glow_materials.add(
+                                shaders::TextGlowMaterial::icy_sheen(theme.accent),
+                            )),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                bottom: Val::Px(0.0),
+                                left: Val::Px(0.0),
+                                width: Val::Percent(100.0),
+                                height: Val::Px(6.0),
+                                ..default()
+                            },
+                        ));
+                    });
 
                 // Right: Connection status (uses glyphon)
                 header.spawn((
@@ -240,7 +264,7 @@ fn setup_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                                 flex_grow: 1.0,
                                 flex_direction: FlexDirection::Column,
                                 overflow: Overflow::scroll_y(),
-                                padding: UiRect::axes(Val::Px(20.0), Val::Px(12.0)),
+                                padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)), // Tighter
                                 ..default()
                             },
                         ));
@@ -250,17 +274,12 @@ fn setup_ui(mut commands: Commands, theme: Res<ui::theme::Theme>) {
                             cell::PromptContainer,
                             Node {
                                 width: Val::Percent(100.0),
-                                min_height: Val::Px(70.0),
-                                max_height: Val::Px(150.0),
+                                min_height: Val::Px(48.0),  // Tighter
+                                max_height: Val::Px(120.0), // Tighter
                                 flex_direction: FlexDirection::Row,
                                 justify_content: JustifyContent::FlexEnd,
                                 align_items: AlignItems::FlexStart,
-                                padding: UiRect::new(
-                                    Val::Px(12.0),
-                                    Val::Px(12.0),
-                                    Val::Px(8.0),
-                                    Val::Px(4.0),
-                                ),
+                                padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)), // Tighter
                                 border: UiRect::top(Val::Px(1.0)),
                                 ..default()
                             },
