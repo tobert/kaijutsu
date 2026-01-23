@@ -23,56 +23,52 @@
 | complete() | 📋 Stub (returns empty completions) |
 | archive() | 📋 Planned (not yet in schema) |
 
-## kaish Integration
+## Architecture
 
-**kaish is the execution engine. Kaijutsu wraps it with collaboration.**
-
-### Interface Ownership
-
-| Interface | Owner | Purpose |
-|-----------|-------|---------|
-| `kaish.capnp::Kernel` | **kaish** | Execution: parse, eval, tools, VFS, MCP, state, blobs |
-| `kaijutsu.capnp::World` | **kaijutsu** | Multi-kernel orchestration |
-| `kaijutsu.capnp::Kernel` | **kaijutsu** | Collaboration: consent, fork/thread, checkpoint, messaging |
-
-### Architecture
+**kaijutsu-kernel owns everything. kaish is an optional subprocess for shell execution.**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      kaijutsu-server                            │
 │                                                                 │
 │  kaijutsu.capnp::World                                          │
-│  └── listKernels, attachKernel, createKernel                    │
+│  └── listKernels, attachKernel, createKernel, listMySeats       │
 │                                                                 │
-│  kaijutsu.capnp::Kernel (collaboration layer)                   │
-│  ├── consent: collaborative vs autonomous                       │
-│  ├── lifecycle: fork, thread, checkpoint, archive               │
-│  ├── messaging: send, mention, subscribe                        │
-│  ├── equipment: listEquipment, equip, unequip                   │
+│  kaijutsu.capnp::Kernel                                         │
+│  ├── VFS: mount, unmount, listMounts, vfs()                     │
+│  ├── State: checkpoints, history, variables                     │
+│  ├── Tools: block_*, kernel_search, executeTool                 │
+│  ├── LLM: prompt() with streaming                               │
+│  ├── Seats: joinContext, leaveSeat, listContexts                │
+│  ├── Lifecycle: fork, thread (stubs), detach                    │
 │  │                                                              │
-│  │  execute() ─────────────────────────────────────────┐        │
-│  │                                                     │        │
-│  └─────────────────────────────────────────────────────┼────────┤
-│                                                        │        │
-│  kaish-kernel (embedded, no IPC)                       ▼        │
+│  │  execute() ───────────────────────────────────────┐          │
+│  │                                                   │          │
+│  └───────────────────────────────────────────────────┼──────────┤
+│                                                      ▼          │
+│  kaish subprocess (spawned lazily on first execute())           │
 │  ┌────────────────────────────────────────────────────────────┐ │
-│  │  kaish.capnp::Kernel (execution layer)                     │ │
-│  │  ├── execute, executeStreaming                             │ │
-│  │  ├── getVar, setVar, listVars                              │ │
-│  │  ├── listTools, callTool, getToolSchema                    │ │
-│  │  ├── mount, unmount, listMounts                            │ │
-│  │  ├── registerMcp, listMcpServers                           │ │
-│  │  ├── snapshot, restore                                     │ │
-│  │  └── readBlob, writeBlob                                   │ │
+│  │  ~95% POSIX shell + agentic builtins                       │ │
+│  │  Unix socket + Cap'n Proto IPC                             │ │
 │  └────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Ownership
+
+| Component | Owner | Notes |
+|-----------|-------|-------|
+| VFS (MountTable) | **kaijutsu-kernel** | LocalBackend, MemoryBackend |
+| State (history, checkpoints) | **kaijutsu-kernel** | KernelState |
+| Tools (block tools, etc.) | **kaijutsu-kernel** | ToolRegistry |
+| LLM integration | **kaijutsu-kernel** | LlmRegistry |
+| Shell execution | **kaish** | ~95% POSIX shell + agentic builtins |
+
 ### Execution Flow
 
-When a user or AI executes code in kaijutsu:
+When a user or AI runs shell code:
 
-1. **Execute** — kaijutsu calls `kaish_kernel.execute(code)`
+1. **Execute** — kaijutsu spawns kaish subprocess (if not already running)
 2. **Record** — Output recorded in message DAG
 3. **Checkpoint** — If autonomous mode, may trigger checkpoint
 
@@ -543,3 +539,4 @@ Think of a kernel like a development environment that:
 - Added Seat & Context Model section with SeatId 4-tuple
 - Rewrote Cap'n Proto Interface to match actual schema (25 methods)
 - Noted fork/thread kernel implementation is complete, only RPC layer is stubbed
+- **Architecture rewrite**: kaijutsu-kernel owns VFS, state, tools, LLM; kaish is subprocess for shell only
