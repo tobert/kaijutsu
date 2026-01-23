@@ -64,16 +64,17 @@ pub struct ViewingConversation {
 pub struct Cell {
     /// Unique identifier
     pub id: CellId,
-    /// What kind of content this cell holds
-    pub kind: CellKind,
 }
 
 impl Cell {
-    pub fn new(kind: CellKind) -> Self {
-        Self {
-            id: CellId::new(),
-            kind,
-        }
+    pub fn new() -> Self {
+        Self { id: CellId::new() }
+    }
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -419,12 +420,8 @@ pub struct WorkspaceLayout {
     pub workspace_margin_top: f32,
     /// Line height for computing dynamic heights
     pub line_height: f32,
-    /// Total height reserved for prompt area at bottom (prompt + status bar + padding)
-    pub prompt_area_height: f32,
     /// Minimum height for prompt cell
     pub prompt_min_height: f32,
-    /// Distance from bottom of window to prompt cell top
-    pub prompt_bottom_offset: f32,
 }
 
 impl Default for WorkspaceLayout {
@@ -435,9 +432,7 @@ impl Default for WorkspaceLayout {
             workspace_margin_left: 20.0,
             workspace_margin_top: 70.0, // Space for compact header
             line_height: 20.0,
-            prompt_area_height: 120.0,  // Space reserved at bottom for prompt
-            prompt_min_height: 50.0,    // Minimum prompt cell height
-            prompt_bottom_offset: 100.0, // Prompt Y = window_height - this
+            prompt_min_height: 50.0,
         }
     }
 }

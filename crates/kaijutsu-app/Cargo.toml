@@ -19,8 +19,6 @@ cosmic-text.workspace = true
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ron = "0.8"
-thiserror = "1.0"
 
 # Logging
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

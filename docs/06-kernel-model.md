@@ -14,8 +14,10 @@
 | Client (kaijutsu-app) | 🚧 Partial |
 | kaish integration | 🚧 kaish L0-L4 complete, embedding planned |
 | Consent modes | ✅ Implemented |
-| Checkpoint system | 📋 Planned |
-| Fork/Thread | 📋 Planned |
+| Checkpoint system | 📋 Planned (not yet in RPC) |
+| Fork/Thread | 📋 Stub only (returns unimplemented error) |
+| complete() | 📋 Stub only (returns empty completions) |
+| archive() | 📋 Planned (not yet in RPC) |
 
 ## kaish Integration
 

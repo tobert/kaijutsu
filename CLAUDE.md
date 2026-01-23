@@ -34,8 +34,8 @@ cargo run -p kaijutsu-app
 ┌──────────────────────────┼──────────────────────────────────────────┐
 │                    Kaijutsu Client (Bevy)                           │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │   UI Shell   │  │   Context    │  │    RPC       │              │
-│  │  (isekai)    │  │    View      │  │   Client     │              │
+│  │  Dashboard / │  │    Block     │  │    RPC       │              │
+│  │ Conversation │  │   Rendering  │  │   Client     │              │
 │  └──────────────┘  └──────────────┘  └──────────────┘              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -45,7 +45,6 @@ cargo run -p kaijutsu-app
 | Doc | Purpose |
 |-----|---------|
 | [docs/06-kernel-model.md](docs/06-kernel-model.md) | **Authoritative kernel model — start here** |
-| [docs/next.md](docs/next.md) | Current status, what's next |
 | [docs/05-lexicon-exploration.md](docs/05-lexicon-exploration.md) | Philosophical background, design decisions |
 
 Use 06-kernel-model.md as the authoritative source of truth.
@@ -100,25 +99,19 @@ The main UI area manages cognitive load, not just chat history.
 - `attachKernel()` returns a `Kernel` capability
 - Real-time streaming for messages and kernel output
 
-### Remote Console (kaish)
-
-- Quake-style drop-down (`` ` `` to toggle)
-- Runs **kaish** (会sh) — the gathering shell
-- Connected to the current kernel
-- Structured output rendering
-
 ## Crate Structure
 
 ```
 kaijutsu/
 ├── crates/
+│   ├── kaijutsu-crdt/       # CRDT primitives (BlockDocument, DAG)
+│   ├── kaijutsu-kernel/     # Kernel state management
 │   ├── kaijutsu-client/     # RPC client library
 │   ├── kaijutsu-server/     # TCP/SSH server
 │   └── kaijutsu-app/        # Bevy GUI
 └── docs/
     ├── 06-kernel-model.md   # ✅ Start here
-    ├── 05-lexicon-exploration.md
-    └── next.md
+    └── 05-lexicon-exploration.md
 ```
 
 ## Related Repos

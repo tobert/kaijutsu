@@ -128,9 +128,7 @@ pub struct SeatsList;
 
 /// Marker for a seat list item
 #[derive(Component)]
-pub struct SeatListItem {
-    pub index: usize,
-}
+pub struct SeatListItem;
 
 /// Marker for the "Take Seat" button
 #[derive(Component)]
@@ -255,60 +253,6 @@ fn setup_dashboard(
 
     // Attach dashboard to ContentArea
     commands.entity(content_entity).add_child(dashboard);
-}
-
-/// Spawn a dashboard column - uses macro to avoid ChildBuilder type issues
-macro_rules! spawn_dashboard_column_impl {
-    ($parent:expr, $theme:expr, $title:expr, $marker:expr) => {
-        $parent
-            .spawn((
-                Node {
-                    flex_grow: 1.0,
-                    flex_direction: FlexDirection::Column,
-                    padding: UiRect::all(Val::Px(12.0)),
-                    border: UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
-                BorderColor::all($theme.border),
-                BackgroundColor($theme.panel_bg),
-            ))
-            .with_children(|col| {
-                // Column header
-                col.spawn((
-                    GlyphonUiText::new($title)
-                        .with_font_size(12.0)
-                        .with_color($theme.fg_dim),
-                    UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(100.0),
-                        min_height: Val::Px(16.0),
-                        margin: UiRect::bottom(Val::Px(12.0)),
-                        ..default()
-                    },
-                ));
-
-                // Content area (scrollable)
-                col.spawn((
-                    $marker,
-                    Node {
-                        flex_grow: 1.0,
-                        flex_direction: FlexDirection::Column,
-                        overflow: Overflow::scroll_y(),
-                        row_gap: Val::Px(4.0),
-                        ..default()
-                    },
-                ));
-            })
-    };
-}
-
-fn spawn_dashboard_column<M: Component>(
-    parent: &mut ChildSpawnerCommands,
-    theme: &Theme,
-    title: &str,
-    marker: M,
-) {
-    spawn_dashboard_column_impl!(parent, theme, title, marker);
 }
 
 /// Spawn a dashboard column with chasing neon border effect
@@ -709,10 +653,10 @@ fn rebuild_seats_list(
     };
 
     commands.entity(list_entity).with_children(|parent| {
-        for (index, seat) in state.my_seats.iter().enumerate() {
+        for seat in state.my_seats.iter() {
             parent
                 .spawn((
-                    SeatListItem { index },
+                    SeatListItem,
                     Button,
                     Node {
                         width: Val::Percent(100.0),

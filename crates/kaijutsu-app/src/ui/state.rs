@@ -140,10 +140,6 @@ impl InputPresence {
     pub fn shows_backdrop(&self) -> bool {
         matches!(self.0, InputPresenceKind::Overlay)
     }
-
-    pub fn shows_frame(&self) -> bool {
-        matches!(self.0, InputPresenceKind::Overlay | InputPresenceKind::Docked)
-    }
 }
 
 /// Dock position for the input area when in Docked presence.
@@ -152,10 +148,6 @@ pub enum InputDockKind {
     /// Full-width at bottom (default)
     #[default]
     Bottom,
-    /// Compact position at bottom-right
-    BottomRight,
-    /// Compact position at bottom-left
-    BottomLeft,
 }
 
 /// Resource tracking dock position preference.
@@ -206,10 +198,6 @@ impl Default for InputShadowHeight {
 /// The actual input floats over this shadow when active.
 #[derive(Component)]
 pub struct InputShadow;
-
-/// Marker for the ChasingLineDecoration within InputShadow.
-#[derive(Component)]
-pub struct ChasingLineDecoration;
 
 /// Marker for the InputLayer - world-level floating container.
 ///

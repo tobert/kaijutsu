@@ -5,7 +5,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    BlockKind, BlockSnapshot, Cell, CellEditor, CellKind, CellPosition, CellState,
+    BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
     ConversationScrollState, CurrentMode, EditorMode, FocusedCell, MainCell, PromptCell,
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
@@ -495,7 +495,7 @@ pub fn debug_spawn_cell(
 
         spawn_cell(
             &mut commands,
-            Cell::new(CellKind::Code),
+            Cell::new(),
             CellPosition::new(next_row),
             "// New cell\nfn main() {\n    println!(\"Hello!\");\n}\n",
         );
@@ -770,9 +770,9 @@ pub fn spawn_prompt_cell(
         return;
     }
 
-    // Create a prompt cell with UserMessage kind
+    // Create a prompt cell
     // Note: Not parented to container - uses absolute positioning for glyphon
-    let cell = Cell::new(CellKind::UserMessage);
+    let cell = Cell::new();
     let cell_id = cell.id.clone();
 
     let entity = commands
@@ -1036,7 +1036,7 @@ pub fn spawn_main_cell(
     }
 
     // Create the main kernel cell
-    let cell = Cell::new(CellKind::System);
+    let cell = Cell::new();
     let cell_id = cell.id.clone();
 
     // Initial welcome message
@@ -1721,7 +1721,7 @@ pub fn apply_block_cell_positions(
 // ============================================================================
 
 use crate::ui::state::{
-    InputBackdrop, InputDock, InputDockKind, InputFrame, InputLayer, InputPresence,
+    InputBackdrop, InputDock, InputFrame, InputLayer, InputPresence,
     InputPresenceKind, InputShadow,
 };
 use crate::ui::theme::Theme;
@@ -1762,26 +1762,12 @@ pub fn compute_input_position(
             pos.show_frame = true;
         }
         InputPresenceKind::Docked => {
-            match dock.0 {
-                InputDockKind::Bottom => {
-                    pos.x = 0.0;
-                    pos.y = win_height - theme.input_docked_height;
-                    pos.width = win_width;
-                    pos.height = theme.input_docked_height;
-                }
-                InputDockKind::BottomRight => {
-                    pos.x = win_width * 0.6;
-                    pos.y = win_height - theme.input_docked_height * 0.75;
-                    pos.width = win_width * 0.38;
-                    pos.height = theme.input_docked_height * 0.75;
-                }
-                InputDockKind::BottomLeft => {
-                    pos.x = win_width * 0.02;
-                    pos.y = win_height - theme.input_docked_height * 0.75;
-                    pos.width = win_width * 0.38;
-                    pos.height = theme.input_docked_height * 0.75;
-                }
-            }
+            // InputDockKind::Bottom - full-width at bottom
+            let _ = dock; // Acknowledge dock for future variants
+            pos.x = 0.0;
+            pos.y = win_height - theme.input_docked_height;
+            pos.width = win_width;
+            pos.height = theme.input_docked_height;
             pos.show_backdrop = false;
             pos.show_frame = true;
         }

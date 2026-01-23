@@ -426,7 +426,7 @@ impl UiMaterial for CursorBeamMaterial {
 /// // Glow backing
 /// commands.spawn((
 ///     Node { width: Val::Px(200.0), height: Val::Px(30.0), ..default() },
-///     MaterialNode(materials.add(TextGlowMaterial::subtle(theme.accent))),
+///     MaterialNode(materials.add(TextGlowMaterial::icy_sheen(theme.accent))),
 ///     ZIndex(-1),
 /// ));
 /// // Text on top (ZIndex 0, default)
@@ -478,36 +478,6 @@ impl Default for TextGlowMaterial {
 }
 
 impl TextGlowMaterial {
-    /// Create a subtle glow with given color (good for body text)
-    pub fn subtle(color: Color) -> Self {
-        let c = color.to_linear();
-        Self {
-            color: Vec4::new(c.red, c.green, c.blue, 0.25),
-            params: Vec4::new(0.25, 0.6, 2.5, 0.0), // mode=0 (glow)
-            ..Default::default()
-        }
-    }
-
-    /// Create a prominent glow (good for headers/titles)
-    pub fn prominent(color: Color) -> Self {
-        let c = color.to_linear();
-        Self {
-            color: Vec4::new(c.red, c.green, c.blue, 0.15),
-            params: Vec4::new(0.4, 0.5, 3.0, 0.0), // mode=0 (glow)
-            ..Default::default()
-        }
-    }
-
-    /// Create an intense "neon" glow effect
-    pub fn neon(color: Color) -> Self {
-        let c = color.to_linear();
-        Self {
-            color: Vec4::new(c.red, c.green, c.blue, 0.6),
-            params: Vec4::new(0.4, 1.8, 1.5, 0.0), // mode=0 (glow)
-            ..Default::default()
-        }
-    }
-
     /// Create an icy sheen effect (cool reflective plane)
     /// Uses params.w > 0.5 to signal "icy mode" to shader
     pub fn icy_sheen(color: Color) -> Self {

@@ -150,7 +150,6 @@ fn setup_ui(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,
     mut text_glow_materials: ResMut<Assets<shaders::TextGlowMaterial>>,
-    mut chasing_materials: ResMut<Assets<shaders::nine_slice::ChasingBorderMaterial>>,
 ) {
     // Root container - fills window, flex column layout
     commands
@@ -279,7 +278,7 @@ fn setup_ui(
                         // ─────────────────────────────────────────────────────
                         conv.spawn((
                             ui::state::InputShadow,
-                            // Also keep PromptContainer marker for backwards compat
+                            // PromptContainer triggers spawn_prompt_cell system
                             cell::PromptContainer,
                             Node {
                                 width: Val::Percent(100.0),
