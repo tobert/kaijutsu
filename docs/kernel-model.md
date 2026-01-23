@@ -1,6 +1,6 @@
 # Kaijutsu Kernel Model
 
-*Last updated: 2026-01-16*
+*Last updated: 2026-01-23*
 
 > **This is the authoritative design document for Kaijutsu's kernel model.**
 
@@ -8,16 +8,20 @@
 
 | Component | Status |
 |-----------|--------|
-| Kernel concept | ✅ Designed (this document) |
-| Cap'n Proto schema | ✅ Complete |
-| Server (kaijutsu-server) | 🚧 Partial |
+| Kernel concept | ✅ Implemented (`kaijutsu-kernel/src/kernel.rs`) |
+| Cap'n Proto schema | ✅ Complete (25 Kernel methods, 5 World methods) |
+| Server (kaijutsu-server) | ✅ Functional |
 | Client (kaijutsu-app) | 🚧 Partial |
-| kaish integration | 🚧 kaish L0-L4 complete, embedding planned |
-| Consent modes | ✅ Implemented |
-| Checkpoint system | 📋 Planned (not yet in RPC) |
-| Fork/Thread | 📋 Stub only (returns unimplemented error) |
-| complete() | 📋 Stub only (returns empty completions) |
-| archive() | 📋 Planned (not yet in RPC) |
+| kaish integration | ✅ Subprocess spawned lazily on execute() |
+| Consent modes | ✅ Implemented (`control.rs`) |
+| Checkpoint system | ✅ Implemented in kernel (not yet exposed via RPC) |
+| Fork/Thread (kernel) | ✅ Implemented (`kernel.rs:367-409`) |
+| Fork/Thread (RPC) | 📋 Stub (returns unimplemented error) |
+| Block tools | ✅ Extensive (9 tools, 104KB implementation) |
+| Seat/Context | ✅ Implemented (4-tuple SeatId model) |
+| LLM integration | ✅ Implemented (Anthropic provider, streaming) |
+| complete() | 📋 Stub (returns empty completions) |
+| archive() | 📋 Planned (not yet in schema) |
 
 ## kaish Integration
 
@@ -371,7 +375,49 @@ When attached bidirectionally:
 └────────┘ └────────┘
 ```
 
-## Cap'n Proto Interface (Draft)
+## Block Tools
+
+The kernel exposes a rich set of CRDT-native block tools for content manipulation.
+These are automatically equipped and available via `executeTool()`.
+
+| Tool | Purpose |
+|------|---------|
+| `block_create` | Create new block with role, kind, optional content |
+| `block_append` | Streaming-optimized text append (batched) |
+| `block_edit` | Line-based editing with CAS validation |
+| `block_splice` | Character-level splice for programmatic edits |
+| `block_read` | Read block content with line numbers |
+| `block_search` | Regex search within a block |
+| `block_list` | List blocks with filters (kind, status, parent) |
+| `block_status` | Set block status (pending/running/done/error) |
+| `kernel_search` | Cross-block grep across kernel |
+
+See [block-tools.md](block-tools.md) for the full interface specification.
+
+## Seat & Context Model
+
+Seats provide presence tracking for multi-participant collaboration.
+
+**SeatId** is a 4-tuple:
+```
+(nick, instance, kernel, context)
+("amy", "laptop", "kaijutsu-dev", "planning")
+```
+
+| Field | Purpose |
+|-------|---------|
+| `nick` | Display name ("amy", "refactor-bot") |
+| `instance` | Device or model ("laptop", "haiku") |
+| `kernel` | Which kernel |
+| `context` | Sub-context within kernel |
+
+**SeatStatus**: `active`, `idle`, `away`
+
+RPC methods: `listContexts`, `joinContext`, `leaveSeat`, `listMySeats` (on World)
+
+## Cap'n Proto Interface
+
+The actual schema lives in `kaijutsu.capnp`. Key interfaces:
 
 ```capnp
 interface World {
@@ -379,65 +425,56 @@ interface World {
   listKernels @1 () -> (kernels :List(KernelInfo));
   attachKernel @2 (id :Text) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
-}
-
-struct KernelConfig {
-  name @0 :Text;
-  consentMode @1 :ConsentMode;
-  mounts @2 :List(MountSpec);
-}
-
-enum ConsentMode {
-  collaborative @0;
-  autonomous @1;
-}
-
-struct MountSpec {
-  path @0 :Text;           # e.g. "/mnt/kaijutsu"
-  source @1 :Text;         # e.g. "~/src/kaijutsu" or "kernel://other"
-  writable @2 :Bool;
+  listMySeats @4 () -> (seats :List(SeatInfo));
 }
 
 interface Kernel {
+  # Info
   getInfo @0 () -> (info :KernelInfo);
 
-  # VFS
-  mount @1 (spec :MountSpec);
-  unmount @2 (path :Text);
-  listMounts @3 () -> (mounts :List(MountInfo));
+  # kaish execution
+  execute @1 (code :Text) -> (execId :UInt64);
+  interrupt @2 (execId :UInt64);
+  complete @3 (...) -> (completions :List(Completion));  # stub
+  subscribeOutput @4 (callback :KernelOutput);           # stub
+  getCommandHistory @5 (limit :UInt32) -> (...);
+
+  # Equipment (tools)
+  listEquipment @6 () -> (tools :List(ToolInfo));
+  equip @7 (tool :Text);
+  unequip @8 (tool :Text);
 
   # Lifecycle
-  fork @4 (name :Text) -> (kernel :Kernel);
-  thread @5 (name :Text) -> (kernel :Kernel);
-  checkpoint @6 (summary :Text);
-  archive @7 ();
+  fork @9 (name :Text) -> (kernel :Kernel);    # stub
+  thread @10 (name :Text) -> (kernel :Kernel); # stub
+  detach @11 ();
 
-  # kaish execution
-  execute @8 (code :Text) -> (execId :UInt64);
-  interrupt @9 (execId :UInt64);
-  complete @10 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
-  subscribeOutput @11 (callback :KernelOutput);
+  # VFS
+  vfs @12 () -> (vfs :Vfs);
+  listMounts @13 () -> (mounts :List(MountInfo));
+  mount @14 (path :Text, source :Text, writable :Bool);
+  unmount @15 (path :Text) -> (success :Bool);
 
-  # History & context
-  getHistory @12 (limit :UInt32) -> (entries :List(HistoryEntry));
-  getCheckpoints @13 () -> (checkpoints :List(CheckpointInfo));
-  emitContext @14 (config :ContextConfig) -> (payload :Data);
-}
+  # Tools
+  executeTool @16 (call :ToolCall) -> (result :ToolResult);
+  getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
-struct CheckpointInfo {
-  id @0 :UInt64;
-  summary @1 :Text;
-  timestamp @2 :Int64;
-  compactedCount @3 :UInt32;  # how many interactions were compacted
-}
+  # Block CRDT
+  applyBlockOp @18 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  subscribeBlocks @19 (callback :BlockEvents);
+  getBlockCellState @20 (cellId :Text) -> (state :BlockCellState);
 
-struct ContextConfig {
-  format @0 :Text;         # "claude", "openai", "raw"
-  includePaths @1 :List(Text);
-  sinceCheckpoint @2 :UInt64;  # 0 = include all
-  maxTokens @3 :UInt32;
+  # LLM
+  prompt @21 (request :LlmRequest) -> (promptId :Text);
+
+  # Context/Seats
+  listContexts @22 () -> (contexts :List(Context));
+  joinContext @23 (contextName :Text, instance :Text) -> (seat :SeatInfo);
+  leaveSeat @24 ();
 }
 ```
+
+**Note:** `fork`, `thread`, and `complete` are stubs awaiting implementation.
 
 ## Storage & Persistence
 
@@ -493,4 +530,16 @@ Think of a kernel like a development environment that:
 
 ## References
 
-- [docs/05-lexicon-exploration.md](./05-lexicon-exploration.md) — Philosophical dialogue that led to this model
+- [design-notes.md](./design-notes.md) — Design explorations and background
+- [block-tools.md](./block-tools.md) — Block CRDT interface specification
+
+---
+
+## Changelog
+
+**2026-01-23**
+- Updated Implementation Status to reflect actual state (checkpoint, block tools, seats all implemented)
+- Added Block Tools section documenting the 9 CRDT-native tools
+- Added Seat & Context Model section with SeatId 4-tuple
+- Rewrote Cap'n Proto Interface to match actual schema (25 methods)
+- Noted fork/thread kernel implementation is complete, only RPC layer is stubbed

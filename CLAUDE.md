@@ -44,10 +44,10 @@ cargo run -p kaijutsu-app
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/06-kernel-model.md](docs/06-kernel-model.md) | **Authoritative kernel model — start here** |
-| [docs/05-lexicon-exploration.md](docs/05-lexicon-exploration.md) | Philosophical background, design decisions |
-
-Use 06-kernel-model.md as the authoritative source of truth.
+| [docs/kernel-model.md](docs/kernel-model.md) | **Authoritative kernel model — start here** |
+| [docs/block-tools.md](docs/block-tools.md) | CRDT block interface design |
+| [docs/diamond-types-fork.md](docs/diamond-types-fork.md) | Why we forked diamond-types |
+| [docs/design-notes.md](docs/design-notes.md) | Collected design explorations |
 
 ## Core Concepts
 
@@ -62,7 +62,7 @@ A kernel:
 - Can checkpoint (distill history into summaries)
 - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 
-See [docs/06-kernel-model.md](docs/06-kernel-model.md) for full details.
+See [docs/kernel-model.md](docs/kernel-model.md) for full details.
 
 ### Context Generation
 
@@ -110,8 +110,10 @@ kaijutsu/
 │   ├── kaijutsu-server/     # TCP/SSH server
 │   └── kaijutsu-app/        # Bevy GUI
 └── docs/
-    ├── 06-kernel-model.md   # ✅ Start here
-    └── 05-lexicon-exploration.md
+    ├── kernel-model.md      # ✅ Start here
+    ├── block-tools.md       # CRDT interface
+    ├── diamond-types-fork.md
+    └── design-notes.md
 ```
 
 ## Related Repos
@@ -193,3 +195,47 @@ Follow typical open source conventions for commits. This project is still in ear
 - We often work in parallel sessions, be specific in what is added
 - We often write ephemeral markdown files, these are not usually committed
 - Set a Co-Authored-By in the commit message
+
+## Bevy 0.18 Quick Reference
+
+### Event → Message rename
+
+| Old (0.14-0.17) | New (0.18) |
+|-----------------|------------|
+| `#[derive(Event)]` | `#[derive(Message)]` |
+| `EventReader<T>` | `MessageReader<T>` |
+| `EventWriter<T>` | `MessageWriter<T>` |
+| `events.send(x)` | `messages.write(x)` |
+| `app.add_event::<T>()` | `app.add_message::<T>()` |
+
+### Other API changes
+
+| Old | New |
+|-----|-----|
+| `ChildBuilder` | `ChildSpawnerCommands` |
+| `BorderColor(color)` | `BorderColor::all(color)` |
+| `resolution: (1280., 800.).into()` | `resolution: (1280, 800).into()` |
+| `query.get_single()` | `query.single()` |
+
+### Keyboard input
+
+```rust
+use bevy::input::keyboard::{Key, KeyboardInput};
+
+fn handle_input(mut keyboard: MessageReader<KeyboardInput>) {
+    for event in keyboard.read() {
+        if !event.state.is_pressed() { continue; }
+        match (&event.logical_key, &event.text) {
+            (Key::Enter, _) => { /* ... */ }
+            (_, Some(text)) => { /* text input */ }
+            _ => {}
+        }
+    }
+}
+```
+
+### References
+
+- Bevy source: `~/src/bevy`
+- Text input example: `~/src/bevy/examples/input/text_input.rs`
+- Message example: `~/src/bevy/examples/ecs/message.rs`
