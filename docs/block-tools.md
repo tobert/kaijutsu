@@ -1,6 +1,6 @@
 # Block Tools Design
 
-*CRDT-native tool interface for models and humans to collaborate on blocks.*
+*CRDT-native tool interface for models and users to collaborate on blocks.*
 
 **Status:** Implemented (v2)
 **Authors:** Amy, Claude, Gemini
@@ -14,10 +14,10 @@ The server conflates "cells" (UI concept) with "blocks" (kernel primitive). This
 
 ## Goals
 
-1. **Clean separation** — Kernel → Blocks, UI → Cells (presentation)
+1. **Equal access** — Same tools for Claude, Gemini, kaish, Rhai, and users
 2. **CRDT-native** — All mutations are CRDT ops, always syncable
 3. **Model-friendly** — Line-based editing (matches training data)
-4. **Human-friendly** — Same primitives power editor UI
+4. **Script-friendly** — kaish and Rhai can drive the same block tools
 5. **Streaming-optimized** — Efficient path for model output
 
 ---
@@ -73,9 +73,9 @@ All blocks form a DAG via `parent_id`. This enables:
 
 **Why no streaming status?** CRDT handles concurrent edits naturally:
 - Model appends tokens at end of block
-- Human edits earlier in block
+- User edits earlier in block
 - CRDT merges both correctly
-- Model doesn't see human edits until next turn (context is frozen)
+- Model doesn't see user edits until next turn (context is frozen)
 - KV cache invalidation is a future optimization, ops are always correct
 
 ### Persistence Model
@@ -105,7 +105,7 @@ dirty = block.version > block.last_persisted_version
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Model / Human / MCP                      │
+│                     Model / User / MCP                      │
 └─────────────────────────────┬───────────────────────────────┘
                               │ Tool calls
                               ▼
@@ -343,8 +343,8 @@ block.sync {
 ```
 
 **Op streaming**: CRDT ops flow to all subscribed clients in real-time. This enables:
-- Multiple humans editing same file (Google Docs style)
-- Model and human editing concurrently (CRDT merges)
+- Multiple users editing same file (Google Docs style)
+- Model and user editing concurrently (CRDT merges)
 - Offline clients catching up on reconnect
 
 ---
@@ -533,7 +533,7 @@ This lets multiple agents work on the same block without stepping on each other'
 
 2. **Block size** — No limits for now. Revisit when we hit a real problem.
 
-3. **Multi-cursor UI** — When multiple humans edit, show their cursors?
+3. **Multi-cursor UI** — When multiple users edit, show their cursors?
    - Pure UI concern, but kernel might need to track cursor positions
    - Or: cursors are ephemeral, not persisted, handled entirely client-side
 

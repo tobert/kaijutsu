@@ -108,6 +108,11 @@ See `~/src/kaish/docs/BUILD.md` for kaish's build plan and layer dependencies.
 
 The **kernel** is the fundamental primitive in Kaijutsu. Everything is a kernel.
 
+**Design philosophy:** Everyone edits shared state via CRDT tools. kaish scripts,
+Rhai programs, Claude, Gemini, and users in the editor all use the same block
+operations. The distributed algorithm equalizes access regardless of network
+conditions or participant type.
+
 A kernel is a state holder that:
 - Owns `/` in its virtual filesystem
 - Can mount other VFS (worktrees, repos, other kernels)
@@ -179,7 +184,7 @@ Unmounting is natural pruning — reduce scope, focus context.
 Connect or disconnect your view to/from a kernel.
 
 ```bash
-# Attach to a kernel (human)
+# Attach to a kernel (user)
 kaish attach kernel://project-kaijutsu
 
 # Attach (AI agent)
@@ -187,7 +192,7 @@ kaish attach kernel://project-kaijutsu
 ```
 
 When attached:
-- Human gets UI view into the kernel
+- User gets UI view into the kernel
 - AI gets context payload from the kernel
 - Both can see each other's presence (if lease permits)
 
@@ -232,14 +237,14 @@ kaish checkpoint "Established kernel model"
 
 # AI-suggested (in collaborative mode, requires consent)
 # Claude: "We've reached a decision point. Checkpoint?"
-# Human: "yes" or approves in UI
+# User: "yes" or approves in UI
 
 # Automatic (in autonomous mode)
 # Kernel self-checkpoints based on heuristics
 ```
 
 **Checkpoint contents:**
-- Summary text (human or AI authored)
+- Summary text (user or AI authored)
 - Timestamp
 - Reference to what was compacted
 - Optionally: archived raw history
@@ -272,8 +277,8 @@ Kernels operate in one of two modes:
 
 ### Collaborative (default)
 
-- Checkpoints require human consent
-- AI suggests, human approves
+- Checkpoints require user consent
+- AI suggests, user approves
 - Good for: pair programming, supervised work
 
 ### Autonomous
@@ -288,7 +293,7 @@ kaish config consent_mode=autonomous
 ```
 
 Hybrid rules are possible:
-- "Auto-checkpoint if no human input for 50 interactions"
+- "Auto-checkpoint if no user input for 50 interactions"
 - "Auto-checkpoint on fork/thread creation"
 - "Require consent for checkpoints that prune > 100 interactions"
 
@@ -513,9 +518,9 @@ Think of a kernel like a development environment that:
 |----------|-----------|
 | Kernel owns `/` | Unix philosophy. Everything is a file. Kernels expose themselves as VFS. |
 | Context is generated, not stored | Fresh context on each interaction. Mounts shape what's visible. Enables pruning. |
-| Fork vs Thread | Maps to how humans think about branching (isolated experiment) vs parallel work (same codebase). |
+| Fork vs Thread | Maps to how users think about branching (isolated experiment) vs parallel work (same codebase). |
 | Checkpoint = distillation | Compress without forgetting. Summaries carry forward. Raw history can be archived. |
-| Consent modes | Collaborative work needs human approval. Autonomous agents need freedom. |
+| Consent modes | Collaborative work needs user approval. Autonomous agents need freedom. |
 
 ### Open Questions
 
