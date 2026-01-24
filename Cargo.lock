@@ -746,7 +746,7 @@ dependencies = [
 [[package]]
 name = "bevy_brp_extras"
 version = "0.19.0-dev"
-source = "git+https://github.com/tobert/bevy_brp?branch=fix%2Fsend-keys-populate-text-field#07588e97c18c6c604386f68b9a02a1c1f62dae65"
+source = "git+https://github.com/tobert/bevy_brp?branch=fix%2Fsend-keys-populate-text-field#7a375fd0e1a14559926b51f117db32dfd79f06f5"
 dependencies = [
  "bevy",
  "serde",
@@ -3701,7 +3701,7 @@ dependencies = [
  "vec_map",
  "wasm-bindgen",
  "web-sys",
- "windows 0.54.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4215,7 +4215,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
