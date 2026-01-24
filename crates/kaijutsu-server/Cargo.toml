@@ -29,6 +29,7 @@ rand.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
 dirs = "5"
 serde_json = "1"
+parking_lot = "0.12"
 
 # No separate russh-keys needed - russh 0.56 includes keys module
 

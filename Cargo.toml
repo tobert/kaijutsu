@@ -71,3 +71,6 @@ rhai = "1.21"
 
 # LLM providers (fork with ToolUse in request content blocks)
 anthropic-api = { git = "https://github.com/tobert/anthropic-api", branch = "add-tooluse-to-request-content-block" }
+
+# MCP (Model Context Protocol) - using local source
+rmcp = { path = "../rmcp/crates/rmcp", features = ["client", "transport-child-process"] }

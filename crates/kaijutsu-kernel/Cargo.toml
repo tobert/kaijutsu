@@ -33,6 +33,9 @@ rhai.workspace = true
 # LLM providers
 anthropic-api.workspace = true
 
+# MCP (Model Context Protocol)
+rmcp.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs"] }
 
