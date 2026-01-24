@@ -22,6 +22,7 @@ use kaijutsu_crdt::{
 };
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
+use crate::flows::{BlockFlow, SharedBlockFlowBus};
 
 /// Thread-safe database handle.
 type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
@@ -124,8 +125,10 @@ pub struct BlockStore {
     db: Option<DbHandle>,
     /// Default agent ID for this store.
     agent_id: RwLock<String>,
-    /// Event broadcaster.
+    /// Event broadcaster (legacy, kept for backwards compat).
     event_tx: broadcast::Sender<BlockEvent>,
+    /// FlowBus for typed pub/sub (preferred for new code).
+    block_flows: Option<SharedBlockFlowBus>,
 }
 
 impl BlockStore {
@@ -137,6 +140,19 @@ impl BlockStore {
             db: None,
             agent_id: RwLock::new(agent_id.into()),
             event_tx,
+            block_flows: None,
+        }
+    }
+
+    /// Create a new in-memory block store with FlowBus.
+    pub fn with_flows(agent_id: impl Into<String>, block_flows: SharedBlockFlowBus) -> Self {
+        let (event_tx, _) = broadcast::channel(1024);
+        Self {
+            documents: DashMap::new(),
+            db: None,
+            agent_id: RwLock::new(agent_id.into()),
+            event_tx,
+            block_flows: Some(block_flows),
         }
     }
 
@@ -148,12 +164,41 @@ impl BlockStore {
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id.into()),
             event_tx,
+            block_flows: None,
         }
     }
 
-    /// Get the event receiver for subscribing to changes.
+    /// Create a block store with SQLite persistence and FlowBus.
+    pub fn with_db_and_flows(
+        db: DocumentDb,
+        agent_id: impl Into<String>,
+        block_flows: SharedBlockFlowBus,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(1024);
+        Self {
+            documents: DashMap::new(),
+            db: Some(Arc::new(std::sync::Mutex::new(db))),
+            agent_id: RwLock::new(agent_id.into()),
+            event_tx,
+            block_flows: Some(block_flows),
+        }
+    }
+
+    /// Get the event receiver for subscribing to changes (legacy API).
     pub fn subscribe(&self) -> broadcast::Receiver<BlockEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Get the FlowBus for typed pub/sub.
+    pub fn block_flows(&self) -> Option<&SharedBlockFlowBus> {
+        self.block_flows.as_ref()
+    }
+
+    /// Emit a block flow event if the bus is configured.
+    fn emit(&self, flow: BlockFlow) {
+        if let Some(bus) = &self.block_flows {
+            bus.publish(flow);
+        }
     }
 
     /// Get the current agent ID.
@@ -293,16 +338,27 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
     ) -> Result<BlockId, String> {
-        let result = {
+        let after_id = after.cloned();
+        let (block_id, snapshot) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            let result = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
+            let block_id = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
                 .map_err(|e| e.to_string())?;
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
+                .ok_or_else(|| "Block not found after insert".to_string())?;
             entry.touch(&agent_id);
-            result
+            (block_id, snapshot)
         };
         self.auto_save(document_id);
-        Ok(result)
+
+        // Emit flow event
+        self.emit(BlockFlow::Inserted {
+            cell_id: document_id.to_string(),
+            block: snapshot,
+            after_id,
+        });
+
+        Ok(block_id)
     }
 
     /// Insert a tool call block into a document.
@@ -314,16 +370,27 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
-        let result = {
+        let after_id = after.cloned();
+        let (block_id, snapshot) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            let result = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
+            let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
                 .map_err(|e| e.to_string())?;
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
+                .ok_or_else(|| "Block not found after insert".to_string())?;
             entry.touch(&agent_id);
-            result
+            (block_id, snapshot)
         };
         self.auto_save(document_id);
-        Ok(result)
+
+        // Emit flow event
+        self.emit(BlockFlow::Inserted {
+            cell_id: document_id.to_string(),
+            block: snapshot,
+            after_id,
+        });
+
+        Ok(block_id)
     }
 
     /// Insert a tool result block into a document.
@@ -336,16 +403,27 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
-        let result = {
+        let after_id = after.cloned();
+        let (block_id, snapshot) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            let result = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
+            let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
                 .map_err(|e| e.to_string())?;
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
+                .ok_or_else(|| "Block not found after insert".to_string())?;
             entry.touch(&agent_id);
-            result
+            (block_id, snapshot)
         };
         self.auto_save(document_id);
-        Ok(result)
+
+        // Emit flow event
+        self.emit(BlockFlow::Inserted {
+            cell_id: document_id.to_string(),
+            block: snapshot,
+            after_id,
+        });
+
+        Ok(block_id)
     }
 
     /// Set the status of a block.
@@ -362,6 +440,14 @@ impl BlockStore {
             entry.touch(&agent_id);
         }
         self.auto_save(document_id);
+
+        // Emit flow event
+        self.emit(BlockFlow::StatusChanged {
+            cell_id: document_id.to_string(),
+            block_id: block_id.clone(),
+            status,
+        });
+
         Ok(())
     }
 
@@ -377,11 +463,23 @@ impl BlockStore {
         insert: &str,
         delete: usize,
     ) -> Result<(), String> {
-        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        {
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+            let agent_id = self.agent_id();
+            entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+        }
         // Note: No auto-save for text edits (high frequency during streaming)
+
+        // Emit flow event
+        self.emit(BlockFlow::Edited {
+            cell_id: document_id.to_string(),
+            block_id: block_id.clone(),
+            pos: pos as u64,
+            insert: insert.to_string(),
+            delete: delete as u64,
+        });
+
         Ok(())
     }
 
@@ -390,11 +488,28 @@ impl BlockStore {
     /// Note: Does not auto-save to avoid excessive I/O during streaming.
     /// Call `save_snapshot()` explicitly when streaming is complete.
     pub fn append_text(&self, document_id: &str, block_id: &BlockId, text: &str) -> Result<(), String> {
-        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
-        entry.touch(&agent_id);
+        let pos = {
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+            let agent_id = self.agent_id();
+            // Get current length before append
+            let current_len = entry.doc.get_block_snapshot(block_id)
+                .map(|s| s.content.len())
+                .unwrap_or(0);
+            entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
+            entry.touch(&agent_id);
+            current_len
+        };
         // Note: No auto-save for text appends (high frequency during streaming)
+
+        // Emit flow event (append is an edit at the end)
+        self.emit(BlockFlow::Edited {
+            cell_id: document_id.to_string(),
+            block_id: block_id.clone(),
+            pos: pos as u64,
+            insert: text.to_string(),
+            delete: 0,
+        });
+
         Ok(())
     }
 
@@ -407,6 +522,14 @@ impl BlockStore {
             entry.touch(&agent_id);
         }
         self.auto_save(document_id);
+
+        // Emit flow event
+        self.emit(BlockFlow::CollapsedChanged {
+            cell_id: document_id.to_string(),
+            block_id: block_id.clone(),
+            collapsed,
+        });
+
         Ok(())
     }
 
@@ -419,6 +542,13 @@ impl BlockStore {
             entry.touch(&agent_id);
         }
         self.auto_save(document_id);
+
+        // Emit flow event
+        self.emit(BlockFlow::Deleted {
+            cell_id: document_id.to_string(),
+            block_id: block_id.clone(),
+        });
+
         Ok(())
     }
 

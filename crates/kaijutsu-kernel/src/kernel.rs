@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::control::ConsentMode;
+use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmRegistry, LlmResult};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
@@ -39,6 +40,8 @@ pub struct Kernel {
     llm: RwLock<LlmRegistry>,
     /// Consent mode (collaborative vs autonomous).
     consent_mode: RwLock<ConsentMode>,
+    /// FlowBus for block events.
+    block_flows: SharedBlockFlowBus,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -52,6 +55,9 @@ impl std::fmt::Debug for Kernel {
             .finish()
     }
 }
+
+/// Default capacity for the block flow bus.
+const DEFAULT_FLOW_CAPACITY: usize = 1024;
 
 impl Kernel {
     /// Create a new kernel with the given name.
@@ -70,6 +76,7 @@ impl Kernel {
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
+            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
     }
 
@@ -85,7 +92,32 @@ impl Kernel {
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
+            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
+    }
+
+    /// Create a new kernel with a shared FlowBus.
+    ///
+    /// Use this when you need to share the flow bus with other components
+    /// (like BlockStore) before creating the kernel.
+    pub async fn with_flows(name: impl Into<String>, block_flows: SharedBlockFlowBus) -> Self {
+        let name = name.into();
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/scratch", MemoryBackend::new()).await;
+
+        Self {
+            vfs,
+            state: RwLock::new(KernelState::new(&name)),
+            tools: RwLock::new(ToolRegistry::new()),
+            llm: RwLock::new(LlmRegistry::new()),
+            consent_mode: RwLock::new(ConsentMode::default()),
+            block_flows,
+        }
+    }
+
+    /// Get the block flows bus.
+    pub fn block_flows(&self) -> &SharedBlockFlowBus {
+        &self.block_flows
     }
 
     // ========================================================================
@@ -389,12 +421,15 @@ impl Kernel {
         // Note: LLM providers are not copied - forked kernels start fresh
         // This matches tool behavior and avoids credential sharing concerns
 
+        // Note: FlowBus is independent - forked kernels have their own event streams
+
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
+            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
     }
 
@@ -409,12 +444,16 @@ impl Kernel {
         // Note: LLM providers are not shared - threaded kernels get fresh registry
         // This avoids credential sharing and allows per-thread provider config
 
+        // Share the FlowBus - threaded kernels share event streams
+        let block_flows = Arc::clone(&self.block_flows);
+
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
+            block_flows,
         }
     }
 }

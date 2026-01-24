@@ -21,13 +21,16 @@ use crate::embedded_kaish::EmbeddedKaish;
 
 use kaijutsu_kernel::{
     DocumentDb, DocumentKind, Kernel,
-    LocalBackend, SharedBlockStore, ToolInfo, VfsOps, shared_block_store, shared_block_store_with_db,
+    LocalBackend, SharedBlockStore, ToolInfo, VfsOps,
     AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
     // MCP
     McpServerPool, McpServerConfig, McpToolEngine,
+    // FlowBus
+    BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
+    block_store::BlockStore,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -248,12 +251,12 @@ fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
 }
 
 /// Open or create a BlockStore with database persistence for a kernel.
-fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
+fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus) -> SharedBlockStore {
     let db_path = kernel_data_dir(kernel_id).join("data.db");
     match DocumentDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened document database at {:?}", db_path);
-            let store = shared_block_store_with_db(db, "server");
+            let store = Arc::new(BlockStore::with_db_and_flows(db, "server", block_flows));
             if let Err(e) = store.load_from_db() {
                 log::warn!("Failed to load documents from DB: {}", e);
             } else {
@@ -263,7 +266,7 @@ fn create_block_store_with_db(kernel_id: &str) -> SharedBlockStore {
         }
         Err(e) => {
             log::warn!("Failed to open document database at {:?}: {}, using in-memory", db_path, e);
-            shared_block_store("server")
+            Arc::new(BlockStore::with_flows("server", block_flows))
         }
     }
 }
@@ -297,8 +300,6 @@ pub struct KernelState {
     pub documents: SharedBlockStore,
     /// Main document ID for this kernel (convention: {kernel_id}@main)
     pub main_document_id: String,
-    /// Subscribers for block update events (LLM streaming)
-    pub block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
     /// Contexts within this kernel (for seat management)
     pub contexts: HashMap<String, ContextState>,
 }
@@ -383,8 +384,11 @@ impl world::Server for WorldImpl {
             };
 
             if needs_create {
-                // Create the kaijutsu kernel with default mounts
-                let kernel = Kernel::new(&id).await;
+                // Create shared FlowBus first - shared between Kernel and BlockStore
+                let block_flows = shared_block_flow_bus(1024);
+
+                // Create the kaijutsu kernel with shared FlowBus
+                let kernel = Kernel::with_flows(&id, block_flows.clone()).await;
 
                 // Mount user's home directory at /home (read-only for now)
                 if let Some(home) = dirs::home_dir() {
@@ -393,8 +397,8 @@ impl world::Server for WorldImpl {
                         .await;
                 }
 
-                // Create block store with database persistence
-                let documents = create_block_store_with_db(&id);
+                // Create block store with database persistence and shared FlowBus
+                let documents = create_block_store_with_db(&id, block_flows);
 
                 // Ensure main document exists (convention ID)
                 let main_document_id = ensure_main_document(&documents, &id)?;
@@ -419,7 +423,6 @@ impl world::Server for WorldImpl {
                         kernel: kernel_arc,
                         documents,
                         main_document_id,
-                        block_subscribers: Vec::new(),
                         contexts,
                     },
                 );
@@ -451,8 +454,11 @@ impl world::Server for WorldImpl {
                 state_ref.next_kernel_id()
             };
 
-            // Create the kaijutsu kernel with default mounts
-            let kernel = Kernel::new(&name).await;
+            // Create shared FlowBus first - shared between Kernel and BlockStore
+            let block_flows = shared_block_flow_bus(1024);
+
+            // Create the kaijutsu kernel with shared FlowBus
+            let kernel = Kernel::with_flows(&name, block_flows.clone()).await;
 
             // Mount user's home directory at /home (read-only for now)
             if let Some(home) = dirs::home_dir() {
@@ -461,8 +467,8 @@ impl world::Server for WorldImpl {
                     .await;
             }
 
-            // Create block store with database persistence
-            let documents = create_block_store_with_db(&id);
+            // Create block store with database persistence and shared FlowBus
+            let documents = create_block_store_with_db(&id, block_flows);
 
             // Ensure main document exists (convention ID)
             let main_document_id = ensure_main_document(&documents, &id)?;
@@ -488,7 +494,6 @@ impl world::Server for WorldImpl {
                         kernel: kernel_arc,
                         documents,
                         main_document_id,
-                        block_subscribers: Vec::new(),
                         contexts,
                     },
                 );
@@ -1116,14 +1121,125 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let callback = pry!(pry!(params.get()).get_callback());
 
-        let mut state = self.state.borrow_mut();
-        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
-            kernel.block_subscribers.push(callback);
-            log::debug!(
-                "Added block subscriber for kernel {} (total: {})",
-                self.kernel_id,
-                kernel.block_subscribers.len()
-            );
+        let state = self.state.borrow();
+        if let Some(kernel_state) = state.kernels.get(&self.kernel_id) {
+            // Get the FlowBus from the kernel
+            let block_flows = kernel_state.kernel.block_flows().clone();
+            let kernel_id = self.kernel_id.clone();
+            drop(state);
+
+            // Spawn a bridge task that forwards FlowBus events to the callback
+            // Use spawn_local because Cap'n Proto callbacks are not Send
+            tokio::task::spawn_local(async move {
+                let mut sub = block_flows.subscribe("block.*");
+                log::debug!("Started FlowBus subscription for kernel {}", kernel_id);
+
+                while let Some(msg) = sub.recv().await {
+                    // Each branch sends its own request type; we convert the result to bool
+                    let success = match msg.payload {
+                        BlockFlow::Inserted { ref cell_id, ref block, ref after_id } => {
+                            let mut req = callback.on_block_inserted_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                params.set_has_after_id(after_id.is_some());
+                                if let Some(after) = after_id {
+                                    let mut aid = params.reborrow().init_after_id();
+                                    aid.set_cell_id(&after.cell_id);
+                                    aid.set_agent_id(&after.agent_id);
+                                    aid.set_seq(after.seq);
+                                }
+                                let mut block_state = params.init_block();
+                                set_block_snapshot(&mut block_state, block);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                        BlockFlow::Edited { ref cell_id, ref block_id, pos, ref insert, delete } => {
+                            let mut req = callback.on_block_edited_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                                params.set_pos(pos);
+                                params.set_insert(insert);
+                                params.set_delete(delete);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                        BlockFlow::Deleted { ref cell_id, ref block_id } => {
+                            let mut req = callback.on_block_deleted_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                        BlockFlow::StatusChanged { ref cell_id, ref block_id, status } => {
+                            let mut req = callback.on_block_status_changed_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                                params.set_status(status_to_capnp(status));
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                        BlockFlow::CollapsedChanged { ref cell_id, ref block_id, collapsed } => {
+                            let mut req = callback.on_block_collapsed_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                                params.set_collapsed(collapsed);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                        BlockFlow::Moved { ref cell_id, ref block_id, ref after_id } => {
+                            let mut req = callback.on_block_moved_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                                params.set_has_after_id(after_id.is_some());
+                                if let Some(after) = after_id {
+                                    let mut aid = params.reborrow().init_after_id();
+                                    aid.set_cell_id(&after.cell_id);
+                                    aid.set_agent_id(&after.agent_id);
+                                    aid.set_seq(after.seq);
+                                }
+                            }
+                            req.send().promise.await.is_ok()
+                        }
+                    };
+
+                    // If callback fails (client disconnected), stop the bridge task
+                    if !success {
+                        log::debug!(
+                            "FlowBus bridge task for kernel {} stopping: callback failed",
+                            kernel_id
+                        );
+                        break;
+                    }
+                }
+
+                log::debug!("FlowBus bridge task for kernel {} ended", kernel_id);
+            });
         }
         Promise::ok(())
     }
@@ -1186,7 +1302,7 @@ impl kernel::Server for KernelImpl {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
             // Get LLM provider and kernel references
-            let (provider, block_subscribers, documents, kernel_arc) = {
+            let (provider, documents, kernel_arc) = {
                 let state_ref = state.borrow();
                 let provider = match &state_ref.llm_provider {
                     Some(p) => p.clone(),
@@ -1202,7 +1318,7 @@ impl kernel::Server for KernelImpl {
                     })?;
                 log::debug!("Got provider and kernel state");
 
-                (provider, kernel_state.block_subscribers.clone(), kernel_state.documents.clone(), kernel_state.kernel.clone())
+                (provider, kernel_state.documents.clone(), kernel_state.kernel.clone())
             };
 
             // Build tool definitions from equipped tools (async)
@@ -1232,41 +1348,7 @@ impl kernel::Server for KernelImpl {
                         capnp::Error::failed(format!("failed to insert user block: {}", e))
                     })?;
                 log::debug!("Inserted user block: {:?}", block_id);
-
-                // Broadcast user block to subscribers
-                for subscriber in &block_subscribers {
-                    let mut req = subscriber.on_block_inserted_request();
-                    {
-                        let mut params = req.get();
-                        params.set_cell_id(&cell_id);
-                        params.set_has_after_id(false);
-                        let mut block_state = params.init_block();
-                        {
-                            let mut id = block_state.reborrow().init_id();
-                            id.set_cell_id(&block_id.cell_id);
-                            id.set_agent_id(&block_id.agent_id);
-                            id.set_seq(block_id.seq);
-                        }
-                        block_state.set_author("user");
-                        block_state.set_created_at(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64
-                        );
-                        // Flat BlockSnapshot fields
-                        block_state.set_role(crate::kaijutsu_capnp::Role::User);
-                        block_state.set_status(crate::kaijutsu_capnp::Status::Done);
-                        block_state.set_kind(crate::kaijutsu_capnp::BlockKind::Text);
-                        block_state.set_content(&content);
-                        block_state.set_collapsed(false);
-                        block_state.set_has_parent_id(false);
-                        block_state.set_has_tool_call_id(false);
-                        block_state.set_has_exit_code(false);
-                        block_state.set_is_error(false);
-                    }
-                    let _ = req.send(); // Fire and forget
-                }
+                // User block broadcast happens via FlowBus (insert_block emits BlockFlow::Inserted)
             };
 
             log::info!("User message block inserted, spawning LLM stream task");
@@ -1278,11 +1360,9 @@ impl kernel::Server for KernelImpl {
                 model_name, model, default_model);
 
             // Spawn LLM streaming in background task with agentic loop
-            // NOTE: Using spawn_local because block_events::Client is !Send (uses Rc internally)
             tokio::task::spawn_local(process_llm_stream(
                 provider,
                 documents,
-                block_subscribers,
                 cell_id,
                 content,
                 model_name,
@@ -1633,6 +1713,104 @@ impl kernel::Server for KernelImpl {
             Ok(())
         })
     }
+
+    // =========================================================================
+    // Shell execution (kaish REPL)
+    // =========================================================================
+
+    fn shell_execute(
+        self: Rc<Self>,
+        params: kernel::ShellExecuteParams,
+        mut results: kernel::ShellExecuteResults,
+    ) -> Promise<(), capnp::Error> {
+        log::debug!("shell_execute() called for kernel {}", self.kernel_id);
+        let params = pry!(params.get());
+        let code = pry!(pry!(params.get_code()).to_str()).to_owned();
+        let cell_id = pry!(pry!(params.get_cell_id()).to_str()).to_owned();
+        log::info!("Shell execute: cell_id={}, code={}", cell_id, code);
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            // Get documents and kernel references
+            let (documents, kernel_arc) = {
+                let state_ref = state.borrow();
+                let kernel_state = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| {
+                        log::error!("kernel {} not found", kernel_id);
+                        capnp::Error::failed("kernel not found".into())
+                    })?;
+                (kernel_state.documents.clone(), kernel_state.kernel.clone())
+            };
+
+            // Auto-create document if it doesn't exist
+            if documents.get(&cell_id).is_none() {
+                log::info!("Auto-creating document {} for shell execute", cell_id);
+                documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
+                    .map_err(|e| capnp::Error::failed(format!("failed to create document: {}", e)))?;
+            }
+
+            // Create ShellCommand block
+            let command_block_id = documents.insert_block(
+                &cell_id, None, None,
+                Role::User, BlockKind::ShellCommand,
+                &code
+            ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
+            log::debug!("Created shell command block: {:?}", command_block_id);
+
+            // Create ShellOutput block (empty, will be filled by execution)
+            let output_block_id = documents.insert_block(
+                &cell_id, Some(&command_block_id), None,
+                Role::System, BlockKind::ShellOutput,
+                ""
+            ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
+            log::debug!("Created shell output block: {:?}", output_block_id);
+
+            // Spawn execution in background
+            let cell_id_clone = cell_id.clone();
+            let output_block_id_clone = output_block_id.clone();
+            let documents_clone = documents.clone();
+
+            tokio::task::spawn_local(async move {
+                // Execute via kernel's default engine (kaish)
+                match kernel_arc.execute(&code).await {
+                    Ok(result) => {
+                        // Combine stdout and stderr
+                        let output = if result.stderr.is_empty() {
+                            result.stdout
+                        } else if result.stdout.is_empty() {
+                            result.stderr
+                        } else {
+                            format!("{}\n{}", result.stdout, result.stderr)
+                        };
+                        log::debug!("Shell execution completed: {} bytes, exit_code={}", output.len(), result.exit_code);
+                        // Update output block with result
+                        if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &output, 0) {
+                            log::error!("Failed to update shell output: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Error: {}", e);
+                        log::error!("Shell execution failed: {}", e);
+                        // Write error to output block
+                        if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &error_msg, 0) {
+                            log::error!("Failed to update shell output with error: {}", e);
+                        }
+                    }
+                }
+            });
+
+            // Return command block ID
+            let mut block_id_builder = results.get().init_command_block_id();
+            block_id_builder.set_cell_id(&command_block_id.cell_id);
+            block_id_builder.set_agent_id(&command_block_id.agent_id);
+            block_id_builder.set_seq(command_block_id.seq);
+
+            log::debug!("shell_execute() returning command_block_id={:?}", command_block_id);
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================
@@ -1845,115 +2023,12 @@ fn get_tool_schema(tool_name: &str) -> serde_json::Value {
     }
 }
 
-/// Convert Rust BlockKind to Cap'n Proto BlockKind
-fn block_kind_to_capnp(kind: BlockKind) -> crate::kaijutsu_capnp::BlockKind {
-    match kind {
-        BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-        BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-        BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-        BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-        BlockKind::ShellCommand => crate::kaijutsu_capnp::BlockKind::ShellCommand,
-        BlockKind::ShellOutput => crate::kaijutsu_capnp::BlockKind::ShellOutput,
-    }
-}
-
-/// Broadcast a block insertion to all subscribers
-fn broadcast_block_inserted(
-    subscribers: &[crate::kaijutsu_capnp::block_events::Client],
-    cell_id: &str,
-    block_id: &kaijutsu_crdt::BlockId,
-    kind: BlockKind,
-    content: &str,
-    collapsed: bool,
-    tool_name: Option<&str>,
-    tool_input: Option<&serde_json::Value>,
-    tool_call_id: Option<&kaijutsu_crdt::BlockId>,
-    is_error: bool,
-) {
-    for subscriber in subscribers {
-        let mut req = subscriber.on_block_inserted_request();
-        {
-            let mut params = req.get();
-            params.set_cell_id(cell_id);
-            params.set_has_after_id(false);
-            let mut block_state = params.init_block();
-            {
-                let mut id = block_state.reborrow().init_id();
-                id.set_cell_id(&block_id.cell_id);
-                id.set_agent_id(&block_id.agent_id);
-                id.set_seq(block_id.seq);
-            }
-            block_state.set_author(&block_id.agent_id);
-            block_state.set_created_at(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            );
-            // Flat BlockSnapshot fields
-            block_state.set_role(crate::kaijutsu_capnp::Role::Model);
-            block_state.set_status(crate::kaijutsu_capnp::Status::Done);
-            block_state.set_kind(block_kind_to_capnp(kind));
-            block_state.set_content(content);
-            block_state.set_collapsed(collapsed);
-            block_state.set_has_parent_id(false);
-
-            // Tool-specific fields
-            if let Some(name) = tool_name {
-                block_state.set_tool_name(name);
-            }
-            if let Some(input) = tool_input {
-                block_state.set_tool_input(&input.to_string());
-            }
-            if let Some(tc_id) = tool_call_id {
-                let mut tc = block_state.reborrow().init_tool_call_id();
-                tc.set_cell_id(&tc_id.cell_id);
-                tc.set_agent_id(&tc_id.agent_id);
-                tc.set_seq(tc_id.seq);
-                block_state.set_has_tool_call_id(true);
-            } else {
-                block_state.set_has_tool_call_id(false);
-            }
-            block_state.set_has_exit_code(false);
-            block_state.set_is_error(is_error);
-        }
-        let _ = req.send();
-    }
-}
-
-/// Broadcast a text append (edit) to all subscribers
-fn broadcast_text_append(
-    subscribers: &[crate::kaijutsu_capnp::block_events::Client],
-    cell_id: &str,
-    block_id: &kaijutsu_crdt::BlockId,
-    pos: u64,
-    text: &str,
-) {
-    for subscriber in subscribers {
-        let mut req = subscriber.on_block_edited_request();
-        {
-            let mut params = req.get();
-            params.set_cell_id(cell_id);
-            {
-                let mut id = params.reborrow().init_block_id();
-                id.set_cell_id(&block_id.cell_id);
-                id.set_agent_id(&block_id.agent_id);
-                id.set_seq(block_id.seq);
-            }
-            params.set_pos(pos);
-            params.set_insert(text);
-            params.set_delete(0);
-        }
-        let _ = req.send();
-    }
-}
-
 /// Process LLM streaming in a background task with agentic loop.
 /// This function handles all stream events, executes tools, and loops until done.
+/// Block events are broadcast via FlowBus (BlockStore emits BlockFlow events).
 async fn process_llm_stream(
     provider: Arc<AnthropicProvider>,
     documents: SharedBlockStore,
-    block_subscribers: Vec<crate::kaijutsu_capnp::block_events::Client>,
     cell_id: String,
     content: String,
     model_name: String,
@@ -1972,9 +2047,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
-                broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, "⚠️ Maximum tool iterations reached", false, None, None, None, true);
-            }
+            let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
             break;
         }
 
@@ -1994,9 +2067,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e)) {
-                    broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", e), false, None, None, None, true);
-                }
+                let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
                 return;
             }
         };
@@ -2018,25 +2089,15 @@ async fn process_llm_stream(
             match event {
                 StreamEvent::ThinkingStart => {
                     match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
-                        Ok(block_id) => {
-                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                BlockKind::Thinking, "", false, None, None, None, false);
-                            current_block_id = Some(block_id);
-                        }
+                        Ok(block_id) => current_block_id = Some(block_id),
                         Err(e) => log::error!("Failed to insert thinking block: {}", e),
                     }
                 }
 
                 StreamEvent::ThinkingDelta(text) => {
                     if let Some(ref block_id) = current_block_id {
-                        let pos = documents.get(&cell_id)
-                            .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                            .map(|s| s.content.chars().count() as u64)
-                            .unwrap_or(0);
                         if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
                             log::error!("Failed to append thinking text: {}", e);
-                        } else {
-                            broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
                         }
                     }
                 }
@@ -2047,11 +2108,7 @@ async fn process_llm_stream(
 
                 StreamEvent::TextStart => {
                     match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
-                        Ok(block_id) => {
-                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                BlockKind::Text, "", false, None, None, None, false);
-                            current_block_id = Some(block_id);
-                        }
+                        Ok(block_id) => current_block_id = Some(block_id),
                         Err(e) => log::error!("Failed to insert text block: {}", e),
                     }
                 }
@@ -2061,14 +2118,8 @@ async fn process_llm_stream(
                     assistant_text.push_str(&text);
 
                     if let Some(ref block_id) = current_block_id {
-                        let pos = documents.get(&cell_id)
-                            .and_then(|cell| cell.doc.get_block_snapshot(block_id))
-                            .map(|s| s.content.chars().count() as u64)
-                            .unwrap_or(0);
                         if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
                             log::error!("Failed to append text: {}", e);
-                        } else {
-                            broadcast_text_append(&block_subscribers, &cell_id, block_id, pos, &text);
                         }
                     }
                 }
@@ -2085,8 +2136,6 @@ async fn process_llm_stream(
                     match documents.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
                         Ok(block_id) => {
                             tool_call_blocks.insert(id.clone(), block_id.clone());
-                            broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                                BlockKind::ToolCall, "", false, Some(name.as_str()), Some(&input), None, false);
                         }
                         Err(e) => log::error!("Failed to insert tool use block: {}", e),
                     }
@@ -2107,9 +2156,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    if let Ok(block_id) = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
-                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id, BlockKind::Text, &format!("❌ Error: {}", err), false, None, None, None, true);
-                    }
+                    let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
                     return;
                 }
             }
@@ -2155,14 +2202,10 @@ async fn process_llm_stream(
                 }
             };
 
-            // Insert tool result block and broadcast
+            // Insert tool result block (FlowBus handles broadcasting)
             if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                match documents.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
-                    Ok(block_id) => {
-                        broadcast_block_inserted(&block_subscribers, &cell_id, &block_id,
-                            BlockKind::ToolResult, &result_content, false, None, None, Some(tool_call_block_id), is_error);
-                    }
-                    Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                if let Err(e) = documents.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
+                    log::error!("Failed to insert tool result block: {}", e);
                 }
             }
 
@@ -2277,6 +2320,16 @@ fn set_block_snapshot(
         builder.set_has_exit_code(false);
     }
     builder.set_is_error(block.is_error);
+}
+
+/// Convert a CRDT Status to Cap'n Proto Status.
+fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
+    match status {
+        kaijutsu_crdt::Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+        kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
+        kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
+        kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
+    }
 }
 
 /// Parse a BlockSnapshot from a Cap'n Proto reader.

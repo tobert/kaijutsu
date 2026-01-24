@@ -17,6 +17,7 @@ pub mod control;
 pub mod conversation;
 pub mod conversation_db;
 pub mod db;
+pub mod flows;
 pub mod kernel;
 pub mod llm;
 pub mod mcp_pool;
@@ -52,3 +53,7 @@ pub use vfs::{
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
 pub use mcp_pool::{McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo};
+pub use flows::{
+    BlockFlow, FlowBus, FlowMessage, HasSubject, SharedBlockFlowBus, Subscription,
+    matches_pattern, shared_block_flow_bus,
+};
