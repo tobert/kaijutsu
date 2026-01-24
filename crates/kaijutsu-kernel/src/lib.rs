@@ -19,6 +19,7 @@ pub mod conversation_db;
 pub mod db;
 pub mod kernel;
 pub mod llm;
+pub mod mcp_pool;
 pub mod rhai_engine;
 pub mod state;
 pub mod tools;
@@ -50,3 +51,4 @@ pub use vfs::{
     backends::{LocalBackend, MemoryBackend},
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
+pub use mcp_pool::{McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo};
