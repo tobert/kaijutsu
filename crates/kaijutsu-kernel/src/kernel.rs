@@ -246,6 +246,16 @@ impl Kernel {
             .collect()
     }
 
+    /// Get a tool's info by name.
+    pub async fn get_tool(&self, name: &str) -> Option<ToolInfo> {
+        self.tools.read().await.get(name).cloned()
+    }
+
+    /// Get an equipped engine by name.
+    pub async fn get_engine(&self, name: &str) -> Option<Arc<dyn ExecutionEngine>> {
+        self.tools.read().await.get_engine(name)
+    }
+
     /// Set the default execution engine.
     pub async fn set_default_engine(&self, name: &str) {
         self.tools.write().await.set_default_engine(name);
