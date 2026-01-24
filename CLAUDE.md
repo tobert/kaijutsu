@@ -90,8 +90,10 @@ The main UI area manages cognitive load, not just chat history.
 | Mode | Purpose | Enter | Exit |
 |------|---------|-------|------|
 | Normal | Navigate, read | `Esc` | - |
-| Insert | Type in input | `i` | `Esc` |
+| Chat | LLM prompts | `i` | `Esc` |
+| Shell | kaish commands | `s` | `Esc` |
 | Command | Slash commands | `:` | `Esc` |
+| Visual | Selection | `v` | `Esc` |
 
 ## Key Patterns
 
@@ -101,16 +103,37 @@ The main UI area manages cognitive load, not just chat history.
 - `attachKernel()` returns a `Kernel` capability
 - Real-time streaming for messages and kernel output
 
+### MCP Integration
+
+Dynamic MCP server registration via RPC:
+- `registerMcp(name, command, args, env)` — spawn and connect to MCP server
+- `unregisterMcp(name)` — disconnect and stop server
+- `listMcpServers()` — list connected servers and their tools
+- `callMcpTool(server, tool, args)` — invoke MCP tool
+
+MCP tools are automatically registered as ExecutionEngines with qualified names like `git:status`.
+
+### kaish Integration
+
+Two execution modes:
+- **EmbeddedKaish** — in-process interpreter, routes file I/O through CRDT blocks via `KaijutsuBackend`
+- **KaishProcess** — subprocess with Unix socket IPC (for isolation)
+
+`KaijutsuBackend` maps kaish file operations to blocks:
+- `/docs/{doc_id}/{block_key}` — read/write block content
+- `/docs/{doc_id}/_meta` — document metadata
+- Tool calls route through kernel's ToolRegistry
+
 ## Crate Structure
 
 ```
 kaijutsu/
 ├── crates/
 │   ├── kaijutsu-crdt/       # CRDT primitives (BlockDocument, DAG)
-│   ├── kaijutsu-kernel/     # Kernel state management
+│   ├── kaijutsu-kernel/     # Kernel, VFS, ToolRegistry, McpServerPool, FlowBus
 │   ├── kaijutsu-client/     # RPC client library
-│   ├── kaijutsu-server/     # TCP/SSH server
-│   └── kaijutsu-app/        # Bevy GUI
+│   ├── kaijutsu-server/     # SSH server, EmbeddedKaish, KaijutsuBackend
+│   └── kaijutsu-app/        # Bevy GUI, kaish syntax validation
 └── docs/
     ├── kernel-model.md      # ✅ Start here
     ├── block-tools.md       # CRDT interface

@@ -1,6 +1,6 @@
 # Kaijutsu Kernel Model
 
-*Last updated: 2026-01-23*
+*Last updated: 2026-01-24*
 
 > **This is the authoritative design document for Kaijutsu's kernel model.**
 
@@ -12,7 +12,9 @@
 | Cap'n Proto schema | ✅ Complete (25 Kernel methods, 5 World methods) |
 | Server (kaijutsu-server) | ✅ Functional |
 | Client (kaijutsu-app) | 🚧 Partial |
-| kaish integration | ✅ Subprocess spawned lazily on execute() |
+| kaish integration | ✅ EmbeddedKaish (in-process) + KaishProcess (subprocess) |
+| KaijutsuBackend | ✅ Maps kaish file I/O to CRDT blocks |
+| MCP integration | ✅ McpServerPool with dynamic registration via RPC |
 | Consent modes | ✅ Implemented (`control.rs`) |
 | Checkpoint system | ✅ Implemented in kernel (not yet exposed via RPC) |
 | Fork/Thread (kernel) | ✅ Implemented (`kernel.rs:367-409`) |
@@ -20,12 +22,13 @@
 | Block tools | ✅ Extensive (9 tools, 104KB implementation) |
 | Seat/Context | ✅ Implemented (4-tuple SeatId model) |
 | LLM integration | ✅ Implemented (Anthropic provider, streaming) |
+| FlowBus | ✅ Pub/sub for CRDT block events |
 | complete() | 📋 Stub (returns empty completions) |
 | archive() | 📋 Planned (not yet in schema) |
 
 ## Architecture
 
-**kaijutsu-kernel owns everything. kaish is an optional subprocess for shell execution.**
+**kaijutsu-kernel owns everything. kaish executes shell commands (embedded or subprocess).**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -38,19 +41,27 @@
 │  ├── VFS: mount, unmount, listMounts, vfs()                     │
 │  ├── State: checkpoints, history, variables                     │
 │  ├── Tools: block_*, kernel_search, executeTool                 │
+│  ├── MCP: registerMcp, unregisterMcp, listMcpServers, callMcp   │
 │  ├── LLM: prompt() with streaming                               │
 │  ├── Seats: joinContext, leaveSeat, listContexts                │
 │  ├── Lifecycle: fork, thread (stubs), detach                    │
 │  │                                                              │
-│  │  execute() ───────────────────────────────────────┐          │
+│  │  execute() / shellExecute() ──────────────────────┐          │
 │  │                                                   │          │
 │  └───────────────────────────────────────────────────┼──────────┤
 │                                                      ▼          │
-│  kaish subprocess (spawned lazily on first execute())           │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  ~95% POSIX shell + agentic builtins                       │ │
-│  │  Unix socket + Cap'n Proto IPC                             │ │
-│  └────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │ EmbeddedKaish (in-process, default)                         ││
+│  │   └── KaijutsuBackend                                       ││
+│  │         ├── File I/O → CRDT BlockStore                      ││
+│  │         └── Tool calls → ToolRegistry (block_*, MCP)        ││
+│  ├─────────────────────────────────────────────────────────────┤│
+│  │ OR: KaishProcess (subprocess, for isolation)                ││
+│  │   └── Unix socket + Cap'n Proto IPC                         ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                                                                 │
+│  McpServerPool ──────────────► MCP servers (git, exa, etc.)     │
+│    └── McpToolEngine (ExecutionEngine per MCP tool)             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -61,33 +72,40 @@
 | VFS (MountTable) | **kaijutsu-kernel** | LocalBackend, MemoryBackend |
 | State (history, checkpoints) | **kaijutsu-kernel** | KernelState |
 | Tools (block tools, etc.) | **kaijutsu-kernel** | ToolRegistry |
+| MCP connections | **kaijutsu-kernel** | McpServerPool (shared across kernels) |
 | LLM integration | **kaijutsu-kernel** | LlmRegistry |
-| Shell execution | **kaish** | ~95% POSIX shell + agentic builtins |
+| Shell execution | **kaijutsu-server** | EmbeddedKaish or KaishProcess |
+| Block I/O for kaish | **kaijutsu-server** | KaijutsuBackend (maps files to CRDT blocks) |
 
 ### Execution Flow
 
 When a user or AI runs shell code:
 
-1. **Execute** — kaijutsu spawns kaish subprocess (if not already running)
-2. **Record** — Output recorded in message DAG
-3. **Checkpoint** — If autonomous mode, may trigger checkpoint
+1. **Execute** — EmbeddedKaish runs code in-process (or KaishProcess for isolation)
+2. **File I/O** — KaijutsuBackend routes to CRDT blocks (collaborative editing)
+3. **Tool calls** — Route through ToolRegistry (block tools, MCP tools)
+4. **Record** — Output recorded in message DAG
+5. **Checkpoint** — If autonomous mode, may trigger checkpoint
 
 ```rust
 // In kaijutsu-server kernel handler
-async fn execute(&self, code: String) -> Result<ExecId> {
-    // 1. Execute via embedded kaish
-    let exec_id = self.next_exec_id();
-    let result = self.kaish.execute(&code).await;
+async fn shell_execute(&self, code: String) -> Result<ExecResult> {
+    // 1. Execute via embedded kaish (backed by KaijutsuBackend)
+    let result = self.embedded_kaish.execute(&code).await?;
 
-    // 2. Record in DAG
-    self.dag.append(Row::tool_result(exec_id, &result));
+    // 2. Create shell output block in conversation
+    let block_id = self.blocks.create_block(
+        &conv_id,
+        BlockKind::ShellOutput,
+        Some(&result.stdout),
+    )?;
 
     // 3. Maybe checkpoint
     if self.consent_mode == Autonomous && self.should_checkpoint() {
         self.checkpoint_auto().await?;
     }
 
-    Ok(exec_id)
+    Ok(result)
 }
 ```
 
@@ -537,6 +555,12 @@ Think of a kernel like a development environment that:
 ---
 
 ## Changelog
+
+**2026-01-24**
+- Added MCP integration (McpServerPool, McpToolEngine, RPC methods)
+- Added EmbeddedKaish and KaijutsuBackend for in-process kaish with CRDT block I/O
+- Added FlowBus for pub/sub of block events
+- Updated architecture diagram to show both execution modes and MCP
 
 **2026-01-23**
 - Updated Implementation Status to reflect actual state (checkpoint, block tools, seats all implemented)
