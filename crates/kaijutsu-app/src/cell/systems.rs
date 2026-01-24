@@ -135,6 +135,7 @@ pub fn handle_cell_input(
     mode: Res<CurrentMode>,
     consumed: Res<ConsumedModeKeys>,
     mut editors: Query<&mut CellEditor>,
+    prompt_cells: Query<Entity, With<PromptCell>>,
 ) {
     let Some(focused_entity) = focused.0 else {
         return;
@@ -143,6 +144,9 @@ pub fn handle_cell_input(
     let Ok(mut editor) = editors.get_mut(focused_entity) else {
         return;
     };
+
+    // Check if focused cell is the prompt cell (for Enter handling)
+    let is_prompt = prompt_cells.contains(focused_entity);
 
     // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
     // This prevents the mode-switch key from being inserted as text
@@ -198,6 +202,11 @@ pub fn handle_cell_input(
                 continue;
             }
             KeyCode::Enter => {
+                // For PromptCell, let handle_prompt_submit deal with Enter
+                // (Enter submits, Shift+Enter adds newline)
+                if is_prompt {
+                    continue;
+                }
                 editor.insert("\n");
                 continue;
             }
@@ -819,12 +828,11 @@ pub fn spawn_prompt_cell(
 pub fn handle_prompt_submit(
     mut key_events: MessageReader<KeyboardInput>,
     focused: Res<FocusedCell>,
-    mut mode: ResMut<CurrentMode>,
+    mode: Res<CurrentMode>,
     keys: Res<ButtonInput<KeyCode>>,
     mut editors: Query<&mut CellEditor>,
     prompt_cells: Query<Entity, With<PromptCell>>,
     mut submit_events: MessageWriter<PromptSubmitted>,
-    mut presence: ResMut<InputPresence>,
 ) {
     // Only handle in Chat or Shell mode (input modes)
     if !matches!(mode.0, EditorMode::Chat | EditorMode::Shell) {
@@ -871,25 +879,29 @@ pub fn handle_prompt_submit(
             // Clear the editor (CRDT-tracked)
             editor.clear();
 
-            // After submit: return to Normal mode and minimize input
-            mode.0 = EditorMode::Normal;
-            presence.0 = InputPresenceKind::Minimized;
-            info!("Prompt submitted, Mode: NORMAL, Presence: MINIMIZED");
+            // Stay in current mode after submit (REPL-style)
+            // User can press Escape to return to Normal mode
+            info!("Prompt submitted, staying in {:?} mode", mode.0);
         }
     }
 }
 
-/// Send submitted prompts to the server-side LLM.
+/// Send submitted prompts to the server.
+///
+/// Routes to either:
+/// - LLM prompt (Chat mode): Adds user message + streams LLM response
+/// - Shell execute (Shell mode): Executes kaish command + streams output
 ///
 /// The server handles:
-/// 1. Adding the user message block to the conversation
-/// 2. Streaming the LLM response as blocks
+/// 1. Adding the appropriate block(s) to the conversation
+/// 2. Streaming the response as blocks
 /// 3. Broadcasting block changes to all connected clients
 ///
-/// Note: We don't add the user message locally - the server adds it and broadcasts
+/// Note: We don't add messages locally - the server adds them and broadcasts
 /// back to us. This avoids duplicate messages.
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
+    mode: Res<CurrentMode>,
     current_conv: Res<CurrentConversation>,
     mut scroll_state: ResMut<ConversationScrollState>,
     cmds: Option<Res<crate::connection::ConnectionCommands>>,
@@ -901,15 +913,30 @@ pub fn handle_prompt_submitted(
     };
 
     for event in submit_events.read() {
-        // Send prompt to server for LLM processing
-        // Server will add the user block and broadcast it back to us
         if let Some(ref cmds) = cmds {
-            cmds.send(crate::connection::ConnectionCommand::Prompt {
-                content: event.text.clone(),
-                model: None, // Use server default
-                cell_id: conv_id.to_string(),
-            });
-            info!("Sent prompt to server for conversation {}", conv_id);
+            match mode.0 {
+                EditorMode::Shell => {
+                    // Shell mode: execute as kaish command
+                    cmds.send(crate::connection::ConnectionCommand::ShellExecute {
+                        command: event.text.clone(),
+                        cell_id: conv_id.to_string(),
+                    });
+                    info!("Sent shell command to server for conversation {}", conv_id);
+                }
+                EditorMode::Chat => {
+                    // Chat mode: send to LLM
+                    cmds.send(crate::connection::ConnectionCommand::Prompt {
+                        content: event.text.clone(),
+                        model: None, // Use server default
+                        cell_id: conv_id.to_string(),
+                    });
+                    info!("Sent prompt to server for conversation {}", conv_id);
+                }
+                _ => {
+                    // Other modes shouldn't submit prompts, but handle gracefully
+                    warn!("Unexpected prompt submission in {:?} mode", mode.0);
+                }
+            }
             // Enable follow mode to smoothly track streaming response
             scroll_state.start_following();
         } else {

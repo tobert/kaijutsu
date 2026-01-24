@@ -76,11 +76,14 @@ impl Plugin for AppScreenPlugin {
 /// Show the dashboard view when entering Dashboard state
 fn show_dashboard(
     mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
+    mut presence: ResMut<InputPresence>,
 ) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
+    // Hide input area when on dashboard
+    presence.0 = InputPresenceKind::Hidden;
 }
 
 /// Hide the dashboard view when leaving Dashboard state
@@ -94,11 +97,16 @@ fn hide_dashboard(
 }
 
 /// Show the conversation view when entering Conversation state
-fn show_conversation(mut query: Query<(&mut Node, &mut Visibility), With<ConversationRoot>>) {
+fn show_conversation(
+    mut query: Query<(&mut Node, &mut Visibility), With<ConversationRoot>>,
+    mut presence: ResMut<InputPresence>,
+) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
+    // Restore input area when entering conversation
+    presence.0 = InputPresenceKind::Docked;
 }
 
 /// Hide the conversation view when leaving Conversation state
