@@ -26,6 +26,7 @@ mod connection;
 mod constants;
 mod conversation;
 mod dashboard;
+mod kaish;
 mod shaders;
 mod text;
 mod ui;

@@ -1,0 +1,255 @@
+//! Kaish syntax validation for the Kaijutsu app.
+//!
+//! This module provides in-process parsing of kaish commands for:
+//! - Syntax validation (highlight errors as user types)
+//! - Token classification (for syntax highlighting)
+//! - Completion hints (identify context for suggestions)
+//!
+//! Uses kaish-kernel's lexer and parser directly without spawning a subprocess.
+
+use kaish_kernel::lexer::Token;
+use kaish_kernel::parser;
+
+/// Result of validating a kaish command.
+#[derive(Debug, Clone)]
+pub struct ValidationResult {
+    /// Whether the input is syntactically valid.
+    pub valid: bool,
+    /// Error messages if invalid.
+    pub errors: Vec<SyntaxError>,
+    /// Whether input is incomplete (could be valid with more input).
+    pub incomplete: bool,
+}
+
+/// A syntax error with location information.
+#[derive(Debug, Clone)]
+pub struct SyntaxError {
+    /// Byte offset of the start of the error.
+    pub start: usize,
+    /// Byte offset of the end of the error.
+    pub end: usize,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Token with span information for syntax highlighting.
+#[derive(Debug, Clone)]
+pub struct SpannedToken {
+    /// The token kind.
+    pub kind: TokenKind,
+    /// Byte offset of the start.
+    pub start: usize,
+    /// Byte offset of the end.
+    pub end: usize,
+}
+
+/// Simplified token kinds for syntax highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// Command or identifier.
+    Command,
+    /// String literal.
+    String,
+    /// Number literal.
+    Number,
+    /// Operator (|, &&, ||, etc.).
+    Operator,
+    /// Variable reference ($foo).
+    Variable,
+    /// Keyword (if, for, fn, etc.).
+    Keyword,
+    /// Flag (--flag, -f).
+    Flag,
+    /// Comment.
+    Comment,
+    /// Punctuation (, ; { } etc.).
+    Punctuation,
+    /// Path (/foo/bar).
+    Path,
+    /// Error token.
+    Error,
+}
+
+/// Validate a kaish command string.
+///
+/// Returns a result indicating whether the input is valid, any errors,
+/// and whether the input is incomplete (waiting for more input).
+pub fn validate(input: &str) -> ValidationResult {
+    if input.trim().is_empty() {
+        return ValidationResult {
+            valid: true,
+            errors: Vec::new(),
+            incomplete: false,
+        };
+    }
+
+    match parser::parse(input) {
+        Ok(_ast) => ValidationResult {
+            valid: true,
+            errors: Vec::new(),
+            incomplete: false,
+        },
+        Err(errs) => {
+            let mut errors = Vec::new();
+            let mut incomplete = false;
+
+            for err in errs {
+                // Check if this is an "unexpected end of input" error
+                let msg = err.message.clone();
+                if msg.contains("end of input") || msg.contains("unexpected end") {
+                    incomplete = true;
+                }
+
+                errors.push(SyntaxError {
+                    start: err.span.start,
+                    end: err.span.end,
+                    message: msg,
+                });
+            }
+
+            ValidationResult {
+                valid: false,
+                errors,
+                incomplete,
+            }
+        }
+    }
+}
+
+/// Tokenize input for syntax highlighting.
+///
+/// Returns a list of tokens with their spans and kinds.
+pub fn tokenize(input: &str) -> Vec<SpannedToken> {
+    use logos::Logos;
+
+    let mut tokens = Vec::new();
+    let lexer = Token::lexer(input);
+
+    for (result, span) in lexer.spanned() {
+        let kind = match result {
+            Ok(token) => classify_token(&token),
+            Err(_) => TokenKind::Error,
+        };
+
+        tokens.push(SpannedToken {
+            kind,
+            start: span.start,
+            end: span.end,
+        });
+    }
+
+    tokens
+}
+
+/// Classify a token for syntax highlighting.
+fn classify_token(token: &Token) -> TokenKind {
+    match token {
+        // Keywords
+        Token::If | Token::Then | Token::Else | Token::Elif | Token::Fi
+        | Token::For | Token::In | Token::Do | Token::Done
+        | Token::While | Token::Case | Token::Esac
+        | Token::Function | Token::Return | Token::Break | Token::Continue | Token::Exit
+        | Token::Set | Token::Local | Token::Tool
+        | Token::True | Token::False => TokenKind::Keyword,
+
+        // Type keywords
+        Token::TypeString | Token::TypeInt | Token::TypeFloat | Token::TypeBool => TokenKind::Keyword,
+
+        // Strings
+        Token::String(_) | Token::SingleString(_) | Token::HereDoc(_) => TokenKind::String,
+
+        // Numbers
+        Token::Int(_) | Token::Float(_) => TokenKind::Number,
+
+        // Variables
+        Token::VarRef(_) | Token::SimpleVarRef(_) | Token::Positional(_)
+        | Token::AllArgs | Token::ArgCount | Token::VarLength(_) => TokenKind::Variable,
+
+        // Flags
+        Token::LongFlag(_) | Token::ShortFlag(_) | Token::PlusFlag(_) | Token::DoubleDash => TokenKind::Flag,
+
+        // Operators
+        Token::Pipe | Token::And | Token::Or | Token::Amp
+        | Token::Eq | Token::EqEq | Token::NotEq | Token::Match | Token::NotMatch
+        | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq
+        | Token::GtGt | Token::Stderr | Token::Both | Token::HereDocStart => TokenKind::Operator,
+
+        // Punctuation
+        Token::Semi | Token::DoubleSemi | Token::Colon | Token::Comma | Token::Dot
+        | Token::LParen | Token::RParen
+        | Token::LBrace | Token::RBrace
+        | Token::LBracket | Token::RBracket
+        | Token::Bang | Token::Question | Token::Star => TokenKind::Punctuation,
+
+        // Comments and newlines
+        Token::Comment => TokenKind::Comment,
+        Token::Newline | Token::LineContinuation => TokenKind::Punctuation,
+
+        // Paths
+        Token::Path(_) => TokenKind::Path,
+
+        // Command substitution
+        Token::CmdSubstStart => TokenKind::Operator,
+        Token::Arithmetic(_) => TokenKind::Number,
+
+        // Commands/identifiers
+        Token::Ident(_) => TokenKind::Command,
+
+        // Invalid tokens
+        Token::InvalidNumberIdent | Token::InvalidFloatNoLeading | Token::InvalidFloatNoTrailing => TokenKind::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_simple_command() {
+        let result = validate("echo hello");
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_pipe() {
+        let result = validate("ls | grep foo");
+        assert!(result.valid);
+    }
+
+    #[test]
+    fn test_validate_empty() {
+        let result = validate("");
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_simple() {
+        let tokens = tokenize("echo hello");
+        assert!(!tokens.is_empty());
+        // First token should be a command
+        assert_eq!(tokens[0].kind, TokenKind::Command);
+    }
+
+    #[test]
+    fn test_tokenize_variable() {
+        let tokens = tokenize("echo $HOME");
+        let var_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Variable).collect();
+        assert!(!var_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_pipe() {
+        let tokens = tokenize("ls | grep foo");
+        let pipe_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Operator).collect();
+        assert!(!pipe_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_flags() {
+        let tokens = tokenize("ls -la --color");
+        let flag_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Flag).collect();
+        assert_eq!(flag_tokens.len(), 2);
+    }
+}
