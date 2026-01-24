@@ -380,8 +380,10 @@ pub enum EditorMode {
     /// Navigation mode (h/j/k/l, commands)
     #[default]
     Normal,
-    /// Text input mode
-    Insert,
+    /// Text input mode (prompts go to LLM)
+    Chat,
+    /// Shell mode (prompts go to kaish REPL)
+    Shell,
     /// Command-line mode (: prefix)
     Command,
     /// Visual selection mode
@@ -392,10 +394,16 @@ impl EditorMode {
     pub fn name(&self) -> &'static str {
         match self {
             EditorMode::Normal => "NORMAL",
-            EditorMode::Insert => "INSERT",
+            EditorMode::Chat => "CHAT",
+            EditorMode::Shell => "SHELL",
             EditorMode::Command => "COMMAND",
             EditorMode::Visual => "VISUAL",
         }
+    }
+
+    /// Check if this mode accepts text input.
+    pub fn accepts_input(&self) -> bool {
+        matches!(self, EditorMode::Chat | EditorMode::Shell | EditorMode::Command)
     }
 }
 

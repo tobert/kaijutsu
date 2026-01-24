@@ -27,7 +27,8 @@ pub fn update_mode_indicator(
     // Color based on mode (from theme)
     let color = match mode.0 {
         EditorMode::Normal => theme.mode_normal,
-        EditorMode::Insert => theme.mode_insert,
+        EditorMode::Chat => theme.mode_chat,
+        EditorMode::Shell => theme.mode_shell,
         EditorMode::Command => theme.mode_command,
         EditorMode::Visual => theme.mode_visual,
     };
