@@ -26,6 +26,8 @@ use kaijutsu_kernel::{
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
+    // MCP
+    McpServerPool, McpServerConfig, McpToolEngine,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -187,6 +189,8 @@ pub struct ServerState {
     pub my_seats: HashMap<String, SeatInfo>,  // key is SeatId::key()
     /// Currently active seat for this connection (if any)
     pub current_seat: Option<SeatId>,
+    /// Shared MCP server pool
+    pub mcp_pool: Arc<McpServerPool>,
 }
 
 impl ServerState {
@@ -211,6 +215,7 @@ impl ServerState {
             llm_provider,
             my_seats: HashMap::new(),
             current_seat: None,
+            mcp_pool: Arc::new(McpServerPool::new()),
         }
     }
 
@@ -1405,6 +1410,224 @@ impl kernel::Server for KernelImpl {
         }
 
         Promise::ok(())
+    }
+
+    // ========================================================================
+    // MCP (Model Context Protocol) methods
+    // ========================================================================
+
+    fn register_mcp(
+        self: Rc<Self>,
+        params: kernel::RegisterMcpParams,
+        mut results: kernel::RegisterMcpResults,
+    ) -> Promise<(), capnp::Error> {
+        let config_reader = pry!(pry!(params.get()).get_config());
+        let name = pry!(pry!(config_reader.get_name()).to_str()).to_owned();
+        let command = pry!(pry!(config_reader.get_command()).to_str()).to_owned();
+
+        // Get arguments
+        let args: Vec<String> = if config_reader.has_args() {
+            pry!(config_reader.get_args())
+                .iter()
+                .filter_map(|a| a.ok().and_then(|s| s.to_str().ok()).map(|s| s.to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Get environment variables
+        let mut env = std::collections::HashMap::new();
+        if config_reader.has_env() {
+            for env_var in pry!(config_reader.get_env()).iter() {
+                if let (Ok(key_reader), Ok(value_reader)) = (env_var.get_key(), env_var.get_value()) {
+                    if let (Ok(key), Ok(value)) = (key_reader.to_str(), value_reader.to_str()) {
+                        env.insert(key.to_owned(), value.to_owned());
+                    }
+                }
+            }
+        }
+
+        // Get working directory
+        let cwd = if config_reader.has_cwd() {
+            let cwd_reader = pry!(config_reader.get_cwd());
+            if let Ok(cwd_str) = cwd_reader.to_str() {
+                if cwd_str.is_empty() { None } else { Some(cwd_str.to_owned()) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let config = McpServerConfig {
+            name: name.clone(),
+            command,
+            args,
+            env,
+            cwd,
+        };
+
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+        let kernel_arc = self.state.borrow().kernels.get(&self.kernel_id)
+            .map(|k| k.kernel.clone());
+
+        Promise::from_future(async move {
+            let info = mcp_pool.register(config).await
+                .map_err(|e| capnp::Error::failed(format!("Failed to register MCP server: {}", e)))?;
+
+            // Register MCP tools with the kernel if we have one
+            if let Some(kernel) = kernel_arc {
+                let tools = McpToolEngine::from_server_tools(mcp_pool.clone(), &name, &info.tools);
+                for (qualified_name, engine) in tools {
+                    let desc = engine.description().to_string();
+                    kernel.register_tool_with_engine(
+                        ToolInfo::new(&qualified_name, &desc, "mcp"),
+                        engine,
+                    ).await;
+                    kernel.equip(&qualified_name).await;
+                }
+            }
+
+            // Build the result
+            let mut info_builder = results.get().init_info();
+            info_builder.set_name(&info.name);
+            info_builder.set_protocol_version(&info.protocol_version);
+            info_builder.set_server_name(&info.server_name);
+            info_builder.set_server_version(&info.server_version);
+
+            let mut tools_builder = info_builder.init_tools(info.tools.len() as u32);
+            for (i, tool) in info.tools.iter().enumerate() {
+                let mut tool_builder = tools_builder.reborrow().get(i as u32);
+                tool_builder.set_name(&tool.name);
+                tool_builder.set_description(&tool.description.clone().unwrap_or_default());
+                tool_builder.set_input_schema(&tool.input_schema.to_string());
+            }
+
+            Ok(())
+        })
+    }
+
+    fn unregister_mcp(
+        self: Rc<Self>,
+        params: kernel::UnregisterMcpParams,
+        _results: kernel::UnregisterMcpResults,
+    ) -> Promise<(), capnp::Error> {
+        let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+        let kernel_arc = self.state.borrow().kernels.get(&self.kernel_id)
+            .map(|k| k.kernel.clone());
+
+        Promise::from_future(async move {
+            // Get tools before unregistering so we can unequip them
+            if let Some(kernel) = kernel_arc {
+                if let Ok(info) = mcp_pool.get_server_info(&name).await {
+                    for tool in &info.tools {
+                        let qualified_name = format!("{}:{}", name, tool.name);
+                        kernel.unequip(&qualified_name).await;
+                    }
+                }
+            }
+
+            mcp_pool.unregister(&name).await
+                .map_err(|e| capnp::Error::failed(format!("Failed to unregister MCP server: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn list_mcp_servers(
+        self: Rc<Self>,
+        _params: kernel::ListMcpServersParams,
+        mut results: kernel::ListMcpServersResults,
+    ) -> Promise<(), capnp::Error> {
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+
+        Promise::from_future(async move {
+            let server_names = mcp_pool.list_servers();
+            let mut servers_info = Vec::new();
+
+            for name in server_names {
+                if let Ok(info) = mcp_pool.get_server_info(&name).await {
+                    servers_info.push(info);
+                }
+            }
+
+            // Build the result
+            let mut servers_builder = results.get().init_servers(servers_info.len() as u32);
+            for (i, info) in servers_info.iter().enumerate() {
+                let mut server_builder = servers_builder.reborrow().get(i as u32);
+                server_builder.set_name(&info.name);
+                server_builder.set_protocol_version(&info.protocol_version);
+                server_builder.set_server_name(&info.server_name);
+                server_builder.set_server_version(&info.server_version);
+
+                let mut tools_builder = server_builder.init_tools(info.tools.len() as u32);
+                for (j, tool) in info.tools.iter().enumerate() {
+                    let mut tool_builder = tools_builder.reborrow().get(j as u32);
+                    tool_builder.set_name(&tool.name);
+                    tool_builder.set_description(&tool.description.clone().unwrap_or_default());
+                    tool_builder.set_input_schema(&tool.input_schema.to_string());
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn call_mcp_tool(
+        self: Rc<Self>,
+        params: kernel::CallMcpToolParams,
+        mut results: kernel::CallMcpToolResults,
+    ) -> Promise<(), capnp::Error> {
+        let call_reader = pry!(pry!(params.get()).get_call());
+        let server = pry!(pry!(call_reader.get_server()).to_str()).to_owned();
+        let tool = pry!(pry!(call_reader.get_tool()).to_str()).to_owned();
+        let arguments_str = pry!(pry!(call_reader.get_arguments()).to_str()).to_owned();
+
+        // Parse JSON arguments
+        let arguments: serde_json::Value = if arguments_str.is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(&arguments_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut result_builder = results.get().init_result();
+                    result_builder.set_success(false);
+                    result_builder.set_is_error(true);
+                    result_builder.set_content(&format!("Invalid JSON arguments: {}", e));
+                    return Promise::ok(());
+                }
+            }
+        };
+
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+
+        Promise::from_future(async move {
+            let mcp_result = mcp_pool.call_tool(&server, &tool, arguments).await;
+
+            let mut result_builder = results.get().init_result();
+            match mcp_result {
+                Ok(r) => {
+                    let is_error = r.is_error.unwrap_or(false);
+                    result_builder.set_success(!is_error);
+                    result_builder.set_is_error(is_error);
+
+                    // Collect text content from the result
+                    let content: String = r.content
+                        .iter()
+                        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    result_builder.set_content(&content);
+                }
+                Err(e) => {
+                    result_builder.set_success(false);
+                    result_builder.set_is_error(true);
+                    result_builder.set_content(&e.to_string());
+                }
+            }
+
+            Ok(())
+        })
     }
 }
 

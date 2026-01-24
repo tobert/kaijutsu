@@ -256,6 +256,12 @@ interface Kernel {
   listContexts @22 () -> (contexts :List(Context));
   joinContext @23 (contextName :Text, instance :Text) -> (seat :SeatInfo);
   leaveSeat @24 ();
+
+  # MCP (Model Context Protocol) management
+  registerMcp @25 (config :McpServerConfig) -> (info :McpServerInfo);
+  unregisterMcp @26 (name :Text);
+  listMcpServers @27 () -> (servers :List(McpServerInfo));
+  callMcpTool @28 (call :McpToolCall) -> (result :McpToolResult);
 }
 
 # ============================================================================
@@ -377,6 +383,53 @@ interface BlockEvents {
   onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);
   onBlockMoved @4 (cellId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
   onBlockStatusChanged @5 (cellId :Text, blockId :BlockId, status :Status);
+}
+
+# ============================================================================
+# VFS Interface
+# ============================================================================
+
+# ============================================================================
+# MCP (Model Context Protocol) Types
+# ============================================================================
+
+struct McpServerConfig {
+  name @0 :Text;              # Unique name for this server (e.g., "git", "exa")
+  command @1 :Text;           # Command to run (e.g., "uvx", "npx")
+  args @2 :List(Text);        # Arguments for the command
+  env @3 :List(EnvVar);       # Environment variables
+  cwd @4 :Text;               # Working directory (optional)
+}
+
+struct EnvVar {
+  key @0 :Text;
+  value @1 :Text;
+}
+
+struct McpServerInfo {
+  name @0 :Text;              # Server name
+  protocolVersion @1 :Text;   # MCP protocol version
+  serverName @2 :Text;        # Server's reported name
+  serverVersion @3 :Text;     # Server's reported version
+  tools @4 :List(McpToolInfo);
+}
+
+struct McpToolInfo {
+  name @0 :Text;              # Tool name (e.g., "git_status")
+  description @1 :Text;       # Tool description
+  inputSchema @2 :Text;       # JSON Schema for parameters
+}
+
+struct McpToolCall {
+  server @0 :Text;            # Server name (e.g., "git")
+  tool @1 :Text;              # Tool name (e.g., "git_status")
+  arguments @2 :Text;         # JSON-encoded arguments
+}
+
+struct McpToolResult {
+  success @0 :Bool;
+  content @1 :Text;           # Result content (text)
+  isError @2 :Bool;           # True if the tool returned an error
 }
 
 # ============================================================================
