@@ -4,7 +4,9 @@
 
 An agentic coding system for teams with two parts: a Bevy 0.18 client, and a Cap'n Proto over SSH server.
 
-**The way of Kaijutsu:** Engineer context for each prompt and anchor models so they can be brilliant.
+**The way of Kaijutsu:** Everyone editing shared state via CRDT tools. Rhai and kaish use the crdts. Claude does. Gemini
+does. Users do via the builtin editor. We share operations via the kernel and reap the collaborative benefits of leaning
+into the distributed algorithm to equalize access and handle different networks.
 
 ## Quick Start
 
@@ -186,6 +188,18 @@ User starts the runner in the graphical session:
 
 - `/tmp/kj.status` — current state (quick check)
 - `/tmp/kaijutsu-runner.typescript` — full output via `script(1)`, captures crashes
+
+## Direct BRP Workflow (Graphical Session)
+
+When Claude runs in a graphical session, use `mcp__bevy_brp__*` tools directly instead of the runner script. The MCP tools are self-documenting.
+
+### When to Use Which Workflow
+
+| Scenario | Workflow |
+|----------|----------|
+| Claude in graphical session | Direct BRP (`mcp__bevy_brp__*`) |
+| Claude SSH'd to headless terminal | `contrib/kj` + runner script |
+| Slow/unstable network | `contrib/kj` (cargo watch handles rebuilds) |
 
 ## Git Conventions
 
