@@ -68,6 +68,13 @@ pub enum ConnectionCommand {
         model: Option<String>,
         cell_id: String,
     },
+
+    // Shell operations (kaish REPL)
+    /// Execute a shell command via kaish
+    ShellExecute {
+        command: String,
+        cell_id: String,
+    },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -600,6 +607,37 @@ async fn connection_loop(
                 }
             }
 
+            // Shell execution (kaish REPL)
+            ConnectionCommand::ShellExecute { command, cell_id } => {
+                if let Some(kernel) = &current_kernel {
+                    match timeout(PROMPT_TIMEOUT, kernel.execute(&command)).await {
+                        Ok(Ok(exec_id)) => {
+                            log::info!("Shell execution started: exec_id={}, cell_id={}", exec_id, cell_id);
+                            // Execution output will come through block events
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during shell execute: {}", err_str);
+                                rpc_client = None;
+                                current_kernel = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::Error(err_str));
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Shell execute RPC timed out after {:?}", PROMPT_TIMEOUT);
+                            rpc_client = None;
+                            current_kernel = None;
+                            let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::Error("Not attached to a kernel".into()));
+                }
+            }
+
             // Seat/context commands
             ConnectionCommand::ListContexts => {
                 if let Some(kernel) = &current_kernel {
@@ -1027,6 +1065,8 @@ fn parse_block_snapshot(
         kaijutsu_client::kaijutsu_capnp::BlockKind::Thinking => kaijutsu_crdt::BlockKind::Thinking,
         kaijutsu_client::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
         kaijutsu_client::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::ShellCommand => kaijutsu_crdt::BlockKind::ShellCommand,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::ShellOutput => kaijutsu_crdt::BlockKind::ShellOutput,
     };
 
     let tool_call_id = if reader.get_has_tool_call_id() {

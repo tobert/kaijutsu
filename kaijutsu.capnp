@@ -297,6 +297,8 @@ enum BlockKind {
   thinking @1;
   toolCall @2;
   toolResult @3;
+  shellCommand @4;
+  shellOutput @5;
 }
 
 # Flat block snapshot - all fields present, some unused depending on kind

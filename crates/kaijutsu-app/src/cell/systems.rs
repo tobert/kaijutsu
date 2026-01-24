@@ -65,21 +65,28 @@ pub fn handle_mode_switch(
 
         match mode.0 {
             EditorMode::Normal => {
-                // In normal mode, i enters insert (docked), Space enters insert (overlay),
-                // : enters command, v enters visual
+                // In normal mode, i enters chat (docked), Space enters chat (overlay),
+                // ` (backtick) enters shell mode, : enters command, v enters visual
                 match event.key_code {
                     KeyCode::KeyI => {
-                        mode.0 = EditorMode::Insert;
+                        mode.0 = EditorMode::Chat;
                         presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::KeyI);
-                        info!("Mode: INSERT, Presence: DOCKED");
+                        info!("Mode: CHAT, Presence: DOCKED");
                     }
                     KeyCode::Space => {
                         // Space summons the overlay input
-                        mode.0 = EditorMode::Insert;
+                        mode.0 = EditorMode::Chat;
                         presence.0 = InputPresenceKind::Overlay;
                         consumed.0.insert(KeyCode::Space);
-                        info!("Mode: INSERT, Presence: OVERLAY");
+                        info!("Mode: CHAT, Presence: OVERLAY");
+                    }
+                    KeyCode::Backquote => {
+                        // Backtick enters shell mode (kaish REPL)
+                        mode.0 = EditorMode::Shell;
+                        presence.0 = InputPresenceKind::Docked;
+                        consumed.0.insert(KeyCode::Backquote);
+                        info!("Mode: SHELL, Presence: DOCKED");
                     }
                     KeyCode::Semicolon if event.text.as_deref() == Some(":") => {
                         mode.0 = EditorMode::Command;
@@ -94,7 +101,7 @@ pub fn handle_mode_switch(
                     _ => {}
                 }
             }
-            EditorMode::Insert | EditorMode::Command | EditorMode::Visual => {
+            EditorMode::Chat | EditorMode::Shell | EditorMode::Command | EditorMode::Visual => {
                 // Escape returns to normal mode
                 if event.key_code == KeyCode::Escape {
                     mode.0 = EditorMode::Normal;
@@ -143,8 +150,8 @@ pub fn handle_cell_input(
         return;
     }
 
-    // Only handle text input in Insert mode
-    if mode.0 != EditorMode::Insert {
+    // Only handle text input in Chat/Shell mode
+    if !mode.0.accepts_input() {
         // In Normal mode, handle navigation with h/j/k/l
         if mode.0 == EditorMode::Normal {
             for event in key_events.read() {
@@ -311,6 +318,13 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                 } else {
                     output.push_str("📤 Result:\n");
                 }
+                output.push_str(&block.content);
+            }
+            BlockKind::ShellCommand => {
+                output.push_str("$ ");
+                output.push_str(&block.content);
+            }
+            BlockKind::ShellOutput => {
                 output.push_str(&block.content);
             }
         }
@@ -681,17 +695,17 @@ pub fn update_cursor(
     // Update cursor mode and wandering orb params
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {
         let cursor_mode = match mode.0 {
-            EditorMode::Insert => CursorMode::Beam,
+            EditorMode::Chat | EditorMode::Shell => CursorMode::Beam,
             EditorMode::Normal => CursorMode::Block,
             EditorMode::Visual => CursorMode::Block,
             EditorMode::Command => CursorMode::Underline,
         };
         material.time.y = cursor_mode as u8 as f32;
 
-        // Cursor colors from theme
+        // Cursor colors from theme (Chat and Shell share cursor_insert for now)
         let color = match mode.0 {
             EditorMode::Normal => theme.cursor_normal,
-            EditorMode::Insert => theme.cursor_insert,
+            EditorMode::Chat | EditorMode::Shell => theme.cursor_insert,
             EditorMode::Command => theme.cursor_command,
             EditorMode::Visual => theme.cursor_visual,
         };
@@ -699,7 +713,7 @@ pub fn update_cursor(
 
         // params: x=orb_size, y=intensity, z=wander_speed, w=blink_rate
         material.params = match mode.0 {
-            EditorMode::Insert => Vec4::new(0.25, 1.2, 2.0, 0.0),  // Larger orb, faster wander, no blink
+            EditorMode::Chat | EditorMode::Shell => Vec4::new(0.25, 1.2, 2.0, 0.0),  // Larger orb, faster wander, no blink
             EditorMode::Normal => Vec4::new(0.2, 1.0, 1.5, 0.6),   // Medium orb, gentle blink
             EditorMode::Visual => Vec4::new(0.22, 1.1, 1.8, 0.0),  // Slightly larger, no blink
             EditorMode::Command => Vec4::new(0.18, 0.9, 2.5, 0.8), // Smaller, fast wander
@@ -812,8 +826,8 @@ pub fn handle_prompt_submit(
     mut submit_events: MessageWriter<PromptSubmitted>,
     mut presence: ResMut<InputPresence>,
 ) {
-    // Only handle in Insert mode
-    if mode.0 != EditorMode::Insert {
+    // Only handle in Chat or Shell mode (input modes)
+    if !matches!(mode.0, EditorMode::Chat | EditorMode::Shell) {
         return;
     }
 
@@ -904,15 +918,15 @@ pub fn handle_prompt_submitted(
     }
 }
 
-/// Auto-focus the prompt cell when entering INSERT mode.
-/// In conversation UI, INSERT mode always means typing in the prompt.
+/// Auto-focus the prompt cell when entering Chat or Shell mode.
+/// In conversation UI, input modes always mean typing in the prompt.
 pub fn auto_focus_prompt(
     mode: Res<CurrentMode>,
     mut focused: ResMut<FocusedCell>,
     prompt_entity: Res<PromptCellEntity>,
 ) {
-    // Only when entering INSERT mode
-    if !mode.is_changed() || mode.0 != EditorMode::Insert {
+    // Only when entering Chat or Shell mode
+    if !mode.is_changed() || !matches!(mode.0, EditorMode::Chat | EditorMode::Shell) {
         return;
     }
 
@@ -1362,6 +1376,12 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             } else {
                 format!("📤 Result:\n{}", block.content)
             }
+        }
+        BlockKind::ShellCommand => {
+            format!("$ {}", block.content)
+        }
+        BlockKind::ShellOutput => {
+            block.content.clone()
         }
     }
 }

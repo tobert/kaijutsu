@@ -466,6 +466,8 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
         crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
         crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+        crate::kaijutsu_capnp::BlockKind::ShellCommand => BlockKind::ShellCommand,
+        crate::kaijutsu_capnp::BlockKind::ShellOutput => BlockKind::ShellOutput,
     };
 
     // Parse content

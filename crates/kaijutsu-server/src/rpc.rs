@@ -17,7 +17,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
-use crate::kaish::KaishProcess;
+use crate::embedded_kaish::EmbeddedKaish;
 
 use kaijutsu_kernel::{
     DocumentDb, DocumentKind, Kernel,
@@ -289,8 +289,8 @@ pub struct KernelState {
     pub name: String,
     pub consent_mode: ConsentMode,
     pub command_history: Vec<CommandEntry>,
-    /// Kaish subprocess for execution (spawned lazily)
-    pub kaish: Option<Rc<KaishProcess>>,
+    /// Embedded kaish executor (created lazily) - routes through CRDT backend
+    pub kaish: Option<Rc<EmbeddedKaish>>,
     /// The kernel (VFS, state, tools, control plane)
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
@@ -578,21 +578,25 @@ impl kernel::Server for KernelImpl {
 
         // Use Promise::from_future for async execution
         Promise::from_future(async move {
-            // Get or spawn kaish process
+            // Get or create embedded kaish executor
             let kaish = {
                 let mut state_ref = state.borrow_mut();
                 let kernel = state_ref.kernels.get_mut(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
 
                 if kernel.kaish.is_none() {
-                    log::info!("Spawning kaish subprocess for kernel {}", kernel_id);
-                    match KaishProcess::spawn(&kernel_id).await {
-                        Ok(process) => {
-                            kernel.kaish = Some(Rc::new(process));
+                    log::info!("Creating embedded kaish for kernel {}", kernel_id);
+                    match EmbeddedKaish::new(
+                        &kernel_id,
+                        kernel.documents.clone(),
+                        kernel.kernel.clone(),
+                    ) {
+                        Ok(kaish) => {
+                            kernel.kaish = Some(Rc::new(kaish));
                         }
                         Err(e) => {
-                            log::error!("Failed to spawn kaish: {}", e);
-                            return Err(capnp::Error::failed(format!("kaish spawn failed: {}", e)));
+                            log::error!("Failed to create embedded kaish: {}", e);
+                            return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
                         }
                     }
                 }
@@ -600,7 +604,7 @@ impl kernel::Server for KernelImpl {
                 kernel.kaish.as_ref().unwrap().clone()
             };
 
-            // Execute code via kaish subprocess
+            // Execute code via embedded kaish (routes through CRDT backend)
             let _exec_result = match kaish.execute(&code).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -1848,6 +1852,8 @@ fn block_kind_to_capnp(kind: BlockKind) -> crate::kaijutsu_capnp::BlockKind {
         BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
         BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
         BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+        BlockKind::ShellCommand => crate::kaijutsu_capnp::BlockKind::ShellCommand,
+        BlockKind::ShellOutput => crate::kaijutsu_capnp::BlockKind::ShellOutput,
     }
 }
 
@@ -2238,6 +2244,8 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
         kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
         kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+        kaijutsu_crdt::BlockKind::ShellCommand => crate::kaijutsu_capnp::BlockKind::ShellCommand,
+        kaijutsu_crdt::BlockKind::ShellOutput => crate::kaijutsu_capnp::BlockKind::ShellOutput,
     });
 
     // Set basic fields
@@ -2312,6 +2320,8 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Thinking => kaijutsu_crdt::BlockKind::Thinking,
         crate::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
         crate::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
+        crate::kaijutsu_capnp::BlockKind::ShellCommand => kaijutsu_crdt::BlockKind::ShellCommand,
+        crate::kaijutsu_capnp::BlockKind::ShellOutput => kaijutsu_crdt::BlockKind::ShellOutput,
     };
 
     let tool_call_id = if reader.get_has_tool_call_id() {

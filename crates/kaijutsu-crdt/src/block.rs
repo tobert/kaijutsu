@@ -172,6 +172,10 @@ pub enum BlockKind {
     ToolCall,
     /// Tool result - content is streamable via Text CRDT.
     ToolResult,
+    /// Shell command entered by user (kaish REPL).
+    ShellCommand,
+    /// Shell command output/result (stdout, exit code).
+    ShellOutput,
 }
 
 impl BlockKind {
@@ -182,6 +186,8 @@ impl BlockKind {
             "thinking" => Some(BlockKind::Thinking),
             "tool_call" | "toolcall" => Some(BlockKind::ToolCall),
             "tool_result" | "toolresult" => Some(BlockKind::ToolResult),
+            "shell_command" | "shellcommand" => Some(BlockKind::ShellCommand),
+            "shell_output" | "shelloutput" => Some(BlockKind::ShellOutput),
             _ => None,
         }
     }
@@ -193,6 +199,8 @@ impl BlockKind {
             BlockKind::Thinking => "thinking",
             BlockKind::ToolCall => "tool_call",
             BlockKind::ToolResult => "tool_result",
+            BlockKind::ShellCommand => "shell_command",
+            BlockKind::ShellOutput => "shell_output",
         }
     }
 
@@ -206,6 +214,11 @@ impl BlockKind {
     /// Check if this is a tool-related block.
     pub fn is_tool(&self) -> bool {
         matches!(self, BlockKind::ToolCall | BlockKind::ToolResult)
+    }
+
+    /// Check if this is a shell-related block.
+    pub fn is_shell(&self) -> bool {
+        matches!(self, BlockKind::ShellCommand | BlockKind::ShellOutput)
     }
 }
 
@@ -366,6 +379,58 @@ impl BlockSnapshot {
             tool_name: None,
             tool_input: None,
             tool_call_id: Some(tool_call_id),
+            exit_code,
+            is_error,
+        }
+    }
+
+    /// Create a new shell command block (user input in shell mode).
+    pub fn shell_command(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        content: impl Into<String>,
+        author: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            parent_id,
+            role: Role::User,
+            status: Status::Done,
+            kind: BlockKind::ShellCommand,
+            content: content.into(),
+            collapsed: false,
+            author: author.into(),
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+        }
+    }
+
+    /// Create a new shell output block (kaish execution result).
+    pub fn shell_output(
+        id: BlockId,
+        command_block_id: BlockId,
+        content: impl Into<String>,
+        is_error: bool,
+        exit_code: Option<i32>,
+        author: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            parent_id: Some(command_block_id.clone()),
+            role: Role::System,
+            status: if is_error { Status::Error } else { Status::Done },
+            kind: BlockKind::ShellOutput,
+            content: content.into(),
+            collapsed: false,
+            author: author.into(),
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
             exit_code,
             is_error,
         }
