@@ -96,7 +96,8 @@ pub struct Theme {
     // Mode colors (vim-style, for mode indicator)
     // ═══════════════════════════════════════════════════════════════════════
     pub mode_normal: Color,
-    pub mode_insert: Color,
+    pub mode_chat: Color,
+    pub mode_shell: Color,
     pub mode_command: Color,
     pub mode_visual: Color,
 
@@ -196,7 +197,8 @@ impl Default for Theme {
 
             // Mode colors (vim-style)
             mode_normal: Color::srgb(0.5, 0.5, 0.5),  // Dim gray (matches fg_dim)
-            mode_insert: Color::srgb(0.4, 0.8, 0.4),  // Green
+            mode_chat: Color::srgb(0.4, 0.8, 0.4),    // Green (chat with LLM)
+            mode_shell: Color::srgb(0.3, 0.9, 0.7),   // Terminal green (kaish REPL)
             mode_command: Color::srgb(0.9, 0.7, 0.2), // Yellow/orange
             mode_visual: Color::srgb(0.7, 0.4, 0.9),  // Purple
 

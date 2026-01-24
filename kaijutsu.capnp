@@ -262,6 +262,10 @@ interface Kernel {
   unregisterMcp @26 (name :Text);
   listMcpServers @27 () -> (servers :List(McpServerInfo));
   callMcpTool @28 (call :McpToolCall) -> (result :McpToolResult);
+
+  # Shell execution (kaish REPL with block output)
+  # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
+  shellExecute @29 (code :Text, cellId :Text) -> (commandBlockId :BlockId);
 }
 
 # ============================================================================

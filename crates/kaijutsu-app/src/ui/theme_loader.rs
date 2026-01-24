@@ -196,8 +196,12 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     if let Some(c) = get_color(&scope, "mode_normal") {
         theme.mode_normal = c;
     }
-    if let Some(c) = get_color(&scope, "mode_insert") {
-        theme.mode_insert = c;
+    // Support both mode_chat (new) and mode_insert (legacy) for backward compatibility
+    if let Some(c) = get_color(&scope, "mode_chat").or_else(|| get_color(&scope, "mode_insert")) {
+        theme.mode_chat = c;
+    }
+    if let Some(c) = get_color(&scope, "mode_shell") {
+        theme.mode_shell = c;
     }
     if let Some(c) = get_color(&scope, "mode_command") {
         theme.mode_command = c;

@@ -1733,15 +1733,33 @@ impl kernel::Server for KernelImpl {
         let kernel_id = self.kernel_id.clone();
 
         Promise::from_future(async move {
-            // Get documents and kernel references
-            let (documents, kernel_arc) = {
-                let state_ref = state.borrow();
-                let kernel_state = state_ref.kernels.get(&kernel_id)
+            // Get or create embedded kaish executor (same pattern as execute RPC)
+            let (documents, kaish) = {
+                let mut state_ref = state.borrow_mut();
+                let kernel = state_ref.kernels.get_mut(&kernel_id)
                     .ok_or_else(|| {
                         log::error!("kernel {} not found", kernel_id);
                         capnp::Error::failed("kernel not found".into())
                     })?;
-                (kernel_state.documents.clone(), kernel_state.kernel.clone())
+
+                if kernel.kaish.is_none() {
+                    log::info!("Creating embedded kaish for kernel {}", kernel_id);
+                    match EmbeddedKaish::new(
+                        &kernel_id,
+                        kernel.documents.clone(),
+                        kernel.kernel.clone(),
+                    ) {
+                        Ok(kaish) => {
+                            kernel.kaish = Some(Rc::new(kaish));
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create embedded kaish: {}", e);
+                            return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
+                        }
+                    }
+                }
+
+                (kernel.documents.clone(), kernel.kaish.as_ref().unwrap().clone())
             };
 
             // Auto-create document if it doesn't exist
@@ -1773,18 +1791,22 @@ impl kernel::Server for KernelImpl {
             let documents_clone = documents.clone();
 
             tokio::task::spawn_local(async move {
-                // Execute via kernel's default engine (kaish)
-                match kernel_arc.execute(&code).await {
+                // Execute via embedded kaish (routes through CRDT backend)
+                log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
+                match kaish.execute(&code).await {
                     Ok(result) => {
-                        // Combine stdout and stderr
-                        let output = if result.stderr.is_empty() {
-                            result.stdout
-                        } else if result.stdout.is_empty() {
-                            result.stderr
+                        log::info!("shell_execute: kaish returned code={} out_len={} err_len={}",
+                            result.code, result.out.len(), result.err.len());
+                        log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
+                        // Combine out and err (kaish uses out/err/code fields)
+                        let output = if result.err.is_empty() {
+                            result.out
+                        } else if result.out.is_empty() {
+                            result.err
                         } else {
-                            format!("{}\n{}", result.stdout, result.stderr)
+                            format!("{}\n{}", result.out, result.err)
                         };
-                        log::debug!("Shell execution completed: {} bytes, exit_code={}", output.len(), result.exit_code);
+                        log::debug!("Shell execution completed: {} bytes, exit_code={}", output.len(), result.code);
                         // Update output block with result
                         if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &output, 0) {
                             log::error!("Failed to update shell output: {}", e);

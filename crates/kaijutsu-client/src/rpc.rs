@@ -240,6 +240,28 @@ impl KernelHandle {
         Ok(response.get()?.get_exec_id())
     }
 
+    /// Execute shell command with block output (kaish REPL mode)
+    ///
+    /// Creates ShellCommand and ShellOutput blocks in the specified cell.
+    /// Output is streamed via block events.
+    /// Returns the BlockId of the command block.
+    pub async fn shell_execute(
+        &self,
+        code: &str,
+        cell_id: &str,
+    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+        let mut request = self.kernel.shell_execute_request();
+        request.get().set_code(code);
+        request.get().set_cell_id(cell_id);
+        let response = request.send().promise.await?;
+        let block_id = response.get()?.get_command_block_id()?;
+        Ok(kaijutsu_crdt::BlockId {
+            cell_id: block_id.get_cell_id()?.to_string()?,
+            agent_id: block_id.get_agent_id()?.to_string()?,
+            seq: block_id.get_seq(),
+        })
+    }
+
     /// Interrupt an execution
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {
         let mut request = self.kernel.interrupt_request();

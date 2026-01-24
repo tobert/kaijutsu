@@ -607,13 +607,13 @@ async fn connection_loop(
                 }
             }
 
-            // Shell execution (kaish REPL)
+            // Shell execution (kaish REPL with block output)
             ConnectionCommand::ShellExecute { command, cell_id } => {
                 if let Some(kernel) = &current_kernel {
-                    match timeout(PROMPT_TIMEOUT, kernel.execute(&command)).await {
-                        Ok(Ok(exec_id)) => {
-                            log::info!("Shell execution started: exec_id={}, cell_id={}", exec_id, cell_id);
-                            // Execution output will come through block events
+                    match timeout(PROMPT_TIMEOUT, kernel.shell_execute(&command, &cell_id)).await {
+                        Ok(Ok(block_id)) => {
+                            log::info!("Shell command block created: {:?}, cell_id={}", block_id, cell_id);
+                            // Output will stream via block events
                         }
                         Ok(Err(e)) => {
                             let err_str = e.to_string();
