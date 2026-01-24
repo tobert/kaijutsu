@@ -21,3 +21,14 @@ don't know what that is, please come back later and we'll explain why it's cool
 and show you a demo.
 
 -Amy
+
+## Forked Dependencies
+
+We maintain forks of several dependencies with fixes or extensions we need. These will be upstreamed once proven out:
+
+| Fork | Branch | Why |
+|------|--------|-----|
+| [diamond-types](https://github.com/tobert/diamond-types) | `feat/maps-and-uuids` | Completes Map/Set/Register types |
+| [glyphon](https://github.com/tobert/glyphon) | `bevy-0.18-compat` | cosmic-text 0.16 for Bevy 0.18 |
+| [bevy_brp](https://github.com/tobert/bevy_brp) | `fix/send-keys-populate-text-field` | send_keys populates text field correctly |
+| [anthropic-api](https://github.com/tobert/anthropic-api) | `add-tooluse-to-request-content-block` | ToolUse in request content blocks |

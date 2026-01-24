@@ -22,8 +22,8 @@ kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 
 # Kaish (execution engine + client)
-kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
-kaish-client = { path = "../kaish/crates/kaish-client" }
+kaish-kernel = { git = "https://github.com/tobert/kaish" }
+kaish-client = { git = "https://github.com/tobert/kaish" }
 
 # Cap'n Proto
 capnp = "0.25"
@@ -54,10 +54,11 @@ shellexpand = "3"
 
 # Bevy Remote Protocol (debugging)
 bevy_remote = "0.18"
-bevy_brp_extras = "0.18"
+# Fork with send_keys text field fix
+bevy_brp_extras = { git = "https://github.com/tobert/bevy_brp", branch = "fix/send-keys-populate-text-field" }
 
-# Text rendering (local fork for Bevy 0.18 compat)
-glyphon = { path = "../glyphon" }
+# Text rendering (fork with cosmic-text 0.16 for Bevy 0.18 compat)
+glyphon = { git = "https://github.com/tobert/glyphon", branch = "bevy-0.18-compat" }
 cosmic-text = "0.16"
 
 # CRDT + Persistence
