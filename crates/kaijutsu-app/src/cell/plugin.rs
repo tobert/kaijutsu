@@ -3,7 +3,8 @@
 use bevy::prelude::*;
 
 use super::components::{
-    ConversationScrollState, CurrentMode, FocusedCell, PromptSubmitted, WorkspaceLayout,
+    ConversationContainer, ConversationScrollState, CurrentMode, EditorMode, FocusedCell,
+    MainCell, PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -16,6 +17,16 @@ impl Plugin for CellPlugin {
     fn build(&self, app: &mut App) {
         // Register messages
         app.add_message::<PromptSubmitted>();
+
+        // Register types for BRP reflection
+        app.register_type::<EditorMode>()
+            .register_type::<CurrentMode>()
+            .register_type::<ConversationScrollState>()
+            .register_type::<ConversationContainer>()
+            .register_type::<PromptContainer>()
+            .register_type::<PromptCell>()
+            .register_type::<MainCell>()
+            .register_type::<PromptSubmitted>();
 
         app.init_resource::<FocusedCell>()
             .init_resource::<CurrentMode>()

@@ -375,7 +375,7 @@ impl CellState {
 }
 
 /// Vim-style editor mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
 pub enum EditorMode {
     /// Navigation mode (h/j/k/l, commands)
     #[default]
@@ -400,7 +400,8 @@ impl EditorMode {
 }
 
 /// Resource tracking the current editor mode.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
 pub struct CurrentMode(pub EditorMode);
 
 /// Resource tracking which cell has keyboard focus.
@@ -456,14 +457,16 @@ impl WorkspaceLayout {
 
 /// Marker for the scrollable conversation container.
 /// Holds message cells (UserMessage, AgentMessage, tool calls).
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct ConversationContainer;
 
 /// Marker for the fixed prompt input area at the bottom.
 ///
 /// FUTURE: The prompt might become mobile - attaching to focused BlockCells
 /// for threaded reply workflows instead of being fixed at bottom.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct PromptContainer;
 
 /// Marker for the prompt input cell (the editable text input at bottom).
@@ -472,7 +475,8 @@ pub struct PromptContainer;
 /// FUTURE: Input capabilities might move to BlockCells directly, or
 /// PromptCell could "attach" to a focused block for reply-to workflows.
 /// Current implementation uses legacy GlyphonText + TextAreaConfig rendering.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct PromptCell;
 
 /// Marker for the main conversation view cell.
@@ -480,11 +484,12 @@ pub struct PromptCell;
 /// NOTE: MainCell no longer renders directly - it holds the CellEditor
 /// (source of truth for content) while BlockCells handle per-block rendering.
 /// Kept as the "owner" entity for BlockCellContainer and TurnCellContainer.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct MainCell;
 
 /// Message fired when user submits prompt text (presses Enter).
-#[derive(Message)]
+#[derive(Message, Reflect)]
 pub struct PromptSubmitted {
     /// The text that was submitted.
     pub text: String,
@@ -496,7 +501,8 @@ pub struct PromptSubmitted {
 /// - `offset` is the current rendered position
 /// - `target_offset` is where we're scrolling toward
 /// - `following` enables auto-tracking bottom during streaming
-#[derive(Resource)]
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
 pub struct ConversationScrollState {
     /// Current scroll offset (pixels from top, 0 = at top).
     /// This is the rendered position, interpolated toward target_offset.

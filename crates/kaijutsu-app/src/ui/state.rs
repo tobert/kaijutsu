@@ -27,7 +27,7 @@ use bevy::prelude::*;
 ///
 /// Uses Bevy's state system for clean screen transitions with proper
 /// system gating via `run_if(in_state(...))`.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States, Reflect)]
 pub enum AppScreen {
     /// Dashboard - Kernel/Context/Seat selection view
     #[default]
@@ -53,6 +53,11 @@ pub struct AppScreenPlugin;
 
 impl Plugin for AppScreenPlugin {
     fn build(&self, app: &mut App) {
+        // Register types for BRP reflection
+        app.register_type::<AppScreen>()
+            .register_type::<InputPresenceKind>()
+            .register_type::<InputPresence>();
+
         app.init_state::<AppScreen>()
             .add_systems(OnEnter(AppScreen::Dashboard), show_dashboard)
             .add_systems(OnExit(AppScreen::Dashboard), hide_dashboard)
@@ -115,7 +120,7 @@ fn hide_conversation(mut query: Query<(&mut Node, &mut Visibility), With<Convers
 /// - **Docked**: Pinned to dock position, no backdrop (i to enter insert)
 /// - **Minimized**: Only chasing line visible (reading mode)
 /// - **Hidden**: Dashboard state, input completely hidden
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Reflect)]
 pub enum InputPresenceKind {
     /// Floating centered overlay with backdrop
     Overlay,
@@ -129,7 +134,8 @@ pub enum InputPresenceKind {
 }
 
 /// Resource tracking current input presence state.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
 pub struct InputPresence(pub InputPresenceKind);
 
 impl InputPresence {

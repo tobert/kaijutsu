@@ -21,5 +21,7 @@ pub mod plugin;
 mod systems;
 
 // Re-export public API
-pub use components::{Cell, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer};
+pub use components::{
+    Cell, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer,
+};
 pub use plugin::CellPlugin;
