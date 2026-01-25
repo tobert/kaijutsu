@@ -1006,6 +1006,10 @@ pub fn auto_focus_prompt(
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
+    // Clear the user_scrolled flag at end of frame
+    // (This system runs late in the frame after block events)
+    scroll_state.user_scrolled_this_frame = false;
+
     let max = scroll_state.max_offset();
 
     // In follow mode, lock directly to bottom - no interpolation needed
@@ -1459,7 +1463,8 @@ pub fn handle_block_events(
     // Terminal-like auto-scroll: if we were at the bottom before processing
     // events and content changed, enable follow mode to smoothly track new content.
     // If user had scrolled up, we don't interrupt them.
-    if was_at_bottom && editor.dirty {
+    // IMPORTANT: Don't re-enable following if user explicitly scrolled this frame.
+    if was_at_bottom && editor.dirty && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
     }
 }

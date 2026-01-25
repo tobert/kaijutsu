@@ -525,6 +525,11 @@ pub struct ConversationScrollState {
     /// When true, target_offset auto-updates to max_offset each frame.
     /// Set to false when user manually scrolls up.
     pub following: bool,
+    /// Set to true when user explicitly scrolls this frame.
+    /// Prevents handle_block_events from re-enabling following mode.
+    /// Cleared each frame by smooth_scroll.
+    #[reflect(ignore)]
+    pub user_scrolled_this_frame: bool,
 }
 
 impl Default for ConversationScrollState {
@@ -535,6 +540,7 @@ impl Default for ConversationScrollState {
             content_height: 0.0,
             visible_height: 600.0, // Will be updated by layout system
             following: true, // Start in follow mode
+            user_scrolled_this_frame: false,
         }
     }
 }
@@ -566,6 +572,10 @@ impl ConversationScrollState {
     /// Scroll by a delta amount (positive = scroll down).
     /// Instant - sets both offset and target for zero-frame-delay.
     pub fn scroll_by(&mut self, delta: f32) {
+        // Mark that user explicitly scrolled this frame
+        // This prevents handle_block_events from re-enabling following
+        self.user_scrolled_this_frame = true;
+
         // If scrolling up, disable follow mode
         if delta < 0.0 {
             self.following = false;
