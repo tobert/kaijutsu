@@ -11,7 +11,7 @@ use super::components::{
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
-use crate::ui::state::{InputPosition, InputShadowHeight};
+use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 
 /// Spawn a new cell entity with all required components.
 pub fn spawn_cell(
@@ -40,16 +40,20 @@ pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
 /// Handle vim-style mode switching with input presence transitions.
 ///
 /// Key bindings:
-/// - `i` in Normal → Insert mode + Docked presence (expand from minimized)
-/// - `Space` in Normal → Insert mode + Overlay presence (summon floating)
+/// - `i` in Normal → Chat mode + Docked presence (expand from minimized)
+/// - `Space` in Normal → Chat mode + Overlay presence (summon floating)
+/// - `Backtick` in Normal → Shell mode + Docked presence
 /// - `Escape` in Insert → Normal mode + Minimized presence (collapse)
 /// - `:` in Normal → Command mode (no presence change)
+///
+/// Note: Chat/Shell modes only allowed in Conversation screen.
 pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
     mut presence: ResMut<InputPresence>,
     prompt_cells: Query<&CellEditor, With<PromptCell>>,
+    screen: Res<State<AppScreen>>,
 ) {
     // Clear consumed keys from last frame
     consumed.0.clear();
@@ -65,6 +69,12 @@ pub fn handle_mode_switch(
 
         match mode.0 {
             EditorMode::Normal => {
+                // Chat/Shell modes only make sense in Conversation screen
+                // (Dashboard has no input field to route to)
+                if *screen.get() != AppScreen::Conversation {
+                    continue;
+                }
+
                 // In normal mode, i enters chat (docked), Space enters chat (overlay),
                 // ` (backtick) enters shell mode, : enters command, v enters visual
                 match event.key_code {
@@ -811,6 +821,9 @@ pub fn spawn_prompt_cell(
             GlyphonText,
             TextAreaConfig::default(),
             PromptCell,
+            // Start hidden - sync_prompt_visibility controls based on InputPresence
+            // This prevents stray glyphon text when on Dashboard
+            Visibility::Hidden,
         ))
         .id();
 
@@ -1936,7 +1949,29 @@ pub fn sync_input_shadow_height(
     }
 }
 
-use crate::ui::state::AppScreen;
+/// Sync PromptCell visibility with InputPresence.
+///
+/// PromptCell is a root entity (not parented to InputLayer) so it needs
+/// its own visibility management for glyphon text extraction. Without this,
+/// the glyphon text renders even when the input area is hidden.
+pub fn sync_prompt_visibility(
+    presence: Res<InputPresence>,
+    prompt_entity: Res<PromptCellEntity>,
+    mut query: Query<&mut Visibility>,
+) {
+    if !presence.is_changed() {
+        return;
+    }
+
+    let Some(entity) = prompt_entity.0 else { return };
+    let Ok(mut vis) = query.get_mut(entity) else { return };
+
+    *vis = if presence.is_visible() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+}
 
 /// Sync InputPresence with AppScreen state.
 ///

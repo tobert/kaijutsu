@@ -77,6 +77,7 @@ impl Plugin for AppScreenPlugin {
 fn show_dashboard(
     mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
     mut presence: ResMut<InputPresence>,
+    mut mode: ResMut<crate::cell::CurrentMode>,
 ) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
@@ -84,6 +85,8 @@ fn show_dashboard(
     }
     // Hide input area when on dashboard
     presence.0 = InputPresenceKind::Hidden;
+    // Reset mode to Normal (Chat/Shell make no sense on Dashboard)
+    mode.0 = crate::cell::EditorMode::Normal;
 }
 
 /// Hide the dashboard view when leaving Dashboard state

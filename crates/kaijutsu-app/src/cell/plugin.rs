@@ -154,6 +154,8 @@ impl Plugin for CellPlugin {
                     systems::sync_backdrop_visibility.after(systems::compute_input_position),
                     systems::apply_input_position.after(systems::compute_input_position),
                     systems::sync_input_shadow_height.after(systems::sync_presence_with_screen),
+                    // PromptCell visibility syncs with presence to hide glyphon text on Dashboard
+                    systems::sync_prompt_visibility.after(systems::sync_presence_with_screen),
                 ),
             );
     }
