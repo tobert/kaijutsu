@@ -595,6 +595,26 @@ impl ConversationScrollState {
 }
 
 // ============================================================================
+// LAYOUT GENERATION TRACKING
+// ============================================================================
+
+/// Tracks when block layout needs recomputation.
+///
+/// Incremented by systems that modify block content. Layout systems
+/// compare against their last-seen generation to skip redundant work.
+/// This is the key optimization for scroll performance: when scrolling,
+/// content hasn't changed, so we skip the expensive layout recomputation.
+#[derive(Resource, Default)]
+pub struct LayoutGeneration(pub u64);
+
+impl LayoutGeneration {
+    /// Bump the generation counter, signaling that layout needs recomputation.
+    pub fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+// ============================================================================
 // BLOCK-ORIENTED UI COMPONENTS
 // ============================================================================
 //

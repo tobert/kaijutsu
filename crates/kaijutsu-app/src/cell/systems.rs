@@ -1607,12 +1607,14 @@ pub fn init_block_cell_buffers(
 /// Sync BlockCell GlyphonTextBuffers with their corresponding block content.
 ///
 /// Only updates cells whose content has changed (tracked via version).
+/// When any buffer is updated, bumps LayoutGeneration to trigger re-layout.
 pub fn sync_block_cell_buffers(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, (With<MainCell>, Changed<CellEditor>)>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&mut BlockCell, &mut GlyphonTextBuffer)>,
     font_system: Res<SharedFontSystem>,
+    mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = main_entity.0 else {
         return;
@@ -1640,6 +1642,7 @@ pub fn sync_block_cell_buffers(
         .map(|b| (b.id.clone(), b))
         .collect();
 
+    let mut updated_any = false;
     for entity in &container.block_cells {
         let Ok((mut block_cell, mut buffer)) = block_cells.get_mut(*entity) else {
             continue;
@@ -1660,6 +1663,12 @@ pub fn sync_block_cell_buffers(
         buffer.set_text(&mut font_system, &text, &attrs, glyphon::Shaping::Advanced);
 
         block_cell.last_render_version = doc_version;
+        updated_any = true;
+    }
+
+    // Bump generation to trigger layout recomputation
+    if updated_any {
+        layout_gen.bump();
     }
 }
 
@@ -1670,6 +1679,10 @@ pub fn sync_block_cell_buffers(
 /// - Spacing between blocks
 /// - Indentation for nested tool results
 /// - Space for turn headers before first block of each turn
+///
+/// **Performance optimization:** This system tracks the last layout generation
+/// and window size. It skips expensive recomputation when neither content nor
+/// window has changed. This makes scrolling feel instant regardless of block count.
 pub fn layout_block_cells(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
@@ -1682,6 +1695,9 @@ pub fn layout_block_cells(
     current: Res<CurrentConversation>,
     font_system: Res<SharedFontSystem>,
     windows: Query<&Window>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_layout_gen: Local<u64>,
+    mut last_window_size: Local<(f32, f32)>,
 ) {
     let Some(main_ent) = main_entity.0 else {
         return;
@@ -1708,6 +1724,22 @@ pub fn layout_block_cells(
         .next()
         .map(|w| (w.resolution.width(), w.resolution.height()))
         .unwrap_or((1280.0, 800.0));
+
+    // === Performance optimization: skip if nothing changed ===
+    // Check if content or window changed since last layout
+    let window_changed = (window_width, window_height) != *last_window_size;
+    let content_changed = layout_gen.0 != *last_layout_gen;
+
+    if !window_changed && !content_changed {
+        // Nothing to re-layout - skip expensive computation
+        return;
+    }
+
+    // Record current state for next frame comparison
+    *last_window_size = (window_width, window_height);
+    *last_layout_gen = layout_gen.0;
+    // === End performance optimization ===
+
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
 
@@ -1792,6 +1824,11 @@ pub fn layout_block_cells(
 }
 
 /// Apply layout positions to BlockCell TextAreaConfig for rendering.
+///
+/// **Performance optimization:** This system tracks the last-applied layout generation
+/// and scroll offset. It skips work when neither layout nor scroll has changed.
+/// Combined with layout_block_cells optimization, this means scrolling only runs
+/// this lightweight position update, not the expensive layout computation.
 pub fn apply_block_cell_positions(
     main_entity: Res<MainCellEntity>,
     containers: Query<&BlockCellContainer>,
@@ -1800,6 +1837,9 @@ pub fn apply_block_cell_positions(
     mut scroll_state: ResMut<ConversationScrollState>,
     shadow_height: Res<InputShadowHeight>,
     windows: Query<&Window>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_applied_gen: Local<u64>,
+    mut prev_scroll: Local<f32>,
 ) {
     let Some(main_ent) = main_entity.0 else {
         return;
@@ -1808,6 +1848,20 @@ pub fn apply_block_cell_positions(
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
+
+    // === Performance optimization: skip if nothing changed ===
+    let layout_changed = layout_gen.0 != *last_applied_gen;
+    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() > 0.1;
+
+    if !layout_changed && !scroll_changed {
+        // Neither layout nor scroll changed - skip position updates
+        return;
+    }
+
+    // Record current state for next frame comparison
+    *last_applied_gen = layout_gen.0;
+    *prev_scroll = scroll_state.offset;
+    // === End performance optimization ===
 
     let (window_width, window_height) = windows
         .iter()

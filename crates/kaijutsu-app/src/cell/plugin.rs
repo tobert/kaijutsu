@@ -4,7 +4,7 @@ use bevy::prelude::*;
 
 use super::components::{
     ConversationContainer, ConversationScrollState, CurrentMode, EditorMode, FocusedCell,
-    MainCell, PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
+    LayoutGeneration, MainCell, PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -32,6 +32,7 @@ impl Plugin for CellPlugin {
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
+            .init_resource::<LayoutGeneration>()
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::PromptCellEntity>()
