@@ -404,8 +404,8 @@ pub fn compute_cell_heights(
 
         // For MainCell, don't cap height - we need full content height for scrolling
         let content_height = if main_cell.is_some() {
-            // Full height without max cap
-            (line_count as f32) * layout.line_height + 24.0
+            // Full height without max cap, tight padding
+            (line_count as f32) * layout.line_height + 4.0
         } else {
             // Other cells use capped height
             layout.height_for_lines(line_count)
@@ -1651,10 +1651,11 @@ pub fn layout_block_cells(
         return;
     };
 
-    const BLOCK_SPACING: f32 = 16.0;
-    const ROLE_HEADER_HEIGHT: f32 = 28.0;
-    const ROLE_HEADER_SPACING: f32 = 8.0;
-    const INDENT_WIDTH: f32 = 32.0;
+    // Terminal-like tight spacing - room for 1px chrome later
+    const BLOCK_SPACING: f32 = 2.0;
+    const ROLE_HEADER_HEIGHT: f32 = 20.0; // Single line height
+    const ROLE_HEADER_SPACING: f32 = 2.0;
+    const INDENT_WIDTH: f32 = 16.0; // Tighter indent
     let mut y_offset = 0.0;
 
     // Get window size for wrap width and visible height calculation
@@ -1732,7 +1733,8 @@ pub fn layout_block_cells(
         // Compute height from visual line count (after text wrapping)
         // This shapes the buffer if needed and returns accurate wrapped line count
         let line_count = buffer.visual_line_count(&mut font_system, wrap_width);
-        let height = (line_count as f32) * layout.line_height + 24.0; // No max cap for scrolling
+        // Tight height: just the lines, minimal padding for future chrome
+        let height = (line_count as f32) * layout.line_height + 4.0;
 
         block_layout.y_offset = y_offset;
         block_layout.height = height;

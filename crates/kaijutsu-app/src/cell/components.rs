@@ -449,7 +449,7 @@ impl Default for WorkspaceLayout {
 impl WorkspaceLayout {
     /// Calculate dynamic cell height based on line count.
     pub fn height_for_lines(&self, line_count: usize) -> f32 {
-        let content_height = (line_count as f32) * self.line_height + 24.0; // padding
+        let content_height = (line_count as f32) * self.line_height + 4.0; // tight padding
         let height = content_height.max(self.min_cell_height);
         if self.max_cell_height > 0.0 {
             height.min(self.max_cell_height)
