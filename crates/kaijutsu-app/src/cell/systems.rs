@@ -1276,26 +1276,38 @@ pub fn handle_block_events(
                     continue;
                 }
 
-                // Find insertion point: after parent (if exists), otherwise by timestamp
+                // Find insertion point: after parent (if exists), otherwise append at end
                 let after_id = if let Some(ref parent_id) = block.parent_id {
-                    // Insert after parent block
-                    Some(parent_id.clone())
+                    // Verify parent exists before inserting child
+                    if editor.doc.get_block_snapshot(parent_id).is_none() {
+                        warn!(
+                            "Block {:?} has parent_id {:?} but parent not found - appending at end",
+                            block.id, parent_id
+                        );
+                        editor.doc.blocks_ordered().last().map(|b| b.id.clone())
+                    } else {
+                        Some(parent_id.clone())
+                    }
                 } else {
-                    // No parent - find position by timestamp among root blocks
-                    editor.doc.blocks_ordered()
-                        .iter()
-                        .filter(|b| b.parent_id.is_none() && b.created_at <= block.created_at)
-                        .next_back()
-                        .map(|b| b.id.clone())
+                    // No parent - append after the last block
+                    editor.doc.blocks_ordered().last().map(|b| b.id.clone())
                 };
+
+                info!(
+                    "Inserting block {:?} (kind={:?}, parent={:?}) after {:?}",
+                    block.id, block.kind, block.parent_id, after_id
+                );
 
                 match editor.doc.insert_from_snapshot((**block).clone(), after_id.as_ref()) {
                     Ok(id) => {
-                        info!("Inserted block from server: {:?}", id);
+                        info!("Inserted block {:?} successfully", id);
                         editor.dirty = true;
                     }
                     Err(e) => {
-                        warn!("Failed to insert block from server: {}", e);
+                        error!(
+                            "Failed to insert block {:?} after {:?}: {}",
+                            block.id, after_id, e
+                        );
                     }
                 }
             }
