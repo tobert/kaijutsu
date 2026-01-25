@@ -197,7 +197,9 @@ fn extract_text_areas(
     ui_text_query: Extract<Query<(Entity, &GlyphonUiText, &UiTextPositionCache, &InheritedVisibility)>>,
     resolution: Extract<Res<TextResolution>>,
 ) {
-    let mut areas = Vec::new();
+    // Pre-allocate with estimated capacity to avoid reallocations
+    let estimated_capacity = buffer_query.iter().len() + ui_text_query.iter().len();
+    let mut areas = Vec::with_capacity(estimated_capacity);
 
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
