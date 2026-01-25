@@ -153,7 +153,9 @@ pub enum BlockFlow {
         after_id: Option<BlockId>,
     },
 
-    /// Text was edited within a block.
+    /// Text was edited within a block (legacy position-based, deprecated).
+    /// Use TextOps for proper CRDT sync.
+    #[deprecated(note = "Use TextOps for CRDT-based sync")]
     Edited {
         /// The cell/document ID.
         cell_id: String,
@@ -165,6 +167,17 @@ pub enum BlockFlow {
         insert: String,
         /// Number of characters to delete at position.
         delete: u64,
+    },
+
+    /// CRDT operations for a block's text content.
+    /// Clients should use merge_ops() to apply these.
+    TextOps {
+        /// The cell/document ID.
+        cell_id: String,
+        /// The block that was edited.
+        block_id: BlockId,
+        /// Serialized CRDT operations (diamond-types format).
+        ops: Vec<u8>,
     },
 
     /// A block was deleted.
@@ -208,10 +221,12 @@ pub enum BlockFlow {
 
 impl BlockFlow {
     /// Get the subject string for this event.
+    #[allow(deprecated)]
     pub fn subject(&self) -> &'static str {
         match self {
             Self::Inserted { .. } => "block.inserted",
             Self::Edited { .. } => "block.edited",
+            Self::TextOps { .. } => "block.text_ops",
             Self::Deleted { .. } => "block.deleted",
             Self::StatusChanged { .. } => "block.status",
             Self::CollapsedChanged { .. } => "block.collapsed",
@@ -220,10 +235,12 @@ impl BlockFlow {
     }
 
     /// Get the cell ID for this event.
+    #[allow(deprecated)]
     pub fn cell_id(&self) -> &str {
         match self {
             Self::Inserted { cell_id, .. }
             | Self::Edited { cell_id, .. }
+            | Self::TextOps { cell_id, .. }
             | Self::Deleted { cell_id, .. }
             | Self::StatusChanged { cell_id, .. }
             | Self::CollapsedChanged { cell_id, .. }
@@ -232,10 +249,12 @@ impl BlockFlow {
     }
 
     /// Get the block ID for this event (if applicable).
+    #[allow(deprecated)]
     pub fn block_id(&self) -> Option<&BlockId> {
         match self {
             Self::Inserted { block, .. } => Some(&block.id),
             Self::Edited { block_id, .. }
+            | Self::TextOps { block_id, .. }
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }

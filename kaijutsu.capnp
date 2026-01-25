@@ -389,6 +389,7 @@ interface BlockEvents {
   onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);
   onBlockMoved @4 (cellId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
   onBlockStatusChanged @5 (cellId :Text, blockId :BlockId, status :Status);
+  onBlockTextOps @6 (cellId :Text, blockId :BlockId, ops :Data);
 }
 
 # ============================================================================

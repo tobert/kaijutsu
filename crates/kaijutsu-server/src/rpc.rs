@@ -1226,6 +1226,19 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
+                        BlockFlow::TextOps { ref cell_id, ref block_id, ref ops } => {
+                            let mut req = callback.on_block_text_ops_request();
+                            {
+                                let mut params = req.get();
+                                params.set_cell_id(cell_id);
+                                let mut id = params.reborrow().init_block_id();
+                                id.set_cell_id(&block_id.cell_id);
+                                id.set_agent_id(&block_id.agent_id);
+                                id.set_seq(block_id.seq);
+                                params.set_ops(ops);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
                     };
 
                     // If callback fails (client disconnected), stop the bridge task

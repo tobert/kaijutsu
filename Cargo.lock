@@ -2916,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "diamond-types"
 version = "2.0.0"
-source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#7bef3264202ca8693553bd61380183dcfe8aba96"
+source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#26e6666b962ee6c60b4e369eb53bda06efee951a"
 dependencies = [
  "bumpalo",
  "crc",
@@ -6619,7 +6619,7 @@ dependencies = [
 [[package]]
 name = "rle"
 version = "0.2.0"
-source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#7bef3264202ca8693553bd61380183dcfe8aba96"
+source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#26e6666b962ee6c60b4e369eb53bda06efee951a"
 dependencies = [
  "smallvec 2.0.0-alpha.12",
 ]

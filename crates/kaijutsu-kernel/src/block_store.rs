@@ -463,21 +463,24 @@ impl BlockStore {
         insert: &str,
         delete: usize,
     ) -> Result<(), String> {
-        {
+        let ops = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
+            // Capture frontier before edit
+            let frontier = entry.doc.frontier();
             entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
-        }
+            // Get ops since frontier (the edit we just applied)
+            let ops = entry.doc.ops_since(&frontier);
+            serde_json::to_vec(&ops).unwrap_or_default()
+        };
         // Note: No auto-save for text edits (high frequency during streaming)
 
-        // Emit flow event
-        self.emit(BlockFlow::Edited {
+        // Emit CRDT ops for proper sync
+        self.emit(BlockFlow::TextOps {
             cell_id: document_id.to_string(),
             block_id: block_id.clone(),
-            pos: pos as u64,
-            insert: insert.to_string(),
-            delete: delete as u64,
+            ops,
         });
 
         Ok(())
@@ -488,26 +491,24 @@ impl BlockStore {
     /// Note: Does not auto-save to avoid excessive I/O during streaming.
     /// Call `save_snapshot()` explicitly when streaming is complete.
     pub fn append_text(&self, document_id: &str, block_id: &BlockId, text: &str) -> Result<(), String> {
-        let pos = {
+        let ops = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            // Get current length before append
-            let current_len = entry.doc.get_block_snapshot(block_id)
-                .map(|s| s.content.len())
-                .unwrap_or(0);
+            // Capture frontier before append
+            let frontier = entry.doc.frontier();
             entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
             entry.touch(&agent_id);
-            current_len
+            // Get ops since frontier (the append we just applied)
+            let ops = entry.doc.ops_since(&frontier);
+            serde_json::to_vec(&ops).unwrap_or_default()
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
-        // Emit flow event (append is an edit at the end)
-        self.emit(BlockFlow::Edited {
+        // Emit CRDT ops for proper sync
+        self.emit(BlockFlow::TextOps {
             cell_id: document_id.to_string(),
             block_id: block_id.clone(),
-            pos: pos as u64,
-            insert: text.to_string(),
-            delete: 0,
+            ops,
         });
 
         Ok(())

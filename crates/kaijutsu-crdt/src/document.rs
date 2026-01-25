@@ -938,6 +938,28 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Merge remote operations (owned version for cross-thread/network use).
+    ///
+    /// Use this when receiving serialized ops that have been deserialized
+    /// into the owned form (e.g., from network RPC).
+    pub fn merge_ops_owned(&mut self, ops: SerializedOpsOwned) -> Result<()> {
+        self.oplog.merge_ops_owned(ops)
+            .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
+
+        // Update next_seq if needed
+        let blocks = self.oplog.checkout_set(self.blocks_set_lv);
+        for p in blocks.iter() {
+            if let Primitive::Str(key) = p
+                && let Some(block_id) = BlockId::from_key(key)
+                    && block_id.agent_id == self.agent_id_str {
+                        self.next_seq = self.next_seq.max(block_id.seq + 1);
+                    }
+        }
+
+        self.version += 1;
+        Ok(())
+    }
+
     /// Get the current frontier (version) for sync.
     pub fn frontier(&self) -> Vec<LV> {
         self.oplog.cg.version.as_ref().to_vec()

@@ -129,13 +129,19 @@ pub enum ConnectionEvent {
         cell_id: String,
         block: Box<kaijutsu_crdt::BlockSnapshot>,
     },
-    /// A block's text content was edited
+    /// A block's text content was edited (deprecated, use BlockTextOps)
     BlockEdited {
         cell_id: String,
         block_id: kaijutsu_crdt::BlockId,
         pos: u64,
         insert: String,
         delete: u64,
+    },
+    /// CRDT operations for a block's text content
+    BlockTextOps {
+        cell_id: String,
+        block_id: kaijutsu_crdt::BlockId,
+        ops: Vec<u8>,
     },
     /// A block's status changed
     BlockStatusChanged {
@@ -1006,6 +1012,45 @@ impl block_events::Server for BlockEventsCallback {
             cell_id,
             block_id,
             status,
+        });
+        Promise::ok(())
+    }
+
+    fn on_block_text_ops(
+        self: Rc<Self>,
+        params: block_events::OnBlockTextOpsParams,
+        _results: block_events::OnBlockTextOpsResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let cell_id = match params.get_cell_id() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let ops = match params.get_ops() {
+            Ok(data) => data.to_vec(),
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockTextOps {
+            cell_id,
+            block_id,
+            ops,
         });
         Promise::ok(())
     }

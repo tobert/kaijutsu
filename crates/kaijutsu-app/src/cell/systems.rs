@@ -1294,8 +1294,8 @@ pub fn handle_block_events(
                 };
 
                 info!(
-                    "Inserting block {:?} (kind={:?}, parent={:?}) after {:?}",
-                    block.id, block.kind, block.parent_id, after_id
+                    "Inserting block {:?} (kind={:?}, parent={:?}, content_len={}) after {:?}",
+                    block.id, block.kind, block.parent_id, block.content.len(), after_id
                 );
 
                 match editor.doc.insert_from_snapshot((**block).clone(), after_id.as_ref()) {
@@ -1323,12 +1323,56 @@ pub fn handle_block_events(
                     continue;
                 }
 
+                // Log current block state for debugging sync issues
+                let current_len = editor
+                    .doc
+                    .get_block_snapshot(block_id)
+                    .map(|b| b.content.len())
+                    .unwrap_or(0);
+
                 match editor.doc.edit_text(block_id, *pos as usize, insert, *delete as usize) {
                     Ok(()) => {
                         editor.dirty = true;
                     }
                     Err(e) => {
-                        warn!("Failed to apply block edit: {}", e);
+                        warn!(
+                            "Failed to apply block edit: {} (block {:?} has len={}, edit pos={}, insert_len={}, delete={})",
+                            e, block_id, current_len, pos, insert.len(), delete
+                        );
+                    }
+                }
+            }
+            ConnectionEvent::BlockTextOps {
+                cell_id,
+                block_id,
+                ops,
+            } => {
+                // Validate cell ID matches our document
+                if cell_id != editor.doc.cell_id() {
+                    continue;
+                }
+
+                // Deserialize and merge CRDT operations
+                match serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
+                    Ok(serialized_ops) => {
+                        match editor.doc.merge_ops_owned(serialized_ops) {
+                            Ok(()) => {
+                                editor.dirty = true;
+                                trace!("Merged CRDT ops for block {:?}", block_id);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to merge CRDT ops for block {:?}: {}",
+                                    block_id, e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to deserialize CRDT ops for block {:?}: {}",
+                            block_id, e
+                        );
                     }
                 }
             }
