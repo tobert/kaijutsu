@@ -76,7 +76,7 @@ pub struct BlockDocument {
 }
 
 impl BlockDocument {
-    /// Create a new empty document.
+    /// Create a new empty document (server-side, creates initial structure).
     pub fn new(cell_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
         let cell_id = cell_id.into();
         let agent_id_str = agent_id.into();
@@ -102,6 +102,32 @@ impl BlockDocument {
             version: 0,
         }
     }
+
+    /// Create an empty document for sync (client-side, no initial operations).
+    ///
+    /// Use this when the document will receive its initial state via `merge_ops`.
+    /// The blocks Set will be created when ops are merged from the server.
+    pub fn new_for_sync(cell_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        let cell_id = cell_id.into();
+        let agent_id_str = agent_id.into();
+
+        let oplog = OpLog::new();
+        // Don't create blocks Set - it will come from merged ops
+        // blocks_set_lv will be looked up after first merge
+
+        Self {
+            cell_id,
+            agent_id_str,
+            agent: 0, // Will be set on first local operation
+            oplog,
+            blocks_set_lv: 0, // Invalid until ops are merged
+            next_seq: 0,
+            version: 0,
+        }
+    }
+
+    // NOTE: refresh_after_merge was removed - we need a proper sync protocol
+    // where the server sends the full oplog on initial connect.
 
     // =========================================================================
     // Accessors
@@ -985,6 +1011,11 @@ impl BlockDocument {
 
         let mut last_id: Option<BlockId> = None;
         for block_snap in snapshot.blocks {
+            // Track max seq for our agent_id to avoid ID collisions
+            if block_snap.id.agent_id == agent_id {
+                doc.next_seq = doc.next_seq.max(block_snap.id.seq + 1);
+            }
+
             let _ = doc.insert_block_with_id(
                 block_snap.id.clone(),
                 block_snap.parent_id.as_ref(),
@@ -1265,5 +1296,230 @@ mod tests {
 
         // Moving after non-existent block should fail
         assert!(doc.move_block(&a, Some(&fake_id)).is_err());
+    }
+
+    /// Test that demonstrates the client-server sync failure.
+    ///
+    /// The problem: Both server and client call `BlockDocument::new()`, which creates
+    /// an independent "blocks" Set operation. When server sends `ops_since(frontier)`
+    /// (incremental ops), those ops reference the server's "blocks" Set creation which
+    /// doesn't exist in the client's oplog -> DataMissing error.
+    ///
+    /// This test replicates the exact behavior causing streaming failures in the UI.
+    #[test]
+    fn test_sync_fails_with_independent_blocks_set_creation() {
+        // === Server side ===
+        // Server creates its document - this creates a "blocks" Set operation
+        let mut server = BlockDocument::new("cell-1", "server-agent");
+
+        // Capture frontier AFTER "blocks" Set was created (current buggy behavior)
+        let frontier_after_init = server.frontier();
+
+        // Server inserts a block
+        let _block_id = server.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Hello from server",
+            "user:alice"
+        ).unwrap();
+
+        // Server gets ops since AFTER init (only the block insert, not the "blocks" Set)
+        let incremental_ops = server.ops_since(&frontier_after_init);
+
+        // === Client side ===
+        // Client creates its OWN document - this creates a DIFFERENT "blocks" Set operation
+        let mut client = BlockDocument::new("cell-1", "client-agent");
+
+        // Client tries to merge the incremental ops
+        // THIS SHOULD FAIL because the ops reference server's "blocks" Set creation
+        // which doesn't exist in client's oplog
+        let result = client.merge_ops_owned(incremental_ops);
+
+        // BUG DEMONSTRATION: This assert documents the current broken behavior.
+        // When we fix the bug, this test should be updated to expect success.
+        assert!(
+            result.is_err(),
+            "Expected DataMissing error when merging incremental ops with independent oplog roots"
+        );
+
+        // Verify the error is specifically about missing data
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("DataMissing") || err_msg.contains("Missing"),
+            "Expected DataMissing error, got: {}", err_msg
+        );
+    }
+
+    /// Test that demonstrates the correct fix: sending full oplog.
+    ///
+    /// When server sends `ops_since(&[])` (from empty frontier), it includes
+    /// the "blocks" Set creation, allowing the client to merge successfully.
+    #[test]
+    fn test_sync_succeeds_with_full_oplog() {
+        // === Server side ===
+        let mut server = BlockDocument::new("cell-1", "server-agent");
+
+        // Server inserts a block
+        let _block_id = server.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Hello from server",
+            "user:alice"
+        ).unwrap();
+
+        // Server gets ops from EMPTY frontier (full oplog, including "blocks" Set creation)
+        let full_ops = server.ops_since(&[]);
+
+        // === Client side ===
+        // Client needs an empty document (no independent "blocks" Set)
+        // Create a new OpLog directly to simulate a clean sync client
+        let mut client_oplog = OpLog::new();
+
+        // Merge the full ops - this should work because it includes "blocks" Set creation
+        let result = client_oplog.merge_ops_owned(full_ops.clone());
+
+        assert!(
+            result.is_ok(),
+            "Full oplog merge should succeed: {:?}", result
+        );
+
+        // Verify client oplog has operations (simple sanity check)
+        // The full checkout should contain the "blocks" key and the block data
+        let checkout = client_oplog.checkout();
+        assert!(
+            checkout.get(&SmartString::from("blocks")).is_some(),
+            "Client should have 'blocks' key after merging full oplog"
+        );
+    }
+
+    /// Test incremental sync after initial full sync.
+    ///
+    /// After client receives full oplog and establishes sync, subsequent
+    /// incremental ops should merge correctly.
+    #[test]
+    fn test_incremental_sync_after_full_sync() {
+        // === Initial full sync ===
+        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let full_ops = server.ops_since(&[]);
+
+        // Client creates empty oplog and merges full state
+        let mut client_oplog = OpLog::new();
+        client_oplog.merge_ops_owned(full_ops).expect("initial sync should work");
+
+        // === Server continues ===
+        let frontier_before_block = server.frontier();
+
+        let _block_id = server.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "New block",
+            "user:alice"
+        ).unwrap();
+
+        // Get incremental ops for just the block insert
+        let incremental_ops = server.ops_since(&frontier_before_block);
+
+        // Client merges incremental ops - should work now because roots match
+        let result = client_oplog.merge_ops_owned(incremental_ops);
+
+        assert!(
+            result.is_ok(),
+            "Incremental merge after full sync should succeed: {:?}", result
+        );
+    }
+
+    /// BUG REPLICATION: This test currently FAILS, will PASS after fix.
+    ///
+    /// Desired behavior: Client receives snapshot, then can merge subsequent ops.
+    /// Current behavior: from_snapshot creates independent oplog → merge fails.
+    #[test]
+    fn test_snapshot_then_streaming_should_work() {
+        // === Server: initial state ===
+        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let block_id = server.insert_block(
+            None,
+            None,
+            Role::Model,
+            BlockKind::Text,
+            "Initial content",
+            "model:claude"
+        ).unwrap();
+
+        // Server sends snapshot to client
+        let snapshot = server.snapshot();
+
+        // === Client: receives snapshot ===
+        // Current: from_snapshot calls new() → independent oplog
+        // Fixed: should share oplog history with server
+        let mut client = BlockDocument::from_snapshot(snapshot, "client-agent");
+
+        // Verify client has the block
+        assert_eq!(client.block_count(), 1);
+
+        // === Server: continues streaming ===
+        let frontier_before_append = server.frontier();
+        server.append_text(&block_id, " more text").unwrap();
+        let incremental_ops = server.ops_since(&frontier_before_append);
+
+        // === Client: merges incremental ops ===
+        // DESIRED: This should succeed - client should see "Initial content more text"
+        // CURRENT BUG: Fails with DataMissing
+        let result = client.merge_ops_owned(incremental_ops);
+
+        assert!(
+            result.is_ok(),
+            "Merge should succeed after snapshot sync. Error: {:?}",
+            result.err()
+        );
+
+        // Verify content converged
+        let final_content = client.get_block_snapshot(&block_id).unwrap().content;
+        assert_eq!(final_content, "Initial content more text");
+    }
+
+    /// Test text streaming sync (append operations).
+    #[test]
+    fn test_text_streaming_sync() {
+        // === Initial setup ===
+        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let block_id = server.insert_block(
+            None,
+            None,
+            Role::Model,
+            BlockKind::Text,
+            "", // Start empty
+            "model:claude"
+        ).unwrap();
+
+        // Full sync to client
+        let full_ops = server.ops_since(&[]);
+        let mut client_oplog = OpLog::new();
+        client_oplog.merge_ops_owned(full_ops).expect("initial sync");
+
+        // === Streaming ===
+        // Server appends text in chunks
+        let chunks = ["Hello", " ", "World", "!"];
+
+        for chunk in chunks {
+            let frontier_before = server.frontier();
+            server.append_text(&block_id, chunk).unwrap();
+
+            let chunk_ops = server.ops_since(&frontier_before);
+            client_oplog.merge_ops_owned(chunk_ops)
+                .expect(&format!("merging chunk '{}' should work", chunk));
+        }
+
+        // Verify final state matches
+        let server_content = server.get_block_snapshot(&block_id).unwrap().content;
+        assert_eq!(server_content, "Hello World!");
+
+        // For client verification, we'd need to wrap the oplog in BlockDocument
+        // For now, just verify the merge succeeded without errors
     }
 }
