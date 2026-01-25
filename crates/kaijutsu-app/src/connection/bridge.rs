@@ -128,14 +128,8 @@ pub enum ConnectionEvent {
     BlockInserted {
         cell_id: String,
         block: Box<kaijutsu_crdt::BlockSnapshot>,
-    },
-    /// A block's text content was edited (deprecated, use BlockTextOps)
-    BlockEdited {
-        cell_id: String,
-        block_id: kaijutsu_crdt::BlockId,
-        pos: u64,
-        insert: String,
-        delete: u64,
+        /// CRDT ops that created this block (for sync)
+        ops: Vec<u8>,
     },
     /// CRDT operations for a block's text content
     BlockTextOps {
@@ -810,7 +804,13 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.evt_tx.send(ConnectionEvent::BlockInserted { cell_id, block: Box::new(block) });
+        // Extract CRDT ops that created this block
+        let ops = match params.get_ops() {
+            Ok(data) => data.to_vec(),
+            Err(_) => vec![], // Empty if not present (backward compat)
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::BlockInserted { cell_id, block: Box::new(block), ops });
         Promise::ok(())
     }
 
@@ -846,47 +846,10 @@ impl block_events::Server for BlockEventsCallback {
 
     fn on_block_edited(
         self: Rc<Self>,
-        params: block_events::OnBlockEditedParams,
+        _params: block_events::OnBlockEditedParams,
         _results: block_events::OnBlockEditedResults,
     ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
-
-        let cell_id = match params.get_cell_id() {
-            Ok(s) => match s.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let block_id = match params.get_block_id() {
-            Ok(b) => match parse_block_id(&b) {
-                Ok(id) => id,
-                Err(e) => return Promise::err(e),
-            },
-            Err(e) => return Promise::err(e),
-        };
-
-        let pos = params.get_pos();
-        let insert = match params.get_insert() {
-            Ok(s) => match s.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
-            },
-            Err(e) => return Promise::err(e),
-        };
-        let delete = params.get_delete();
-
-        let _ = self.evt_tx.send(ConnectionEvent::BlockEdited {
-            cell_id,
-            block_id,
-            pos,
-            insert,
-            delete,
-        });
+        // Deprecated: position-based edits removed (25b2bc6), use on_block_text_ops
         Promise::ok(())
     }
 

@@ -992,6 +992,89 @@ impl BlockDocument {
     }
 
     // =========================================================================
+    // Oplog-Based Sync (for initial state transfer)
+    // =========================================================================
+
+    /// Get full oplog as serialized bytes (for initial sync).
+    ///
+    /// This serializes the complete oplog from empty frontier, enabling clients
+    /// to receive the full CRDT history including the root "blocks" Set creation.
+    /// This is essential for proper sync - clients cannot merge incremental ops
+    /// without having the oplog root operations.
+    pub fn oplog_bytes(&self) -> Vec<u8> {
+        let ops = self.ops_since(&[]); // Full oplog from empty frontier
+        serde_json::to_vec(&ops).unwrap_or_default()
+    }
+
+    /// Create document from serialized oplog (client-side sync).
+    ///
+    /// This is the proper way to initialize a client document for sync.
+    /// Instead of creating an independent oplog root (which breaks causality),
+    /// we start with an empty OpLog and merge the server's full oplog.
+    ///
+    /// # Arguments
+    ///
+    /// * `cell_id` - Cell ID for the document
+    /// * `agent_id` - Agent ID for local operations
+    /// * `oplog_bytes` - Serialized oplog from server's `oplog_bytes()`
+    ///
+    /// # Returns
+    ///
+    /// A BlockDocument with the same oplog state as the server, ready for
+    /// incremental sync via `merge_ops`.
+    pub fn from_oplog(
+        cell_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        oplog_bytes: &[u8],
+    ) -> Result<Self> {
+        let cell_id = cell_id.into();
+        let agent_id_str = agent_id.into();
+
+        // Start with empty oplog (no independent "blocks" Set!)
+        let mut oplog = OpLog::new();
+
+        // Merge server's full oplog
+        let ops: SerializedOpsOwned = serde_json::from_slice(oplog_bytes)
+            .map_err(|e| CrdtError::Internal(format!("deserialize oplog: {}", e)))?;
+        oplog
+            .merge_ops_owned(ops)
+            .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;
+
+        // Find blocks_set_lv from merged oplog by looking up ROOT["blocks"]
+        let (kind, blocks_set_lv) = oplog.crdt_at_path(&["blocks"]);
+        if kind != CRDTKind::Set {
+            return Err(CrdtError::Internal(
+                "oplog missing 'blocks' Set at root".into(),
+            ));
+        }
+
+        let agent = oplog.cg.get_or_create_agent_id(&agent_id_str);
+
+        // Calculate next_seq from existing blocks (avoid ID collisions)
+        let mut next_seq = 0u64;
+        let blocks = oplog.checkout_set(blocks_set_lv);
+        for p in blocks.iter() {
+            if let Primitive::Str(key) = p {
+                if let Some(block_id) = BlockId::from_key(key) {
+                    if block_id.agent_id == agent_id_str {
+                        next_seq = next_seq.max(block_id.seq + 1);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            cell_id,
+            agent_id_str,
+            agent,
+            oplog,
+            blocks_set_lv,
+            next_seq,
+            version: 0,
+        })
+    }
+
+    // =========================================================================
     // Serialization
     // =========================================================================
 
@@ -1434,10 +1517,10 @@ mod tests {
         );
     }
 
-    /// BUG REPLICATION: This test currently FAILS, will PASS after fix.
+    /// Test oplog-based sync: client receives full oplog, then streams work.
     ///
-    /// Desired behavior: Client receives snapshot, then can merge subsequent ops.
-    /// Current behavior: from_snapshot creates independent oplog → merge fails.
+    /// This replaces the old snapshot-based approach. The server sends its full
+    /// oplog, client creates document from it, and subsequent incremental ops merge.
     #[test]
     fn test_snapshot_then_streaming_should_work() {
         // === Server: initial state ===
@@ -1451,13 +1534,13 @@ mod tests {
             "model:claude"
         ).unwrap();
 
-        // Server sends snapshot to client
-        let snapshot = server.snapshot();
+        // Server sends full oplog to client (the fix!)
+        let oplog_bytes = server.oplog_bytes();
 
-        // === Client: receives snapshot ===
-        // Current: from_snapshot calls new() → independent oplog
-        // Fixed: should share oplog history with server
-        let mut client = BlockDocument::from_snapshot(snapshot, "client-agent");
+        // === Client: receives full oplog ===
+        // Fixed: from_oplog merges server's oplog → shared history
+        let mut client = BlockDocument::from_oplog("cell-1", "client-agent", &oplog_bytes)
+            .expect("from_oplog should succeed");
 
         // Verify client has the block
         assert_eq!(client.block_count(), 1);
@@ -1468,13 +1551,12 @@ mod tests {
         let incremental_ops = server.ops_since(&frontier_before_append);
 
         // === Client: merges incremental ops ===
-        // DESIRED: This should succeed - client should see "Initial content more text"
-        // CURRENT BUG: Fails with DataMissing
+        // Now works because client and server share oplog history
         let result = client.merge_ops_owned(incremental_ops);
 
         assert!(
             result.is_ok(),
-            "Merge should succeed after snapshot sync. Error: {:?}",
+            "Merge should succeed after oplog sync. Error: {:?}",
             result.err()
         );
 

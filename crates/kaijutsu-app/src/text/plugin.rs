@@ -371,7 +371,21 @@ fn prepare_text(
     for area in &extracted.areas {
         seen_entities.insert(area.entity);
 
-        let wrap_width = (area.bounds.right - area.bounds.left) as f32;
+        // Defensive bounds calculation - use saturating arithmetic to prevent overflow panics
+        // TODO: Investigate root cause - bounds can be invalid (right < left) after CRDT sync
+        // This may be due to corrupt data from old DB or layout race conditions
+        let wrap_width = {
+            let width = (area.bounds.right as i64).saturating_sub(area.bounds.left as i64);
+            if width <= 0 {
+                warn!(
+                    "Invalid text bounds for entity {:?}: left={}, right={}, computed_width={} - using fallback",
+                    area.entity, area.bounds.left, area.bounds.right, width
+                );
+                800.0
+            } else {
+                width as f32
+            }
+        };
         // Use pre-computed hash if available, otherwise compute it
         // This avoids double-hashing for GlyphonTextBuffer entities
         let text_hash = area.text_hash.unwrap_or_else(|| hash_text(&area.text));

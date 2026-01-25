@@ -151,22 +151,9 @@ pub enum BlockFlow {
         block: BlockSnapshot,
         /// Block to insert after (None = beginning).
         after_id: Option<BlockId>,
-    },
-
-    /// Text was edited within a block (legacy position-based, deprecated).
-    /// Use TextOps for proper CRDT sync.
-    #[deprecated(note = "Use TextOps for CRDT-based sync")]
-    Edited {
-        /// The cell/document ID.
-        cell_id: String,
-        /// The block that was edited.
-        block_id: BlockId,
-        /// Character position where edit starts.
-        pos: u64,
-        /// Text to insert at position.
-        insert: String,
-        /// Number of characters to delete at position.
-        delete: u64,
+        /// CRDT operations that created this block (for sync).
+        /// Clients should merge these ops instead of creating their own.
+        ops: Vec<u8>,
     },
 
     /// CRDT operations for a block's text content.
@@ -221,11 +208,9 @@ pub enum BlockFlow {
 
 impl BlockFlow {
     /// Get the subject string for this event.
-    #[allow(deprecated)]
     pub fn subject(&self) -> &'static str {
         match self {
             Self::Inserted { .. } => "block.inserted",
-            Self::Edited { .. } => "block.edited",
             Self::TextOps { .. } => "block.text_ops",
             Self::Deleted { .. } => "block.deleted",
             Self::StatusChanged { .. } => "block.status",
@@ -235,11 +220,9 @@ impl BlockFlow {
     }
 
     /// Get the cell ID for this event.
-    #[allow(deprecated)]
     pub fn cell_id(&self) -> &str {
         match self {
             Self::Inserted { cell_id, .. }
-            | Self::Edited { cell_id, .. }
             | Self::TextOps { cell_id, .. }
             | Self::Deleted { cell_id, .. }
             | Self::StatusChanged { cell_id, .. }
@@ -249,12 +232,10 @@ impl BlockFlow {
     }
 
     /// Get the block ID for this event (if applicable).
-    #[allow(deprecated)]
     pub fn block_id(&self) -> Option<&BlockId> {
         match self {
             Self::Inserted { block, .. } => Some(&block.id),
-            Self::Edited { block_id, .. }
-            | Self::TextOps { block_id, .. }
+            Self::TextOps { block_id, .. }
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }
@@ -488,22 +469,11 @@ mod tests {
             BlockFlow::Inserted {
                 cell_id: "cell-1".into(),
                 block,
-                after_id: None
+                after_id: None,
+                ops: vec![],
             }
             .subject(),
             "block.inserted"
-        );
-
-        assert_eq!(
-            BlockFlow::Edited {
-                cell_id: "cell-1".into(),
-                block_id: id.clone(),
-                pos: 0,
-                insert: "x".into(),
-                delete: 0
-            }
-            .subject(),
-            "block.edited"
         );
 
         assert_eq!(
@@ -563,6 +533,7 @@ mod tests {
                 cell_id: "cell-1".into(),
                 block: block_clone,
                 after_id: None,
+                ops: vec![],
             });
         });
 
@@ -596,6 +567,7 @@ mod tests {
             cell_id: "cell-1".into(),
             block,
             after_id: None,
+            ops: vec![],
         });
 
         // Publish a status change

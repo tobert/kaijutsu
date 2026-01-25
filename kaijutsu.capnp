@@ -379,11 +379,12 @@ struct BlockCellState {
   cellId @0 :Text;
   blocks @1 :List(BlockSnapshot);
   version @2 :UInt64;
+  ops @3 :Data;  # Full oplog bytes for CRDT sync
 }
 
 # Callback for receiving block updates from server
 interface BlockEvents {
-  onBlockInserted @0 (cellId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool);
+  onBlockInserted @0 (cellId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
   onBlockDeleted @1 (cellId :Text, blockId :BlockId);
   onBlockEdited @2 (cellId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
   onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);

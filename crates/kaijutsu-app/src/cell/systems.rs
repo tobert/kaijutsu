@@ -1204,9 +1204,6 @@ pub fn sync_main_cell_to_conversation(
         editor.cursor = super::components::BlockCursor::at(last_block.id.clone(), len);
     }
 
-    // Mark dirty so rendering updates
-    editor.dirty = true;
-
     // Update or insert the ViewingConversation component
     match viewing_opt {
         Some(mut viewing) => {
@@ -1245,6 +1242,7 @@ pub fn handle_block_events(
     mut events: MessageReader<ConnectionEvent>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    layout_gen: Res<super::components::LayoutGeneration>,
 ) {
     let Ok(mut editor) = main_cells.single_mut() else {
         return;
@@ -1255,12 +1253,13 @@ pub fn handle_block_events(
 
     for event in events.read() {
         match event {
-            ConnectionEvent::BlockInserted { cell_id, block } => {
+            ConnectionEvent::BlockInserted { cell_id, block, ops } => {
                 info!(
-                    "Received BlockInserted: cell_id='{}', block_id={:?}, MainCell cell_id='{}'",
+                    "Received BlockInserted: cell_id='{}', block_id={:?}, MainCell cell_id='{}', ops_len={}",
                     cell_id,
                     block.id,
-                    editor.doc.cell_id()
+                    editor.doc.cell_id(),
+                    ops.len()
                 );
 
                 // Validate cell ID matches our document
@@ -1277,73 +1276,41 @@ pub fn handle_block_events(
 
                 // Skip if block already exists (idempotent)
                 if editor.doc.get_block_snapshot(&block.id).is_some() {
+                    trace!("Block {:?} already exists, skipping", block.id);
                     continue;
                 }
 
-                // Find insertion point: after parent (if exists), otherwise append at end
-                let after_id = if let Some(ref parent_id) = block.parent_id {
-                    // Verify parent exists before inserting child
-                    if editor.doc.get_block_snapshot(parent_id).is_none() {
-                        warn!(
-                            "Block {:?} has parent_id {:?} but parent not found - appending at end",
-                            block.id, parent_id
-                        );
-                        editor.doc.blocks_ordered().last().map(|b| b.id.clone())
-                    } else {
-                        Some(parent_id.clone())
+                // Sync document from server's full oplog
+                // Server always sends full oplog on BlockInserted for reliable sync
+                // TODO: Optimize with frontier-based incremental sync
+                if !ops.is_empty() {
+                    match kaijutsu_crdt::BlockDocument::from_oplog(
+                        cell_id.clone(),
+                        editor.doc.agent_id(),
+                        ops,
+                    ) {
+                        Ok(new_doc) => {
+                            let block_count = new_doc.block_count();
+                            editor.doc = new_doc;
+                            info!(
+                                "Synced document from oplog - {} blocks, {} bytes",
+                                block_count,
+                                ops.len()
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to sync document from oplog for cell '{}': {}",
+                                cell_id, e
+                            );
+                        }
                     }
                 } else {
-                    // No parent - append after the last block
-                    editor.doc.blocks_ordered().last().map(|b| b.id.clone())
-                };
-
-                info!(
-                    "Inserting block {:?} (kind={:?}, parent={:?}, content_len={}) after {:?}",
-                    block.id, block.kind, block.parent_id, block.content.len(), after_id
-                );
-
-                match editor.doc.insert_from_snapshot((**block).clone(), after_id.as_ref()) {
-                    Ok(id) => {
-                        info!("Inserted block {:?} successfully", id);
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to insert block {:?} after {:?}: {}",
-                            block.id, after_id, e
-                        );
-                    }
-                }
-            }
-            ConnectionEvent::BlockEdited {
-                cell_id,
-                block_id,
-                pos,
-                insert,
-                delete,
-            } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
-                    continue;
-                }
-
-                // Log current block state for debugging sync issues
-                let current_len = editor
-                    .doc
-                    .get_block_snapshot(block_id)
-                    .map(|b| b.content.len())
-                    .unwrap_or(0);
-
-                match editor.doc.edit_text(block_id, *pos as usize, insert, *delete as usize) {
-                    Ok(()) => {
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to apply block edit: {} (block {:?} has len={}, edit pos={}, insert_len={}, delete={})",
-                            e, block_id, current_len, pos, insert.len(), delete
-                        );
-                    }
+                    // No ops is a protocol error - server must send creation ops
+                    error!(
+                        "BlockInserted for {:?} has no ops - protocol violation, block will not be created",
+                        block.id
+                    );
                 }
             }
             ConnectionEvent::BlockTextOps {
@@ -1361,7 +1328,6 @@ pub fn handle_block_events(
                     Ok(serialized_ops) => {
                         match editor.doc.merge_ops_owned(serialized_ops) {
                             Ok(()) => {
-                                editor.dirty = true;
                                 trace!("Merged CRDT ops for block {:?}", block_id);
                             }
                             Err(e) => {
@@ -1390,13 +1356,8 @@ pub fn handle_block_events(
                     continue;
                 }
 
-                match editor.doc.set_status(block_id, *status) {
-                    Ok(()) => {
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        warn!("Failed to update block status: {}", e);
-                    }
+                if let Err(e) = editor.doc.set_status(block_id, *status) {
+                    warn!("Failed to update block status: {}", e);
                 }
             }
             ConnectionEvent::BlockDeleted {
@@ -1408,13 +1369,8 @@ pub fn handle_block_events(
                     continue;
                 }
 
-                match editor.doc.delete_block(block_id) {
-                    Ok(()) => {
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        warn!("Failed to delete block: {}", e);
-                    }
+                if let Err(e) = editor.doc.delete_block(block_id) {
+                    warn!("Failed to delete block: {}", e);
                 }
             }
             ConnectionEvent::BlockCollapsedChanged {
@@ -1427,13 +1383,8 @@ pub fn handle_block_events(
                     continue;
                 }
 
-                match editor.doc.set_collapsed(block_id, *collapsed) {
-                    Ok(()) => {
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        warn!("Failed to update block collapsed state: {}", e);
-                    }
+                if let Err(e) = editor.doc.set_collapsed(block_id, *collapsed) {
+                    warn!("Failed to update block collapsed state: {}", e);
                 }
             }
             ConnectionEvent::BlockMoved {
@@ -1446,13 +1397,8 @@ pub fn handle_block_events(
                     continue;
                 }
 
-                match editor.doc.move_block(block_id, after_id.as_ref()) {
-                    Ok(()) => {
-                        editor.dirty = true;
-                    }
-                    Err(e) => {
-                        warn!("Failed to move block: {}", e);
-                    }
+                if let Err(e) = editor.doc.move_block(block_id, after_id.as_ref()) {
+                    warn!("Failed to move block: {}", e);
                 }
             }
             // Ignore other connection events - they're handled elsewhere
@@ -1464,8 +1410,10 @@ pub fn handle_block_events(
     // events and content changed, enable follow mode to smoothly track new content.
     // If user had scrolled up, we don't interrupt them.
     // IMPORTANT: Don't re-enable following if user explicitly scrolled this frame.
-    if was_at_bottom && editor.dirty && !scroll_state.user_scrolled_this_frame {
+    // Use LayoutGeneration to detect content changes (bumped by sync_block_cell_buffers).
+    if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
+        scroll_state.last_content_gen = layout_gen.0;
     }
 }
 

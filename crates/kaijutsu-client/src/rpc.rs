@@ -341,10 +341,14 @@ impl KernelHandle {
             blocks.push(snapshot);
         }
 
+        // Get full oplog for proper CRDT sync
+        let ops = state.get_ops().map(|d| d.to_vec()).unwrap_or_default();
+
         Ok(BlockCellState {
             cell_id,
             blocks,
             version,
+            ops,
         })
     }
 
@@ -593,6 +597,8 @@ pub struct BlockCellState {
     pub cell_id: String,
     pub blocks: Vec<kaijutsu_crdt::BlockSnapshot>,
     pub version: u64,
+    /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
+    pub ops: Vec<u8>,
 }
 
 // ============================================================================

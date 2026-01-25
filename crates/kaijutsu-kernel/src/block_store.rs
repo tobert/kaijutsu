@@ -339,23 +339,29 @@ impl BlockStore {
         content: impl Into<String>,
     ) -> Result<BlockId, String> {
         let after_id = after.cloned();
-        let (block_id, snapshot) = {
+        let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             let block_id = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
+            // Always send full oplog for BlockInserted to ensure clients can sync
+            // TODO: Optimize with frontier tracking - clients send their frontier,
+            // server sends ops_since(client_frontier) instead of full oplog
+            let ops = entry.doc.ops_since(&[]); // Full oplog from empty frontier
+            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
-            (block_id, snapshot)
+            (block_id, snapshot, ops_bytes)
         };
         self.auto_save(document_id);
 
-        // Emit flow event
+        // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             cell_id: document_id.to_string(),
             block: snapshot,
             after_id,
+            ops,
         });
 
         Ok(block_id)
@@ -371,23 +377,29 @@ impl BlockStore {
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
         let after_id = after.cloned();
-        let (block_id, snapshot) = {
+        let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
+            // Capture frontier before insert to get creation ops
+            let frontier = entry.doc.frontier();
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
+            // Get ops that created this block
+            let ops = entry.doc.ops_since(&frontier);
+            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
-            (block_id, snapshot)
+            (block_id, snapshot, ops_bytes)
         };
         self.auto_save(document_id);
 
-        // Emit flow event
+        // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             cell_id: document_id.to_string(),
             block: snapshot,
             after_id,
+            ops,
         });
 
         Ok(block_id)
@@ -404,23 +416,29 @@ impl BlockStore {
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
         let after_id = after.cloned();
-        let (block_id, snapshot) = {
+        let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
+            // Capture frontier before insert to get creation ops
+            let frontier = entry.doc.frontier();
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
+            // Get ops that created this block
+            let ops = entry.doc.ops_since(&frontier);
+            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
-            (block_id, snapshot)
+            (block_id, snapshot, ops_bytes)
         };
         self.auto_save(document_id);
 
-        // Emit flow event
+        // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             cell_id: document_id.to_string(),
             block: snapshot,
             after_id,
+            ops,
         });
 
         Ok(block_id)

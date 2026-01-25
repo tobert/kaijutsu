@@ -1057,19 +1057,8 @@ impl kernel::Server for KernelImpl {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
-            Which::EditBlockText(group) => {
-                let id_reader = pry!(group.get_id());
-                let block_id = kaijutsu_crdt::BlockId {
-                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
-                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
-                    seq: id_reader.get_seq(),
-                };
-                let pos = group.get_pos() as usize;
-                let insert = pry!(pry!(group.get_insert()).to_str());
-                let delete = group.get_delete() as usize;
-                if let Err(e) = kernel.documents.edit_text(&cell_id, &block_id, pos, insert, delete) {
-                    return Promise::err(capnp::Error::failed(e));
-                }
+            Which::EditBlockText(_) => {
+                // Deprecated: position-based edits replaced by CRDT ops (25b2bc6)
             }
             Which::SetCollapsed(group) => {
                 let id_reader = pry!(group.get_id());
@@ -1137,7 +1126,7 @@ impl kernel::Server for KernelImpl {
                 while let Some(msg) = sub.recv().await {
                     // Each branch sends its own request type; we convert the result to bool
                     let success = match msg.payload {
-                        BlockFlow::Inserted { ref cell_id, ref block, ref after_id } => {
+                        BlockFlow::Inserted { ref cell_id, ref block, ref after_id, ref ops } => {
                             let mut req = callback.on_block_inserted_request();
                             {
                                 let mut params = req.get();
@@ -1149,23 +1138,10 @@ impl kernel::Server for KernelImpl {
                                     aid.set_agent_id(&after.agent_id);
                                     aid.set_seq(after.seq);
                                 }
+                                // Include CRDT ops for proper sync
+                                params.set_ops(ops);
                                 let mut block_state = params.init_block();
                                 set_block_snapshot(&mut block_state, block);
-                            }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::Edited { ref cell_id, ref block_id, pos, ref insert, delete } => {
-                            let mut req = callback.on_block_edited_request();
-                            {
-                                let mut params = req.get();
-                                params.set_cell_id(cell_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
-                                params.set_pos(pos);
-                                params.set_insert(insert);
-                                params.set_delete(delete);
                             }
                             req.send().promise.await.is_ok()
                         }
@@ -1275,11 +1251,22 @@ impl kernel::Server for KernelImpl {
 
                 // Get actual blocks from BlockDocument
                 let blocks = doc.doc.blocks_ordered();
-                let mut block_list = cell_state.init_blocks(blocks.len() as u32);
+                let mut block_list = cell_state.reborrow().init_blocks(blocks.len() as u32);
                 for (i, block) in blocks.iter().enumerate() {
                     let mut block_builder = block_list.reborrow().get(i as u32);
                     set_block_snapshot(&mut block_builder, block);
                 }
+
+                // Send full oplog for proper CRDT sync
+                // This enables clients to merge subsequent incremental ops
+                let oplog_bytes = doc.doc.oplog_bytes();
+                cell_state.set_ops(&oplog_bytes);
+                log::debug!(
+                    "Sending BlockCellState for cell {} with {} blocks, {} bytes oplog",
+                    cell_id,
+                    blocks.len(),
+                    oplog_bytes.len()
+                );
             }
         }
 

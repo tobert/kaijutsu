@@ -116,9 +116,6 @@ pub struct CellEditor {
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
-
-    /// Whether content has changed since last sync.
-    pub dirty: bool,
 }
 
 impl Default for CellEditor {
@@ -135,7 +132,6 @@ impl CellEditor {
         Self {
             doc: BlockDocument::new(&cell_id, &agent_id),
             cursor: BlockCursor::default(),
-            dirty: false,
         }
     }
 
@@ -189,7 +185,6 @@ impl CellEditor {
             let _ = self.doc.delete_block(&id);
         }
         self.cursor = BlockCursor::default();
-        self.dirty = true;
     }
 
     /// Insert text at cursor position.
@@ -212,7 +207,6 @@ impl CellEditor {
                 .is_ok()
             {
                 self.cursor.offset += text.len();
-                self.dirty = true;
             }
     }
 
@@ -238,7 +232,6 @@ impl CellEditor {
                     .is_ok()
                 {
                     self.cursor.offset = new_offset;
-                    self.dirty = true;
                 }
             }
         }
@@ -260,13 +253,9 @@ impl CellEditor {
                 }
                 let delete_len = end - self.cursor.offset;
 
-                if self
+                let _ = self
                     .doc
-                    .edit_text(block_id, self.cursor.offset, "", delete_len)
-                    .is_ok()
-                {
-                    self.dirty = true;
-                }
+                    .edit_text(block_id, self.cursor.offset, "", delete_len);
             }
     }
 
@@ -333,7 +322,6 @@ impl CellEditor {
         if let Some(block) = self.doc.get_block_snapshot(block_id) {
             let new_state = !block.collapsed;
             let _ = self.doc.set_collapsed(block_id, new_state);
-            self.dirty = true;
         }
     }
 
@@ -530,6 +518,10 @@ pub struct ConversationScrollState {
     /// Cleared each frame by smooth_scroll.
     #[reflect(ignore)]
     pub user_scrolled_this_frame: bool,
+    /// Last LayoutGeneration value when we checked for auto-scroll.
+    /// Used to detect content changes for scroll auto-follow.
+    #[reflect(ignore)]
+    pub last_content_gen: u64,
 }
 
 impl Default for ConversationScrollState {
@@ -541,6 +533,7 @@ impl Default for ConversationScrollState {
             visible_height: 600.0, // Will be updated by layout system
             following: true, // Start in follow mode
             user_scrolled_this_frame: false,
+            last_content_gen: 0,
         }
     }
 }
