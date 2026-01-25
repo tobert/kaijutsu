@@ -115,6 +115,9 @@ pub struct GlyphonTextBuffer {
     cached_visual_lines: usize,
     /// The wrap width used for the cached visual line count.
     cached_wrap_width: f32,
+    /// Cached hash of text content for extract-phase optimization.
+    /// When text hasn't changed, extraction can skip the expensive text() call.
+    text_hash: u64,
 }
 
 impl GlyphonTextBuffer {
@@ -125,6 +128,7 @@ impl GlyphonTextBuffer {
             dirty: true,
             cached_visual_lines: 1,
             cached_wrap_width: 0.0,
+            text_hash: 0,
         }
     }
 
@@ -138,6 +142,21 @@ impl GlyphonTextBuffer {
     ) {
         self.buffer.set_text(font_system, text, attrs, shaping, None);
         self.dirty = true;
+        // Update text hash for extraction optimization
+        self.text_hash = Self::hash_str(text);
+    }
+
+    /// Get the cached text hash for extraction-phase optimization.
+    pub fn text_hash(&self) -> u64 {
+        self.text_hash
+    }
+
+    /// Hash a string (used for cache invalidation).
+    fn hash_str(s: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Get the text content as a string.

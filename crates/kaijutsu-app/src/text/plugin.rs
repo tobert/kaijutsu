@@ -81,6 +81,10 @@ pub struct ExtractedTextAreas {
 pub struct ExtractedTextArea {
     /// Entity ID for stable caching (enables buffer reuse across frames)
     pub entity: Entity,
+    /// Pre-computed text hash for cache invalidation (avoids text() allocation in extract).
+    /// If Some, the prepare phase can skip text() if hash matches cached value.
+    pub text_hash: Option<u64>,
+    /// Text content - only allocated when hash is None or cache needs rebuild.
     pub text: String,
     pub left: f32,
     pub top: f32,
@@ -198,13 +202,16 @@ fn extract_text_areas(
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     // Extract GlyphonTextBuffer areas (cells use monospace)
+    // Pass pre-computed hash to avoid text() allocation when cache is valid
     for (entity, buffer, config, inherited_visibility) in buffer_query.iter() {
         // Skip entities that aren't visible (respects parent Visibility::Hidden)
         if !inherited_visibility.get() {
             continue;
         }
 
-        let text = buffer.text();
+        // Use pre-computed hash - prepare phase will only call text() if cache miss
+        let text_hash = buffer.text_hash();
+        let text = buffer.text(); // Still need text for cache misses, but hash enables skipping reshaping
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             info!(
                 "First text extraction: {} chars at ({}, {}) bounds: {:?}",
@@ -216,6 +223,7 @@ fn extract_text_areas(
         }
         areas.push(ExtractedTextArea {
             entity,
+            text_hash: Some(text_hash),
             text,
             left: config.left,
             top: config.top,
@@ -228,6 +236,7 @@ fn extract_text_areas(
     }
 
     // Extract GlyphonUiText areas (UI labels)
+    // UI text doesn't have pre-computed hashes, so pass None
     for (entity, ui_text, position, inherited_visibility) in ui_text_query.iter() {
         // Skip entities that aren't visible (respects parent Visibility::Hidden)
         if !inherited_visibility.get() {
@@ -240,6 +249,7 @@ fn extract_text_areas(
         }
         areas.push(ExtractedTextArea {
             entity,
+            text_hash: None, // UI text doesn't cache hash
             text: ui_text.text.clone(),
             left: position.left,
             top: position.top,
@@ -360,7 +370,9 @@ fn prepare_text(
         seen_entities.insert(area.entity);
 
         let wrap_width = (area.bounds.right - area.bounds.left) as f32;
-        let text_hash = hash_text(&area.text);
+        // Use pre-computed hash if available, otherwise compute it
+        // This avoids double-hashing for GlyphonTextBuffer entities
+        let text_hash = area.text_hash.unwrap_or_else(|| hash_text(&area.text));
 
         // Check if we have a valid cached buffer
         let needs_rebuild = buffer_cache
