@@ -912,10 +912,14 @@ pub fn handle_prompt_submit(
 ///
 /// Note: We don't add messages locally - the server adds them and broadcasts
 /// back to us. This avoids duplicate messages.
+///
+/// IMPORTANT: Uses the conversation's document cell_id (not the registry ID)
+/// so that BlockInserted events from the server match our document's cell_id.
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
     mode: Res<CurrentMode>,
     current_conv: Res<CurrentConversation>,
+    registry: Res<ConversationRegistry>,
     mut scroll_state: ResMut<ConversationScrollState>,
     cmds: Option<Res<crate::connection::ConnectionCommands>>,
 ) {
@@ -925,6 +929,15 @@ pub fn handle_prompt_submitted(
         return;
     };
 
+    // Get the conversation's document cell_id (not the registry ID)
+    // This is critical: the server sends BlockInserted events with the document's
+    // cell_id, and handle_block_events validates against editor.doc.cell_id()
+    let Some(conv) = registry.get(conv_id) else {
+        warn!("Conversation {} not in registry", conv_id);
+        return;
+    };
+    let doc_cell_id = conv.doc.cell_id().to_string();
+
     for event in submit_events.read() {
         if let Some(ref cmds) = cmds {
             match mode.0 {
@@ -932,18 +945,24 @@ pub fn handle_prompt_submitted(
                     // Shell mode: execute as kaish command
                     cmds.send(crate::connection::ConnectionCommand::ShellExecute {
                         command: event.text.clone(),
-                        cell_id: conv_id.to_string(),
+                        cell_id: doc_cell_id.clone(),
                     });
-                    info!("Sent shell command to server for conversation {}", conv_id);
+                    info!(
+                        "Sent shell command to server (conv={}, cell_id={})",
+                        conv_id, doc_cell_id
+                    );
                 }
                 EditorMode::Chat => {
                     // Chat mode: send to LLM
                     cmds.send(crate::connection::ConnectionCommand::Prompt {
                         content: event.text.clone(),
                         model: None, // Use server default
-                        cell_id: conv_id.to_string(),
+                        cell_id: doc_cell_id.clone(),
                     });
-                    info!("Sent prompt to server for conversation {}", conv_id);
+                    info!(
+                        "Sent prompt to server (conv={}, cell_id={})",
+                        conv_id, doc_cell_id
+                    );
                 }
                 _ => {
                     // Other modes shouldn't submit prompts, but handle gracefully
@@ -1233,9 +1252,22 @@ pub fn handle_block_events(
     for event in events.read() {
         match event {
             ConnectionEvent::BlockInserted { cell_id, block } => {
+                info!(
+                    "Received BlockInserted: cell_id='{}', block_id={:?}, MainCell cell_id='{}'",
+                    cell_id,
+                    block.id,
+                    editor.doc.cell_id()
+                );
+
                 // Validate cell ID matches our document
                 if cell_id != editor.doc.cell_id() {
                     // Event for different cell - skip (future: route to correct cell)
+                    warn!(
+                        "Block event for cell_id '{}' but MainCell has '{}', dropping block {:?}",
+                        cell_id,
+                        editor.doc.cell_id(),
+                        block.id
+                    );
                     continue;
                 }
 
