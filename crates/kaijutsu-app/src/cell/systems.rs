@@ -10,8 +10,49 @@ use super::components::{
     PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
-use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer};
+use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer, TextMetrics};
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
+use crate::ui::theme::Theme;
+
+// ============================================================================
+// BLOCK COLOR MAPPING
+// ============================================================================
+
+/// Map a block to its semantic text color based on BlockKind and Role.
+///
+/// This enables visual distinction between different block types:
+/// - User messages: soft white
+/// - Assistant messages: light blue
+/// - Thinking: dim gray (de-emphasized)
+/// - Tool calls: amber
+/// - Tool results: green (error: red)
+/// - Shell: cyan for commands, gray for output
+pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color {
+    use kaijutsu_crdt::Role;
+
+    match block.kind {
+        BlockKind::Text => {
+            // Text blocks colored by role
+            match block.role {
+                Role::User => theme.block_user,
+                Role::Model => theme.block_assistant,  // Model/AI responses
+                Role::System => theme.fg_dim,          // System messages are dim
+                Role::Tool => theme.block_tool_result, // Tool context
+            }
+        }
+        BlockKind::Thinking => theme.block_thinking,
+        BlockKind::ToolCall => theme.block_tool_call,
+        BlockKind::ToolResult => {
+            if block.is_error {
+                theme.block_tool_error
+            } else {
+                theme.block_tool_result
+            }
+        }
+        BlockKind::ShellCommand => theme.block_shell_cmd,
+        BlockKind::ShellOutput => theme.block_shell_output,
+    }
+}
 
 /// Spawn a new cell entity with all required components.
 pub fn spawn_cell(
@@ -261,14 +302,15 @@ pub fn init_cell_buffers(
     mut commands: Commands,
     cells_without_buffer: Query<(Entity, &CellEditor), (With<GlyphonText>, Without<GlyphonTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
+    text_metrics: Res<TextMetrics>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
         return;
     };
 
     for (entity, editor) in cells_without_buffer.iter() {
-        // Create a new buffer with default metrics
-        let metrics = glyphon::Metrics::new(16.0, 20.0);
+        // Create a new buffer with DPI-aware metrics
+        let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
 
         // Initialize with current editor text
@@ -1015,8 +1057,12 @@ pub fn smooth_scroll(
     // In follow mode, lock directly to bottom - no interpolation needed
     // This is how terminals work: content grows, viewport stays anchored
     if scroll_state.following {
-        scroll_state.offset = max;
-        scroll_state.target_offset = max;
+        // Jitter prevention: only update if max changed by at least 1 pixel
+        // This prevents sub-pixel oscillation during streaming
+        if (max - scroll_state.offset).abs() >= 1.0 {
+            scroll_state.offset = max;
+            scroll_state.target_offset = max;
+        }
         return;
     }
 
@@ -1032,38 +1078,31 @@ pub fn handle_scroll_input(
     mode: Res<CurrentMode>,
     keys: Res<ButtonInput<KeyCode>>,
 ) {
-    // Scroll speed multiplier
-    const SCROLL_SPEED: f32 = 40.0;
+    // Scroll speed multipliers - tuned for responsive feel
+    // Line units (discrete mouse wheel clicks): ~3 lines per click
+    const LINE_SCROLL_SPEED: f32 = 60.0;
+    // Pixel units (touchpad, smooth scroll): direct 1:1 feels natural
+    const PIXEL_SCROLL_SPEED: f32 = 1.5;
 
-    // Handle mouse wheel
+    // Handle mouse wheel - accumulate all events this frame
     for event in mouse_wheel.read() {
         // Scroll up = negative delta = decrease offset (show earlier content)
         // Scroll down = positive delta = increase offset (show later content)
-        let delta = -event.y * SCROLL_SPEED;
+        let multiplier = match event.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => LINE_SCROLL_SPEED,
+            bevy::input::mouse::MouseScrollUnit::Pixel => PIXEL_SCROLL_SPEED,
+        };
+        let delta = -event.y * multiplier;
         scroll_state.scroll_by(delta);
     }
 
     // Handle j/k navigation in Normal mode
     if mode.0 == EditorMode::Normal {
         if keys.just_pressed(KeyCode::KeyJ) {
-            info!(
-                "scroll j: offset={} -> {}, content={}, visible={}",
-                scroll_state.offset,
-                scroll_state.offset + SCROLL_SPEED,
-                scroll_state.content_height,
-                scroll_state.visible_height
-            );
-            scroll_state.scroll_by(SCROLL_SPEED);
+            scroll_state.scroll_by(LINE_SCROLL_SPEED);
         }
         if keys.just_pressed(KeyCode::KeyK) {
-            info!(
-                "scroll k: offset={} -> {}, content={}, visible={}",
-                scroll_state.offset,
-                scroll_state.offset - SCROLL_SPEED,
-                scroll_state.content_height,
-                scroll_state.visible_height
-            );
-            scroll_state.scroll_by(-SCROLL_SPEED);
+            scroll_state.scroll_by(-LINE_SCROLL_SPEED);
         }
         // Page down/up with Ctrl+d/u
         if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
@@ -1235,6 +1274,11 @@ use crate::connection::ConnectionEvent;
 /// This system processes streamed block events (inserted, edited, deleted, etc.)
 /// from the server and applies them to the local document for live updates.
 ///
+/// **Frontier-based sync protocol:**
+/// - First BlockInserted (or cell_id change) → full sync via `from_oplog()`
+/// - Subsequent BlockInserted → incremental merge via `merge_ops_owned()`
+/// - BlockTextOps → always incremental merge
+///
 /// Implements terminal-like auto-scroll: if the user is at the bottom when
 /// new content arrives, we stay at the bottom. If they've scrolled up to
 /// read history, we don't interrupt them.
@@ -1242,6 +1286,7 @@ pub fn handle_block_events(
     mut events: MessageReader<ConnectionEvent>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    mut sync_state: ResMut<super::components::DocumentSyncState>,
     layout_gen: Res<super::components::LayoutGeneration>,
 ) {
     let Ok(mut editor) = main_cells.single_mut() else {
@@ -1253,99 +1298,50 @@ pub fn handle_block_events(
 
     for event in events.read() {
         match event {
-            ConnectionEvent::BlockInserted { cell_id, block, ops } => {
-                info!(
-                    "Received BlockInserted: cell_id='{}', block_id={:?}, MainCell cell_id='{}', ops_len={}",
-                    cell_id,
-                    block.id,
-                    editor.doc.cell_id(),
-                    ops.len()
-                );
-
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
-                    // Event for different cell - skip (future: route to correct cell)
-                    warn!(
-                        "Block event for cell_id '{}' but MainCell has '{}', dropping block {:?}",
-                        cell_id,
-                        editor.doc.cell_id(),
-                        block.id
-                    );
-                    continue;
-                }
-
-                // Skip if block already exists (idempotent)
-                if editor.doc.get_block_snapshot(&block.id).is_some() {
-                    trace!("Block {:?} already exists, skipping", block.id);
-                    continue;
-                }
-
-                // Sync document from server's full oplog
-                // Server always sends full oplog on BlockInserted for reliable sync
-                // TODO: Optimize with frontier-based incremental sync
-                if !ops.is_empty() {
-                    match kaijutsu_crdt::BlockDocument::from_oplog(
-                        cell_id.clone(),
-                        editor.doc.agent_id(),
-                        ops,
-                    ) {
-                        Ok(new_doc) => {
-                            let block_count = new_doc.block_count();
-                            editor.doc = new_doc;
-                            info!(
-                                "Synced document from oplog - {} blocks, {} bytes",
-                                block_count,
-                                ops.len()
-                            );
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to sync document from oplog for cell '{}': {}",
-                                cell_id, e
-                            );
-                        }
+            // Initial state from server - delegate to SyncManager
+            ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
+                match sync_state.apply_initial_state(&mut editor.doc, cell_id, ops) {
+                    Ok(result) => {
+                        trace!("Initial state sync result: {:?}", result);
                     }
-                } else {
-                    // No ops is a protocol error - server must send creation ops
-                    error!(
-                        "BlockInserted for {:?} has no ops - protocol violation, block will not be created",
-                        block.id
-                    );
+                    Err(e) => {
+                        // SyncManager already logged the error
+                        trace!("Initial state sync error: {}", e);
+                    }
                 }
             }
+
+            // Block insertion - delegate to SyncManager
+            ConnectionEvent::BlockInserted { cell_id, block, ops } => {
+                match sync_state.apply_block_inserted(&mut editor.doc, cell_id, block, ops) {
+                    Ok(result) => {
+                        trace!("Block insert sync result for {:?}: {:?}", block.id, result);
+                    }
+                    Err(e) => {
+                        // SyncManager already logged the error and reset frontier if needed
+                        trace!("Block insert sync error for {:?}: {}", block.id, e);
+                    }
+                }
+            }
+
+            // Text streaming ops - delegate to SyncManager
             ConnectionEvent::BlockTextOps {
                 cell_id,
                 block_id,
                 ops,
             } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
-                    continue;
-                }
-
-                // Deserialize and merge CRDT operations
-                match serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
-                    Ok(serialized_ops) => {
-                        match editor.doc.merge_ops_owned(serialized_ops) {
-                            Ok(()) => {
-                                trace!("Merged CRDT ops for block {:?}", block_id);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to merge CRDT ops for block {:?}: {}",
-                                    block_id, e
-                                );
-                            }
-                        }
+                match sync_state.apply_text_ops(&mut editor.doc, cell_id, ops) {
+                    Ok(result) => {
+                        trace!("Text ops sync result for {:?}: {:?}", block_id, result);
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to deserialize CRDT ops for block {:?}: {}",
-                            block_id, e
-                        );
+                        // SyncManager already logged the error and reset frontier if needed
+                        trace!("Text ops sync error for {:?}: {}", block_id, e);
                     }
                 }
             }
+
+            // Non-CRDT events stay in the system (no sync state changes)
             ConnectionEvent::BlockStatusChanged {
                 cell_id,
                 block_id,
@@ -1545,13 +1541,14 @@ pub fn init_block_cell_buffers(
     mut commands: Commands,
     block_cells: Query<Entity, (With<BlockCell>, With<GlyphonText>, Without<GlyphonTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
+    text_metrics: Res<TextMetrics>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
         return;
     };
 
     for entity in block_cells.iter() {
-        let metrics = glyphon::Metrics::new(16.0, 20.0);
+        let metrics = text_metrics.scaled_cell_metrics();
         let buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
         commands.entity(entity).insert(buffer);
     }
@@ -1561,12 +1558,18 @@ pub fn init_block_cell_buffers(
 ///
 /// Only updates cells whose content has changed (tracked via version).
 /// When any buffer is updated, bumps LayoutGeneration to trigger re-layout.
+/// Also applies block-specific text colors based on BlockKind and Role.
+///
+/// Note: We don't use Changed<CellEditor> because sync_main_cell_to_conversation
+/// mutates editor.doc directly which doesn't trigger Bevy change detection.
+/// Instead, we rely on block_cell.last_render_version for dirty tracking.
 pub fn sync_block_cell_buffers(
     main_entity: Res<MainCellEntity>,
-    main_cells: Query<&CellEditor, (With<MainCell>, Changed<CellEditor>)>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut GlyphonTextBuffer)>,
+    mut block_cells: Query<(&mut BlockCell, &mut GlyphonTextBuffer, &mut TextAreaConfig)>,
     font_system: Res<SharedFontSystem>,
+    theme: Res<Theme>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = main_entity.0 else {
@@ -1588,16 +1591,25 @@ pub fn sync_block_cell_buffers(
 
     let doc_version = editor.version();
 
-    // Get all blocks for lookup
-    let blocks: std::collections::HashMap<_, _> = editor
-        .blocks()
-        .into_iter()
-        .map(|b| (b.id.clone(), b))
-        .collect();
+    // Get ordered blocks for role transition detection
+    let blocks_ordered = editor.blocks();
 
-    let mut updated_any = false;
+    // Build lookup map and track role transitions
+    let mut blocks: std::collections::HashMap<_, _> = std::collections::HashMap::new();
+    let mut is_role_transition: std::collections::HashMap<kaijutsu_crdt::BlockId, (bool, kaijutsu_crdt::Role)> =
+        std::collections::HashMap::new();
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+
+    for block in &blocks_ordered {
+        let transition = prev_role != Some(block.role);
+        is_role_transition.insert(block.id.clone(), (transition, block.role));
+        blocks.insert(block.id.clone(), block.clone());
+        prev_role = Some(block.role);
+    }
+
+    let mut layout_changed = false;
     for entity in &container.block_cells {
-        let Ok((mut block_cell, mut buffer)) = block_cells.get_mut(*entity) else {
+        let Ok((mut block_cell, mut buffer, mut config)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -1611,16 +1623,45 @@ pub fn sync_block_cell_buffers(
         };
 
         // Format and update the buffer
-        let text = format_single_block(block);
+        let mut text = String::new();
+
+        // Prepend role header on transitions
+        if let Some(&(is_transition, role)) = is_role_transition.get(&block_cell.block_id) {
+            if is_transition {
+                let header = match role {
+                    kaijutsu_crdt::Role::User => "── USER ──────────────────────",
+                    kaijutsu_crdt::Role::Model => "── ASSISTANT ─────────────────",
+                    kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
+                    kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
+                };
+                text.push_str(header);
+                text.push('\n');
+            }
+        }
+
+        text.push_str(&format_single_block(block));
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
         buffer.set_text(&mut font_system, &text, &attrs, glyphon::Shaping::Advanced);
 
+        // Apply block-specific color based on BlockKind and Role
+        let color = block_color(block, &theme);
+        config.default_color = bevy_to_glyphon_color(color);
+
+        // Track line count for layout dirty detection
+        // Use newline count as a fast proxy - layout only needs to recompute
+        // when vertical extent changes, not on every character
+        let line_count = text.chars().filter(|c| *c == '\n').count() + 1;
+        if block_cell.last_line_count != line_count {
+            block_cell.last_line_count = line_count;
+            layout_changed = true;
+        }
+
         block_cell.last_render_version = doc_version;
-        updated_any = true;
     }
 
-    // Bump generation to trigger layout recomputation
-    if updated_any {
+    // Only bump generation when layout actually needs to change
+    // (new blocks, removed blocks, or line count changes)
+    if layout_changed {
         layout_gen.bump();
     }
 }
@@ -1804,7 +1845,8 @@ pub fn apply_block_cell_positions(
 
     // === Performance optimization: skip if nothing changed ===
     let layout_changed = layout_gen.0 != *last_applied_gen;
-    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() > 0.1;
+    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
+    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
 
     if !layout_changed && !scroll_changed {
         // Neither layout nor scroll changed - skip position updates
@@ -1881,7 +1923,6 @@ use crate::ui::state::{
     InputBackdrop, InputDock, InputFrame, InputLayer, InputPresence,
     InputPresenceKind, InputShadow,
 };
-use crate::ui::theme::Theme;
 
 /// Compute the input position based on presence, dock, and window size.
 ///

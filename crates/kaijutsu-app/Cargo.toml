@@ -25,8 +25,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Logging
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+# Error handling
+thiserror.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true

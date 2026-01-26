@@ -18,10 +18,13 @@
 mod components;
 pub mod frame_assembly;
 pub mod plugin;
+mod sync;
 mod systems;
 
 // Re-export public API
 pub use components::{
-    Cell, ConversationContainer, CurrentMode, EditorMode, FocusedCell, PromptContainer,
+    Cell, ConversationContainer, CurrentMode, DocumentSyncState, EditorMode, FocusedCell,
+    PromptContainer,
 };
 pub use plugin::CellPlugin;
+pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};

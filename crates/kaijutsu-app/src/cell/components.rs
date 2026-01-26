@@ -404,6 +404,32 @@ pub struct CurrentMode(pub EditorMode);
 #[derive(Resource, Default)]
 pub struct FocusedCell(pub Option<Entity>);
 
+/// Resource tracking CRDT sync state for frontier-based incremental updates.
+///
+/// This is a thin wrapper around [`SyncManager`](super::sync::SyncManager) that
+/// integrates with Bevy ECS. The actual sync logic is in SyncManager, which can
+/// be unit tested without Bevy dependencies.
+///
+/// **Sync protocol:**
+/// - `frontier = None` or `cell_id` changed → full sync (from_oplog)
+/// - `frontier = Some(_)` and matching cell_id → incremental merge (merge_ops_owned)
+#[derive(Resource, Default)]
+pub struct DocumentSyncState(pub super::sync::SyncManager);
+
+impl std::ops::Deref for DocumentSyncState {
+    type Target = super::sync::SyncManager;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DocumentSyncState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Configuration for workspace layout.
 #[derive(Resource)]
 pub struct WorkspaceLayout {
@@ -647,6 +673,9 @@ pub struct BlockCell {
     pub block_id: BlockId,
     /// Last known content hash/version for dirty tracking.
     pub last_render_version: u64,
+    /// Last known visual line count for layout dirty tracking.
+    /// Only bump LayoutGeneration when this changes.
+    pub last_line_count: usize,
 }
 
 impl BlockCell {
@@ -654,6 +683,7 @@ impl BlockCell {
         Self {
             block_id,
             last_render_version: 0,
+            last_line_count: 0,
         }
     }
 }
