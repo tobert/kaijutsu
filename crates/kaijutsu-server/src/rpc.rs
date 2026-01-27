@@ -1328,28 +1328,26 @@ impl kernel::Server for KernelImpl {
             let prompt_id = uuid::Uuid::new_v4().to_string();
             log::debug!("Generated prompt_id={}", prompt_id);
 
-            // Insert user message block
-            {
-                // Auto-create document if it doesn't exist (client conversation ID)
-                if documents.get(&cell_id).is_none() {
-                    log::info!("Auto-creating document {} for prompt", cell_id);
-                    documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
-                        .map_err(|e| {
-                            log::error!("Failed to create document: {}", e);
-                            capnp::Error::failed(format!("failed to create document: {}", e))
-                        })?;
-                }
-
-                // Create user message block using the store's helper method
-                log::debug!("Inserting user block into document {}", cell_id);
-                let block_id = documents.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content)
+            // Auto-create document if it doesn't exist (client conversation ID)
+            if documents.get(&cell_id).is_none() {
+                log::info!("Auto-creating document {} for prompt", cell_id);
+                documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
                     .map_err(|e| {
-                        log::error!("Failed to insert user block: {}", e);
-                        capnp::Error::failed(format!("failed to insert user block: {}", e))
+                        log::error!("Failed to create document: {}", e);
+                        capnp::Error::failed(format!("failed to create document: {}", e))
                     })?;
-                log::debug!("Inserted user block: {:?}", block_id);
-                // User block broadcast happens via FlowBus (insert_block emits BlockFlow::Inserted)
-            };
+            }
+
+            // Create user message block at the end of the document
+            let last_block = documents.last_block_id(&cell_id);
+            log::info!("Inserting user block into document {}, after={:?}", cell_id, last_block);
+            let user_block_id = documents.insert_block(&cell_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content)
+                .map_err(|e| {
+                    log::error!("Failed to insert user block: {}", e);
+                    capnp::Error::failed(format!("failed to insert user block: {}", e))
+                })?;
+            log::debug!("Inserted user block: {:?}", user_block_id);
+            // User block broadcast happens via FlowBus (insert_block emits BlockFlow::Inserted)
 
             log::info!("User message block inserted, spawning LLM stream task");
 
@@ -1360,6 +1358,7 @@ impl kernel::Server for KernelImpl {
                 model_name, model, default_model);
 
             // Spawn LLM streaming in background task with agentic loop
+            // Pass user block_id so streaming blocks are inserted AFTER it
             tokio::task::spawn_local(process_llm_stream(
                 provider,
                 documents,
@@ -1368,6 +1367,7 @@ impl kernel::Server for KernelImpl {
                 model_name,
                 kernel_arc,
                 tools,
+                user_block_id, // last_block_id - streaming blocks appear after this
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -1769,17 +1769,20 @@ impl kernel::Server for KernelImpl {
                     .map_err(|e| capnp::Error::failed(format!("failed to create document: {}", e)))?;
             }
 
-            // Create ShellCommand block
+            // Create ShellCommand block at the end of the document
+            let last_block = documents.last_block_id(&cell_id);
+            log::info!("Inserting shell command into document {}, after={:?}", cell_id, last_block);
             let command_block_id = documents.insert_block(
-                &cell_id, None, None,
+                &cell_id, None, last_block.as_ref(),
                 Role::User, BlockKind::ShellCommand,
                 &code
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
-            log::debug!("Created shell command block: {:?}", command_block_id);
+            log::info!("Created shell command block: {:?}", command_block_id);
 
             // Create ShellOutput block (empty, will be filled by execution)
+            // Note: after = command_block_id ensures output appears after command in order
             let output_block_id = documents.insert_block(
-                &cell_id, Some(&command_block_id), None,
+                &cell_id, Some(&command_block_id), Some(&command_block_id),
                 Role::System, BlockKind::ShellOutput,
                 ""
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
@@ -2048,6 +2051,9 @@ fn get_tool_schema(tool_name: &str) -> serde_json::Value {
 /// Process LLM streaming in a background task with agentic loop.
 /// This function handles all stream events, executes tools, and loops until done.
 /// Block events are broadcast via FlowBus (BlockStore emits BlockFlow events).
+///
+/// `after_block_id` is the starting point for block ordering - all streaming blocks
+/// will be inserted after this block (typically the user's message).
 async fn process_llm_stream(
     provider: Arc<AnthropicProvider>,
     documents: SharedBlockStore,
@@ -2056,6 +2062,7 @@ async fn process_llm_stream(
     model_name: String,
     kernel: Arc<Kernel>,
     tools: Vec<ToolDefinition>,
+    after_block_id: kaijutsu_crdt::BlockId,
 ) {
     // Build initial conversation messages
     let mut messages: Vec<LlmMessage> = vec![LlmMessage::user(&content)];
@@ -2064,12 +2071,17 @@ async fn process_llm_stream(
     let max_iterations = 20;
     let mut iteration = 0;
 
+    // Track last inserted block for ordering - each new block goes after the previous
+    let mut last_block_id = after_block_id;
+
     // Agentic loop - continue until model is done or max iterations
     loop {
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
+            if let Ok(block_id) = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
+                last_block_id = block_id;
+            }
             break;
         }
 
@@ -2089,7 +2101,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
+                let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
                 return;
             }
         };
@@ -2110,8 +2122,11 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Thinking, "") {
-                        Ok(block_id) => current_block_id = Some(block_id),
+                    match documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "") {
+                        Ok(block_id) => {
+                            last_block_id = block_id.clone();
+                            current_block_id = Some(block_id);
+                        }
                         Err(e) => log::error!("Failed to insert thinking block: {}", e),
                     }
                 }
@@ -2129,8 +2144,11 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, "") {
-                        Ok(block_id) => current_block_id = Some(block_id),
+                    match documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "") {
+                        Ok(block_id) => {
+                            last_block_id = block_id.clone();
+                            current_block_id = Some(block_id);
+                        }
                         Err(e) => log::error!("Failed to insert text block: {}", e),
                     }
                 }
@@ -2155,9 +2173,10 @@ async fn process_llm_stream(
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
 
                     // Insert block and track it
-                    match documents.insert_tool_call(&cell_id, None, None, &name, input.clone()) {
+                    match documents.insert_tool_call(&cell_id, None, Some(&last_block_id), &name, input.clone()) {
                         Ok(block_id) => {
-                            tool_call_blocks.insert(id.clone(), block_id.clone());
+                            last_block_id = block_id.clone();
+                            tool_call_blocks.insert(id.clone(), block_id);
                         }
                         Err(e) => log::error!("Failed to insert tool use block: {}", e),
                     }
@@ -2178,7 +2197,9 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block(&cell_id, None, None, Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
+                    if let Ok(block_id) = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
+                        last_block_id = block_id;
+                    }
                     return;
                 }
             }
@@ -2224,10 +2245,13 @@ async fn process_llm_stream(
                 }
             };
 
-            // Insert tool result block (FlowBus handles broadcasting)
+            // Insert tool result block after the tool call (FlowBus handles broadcasting)
             if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                if let Err(e) = documents.insert_tool_result(&cell_id, tool_call_block_id, None, &result_content, is_error, None) {
-                    log::error!("Failed to insert tool result block: {}", e);
+                match documents.insert_tool_result(&cell_id, tool_call_block_id, Some(tool_call_block_id), &result_content, is_error, None) {
+                    Ok(block_id) => {
+                        last_block_id = block_id;
+                    }
+                    Err(e) => log::error!("Failed to insert tool result block: {}", e),
                 }
             }
 
