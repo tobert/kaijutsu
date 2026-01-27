@@ -66,7 +66,7 @@ struct ToolSchema {
 struct LlmRequest {
   content @0 :Text;       # The prompt text
   model @1 :Text;         # Optional model name, uses server default if empty
-  cellId @2 :Text;        # Target cell for response blocks
+  documentId @2 :Text;    # Target document for response blocks
 }
 
 struct Completion {
@@ -113,7 +113,7 @@ struct SeatInfo {
   status @2 :SeatStatus;
   lastActivity @3 :UInt64;    # Unix timestamp in milliseconds
   cursorBlock @4 :Text;       # Which block they're focused on (optional)
-  cellId @5 :Text;            # The kernel's main document cell_id for this seat
+  documentId @5 :Text;        # The kernel's main document ID for this seat
 }
 
 # A context within a kernel - a collection of documents with a focus scope
@@ -246,9 +246,9 @@ interface Kernel {
   getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
   # Block-based CRDT operations
-  applyBlockOp @18 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  applyBlockOp @18 (documentId :Text, op :BlockDocOp) -> (newVersion :UInt64);
   subscribeBlocks @19 (callback :BlockEvents);
-  getBlockCellState @20 (cellId :Text) -> (state :BlockCellState);
+  getDocumentState @20 (documentId :Text) -> (state :DocumentState);
 
   # LLM operations
   prompt @21 (request :LlmRequest) -> (promptId :Text);
@@ -266,16 +266,16 @@ interface Kernel {
 
   # Shell execution (kaish REPL with block output)
   # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
-  shellExecute @29 (code :Text, cellId :Text) -> (commandBlockId :BlockId);
+  shellExecute @29 (code :Text, documentId :Text) -> (commandBlockId :BlockId);
 }
 
 # ============================================================================
 # Block-Based CRDT Types (DAG Architecture)
 # ============================================================================
 
-# Block identifier - globally unique across all cells and agents
+# Block identifier - globally unique across all documents and agents
 struct BlockId {
-  cellId @0 :Text;
+  documentId @0 :Text;
   agentId @1 :Text;
   seq @2 :UInt64;
 }
@@ -379,9 +379,9 @@ struct BlockDocOp {
   }
 }
 
-# Full cell state with blocks
-struct BlockCellState {
-  cellId @0 :Text;
+# Full document state with blocks
+struct DocumentState {
+  documentId @0 :Text;
   blocks @1 :List(BlockSnapshot);
   version @2 :UInt64;
   ops @3 :Data;  # Full oplog bytes for CRDT sync
@@ -389,13 +389,13 @@ struct BlockCellState {
 
 # Callback for receiving block updates from server
 interface BlockEvents {
-  onBlockInserted @0 (cellId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
-  onBlockDeleted @1 (cellId :Text, blockId :BlockId);
-  onBlockEdited @2 (cellId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
-  onBlockCollapsed @3 (cellId :Text, blockId :BlockId, collapsed :Bool);
-  onBlockMoved @4 (cellId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @5 (cellId :Text, blockId :BlockId, status :Status);
-  onBlockTextOps @6 (cellId :Text, blockId :BlockId, ops :Data);
+  onBlockInserted @0 (documentId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
+  onBlockDeleted @1 (documentId :Text, blockId :BlockId);
+  onBlockEdited @2 (documentId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
+  onBlockCollapsed @3 (documentId :Text, blockId :BlockId, collapsed :Bool);
+  onBlockMoved @4 (documentId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
+  onBlockStatusChanged @5 (documentId :Text, blockId :BlockId, status :Status);
+  onBlockTextOps @6 (documentId :Text, blockId :BlockId, ops :Data);
 }
 
 # ============================================================================
