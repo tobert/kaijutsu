@@ -113,6 +113,7 @@ struct SeatInfo {
   status @2 :SeatStatus;
   lastActivity @3 :UInt64;    # Unix timestamp in milliseconds
   cursorBlock @4 :Text;       # Which block they're focused on (optional)
+  cellId @5 :Text;            # The kernel's main document cell_id for this seat
 }
 
 # A context within a kernel - a collection of documents with a focus scope

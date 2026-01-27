@@ -1724,6 +1724,8 @@ pub fn handle_block_events(
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
     layout_gen: Res<super::components::LayoutGeneration>,
+    current_conv: Res<CurrentConversation>,
+    mut registry: ResMut<ConversationRegistry>,
 ) {
     let Ok(mut editor) = main_cells.single_mut() else {
         return;
@@ -1734,44 +1736,88 @@ pub fn handle_block_events(
 
     for event in events.read() {
         match event {
-            // Initial state from server - delegate to SyncManager
+            // Initial state from server - apply to conversation registry
+            // sync_main_cell_to_conversation will then copy to MainCell
             ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
+                // Update the conversation in the registry (authoritative source)
+                if let Some(conv_id) = current_conv.id() {
+                    if let Some(conv) = registry.get_mut(conv_id) {
+                        let agent_id = conv.doc.agent_id().to_string();
+                        match kaijutsu_crdt::BlockDocument::from_oplog(
+                            cell_id.clone(),
+                            &agent_id,
+                            ops,
+                        ) {
+                            Ok(new_doc) => {
+                                info!(
+                                    "Applied initial state to conversation {}: {} blocks",
+                                    conv_id,
+                                    new_doc.block_count()
+                                );
+                                conv.doc = new_doc;
+                            }
+                            Err(e) => {
+                                warn!("Failed to apply initial state to conversation: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Also update sync state frontier for incremental ops
                 match sync_state.apply_initial_state(&mut editor.doc, cell_id, ops) {
                     Ok(result) => {
                         trace!("Initial state sync result: {:?}", result);
                     }
                     Err(e) => {
-                        // SyncManager already logged the error
                         trace!("Initial state sync error: {}", e);
                     }
                 }
             }
 
-            // Block insertion - delegate to SyncManager
+            // Block insertion - apply to conversation and sync state
             ConnectionEvent::BlockInserted { cell_id, block, ops } => {
+                // Update conversation registry (deserialize ops for CRDT merge)
+                if let Some(conv_id) = current_conv.id() {
+                    if let Some(conv) = registry.get_mut(conv_id) {
+                        if let Ok(serialized_ops) = serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
+                            if let Err(e) = conv.doc.merge_ops_owned(serialized_ops) {
+                                warn!("Failed to merge block insert ops to conversation: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Update sync state
                 match sync_state.apply_block_inserted(&mut editor.doc, cell_id, block, ops) {
                     Ok(result) => {
                         trace!("Block insert sync result for {:?}: {:?}", block.id, result);
                     }
                     Err(e) => {
-                        // SyncManager already logged the error and reset frontier if needed
                         trace!("Block insert sync error for {:?}: {}", block.id, e);
                     }
                 }
             }
 
-            // Text streaming ops - delegate to SyncManager
+            // Text streaming ops - apply to conversation and sync state
             ConnectionEvent::BlockTextOps {
                 cell_id,
                 block_id,
                 ops,
             } => {
+                // Update conversation registry (deserialize ops for CRDT merge)
+                if let Some(conv_id) = current_conv.id() {
+                    if let Some(conv) = registry.get_mut(conv_id) {
+                        if let Ok(serialized_ops) = serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
+                            if let Err(e) = conv.doc.merge_ops_owned(serialized_ops) {
+                                warn!("Failed to merge text ops to conversation: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Update sync state
                 match sync_state.apply_text_ops(&mut editor.doc, cell_id, ops) {
                     Ok(result) => {
                         trace!("Text ops sync result for {:?}: {:?}", block_id, result);
                     }
                     Err(e) => {
-                        // SyncManager already logged the error and reset frontier if needed
                         trace!("Text ops sync error for {:?}: {}", block_id, e);
                     }
                 }

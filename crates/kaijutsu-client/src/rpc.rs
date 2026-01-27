@@ -135,6 +135,7 @@ impl RpcClient {
                     context: id_reader.get_context()?.to_string()?,
                 },
                 owner: seat.get_owner()?.to_string()?,
+                cell_id: seat.get_cell_id()?.to_string()?,
             });
         }
         Ok(result)
@@ -182,6 +183,8 @@ pub struct SeatInfo {
     pub id: SeatId,
     /// Strong identity: username from SSH auth
     pub owner: String,
+    /// The kernel's main document cell_id for this seat
+    pub cell_id: String,
 }
 
 /// A context within a kernel - a collection of documents with a focus scope
@@ -432,6 +435,7 @@ impl KernelHandle {
                 context: id_reader.get_context()?.to_string()?,
             },
             owner: seat.get_owner()?.to_string()?,
+            cell_id: seat.get_cell_id()?.to_string()?,
         })
     }
 

@@ -101,11 +101,12 @@ impl Plugin for CellPlugin {
                 ),
             )
             // Block event handling (server → client sync)
-            // Receives block events from the server and updates the MainCell's document
+            // Receives block events from the server and updates the Conversation registry.
+            // Must run BEFORE sync_main_cell_to_conversation so sync sees updated version.
             .add_systems(
                 Update,
                 systems::handle_block_events
-                    .after(systems::sync_main_cell_to_conversation),
+                    .before(systems::sync_main_cell_to_conversation),
             )
             // Block cell systems (per-block UI rendering for conversation)
             // Each block gets its own entity with independent GlyphonTextBuffer
@@ -121,7 +122,8 @@ impl Plugin for CellPlugin {
                 Update,
                 (
                     systems::spawn_block_cells
-                        .after(systems::handle_block_events),
+                        .after(systems::handle_block_events)
+                        .after(systems::sync_main_cell_to_conversation),
                     ApplyDeferred
                         .after(systems::spawn_block_cells),
                     systems::init_block_cell_buffers

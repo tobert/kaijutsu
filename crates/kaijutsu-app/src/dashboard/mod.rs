@@ -363,22 +363,22 @@ fn handle_dashboard_events(
                 // BlockCellInitialState event (sent after SeatTaken) sets up the document
                 // from full oplog and establishes the frontier for incremental sync.
 
-                // Create/update conversation for this context with matching cell_id
-                // The cell_id must match what the server uses for BlockInserted events
-                let context_id = format!("{}:{}", seat.id.kernel, seat.id.context);
+                // Use the cell_id from the seat (server provides the main document ID)
+                // This ensures the client uses the same cell_id the server uses for BlockInserted events
+                let cell_id = seat.cell_id.clone();
                 let agent_id = format!("user:{}", whoami::username());
 
-                // Create conversation with context_id as both conversation ID and cell_id
+                // Create conversation using the server-provided cell_id
                 // (with_id uses the ID for BlockDocument::new which sets cell_id)
                 let conv = kaijutsu_kernel::Conversation::with_id(
-                    &context_id,  // becomes both conversation ID and doc cell_id
-                    &context_id,  // name (display)
+                    &cell_id,  // becomes both conversation ID and doc cell_id
+                    &cell_id,  // name (display)
                     &agent_id,
                 );
                 registry.add(conv);
-                current_conv.0 = Some(context_id.clone());
+                current_conv.0 = Some(cell_id.clone());
 
-                info!("Created conversation for context {}", context_id);
+                info!("Created conversation for cell {}", cell_id);
 
                 // Transition to Conversation screen
                 next_screen.set(AppScreen::Conversation);

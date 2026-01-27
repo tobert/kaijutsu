@@ -691,8 +691,8 @@ async fn connection_loop(
                 if let Some(kernel) = &current_kernel {
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
-                            // Build cell_id from seat info (kernel:context format)
-                            let cell_id = format!("{}:{}", seat.id.kernel, seat.id.context);
+                            // Use the cell_id provided by the server (kernel's main document)
+                            let cell_id = seat.cell_id.clone();
 
                             // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
@@ -768,8 +768,8 @@ async fn connection_loop(
                     // For now, just join the context with the given instance
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
-                            // Build cell_id from seat info (kernel:context format)
-                            let cell_id = format!("{}:{}", seat.id.kernel, seat.id.context);
+                            // Use the cell_id provided by the server (kernel's main document)
+                            let cell_id = seat.cell_id.clone();
 
                             // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });

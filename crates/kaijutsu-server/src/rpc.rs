@@ -1243,32 +1243,48 @@ impl kernel::Server for KernelImpl {
         log::debug!("get_block_cell_state called for cell {}", cell_id);
 
         let state = self.state.borrow();
-        if let Some(kernel) = state.kernels.get(&self.kernel_id) {
-            if let Some(doc) = kernel.documents.get(&cell_id) {
-                let mut cell_state = results.get().init_state();
-                cell_state.set_cell_id(&cell_id);
-                cell_state.reborrow().set_version(doc.version());
-
-                // Get actual blocks from BlockDocument
-                let blocks = doc.doc.blocks_ordered();
-                let mut block_list = cell_state.reborrow().init_blocks(blocks.len() as u32);
-                for (i, block) in blocks.iter().enumerate() {
-                    let mut block_builder = block_list.reborrow().get(i as u32);
-                    set_block_snapshot(&mut block_builder, block);
-                }
-
-                // Send full oplog for proper CRDT sync
-                // This enables clients to merge subsequent incremental ops
-                let oplog_bytes = doc.doc.oplog_bytes();
-                cell_state.set_ops(&oplog_bytes);
-                log::debug!(
-                    "Sending BlockCellState for cell {} with {} blocks, {} bytes oplog",
-                    cell_id,
-                    blocks.len(),
-                    oplog_bytes.len()
-                );
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k,
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "kernel '{}' not found",
+                    self.kernel_id
+                )));
             }
+        };
+
+        let doc = match kernel.documents.get(&cell_id) {
+            Some(d) => d,
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "cell '{}' not found in kernel '{}'",
+                    cell_id, self.kernel_id
+                )));
+            }
+        };
+
+        let mut cell_state = results.get().init_state();
+        cell_state.set_cell_id(&cell_id);
+        cell_state.reborrow().set_version(doc.version());
+
+        // Get actual blocks from BlockDocument
+        let blocks = doc.doc.blocks_ordered();
+        let mut block_list = cell_state.reborrow().init_blocks(blocks.len() as u32);
+        for (i, block) in blocks.iter().enumerate() {
+            let mut block_builder = block_list.reborrow().get(i as u32);
+            set_block_snapshot(&mut block_builder, block);
         }
+
+        // Send full oplog for proper CRDT sync
+        // This enables clients to merge subsequent incremental ops
+        let oplog_bytes = doc.doc.oplog_bytes();
+        cell_state.set_ops(&oplog_bytes);
+        log::debug!(
+            "Sending BlockCellState for cell {} with {} blocks, {} bytes oplog",
+            cell_id,
+            blocks.len(),
+            oplog_bytes.len()
+        );
 
         Promise::ok(())
     }
@@ -1456,6 +1472,14 @@ impl kernel::Server for KernelImpl {
             state_ref.current_seat = Some(seat_id);
         }
 
+        // Get main_document_id for this kernel
+        let cell_id = {
+            let state_ref = state.borrow();
+            state_ref.kernels.get(&kernel_id)
+                .map(|k| k.main_document_id.clone())
+                .unwrap_or_else(|| format!("{}@main", kernel_id))
+        };
+
         // Build result
         {
             let mut seat = results.get().init_seat();
@@ -1468,6 +1492,7 @@ impl kernel::Server for KernelImpl {
             seat.set_owner(&seat_info.owner);
             seat.set_status(crate::kaijutsu_capnp::SeatStatus::Active);
             seat.set_last_activity(seat_info.last_activity);
+            seat.set_cell_id(&cell_id);
         }
 
         Promise::ok(())

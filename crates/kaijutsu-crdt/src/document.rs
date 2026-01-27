@@ -1063,6 +1063,11 @@ impl BlockDocument {
             }
         }
 
+        // Use block count as initial version - ensures non-zero if content exists
+        // This makes sync detect the document has changed from an empty state
+        let block_count = oplog.checkout_set(blocks_set_lv).len();
+        let version = if block_count > 0 { block_count as u64 } else { 0 };
+
         Ok(Self {
             cell_id,
             agent_id_str,
@@ -1070,7 +1075,7 @@ impl BlockDocument {
             oplog,
             blocks_set_lv,
             next_seq,
-            version: 0,
+            version,
         })
     }
 
