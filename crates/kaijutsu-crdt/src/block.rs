@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
 /// Globally unique block identifier.
 ///
 /// Composed of:
-/// - `cell_id`: The cell this block belongs to
+/// - `document_id`: The document this block belongs to
 /// - `agent_id`: The agent that created this block
 /// - `seq`: Agent-local sequence number (monotonically increasing)
 ///
 /// This ensures global uniqueness without coordination.
 #[derive(Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
 pub struct BlockId {
-    /// Cell this block belongs to.
-    pub cell_id: String,
+    /// Document this block belongs to.
+    pub document_id: String,
     /// Agent that created this block.
     pub agent_id: String,
     /// Agent-local sequence number.
@@ -25,9 +25,9 @@ pub struct BlockId {
 
 impl BlockId {
     /// Create a new block ID.
-    pub fn new(cell_id: impl Into<String>, agent_id: impl Into<String>, seq: u64) -> Self {
+    pub fn new(document_id: impl Into<String>, agent_id: impl Into<String>, seq: u64) -> Self {
         Self {
-            cell_id: cell_id.into(),
+            document_id: document_id.into(),
             agent_id: agent_id.into(),
             seq,
         }
@@ -35,7 +35,7 @@ impl BlockId {
 
     /// Convert to a compact string representation.
     pub fn to_key(&self) -> String {
-        format!("{}/{}/{}", self.cell_id, self.agent_id, self.seq)
+        format!("{}/{}/{}", self.document_id, self.agent_id, self.seq)
     }
 
     /// Parse from key string.
@@ -45,7 +45,7 @@ impl BlockId {
             return None;
         }
         Some(Self {
-            cell_id: parts[0].to_string(),
+            document_id: parts[0].to_string(),
             agent_id: parts[1].to_string(),
             seq: parts[2].parse().ok()?,
         })
@@ -54,7 +54,7 @@ impl BlockId {
 
 impl std::fmt::Display for BlockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}#{}", self.cell_id, self.agent_id, self.seq)
+        write!(f, "{}@{}#{}", self.document_id, self.agent_id, self.seq)
     }
 }
 

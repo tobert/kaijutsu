@@ -53,8 +53,8 @@ use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 /// - Text uses sequence CRDT for character-level merging
 /// - All peers converge to identical state after sync
 pub struct BlockDocument {
-    /// Cell ID this document belongs to.
-    cell_id: String,
+    /// Document ID this document belongs to.
+    document_id: String,
 
     /// Agent ID string for this instance.
     agent_id_str: String,
@@ -77,8 +77,8 @@ pub struct BlockDocument {
 
 impl BlockDocument {
     /// Create a new empty document (server-side, creates initial structure).
-    pub fn new(cell_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
-        let cell_id = cell_id.into();
+    pub fn new(document_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
         let mut oplog = OpLog::new();
@@ -93,7 +93,7 @@ impl BlockDocument {
         );
 
         Self {
-            cell_id,
+            document_id,
             agent_id_str,
             agent,
             oplog,
@@ -107,8 +107,8 @@ impl BlockDocument {
     ///
     /// Use this when the document will receive its initial state via `merge_ops`.
     /// The blocks Set will be created when ops are merged from the server.
-    pub fn new_for_sync(cell_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
-        let cell_id = cell_id.into();
+    pub fn new_for_sync(document_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
         let oplog = OpLog::new();
@@ -116,7 +116,7 @@ impl BlockDocument {
         // blocks_set_lv will be looked up after first merge
 
         Self {
-            cell_id,
+            document_id,
             agent_id_str,
             agent: 0, // Will be set on first local operation
             oplog,
@@ -133,9 +133,9 @@ impl BlockDocument {
     // Accessors
     // =========================================================================
 
-    /// Get the cell ID.
-    pub fn cell_id(&self) -> &str {
-        &self.cell_id
+    /// Get the document ID.
+    pub fn document_id(&self) -> &str {
+        &self.document_id
     }
 
     /// Get the agent ID.
@@ -348,7 +348,7 @@ impl BlockDocument {
 
     /// Generate a new block ID.
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(&self.cell_id, &self.agent_id_str, self.next_seq);
+        let id = BlockId::new(&self.document_id, &self.agent_id_str, self.next_seq);
         self.next_seq += 1;
         id
     }
@@ -1057,7 +1057,7 @@ impl BlockDocument {
     ///
     /// # Arguments
     ///
-    /// * `cell_id` - Cell ID for the document
+    /// * `document_id` - Document ID for the document
     /// * `agent_id` - Agent ID for local operations
     /// * `oplog_bytes` - Serialized oplog from server's `oplog_bytes()`
     ///
@@ -1066,11 +1066,11 @@ impl BlockDocument {
     /// A BlockDocument with the same oplog state as the server, ready for
     /// incremental sync via `merge_ops`.
     pub fn from_oplog(
-        cell_id: impl Into<String>,
+        document_id: impl Into<String>,
         agent_id: impl Into<String>,
         oplog_bytes: &[u8],
     ) -> Result<Self> {
-        let cell_id = cell_id.into();
+        let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
         // Start with empty oplog (no independent "blocks" Set!)
@@ -1112,7 +1112,7 @@ impl BlockDocument {
         let version = if block_count > 0 { block_count as u64 } else { 0 };
 
         Ok(Self {
-            cell_id,
+            document_id,
             agent_id_str,
             agent,
             oplog,
@@ -1129,7 +1129,7 @@ impl BlockDocument {
     /// Create a snapshot of the entire document.
     pub fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
-            cell_id: self.cell_id.clone(),
+            document_id: self.document_id.clone(),
             blocks: self.blocks_ordered(),
             version: self.version,
         }
@@ -1138,7 +1138,7 @@ impl BlockDocument {
     /// Restore from a snapshot.
     pub fn from_snapshot(snapshot: DocumentSnapshot, agent_id: impl Into<String>) -> Self {
         let agent_id = agent_id.into();
-        let mut doc = Self::new(&snapshot.cell_id, &agent_id);
+        let mut doc = Self::new(&snapshot.document_id, &agent_id);
 
         let mut last_id: Option<BlockId> = None;
         for block_snap in snapshot.blocks {
@@ -1173,8 +1173,8 @@ impl BlockDocument {
 /// Snapshot of a block document (serializable).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DocumentSnapshot {
-    /// Cell ID.
-    pub cell_id: String,
+    /// Document ID.
+    pub document_id: String,
     /// Blocks in order.
     pub blocks: Vec<BlockSnapshot>,
     /// Version.
@@ -1187,8 +1187,8 @@ mod tests {
 
     #[test]
     fn test_new_document() {
-        let doc = BlockDocument::new("cell-1", "alice");
-        assert_eq!(doc.cell_id(), "cell-1");
+        let doc = BlockDocument::new("doc-1", "alice");
+        assert_eq!(doc.document_id(), "doc-1");
         assert_eq!(doc.agent_id(), "alice");
         assert!(doc.is_empty());
         assert_eq!(doc.version(), 0);
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn test_insert_block_new_api() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let id1 = doc.insert_block(
             None,
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn test_dag_operations() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         // Create a parent block
         let parent_id = doc.insert_block(
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[test]
     fn test_set_status() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let id = doc.insert_block(
             None,
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_and_result() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         // Create tool call
         let tool_call_id = doc.insert_tool_call(
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_order() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
         let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", "alice").unwrap();
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn test_insert_at_beginning() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
         let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First", "alice").unwrap();
@@ -1365,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_roundtrip() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", "model:claude").unwrap();
         doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response", "model:claude").unwrap();
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_text_editing() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello", "user:amy").unwrap();
         doc.append_text(&id, " World").unwrap();
@@ -1394,7 +1394,7 @@ mod tests {
 
     #[test]
     fn test_move_block() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         // Insert three blocks: A, B, C
         let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A", "user").unwrap();
@@ -1442,7 +1442,7 @@ mod tests {
     fn test_sync_fails_with_independent_blocks_set_creation() {
         // === Server side ===
         // Server creates its document - this creates a "blocks" Set operation
-        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let mut server = BlockDocument::new("doc-1", "server-agent");
 
         // Capture frontier AFTER "blocks" Set was created (current buggy behavior)
         let frontier_after_init = server.frontier();
@@ -1462,7 +1462,7 @@ mod tests {
 
         // === Client side ===
         // Client creates its OWN document - this creates a DIFFERENT "blocks" Set operation
-        let mut client = BlockDocument::new("cell-1", "client-agent");
+        let mut client = BlockDocument::new("doc-1", "client-agent");
 
         // Client tries to merge the incremental ops
         // THIS SHOULD FAIL because the ops reference server's "blocks" Set creation
@@ -1491,7 +1491,7 @@ mod tests {
     #[test]
     fn test_sync_succeeds_with_full_oplog() {
         // === Server side ===
-        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let mut server = BlockDocument::new("doc-1", "server-agent");
 
         // Server inserts a block
         let _block_id = server.insert_block(
@@ -1535,7 +1535,7 @@ mod tests {
     #[test]
     fn test_incremental_sync_after_full_sync() {
         // === Initial full sync ===
-        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let mut server = BlockDocument::new("doc-1", "server-agent");
         let full_ops = server.ops_since(&[]);
 
         // Client creates empty oplog and merges full state
@@ -1573,7 +1573,7 @@ mod tests {
     #[test]
     fn test_snapshot_then_streaming_should_work() {
         // === Server: initial state ===
-        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let mut server = BlockDocument::new("doc-1", "server-agent");
         let block_id = server.insert_block(
             None,
             None,
@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn test_text_streaming_sync() {
         // === Initial setup ===
-        let mut server = BlockDocument::new("cell-1", "server-agent");
+        let mut server = BlockDocument::new("doc-1", "server-agent");
         let block_id = server.insert_block(
             None,
             None,
