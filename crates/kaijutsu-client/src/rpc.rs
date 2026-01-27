@@ -135,7 +135,7 @@ impl RpcClient {
                     context: id_reader.get_context()?.to_string()?,
                 },
                 owner: seat.get_owner()?.to_string()?,
-                cell_id: seat.get_cell_id()?.to_string()?,
+                document_id: seat.get_document_id()?.to_string()?,
             });
         }
         Ok(result)
@@ -183,8 +183,8 @@ pub struct SeatInfo {
     pub id: SeatId,
     /// Strong identity: username from SSH auth
     pub owner: String,
-    /// The kernel's main document cell_id for this seat
-    pub cell_id: String,
+    /// The kernel's main document ID for this seat
+    pub document_id: String,
 }
 
 /// A context within a kernel - a collection of documents with a focus scope
@@ -255,11 +255,11 @@ impl KernelHandle {
     ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
         let mut request = self.kernel.shell_execute_request();
         request.get().set_code(code);
-        request.get().set_cell_id(cell_id);
+        request.get().set_document_id(cell_id);
         let response = request.send().promise.await?;
         let block_id = response.get()?.get_command_block_id()?;
         Ok(kaijutsu_crdt::BlockId {
-            cell_id: block_id.get_cell_id()?.to_string()?,
+            document_id: block_id.get_document_id()?.to_string()?,
             agent_id: block_id.get_agent_id()?.to_string()?,
             seq: block_id.get_seq(),
         })
@@ -324,17 +324,17 @@ impl KernelHandle {
     // NOTE: apply_block_op was removed - the unified CRDT model uses SerializedOps
     // for replication. See BlockDocument::ops_since() and apply_ops() in kaijutsu-crdt.
 
-    /// Get block cell state
-    pub async fn get_block_cell_state(
+    /// Get document state (blocks and CRDT oplog)
+    pub async fn get_document_state(
         &self,
-        cell_id: &str,
-    ) -> Result<BlockCellState, RpcError> {
-        let mut request = self.kernel.get_block_cell_state_request();
-        request.get().set_cell_id(cell_id);
+        document_id: &str,
+    ) -> Result<DocumentState, RpcError> {
+        let mut request = self.kernel.get_document_state_request();
+        request.get().set_document_id(document_id);
         let response = request.send().promise.await?;
         let state = response.get()?.get_state()?;
 
-        let cell_id = state.get_cell_id()?.to_string()?;
+        let document_id = state.get_document_id()?.to_string()?;
         let version = state.get_version();
         let blocks_reader = state.get_blocks()?;
         let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
@@ -347,8 +347,8 @@ impl KernelHandle {
         // Get full oplog for proper CRDT sync
         let ops = state.get_ops().map(|d| d.to_vec()).unwrap_or_default();
 
-        Ok(BlockCellState {
-            cell_id,
+        Ok(DocumentState {
+            document_id,
             blocks,
             version,
             ops,
@@ -376,7 +376,7 @@ impl KernelHandle {
             if let Some(m) = model {
                 req.set_model(m);
             }
-            req.set_cell_id(cell_id);
+            req.set_document_id(cell_id);
         }
         let response = request.send().promise.await?;
         Ok(response.get()?.get_prompt_id()?.to_string()?)
@@ -435,7 +435,7 @@ impl KernelHandle {
                 context: id_reader.get_context()?.to_string()?,
             },
             owner: seat.get_owner()?.to_string()?,
-            cell_id: seat.get_cell_id()?.to_string()?,
+            document_id: seat.get_document_id()?.to_string()?,
         })
     }
 
@@ -452,7 +452,7 @@ fn parse_block_id(
     reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
 ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
     Ok(kaijutsu_crdt::BlockId {
-        cell_id: reader.get_cell_id()?.to_string()?,
+        document_id: reader.get_document_id()?.to_string()?,
         agent_id: reader.get_agent_id()?.to_string()?,
         seq: reader.get_seq(),
     })
@@ -607,10 +607,10 @@ pub struct HistoryEntry {
 // Block Types
 // ============================================================================
 
-/// Full cell state with blocks
+/// Full document state with blocks
 #[derive(Debug, Clone)]
-pub struct BlockCellState {
-    pub cell_id: String,
+pub struct DocumentState {
+    pub document_id: String,
     pub blocks: Vec<kaijutsu_crdt::BlockSnapshot>,
     pub version: u64,
     /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
