@@ -303,6 +303,12 @@ impl BlockStore {
         self.documents.len()
     }
 
+    /// Get the last block ID in a document (for ordering new blocks at the end).
+    pub fn last_block_id(&self, document_id: &str) -> Option<BlockId> {
+        let entry = self.get(document_id)?;
+        entry.doc.blocks_ordered().last().map(|b| b.id.clone())
+    }
+
     // =========================================================================
     // Block Operations
     // =========================================================================
@@ -343,6 +349,8 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Check if this is the first block - need full oplog for fresh clients
+            let is_first_block = entry.doc.block_count() == 0;
             // Capture frontier before insert for incremental ops
             let frontier_before = entry.doc.frontier();
 
@@ -351,9 +359,14 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Send only the ops that created this block (incremental sync)
-            // Client tracks frontier and uses merge_ops_owned() for efficient sync
-            let ops = entry.doc.ops_since(&frontier_before);
+            // For first block, send full oplog (includes document structure creation ops)
+            // For subsequent blocks, send only incremental ops for efficiency
+            // Client uses merge_ops_owned() for sync
+            let ops = if is_first_block {
+                entry.doc.ops_since(&[]) // Full oplog from empty frontier
+            } else {
+                entry.doc.ops_since(&frontier_before) // Incremental
+            };
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -385,6 +398,8 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Check if this is the first block - need full oplog for fresh clients
+            let is_first_block = entry.doc.block_count() == 0;
             // Capture frontier before insert for incremental ops
             let frontier_before = entry.doc.frontier();
 
@@ -393,8 +408,13 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Send only the ops that created this block (incremental sync)
-            let ops = entry.doc.ops_since(&frontier_before);
+            // For first block, send full oplog (includes document structure creation ops)
+            // For subsequent blocks, send only incremental ops for efficiency
+            let ops = if is_first_block {
+                entry.doc.ops_since(&[]) // Full oplog from empty frontier
+            } else {
+                entry.doc.ops_since(&frontier_before) // Incremental
+            };
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -427,6 +447,9 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Check if this is the first block - need full oplog for fresh clients
+            // (unlikely for tool results, but consistent with other insert methods)
+            let is_first_block = entry.doc.block_count() == 0;
             // Capture frontier before insert for incremental ops
             let frontier_before = entry.doc.frontier();
 
@@ -435,8 +458,13 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Send only the ops that created this block (incremental sync)
-            let ops = entry.doc.ops_since(&frontier_before);
+            // For first block, send full oplog (includes document structure creation ops)
+            // For subsequent blocks, send only incremental ops for efficiency
+            let ops = if is_first_block {
+                entry.doc.ops_since(&[]) // Full oplog from empty frontier
+            } else {
+                entry.doc.ops_since(&frontier_before) // Incremental
+            };
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
