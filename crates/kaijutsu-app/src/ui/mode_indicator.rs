@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use crate::cell::{CurrentMode, EditorMode};
+use crate::cell::{CurrentMode, EditorMode, InputKind};
 use crate::text::{bevy_to_glyphon_color, GlyphonUiText};
 use crate::ui::theme::Theme;
 
@@ -27,9 +27,8 @@ pub fn update_mode_indicator(
     // Color based on mode (from theme)
     let color = match mode.0 {
         EditorMode::Normal => theme.mode_normal,
-        EditorMode::Chat => theme.mode_chat,
-        EditorMode::Shell => theme.mode_shell,
-        EditorMode::Command => theme.mode_command,
+        EditorMode::Input(InputKind::Chat) => theme.mode_chat,
+        EditorMode::Input(InputKind::Shell) => theme.mode_shell,
         EditorMode::Visual => theme.mode_visual,
     };
 

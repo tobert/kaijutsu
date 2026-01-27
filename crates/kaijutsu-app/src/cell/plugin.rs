@@ -3,8 +3,9 @@
 use bevy::prelude::*;
 
 use super::components::{
-    ConversationContainer, ConversationScrollState, CurrentMode, EditorMode, FocusedCell,
-    LayoutGeneration, MainCell, PromptCell, PromptContainer, PromptSubmitted, WorkspaceLayout,
+    ConversationContainer, ConversationFocus, ConversationScrollState, CurrentMode,
+    DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell, PromptCell,
+    PromptContainer, PromptSubmitted, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -32,11 +33,14 @@ impl Plugin for CellPlugin {
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
+            .init_resource::<ConversationFocus>()
             .init_resource::<LayoutGeneration>()
+            .init_resource::<DocumentSyncState>()
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::PromptCellEntity>()
             .init_resource::<systems::MainCellEntity>()
+            .init_resource::<systems::ExpandedBlockEntity>()
             // Input area state resources
             .init_resource::<InputPresence>()
             .init_resource::<InputDock>()
@@ -65,9 +69,19 @@ impl Plugin for CellPlugin {
                     systems::handle_prompt_submitted,
                     systems::sync_main_cell_to_conversation
                         .after(systems::handle_prompt_submitted),
+                    // Block navigation (j/k) runs before scroll_input
+                    systems::navigate_blocks
+                        .after(systems::sync_main_cell_to_conversation),
+                    // Expand block with `f` key
+                    systems::handle_expand_block
+                        .after(systems::navigate_blocks),
+                    // Pop ViewStack with Esc (before mode switch handles Esc)
+                    systems::handle_view_pop
+                        .before(systems::handle_mode_switch),
                     // scroll_input sets target, but smooth_scroll must run AFTER layout
                     // (layout updates content_height, smooth_scroll depends on it)
-                    systems::handle_scroll_input,
+                    systems::handle_scroll_input
+                        .after(systems::navigate_blocks),
                 ),
             )
             // Layout and rendering for PromptCell
@@ -100,18 +114,26 @@ impl Plugin for CellPlugin {
             //   1. layout_block_cells → computes heights, updates content_height
             //   2. smooth_scroll → updates offset using new content_height
             //   3. apply_block_cell_positions → positions blocks using new offset
+            // Block cell systems with explicit command flush between spawn and init.
+            // spawn_block_cells uses deferred commands, so we need ApplyDeferred
+            // before init_block_cell_buffers can see the new entities.
             .add_systems(
                 Update,
                 (
                     systems::spawn_block_cells
                         .after(systems::handle_block_events),
-                    systems::init_block_cell_buffers
+                    ApplyDeferred
                         .after(systems::spawn_block_cells),
+                    systems::init_block_cell_buffers
+                        .after(ApplyDeferred),
                     systems::sync_block_cell_buffers
                         .after(systems::init_block_cell_buffers)
                         .after(systems::handle_cell_input),
-                    systems::layout_block_cells
+                    // Highlight focused block (overrides color set by sync_block_cell_buffers)
+                    systems::highlight_focused_block
                         .after(systems::sync_block_cell_buffers),
+                    systems::layout_block_cells
+                        .after(systems::highlight_focused_block),
                     systems::smooth_scroll
                         .after(systems::layout_block_cells),
                     systems::apply_block_cell_positions
@@ -125,6 +147,15 @@ impl Plugin for CellPlugin {
             .add_systems(
                 Update,
                 systems::handle_collapse_toggle,
+            )
+            // Expanded block view (Phase 4)
+            .add_systems(
+                Update,
+                (
+                    systems::spawn_expanded_block_view,
+                    systems::sync_expanded_block_content
+                        .after(systems::spawn_expanded_block_view),
+                ),
             )
             // 9-slice frame system
             .add_systems(

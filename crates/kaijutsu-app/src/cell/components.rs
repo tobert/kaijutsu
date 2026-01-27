@@ -362,18 +362,38 @@ impl CellState {
     }
 }
 
-/// Vim-style editor mode.
+/// Input routing kind for text entry modes.
+///
+/// Determines where submitted text goes:
+/// - **Chat**: Routes to LLM for AI conversation
+/// - **Shell**: Routes to kaish REPL (handles both shell commands and `:` commands)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+pub enum InputKind {
+    /// Prompts go to LLM
+    Chat,
+    /// Prompts go to kaish REPL
+    Shell,
+}
+
+impl InputKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            InputKind::Chat => "CHAT",
+            InputKind::Shell => "SHELL",
+        }
+    }
+}
+
+/// Vim-style editor mode (simplified from 5 to 3 modes).
+///
+/// The old Command mode is folded into Shell - kaish handles `:` commands natively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
 pub enum EditorMode {
-    /// Navigation mode (h/j/k/l, commands)
+    /// Navigation mode (h/j/k/l, block focus)
     #[default]
     Normal,
-    /// Text input mode (prompts go to LLM)
-    Chat,
-    /// Shell mode (prompts go to kaish REPL)
-    Shell,
-    /// Command-line mode (: prefix)
-    Command,
+    /// Text input mode with routing to Chat or Shell
+    Input(InputKind),
     /// Visual selection mode
     Visual,
 }
@@ -382,16 +402,32 @@ impl EditorMode {
     pub fn name(&self) -> &'static str {
         match self {
             EditorMode::Normal => "NORMAL",
-            EditorMode::Chat => "CHAT",
-            EditorMode::Shell => "SHELL",
-            EditorMode::Command => "COMMAND",
+            EditorMode::Input(kind) => kind.name(),
             EditorMode::Visual => "VISUAL",
         }
     }
 
     /// Check if this mode accepts text input.
     pub fn accepts_input(&self) -> bool {
-        matches!(self, EditorMode::Chat | EditorMode::Shell | EditorMode::Command)
+        matches!(self, EditorMode::Input(_))
+    }
+
+    /// Get the input kind if in Input mode.
+    pub fn input_kind(&self) -> Option<InputKind> {
+        match self {
+            EditorMode::Input(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Check if this is Chat input mode.
+    pub fn is_chat(&self) -> bool {
+        matches!(self, EditorMode::Input(InputKind::Chat))
+    }
+
+    /// Check if this is Shell input mode.
+    pub fn is_shell(&self) -> bool {
+        matches!(self, EditorMode::Input(InputKind::Shell))
     }
 }
 
@@ -403,6 +439,44 @@ pub struct CurrentMode(pub EditorMode);
 /// Resource tracking which cell has keyboard focus.
 #[derive(Resource, Default)]
 pub struct FocusedCell(pub Option<Entity>);
+
+// ============================================================================
+// BLOCK FOCUS NAVIGATION (Phase 2)
+// ============================================================================
+
+/// Which block is focused for navigation/reply.
+///
+/// This enables j/k navigation between blocks (not just scroll) and
+/// supports future "reply to this block" workflows.
+#[derive(Resource, Default)]
+pub struct ConversationFocus {
+    /// The currently focused block (if any).
+    pub block_id: Option<BlockId>,
+}
+
+impl ConversationFocus {
+    /// Check if a specific block is focused.
+    pub fn is_focused(&self, block_id: &BlockId) -> bool {
+        self.block_id.as_ref() == Some(block_id)
+    }
+
+    /// Clear the focus.
+    pub fn clear(&mut self) {
+        self.block_id = None;
+    }
+
+    /// Set focus to a block.
+    pub fn focus(&mut self, block_id: BlockId) {
+        self.block_id = Some(block_id);
+    }
+}
+
+/// Marker for the currently focused block cell.
+///
+/// Added/removed by the navigate_blocks system to enable visual feedback
+/// and future reply-target workflows.
+#[derive(Component)]
+pub struct FocusedBlockCell;
 
 /// Resource tracking CRDT sync state for frontier-based incremental updates.
 ///

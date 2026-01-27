@@ -6,8 +6,8 @@ use bevy::prelude::*;
 
 use super::components::{
     BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ConversationScrollState, CurrentMode, EditorMode, FocusedCell, MainCell, PromptCell,
-    PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
+    ConversationScrollState, CurrentMode, EditorMode, FocusedCell, InputKind, MainCell,
+    PromptCell, PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer, TextMetrics};
@@ -110,39 +110,45 @@ pub fn handle_mode_switch(
 
         match mode.0 {
             EditorMode::Normal => {
-                // Chat/Shell modes only make sense in Conversation screen
+                // Input modes only make sense in Conversation screen
                 // (Dashboard has no input field to route to)
                 if *screen.get() != AppScreen::Conversation {
                     continue;
                 }
 
-                // In normal mode, i enters chat (docked), Space enters chat (overlay),
-                // ` (backtick) enters shell mode, : enters command, v enters visual
+                // In normal mode:
+                // - i enters Chat (docked)
+                // - Space enters Chat (overlay)
+                // - ` (backtick) enters Shell
+                // - : also enters Shell (kaish handles commands natively)
+                // - v enters Visual
                 match event.key_code {
                     KeyCode::KeyI => {
-                        mode.0 = EditorMode::Chat;
+                        mode.0 = EditorMode::Input(InputKind::Chat);
                         presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::KeyI);
                         info!("Mode: CHAT, Presence: DOCKED");
                     }
                     KeyCode::Space => {
                         // Space summons the overlay input
-                        mode.0 = EditorMode::Chat;
+                        mode.0 = EditorMode::Input(InputKind::Chat);
                         presence.0 = InputPresenceKind::Overlay;
                         consumed.0.insert(KeyCode::Space);
                         info!("Mode: CHAT, Presence: OVERLAY");
                     }
                     KeyCode::Backquote => {
                         // Backtick enters shell mode (kaish REPL)
-                        mode.0 = EditorMode::Shell;
+                        mode.0 = EditorMode::Input(InputKind::Shell);
                         presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::Backquote);
                         info!("Mode: SHELL, Presence: DOCKED");
                     }
                     KeyCode::Semicolon if event.text.as_deref() == Some(":") => {
-                        mode.0 = EditorMode::Command;
+                        // Colon also enters Shell - kaish handles : commands natively
+                        mode.0 = EditorMode::Input(InputKind::Shell);
+                        presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::Semicolon);
-                        info!("Mode: COMMAND");
+                        info!("Mode: SHELL (command), Presence: DOCKED");
                     }
                     KeyCode::KeyV => {
                         mode.0 = EditorMode::Visual;
@@ -152,7 +158,7 @@ pub fn handle_mode_switch(
                     _ => {}
                 }
             }
-            EditorMode::Chat | EditorMode::Shell | EditorMode::Command | EditorMode::Visual => {
+            EditorMode::Input(_) | EditorMode::Visual => {
                 // Escape returns to normal mode
                 if event.key_code == KeyCode::Escape {
                     mode.0 = EditorMode::Normal;
@@ -756,28 +762,25 @@ pub fn update_cursor(
     // Update cursor mode and wandering orb params
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {
         let cursor_mode = match mode.0 {
-            EditorMode::Chat | EditorMode::Shell => CursorMode::Beam,
+            EditorMode::Input(_) => CursorMode::Beam,
             EditorMode::Normal => CursorMode::Block,
             EditorMode::Visual => CursorMode::Block,
-            EditorMode::Command => CursorMode::Underline,
         };
         material.time.y = cursor_mode as u8 as f32;
 
-        // Cursor colors from theme (Chat and Shell share cursor_insert for now)
+        // Cursor colors from theme
         let color = match mode.0 {
             EditorMode::Normal => theme.cursor_normal,
-            EditorMode::Chat | EditorMode::Shell => theme.cursor_insert,
-            EditorMode::Command => theme.cursor_command,
+            EditorMode::Input(_) => theme.cursor_insert,
             EditorMode::Visual => theme.cursor_visual,
         };
         material.color = color;
 
         // params: x=orb_size, y=intensity, z=wander_speed, w=blink_rate
         material.params = match mode.0 {
-            EditorMode::Chat | EditorMode::Shell => Vec4::new(0.25, 1.2, 2.0, 0.0),  // Larger orb, faster wander, no blink
-            EditorMode::Normal => Vec4::new(0.2, 1.0, 1.5, 0.6),   // Medium orb, gentle blink
-            EditorMode::Visual => Vec4::new(0.22, 1.1, 1.8, 0.0),  // Slightly larger, no blink
-            EditorMode::Command => Vec4::new(0.18, 0.9, 2.5, 0.8), // Smaller, fast wander
+            EditorMode::Input(_) => Vec4::new(0.25, 1.2, 2.0, 0.0),  // Larger orb, faster wander, no blink
+            EditorMode::Normal => Vec4::new(0.2, 1.0, 1.5, 0.6),    // Medium orb, gentle blink
+            EditorMode::Visual => Vec4::new(0.22, 1.1, 1.8, 0.0),   // Slightly larger, no blink
         };
     }
 }
@@ -889,8 +892,8 @@ pub fn handle_prompt_submit(
     prompt_cells: Query<Entity, With<PromptCell>>,
     mut submit_events: MessageWriter<PromptSubmitted>,
 ) {
-    // Only handle in Chat or Shell mode (input modes)
-    if !matches!(mode.0, EditorMode::Chat | EditorMode::Shell) {
+    // Only handle in Input modes (Chat or Shell)
+    if !mode.0.accepts_input() {
         return;
     }
 
@@ -983,7 +986,7 @@ pub fn handle_prompt_submitted(
     for event in submit_events.read() {
         if let Some(ref cmds) = cmds {
             match mode.0 {
-                EditorMode::Shell => {
+                EditorMode::Input(InputKind::Shell) => {
                     // Shell mode: execute as kaish command
                     cmds.send(crate::connection::ConnectionCommand::ShellExecute {
                         command: event.text.clone(),
@@ -994,7 +997,7 @@ pub fn handle_prompt_submitted(
                         conv_id, doc_cell_id
                     );
                 }
-                EditorMode::Chat => {
+                EditorMode::Input(InputKind::Chat) => {
                     // Chat mode: send to LLM
                     cmds.send(crate::connection::ConnectionCommand::Prompt {
                         content: event.text.clone(),
@@ -1019,22 +1022,22 @@ pub fn handle_prompt_submitted(
     }
 }
 
-/// Auto-focus the prompt cell when entering Chat or Shell mode.
+/// Auto-focus the prompt cell when entering Input mode.
 /// In conversation UI, input modes always mean typing in the prompt.
 pub fn auto_focus_prompt(
     mode: Res<CurrentMode>,
     mut focused: ResMut<FocusedCell>,
     prompt_entity: Res<PromptCellEntity>,
 ) {
-    // Only when entering Chat or Shell mode
-    if !mode.is_changed() || !matches!(mode.0, EditorMode::Chat | EditorMode::Shell) {
+    // Only when entering Input mode
+    if !mode.is_changed() || !mode.0.accepts_input() {
         return;
     }
 
-    // Always focus the prompt when entering INSERT mode
+    // Always focus the prompt when entering Input mode
     if let Some(entity) = prompt_entity.0 {
         focused.0 = Some(entity);
-        info!("Focused prompt cell for INSERT mode");
+        info!("Focused prompt cell for {} mode", mode.0.name());
     }
 }
 
@@ -1096,14 +1099,11 @@ pub fn handle_scroll_input(
         scroll_state.scroll_by(delta);
     }
 
-    // Handle j/k navigation in Normal mode
+    // Note: j/k now handled by navigate_blocks for block-level navigation
+    // This system keeps page navigation and Shift+G
+
+    // Page down/up with Ctrl+d/u in Normal mode
     if mode.0 == EditorMode::Normal {
-        if keys.just_pressed(KeyCode::KeyJ) {
-            scroll_state.scroll_by(LINE_SCROLL_SPEED);
-        }
-        if keys.just_pressed(KeyCode::KeyK) {
-            scroll_state.scroll_by(-LINE_SCROLL_SPEED);
-        }
         // Page down/up with Ctrl+d/u
         if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
             let half_page = scroll_state.visible_height * 0.5;
@@ -1121,6 +1121,423 @@ pub fn handle_scroll_input(
                 scroll_state.scroll_to_end();
             }
             // Note: gg (double tap) would need state tracking, skip for now
+    }
+}
+
+// ============================================================================
+// BLOCK FOCUS NAVIGATION (Phase 2)
+// ============================================================================
+
+use super::components::{ConversationFocus, FocusedBlockCell};
+
+/// Navigate between blocks with j/k in Normal mode.
+///
+/// This is the core Phase 2 feature: j/k moves focus between blocks rather
+/// than just scrolling. The focused block gets visual highlighting and
+/// scroll-to-view behavior.
+///
+/// Key bindings (Normal mode only):
+/// - `j` → Focus next block
+/// - `k` → Focus previous block
+/// - `G` (Shift+G) → Focus last block
+/// - `g` then `g` → Focus first block (TODO: needs double-tap state)
+/// - `Home` → Focus first block
+/// - `End` → Focus last block
+pub fn navigate_blocks(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<CurrentMode>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+    block_cells: Query<(Entity, &BlockCell, &BlockCellLayout)>,
+    mut focus: ResMut<ConversationFocus>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+    focused_markers: Query<Entity, With<FocusedBlockCell>>,
+) {
+    // Only in Normal mode
+    if mode.0 != EditorMode::Normal {
+        return;
+    }
+
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    // Get ordered block IDs from the document
+    let blocks = editor.blocks();
+    if blocks.is_empty() {
+        return;
+    }
+
+    // Determine navigation direction
+    let nav = if keys.just_pressed(KeyCode::KeyJ) {
+        Some(NavigationDirection::Next)
+    } else if keys.just_pressed(KeyCode::KeyK) {
+        Some(NavigationDirection::Previous)
+    } else if keys.just_pressed(KeyCode::Home) {
+        Some(NavigationDirection::First)
+    } else if keys.just_pressed(KeyCode::End)
+        || (keys.just_pressed(KeyCode::KeyG)
+            && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)))
+    {
+        Some(NavigationDirection::Last)
+    } else {
+        None
+    };
+
+    let Some(direction) = nav else {
+        return;
+    };
+
+    // Find current focus index
+    let current_idx = focus
+        .block_id
+        .as_ref()
+        .and_then(|id| blocks.iter().position(|b| &b.id == id));
+
+    // Calculate new index based on direction
+    let new_idx = match direction {
+        NavigationDirection::Next => match current_idx {
+            Some(i) if i + 1 < blocks.len() => i + 1,
+            Some(i) => i, // Stay at end
+            None => 0,    // Start at first
+        },
+        NavigationDirection::Previous => match current_idx {
+            Some(i) if i > 0 => i - 1,
+            Some(i) => i,                // Stay at start
+            None => blocks.len() - 1,    // Start at last
+        },
+        NavigationDirection::First => 0,
+        NavigationDirection::Last => blocks.len() - 1,
+    };
+
+    let new_block = &blocks[new_idx];
+
+    // Update focus resource
+    focus.focus(new_block.id.clone());
+
+    // Remove old FocusedBlockCell markers
+    for entity in focused_markers.iter() {
+        commands.entity(entity).remove::<FocusedBlockCell>();
+    }
+
+    // Add FocusedBlockCell marker to the new focused entity
+    if let Some(entity) = container.get_entity(&new_block.id) {
+        commands.entity(entity).insert(FocusedBlockCell);
+
+        // Scroll to keep focused block visible
+        if let Ok((_, _, layout)) = block_cells.get(entity) {
+            scroll_to_block_visible(&mut scroll_state, layout);
+        }
+    }
+
+    debug!("Block focus: {:?} (index {})", new_block.id, new_idx);
+}
+
+/// Navigation direction for block focus.
+#[derive(Debug, Clone, Copy)]
+enum NavigationDirection {
+    Next,
+    Previous,
+    First,
+    Last,
+}
+
+/// Scroll to keep a block visible in the viewport.
+///
+/// If the block is above the viewport, scroll up to show its top.
+/// If below, scroll down to show its bottom.
+fn scroll_to_block_visible(
+    scroll_state: &mut ConversationScrollState,
+    layout: &BlockCellLayout,
+) {
+    let block_top = layout.y_offset;
+    let block_bottom = layout.y_offset + layout.height;
+    let view_top = scroll_state.offset;
+    let view_bottom = scroll_state.offset + scroll_state.visible_height;
+
+    // Margin to keep around the block (so it's not right at the edge)
+    const MARGIN: f32 = 20.0;
+
+    if block_top < view_top + MARGIN {
+        // Block is above viewport - scroll up
+        scroll_state.target_offset = (block_top - MARGIN).max(0.0);
+        scroll_state.offset = scroll_state.target_offset;
+        scroll_state.following = false; // User navigated, disable auto-follow
+    } else if block_bottom > view_bottom - MARGIN {
+        // Block is below viewport - scroll down
+        let target = block_bottom - scroll_state.visible_height + MARGIN;
+        scroll_state.target_offset = target.min(scroll_state.max_offset());
+        scroll_state.offset = scroll_state.target_offset;
+        // If we scrolled to the very bottom, enable following
+        scroll_state.following = scroll_state.is_at_bottom();
+    }
+}
+
+/// Highlight the focused block cell with a visual indicator.
+///
+/// Applies a background tint or border highlight to the BlockCell
+/// that has the FocusedBlockCell marker.
+pub fn highlight_focused_block(
+    mut focused_configs: Query<(&BlockCell, &mut TextAreaConfig), With<FocusedBlockCell>>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    theme: Res<Theme>,
+) {
+    // For now, we indicate focus by slightly brightening the text color
+    // Future: could add a background highlight or border via a separate UI element
+
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    // Build block lookup
+    let blocks: std::collections::HashMap<_, _> = editor
+        .blocks()
+        .into_iter()
+        .map(|b| (b.id.clone(), b))
+        .collect();
+
+    // Focused blocks get a slightly brighter color
+    for (block_cell, mut config) in focused_configs.iter_mut() {
+        if let Some(block) = blocks.get(&block_cell.block_id) {
+            let base_color = block_color(block, &theme);
+            // Brighten the color slightly to indicate focus
+            let srgba = base_color.to_srgba();
+            let focused_color = Color::srgba(
+                (srgba.red * 1.15).min(1.0),
+                (srgba.green * 1.15).min(1.0),
+                (srgba.blue * 1.15).min(1.0),
+                srgba.alpha,
+            );
+            config.default_color = bevy_to_glyphon_color(focused_color);
+        }
+    }
+
+    // Unfocused blocks return to base color (handled by sync_block_cell_buffers)
+    // Note: This system runs after sync_block_cell_buffers so the focused block
+    // override takes precedence.
+}
+
+/// Handle `f` keybinding to expand the focused block to full screen.
+///
+/// In Normal mode with a focused block:
+/// - `f` pushes ExpandedBlock view onto ViewStack
+/// - The block content is shown full-screen for easier reading/editing
+pub fn handle_expand_block(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<CurrentMode>,
+    focus: Res<ConversationFocus>,
+    mut view_stack: ResMut<crate::ui::state::ViewStack>,
+) {
+    // Only in Normal mode with a focused block
+    if mode.0 != EditorMode::Normal {
+        return;
+    }
+
+    let Some(ref block_id) = focus.block_id else {
+        return;
+    };
+
+    // `f` expands the focused block
+    if keys.just_pressed(KeyCode::KeyF) {
+        view_stack.push(crate::ui::state::View::ExpandedBlock {
+            block_id: block_id.clone(),
+        });
+        info!("Expanded block: {:?}", block_id);
+    }
+}
+
+/// Handle Esc to pop ViewStack when in an overlay view.
+///
+/// In Normal mode with an overlay view (like ExpandedBlock):
+/// - Esc pops the view stack, returning to the previous view
+/// - At root view, Esc is handled by mode switching instead
+pub fn handle_view_pop(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<CurrentMode>,
+    mut view_stack: ResMut<crate::ui::state::ViewStack>,
+) {
+    // Only in Normal mode
+    if mode.0 != EditorMode::Normal {
+        return;
+    }
+
+    // Only when Esc is pressed and we're not at root
+    if keys.just_pressed(KeyCode::Escape) && !view_stack.is_at_root() {
+        view_stack.pop();
+    }
+}
+
+// ============================================================================
+// EXPANDED BLOCK VIEW (Phase 4)
+// ============================================================================
+
+use crate::ui::state::{ExpandedBlockView, ViewStack};
+
+/// Tracks the expanded block view entity.
+#[derive(Resource, Default)]
+pub struct ExpandedBlockEntity(pub Option<Entity>);
+
+/// Spawn the ExpandedBlockView when ViewStack enters ExpandedBlock state.
+pub fn spawn_expanded_block_view(
+    mut commands: Commands,
+    view_stack: Res<ViewStack>,
+    mut expanded_entity: ResMut<ExpandedBlockEntity>,
+    existing_views: Query<Entity, With<ExpandedBlockView>>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    font_system: Res<SharedFontSystem>,
+    text_metrics: Res<TextMetrics>,
+    theme: Res<Theme>,
+) {
+    // Check if we need to spawn or despawn
+    let should_show = view_stack.has_expanded_block();
+
+    if should_show && expanded_entity.0.is_none() {
+        // Spawn the expanded block view
+        let Some(block_id) = view_stack.expanded_block_id() else {
+            return;
+        };
+
+        // Get the block content from MainCell
+        let Some(main_ent) = main_entity.0 else {
+            return;
+        };
+        let Ok(editor) = main_cells.get(main_ent) else {
+            return;
+        };
+
+        let blocks = editor.blocks();
+        let Some(block) = blocks.iter().find(|b| &b.id == block_id) else {
+            warn!("Expanded block not found: {:?}", block_id);
+            return;
+        };
+
+        // Create the text buffer
+        let mut fs = font_system.0.lock().unwrap();
+        let metrics = text_metrics.scaled_cell_metrics();
+        let mut buffer = GlyphonTextBuffer::new(&mut fs, metrics);
+
+        let color = block_color(block, &theme);
+        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        buffer.set_text(&mut fs, &block.content, &attrs, glyphon::Shaping::Advanced);
+        drop(fs);
+
+        // Spawn the view entity
+        let entity = commands
+            .spawn((
+                ExpandedBlockView,
+                GlyphonText,
+                buffer,
+                TextAreaConfig {
+                    left: 40.0,
+                    top: 60.0,  // Leave room for header
+                    scale: 1.0,
+                    bounds: glyphon::TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: 1200,
+                        bottom: 800,
+                    },
+                    default_color: bevy_to_glyphon_color(color),
+                },
+                Visibility::Inherited,
+                // Store block info for updates
+                ExpandedBlockInfo {
+                    block_id: block_id.clone(),
+                    block_kind: block.kind,
+                },
+            ))
+            .id();
+
+        expanded_entity.0 = Some(entity);
+        info!("Spawned ExpandedBlockView for {:?}", block_id);
+    } else if !should_show && expanded_entity.0.is_some() {
+        // Despawn when leaving ExpandedBlock view
+        for entity in existing_views.iter() {
+            commands.entity(entity).despawn();
+        }
+        expanded_entity.0 = None;
+        info!("Despawned ExpandedBlockView");
+    }
+}
+
+/// Stores info about the currently expanded block.
+#[derive(Component)]
+pub struct ExpandedBlockInfo {
+    pub block_id: kaijutsu_crdt::BlockId,
+    pub block_kind: BlockKind,
+}
+
+/// Update the ExpandedBlockView content when the block changes.
+pub fn sync_expanded_block_content(
+    view_stack: Res<ViewStack>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    mut expanded_views: Query<
+        (&ExpandedBlockInfo, &mut GlyphonTextBuffer, &mut TextAreaConfig),
+        With<ExpandedBlockView>,
+    >,
+    font_system: Res<SharedFontSystem>,
+    theme: Res<Theme>,
+    windows: Query<&Window>,
+) {
+    if !view_stack.has_expanded_block() {
+        return;
+    }
+
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    // Get window size for bounds
+    let (width, height) = windows
+        .iter()
+        .next()
+        .map(|w| (w.width(), w.height()))
+        .unwrap_or((1280.0, 800.0));
+
+    let blocks = editor.blocks();
+
+    for (info, mut buffer, mut config) in expanded_views.iter_mut() {
+        let Some(block) = blocks.iter().find(|b| b.id == info.block_id) else {
+            continue;
+        };
+
+        // Update text if changed
+        let mut fs = font_system.0.lock().unwrap();
+        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        buffer.set_text(&mut fs, &block.content, &attrs, glyphon::Shaping::Advanced);
+        drop(fs);
+
+        // Update color
+        let color = block_color(block, &theme);
+        config.default_color = bevy_to_glyphon_color(color);
+
+        // Update bounds to fill screen (with padding)
+        config.bounds = glyphon::TextBounds {
+            left: 40,
+            top: 60,
+            right: (width - 40.0) as i32,
+            bottom: (height - 40.0) as i32,
+        };
     }
 }
 

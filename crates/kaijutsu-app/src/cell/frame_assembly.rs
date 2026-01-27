@@ -525,8 +525,7 @@ pub fn update_nine_slice_state(
         } else {
             match mode.0 {
                 EditorMode::Normal => theme.frame_focused,
-                EditorMode::Chat | EditorMode::Shell => theme.frame_insert, // Input modes share insert style
-                EditorMode::Command => theme.frame_command,
+                EditorMode::Input(_) => theme.frame_insert, // Input modes share insert style
                 EditorMode::Visual => theme.frame_visual,
             }
         };
