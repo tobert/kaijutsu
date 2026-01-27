@@ -17,11 +17,6 @@ pub enum CrdtError {
     #[error("operation not supported on block {0:?}")]
     UnsupportedOperation(BlockId),
 
-    /// Attempted to edit a block without a Text CRDT content field.
-    #[deprecated(note = "All block types now support Text CRDT - this error should not occur")]
-    #[error("block {0:?} has no editable content")]
-    ImmutableBlock(BlockId),
-
     /// Edit position out of bounds.
     #[error("edit position {pos} out of bounds for block with length {len}")]
     PositionOutOfBounds { pos: usize, len: usize },
