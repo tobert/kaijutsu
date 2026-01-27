@@ -513,6 +513,24 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the display hint for a block.
+    ///
+    /// Display hints provide formatting information (tables, trees) for richer output.
+    /// The hint is stored as a JSON string in the CRDT block.
+    pub fn set_display_hint(
+        &self,
+        document_id: &str,
+        block_id: &BlockId,
+        hint: Option<&str>,
+    ) -> Result<(), String> {
+        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+        let agent_id = self.agent_id();
+        entry.doc.set_display_hint(block_id, hint).map_err(|e| e.to_string())?;
+        entry.touch(&agent_id);
+        // Note: No event emission for display hint changes for now - they're synced with full state
+        Ok(())
+    }
+
     /// Append text to a block.
     ///
     /// Note: Does not auto-save to avoid excessive I/O during streaming.

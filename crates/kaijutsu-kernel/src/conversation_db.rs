@@ -207,6 +207,7 @@ fn row_to_block(
         tool_call_id,
         exit_code,
         is_error,
+        display_hint: None, // TODO: persist display hints to DB if needed
     }
 }
 

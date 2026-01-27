@@ -1158,6 +1158,17 @@ fn parse_block_snapshot(
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok());
 
+    // Read display hint from wire protocol
+    let display_hint = if reader.get_has_display_hint() {
+        reader.get_display_hint()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+    } else {
+        None
+    };
+
     Ok(kaijutsu_crdt::BlockSnapshot {
         id,
         parent_id,
@@ -1173,5 +1184,6 @@ fn parse_block_snapshot(
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
+        display_hint,
     })
 }

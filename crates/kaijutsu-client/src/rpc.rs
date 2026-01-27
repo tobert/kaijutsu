@@ -540,6 +540,17 @@ fn parse_block_snapshot(
 
     let is_error = reader.get_is_error();
 
+    // Read display hint from wire protocol
+    let display_hint = if reader.get_has_display_hint() {
+        reader.get_display_hint()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+    } else {
+        None
+    };
+
     Ok(BlockSnapshot {
         id,
         parent_id,
@@ -555,6 +566,7 @@ fn parse_block_snapshot(
         tool_call_id,
         exit_code,
         is_error,
+        display_hint,
     })
 }
 

@@ -336,6 +336,10 @@ struct BlockSnapshot {
   exitCode @14 :Int32;        # Exit code for toolResult
   hasExitCode @15 :Bool;      # True if exitCode is set
   isError @16 :Bool;          # True if toolResult is an error
+
+  # Display hint for richer output formatting (JSON-serialized)
+  displayHint @17 :Text;      # JSON DisplayHint for tables/trees
+  hasDisplayHint @18 :Bool;   # True if displayHint is set
 }
 
 # Operations on block documents

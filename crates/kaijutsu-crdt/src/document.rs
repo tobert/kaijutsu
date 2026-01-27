@@ -264,6 +264,9 @@ impl BlockDocument {
                 .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
                 .unwrap_or(false);
 
+            let display_hint = map.get(&SmartString::from("display_hint"))
+                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None });
+
             Some(BlockSnapshot {
                 id: id.clone(),
                 parent_id,
@@ -279,6 +282,7 @@ impl BlockDocument {
                 tool_call_id,
                 exit_code,
                 is_error,
+                display_hint,
             })
         } else {
             None
@@ -456,6 +460,7 @@ impl BlockDocument {
             None, // tool_call_id
             None, // exit_code
             false, // is_error
+            None, // display_hint
         )?;
 
         Ok(id)
@@ -486,6 +491,7 @@ impl BlockDocument {
             None,
             None,
             false,
+            None, // display_hint
         )?;
 
         Ok(id)
@@ -516,6 +522,7 @@ impl BlockDocument {
             Some(tool_call_id.clone()),
             exit_code,
             is_error,
+            None, // display_hint
         )?;
 
         Ok(id)
@@ -557,6 +564,7 @@ impl BlockDocument {
             snapshot.tool_call_id,
             snapshot.exit_code,
             snapshot.is_error,
+            snapshot.display_hint,
         )?;
 
         Ok(snapshot.id)
@@ -578,6 +586,7 @@ impl BlockDocument {
         tool_call_id: Option<BlockId>,
         exit_code: Option<i32>,
         is_error: bool,
+        display_hint: Option<String>,
     ) -> Result<()> {
         let block_key = id.to_key();
 
@@ -747,6 +756,15 @@ impl BlockDocument {
             );
         }
 
+        if let Some(hint) = display_hint {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "display_hint",
+                CreateValue::Primitive(Primitive::Str(SmartString::from(hint.as_str()))),
+            );
+        }
+
         self.version += 1;
         Ok(())
     }
@@ -767,6 +785,31 @@ impl BlockDocument {
             "status",
             CreateValue::Primitive(Primitive::Str(SmartString::from(status.as_str()))),
         );
+
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the display hint of a block.
+    ///
+    /// Display hints are used for richer output formatting (tables, trees).
+    /// The hint is stored as a JSON string.
+    pub fn set_display_hint(&mut self, id: &BlockId, hint: Option<&str>) -> Result<()> {
+        let _snapshot = self.get_block_snapshot(id)
+            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+
+        let block_key = format!("block:{}", id.to_key());
+        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
+
+        if let Some(h) = hint {
+            self.oplog.local_map_set(
+                self.agent,
+                block_map_lv,
+                "display_hint",
+                CreateValue::Primitive(Primitive::Str(SmartString::from(h))),
+            );
+        }
+        // If hint is None, we don't need to do anything - it's already not set
 
         self.version += 1;
         Ok(())
@@ -1117,6 +1160,7 @@ impl BlockDocument {
                 block_snap.tool_call_id,
                 block_snap.exit_code,
                 block_snap.is_error,
+                block_snap.display_hint,
             );
             last_id = Some(block_snap.id);
         }

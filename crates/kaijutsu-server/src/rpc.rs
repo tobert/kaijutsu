@@ -1826,6 +1826,11 @@ impl kernel::Server for KernelImpl {
                         log::info!("shell_execute: kaish returned code={} out_len={} err_len={}",
                             result.code, result.out.len(), result.err.len());
                         log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
+
+                        // Convert kaish DisplayHint to kaijutsu format and serialize
+                        let display_hint = crate::embedded_kaish::convert_display_hint(&result.hint);
+                        let hint_json = crate::embedded_kaish::serialize_display_hint(&display_hint);
+
                         // Combine out and err (kaish uses out/err/code fields)
                         let output = if result.err.is_empty() {
                             result.out
@@ -1834,10 +1839,19 @@ impl kernel::Server for KernelImpl {
                         } else {
                             format!("{}\n{}", result.out, result.err)
                         };
-                        log::debug!("Shell execution completed: {} bytes, exit_code={}", output.len(), result.code);
-                        // Update output block with result
+                        log::debug!("Shell execution completed: {} bytes, exit_code={}, has_hint={}",
+                            output.len(), result.code, hint_json.is_some());
+
+                        // Update output block with result text
                         if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &output, 0) {
                             log::error!("Failed to update shell output: {}", e);
+                        }
+
+                        // Store display hint if present
+                        if let Some(hint) = hint_json.as_deref() {
+                            if let Err(e) = documents_clone.set_display_hint(&cell_id_clone, &output_block_id_clone, Some(hint)) {
+                                log::error!("Failed to set display hint: {}", e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -2391,6 +2405,14 @@ fn set_block_snapshot(
         builder.set_has_exit_code(false);
     }
     builder.set_is_error(block.is_error);
+
+    // Set display hint if present
+    if let Some(ref hint) = block.display_hint {
+        builder.set_has_display_hint(true);
+        builder.set_display_hint(hint);
+    } else {
+        builder.set_has_display_hint(false);
+    }
 }
 
 /// Convert a CRDT Status to Cap'n Proto Status.
@@ -2465,6 +2487,17 @@ fn parse_block_snapshot(
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok());
 
+    // Read display hint from wire protocol
+    let display_hint = if reader.get_has_display_hint() {
+        reader.get_display_hint()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+    } else {
+        None
+    };
+
     Ok(kaijutsu_crdt::BlockSnapshot {
         id,
         parent_id,
@@ -2480,6 +2513,7 @@ fn parse_block_snapshot(
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
+        display_hint,
     })
 }
 

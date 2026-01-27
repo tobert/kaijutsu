@@ -276,6 +276,10 @@ pub struct BlockSnapshot {
     /// Whether this is an error result (for ToolResult blocks).
     #[serde(default)]
     pub is_error: bool,
+    /// Display hint for richer output formatting (JSON-serialized).
+    /// Used for shell output blocks to enable per-viewer rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_hint: Option<String>,
 }
 
 impl BlockSnapshot {
@@ -302,6 +306,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            display_hint: None,
         }
     }
 
@@ -327,6 +332,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            display_hint: None,
         }
     }
 
@@ -354,6 +360,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            display_hint: None,
         }
     }
 
@@ -381,6 +388,7 @@ impl BlockSnapshot {
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
+            display_hint: None,
         }
     }
 
@@ -406,6 +414,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            display_hint: None,
         }
     }
 
@@ -433,6 +442,36 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code,
             is_error,
+            display_hint: None,
+        }
+    }
+
+    /// Create a new shell output block with a display hint.
+    pub fn shell_output_with_hint(
+        id: BlockId,
+        command_block_id: BlockId,
+        content: impl Into<String>,
+        is_error: bool,
+        exit_code: Option<i32>,
+        author: impl Into<String>,
+        display_hint: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            parent_id: Some(command_block_id.clone()),
+            role: Role::System,
+            status: if is_error { Status::Error } else { Status::Done },
+            kind: BlockKind::ShellOutput,
+            content: content.into(),
+            collapsed: false,
+            author: author.into(),
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code,
+            is_error,
+            display_hint,
         }
     }
 

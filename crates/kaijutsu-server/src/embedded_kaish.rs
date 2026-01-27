@@ -28,10 +28,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use kaish_kernel::interpreter::ExecResult;
+use kaish_kernel::interpreter::{DisplayHint as KaishDisplayHint, EntryType as KaishEntryType, ExecResult};
 use kaish_kernel::{Kernel as KaishKernel, KernelConfig as KaishConfig};
 
 use kaijutsu_kernel::block_store::SharedBlockStore;
+use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 
 // TODO: Re-enable once path routing is fixed
@@ -131,6 +132,57 @@ impl EmbeddedKaish {
     pub async fn shutdown(self) -> Result<()> {
         // Nothing to do - kernel will be dropped
         Ok(())
+    }
+}
+
+// ============================================================================
+// DisplayHint Conversion
+// ============================================================================
+
+/// Convert a kaish EntryType to kaijutsu EntryType.
+pub fn convert_entry_type(et: &KaishEntryType) -> EntryType {
+    match et {
+        KaishEntryType::File => EntryType::File,
+        KaishEntryType::Directory => EntryType::Directory,
+        KaishEntryType::Executable => EntryType::Executable,
+        KaishEntryType::Symlink => EntryType::Symlink,
+    }
+}
+
+/// Convert a kaish DisplayHint to kaijutsu DisplayHint.
+pub fn convert_display_hint(kaish_hint: &KaishDisplayHint) -> DisplayHint {
+    match kaish_hint {
+        KaishDisplayHint::None => DisplayHint::None,
+
+        KaishDisplayHint::Formatted { user, model } => DisplayHint::Formatted {
+            user: user.clone(),
+            model: model.clone(),
+        },
+
+        KaishDisplayHint::Table { headers, rows, entry_types } => DisplayHint::Table {
+            headers: headers.clone(),
+            rows: rows.clone(),
+            entry_types: entry_types.as_ref().map(|ets| {
+                ets.iter().map(convert_entry_type).collect()
+            }),
+        },
+
+        KaishDisplayHint::Tree { root, structure, traditional, compact } => DisplayHint::Tree {
+            root: root.clone(),
+            structure: structure.clone(),
+            traditional: traditional.clone(),
+            compact: compact.clone(),
+        },
+    }
+}
+
+/// Serialize a DisplayHint to JSON for storage in CRDT blocks.
+///
+/// Returns None for DisplayHint::None to avoid storing unnecessary data.
+pub fn serialize_display_hint(hint: &DisplayHint) -> Option<String> {
+    match hint {
+        DisplayHint::None => None,
+        _ => serde_json::to_string(hint).ok(),
     }
 }
 

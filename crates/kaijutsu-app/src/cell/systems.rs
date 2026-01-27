@@ -11,6 +11,7 @@ use super::components::{
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer, TextMetrics};
+use crate::ui::format::format_for_display;
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 use crate::ui::theme::Theme;
 
@@ -411,7 +412,9 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                 output.push_str(&block.content);
             }
             BlockKind::ShellOutput => {
-                output.push_str(&block.content);
+                // Use display hint for richer formatting (tables, trees)
+                let formatted = format_for_display(&block.content, block.display_hint.as_deref());
+                output.push_str(&formatted.text);
             }
         }
     }
@@ -1940,7 +1943,9 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             format!("$ {}", block.content)
         }
         BlockKind::ShellOutput => {
-            block.content.clone()
+            // Use display hint for richer formatting (tables, trees)
+            let formatted = format_for_display(&block.content, block.display_hint.as_deref());
+            formatted.text
         }
     }
 }

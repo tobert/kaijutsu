@@ -8,6 +8,75 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// ============================================================================
+// DisplayHint - Dual-format output for humans vs models
+// ============================================================================
+
+/// Display hint for command output.
+///
+/// Tools can specify how their output should be formatted for different audiences:
+/// - **Humans** → Pretty columns, colors, traditional tree
+/// - **Models** → Token-efficient compact formats (brace notation, JSON)
+///
+/// This mirrors kaish's DisplayHint but uses serde for wire serialization.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DisplayHint {
+    /// No special formatting - use raw output as-is.
+    #[default]
+    None,
+
+    /// Pre-rendered output for both audiences.
+    Formatted {
+        /// Pretty format for humans (TTY).
+        user: String,
+        /// Compact format for models/piping.
+        model: String,
+    },
+
+    /// Tabular data - client handles column layout.
+    Table {
+        /// Optional column headers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<Vec<String>>,
+        /// Table rows (each row is a vector of cell values).
+        rows: Vec<Vec<String>>,
+        /// Entry metadata for coloring (is_dir, is_executable, etc.).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entry_types: Option<Vec<EntryType>>,
+    },
+
+    /// Tree structure - client chooses traditional vs compact.
+    Tree {
+        /// Root directory name.
+        root: String,
+        /// Tree structure as JSON for flexible rendering.
+        structure: serde_json::Value,
+        /// Pre-rendered traditional format (for human display).
+        traditional: String,
+        /// Pre-rendered compact format (for model/piped display).
+        compact: String,
+    },
+}
+
+/// Entry type for colorizing file listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryType {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+    /// Executable file.
+    Executable,
+    /// Symbolic link.
+    Symlink,
+}
+
+// ============================================================================
+// Tool Info
+// ============================================================================
+
 /// Information about a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
@@ -48,6 +117,14 @@ pub struct ExecResult {
     pub exit_code: i32,
     /// Whether execution succeeded.
     pub success: bool,
+    /// Display hint for richer formatting.
+    #[serde(default, skip_serializing_if = "is_display_hint_none")]
+    pub hint: DisplayHint,
+}
+
+/// Helper for serde skip_serializing_if
+fn is_display_hint_none(hint: &DisplayHint) -> bool {
+    matches!(hint, DisplayHint::None)
 }
 
 impl ExecResult {
@@ -58,6 +135,7 @@ impl ExecResult {
             stderr: String::new(),
             exit_code: 0,
             success: true,
+            hint: DisplayHint::None,
         }
     }
 
@@ -68,6 +146,7 @@ impl ExecResult {
             stderr: stderr.into(),
             exit_code,
             success: false,
+            hint: DisplayHint::None,
         }
     }
 
@@ -82,7 +161,14 @@ impl ExecResult {
             stderr: stderr.into(),
             exit_code,
             success: exit_code == 0,
+            hint: DisplayHint::None,
         }
+    }
+
+    /// Create a result with a display hint.
+    pub fn with_hint(mut self, hint: DisplayHint) -> Self {
+        self.hint = hint;
+        self
     }
 }
 
@@ -341,5 +427,54 @@ mod tests {
         let result = engine.execute("test").await.unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "noop: test");
+    }
+
+    #[test]
+    fn test_display_hint_default() {
+        let result = ExecResult::success("test");
+        assert_eq!(result.hint, DisplayHint::None);
+    }
+
+    #[test]
+    fn test_display_hint_with_hint() {
+        let result = ExecResult::success("test").with_hint(DisplayHint::Formatted {
+            user: "Pretty output".to_string(),
+            model: "compact".to_string(),
+        });
+        match &result.hint {
+            DisplayHint::Formatted { user, model } => {
+                assert_eq!(user, "Pretty output");
+                assert_eq!(model, "compact");
+            }
+            _ => panic!("Expected Formatted hint"),
+        }
+    }
+
+    #[test]
+    fn test_display_hint_table() {
+        let hint = DisplayHint::Table {
+            headers: Some(vec!["Name".to_string(), "Size".to_string()]),
+            rows: vec![
+                vec!["file1.txt".to_string(), "1024".to_string()],
+                vec!["file2.txt".to_string(), "2048".to_string()],
+            ],
+            entry_types: Some(vec![EntryType::File, EntryType::File]),
+        };
+        let result = ExecResult::success("file1.txt\nfile2.txt").with_hint(hint);
+        assert!(matches!(result.hint, DisplayHint::Table { .. }));
+    }
+
+    #[test]
+    fn test_display_hint_serialization() {
+        let hint = DisplayHint::Table {
+            headers: None,
+            rows: vec![vec!["src".to_string()], vec!["Cargo.toml".to_string()]],
+            entry_types: Some(vec![EntryType::Directory, EntryType::File]),
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        assert!(json.contains("\"type\":\"table\""));
+        assert!(json.contains("\"directory\""));
+        let parsed: DisplayHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(hint, parsed);
     }
 }
