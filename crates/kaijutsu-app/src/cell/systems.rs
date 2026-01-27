@@ -15,6 +15,25 @@ use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 use crate::ui::theme::Theme;
 
 // ============================================================================
+// LAYOUT CONSTANTS
+// ============================================================================
+
+/// Horizontal indentation per nesting level (for nested tool results, etc.)
+const INDENT_WIDTH: f32 = 24.0;
+
+/// Vertical spacing between blocks.
+const BLOCK_SPACING: f32 = 2.0;
+
+/// Height reserved for role transition headers (e.g., "User", "Assistant").
+const ROLE_HEADER_HEIGHT: f32 = 20.0;
+
+/// Spacing between role header and block content.
+const ROLE_HEADER_SPACING: f32 = 2.0;
+
+/// Height of the status bar at bottom of window.
+const STATUS_BAR_HEIGHT: f32 = 24.0;
+
+// ============================================================================
 // BLOCK COLOR MAPPING
 // ============================================================================
 
@@ -2122,11 +2141,6 @@ pub fn layout_block_cells(
         return;
     };
 
-    // Terminal-like tight spacing - room for 1px chrome later
-    const BLOCK_SPACING: f32 = 2.0;
-    const ROLE_HEADER_HEIGHT: f32 = 20.0; // Single line height
-    const ROLE_HEADER_SPACING: f32 = 2.0;
-    const INDENT_WIDTH: f32 = 16.0; // Tighter indent
     let mut y_offset = 0.0;
 
     // Get window size for wrap width and visible height calculation
@@ -2156,8 +2170,6 @@ pub fn layout_block_cells(
 
     // Update visible_height early so smooth_scroll has correct max_offset
     // Use InputShadowHeight (0 when minimized, docked_height when visible)
-    // Plus status bar height (always 24px)
-    const STATUS_BAR_HEIGHT: f32 = 24.0;
     let visible_top = layout.workspace_margin_top;
     let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
     scroll_state.visible_height = visible_bottom - visible_top;
@@ -2282,13 +2294,11 @@ pub fn apply_block_cell_positions(
         .unwrap_or((1280.0, 800.0));
 
     // Visible area (use shadow_height, 0 when minimized)
-    const STATUS_BAR_HEIGHT: f32 = 24.0;
     let visible_top = layout.workspace_margin_top;
     let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
     let visible_height = visible_bottom - visible_top;
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
-    const INDENT_WIDTH: f32 = 32.0;
 
     // Update scroll state with visible area and clamp offset
     scroll_state.visible_height = visible_height;
@@ -2311,12 +2321,14 @@ pub fn apply_block_cell_positions(
         config.top = content_top;
         config.scale = 1.0;
 
-        // Bounds are the fixed visible clipping window
+        // Clamp bounds to intersection of visible area and block area
+        // This prevents text from rendering outside its block when partially scrolled
+        let block_bottom = content_top + block_layout.height;
         config.bounds = glyphon::TextBounds {
             left: left as i32,
-            top: visible_top as i32,
+            top: visible_top.max(content_top) as i32,
             right: (left + width) as i32,
-            bottom: visible_bottom as i32,
+            bottom: visible_bottom.min(block_bottom) as i32,
         };
     }
 }
