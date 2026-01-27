@@ -9,6 +9,7 @@ use super::components::{
 };
 use super::frame_assembly;
 use super::systems;
+use crate::dashboard::DashboardEventHandling;
 use crate::ui::state::{InputDock, InputPosition, InputPresence, InputShadowHeight};
 
 /// Plugin that enables cell-based editing in the workspace.
@@ -102,10 +103,13 @@ impl Plugin for CellPlugin {
             )
             // Block event handling (server → client sync)
             // Receives block events from the server and updates the Conversation registry.
-            // Must run BEFORE sync_main_cell_to_conversation so sync sees updated version.
+            // Must run:
+            // - AFTER DashboardEventHandling so SeatTaken creates conversation first
+            // - BEFORE sync_main_cell_to_conversation so sync sees updated version
             .add_systems(
                 Update,
                 systems::handle_block_events
+                    .after(DashboardEventHandling)
                     .before(systems::sync_main_cell_to_conversation),
             )
             // Block cell systems (per-block UI rendering for conversation)

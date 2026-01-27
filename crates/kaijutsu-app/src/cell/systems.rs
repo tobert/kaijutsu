@@ -1743,6 +1743,8 @@ pub fn handle_block_events(
             // sync_main_cell_to_conversation will then copy to MainCell
             ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
                 // Update the conversation in the registry (authoritative source)
+                // NOTE: This system must run after DashboardEventHandling (see cell/plugin.rs)
+                // so that SeatTaken has already created the conversation.
                 if let Some(conv_id) = current_conv.id() {
                     if let Some(conv) = registry.get_mut(conv_id) {
                         let agent_id = conv.doc.agent_id().to_string();
@@ -1763,7 +1765,18 @@ pub fn handle_block_events(
                                 warn!("Failed to apply initial state to conversation: {}", e);
                             }
                         }
+                    } else {
+                        warn!(
+                            "BlockCellInitialState: conversation {} not found in registry",
+                            conv_id
+                        );
                     }
+                } else {
+                    warn!(
+                        "BlockCellInitialState arrived but no current conversation set. \
+                         This indicates a system ordering bug - handle_block_events should \
+                         run after DashboardEventHandling."
+                    );
                 }
                 // Also update sync state frontier for incremental ops
                 match sync_state.apply_initial_state(&mut editor.doc, cell_id, ops) {

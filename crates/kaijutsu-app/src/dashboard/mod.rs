@@ -29,6 +29,12 @@ use crate::HeaderContainer;
 
 pub use seat_selector::{spawn_seat_dropdown, spawn_seat_selector};
 
+/// System set for dashboard event handling.
+/// Other plugins can schedule systems `.after(DashboardEventHandling)` to ensure
+/// they run after SeatTaken creates the conversation in the registry.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DashboardEventHandling;
+
 /// Plugin for the dashboard/lobby experience
 pub struct DashboardPlugin;
 
@@ -40,8 +46,9 @@ impl Plugin for DashboardPlugin {
             .add_systems(
                 Update,
                 (
-                    // Dashboard systems
-                    handle_dashboard_events,
+                    // Dashboard event handling - creates conversation on SeatTaken
+                    // Other systems (like handle_block_events) must run after this
+                    handle_dashboard_events.in_set(DashboardEventHandling),
                     handle_kernel_selection,
                     handle_context_selection,
                     handle_take_seat,
