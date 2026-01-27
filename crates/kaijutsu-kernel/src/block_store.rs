@@ -342,14 +342,18 @@ impl BlockStore {
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
+
+            // Capture frontier before insert for incremental ops
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
-            // Always send full oplog for BlockInserted to ensure clients can sync
-            // TODO: Optimize with frontier tracking - clients send their frontier,
-            // server sends ops_since(client_frontier) instead of full oplog
-            let ops = entry.doc.ops_since(&[]); // Full oplog from empty frontier
+
+            // Send only the ops that created this block (incremental sync)
+            // Client tracks frontier and uses merge_ops_owned() for efficient sync
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -380,14 +384,17 @@ impl BlockStore {
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            // Capture frontier before insert to get creation ops
-            let frontier = entry.doc.frontier();
+
+            // Capture frontier before insert for incremental ops
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
-            // Get ops that created this block
-            let ops = entry.doc.ops_since(&frontier);
+
+            // Send only the ops that created this block (incremental sync)
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -419,14 +426,17 @@ impl BlockStore {
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
-            // Capture frontier before insert to get creation ops
-            let frontier = entry.doc.frontier();
+
+            // Capture frontier before insert for incremental ops
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
-            // Get ops that created this block
-            let ops = entry.doc.ops_since(&frontier);
+
+            // Send only the ops that created this block (incremental sync)
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -1038,5 +1048,270 @@ mod tests {
 
         // Should have received at least some events
         assert!(events_received > 0, "Should have received some events");
+    }
+
+    // ============================================================================
+    // FRONTIER-BASED INCREMENTAL SYNC TESTS
+    // ============================================================================
+    //
+    // These tests verify Phase 2 of the frontier-based CRDT sync:
+    // - Server sends incremental ops (not full oplog) for block insertions
+    // - Client can merge these ops after initial full sync
+
+    use crate::flows::{BlockFlow, FlowBus, SharedBlockFlowBus};
+    use std::sync::Arc;
+
+    /// Helper to create a BlockStore with FlowBus for testing.
+    fn store_with_flows() -> (BlockStore, SharedBlockFlowBus) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let store = BlockStore::with_flows("server-agent", bus.clone());
+        (store, bus)
+    }
+
+    /// Test that insert_block emits incremental ops that can be merged
+    /// by a client that already has the base document state.
+    #[tokio::test]
+    async fn test_insert_block_emits_incremental_ops() {
+        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        // Create document on server
+        store.create_document("sync-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Get full oplog for client initial sync (simulates get_block_cell_state)
+        let full_oplog = {
+            let entry = store.get("sync-test").unwrap();
+            entry.doc.oplog_bytes()
+        };
+
+        // Client creates document from full oplog (initial sync)
+        let mut client = BlockDocument::from_oplog("sync-test", "client-agent", &full_oplog)
+            .expect("client should sync from oplog");
+        assert_eq!(client.block_count(), 0, "initially empty");
+
+        // Server inserts a block
+        let block_id = store.insert_block(
+            "sync-test",
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Hello from server"
+        ).unwrap();
+
+        // Get the BlockInserted event with ops
+        let msg = sub.try_recv().expect("should receive BlockInserted event");
+        let ops = match msg.payload {
+            BlockFlow::Inserted { ops, .. } => ops,
+            _ => panic!("expected BlockInserted event"),
+        };
+
+        // Deserialize and merge incremental ops on client
+        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops)
+            .expect("should deserialize ops");
+
+        client.merge_ops_owned(serialized_ops)
+            .expect("client should merge incremental ops without DataMissing error");
+
+        // Verify client has the block
+        assert_eq!(client.block_count(), 1);
+        let snapshot = client.get_block_snapshot(&block_id).expect("block should exist on client");
+        assert_eq!(snapshot.content, "Hello from server");
+    }
+
+    /// Test that insert_tool_call emits incremental ops that can be merged.
+    #[tokio::test]
+    async fn test_insert_tool_call_emits_incremental_ops() {
+        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        store.create_document("tool-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Full sync
+        let full_oplog = store.get("tool-test").unwrap().doc.oplog_bytes();
+        let mut client = BlockDocument::from_oplog("tool-test", "client-agent", &full_oplog)
+            .expect("initial sync");
+
+        // Server inserts tool call
+        let block_id = store.insert_tool_call(
+            "tool-test",
+            None,
+            None,
+            "bash",
+            serde_json::json!({"command": "ls -la"})
+        ).unwrap();
+
+        // Get incremental ops from event
+        let msg = sub.try_recv().expect("should receive event");
+        let ops = match msg.payload {
+            BlockFlow::Inserted { ops, .. } => ops,
+            _ => panic!("expected BlockInserted"),
+        };
+
+        // Client merges incremental ops
+        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+        client.merge_ops_owned(serialized_ops)
+            .expect("should merge tool_call incremental ops");
+
+        // Verify
+        let snapshot = client.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(snapshot.kind, BlockKind::ToolCall);
+        assert_eq!(snapshot.tool_name.as_deref(), Some("bash"));
+    }
+
+    /// Test that insert_tool_result emits incremental ops that can be merged.
+    #[tokio::test]
+    async fn test_insert_tool_result_emits_incremental_ops() {
+        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        store.create_document("result-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Insert a tool call first (parent for tool result)
+        let tool_call_id = store.insert_tool_call(
+            "result-test",
+            None,
+            None,
+            "bash",
+            serde_json::json!({"command": "echo hello"})
+        ).unwrap();
+        let _ = sub.try_recv(); // drain tool call event
+
+        // Full sync (after tool call exists)
+        let full_oplog = store.get("result-test").unwrap().doc.oplog_bytes();
+        let mut client = BlockDocument::from_oplog("result-test", "client-agent", &full_oplog)
+            .expect("initial sync");
+        assert_eq!(client.block_count(), 1, "should have tool call");
+
+        // Server inserts tool result
+        let result_id = store.insert_tool_result(
+            "result-test",
+            &tool_call_id,
+            None,
+            "hello\n",
+            false,
+            Some(0)
+        ).unwrap();
+
+        // Get incremental ops
+        let msg = sub.try_recv().expect("should receive event");
+        let ops = match msg.payload {
+            BlockFlow::Inserted { ops, .. } => ops,
+            _ => panic!("expected BlockInserted"),
+        };
+
+        // Client merges
+        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+        client.merge_ops_owned(serialized_ops)
+            .expect("should merge tool_result incremental ops");
+
+        // Verify
+        assert_eq!(client.block_count(), 2);
+        let snapshot = client.get_block_snapshot(&result_id).unwrap();
+        assert_eq!(snapshot.kind, BlockKind::ToolResult);
+        assert_eq!(snapshot.content, "hello\n");
+        assert_eq!(snapshot.exit_code, Some(0));
+    }
+
+    /// Test multiple sequential block inserts all produce mergeable incremental ops.
+    #[tokio::test]
+    async fn test_multiple_incremental_syncs() {
+        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        store.create_document("multi-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Initial sync
+        let full_oplog = store.get("multi-test").unwrap().doc.oplog_bytes();
+        let mut client = BlockDocument::from_oplog("multi-test", "client-agent", &full_oplog)
+            .expect("initial sync");
+
+        // Insert multiple blocks, merging each incrementally
+        for i in 0..5 {
+            let _ = store.insert_block(
+                "multi-test",
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                format!("Message {}", i)
+            ).unwrap();
+
+            let msg = sub.try_recv().expect("should receive event");
+            let ops = match msg.payload {
+                BlockFlow::Inserted { ops, .. } => ops,
+                _ => panic!("expected BlockInserted"),
+            };
+
+            let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+            client.merge_ops_owned(serialized_ops)
+                .expect(&format!("should merge block {} incrementally", i));
+        }
+
+        // Verify all blocks synced
+        assert_eq!(client.block_count(), 5);
+
+        // Verify content matches server
+        let server_blocks = store.block_snapshots("multi-test").unwrap();
+        let client_blocks = client.blocks_ordered();
+
+        for (server_block, client_block) in server_blocks.iter().zip(client_blocks.iter()) {
+            assert_eq!(server_block.content, client_block.content);
+        }
+    }
+
+    /// Test that text streaming (append_text) produces incremental ops.
+    #[tokio::test]
+    async fn test_text_streaming_incremental_ops() {
+        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        store.create_document("stream-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Insert initial empty block
+        let block_id = store.insert_block(
+            "stream-test",
+            None,
+            None,
+            Role::Model,
+            BlockKind::Text,
+            ""  // Start empty
+        ).unwrap();
+        let _ = sub.try_recv(); // drain insert event
+
+        // Full sync after block created
+        let full_oplog = store.get("stream-test").unwrap().doc.oplog_bytes();
+        let mut client = BlockDocument::from_oplog("stream-test", "client-agent", &full_oplog)
+            .expect("initial sync");
+
+        // Stream text in chunks
+        let chunks = ["Hello", " ", "World", "!"];
+        for chunk in chunks {
+            store.append_text("stream-test", &block_id, chunk).unwrap();
+
+            let msg = sub.try_recv().expect("should receive event");
+            let ops = match msg.payload {
+                BlockFlow::TextOps { ops, .. } => ops,
+                _ => panic!("expected TextOps event, got {:?}", msg.payload),
+            };
+
+            let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+            client.merge_ops_owned(serialized_ops)
+                .expect(&format!("should merge chunk '{}'", chunk));
+        }
+
+        // Verify final content
+        let snapshot = client.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(snapshot.content, "Hello World!");
     }
 }
