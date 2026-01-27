@@ -908,15 +908,6 @@ impl block_events::Server for BlockEventsCallback {
         Promise::ok(())
     }
 
-    fn on_block_edited(
-        self: Rc<Self>,
-        _params: block_events::OnBlockEditedParams,
-        _results: block_events::OnBlockEditedResults,
-    ) -> Promise<(), capnp::Error> {
-        // Deprecated: position-based edits removed (25b2bc6), use on_block_text_ops
-        Promise::ok(())
-    }
-
     fn on_block_collapsed(
         self: Rc<Self>,
         params: block_events::OnBlockCollapsedParams,

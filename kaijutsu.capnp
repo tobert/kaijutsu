@@ -391,7 +391,7 @@ struct DocumentState {
 interface BlockEvents {
   onBlockInserted @0 (documentId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
   onBlockDeleted @1 (documentId :Text, blockId :BlockId);
-  onBlockEdited @2 (documentId :Text, blockId :BlockId, pos :UInt64, insert :Text, delete :UInt64);
+  # @2 reserved (was onBlockEdited, removed - use onBlockTextOps for CRDT ops)
   onBlockCollapsed @3 (documentId :Text, blockId :BlockId, collapsed :Bool);
   onBlockMoved @4 (documentId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
   onBlockStatusChanged @5 (documentId :Text, blockId :BlockId, status :Status);
