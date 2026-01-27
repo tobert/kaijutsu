@@ -1003,7 +1003,7 @@ pub fn handle_prompt_submitted(
         warn!("Conversation {} not in registry", conv_id);
         return;
     };
-    let doc_cell_id = conv.doc.cell_id().to_string();
+    let doc_cell_id = conv.doc.document_id().to_string();
 
     for event in submit_events.read() {
         if let Some(ref cmds) = cmds {
@@ -1833,7 +1833,7 @@ pub fn handle_block_events(
                 status,
             } => {
                 // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
+                if cell_id != editor.doc.document_id() {
                     continue;
                 }
 
@@ -1846,7 +1846,7 @@ pub fn handle_block_events(
                 block_id,
             } => {
                 // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
+                if cell_id != editor.doc.document_id() {
                     continue;
                 }
 
@@ -1860,7 +1860,7 @@ pub fn handle_block_events(
                 collapsed,
             } => {
                 // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
+                if cell_id != editor.doc.document_id() {
                     continue;
                 }
 
@@ -1874,7 +1874,7 @@ pub fn handle_block_events(
                 after_id,
             } => {
                 // Validate cell ID matches our document
-                if cell_id != editor.doc.cell_id() {
+                if cell_id != editor.doc.document_id() {
                     continue;
                 }
 

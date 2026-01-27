@@ -691,25 +691,25 @@ async fn connection_loop(
                 if let Some(kernel) = &current_kernel {
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
-                            // Use the cell_id provided by the server (kernel's main document)
-                            let cell_id = seat.cell_id.clone();
+                            // Use the document_id provided by the server (kernel's main document)
+                            let document_id = seat.document_id.clone();
 
                             // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
 
-                            // THEN fetch initial block cell state for frontier-based sync
+                            // THEN fetch initial document state for frontier-based sync
                             // This provides the full oplog so the client can merge incremental ops
                             // Must come after SeatTaken so the document exists when we sync
-                            match timeout(RPC_TIMEOUT, kernel.get_block_cell_state(&cell_id)).await {
+                            match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
                                 Ok(Ok(state)) => {
                                     log::info!(
-                                        "Fetched initial state for cell_id={}: {} blocks, {} bytes oplog",
-                                        cell_id,
+                                        "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
+                                        document_id,
                                         state.blocks.len(),
                                         state.ops.len()
                                     );
                                     let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
-                                        cell_id: state.cell_id,
+                                        cell_id: state.document_id,
                                         ops: state.ops,
                                         blocks: state.blocks,
                                     });
@@ -718,7 +718,7 @@ async fn connection_loop(
                                     log::warn!("Failed to get initial block state: {}", e);
                                 }
                                 Err(_) => {
-                                    log::warn!("get_block_cell_state timed out for {}", cell_id);
+                                    log::warn!("get_document_state timed out for {}", document_id);
                                 }
                             }
                         }
@@ -768,23 +768,23 @@ async fn connection_loop(
                     // For now, just join the context with the given instance
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
-                            // Use the cell_id provided by the server (kernel's main document)
-                            let cell_id = seat.cell_id.clone();
+                            // Use the document_id provided by the server (kernel's main document)
+                            let document_id = seat.document_id.clone();
 
                             // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
 
-                            // THEN fetch initial block cell state for frontier-based sync
-                            match timeout(RPC_TIMEOUT, kernel.get_block_cell_state(&cell_id)).await {
+                            // THEN fetch initial document state for frontier-based sync
+                            match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
                                 Ok(Ok(state)) => {
                                     log::info!(
-                                        "Fetched initial state for cell_id={}: {} blocks, {} bytes oplog",
-                                        cell_id,
+                                        "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
+                                        document_id,
                                         state.blocks.len(),
                                         state.ops.len()
                                     );
                                     let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
-                                        cell_id: state.cell_id,
+                                        cell_id: state.document_id,
                                         ops: state.ops,
                                         blocks: state.blocks,
                                     });
@@ -793,7 +793,7 @@ async fn connection_loop(
                                     log::warn!("Failed to get initial block state: {}", e);
                                 }
                                 Err(_) => {
-                                    log::warn!("get_block_cell_state timed out for {}", cell_id);
+                                    log::warn!("get_document_state timed out for {}", document_id);
                                 }
                             }
                         }
@@ -852,7 +852,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -888,7 +888,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -927,7 +927,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -963,7 +963,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -1009,7 +1009,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -1053,7 +1053,7 @@ impl block_events::Server for BlockEventsCallback {
             Err(e) => return Promise::err(e),
         };
 
-        let cell_id = match params.get_cell_id() {
+        let cell_id = match params.get_document_id() {
             Ok(s) => match s.to_str() {
                 Ok(s) => s.to_owned(),
                 Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
@@ -1091,7 +1091,7 @@ fn parse_block_id(
     reader: &kaijutsu_client::kaijutsu_capnp::block_id::Reader<'_>,
 ) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
     Ok(kaijutsu_crdt::BlockId {
-        cell_id: reader.get_cell_id()?.to_str()?.to_owned(),
+        document_id: reader.get_document_id()?.to_str()?.to_owned(),
         agent_id: reader.get_agent_id()?.to_str()?.to_owned(),
         seq: reader.get_seq(),
     })
@@ -1102,7 +1102,7 @@ fn parse_block_snapshot(
 ) -> Result<kaijutsu_crdt::BlockSnapshot, capnp::Error> {
     let id_reader = reader.get_id()?;
     let id = kaijutsu_crdt::BlockId {
-        cell_id: id_reader.get_cell_id()?.to_str()?.to_owned(),
+        document_id: id_reader.get_document_id()?.to_str()?.to_owned(),
         agent_id: id_reader.get_agent_id()?.to_str()?.to_owned(),
         seq: id_reader.get_seq(),
     };
@@ -1110,7 +1110,7 @@ fn parse_block_snapshot(
     let parent_id = if reader.get_has_parent_id() {
         let pid_reader = reader.get_parent_id()?;
         Some(kaijutsu_crdt::BlockId {
-            cell_id: pid_reader.get_cell_id()?.to_str()?.to_owned(),
+            document_id: pid_reader.get_document_id()?.to_str()?.to_owned(),
             agent_id: pid_reader.get_agent_id()?.to_str()?.to_owned(),
             seq: pid_reader.get_seq(),
         })
@@ -1144,7 +1144,7 @@ fn parse_block_snapshot(
     let tool_call_id = if reader.get_has_tool_call_id() {
         let tc_reader = reader.get_tool_call_id()?;
         Some(kaijutsu_crdt::BlockId {
-            cell_id: tc_reader.get_cell_id()?.to_str()?.to_owned(),
+            document_id: tc_reader.get_document_id()?.to_str()?.to_owned(),
             agent_id: tc_reader.get_agent_id()?.to_str()?.to_owned(),
             seq: tc_reader.get_seq(),
         })

@@ -5,8 +5,8 @@
 //!
 //! # Sync Protocol
 //!
-//! - `frontier = None` or `cell_id` changed → full sync (from_oplog)
-//! - `frontier = Some(_)` and matching cell_id → incremental merge (merge_ops_owned)
+//! - `frontier = None` or `document_id` changed → full sync (from_oplog)
+//! - `frontier = Some(_)` and matching document_id → incremental merge (merge_ops_owned)
 //! - On merge failure → reset frontier, next event triggers full sync
 
 use kaijutsu_crdt::{BlockDocument, BlockSnapshot, SerializedOpsOwned, LV};
@@ -29,8 +29,8 @@ pub enum SyncResult {
 pub enum SkipReason {
     /// The oplog bytes were empty.
     EmptyOplog,
-    /// Cell ID doesn't match our tracked document.
-    CellIdMismatch { expected: String, got: String },
+    /// Document ID doesn't match our tracked document.
+    DocumentIdMismatch { expected: String, got: String },
     /// Block already exists in document (idempotent insert).
     BlockAlreadyExists,
     /// Protocol violation (e.g., BlockInserted with no ops).
@@ -60,16 +60,16 @@ pub enum SyncError {
 ///
 /// ```text
 /// ┌────────────────┐
-/// │ Initial State  │ frontier=None, cell_id=None
+/// │ Initial State  │ frontier=None, document_id=None
 /// │ (needs sync)   │
 /// └───────┬────────┘
 ///         │ apply_initial_state() or apply_block_inserted() with full oplog
 ///         ▼
 /// ┌────────────────┐
-/// │  Synchronized  │ frontier=Some(vec), cell_id=Some(id)
+/// │  Synchronized  │ frontier=Some(vec), document_id=Some(id)
 /// │ (incremental)  │
 /// └───────┬────────┘
-///         │ merge failure OR cell_id change
+///         │ merge failure OR document_id change
 ///         ▼
 /// ┌────────────────┐
 /// │  Needs Resync  │ frontier=None (triggers full sync on next event)
@@ -79,8 +79,8 @@ pub enum SyncError {
 pub struct SyncManager {
     /// Current frontier (None = never synced or needs full sync).
     frontier: Option<Vec<LV>>,
-    /// Cell ID we're synced to. Change triggers full sync.
-    cell_id: Option<String>,
+    /// Document ID we're synced to. Change triggers full sync.
+    document_id: Option<String>,
 }
 
 impl SyncManager {
@@ -88,22 +88,22 @@ impl SyncManager {
     pub fn new() -> Self {
         Self {
             frontier: None,
-            cell_id: None,
+            document_id: None,
         }
     }
 
     /// Create a SyncManager with existing state (for testing/migration).
-    pub fn with_state(cell_id: Option<String>, frontier: Option<Vec<LV>>) -> Self {
-        Self { frontier, cell_id }
+    pub fn with_state(document_id: Option<String>, frontier: Option<Vec<LV>>) -> Self {
+        Self { frontier, document_id }
     }
 
-    /// Check if we need a full sync for the given cell.
+    /// Check if we need a full sync for the given document.
     ///
     /// Returns true if:
     /// - We have no frontier (never synced or reset after failure)
-    /// - The cell_id doesn't match our tracked document
-    pub fn needs_full_sync(&self, cell_id: &str) -> bool {
-        self.frontier.is_none() || self.cell_id.as_deref() != Some(cell_id)
+    /// - The document_id doesn't match our tracked document
+    pub fn needs_full_sync(&self, document_id: &str) -> bool {
+        self.frontier.is_none() || self.document_id.as_deref() != Some(document_id)
     }
 
     /// Get the current frontier (for testing/debugging).
@@ -111,9 +111,9 @@ impl SyncManager {
         self.frontier.as_deref()
     }
 
-    /// Get the current cell_id (for testing/debugging).
-    pub fn cell_id(&self) -> Option<&str> {
-        self.cell_id.as_deref()
+    /// Get the current document_id (for testing/debugging).
+    pub fn document_id(&self) -> Option<&str> {
+        self.document_id.as_deref()
     }
 
     /// Reset sync state, forcing full sync on next event.
@@ -122,7 +122,7 @@ impl SyncManager {
     /// force a resync from the server's full oplog.
     pub fn reset(&mut self) {
         self.frontier = None;
-        // Keep cell_id - if it changes we'll detect that too
+        // Keep document_id - if it changes we'll detect that too
     }
 
     /// Apply initial state from server (BlockCellInitialState event).
@@ -131,7 +131,7 @@ impl SyncManager {
     pub fn apply_initial_state(
         &mut self,
         doc: &mut BlockDocument,
-        cell_id: &str,
+        document_id: &str,
         oplog_bytes: &[u8],
     ) -> Result<SyncResult, SyncError> {
         if oplog_bytes.is_empty() {
@@ -142,32 +142,32 @@ impl SyncManager {
         }
 
         info!(
-            "Received initial state for cell_id='{}', {} bytes oplog",
-            cell_id,
+            "Received initial state for document_id='{}', {} bytes oplog",
+            document_id,
             oplog_bytes.len()
         );
 
-        match BlockDocument::from_oplog(cell_id.to_string(), doc.agent_id(), oplog_bytes) {
+        match BlockDocument::from_oplog(document_id.to_string(), doc.agent_id(), oplog_bytes) {
             Ok(new_doc) => {
                 let block_count = new_doc.block_count();
                 // Update sync state with frontier
                 self.frontier = Some(new_doc.frontier());
-                self.cell_id = Some(cell_id.to_string());
+                self.document_id = Some(document_id.to_string());
 
                 // Replace the document
                 *doc = new_doc;
 
                 info!(
-                    "Initial sync complete for cell_id='{}' - {} blocks, frontier={:?}",
-                    cell_id, block_count, self.frontier
+                    "Initial sync complete for document_id='{}' - {} blocks, frontier={:?}",
+                    document_id, block_count, self.frontier
                 );
 
                 Ok(SyncResult::FullSync { block_count })
             }
             Err(e) => {
                 error!(
-                    "Failed to create document from initial oplog for cell '{}': {}",
-                    cell_id, e
+                    "Failed to create document from initial oplog for document '{}': {}",
+                    document_id, e
                 );
                 Err(SyncError::FromOplog(e.to_string()))
             }
@@ -183,22 +183,22 @@ impl SyncManager {
     pub fn apply_block_inserted(
         &mut self,
         doc: &mut BlockDocument,
-        cell_id: &str,
+        document_id: &str,
         block: &BlockSnapshot,
         ops: &[u8],
     ) -> Result<SyncResult, SyncError> {
-        // Cell ID mismatch check
-        if cell_id != doc.cell_id() {
+        // Document ID mismatch check
+        if document_id != doc.document_id() {
             warn!(
-                "Block event for cell_id '{}' but document has '{}', skipping block {:?}",
-                cell_id,
-                doc.cell_id(),
+                "Block event for document_id '{}' but document has '{}', skipping block {:?}",
+                document_id,
+                doc.document_id(),
                 block.id
             );
             return Ok(SyncResult::Skipped {
-                reason: SkipReason::CellIdMismatch {
-                    expected: doc.cell_id().to_string(),
-                    got: cell_id.to_string(),
+                reason: SkipReason::DocumentIdMismatch {
+                    expected: doc.document_id().to_string(),
+                    got: document_id.to_string(),
                 },
             });
         }
@@ -225,8 +225,8 @@ impl SyncManager {
         }
 
         // Determine sync strategy
-        if self.needs_full_sync(cell_id) {
-            self.do_full_sync(doc, cell_id, ops, Some(&block.id))
+        if self.needs_full_sync(document_id) {
+            self.do_full_sync(doc, document_id, ops, Some(&block.id))
         } else {
             self.do_incremental_merge(doc, ops, Some(&block.id))
         }
@@ -243,15 +243,15 @@ impl SyncManager {
     pub fn apply_text_ops(
         &mut self,
         doc: &mut BlockDocument,
-        cell_id: &str,
+        document_id: &str,
         ops: &[u8],
     ) -> Result<SyncResult, SyncError> {
-        // Cell ID mismatch check
-        if cell_id != doc.cell_id() {
+        // Document ID mismatch check
+        if document_id != doc.document_id() {
             return Ok(SyncResult::Skipped {
-                reason: SkipReason::CellIdMismatch {
-                    expected: doc.cell_id().to_string(),
-                    got: cell_id.to_string(),
+                reason: SkipReason::DocumentIdMismatch {
+                    expected: doc.document_id().to_string(),
+                    got: document_id.to_string(),
                 },
             });
         }
@@ -275,25 +275,25 @@ impl SyncManager {
     fn do_full_sync(
         &mut self,
         doc: &mut BlockDocument,
-        cell_id: &str,
+        document_id: &str,
         ops: &[u8],
         block_id: Option<&kaijutsu_crdt::BlockId>,
     ) -> Result<SyncResult, SyncError> {
         info!(
-            "Full sync for cell_id='{}', block_id={:?}, ops_len={} (frontier={:?}, tracked_cell={:?})",
-            cell_id,
+            "Full sync for document_id='{}', block_id={:?}, ops_len={} (frontier={:?}, tracked_document={:?})",
+            document_id,
             block_id,
             ops.len(),
             self.frontier.is_some(),
-            self.cell_id
+            self.document_id
         );
 
-        match BlockDocument::from_oplog(cell_id.to_string(), doc.agent_id(), ops) {
+        match BlockDocument::from_oplog(document_id.to_string(), doc.agent_id(), ops) {
             Ok(new_doc) => {
                 let block_count = new_doc.block_count();
                 // Update sync state with new frontier
                 self.frontier = Some(new_doc.frontier());
-                self.cell_id = Some(cell_id.to_string());
+                self.document_id = Some(document_id.to_string());
 
                 // Replace the document
                 *doc = new_doc;
@@ -309,8 +309,8 @@ impl SyncManager {
             }
             Err(e) => {
                 error!(
-                    "Failed to sync document from oplog for cell '{}': {}",
-                    cell_id, e
+                    "Failed to sync document from oplog for document '{}': {}",
+                    document_id, e
                 );
                 Err(SyncError::FromOplog(e.to_string()))
             }
@@ -371,17 +371,17 @@ mod tests {
     use kaijutsu_crdt::{BlockKind, Role};
 
     /// Helper: create a server document with some content.
-    fn create_server_doc(cell_id: &str) -> BlockDocument {
-        let mut doc = BlockDocument::new(cell_id, "server-agent");
+    fn create_server_doc(document_id: &str) -> BlockDocument {
+        let mut doc = BlockDocument::new(document_id, "server-agent");
         doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server", "server")
             .expect("insert block");
         doc
     }
 
     /// Helper: create a client document (empty, ready for sync).
-    fn create_client_doc(cell_id: &str) -> BlockDocument {
+    fn create_client_doc(document_id: &str) -> BlockDocument {
         // Client starts with empty document (will be replaced by sync)
-        BlockDocument::new(cell_id, "client-agent")
+        BlockDocument::new(document_id, "client-agent")
     }
 
     // =========================================================================
@@ -390,21 +390,21 @@ mod tests {
 
     #[test]
     fn test_initial_sync() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
 
         let result = sync
-            .apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+            .apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
         assert!(matches!(result, SyncResult::FullSync { block_count: 1 }));
-        assert!(!sync.needs_full_sync("cell-1"));
-        assert_eq!(sync.cell_id(), Some("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
+        assert_eq!(sync.document_id(), Some("doc-1"));
         assert!(sync.frontier().is_some());
 
         // Verify document content
@@ -415,13 +415,13 @@ mod tests {
     #[test]
     fn test_incremental_after_full_sync() {
         // Initial sync
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
         let initial_oplog = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &initial_oplog)
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
             .expect("initial sync");
 
         // Server adds a new block
@@ -437,7 +437,7 @@ mod tests {
 
         // Apply incremental merge
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &block, &ops_bytes)
+            .apply_block_inserted(&mut client, "doc-1", &block, &ops_bytes)
             .expect("incremental merge");
 
         assert!(matches!(result, SyncResult::IncrementalMerge));
@@ -446,30 +446,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_id_mismatch_skips() {
-        let server = create_server_doc("cell-1");
+    fn test_document_id_mismatch_skips() {
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        // First sync to cell-1
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        // First sync to doc-1
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
-        // Try to apply block for different cell
-        let other_server = create_server_doc("cell-2");
+        // Try to apply block for different document
+        let other_server = create_server_doc("doc-2");
         let other_block = other_server.blocks_ordered()[0].clone();
         let other_ops = other_server.oplog_bytes();
 
         let result = sync
-            .apply_block_inserted(&mut client, "cell-2", &other_block, &other_ops)
+            .apply_block_inserted(&mut client, "doc-2", &other_block, &other_ops)
             .expect("should skip");
 
         assert!(matches!(
             result,
             SyncResult::Skipped {
-                reason: SkipReason::CellIdMismatch { .. }
+                reason: SkipReason::DocumentIdMismatch { .. }
             }
         ));
         // Document unchanged
@@ -478,20 +478,20 @@ mod tests {
 
     #[test]
     fn test_idempotent_block_insert() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
         let block = server.blocks_ordered()[0].clone();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         // Initial sync
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
         // Try to insert same block again
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &block, &oplog_bytes)
+            .apply_block_inserted(&mut client, "doc-1", &block, &oplog_bytes)
             .expect("should skip");
 
         assert!(matches!(
@@ -508,24 +508,24 @@ mod tests {
 
     #[test]
     fn test_merge_failure_resets_frontier_deserialization() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         // Initial sync
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
 
         // Corrupt ops to simulate deserialization failure
         let corrupt_ops = b"not valid json";
-        let result = sync.apply_text_ops(&mut client, "cell-1", corrupt_ops);
+        let result = sync.apply_text_ops(&mut client, "doc-1", corrupt_ops);
 
         assert!(matches!(result, Err(SyncError::Deserialize(_))));
         // Frontier should be reset
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
         assert!(sync.frontier().is_none());
     }
 
@@ -538,16 +538,16 @@ mod tests {
         // because they reference CRDT structures that don't exist locally.
 
         // Server has its own oplog with a block
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
 
         // Client has an INDEPENDENT oplog (different root!)
         // This simulates a client that somehow got out of sync.
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
 
         // Pretend the client thinks it's synced (would happen if connection dropped
         // mid-sync and client kept old state)
         let mut sync = SyncManager::with_state(
-            Some("cell-1".to_string()),
+            Some("doc-1".to_string()),
             Some(client.frontier()), // Client's own frontier, not server's
         );
 
@@ -564,7 +564,7 @@ mod tests {
         let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
 
         // Try to apply incremental merge - should fail with DataMissing
-        let result = sync.apply_block_inserted(&mut client, "cell-1", &new_block, &ops_bytes);
+        let result = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
 
         // Should be a Merge error (CRDT couldn't apply ops due to missing dependencies)
         assert!(
@@ -574,37 +574,37 @@ mod tests {
         );
 
         // Frontier should be reset, enabling recovery on next full sync
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
         assert!(sync.frontier().is_none());
 
         // Now simulate recovery: server sends full oplog
         let full_oplog = server.oplog_bytes();
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &new_block, &full_oplog)
+            .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery should succeed");
 
         // Should do full sync and recover
         assert!(matches!(result, SyncResult::FullSync { block_count: 2 }));
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
         assert!(client.full_text().contains("New content"));
     }
 
     #[test]
     fn test_recovery_after_merge_failure() {
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         // Initial sync
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
         // Cause a failure by sending corrupt ops
         let corrupt_ops = b"not valid json";
-        let _ = sync.apply_text_ops(&mut client, "cell-1", corrupt_ops);
-        assert!(sync.needs_full_sync("cell-1"));
+        let _ = sync.apply_text_ops(&mut client, "doc-1", corrupt_ops);
+        assert!(sync.needs_full_sync("doc-1"));
 
         // Server adds new content - capture the block ID directly from insert
         let new_block_id = server
@@ -615,64 +615,64 @@ mod tests {
 
         // Apply block inserted - should trigger full sync since frontier was reset
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &new_block, &full_oplog)
+            .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery sync");
 
         assert!(matches!(result, SyncResult::FullSync { block_count: 2 }));
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
         assert!(client.full_text().contains("Recovery content"));
     }
 
     #[test]
     fn test_frontier_none_triggers_full_sync() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
         let block = server.blocks_ordered()[0].clone();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         // Fresh SyncManager has no frontier
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
         assert!(sync.frontier().is_none());
 
         // Apply block inserted (not initial state) - should trigger full sync
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &block, &oplog_bytes)
+            .apply_block_inserted(&mut client, "doc-1", &block, &oplog_bytes)
             .expect("full sync");
 
         assert!(matches!(result, SyncResult::FullSync { block_count: 1 }));
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
     }
 
     #[test]
-    fn test_cell_id_change_triggers_full_sync() {
-        // Sync to cell-1
-        let server1 = create_server_doc("cell-1");
+    fn test_document_id_change_triggers_full_sync() {
+        // Sync to doc-1
+        let server1 = create_server_doc("doc-1");
         let oplog1 = server1.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &oplog1)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog1)
             .expect("initial sync");
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
 
-        // Now switch to cell-2 - should need full sync
-        assert!(sync.needs_full_sync("cell-2"));
+        // Now switch to doc-2 - should need full sync
+        assert!(sync.needs_full_sync("doc-2"));
 
-        // Create server for cell-2
-        let server2 = create_server_doc("cell-2");
+        // Create server for doc-2
+        let server2 = create_server_doc("doc-2");
         let oplog2 = server2.oplog_bytes();
 
-        // Apply initial state for cell-2
+        // Apply initial state for doc-2
         let result = sync
-            .apply_initial_state(&mut client, "cell-2", &oplog2)
-            .expect("sync to cell-2");
+            .apply_initial_state(&mut client, "doc-2", &oplog2)
+            .expect("sync to doc-2");
 
         assert!(matches!(result, SyncResult::FullSync { block_count: 1 }));
-        assert_eq!(sync.cell_id(), Some("cell-2"));
-        assert!(!sync.needs_full_sync("cell-2"));
+        assert_eq!(sync.document_id(), Some("doc-2"));
+        assert!(!sync.needs_full_sync("doc-2"));
     }
 
     // =========================================================================
@@ -682,13 +682,13 @@ mod tests {
     #[test]
     fn test_text_streaming_multiple_chunks() {
         // Setup: server with initial block
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
         let initial_oplog = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &initial_oplog)
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
             .expect("initial sync");
 
         // Server adds a response block
@@ -699,7 +699,7 @@ mod tests {
         let incremental_ops = serde_json::to_vec(&server.ops_since(&server_frontier)).unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
 
-        sync.apply_block_inserted(&mut client, "cell-1", &block, &incremental_ops)
+        sync.apply_block_inserted(&mut client, "doc-1", &block, &incremental_ops)
             .expect("insert empty block");
 
         // Stream text in chunks
@@ -710,7 +710,7 @@ mod tests {
             let chunk_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
 
             let result = sync
-                .apply_text_ops(&mut client, "cell-1", &chunk_ops)
+                .apply_text_ops(&mut client, "doc-1", &chunk_ops)
                 .expect("stream chunk");
 
             assert!(matches!(result, SyncResult::IncrementalMerge));
@@ -724,13 +724,13 @@ mod tests {
     #[test]
     fn test_text_streaming_with_mid_stream_error() {
         // Setup
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
         let initial_oplog = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &initial_oplog)
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
             .expect("initial sync");
 
         // Add streaming block
@@ -741,41 +741,41 @@ mod tests {
         let incremental_ops = serde_json::to_vec(&server.ops_since(&server_frontier)).unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
 
-        sync.apply_block_inserted(&mut client, "cell-1", &block, &incremental_ops)
+        sync.apply_block_inserted(&mut client, "doc-1", &block, &incremental_ops)
             .expect("insert block");
 
         // Stream chunk 1
         let frontier_before = server.frontier();
         server.append_text(&block_id, "Hello").expect("append");
         let chunk_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
-        sync.apply_text_ops(&mut client, "cell-1", &chunk_ops)
+        sync.apply_text_ops(&mut client, "doc-1", &chunk_ops)
             .expect("chunk 1");
 
         // Corrupt chunk 2 - simulates network corruption
         let corrupt_chunk = b"corrupted data";
-        let result = sync.apply_text_ops(&mut client, "cell-1", corrupt_chunk);
+        let result = sync.apply_text_ops(&mut client, "doc-1", corrupt_chunk);
         assert!(matches!(result, Err(SyncError::Deserialize(_))));
 
         // Frontier should be reset
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
     }
 
     #[test]
     fn test_text_streaming_recovery_after_error() {
         // Setup
-        let mut server = create_server_doc("cell-1");
+        let mut server = create_server_doc("doc-1");
         let initial_oplog = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &initial_oplog)
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
             .expect("initial sync");
 
         // Cause deserialization error
         let corrupt_ops = b"not json";
-        let _ = sync.apply_text_ops(&mut client, "cell-1", corrupt_ops);
-        assert!(sync.needs_full_sync("cell-1"));
+        let _ = sync.apply_text_ops(&mut client, "doc-1", corrupt_ops);
+        assert!(sync.needs_full_sync("doc-1"));
 
         // Server adds more content - capture block ID directly
         let new_block_id = server
@@ -786,11 +786,11 @@ mod tests {
 
         // Recovery via full sync
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &new_block, &full_oplog)
+            .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery");
 
         assert!(matches!(result, SyncResult::FullSync { block_count: 2 }));
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
         assert!(client.full_text().contains("After error"));
     }
 
@@ -800,11 +800,11 @@ mod tests {
 
     #[test]
     fn test_empty_oplog_skips_initial_state() {
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         let result = sync
-            .apply_initial_state(&mut client, "cell-1", &[])
+            .apply_initial_state(&mut client, "doc-1", &[])
             .expect("should skip");
 
         assert!(matches!(
@@ -817,19 +817,19 @@ mod tests {
 
     #[test]
     fn test_empty_ops_skips_text_ops() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
         // Initial sync
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
         // Empty text ops should skip, not fail
         let result = sync
-            .apply_text_ops(&mut client, "cell-1", &[])
+            .apply_text_ops(&mut client, "doc-1", &[])
             .expect("should skip");
 
         assert!(matches!(
@@ -840,27 +840,27 @@ mod tests {
         ));
 
         // Frontier should NOT be reset (it wasn't an error)
-        assert!(!sync.needs_full_sync("cell-1"));
+        assert!(!sync.needs_full_sync("doc-1"));
     }
 
     #[test]
     fn test_protocol_violation_no_ops() {
-        let server = create_server_doc("cell-1");
+        let server = create_server_doc("doc-1");
         let block = server.blocks_ordered()[0].clone();
 
-        // Create client with matching cell_id (so it won't be rejected for mismatch)
-        let mut client = create_client_doc("cell-1");
+        // Create client with matching document_id (so it won't be rejected for mismatch)
+        let mut client = create_client_doc("doc-1");
 
         // Create SyncManager that thinks it's synced (has frontier)
         // Use with_state() rather than direct field access
         let mut sync = SyncManager::with_state(
-            Some("cell-1".to_string()),
+            Some("doc-1".to_string()),
             Some(vec![]), // Empty frontier = "synced" state
         );
 
         // Try to insert block with empty ops - should fail protocol validation
         let result = sync
-            .apply_block_inserted(&mut client, "cell-1", &block, &[])
+            .apply_block_inserted(&mut client, "doc-1", &block, &[])
             .expect("should skip");
 
         assert!(matches!(
@@ -872,25 +872,25 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_clears_frontier_but_keeps_cell_id() {
-        let server = create_server_doc("cell-1");
+    fn test_reset_clears_frontier_but_keeps_document_id() {
+        let server = create_server_doc("doc-1");
         let oplog_bytes = server.oplog_bytes();
 
-        let mut client = create_client_doc("cell-1");
+        let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
 
-        sync.apply_initial_state(&mut client, "cell-1", &oplog_bytes)
+        sync.apply_initial_state(&mut client, "doc-1", &oplog_bytes)
             .expect("initial sync");
 
         assert!(sync.frontier().is_some());
-        assert_eq!(sync.cell_id(), Some("cell-1"));
+        assert_eq!(sync.document_id(), Some("doc-1"));
 
         sync.reset();
 
         assert!(sync.frontier().is_none());
-        // Cell ID is preserved for diagnostics
-        assert_eq!(sync.cell_id(), Some("cell-1"));
+        // Document ID is preserved for diagnostics
+        assert_eq!(sync.document_id(), Some("doc-1"));
         // But we still need full sync
-        assert!(sync.needs_full_sync("cell-1"));
+        assert!(sync.needs_full_sync("doc-1"));
     }
 }
