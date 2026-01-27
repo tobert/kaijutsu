@@ -10,5 +10,5 @@ mod resources;
 pub use plugin::TextRenderPlugin;
 pub use resources::{
     bevy_to_glyphon_color, GlyphonText, GlyphonUiText, SharedFontSystem, TextAreaConfig,
-    GlyphonTextBuffer, UiTextPositionCache,
+    GlyphonTextBuffer, TextMetrics, UiTextPositionCache,
 };

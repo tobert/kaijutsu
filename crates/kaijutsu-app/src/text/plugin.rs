@@ -24,6 +24,7 @@ impl Plugin for TextRenderPlugin {
         app.init_resource::<SharedFontSystem>()
             .init_resource::<SharedSwashCache>()
             .init_resource::<TextResolution>()
+            .init_resource::<TextMetrics>()
             .add_systems(Update, update_text_resolution)
             // Sync UI text positions after Bevy UI layout computes positions
             .add_systems(PostUpdate, sync_ui_text_positions.after(UiSystems::Layout));
@@ -143,10 +144,11 @@ fn metrics_equal(a: &glyphon::Metrics, b: &glyphon::Metrics) -> bool {
         && (a.line_height - b.line_height).abs() < f32::EPSILON
 }
 
-/// Update the text resolution when the window resizes.
+/// Update the text resolution and scale factor when the window resizes.
 fn update_text_resolution(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut resolution: ResMut<TextResolution>,
+    mut text_metrics: ResMut<TextMetrics>,
 ) {
     if let Ok(window) = windows.single() {
         let new_res = Resolution {
@@ -155,6 +157,13 @@ fn update_text_resolution(
         };
         if resolution.0.width != new_res.width || resolution.0.height != new_res.height {
             resolution.0 = new_res;
+        }
+
+        // Update scale factor for DPI-aware text rendering
+        let scale = window.scale_factor();
+        if (text_metrics.scale_factor - scale).abs() > 0.01 {
+            text_metrics.scale_factor = scale;
+            info!("TextMetrics scale_factor updated: {:.2}", scale);
         }
     }
 }
@@ -196,6 +205,7 @@ fn extract_text_areas(
     // New GlyphonUiText query (for UI labels)
     ui_text_query: Extract<Query<(Entity, &GlyphonUiText, &UiTextPositionCache, &InheritedVisibility)>>,
     resolution: Extract<Res<TextResolution>>,
+    text_metrics: Extract<Res<TextMetrics>>,
 ) {
     // Pre-allocate with estimated capacity to avoid reallocations
     let estimated_capacity = buffer_query.iter().len() + ui_text_query.iter().len();
@@ -232,7 +242,7 @@ fn extract_text_areas(
             scale: config.scale,
             bounds: config.bounds,
             color: config.default_color,
-            metrics: glyphon::Metrics::new(14.0, 20.0), // Default metrics for cells
+            metrics: text_metrics.scaled_cell_metrics(),
             family: glyphon::Family::Monospace,
         });
     }

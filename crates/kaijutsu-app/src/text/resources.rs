@@ -7,6 +7,77 @@ use glyphon::{
 use std::sync::{Arc, Mutex};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Text Metrics Resource (DPI-aware font sizing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Centralized text metrics for consistent, DPI-aware font sizing.
+///
+/// All text rendering should use this resource instead of hardcoding
+/// Metrics::new() calls. The scale_factor is updated when the window
+/// resizes and is automatically applied via scaled_*_metrics() methods.
+///
+/// **Customization:** These values can be hot-reloaded from theme or
+/// user preferences in the future.
+#[derive(Resource, Clone)]
+pub struct TextMetrics {
+    /// Base font size for content cells (blocks, code). Default: 15.0
+    pub cell_font_size: f32,
+    /// Line height for content cells. Default: 22.5 (1.5x font size)
+    pub cell_line_height: f32,
+    /// Base font size for UI elements (labels, status). Default: 13.0
+    pub ui_font_size: f32,
+    /// Line height for UI elements. Default: 18.2 (1.4x font size)
+    pub ui_line_height: f32,
+    /// Window scale factor, updated from window resize events.
+    /// Applied automatically in scaled_*_metrics() methods.
+    pub scale_factor: f32,
+}
+
+impl Default for TextMetrics {
+    fn default() -> Self {
+        Self {
+            cell_font_size: 15.0,
+            cell_line_height: 22.5,  // 1.5x for comfortable reading
+            ui_font_size: 13.0,
+            ui_line_height: 18.2,    // 1.4x for compact UI
+            scale_factor: 1.0,
+        }
+    }
+}
+
+impl TextMetrics {
+    /// Get scaled metrics for content cells (conversation blocks, code).
+    ///
+    /// Use this for GlyphonTextBuffer in BlockCells, PromptCell, etc.
+    pub fn scaled_cell_metrics(&self) -> Metrics {
+        Metrics::new(
+            self.cell_font_size * self.scale_factor,
+            self.cell_line_height * self.scale_factor,
+        )
+    }
+
+    /// Get scaled metrics for UI elements (labels, status bar, headers).
+    ///
+    /// Use this for GlyphonUiText and other UI chrome.
+    pub fn scaled_ui_metrics(&self) -> Metrics {
+        Metrics::new(
+            self.ui_font_size * self.scale_factor,
+            self.ui_line_height * self.scale_factor,
+        )
+    }
+
+    /// Get unscaled cell metrics (for layout calculations before scaling).
+    pub fn cell_metrics(&self) -> Metrics {
+        Metrics::new(self.cell_font_size, self.cell_line_height)
+    }
+
+    /// Get unscaled UI metrics (for layout calculations before scaling).
+    pub fn ui_metrics(&self) -> Metrics {
+        Metrics::new(self.ui_font_size, self.ui_line_height)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UI Text Components (for simple text rendered via glyphon)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -211,7 +282,14 @@ impl Default for TextAreaConfig {
             left: 0.0,
             top: 0.0,
             scale: 1.0,
-            bounds: glyphon::TextBounds::default(),
+            // Valid bounds to prevent "Invalid text bounds" warnings.
+            // These are placeholders that get overwritten by layout systems.
+            bounds: glyphon::TextBounds {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 600,
+            },
             default_color: glyphon::Color::rgb(220, 220, 240),
         }
     }
