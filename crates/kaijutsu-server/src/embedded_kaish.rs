@@ -85,6 +85,7 @@ impl EmbeddedKaish {
             mount_local: true,
             local_root: Some(src_dir),
             cwd: std::path::PathBuf::from("/mnt/local"),
+            skip_validation: false, // run pre-execution validator
         };
 
         // Create standard kaish kernel (mounts local fs at /mnt/local)

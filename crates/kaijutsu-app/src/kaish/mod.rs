@@ -149,7 +149,7 @@ fn classify_token(token: &Token) -> TokenKind {
         | Token::For | Token::In | Token::Do | Token::Done
         | Token::While | Token::Case | Token::Esac
         | Token::Function | Token::Return | Token::Break | Token::Continue | Token::Exit
-        | Token::Set | Token::Local | Token::Tool
+        | Token::Set | Token::Local
         | Token::True | Token::False => TokenKind::Keyword,
 
         // Type keywords
