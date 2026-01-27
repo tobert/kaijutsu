@@ -7,7 +7,8 @@
 #
 # COMMANDS YOU'LL USE MOST:
 #   ./contrib/kj status   - "is it running? what state?"
-#   ./contrib/kj tail     - "show me build output" (Ctrl+C to exit)
+#   ./contrib/kj tail     - "show last 100 lines of build output"
+#   ./contrib/kj tail 50  - "show last 50 lines"
 #   ./contrib/kj rebuild  - "clean rebuild everything"
 #   ./contrib/kj pause    - "stop rebuilding, I'm making multiple edits"
 #   ./contrib/kj resume   - "ok done editing, rebuild now"
@@ -38,6 +39,7 @@ case "${1:-status}" in
     stop)    touch /tmp/kj.stop    && echo "🛑 Stop triggered" ;;
     status)  cat /tmp/kj.status 2>/dev/null || echo "Runner not active" ;;
     log)     cat /tmp/kaijutsu-runner.typescript ;;
-    tail)    tail -f /tmp/kaijutsu-runner.typescript ;;
-    *)       echo "Usage: kj [pause|resume|rebuild|restart|stop|status|log|tail]" ;;
+    tail)    tail -n "${2:-100}" /tmp/kaijutsu-runner.typescript ;;
+    follow)  tail -f /tmp/kaijutsu-runner.typescript ;;
+    *)       echo "Usage: kj [pause|resume|rebuild|restart|stop|status|log|tail [N]|follow]" ;;
 esac
