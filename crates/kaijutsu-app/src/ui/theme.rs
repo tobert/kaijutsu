@@ -86,6 +86,28 @@ pub struct Theme {
     pub row_result: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Block text colors (per-block-type for semantic distinction)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// User message text color (soft white)
+    pub block_user: Color,
+    /// Assistant message text color (light blue)
+    pub block_assistant: Color,
+    /// Thinking block text color (dim gray for de-emphasis)
+    pub block_thinking: Color,
+    /// Tool call block text color (amber)
+    pub block_tool_call: Color,
+    /// Tool result block text color (green for success)
+    pub block_tool_result: Color,
+    /// Tool error block text color (red)
+    pub block_tool_error: Color,
+    /// Shell command block text color (cyan)
+    pub block_shell_cmd: Color,
+    /// Shell output block text color (light gray)
+    pub block_shell_output: Color,
+    /// Focused block highlight color (border/background accent)
+    pub block_focus: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Semantic colors
     // ═══════════════════════════════════════════════════════════════════════
     pub error: Color,
@@ -98,7 +120,6 @@ pub struct Theme {
     pub mode_normal: Color,
     pub mode_chat: Color,
     pub mode_shell: Color,
-    pub mode_command: Color,
     pub mode_visual: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -106,7 +127,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     pub cursor_normal: Vec4,
     pub cursor_insert: Vec4,
-    pub cursor_command: Vec4,
     pub cursor_visual: Vec4,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -126,8 +146,7 @@ pub struct Theme {
     // Frame colors (per-state)
     pub frame_base: Color,      // Default frame color
     pub frame_focused: Color,   // When focused in normal mode
-    pub frame_insert: Color,    // Insert mode
-    pub frame_command: Color,   // Command mode
+    pub frame_insert: Color,    // Input modes (Chat/Shell)
     pub frame_visual: Color,    // Visual mode
     pub frame_unfocused: Color, // Lost focus
     pub frame_edge: Color,      // Edge color (usually dimmer)
@@ -190,6 +209,17 @@ impl Default for Theme {
             row_tool: Color::srgb(0.83, 0.6, 0.13),    // Orange - tool calls
             row_result: Color::srgb(0.25, 0.73, 0.31), // Green - tool results
 
+            // Block text colors - Tokyo Night inspired palette
+            block_user: Color::srgb(0.90, 0.90, 0.92),         // Soft white
+            block_assistant: Color::srgb(0.58, 0.74, 1.00),    // Light blue (#94bdff)
+            block_thinking: Color::srgb(0.45, 0.47, 0.55),     // Dim gray (de-emphasized)
+            block_tool_call: Color::srgb(0.89, 0.79, 0.49),    // Amber (ansi.yellow)
+            block_tool_result: Color::srgb(0.62, 0.81, 0.42),  // Green (ansi.green)
+            block_tool_error: Color::srgb(0.97, 0.38, 0.45),   // Red (ansi.red)
+            block_shell_cmd: Color::srgb(0.49, 0.85, 0.82),    // Cyan (ansi.cyan)
+            block_shell_output: Color::srgb(0.70, 0.72, 0.78), // Light gray
+            block_focus: Color::srgba(0.48, 0.64, 0.97, 0.3),      // Soft blue highlight (#7aa2f7)
+
             // Semantic
             error: Color::srgb(0.97, 0.38, 0.45),     // Red
             warning: Color::srgb(0.89, 0.79, 0.49),   // Yellow
@@ -199,13 +229,11 @@ impl Default for Theme {
             mode_normal: Color::srgb(0.5, 0.5, 0.5),  // Dim gray (matches fg_dim)
             mode_chat: Color::srgb(0.4, 0.8, 0.4),    // Green (chat with LLM)
             mode_shell: Color::srgb(0.3, 0.9, 0.7),   // Terminal green (kaish REPL)
-            mode_command: Color::srgb(0.9, 0.7, 0.2), // Yellow/orange
             mode_visual: Color::srgb(0.7, 0.4, 0.9),  // Purple
 
             // Cursor colors - soft aesthetic terminal style
             cursor_normal: Vec4::new(0.85, 0.92, 1.0, 0.85),  // Soft ice blue
             cursor_insert: Vec4::new(1.0, 0.5, 0.75, 0.95),   // Hot pink
-            cursor_command: Vec4::new(0.7, 1.0, 0.8, 0.9),    // Soft mint
             cursor_visual: Vec4::new(0.95, 0.85, 0.6, 0.9),   // Warm gold
 
             // ANSI palette
@@ -219,8 +247,7 @@ impl Default for Theme {
             // Frame colors - soft purple base (Tokyo Night aesthetic)
             frame_base: Color::srgb(0.73, 0.60, 0.97),      // #bb9af7 soft purple
             frame_focused: Color::srgb(0.73, 0.60, 0.97),   // Same as base when focused
-            frame_insert: Color::srgb(0.62, 0.81, 0.42),    // #9ece6a green - reuse mode color
-            frame_command: Color::srgb(0.88, 0.69, 0.41),   // #e0af68 amber - reuse mode color
+            frame_insert: Color::srgb(0.62, 0.81, 0.42),    // #9ece6a green - input modes
             frame_visual: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue - reuse accent
             frame_unfocused: Color::srgba(0.34, 0.37, 0.54, 0.6), // #565f89 dimmed
             frame_edge: Color::srgba(0.73, 0.60, 0.97, 0.5), // Dimmer purple

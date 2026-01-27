@@ -203,9 +203,6 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     if let Some(c) = get_color(&scope, "mode_shell") {
         theme.mode_shell = c;
     }
-    if let Some(c) = get_color(&scope, "mode_command") {
-        theme.mode_command = c;
-    }
     if let Some(c) = get_color(&scope, "mode_visual") {
         theme.mode_visual = c;
     }
@@ -216,9 +213,6 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     }
     if let Some(v) = get_vec4(&scope, "cursor_insert") {
         theme.cursor_insert = v;
-    }
-    if let Some(v) = get_vec4(&scope, "cursor_command") {
-        theme.cursor_command = v;
     }
     if let Some(v) = get_vec4(&scope, "cursor_visual") {
         theme.cursor_visual = v;
@@ -251,9 +245,6 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     }
     if let Some(c) = get_color_with_alpha(&scope, "frame_insert") {
         theme.frame_insert = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_command") {
-        theme.frame_command = c;
     }
     if let Some(c) = get_color_with_alpha(&scope, "frame_visual") {
         theme.frame_visual = c;
