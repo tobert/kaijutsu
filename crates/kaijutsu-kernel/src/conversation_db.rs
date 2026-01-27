@@ -143,11 +143,11 @@ struct ToolResultRow {
 /// Convert a BlockSnapshot to a BlockRow for insertion.
 fn block_to_row(block: &BlockSnapshot, order_idx: usize) -> BlockRow {
     BlockRow {
-        cell_id: block.id.cell_id.clone(),
+        cell_id: block.id.document_id.clone(),
         agent_id: block.id.agent_id.clone(),
         seq: block.id.seq,
         order_idx: order_idx as i64,
-        parent_cell_id: block.parent_id.as_ref().map(|p| p.cell_id.clone()),
+        parent_cell_id: block.parent_id.as_ref().map(|p| p.document_id.clone()),
         parent_agent_id: block.parent_id.as_ref().map(|p| p.agent_id.clone()),
         parent_seq: block.parent_id.as_ref().map(|p| p.seq),
         role: block.role.as_str().to_string(),
@@ -235,7 +235,7 @@ impl ConversationDb {
     /// Save a conversation (insert or replace).
     pub fn save(&self, conv: &Conversation) -> SqliteResult<()> {
         let snapshot = conv.doc.snapshot();
-        let cell_id = snapshot.cell_id.clone();
+        let cell_id = snapshot.document_id.clone();
         let version = snapshot.version;
 
         // Use a transaction for atomicity
@@ -381,7 +381,7 @@ impl ConversationDb {
                             row.cell_id,
                             row.agent_id,
                             row.seq as i64,
-                            call_id.cell_id,
+                            call_id.document_id,
                             call_id.agent_id,
                             call_id.seq as i64,
                             block.exit_code,
@@ -419,7 +419,7 @@ impl ConversationDb {
         // Load blocks and reconstruct document
         let blocks = self.load_blocks(&cell_id)?;
         let snapshot = DocumentSnapshot {
-            cell_id,
+            document_id: cell_id,
             blocks,
             version: version as u64,
         };

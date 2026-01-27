@@ -349,16 +349,18 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Capture frontier before the operation for incremental ops.
+            // Clients that are in sync can merge these directly.
+            // Clients that are out of sync will get full oplog via get_document_state.
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_block(parent_id, after, role, kind, content, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Always send full oplog for block inserts to ensure clients can sync
-            // regardless of event ordering (rapid sequential inserts can race).
-            // Text streaming ops (BlockTextOps) remain incremental since they
-            // operate on existing blocks.
-            let ops = entry.doc.ops_since(&[]); // Full oplog
+            // Send incremental ops (just this operation) for efficient sync.
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -367,7 +369,7 @@ impl BlockStore {
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block: snapshot,
             after_id,
             ops,
@@ -390,13 +392,16 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Capture frontier before the operation for incremental ops
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Always send full oplog for block inserts (see insert_block comment)
-            let ops = entry.doc.ops_since(&[]); // Full oplog
+            // Send incremental ops (just this operation) for efficient sync
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -405,7 +410,7 @@ impl BlockStore {
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block: snapshot,
             after_id,
             ops,
@@ -429,13 +434,16 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
 
+            // Capture frontier before the operation for incremental ops
+            let frontier_before = entry.doc.frontier();
+
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, &agent_id)
                 .map_err(|e| e.to_string())?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
-            // Always send full oplog for block inserts (see insert_block comment)
-            let ops = entry.doc.ops_since(&[]); // Full oplog
+            // Send incremental ops (just this operation) for efficient sync
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
@@ -444,7 +452,7 @@ impl BlockStore {
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block: snapshot,
             after_id,
             ops,
@@ -470,7 +478,7 @@ impl BlockStore {
 
         // Emit flow event
         self.emit(BlockFlow::StatusChanged {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block_id: block_id.clone(),
             status,
         });
@@ -505,7 +513,7 @@ impl BlockStore {
 
         // Emit CRDT ops for proper sync
         self.emit(BlockFlow::TextOps {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block_id: block_id.clone(),
             ops,
         });
@@ -551,7 +559,7 @@ impl BlockStore {
 
         // Emit CRDT ops for proper sync
         self.emit(BlockFlow::TextOps {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block_id: block_id.clone(),
             ops,
         });
@@ -571,7 +579,7 @@ impl BlockStore {
 
         // Emit flow event
         self.emit(BlockFlow::CollapsedChanged {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block_id: block_id.clone(),
             collapsed,
         });
@@ -591,7 +599,7 @@ impl BlockStore {
 
         // Emit flow event
         self.emit(BlockFlow::Deleted {
-            cell_id: document_id.to_string(),
+            document_id: document_id.to_string(),
             block_id: block_id.clone(),
         });
 

@@ -139,14 +139,14 @@ impl<T: HasSubject> FlowMessage<T> {
 
 /// Block-related flow events.
 ///
-/// These events are emitted by the BlockStore when blocks are modified.
+/// These events are emitted by the DocumentStore when blocks are modified.
 /// Each variant corresponds to a specific block operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BlockFlow {
     /// A new block was inserted.
     Inserted {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// Full snapshot of the inserted block.
         block: BlockSnapshot,
         /// Block to insert after (None = beginning).
@@ -159,8 +159,8 @@ pub enum BlockFlow {
     /// CRDT operations for a block's text content.
     /// Clients should use merge_ops() to apply these.
     TextOps {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// The block that was edited.
         block_id: BlockId,
         /// Serialized CRDT operations (diamond-types format).
@@ -169,16 +169,16 @@ pub enum BlockFlow {
 
     /// A block was deleted.
     Deleted {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// The block that was deleted.
         block_id: BlockId,
     },
 
     /// Block status changed.
     StatusChanged {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// The block whose status changed.
         block_id: BlockId,
         /// The new status.
@@ -187,8 +187,8 @@ pub enum BlockFlow {
 
     /// Block collapsed state changed (for thinking blocks).
     CollapsedChanged {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// The block whose collapsed state changed.
         block_id: BlockId,
         /// New collapsed state.
@@ -197,8 +197,8 @@ pub enum BlockFlow {
 
     /// Block was moved to a new position.
     Moved {
-        /// The cell/document ID.
-        cell_id: String,
+        /// The document ID.
+        document_id: String,
         /// The block that was moved.
         block_id: BlockId,
         /// New position (after this block, None = beginning).
@@ -219,15 +219,15 @@ impl BlockFlow {
         }
     }
 
-    /// Get the cell ID for this event.
-    pub fn cell_id(&self) -> &str {
+    /// Get the document ID for this event.
+    pub fn document_id(&self) -> &str {
         match self {
-            Self::Inserted { cell_id, .. }
-            | Self::TextOps { cell_id, .. }
-            | Self::Deleted { cell_id, .. }
-            | Self::StatusChanged { cell_id, .. }
-            | Self::CollapsedChanged { cell_id, .. }
-            | Self::Moved { cell_id, .. } => cell_id,
+            Self::Inserted { document_id, .. }
+            | Self::TextOps { document_id, .. }
+            | Self::Deleted { document_id, .. }
+            | Self::StatusChanged { document_id, .. }
+            | Self::CollapsedChanged { document_id, .. }
+            | Self::Moved { document_id, .. } => document_id,
         }
     }
 
@@ -467,7 +467,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::Inserted {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block,
                 after_id: None,
                 ops: vec![],
@@ -478,7 +478,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::Deleted {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block_id: id.clone()
             }
             .subject(),
@@ -487,7 +487,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::StatusChanged {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block_id: id.clone(),
                 status: Status::Done
             }
@@ -497,7 +497,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::CollapsedChanged {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block_id: id.clone(),
                 collapsed: true
             }
@@ -507,7 +507,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::Moved {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block_id: id,
                 after_id: None
             }
@@ -530,7 +530,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             bus_clone.publish(BlockFlow::Inserted {
-                cell_id: "cell-1".into(),
+                document_id: "doc-1".into(),
                 block: block_clone,
                 after_id: None,
                 ops: vec![],
@@ -545,7 +545,7 @@ mod tests {
 
         assert_eq!(msg.subject, "block.inserted");
         match msg.payload {
-            BlockFlow::Inserted { cell_id, .. } => assert_eq!(cell_id, "cell-1"),
+            BlockFlow::Inserted { document_id, .. } => assert_eq!(document_id, "doc-1"),
             _ => panic!("wrong event type"),
         }
     }
@@ -564,7 +564,7 @@ mod tests {
 
         // Publish an insertion
         bus.publish(BlockFlow::Inserted {
-            cell_id: "cell-1".into(),
+            document_id: "doc-1".into(),
             block,
             after_id: None,
             ops: vec![],
@@ -572,7 +572,7 @@ mod tests {
 
         // Publish a status change
         bus.publish(BlockFlow::StatusChanged {
-            cell_id: "cell-1".into(),
+            document_id: "doc-1".into(),
             block_id: id,
             status: Status::Done,
         });
