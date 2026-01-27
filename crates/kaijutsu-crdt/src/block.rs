@@ -510,10 +510,10 @@ mod tests {
 
     #[test]
     fn test_block_id() {
-        let id = BlockId::new("cell-1", "alice", 42);
-        assert_eq!(id.to_key(), "cell-1/alice/42");
-        assert_eq!(BlockId::from_key("cell-1/alice/42"), Some(id.clone()));
-        assert_eq!(id.to_string(), "cell-1@alice#42");
+        let id = BlockId::new("doc-1", "alice", 42);
+        assert_eq!(id.to_key(), "doc-1/alice/42");
+        assert_eq!(BlockId::from_key("doc-1/alice/42"), Some(id.clone()));
+        assert_eq!(id.to_string(), "doc-1@alice#42");
     }
 
     #[test]
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_block_snapshot_text() {
-        let id = BlockId::new("cell-1", "alice", 1);
+        let id = BlockId::new("doc-1", "alice", 1);
         let snap = BlockSnapshot::text(id.clone(), None, Role::User, "Hello!", "user:amy");
 
         assert_eq!(snap.id, id);
@@ -566,8 +566,8 @@ mod tests {
 
     #[test]
     fn test_block_snapshot_thinking() {
-        let id = BlockId::new("cell-1", "alice", 2);
-        let parent = BlockId::new("cell-1", "alice", 1);
+        let id = BlockId::new("doc-1", "alice", 2);
+        let parent = BlockId::new("doc-1", "alice", 1);
         let snap = BlockSnapshot::thinking(id.clone(), Some(parent.clone()), "Let me think...", "model:claude");
 
         assert_eq!(snap.kind, BlockKind::Thinking);
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_block_snapshot_tool_call() {
-        let id = BlockId::new("cell-1", "alice", 3);
+        let id = BlockId::new("doc-1", "alice", 3);
         let input = serde_json::json!({"path": "/etc/hosts"});
         let snap = BlockSnapshot::tool_call(id.clone(), None, "read_file", input.clone(), "model:claude");
 
@@ -591,8 +591,8 @@ mod tests {
 
     #[test]
     fn test_block_snapshot_tool_result() {
-        let tool_call_id = BlockId::new("cell-1", "alice", 3);
-        let id = BlockId::new("cell-1", "alice", 4);
+        let tool_call_id = BlockId::new("doc-1", "alice", 3);
+        let id = BlockId::new("doc-1", "alice", 4);
         let snap = BlockSnapshot::tool_result(
             id.clone(),
             tool_call_id.clone(),

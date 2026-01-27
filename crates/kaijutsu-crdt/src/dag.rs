@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_dag_from_flat_document() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         // Create flat structure
         let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn test_dag_with_parent_child() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         // Create parent-child structure
         let parent = doc.insert_block(None, None, Role::User, BlockKind::Text, "Question", "alice").unwrap();
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_dfs_iteration() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", "alice").unwrap();
         let child1 = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child1", "claude").unwrap();
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_subtree() {
-        let mut doc = BlockDocument::new("cell-1", "alice");
+        let mut doc = BlockDocument::new("doc-1", "alice");
 
         let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", "alice").unwrap();
         let child = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child", "claude").unwrap();

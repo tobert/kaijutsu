@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_block_flow_subjects() {
-        let id = BlockId::new("cell-1", "agent", 1);
+        let id = BlockId::new("doc-1", "agent", 1);
         let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
 
         assert_eq!(
@@ -521,7 +521,7 @@ mod tests {
         let bus: FlowBus<BlockFlow> = FlowBus::new(16);
         let mut sub = bus.subscribe("block.*");
 
-        let id = BlockId::new("cell-1", "agent", 1);
+        let id = BlockId::new("doc-1", "agent", 1);
         let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
 
         // Publish in background task
@@ -559,7 +559,7 @@ mod tests {
         // Subscribe only to status changes
         let mut status_sub = bus.subscribe("block.status");
 
-        let id = BlockId::new("cell-1", "agent", 1);
+        let id = BlockId::new("doc-1", "agent", 1);
         let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
 
         // Publish an insertion

@@ -1423,7 +1423,7 @@ mod tests {
         assert_eq!(ordered[2].id, a, "A should be last after moving after B");
 
         // Moving non-existent block should fail
-        let fake_id = BlockId::new("cell-1", "fake", 999);
+        let fake_id = BlockId::new("doc-1", "fake", 999);
         assert!(doc.move_block(&fake_id, None).is_err());
 
         // Moving after non-existent block should fail
@@ -1588,7 +1588,7 @@ mod tests {
 
         // === Client: receives full oplog ===
         // Fixed: from_oplog merges server's oplog → shared history
-        let mut client = BlockDocument::from_oplog("cell-1", "client-agent", &oplog_bytes)
+        let mut client = BlockDocument::from_oplog("doc-1", "client-agent", &oplog_bytes)
             .expect("from_oplog should succeed");
 
         // Verify client has the block

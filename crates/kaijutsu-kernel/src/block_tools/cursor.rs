@@ -221,7 +221,7 @@ mod tests {
     use super::*;
 
     fn test_block_id() -> BlockId {
-        BlockId::new("test-cell", "test-agent", 1)
+        BlockId::new("test-doc", "test-agent", 1)
     }
 
     #[test]

@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn test_document_basic_operations() {
-        let mut doc = BlockDocument::new("test-cell", "alice");
+        let mut doc = BlockDocument::new("test-doc", "alice");
 
         // Insert a text block using new API
         let block_id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!", "alice").unwrap();
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn test_document_multiple_blocks() {
-        let mut doc = BlockDocument::new("test-cell", "alice");
+        let mut doc = BlockDocument::new("test-doc", "alice");
 
         // Insert thinking block first
         let thinking_id = doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Let me think...", "alice").unwrap();
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_tool_blocks_are_editable() {
-        let mut doc = BlockDocument::new("test-cell", "alice");
+        let mut doc = BlockDocument::new("test-doc", "alice");
 
         // Tool call using new API
         let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"}), "alice").unwrap();
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_document_delete_block() {
-        let mut doc = BlockDocument::new("test-cell", "alice");
+        let mut doc = BlockDocument::new("test-doc", "alice");
 
         let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
         let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", "alice").unwrap();
@@ -137,11 +137,11 @@ mod tests {
         // NOTE: This test requires documents to share a common initial OpLog state.
         // Independent documents create different CRDT IDs for their "blocks" Sets.
         // The BlockStore in Phase 2 will handle proper multi-client sync by:
-        // 1. Having a single canonical OpLog per cell
+        // 1. Having a single canonical OpLog per document
         // 2. Syncing deltas via SerializedOps
         // 3. Ensuring all clients operate on the same CRDT structure
-        let mut doc1 = BlockDocument::new("test-cell", "alice");
-        let mut doc2 = BlockDocument::new("test-cell", "bob");
+        let mut doc1 = BlockDocument::new("test-doc", "alice");
+        let mut doc2 = BlockDocument::new("test-doc", "bob");
 
         let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block", "alice").unwrap();
         let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block", "bob").unwrap();
@@ -162,8 +162,8 @@ mod tests {
     fn test_concurrent_text_editing() {
         // NOTE: Same issue as above - independent documents have different CRDT structures.
         // For proper convergence, clients must start from the same OpLog state.
-        let mut doc1 = BlockDocument::new("test-cell", "alice");
-        let mut doc2 = BlockDocument::new("test-cell", "bob");
+        let mut doc1 = BlockDocument::new("test-doc", "alice");
+        let mut doc2 = BlockDocument::new("test-doc", "bob");
 
         let block_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "hello", "alice").unwrap();
         doc2.oplog.merge_ops(doc1.oplog.ops_since(&[])).unwrap();
