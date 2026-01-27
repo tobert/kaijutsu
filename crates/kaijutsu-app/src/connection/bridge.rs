@@ -115,6 +115,14 @@ pub enum ConnectionEvent {
     SeatTaken { seat: SeatInfo },
     /// User left their seat
     SeatLeft,
+    /// Initial block cell state received (full oplog for frontier-based sync)
+    BlockCellInitialState {
+        cell_id: String,
+        /// Full oplog for document reconstruction
+        ops: Vec<u8>,
+        /// Block snapshots for immediate display
+        blocks: Vec<kaijutsu_crdt::BlockSnapshot>,
+    },
 
     // LLM events (server-side)
     /// Prompt was sent to server-side LLM
@@ -683,7 +691,36 @@ async fn connection_loop(
                 if let Some(kernel) = &current_kernel {
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
+                            // Build cell_id from seat info (kernel:context format)
+                            let cell_id = format!("{}:{}", seat.id.kernel, seat.id.context);
+
+                            // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+
+                            // THEN fetch initial block cell state for frontier-based sync
+                            // This provides the full oplog so the client can merge incremental ops
+                            // Must come after SeatTaken so the document exists when we sync
+                            match timeout(RPC_TIMEOUT, kernel.get_block_cell_state(&cell_id)).await {
+                                Ok(Ok(state)) => {
+                                    log::info!(
+                                        "Fetched initial state for cell_id={}: {} blocks, {} bytes oplog",
+                                        cell_id,
+                                        state.blocks.len(),
+                                        state.ops.len()
+                                    );
+                                    let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
+                                        cell_id: state.cell_id,
+                                        ops: state.ops,
+                                        blocks: state.blocks,
+                                    });
+                                }
+                                Ok(Err(e)) => {
+                                    log::warn!("Failed to get initial block state: {}", e);
+                                }
+                                Err(_) => {
+                                    log::warn!("get_block_cell_state timed out for {}", cell_id);
+                                }
+                            }
                         }
                         Ok(Err(e)) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to join context: {}", e)));
@@ -731,7 +768,34 @@ async fn connection_loop(
                     // For now, just join the context with the given instance
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
                         Ok(Ok(seat)) => {
+                            // Build cell_id from seat info (kernel:context format)
+                            let cell_id = format!("{}:{}", seat.id.kernel, seat.id.context);
+
+                            // Send SeatTaken FIRST - dashboard sets up conversation
                             let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+
+                            // THEN fetch initial block cell state for frontier-based sync
+                            match timeout(RPC_TIMEOUT, kernel.get_block_cell_state(&cell_id)).await {
+                                Ok(Ok(state)) => {
+                                    log::info!(
+                                        "Fetched initial state for cell_id={}: {} blocks, {} bytes oplog",
+                                        cell_id,
+                                        state.blocks.len(),
+                                        state.ops.len()
+                                    );
+                                    let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
+                                        cell_id: state.cell_id,
+                                        ops: state.ops,
+                                        blocks: state.blocks,
+                                    });
+                                }
+                                Ok(Err(e)) => {
+                                    log::warn!("Failed to get initial block state: {}", e);
+                                }
+                                Err(_) => {
+                                    log::warn!("get_block_cell_state timed out for {}", cell_id);
+                                }
+                            }
                         }
                         Ok(Err(e)) => {
                             let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to take seat: {}", e)));
