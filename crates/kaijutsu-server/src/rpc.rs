@@ -1006,7 +1006,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ApplyBlockOpResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
-        let cell_id = pry!(pry!(params.get_cell_id()).to_str()).to_owned();
+        let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
         let op = pry!(params.get_op());
 
         log::debug!("apply_block_op called for cell {}", cell_id);
@@ -1026,7 +1026,7 @@ impl kernel::Server for KernelImpl {
                 let after_id = if group.get_has_after_id() {
                     let after_reader = pry!(group.get_after_id());
                     Some(kaijutsu_crdt::BlockId {
-                        cell_id: pry!(pry!(after_reader.get_cell_id()).to_str()).to_owned(),
+                        document_id: pry!(pry!(after_reader.get_document_id()).to_str()).to_owned(),
                         agent_id: pry!(pry!(after_reader.get_agent_id()).to_str()).to_owned(),
                         seq: after_reader.get_seq(),
                     })
@@ -1049,7 +1049,7 @@ impl kernel::Server for KernelImpl {
             Which::DeleteBlock(id_result) => {
                 let id_reader = pry!(id_result);
                 let block_id = kaijutsu_crdt::BlockId {
-                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
                     agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
                     seq: id_reader.get_seq(),
                 };
@@ -1063,7 +1063,7 @@ impl kernel::Server for KernelImpl {
             Which::SetCollapsed(group) => {
                 let id_reader = pry!(group.get_id());
                 let block_id = kaijutsu_crdt::BlockId {
-                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
                     agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
                     seq: id_reader.get_seq(),
                 };
@@ -1075,7 +1075,7 @@ impl kernel::Server for KernelImpl {
             Which::SetStatus(group) => {
                 let id_reader = pry!(group.get_id());
                 let block_id = kaijutsu_crdt::BlockId {
-                    cell_id: pry!(pry!(id_reader.get_cell_id()).to_str()).to_owned(),
+                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
                     agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
                     seq: id_reader.get_seq(),
                 };
@@ -1126,15 +1126,15 @@ impl kernel::Server for KernelImpl {
                 while let Some(msg) = sub.recv().await {
                     // Each branch sends its own request type; we convert the result to bool
                     let success = match msg.payload {
-                        BlockFlow::Inserted { ref cell_id, ref block, ref after_id, ref ops } => {
+                        BlockFlow::Inserted { ref document_id, ref block, ref after_id, ref ops } => {
                             let mut req = callback.on_block_inserted_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 params.set_has_after_id(after_id.is_some());
                                 if let Some(after) = after_id {
                                     let mut aid = params.reborrow().init_after_id();
-                                    aid.set_cell_id(&after.cell_id);
+                                    aid.set_document_id(&after.document_id);
                                     aid.set_agent_id(&after.agent_id);
                                     aid.set_seq(after.seq);
                                 }
@@ -1145,70 +1145,70 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Deleted { ref cell_id, ref block_id } => {
+                        BlockFlow::Deleted { ref document_id, ref block_id } => {
                             let mut req = callback.on_block_deleted_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
+                                id.set_document_id(&block_id.document_id);
                                 id.set_agent_id(&block_id.agent_id);
                                 id.set_seq(block_id.seq);
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::StatusChanged { ref cell_id, ref block_id, status } => {
+                        BlockFlow::StatusChanged { ref document_id, ref block_id, status } => {
                             let mut req = callback.on_block_status_changed_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
+                                id.set_document_id(&block_id.document_id);
                                 id.set_agent_id(&block_id.agent_id);
                                 id.set_seq(block_id.seq);
                                 params.set_status(status_to_capnp(status));
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::CollapsedChanged { ref cell_id, ref block_id, collapsed } => {
+                        BlockFlow::CollapsedChanged { ref document_id, ref block_id, collapsed } => {
                             let mut req = callback.on_block_collapsed_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
+                                id.set_document_id(&block_id.document_id);
                                 id.set_agent_id(&block_id.agent_id);
                                 id.set_seq(block_id.seq);
                                 params.set_collapsed(collapsed);
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Moved { ref cell_id, ref block_id, ref after_id } => {
+                        BlockFlow::Moved { ref document_id, ref block_id, ref after_id } => {
                             let mut req = callback.on_block_moved_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
+                                id.set_document_id(&block_id.document_id);
                                 id.set_agent_id(&block_id.agent_id);
                                 id.set_seq(block_id.seq);
                                 params.set_has_after_id(after_id.is_some());
                                 if let Some(after) = after_id {
                                     let mut aid = params.reborrow().init_after_id();
-                                    aid.set_cell_id(&after.cell_id);
+                                    aid.set_document_id(&after.document_id);
                                     aid.set_agent_id(&after.agent_id);
                                     aid.set_seq(after.seq);
                                 }
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::TextOps { ref cell_id, ref block_id, ref ops } => {
+                        BlockFlow::TextOps { ref document_id, ref block_id, ref ops } => {
                             let mut req = callback.on_block_text_ops_request();
                             {
                                 let mut params = req.get();
-                                params.set_cell_id(cell_id);
+                                params.set_document_id(document_id);
                                 let mut id = params.reborrow().init_block_id();
-                                id.set_cell_id(&block_id.cell_id);
+                                id.set_document_id(&block_id.document_id);
                                 id.set_agent_id(&block_id.agent_id);
                                 id.set_seq(block_id.seq);
                                 params.set_ops(ops);
@@ -1233,14 +1233,14 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn get_block_cell_state(
+    fn get_document_state(
         self: Rc<Self>,
-        params: kernel::GetBlockCellStateParams,
-        mut results: kernel::GetBlockCellStateResults,
+        params: kernel::GetDocumentStateParams,
+        mut results: kernel::GetDocumentStateResults,
     ) -> Promise<(), capnp::Error> {
-        let cell_id = pry!(pry!(pry!(params.get()).get_cell_id()).to_str()).to_owned();
+        let cell_id = pry!(pry!(pry!(params.get()).get_document_id()).to_str()).to_owned();
 
-        log::debug!("get_block_cell_state called for cell {}", cell_id);
+        log::debug!("get_document_state called for cell {}", cell_id);
 
         let state = self.state.borrow();
         let kernel = match state.kernels.get(&self.kernel_id) {
@@ -1264,7 +1264,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let mut cell_state = results.get().init_state();
-        cell_state.set_cell_id(&cell_id);
+        cell_state.set_document_id(&cell_id);
         cell_state.reborrow().set_version(doc.version());
 
         // Get actual blocks from BlockDocument
@@ -1280,7 +1280,7 @@ impl kernel::Server for KernelImpl {
         let oplog_bytes = doc.doc.oplog_bytes();
         cell_state.set_ops(&oplog_bytes);
         log::debug!(
-            "Sending BlockCellState for cell {} with {} blocks, {} bytes oplog",
+            "Sending DocumentState for cell {} with {} blocks, {} bytes oplog",
             cell_id,
             blocks.len(),
             oplog_bytes.len()
@@ -1303,13 +1303,13 @@ impl kernel::Server for KernelImpl {
         let request = pry!(params.get_request());
         let content = pry!(pry!(request.get_content()).to_str()).to_owned();
         log::info!("Received prompt request: cell_id={}, content_len={}",
-            pry!(request.get_cell_id()).to_str().unwrap_or("?"), content.len());
+            pry!(request.get_document_id()).to_str().unwrap_or("?"), content.len());
         // Note: Cap'n Proto defaults unset Text fields to "", so we filter empty strings
         let model = request.get_model().ok()
             .and_then(|m| m.to_str().ok())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
-        let cell_id = pry!(pry!(request.get_cell_id()).to_str()).to_owned();
+        let cell_id = pry!(pry!(request.get_document_id()).to_str()).to_owned();
 
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
@@ -1492,7 +1492,7 @@ impl kernel::Server for KernelImpl {
             seat.set_owner(&seat_info.owner);
             seat.set_status(crate::kaijutsu_capnp::SeatStatus::Active);
             seat.set_last_activity(seat_info.last_activity);
-            seat.set_cell_id(&cell_id);
+            seat.set_document_id(&cell_id);
         }
 
         Promise::ok(())
@@ -1751,7 +1751,7 @@ impl kernel::Server for KernelImpl {
         log::debug!("shell_execute() called for kernel {}", self.kernel_id);
         let params = pry!(params.get());
         let code = pry!(pry!(params.get_code()).to_str()).to_owned();
-        let cell_id = pry!(pry!(params.get_cell_id()).to_str()).to_owned();
+        let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
         log::info!("Shell execute: cell_id={}, code={}", cell_id, code);
 
         let state = self.state.clone();
@@ -1867,7 +1867,7 @@ impl kernel::Server for KernelImpl {
 
             // Return command block ID
             let mut block_id_builder = results.get().init_command_block_id();
-            block_id_builder.set_cell_id(&command_block_id.cell_id);
+            block_id_builder.set_document_id(&command_block_id.document_id);
             block_id_builder.set_agent_id(&command_block_id.agent_id);
             block_id_builder.set_seq(command_block_id.seq);
 
@@ -2334,7 +2334,7 @@ fn set_block_snapshot(
     // Set ID
     {
         let mut id = builder.reborrow().init_id();
-        id.set_cell_id(&block.id.cell_id);
+        id.set_document_id(&block.id.document_id);
         id.set_agent_id(&block.id.agent_id);
         id.set_seq(block.id.seq);
     }
@@ -2343,7 +2343,7 @@ fn set_block_snapshot(
     if let Some(ref parent) = block.parent_id {
         builder.set_has_parent_id(true);
         let mut pid = builder.reborrow().init_parent_id();
-        pid.set_cell_id(&parent.cell_id);
+        pid.set_document_id(&parent.document_id);
         pid.set_agent_id(&parent.agent_id);
         pid.set_seq(parent.seq);
     } else {
@@ -2392,7 +2392,7 @@ fn set_block_snapshot(
     if let Some(ref tc_id) = block.tool_call_id {
         builder.set_has_tool_call_id(true);
         let mut tcid = builder.reborrow().init_tool_call_id();
-        tcid.set_cell_id(&tc_id.cell_id);
+        tcid.set_document_id(&tc_id.document_id);
         tcid.set_agent_id(&tc_id.agent_id);
         tcid.set_seq(tc_id.seq);
     } else {
@@ -2431,7 +2431,7 @@ fn parse_block_snapshot(
 ) -> Result<kaijutsu_crdt::BlockSnapshot, capnp::Error> {
     let id_reader = reader.get_id()?;
     let id = kaijutsu_crdt::BlockId {
-        cell_id: id_reader.get_cell_id()?.to_str()?.to_owned(),
+        document_id: id_reader.get_document_id()?.to_str()?.to_owned(),
         agent_id: id_reader.get_agent_id()?.to_str()?.to_owned(),
         seq: id_reader.get_seq(),
     };
@@ -2439,7 +2439,7 @@ fn parse_block_snapshot(
     let parent_id = if reader.get_has_parent_id() {
         let pid_reader = reader.get_parent_id()?;
         Some(kaijutsu_crdt::BlockId {
-            cell_id: pid_reader.get_cell_id()?.to_str()?.to_owned(),
+            document_id: pid_reader.get_document_id()?.to_str()?.to_owned(),
             agent_id: pid_reader.get_agent_id()?.to_str()?.to_owned(),
             seq: pid_reader.get_seq(),
         })
@@ -2473,7 +2473,7 @@ fn parse_block_snapshot(
     let tool_call_id = if reader.get_has_tool_call_id() {
         let tc_reader = reader.get_tool_call_id()?;
         Some(kaijutsu_crdt::BlockId {
-            cell_id: tc_reader.get_cell_id()?.to_str()?.to_owned(),
+            document_id: tc_reader.get_document_id()?.to_str()?.to_owned(),
             agent_id: tc_reader.get_agent_id()?.to_str()?.to_owned(),
             seq: tc_reader.get_seq(),
         })
