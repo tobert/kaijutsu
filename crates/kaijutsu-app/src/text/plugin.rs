@@ -377,6 +377,12 @@ fn prepare_text(
     // Track which entities we see this frame for stale entry cleanup
     let mut seen_entities: HashSet<Entity> = HashSet::with_capacity(extracted.areas.len());
 
+    // Get fallback width from resolution (better than hardcoded 800px)
+    let fallback_width = resolution
+        .as_ref()
+        .map(|r| r.0.width as f32)
+        .unwrap_or(800.0);
+
     // Phase 1: Update cache (all mutations happen here)
     for area in &extracted.areas {
         seen_entities.insert(area.entity);
@@ -391,7 +397,7 @@ fn prepare_text(
                     "Invalid text bounds for entity {:?}: left={}, right={}, computed_width={} - using fallback",
                     area.entity, area.bounds.left, area.bounds.right, width
                 );
-                800.0
+                fallback_width
             } else {
                 width as f32
             }

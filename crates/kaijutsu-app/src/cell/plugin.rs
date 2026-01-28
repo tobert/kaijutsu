@@ -128,12 +128,17 @@ impl Plugin for CellPlugin {
                     systems::spawn_block_cells
                         .after(systems::handle_block_events)
                         .after(systems::sync_main_cell_to_conversation),
-                    ApplyDeferred
+                    systems::sync_role_headers
                         .after(systems::spawn_block_cells),
+                    ApplyDeferred
+                        .after(systems::sync_role_headers),
                     systems::init_block_cell_buffers
+                        .after(ApplyDeferred),
+                    systems::init_role_header_buffers
                         .after(ApplyDeferred),
                     systems::sync_block_cell_buffers
                         .after(systems::init_block_cell_buffers)
+                        .after(systems::init_role_header_buffers)
                         .after(systems::handle_cell_input),
                     // Highlight focused block (overrides color set by sync_block_cell_buffers)
                     systems::highlight_focused_block

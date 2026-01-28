@@ -28,6 +28,7 @@ impl ConversationRegistry {
     }
 
     /// Remove a conversation by ID.
+    #[allow(dead_code)]
     pub fn remove(&mut self, id: &str) -> Option<Conversation> {
         self.order.retain(|oid| oid != id);
         self.conversations.remove(id)
@@ -44,16 +45,19 @@ impl ConversationRegistry {
     }
 
     /// Get all conversations in display order.
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &Conversation> {
         self.order.iter().filter_map(|id| self.conversations.get(id))
     }
 
     /// Get the number of conversations.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.conversations.len()
     }
 
     /// Check if the registry is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.conversations.is_empty()
     }

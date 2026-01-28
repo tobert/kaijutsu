@@ -42,6 +42,7 @@ impl ConversationStore {
     }
 
     /// Delete a conversation from the database.
+    #[allow(dead_code)]
     pub fn delete(&self, id: &str) {
         if let Ok(db) = self.db.lock()
             && let Err(e) = db.delete(id) {

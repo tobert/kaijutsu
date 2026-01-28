@@ -28,6 +28,7 @@ pub struct FormattedOutput {
     /// The formatted text content.
     pub text: String,
     /// Whether this output has special formatting applied.
+    #[allow(dead_code)]
     pub is_formatted: bool,
 }
 
@@ -86,6 +87,7 @@ pub fn format_for_display(content: &str, hint_json: Option<&str>) -> FormattedOu
 /// - Trees → compact brace notation
 /// - Formatted → pre-rendered model format
 /// - None → raw content
+#[allow(dead_code)]
 pub fn format_for_model(content: &str, hint_json: Option<&str>) -> String {
     let Some(json) = hint_json else {
         return content.to_string();

@@ -105,6 +105,7 @@ pub struct Theme {
     /// Shell output block text color (light gray)
     pub block_shell_output: Color,
     /// Focused block highlight color (border/background accent)
+    #[allow(dead_code)]
     pub block_focus: Color,
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -374,7 +374,8 @@ pub struct CursorBeamMaterial {
 pub enum CursorMode {
     Beam = 0,      // Vertical line (insert mode)
     Block = 1,     // Filled block (normal mode)
-    Underline = 2, // Bottom line
+    #[allow(dead_code)]
+    Underline = 2, // Bottom line (future: replace mode)
 }
 
 impl Default for CursorBeamMaterial {

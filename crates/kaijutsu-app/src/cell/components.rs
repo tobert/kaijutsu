@@ -413,6 +413,7 @@ impl EditorMode {
     }
 
     /// Get the input kind if in Input mode.
+    #[allow(dead_code)]
     pub fn input_kind(&self) -> Option<InputKind> {
         match self {
             EditorMode::Input(kind) => Some(*kind),
@@ -421,11 +422,13 @@ impl EditorMode {
     }
 
     /// Check if this is Chat input mode.
+    #[allow(dead_code)]
     pub fn is_chat(&self) -> bool {
         matches!(self, EditorMode::Input(InputKind::Chat))
     }
 
     /// Check if this is Shell input mode.
+    #[allow(dead_code)]
     pub fn is_shell(&self) -> bool {
         matches!(self, EditorMode::Input(InputKind::Shell))
     }
@@ -456,11 +459,13 @@ pub struct ConversationFocus {
 
 impl ConversationFocus {
     /// Check if a specific block is focused.
+    #[allow(dead_code)]
     pub fn is_focused(&self, block_id: &BlockId) -> bool {
         self.block_id.as_ref() == Some(block_id)
     }
 
     /// Clear the focus.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.block_id = None;
     }
@@ -528,7 +533,7 @@ impl Default for WorkspaceLayout {
             max_cell_height: 400.0,
             workspace_margin_left: 20.0,
             workspace_margin_top: 70.0, // Space for compact header
-            line_height: 20.0,
+            line_height: 22.5, // Match TextMetrics.cell_line_height for cursor alignment
             prompt_min_height: 50.0,
         }
     }
@@ -771,6 +776,8 @@ pub struct BlockCellContainer {
     pub block_cells: Vec<Entity>,
     /// Map from block ID to entity for fast lookup.
     pub block_to_entity: std::collections::HashMap<BlockId, Entity>,
+    /// Role header entities (one per role transition).
+    pub role_headers: Vec<Entity>,
 }
 
 impl BlockCellContainer {
@@ -809,9 +816,22 @@ pub struct BlockCellLayout {
 }
 
 // ============================================================================
-// TURN UI COMPONENTS (Removed)
+// ROLE HEADER COMPONENTS
 // ============================================================================
-//
-// Turn headers are now rendered inline based on role transitions.
-// The layout_block_cells system handles role transition detection and
-// reserves space for inline role headers. See systems.rs for details.
+
+/// Role header entity that appears before first block of each turn.
+/// Rendered as a styled, distinct header separate from block content.
+#[derive(Component, Debug, Clone)]
+pub struct RoleHeader {
+    /// The role this header represents.
+    pub role: kaijutsu_crdt::Role,
+    /// The block ID this header precedes (for layout positioning).
+    pub block_id: BlockId,
+}
+
+/// Layout information for a role header.
+#[derive(Component, Debug, Default)]
+pub struct RoleHeaderLayout {
+    /// Y position (top) relative to conversation content start.
+    pub y_offset: f32,
+}

@@ -66,6 +66,7 @@ pub enum View {
     /// Dashboard - kernel/conversation selection
     Dashboard,
     /// Conversation view - main chat/shell interface
+    #[allow(dead_code)]
     Conversation {
         /// The conversation/kernel ID being viewed
         kernel_id: String,
@@ -88,11 +89,13 @@ impl View {
     }
 
     /// Check if this is an overlay view (pushed on top of root).
+    #[allow(dead_code)]
     pub fn is_overlay(&self) -> bool {
         !self.is_root()
     }
 
     /// Get the base AppScreen this view corresponds to.
+    #[allow(dead_code)]
     pub fn base_screen(&self) -> AppScreen {
         match self {
             View::Dashboard => AppScreen::Dashboard,
@@ -155,6 +158,7 @@ impl ViewStack {
     }
 
     /// Get the stack depth.
+    #[allow(dead_code)]
     pub fn depth(&self) -> usize {
         self.stack.len()
     }

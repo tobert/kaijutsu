@@ -83,6 +83,7 @@ pub struct SyncManager {
     document_id: Option<String>,
 }
 
+#[allow(dead_code)]
 impl SyncManager {
     /// Create a new SyncManager in "needs full sync" state.
     pub fn new() -> Self {

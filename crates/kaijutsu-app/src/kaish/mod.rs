@@ -6,6 +6,10 @@
 //! - Completion hints (identify context for suggestions)
 //!
 //! Uses kaish-kernel's lexer and parser directly without spawning a subprocess.
+//!
+//! Note: This module is awaiting integration with the shell input mode.
+
+#![allow(dead_code)]
 
 use kaish_kernel::lexer::Token;
 use kaish_kernel::parser;

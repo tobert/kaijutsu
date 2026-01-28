@@ -24,10 +24,6 @@ pub struct TextMetrics {
     pub cell_font_size: f32,
     /// Line height for content cells. Default: 22.5 (1.5x font size)
     pub cell_line_height: f32,
-    /// Base font size for UI elements (labels, status). Default: 13.0
-    pub ui_font_size: f32,
-    /// Line height for UI elements. Default: 18.2 (1.4x font size)
-    pub ui_line_height: f32,
     /// Window scale factor, updated from window resize events.
     /// Applied automatically in scaled_*_metrics() methods.
     pub scale_factor: f32,
@@ -37,9 +33,7 @@ impl Default for TextMetrics {
     fn default() -> Self {
         Self {
             cell_font_size: 15.0,
-            cell_line_height: 22.5,  // 1.5x for comfortable reading
-            ui_font_size: 13.0,
-            ui_line_height: 18.2,    // 1.4x for compact UI
+            cell_line_height: 22.5, // 1.5x for comfortable reading
             scale_factor: 1.0,
         }
     }
@@ -56,25 +50,6 @@ impl TextMetrics {
         )
     }
 
-    /// Get scaled metrics for UI elements (labels, status bar, headers).
-    ///
-    /// Use this for GlyphonUiText and other UI chrome.
-    pub fn scaled_ui_metrics(&self) -> Metrics {
-        Metrics::new(
-            self.ui_font_size * self.scale_factor,
-            self.ui_line_height * self.scale_factor,
-        )
-    }
-
-    /// Get unscaled cell metrics (for layout calculations before scaling).
-    pub fn cell_metrics(&self) -> Metrics {
-        Metrics::new(self.cell_font_size, self.cell_line_height)
-    }
-
-    /// Get unscaled UI metrics (for layout calculations before scaling).
-    pub fn ui_metrics(&self) -> Metrics {
-        Metrics::new(self.ui_font_size, self.ui_line_height)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

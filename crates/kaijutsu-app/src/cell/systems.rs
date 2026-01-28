@@ -7,7 +7,8 @@ use bevy::prelude::*;
 use super::components::{
     BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
     ConversationScrollState, CurrentMode, EditorMode, FocusedCell, InputKind, MainCell,
-    PromptCell, PromptContainer, PromptSubmitted, ViewingConversation, WorkspaceLayout,
+    PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer, TextMetrics};
@@ -694,9 +695,10 @@ pub struct CursorMarker;
 #[derive(Resource, Default)]
 pub struct CursorEntity(pub Option<Entity>);
 
-/// Font metrics for cursor positioning.
-const CHAR_WIDTH: f32 = 8.4;   // Approximate monospace char width at 14px
-const LINE_HEIGHT: f32 = 20.0; // Line height from text config
+// Font metrics are now read from TextMetrics resource instead of hardcoded constants.
+// This ensures cursor positioning matches actual text rendering.
+// Monospace char width is approximately 0.6x the font size.
+const MONOSPACE_WIDTH_RATIO: f32 = 0.6;
 
 /// Spawn the cursor entity if it doesn't exist.
 pub fn spawn_cursor(
@@ -704,6 +706,7 @@ pub fn spawn_cursor(
     mut cursor_entity: ResMut<CursorEntity>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
+    text_metrics: Res<TextMetrics>,
 ) {
     if cursor_entity.0.is_some() {
         return;
@@ -719,13 +722,17 @@ pub fn spawn_cursor(
         time: Vec4::new(0.0, CursorMode::Block as u8 as f32, 0.0, 0.0),
     });
 
+    // Derive cursor size from TextMetrics for consistency with text rendering
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let line_height = text_metrics.cell_line_height;
+
     let entity = commands
         .spawn((
             CursorMarker,
             Node {
                 position_type: PositionType::Absolute,
-                width: Val::Px(CHAR_WIDTH + 8.0),  // Slightly larger for bloom
-                height: Val::Px(LINE_HEIGHT + 4.0),
+                width: Val::Px(char_width + 8.0),  // Slightly larger for bloom
+                height: Val::Px(line_height + 4.0),
                 ..default()
             },
             BackgroundColor(Color::NONE),  // Explicit transparent - let shader handle all rendering
@@ -748,6 +755,7 @@ pub fn update_cursor(
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
+    text_metrics: Res<TextMetrics>,
 ) {
     let Some(cursor_ent) = cursor_entity.0 else {
         return;
@@ -774,9 +782,11 @@ pub fn update_cursor(
     // Calculate cursor position by walking blocks directly
     let (row, col) = cursor_position(editor);
 
-    // Position relative to cell bounds
-    let x = config.left + (col as f32 * CHAR_WIDTH);
-    let y = config.top + (row as f32 * LINE_HEIGHT);
+    // Position relative to cell bounds using TextMetrics for consistency
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let line_height = text_metrics.cell_line_height;
+    let x = config.left + (col as f32 * char_width);
+    let y = config.top + (row as f32 * line_height);
 
     node.left = Val::Px(x - 2.0); // Slight offset for beam alignment
     node.top = Val::Px(y);
@@ -1502,6 +1512,7 @@ pub fn spawn_expanded_block_view(
 #[derive(Component)]
 pub struct ExpandedBlockInfo {
     pub block_id: kaijutsu_crdt::BlockId,
+    #[allow(dead_code)]
     pub block_kind: BlockKind,
 }
 
@@ -2036,6 +2047,101 @@ pub fn spawn_block_cells(
     container.block_cells = new_order;
 }
 
+/// Sync RoleHeader entities for role transitions.
+///
+/// Spawns role header entities using the same pattern as BlockCells:
+/// GlyphonText + TextAreaConfig for consistent rendering.
+pub fn sync_role_headers(
+    mut commands: Commands,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    mut containers: Query<&mut BlockCellContainer>,
+    theme: Res<Theme>,
+) {
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Ok(mut container) = containers.get_mut(main_ent) else {
+        return;
+    };
+
+    // Despawn existing role headers (will rebuild each time blocks change)
+    for entity in container.role_headers.drain(..) {
+        commands.entity(entity).try_despawn();
+    }
+
+    // Detect role transitions and spawn headers
+    let blocks = editor.blocks();
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+
+    for block in &blocks {
+        let is_transition = prev_role != Some(block.role);
+        if is_transition {
+            // Get color for this role
+            let color = match block.role {
+                kaijutsu_crdt::Role::User => theme.block_user,
+                kaijutsu_crdt::Role::Model => theme.block_assistant,
+                kaijutsu_crdt::Role::System => theme.fg_dim,
+                kaijutsu_crdt::Role::Tool => theme.block_tool_call,
+            };
+
+            // Use same rendering pattern as BlockCells
+            let mut config = TextAreaConfig::default();
+            config.default_color = bevy_to_glyphon_color(color);
+
+            let entity = commands
+                .spawn((
+                    RoleHeader {
+                        role: block.role,
+                        block_id: block.id.clone(),
+                    },
+                    RoleHeaderLayout::default(),
+                    GlyphonText,
+                    config,
+                ))
+                .id();
+
+            container.role_headers.push(entity);
+        }
+        prev_role = Some(block.role);
+    }
+}
+
+/// Initialize GlyphonTextBuffers for RoleHeaders that don't have one.
+pub fn init_role_header_buffers(
+    mut commands: Commands,
+    role_headers: Query<(Entity, &RoleHeader), (With<GlyphonText>, Without<GlyphonTextBuffer>)>,
+    font_system: Res<SharedFontSystem>,
+    text_metrics: Res<TextMetrics>,
+) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    for (entity, header) in role_headers.iter() {
+        // Use UI metrics for headers (slightly smaller than content)
+        let metrics = text_metrics.scaled_cell_metrics();
+        let mut buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
+
+        // Set header text based on role
+        let text = match header.role {
+            kaijutsu_crdt::Role::User => "── USER ──────────────────────",
+            kaijutsu_crdt::Role::Model => "── ASSISTANT ─────────────────",
+            kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
+            kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
+        };
+        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        buffer.set_text(&mut font_system, text, &attrs, glyphon::Shaping::Advanced);
+
+        commands.entity(entity).insert(buffer);
+    }
+}
+
 /// Initialize GlyphonTextBuffers for BlockCells that don't have one.
 pub fn init_block_cell_buffers(
     mut commands: Commands,
@@ -2123,23 +2229,9 @@ pub fn sync_block_cell_buffers(
         };
 
         // Format and update the buffer
-        let mut text = String::new();
-
-        // Prepend role header on transitions
-        if let Some(&(is_transition, role)) = is_role_transition.get(&block_cell.block_id) {
-            if is_transition {
-                let header = match role {
-                    kaijutsu_crdt::Role::User => "── USER ──────────────────────",
-                    kaijutsu_crdt::Role::Model => "── ASSISTANT ─────────────────",
-                    kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
-                    kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
-                };
-                text.push_str(header);
-                text.push('\n');
-            }
-        }
-
-        text.push_str(&format_single_block(block));
+        // Note: Role headers are now rendered as separate RoleHeader entities,
+        // no longer prepended inline. See layout_block_cells for space reservation.
+        let text = format_single_block(block);
         let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
         buffer.set_text(&mut font_system, &text, &attrs, glyphon::Shaping::Advanced);
 
@@ -2182,9 +2274,10 @@ pub fn layout_block_cells(
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut GlyphonTextBuffer)>,
+    mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    shadow_height: Res<InputShadowHeight>,
+    _shadow_height: Res<InputShadowHeight>, // Used only in apply_block_cell_positions now
     registry: Res<ConversationRegistry>,
     current: Res<CurrentConversation>,
     font_system: Res<SharedFontSystem>,
@@ -2232,11 +2325,8 @@ pub fn layout_block_cells(
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
 
-    // Update visible_height early so smooth_scroll has correct max_offset
-    // Use InputShadowHeight (0 when minimized, docked_height when visible)
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
-    scroll_state.visible_height = visible_bottom - visible_top;
+    // Note: visible_height is now updated only in apply_block_cell_positions
+    // to consolidate scroll state updates and prevent double-clamping issues
 
     // Lock font system for shaping
     let mut font_system = font_system.0.lock().unwrap();
@@ -2269,8 +2359,15 @@ pub fn layout_block_cells(
             continue;
         };
 
-        // Check if this is a role transition - if so, add space for role header
+        // Check if this is a role transition - if so, position the role header and add space
         if block_is_role_transition.get(&block_cell.block_id) == Some(&true) {
+            // Find and position the role header for this block
+            for (header, mut header_layout) in role_headers.iter_mut() {
+                if header.block_id == block_cell.block_id {
+                    header_layout.y_offset = y_offset;
+                    break;
+                }
+            }
             y_offset += ROLE_HEADER_HEIGHT + ROLE_HEADER_SPACING;
         }
 
@@ -2320,6 +2417,7 @@ pub fn apply_block_cell_positions(
     main_entity: Res<MainCellEntity>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCellLayout, &mut TextAreaConfig), With<BlockCell>>,
+    mut role_headers: Query<(&RoleHeaderLayout, &mut TextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     shadow_height: Res<InputShadowHeight>,
@@ -2360,13 +2458,13 @@ pub fn apply_block_cell_positions(
     // Visible area (use shadow_height, 0 when minimized)
     let visible_top = layout.workspace_margin_top;
     let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
-    let visible_height = visible_bottom - visible_top;
+    let visible_height = (visible_bottom - visible_top).max(100.0); // Ensure positive
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
 
-    // Update scroll state with visible area and clamp offset
+    // Update scroll state with visible area
+    // Note: smooth_scroll handles clamping, so we don't call clamp_target() here
     scroll_state.visible_height = visible_height;
-    scroll_state.clamp_target();
 
     let scroll_offset = scroll_state.offset;
 
@@ -2388,11 +2486,35 @@ pub fn apply_block_cell_positions(
         // Clamp bounds to intersection of visible area and block area
         // This prevents text from rendering outside its block when partially scrolled
         let block_bottom = content_top + block_layout.height;
+        let clamped_top = visible_top.max(content_top).max(0.0);
+        let clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
         config.bounds = glyphon::TextBounds {
             left: left as i32,
-            top: visible_top.max(content_top) as i32,
+            top: clamped_top as i32,
             right: (left + width) as i32,
-            bottom: visible_bottom.min(block_bottom) as i32,
+            bottom: clamped_bottom as i32,
+        };
+    }
+
+    // Position role headers
+    for entity in &container.role_headers {
+        let Ok((header_layout, mut config)) = role_headers.get_mut(*entity) else {
+            continue;
+        };
+
+        let content_top = visible_top + header_layout.y_offset - scroll_offset;
+        let header_bottom = content_top + ROLE_HEADER_HEIGHT;
+        let clamped_top = visible_top.max(content_top).max(0.0);
+        let clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
+
+        config.left = margin;
+        config.top = content_top;
+        config.scale = 1.0;
+        config.bounds = glyphon::TextBounds {
+            left: margin as i32,
+            top: clamped_top as i32,
+            right: (margin + base_width) as i32,
+            bottom: clamped_bottom as i32,
         };
     }
 }
