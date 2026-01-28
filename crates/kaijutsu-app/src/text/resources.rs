@@ -71,6 +71,7 @@ impl Default for SharedFontSystem {
 /// Convert Bevy Color to cosmic-text Color.
 ///
 /// Uses sRGB color space - cosmic-text expects 0-255 sRGB values.
+#[allow(dead_code)]
 pub fn bevy_to_cosmic_color(color: Color) -> cosmic_text::Color {
     let srgba = color.to_srgba();
     cosmic_text::Color::rgba(

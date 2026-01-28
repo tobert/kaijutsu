@@ -2118,9 +2118,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            if let Ok(block_id) = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached") {
-                last_block_id = block_id;
-            }
+            let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
             break;
         }
 
@@ -2236,9 +2234,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    if let Ok(block_id) = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err)) {
-                        last_block_id = block_id;
-                    }
+                    let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
                     return;
                 }
             }

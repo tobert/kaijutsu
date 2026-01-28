@@ -73,6 +73,7 @@ impl Default for MsdfUniforms {
 }
 
 /// Extracted text area for rendering.
+#[allow(dead_code)]
 pub struct ExtractedMsdfText {
     pub entity: Entity,
     pub glyphs: Vec<PositionedGlyph>,
@@ -109,6 +110,7 @@ pub struct ExtractedMsdfAtlas {
 
 /// Render world resources for MSDF text.
 #[derive(Resource)]
+#[allow(dead_code)]
 pub struct MsdfTextResources {
     pub pipeline: CachedRenderPipelineId,
     pub bind_group_layout: BindGroupLayout,

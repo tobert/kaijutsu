@@ -47,6 +47,7 @@ pub struct MsdfTextBuffer {
     default_color: [u8; 4],
 }
 
+#[allow(dead_code)]
 impl MsdfTextBuffer {
     /// Create a new buffer with the given metrics.
     pub fn new(font_system: &mut FontSystem, metrics: Metrics) -> Self {
@@ -229,6 +230,7 @@ pub struct TextBounds {
     pub bottom: i32,
 }
 
+#[allow(dead_code)]
 impl TextBounds {
     /// Create bounds from position and size.
     pub fn from_rect(x: f32, y: f32, width: f32, height: f32) -> Self {

@@ -20,11 +20,8 @@ mod plugin;
 mod resources;
 
 pub use msdf::{
-    GlowConfig, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText, SdfTextEffects,
+    MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText,
     TextBounds, UiTextPositionCache,
 };
 pub use plugin::TextRenderPlugin;
-pub use resources::{bevy_to_cosmic_color, bevy_to_rgba8, SharedFontSystem, TextMetrics, TextResolution};
-
-// Re-export commonly used cosmic-text types
-pub use cosmic_text::{Attrs, Family, Metrics, Shaping};
+pub use resources::{bevy_to_rgba8, SharedFontSystem, TextMetrics};

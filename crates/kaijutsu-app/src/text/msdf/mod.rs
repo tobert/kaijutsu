@@ -20,8 +20,8 @@ pub mod buffer;
 pub mod generator;
 pub mod pipeline;
 
-pub use atlas::{AtlasRegion, GlyphKey, MsdfAtlas};
-pub use buffer::{MsdfTextAreaConfig, MsdfTextBuffer, PositionedGlyph, TextBounds};
+pub use atlas::MsdfAtlas;
+pub use buffer::{MsdfTextAreaConfig, MsdfTextBuffer, TextBounds};
 pub use generator::MsdfGenerator;
 pub use pipeline::{
     extract_msdf_texts, init_msdf_resources, prepare_msdf_texts, ExtractedMsdfTexts,
@@ -34,6 +34,9 @@ use cosmic_text::{Family, Metrics};
 use crate::text::resources::bevy_to_rgba8;
 
 /// Text effects that can be applied to MSDF-rendered text.
+///
+/// These are defined but not yet wired into the rendering pipeline.
+/// They'll be used when rainbow/glow shaders are implemented.
 #[derive(Component, Default, Clone)]
 pub struct SdfTextEffects {
     /// Enable rainbow color cycling effect.
@@ -84,6 +87,7 @@ pub struct MsdfUiText {
     pub family: Family<'static>,
 }
 
+#[allow(dead_code)]
 impl MsdfUiText {
     /// Create a new UI text with default settings.
     pub fn new(text: impl Into<String>) -> Self {

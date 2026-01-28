@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 use bevy::render::{
     render_graph::{RenderGraphExt, ViewNodeRunner},
-    Extract, Render, RenderApp, RenderPlugin,
+    ExtractSchedule, Render, RenderApp, RenderPlugin,
 };
 use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;

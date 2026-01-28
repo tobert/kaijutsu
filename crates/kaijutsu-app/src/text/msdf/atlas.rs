@@ -34,7 +34,10 @@ pub struct AtlasRegion {
     pub width: u32,
     pub height: u32,
     /// Anchor point for positioning (offset from glyph origin).
+    /// Will be used for proper glyph positioning once spacing is fixed.
+    #[allow(dead_code)]
     pub anchor_x: f32,
+    #[allow(dead_code)]
     pub anchor_y: f32,
 }
 
@@ -84,6 +87,7 @@ pub struct MsdfAtlas {
     pub msdf_range: f32,
 }
 
+#[allow(dead_code)]
 impl MsdfAtlas {
     /// Default MSDF range (distance field extent in pixels).
     pub const DEFAULT_RANGE: f32 = 8.0;

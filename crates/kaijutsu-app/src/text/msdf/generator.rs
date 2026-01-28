@@ -38,6 +38,7 @@ pub struct MsdfGenerator {
     pub angle_threshold: f64,
 }
 
+#[allow(dead_code)]
 impl MsdfGenerator {
     /// Create a new generator with default settings.
     pub fn new() -> Self {
@@ -160,6 +161,7 @@ fn get_font_data_vec(font_system: &FontSystem, font_id: FontId) -> Option<Vec<u8
 }
 
 /// Get glyph ID for a character in a font.
+#[allow(dead_code)]
 fn get_glyph_id(font_system: &FontSystem, font_id: FontId, c: char) -> Option<u16> {
     let db = font_system.db();
     let face_info = db.face(font_id)?;
