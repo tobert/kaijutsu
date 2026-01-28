@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 
 use crate::connection::{ConnectionCommand, ConnectionCommands};
-use crate::text::{GlyphonUiText, UiTextPositionCache};
+use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
 use super::DashboardState;
@@ -65,7 +65,7 @@ pub fn spawn_seat_selector(commands: &mut Commands, theme: &Theme) -> Entity {
         .with_children(|selector| {
             // Seat icon (席)
             selector.spawn((
-                GlyphonUiText::new("席")
+                MsdfUiText::new("席")
                     .with_font_size(14.0)
                     .with_color(theme.accent),
                 UiTextPositionCache::default(),
@@ -79,7 +79,7 @@ pub fn spawn_seat_selector(commands: &mut Commands, theme: &Theme) -> Entity {
             // Current seat text
             selector.spawn((
                 CurrentSeatText,
-                GlyphonUiText::new("No seat")
+                MsdfUiText::new("No seat")
                     .with_font_size(12.0)
                     .with_color(theme.fg_dim),
                 UiTextPositionCache::default(),
@@ -93,7 +93,7 @@ pub fn spawn_seat_selector(commands: &mut Commands, theme: &Theme) -> Entity {
             // Seat count badge (shows when multiple seats)
             selector.spawn((
                 SeatCountText,
-                GlyphonUiText::new("")
+                MsdfUiText::new("")
                     .with_font_size(10.0)
                     .with_color(theme.bg),
                 UiTextPositionCache::default(),
@@ -146,7 +146,7 @@ pub fn spawn_seat_dropdown(commands: &mut Commands, theme: &Theme) -> Entity {
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        GlyphonUiText::new("◀ Dashboard")
+                        MsdfUiText::new("◀ Dashboard")
                             .with_font_size(12.0)
                             .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),
@@ -168,8 +168,8 @@ pub fn spawn_seat_dropdown(commands: &mut Commands, theme: &Theme) -> Entity {
 /// Update the seat selector display based on current state
 pub fn update_seat_selector(
     state: Res<DashboardState>,
-    mut current_text: Query<&mut GlyphonUiText, With<CurrentSeatText>>,
-    mut count_text: Query<(&mut GlyphonUiText, &mut Node), (With<SeatCountText>, Without<CurrentSeatText>)>,
+    mut current_text: Query<&mut MsdfUiText, With<CurrentSeatText>>,
+    mut count_text: Query<(&mut MsdfUiText, &mut Node), (With<SeatCountText>, Without<CurrentSeatText>)>,
     theme: Res<Theme>,
 ) {
     if !state.is_changed() {
@@ -181,10 +181,10 @@ pub fn update_seat_selector(
         if let Some(seat) = &state.current_seat {
             // Format: @nick:instance • context
             text.text = format!("@{}:{} • {}", seat.id.nick, seat.id.instance, seat.id.context);
-            text.color = crate::text::bevy_to_glyphon_color(theme.accent);
+            text.color = crate::text::bevy_to_rgba8(theme.accent);
         } else {
             text.text = "No seat".into();
-            text.color = crate::text::bevy_to_glyphon_color(theme.fg_dim);
+            text.color = crate::text::bevy_to_rgba8(theme.fg_dim);
         }
     }
 
@@ -334,7 +334,7 @@ pub fn rebuild_seat_options(
                     ))
                     .with_children(|btn| {
                         btn.spawn((
-                            GlyphonUiText::new(format!(
+                            MsdfUiText::new(format!(
                                 "@{}:{} • {}",
                                 seat.id.nick, seat.id.instance, seat.id.context
                             ))

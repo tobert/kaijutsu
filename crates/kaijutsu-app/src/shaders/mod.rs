@@ -543,7 +543,7 @@ fn sync_effect_context_to_text_glow(
 /// This enables position-aware shader effects (baseline glow, per-line effects, etc.)
 fn sync_text_geometry_to_materials(
     glow_query: Query<(&TextGlowTarget, &MaterialNode<TextGlowMaterial>)>,
-    text_query: Query<(&crate::text::UiTextPositionCache, &crate::text::GlyphonUiText)>,
+    text_query: Query<(&crate::text::UiTextPositionCache, &crate::text::MsdfUiText)>,
     mut materials: ResMut<Assets<TextGlowMaterial>>,
 ) {
     for (target, material_node) in glow_query.iter() {

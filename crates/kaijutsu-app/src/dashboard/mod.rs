@@ -22,7 +22,7 @@ use kaijutsu_client::{Context, KernelInfo, SeatInfo};
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
 use crate::shaders::nine_slice::{ChasingBorder, ChasingBorderMaterial};
-use crate::text::{GlyphonUiText, UiTextPositionCache};
+use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
 use crate::HeaderContainer;
@@ -219,7 +219,7 @@ fn setup_dashboard(
             ))
             .with_children(|footer| {
                 footer.spawn((
-                    GlyphonUiText::new("Take a seat:")
+                    MsdfUiText::new("Take a seat:")
                         .with_font_size(14.0)
                         .with_color(theme.fg_dim),
                     UiTextPositionCache::default(),
@@ -243,7 +243,7 @@ fn setup_dashboard(
                     ))
                     .with_children(|btn| {
                         btn.spawn((
-                            GlyphonUiText::new("Take Seat 席")
+                            MsdfUiText::new("Take Seat 席")
                                 .with_font_size(14.0)
                                 .with_color(theme.bg),
                             UiTextPositionCache::default(),
@@ -300,7 +300,7 @@ fn spawn_dashboard_column_with_border<M: Component>(
                 .with_children(|col| {
                     // Column header
                     col.spawn((
-                        GlyphonUiText::new(title)
+                        MsdfUiText::new(title)
                             .with_font_size(12.0)
                             .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),
@@ -587,7 +587,7 @@ fn rebuild_kernel_list(
                         kernel.user_count
                     );
                     item.spawn((
-                        GlyphonUiText::new(&display)
+                        MsdfUiText::new(&display)
                             .with_font_size(14.0)
                             .with_color(theme.fg),
                         UiTextPositionCache::default(),
@@ -646,7 +646,7 @@ fn rebuild_context_list(
                 ))
                 .with_children(|item| {
                     item.spawn((
-                        GlyphonUiText::new(&context.name)
+                        MsdfUiText::new(&context.name)
                             .with_font_size(14.0)
                             .with_color(theme.fg),
                         UiTextPositionCache::default(),
@@ -702,7 +702,7 @@ fn rebuild_seats_list(
                     // Nick and instance
                     let nick_text = format!("@{}:{}", seat.id.nick, seat.id.instance);
                     item.spawn((
-                        GlyphonUiText::new(&nick_text)
+                        MsdfUiText::new(&nick_text)
                             .with_font_size(14.0)
                             .with_color(theme.fg),
                         UiTextPositionCache::default(),
@@ -716,7 +716,7 @@ fn rebuild_seats_list(
                     // Context and kernel
                     let context_text = format!("  :{}@{}", seat.id.context, seat.id.kernel);
                     item.spawn((
-                        GlyphonUiText::new(&context_text)
+                        MsdfUiText::new(&context_text)
                             .with_font_size(12.0)
                             .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),

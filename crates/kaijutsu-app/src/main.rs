@@ -191,7 +191,7 @@ fn setup_ui(
                     .with_children(|title_container| {
                         // Title text (normal flow)
                         title_container.spawn((
-                            text::GlyphonUiText::new("会術 Kaijutsu")
+                            text::MsdfUiText::new("会術 Kaijutsu")
                                 .with_font_size(24.0)
                                 .with_color(theme.accent),
                             text::UiTextPositionCache::default(),
@@ -217,7 +217,7 @@ fn setup_ui(
                 // Right: Connection status (uses glyphon)
                 header.spawn((
                     StatusText,
-                    text::GlyphonUiText::new("Connecting...")
+                    text::MsdfUiText::new("Connecting...")
                         .with_font_size(14.0)
                         .with_color(theme.fg_dim),
                     text::UiTextPositionCache::default(),
@@ -315,7 +315,7 @@ fn setup_ui(
                 // Left: Mode indicator (spawned as flex child, not absolute)
                 status_bar.spawn((
                     ui::mode_indicator::ModeIndicator,
-                    text::GlyphonUiText::new("NORMAL")
+                    text::MsdfUiText::new("NORMAL")
                         .with_font_size(14.0)
                         .with_color(theme.fg_dim),
                     text::UiTextPositionCache::default(),
@@ -336,7 +336,7 @@ fn setup_ui(
 
                 // Right: Key hints
                 status_bar.spawn((
-                    text::GlyphonUiText::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode")
+                    text::MsdfUiText::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode")
                         .with_font_size(11.0)
                         .with_color(theme.fg_dim),
                     text::UiTextPositionCache::default(),
@@ -420,7 +420,7 @@ pub struct HeaderContainer;
 /// Convert connection events to UI updates
 fn handle_connection_events(
     mut conn_events: MessageReader<connection::ConnectionEvent>,
-    mut status_text: Query<&mut text::GlyphonUiText, With<StatusText>>,
+    mut status_text: Query<&mut text::MsdfUiText, With<StatusText>>,
     theme: Res<ui::theme::Theme>,
 ) {
     use connection::ConnectionEvent;
@@ -430,23 +430,23 @@ fn handle_connection_events(
             match event {
                 ConnectionEvent::Connected => {
                     ui_text.text = "✓ Connected to server".into();
-                    ui_text.color = text::bevy_to_glyphon_color(theme.row_result);
+                    ui_text.color = text::bevy_to_rgba8(theme.row_result);
                 }
                 ConnectionEvent::Disconnected => {
                     ui_text.text = "⚡ Disconnected (reconnecting...)".into();
-                    ui_text.color = text::bevy_to_glyphon_color(theme.row_tool);
+                    ui_text.color = text::bevy_to_rgba8(theme.row_tool);
                 }
                 ConnectionEvent::ConnectionFailed(err) => {
                     ui_text.text = format!("✗ {}", err);
-                    ui_text.color = text::bevy_to_glyphon_color(theme.accent2);
+                    ui_text.color = text::bevy_to_rgba8(theme.accent2);
                 }
                 ConnectionEvent::Reconnecting { attempt, .. } => {
                     ui_text.text = format!("⟳ Reconnecting (attempt {})...", attempt);
-                    ui_text.color = text::bevy_to_glyphon_color(theme.fg_dim);
+                    ui_text.color = text::bevy_to_rgba8(theme.fg_dim);
                 }
                 ConnectionEvent::AttachedKernel(info) => {
                     ui_text.text = format!("✓ Attached to kernel: {}", info.name);
-                    ui_text.color = text::bevy_to_glyphon_color(theme.row_result);
+                    ui_text.color = text::bevy_to_rgba8(theme.row_result);
                 }
                 _ => {}
             }

@@ -11,7 +11,7 @@ use super::components::{
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
-use crate::text::{bevy_to_glyphon_color, GlyphonText, SharedFontSystem, TextAreaConfig, GlyphonTextBuffer, TextMetrics};
+use crate::text::{MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
 use crate::ui::format::format_for_display;
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 use crate::ui::theme::Theme;
@@ -89,8 +89,8 @@ pub fn spawn_cell(
             CellState::new(),
             position,
             // Text rendering components
-            GlyphonText,
-            TextAreaConfig::default(),
+            MsdfText,
+            MsdfTextAreaConfig::default(),
         ))
         .id()
 }
@@ -324,10 +324,10 @@ pub fn handle_cell_input(
     }
 }
 
-/// Initialize GlyphonTextBuffer for cells that don't have one yet.
+/// Initialize MsdfTextBuffer for cells that don't have one yet.
 pub fn init_cell_buffers(
     mut commands: Commands,
-    cells_without_buffer: Query<(Entity, &CellEditor), (With<GlyphonText>, Without<GlyphonTextBuffer>)>,
+    cells_without_buffer: Query<(Entity, &CellEditor), (With<MsdfText>, Without<MsdfTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
     text_metrics: Res<TextMetrics>,
 ) {
@@ -338,19 +338,19 @@ pub fn init_cell_buffers(
     for (entity, editor) in cells_without_buffer.iter() {
         // Create a new buffer with DPI-aware metrics
         let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
+        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
 
         // Initialize with current editor text
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
         buffer.set_text(
             &mut font_system,
             &editor.text(),
-            &attrs,
-            glyphon::Shaping::Advanced,
+            attrs,
+            cosmic_text::Shaping::Advanced,
         );
 
         commands.entity(entity).insert(buffer);
-        info!("Initialized GlyphonTextBuffer for entity {:?}", entity);
+        info!("Initialized MsdfTextBuffer for entity {:?}", entity);
     }
 }
 
@@ -423,12 +423,12 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
     output
 }
 
-/// Update GlyphonTextBuffer from CellEditor when dirty.
+/// Update MsdfTextBuffer from CellEditor when dirty.
 ///
 /// For cells with content blocks, formats them with visual markers.
 /// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut GlyphonTextBuffer), Changed<CellEditor>>,
+    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer), Changed<CellEditor>>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -436,7 +436,7 @@ pub fn sync_cell_buffers(
     };
 
     for (editor, mut buffer) in cells.iter_mut() {
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
 
         // Use block-formatted text if we have blocks, otherwise use raw text
         let display_text = if editor.has_blocks() {
@@ -448,8 +448,8 @@ pub fn sync_cell_buffers(
         buffer.set_text(
             &mut font_system,
             &display_text,
-            &attrs,
-            glyphon::Shaping::Advanced,
+            attrs,
+            cosmic_text::Shaping::Advanced,
         );
     }
 }
@@ -494,7 +494,7 @@ pub fn compute_cell_heights(
 /// Layout the prompt cell at the bottom of the window.
 /// Uses full window width minus margins for a wide input area.
 pub fn layout_prompt_cell_position(
-    mut cells: Query<(&CellState, &mut TextAreaConfig), With<PromptCell>>,
+    mut cells: Query<(&CellState, &mut MsdfTextAreaConfig), With<PromptCell>>,
     pos: Res<InputPosition>,
     layout: Res<WorkspaceLayout>,
 ) {
@@ -511,7 +511,7 @@ pub fn layout_prompt_cell_position(
         config.left = text_left;
         config.top = text_top;
         config.scale = 1.0;
-        config.bounds = glyphon::TextBounds {
+        config.bounds = crate::text::TextBounds {
             left: text_left as i32,
             top: text_top as i32,
             right: (text_left + text_width) as i32,
@@ -523,7 +523,7 @@ pub fn layout_prompt_cell_position(
 /// Visual indication for focused cell.
 pub fn highlight_focused_cell(
     focused: Res<FocusedCell>,
-    mut cells: Query<(Entity, &mut TextAreaConfig), With<Cell>>,
+    mut cells: Query<(Entity, &mut MsdfTextAreaConfig), With<Cell>>,
     theme: Option<Res<crate::ui::theme::Theme>>,
 ) {
     let Some(ref theme) = theme else {
@@ -537,7 +537,7 @@ pub fn highlight_focused_cell(
         } else {
             theme.fg_dim
         };
-        config.default_color = bevy_to_glyphon_color(color);
+        config.default_color = color;
     }
 }
 
@@ -548,12 +548,12 @@ pub fn highlight_focused_cell(
 /// - Input area might "attach" to the focused block or move on-screen
 /// - Consider: FocusedCell vs ActiveThread vs ReplyTarget as separate concepts
 ///
-/// For now: Any cell with TextAreaConfig can receive focus.
+/// For now: Any cell with MsdfTextAreaConfig can receive focus.
 /// The cursor renders at the focused cell's position.
 pub fn click_to_focus(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
-    cells: Query<(Entity, &TextAreaConfig), With<Cell>>,
+    cells: Query<(Entity, &MsdfTextAreaConfig), With<Cell>>,
     mut focused: ResMut<FocusedCell>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
@@ -751,7 +751,7 @@ pub fn update_cursor(
     focused: Res<FocusedCell>,
     mode: Res<CurrentMode>,
     cursor_entity: Res<CursorEntity>,
-    cells: Query<(&CellEditor, &TextAreaConfig)>,
+    cells: Query<(&CellEditor, &MsdfTextAreaConfig)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
@@ -895,8 +895,8 @@ pub fn spawn_prompt_cell(
             },
             // Row value is unused - PromptCell marker + Without<PromptCell> filters handle exclusion
             CellPosition::new(0),
-            GlyphonText,
-            TextAreaConfig::default(),
+            MsdfText,
+            MsdfTextAreaConfig::default(),
             PromptCell,
             // Start hidden - sync_prompt_visibility controls based on InputPresence
             // This prevents stray glyphon text when on Dashboard
@@ -1320,7 +1320,7 @@ fn scroll_to_block_visible(
 /// Applies a background tint or border highlight to the BlockCell
 /// that has the FocusedBlockCell marker.
 pub fn highlight_focused_block(
-    mut focused_configs: Query<(&BlockCell, &mut TextAreaConfig), With<FocusedBlockCell>>,
+    mut focused_configs: Query<(&BlockCell, &mut MsdfTextAreaConfig), With<FocusedBlockCell>>,
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     theme: Res<Theme>,
@@ -1355,7 +1355,7 @@ pub fn highlight_focused_block(
                 (srgba.blue * 1.15).min(1.0),
                 srgba.alpha,
             );
-            config.default_color = bevy_to_glyphon_color(focused_color);
+            config.default_color = focused_color;
         }
     }
 
@@ -1462,30 +1462,30 @@ pub fn spawn_expanded_block_view(
         // Create the text buffer
         let mut fs = font_system.0.lock().unwrap();
         let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = GlyphonTextBuffer::new(&mut fs, metrics);
+        let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
 
         let color = block_color(block, &theme);
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
-        buffer.set_text(&mut fs, &block.content, &attrs, glyphon::Shaping::Advanced);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
         drop(fs);
 
         // Spawn the view entity
         let entity = commands
             .spawn((
                 ExpandedBlockView,
-                GlyphonText,
+                MsdfText,
                 buffer,
-                TextAreaConfig {
+                MsdfTextAreaConfig {
                     left: 40.0,
                     top: 60.0,  // Leave room for header
                     scale: 1.0,
-                    bounds: glyphon::TextBounds {
+                    bounds: crate::text::TextBounds {
                         left: 0,
                         top: 0,
                         right: 1200,
                         bottom: 800,
                     },
-                    default_color: bevy_to_glyphon_color(color),
+                    default_color: color,
                 },
                 Visibility::Inherited,
                 // Store block info for updates
@@ -1522,7 +1522,7 @@ pub fn sync_expanded_block_content(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut expanded_views: Query<
-        (&ExpandedBlockInfo, &mut GlyphonTextBuffer, &mut TextAreaConfig),
+        (&ExpandedBlockInfo, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig),
         With<ExpandedBlockView>,
     >,
     font_system: Res<SharedFontSystem>,
@@ -1556,16 +1556,16 @@ pub fn sync_expanded_block_content(
 
         // Update text if changed
         let mut fs = font_system.0.lock().unwrap();
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
-        buffer.set_text(&mut fs, &block.content, &attrs, glyphon::Shaping::Advanced);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
         drop(fs);
 
         // Update color
         let color = block_color(block, &theme);
-        config.default_color = bevy_to_glyphon_color(color);
+        config.default_color = color;
 
         // Update bounds to fill screen (with padding)
-        config.bounds = glyphon::TextBounds {
+        config.bounds = crate::text::TextBounds {
             left: 40,
             top: 60,
             right: (width - 40.0) as i32,
@@ -1608,7 +1608,7 @@ pub fn spawn_main_cell(
     // Initial welcome message
     let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
 
-    // NOTE: MainCell does NOT get GlyphonText/TextAreaConfig.
+    // NOTE: MainCell does NOT get MsdfText/MsdfTextAreaConfig.
     // The BlockCell system handles per-block rendering.
     // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
@@ -2029,8 +2029,8 @@ pub fn spawn_block_cells(
                 .spawn((
                     BlockCell::new(block_id.clone()),
                     BlockCellLayout::default(),
-                    GlyphonText,
-                    TextAreaConfig::default(),
+                    MsdfText,
+                    MsdfTextAreaConfig::default(),
                 ))
                 .id();
             container.add(block_id.clone(), entity);
@@ -2050,7 +2050,7 @@ pub fn spawn_block_cells(
 /// Sync RoleHeader entities for role transitions.
 ///
 /// Spawns role header entities using the same pattern as BlockCells:
-/// GlyphonText + TextAreaConfig for consistent rendering.
+/// MsdfText + MsdfTextAreaConfig for consistent rendering.
 pub fn sync_role_headers(
     mut commands: Commands,
     main_entity: Res<MainCellEntity>,
@@ -2091,8 +2091,8 @@ pub fn sync_role_headers(
             };
 
             // Use same rendering pattern as BlockCells
-            let mut config = TextAreaConfig::default();
-            config.default_color = bevy_to_glyphon_color(color);
+            let mut config = MsdfTextAreaConfig::default();
+            config.default_color = color;
 
             let entity = commands
                 .spawn((
@@ -2101,7 +2101,7 @@ pub fn sync_role_headers(
                         block_id: block.id.clone(),
                     },
                     RoleHeaderLayout::default(),
-                    GlyphonText,
+                    MsdfText,
                     config,
                 ))
                 .id();
@@ -2112,10 +2112,10 @@ pub fn sync_role_headers(
     }
 }
 
-/// Initialize GlyphonTextBuffers for RoleHeaders that don't have one.
+/// Initialize MsdfTextBuffers for RoleHeaders that don't have one.
 pub fn init_role_header_buffers(
     mut commands: Commands,
-    role_headers: Query<(Entity, &RoleHeader), (With<GlyphonText>, Without<GlyphonTextBuffer>)>,
+    role_headers: Query<(Entity, &RoleHeader), (With<MsdfText>, Without<MsdfTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
     text_metrics: Res<TextMetrics>,
 ) {
@@ -2126,7 +2126,7 @@ pub fn init_role_header_buffers(
     for (entity, header) in role_headers.iter() {
         // Use UI metrics for headers (slightly smaller than content)
         let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
+        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
 
         // Set header text based on role
         let text = match header.role {
@@ -2135,17 +2135,17 @@ pub fn init_role_header_buffers(
             kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
             kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
         };
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
-        buffer.set_text(&mut font_system, text, &attrs, glyphon::Shaping::Advanced);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
 
         commands.entity(entity).insert(buffer);
     }
 }
 
-/// Initialize GlyphonTextBuffers for BlockCells that don't have one.
+/// Initialize MsdfTextBuffers for BlockCells that don't have one.
 pub fn init_block_cell_buffers(
     mut commands: Commands,
-    block_cells: Query<Entity, (With<BlockCell>, With<GlyphonText>, Without<GlyphonTextBuffer>)>,
+    block_cells: Query<Entity, (With<BlockCell>, With<MsdfText>, Without<MsdfTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
     text_metrics: Res<TextMetrics>,
 ) {
@@ -2155,12 +2155,12 @@ pub fn init_block_cell_buffers(
 
     for entity in block_cells.iter() {
         let metrics = text_metrics.scaled_cell_metrics();
-        let buffer = GlyphonTextBuffer::new(&mut font_system, metrics);
+        let buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         commands.entity(entity).insert(buffer);
     }
 }
 
-/// Sync BlockCell GlyphonTextBuffers with their corresponding block content.
+/// Sync BlockCell MsdfTextBuffers with their corresponding block content.
 ///
 /// Only updates cells whose content has changed (tracked via version).
 /// When any buffer is updated, bumps LayoutGeneration to trigger re-layout.
@@ -2173,7 +2173,7 @@ pub fn sync_block_cell_buffers(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut GlyphonTextBuffer, &mut TextAreaConfig)>,
+    mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig)>,
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
@@ -2232,12 +2232,12 @@ pub fn sync_block_cell_buffers(
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
         let text = format_single_block(block);
-        let attrs = glyphon::Attrs::new().family(glyphon::Family::Monospace);
-        buffer.set_text(&mut font_system, &text, &attrs, glyphon::Shaping::Advanced);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
 
         // Apply block-specific color based on BlockKind and Role
         let color = block_color(block, &theme);
-        config.default_color = bevy_to_glyphon_color(color);
+        config.default_color = color;
 
         // Track line count for layout dirty detection
         // Use newline count as a fast proxy - layout only needs to recompute
@@ -2273,7 +2273,7 @@ pub fn layout_block_cells(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut GlyphonTextBuffer)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2407,7 +2407,7 @@ pub fn layout_block_cells(
     scroll_state.content_height = y_offset;
 }
 
-/// Apply layout positions to BlockCell TextAreaConfig for rendering.
+/// Apply layout positions to BlockCell MsdfTextAreaConfig for rendering.
 ///
 /// **Performance optimization:** This system tracks the last-applied layout generation
 /// and scroll offset. It skips work when neither layout nor scroll has changed.
@@ -2416,8 +2416,8 @@ pub fn layout_block_cells(
 pub fn apply_block_cell_positions(
     main_entity: Res<MainCellEntity>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut TextAreaConfig), With<BlockCell>>,
-    mut role_headers: Query<(&RoleHeaderLayout, &mut TextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
+    mut block_cells: Query<(&BlockCellLayout, &mut MsdfTextAreaConfig), With<BlockCell>>,
+    mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     shadow_height: Res<InputShadowHeight>,
@@ -2488,7 +2488,7 @@ pub fn apply_block_cell_positions(
         let block_bottom = content_top + block_layout.height;
         let clamped_top = visible_top.max(content_top).max(0.0);
         let clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
-        config.bounds = glyphon::TextBounds {
+        config.bounds = crate::text::TextBounds {
             left: left as i32,
             top: clamped_top as i32,
             right: (left + width) as i32,
@@ -2510,7 +2510,7 @@ pub fn apply_block_cell_positions(
         config.left = margin;
         config.top = content_top;
         config.scale = 1.0;
-        config.bounds = glyphon::TextBounds {
+        config.bounds = crate::text::TextBounds {
             left: margin as i32,
             top: clamped_top as i32,
             right: (margin + base_width) as i32,

@@ -57,8 +57,7 @@ bevy_remote = "0.18"
 # Fork with send_keys text field fix
 bevy_brp_extras = { git = "https://github.com/tobert/bevy_brp", branch = "fix/send-keys-populate-text-field" }
 
-# Text rendering (fork with cosmic-text 0.16 for Bevy 0.18 compat)
-glyphon = { git = "https://github.com/tobert/glyphon", branch = "bevy-0.18-compat" }
+# Text rendering
 cosmic-text = "0.16"
 
 # CRDT + Persistence

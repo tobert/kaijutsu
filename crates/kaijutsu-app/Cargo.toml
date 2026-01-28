@@ -16,9 +16,14 @@ logos = "0.15"  # For Token::lexer trait
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
 
-# Text rendering
-glyphon.workspace = true
+# Text rendering (MSDF-based)
 cosmic-text.workspace = true
+
+# MSDF generation
+msdfgen = { git = "https://github.com/katyo/msdfgen-rs", rev = "5e62bcf", default-features = false, features = ["ttf-parser"] }
+owned_ttf_parser = "0.19"  # Must match msdfgen's ttf-parser version for FontExt trait
+rect_packer = "0.2"
+bytemuck = { version = "1.21", features = ["derive"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

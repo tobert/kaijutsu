@@ -15,7 +15,7 @@ use crate::shaders::nine_slice::{
     CornerMarker, CornerMaterial, CornerPosition, EdgeMarker, EdgeMaterial, EdgePosition,
     FramePiece,
 };
-use crate::text::TextAreaConfig;
+use crate::text::MsdfTextAreaConfig;
 use crate::ui::state::AppScreen;
 use crate::ui::theme::{color_to_vec4, Theme};
 
@@ -50,7 +50,7 @@ pub struct NineSliceMarker;
 pub fn spawn_nine_slice_frames(
     mut commands: Commands,
     new_cells: Query<
-        (Entity, &Cell, &TextAreaConfig),
+        (Entity, &Cell, &MsdfTextAreaConfig),
         (Added<Cell>, Without<NineSliceFrame>, With<PromptCell>),
     >,
     theme: Res<Theme>,
@@ -371,12 +371,12 @@ fn spawn_edges(
 
 /// Updates frame piece positions when cell bounds change.
 ///
-/// Note: We use `Or<(Changed<TextAreaConfig>, Added<NineSliceFrame>)>` to handle both:
+/// Note: We use `Or<(Changed<MsdfTextAreaConfig>, Added<NineSliceFrame>)>` to handle both:
 /// 1. Normal updates when bounds change
 /// 2. First-frame updates after frame is spawned (commands are deferred, so
-///    Changed<TextAreaConfig> from the same frame won't be visible yet)
+///    Changed<MsdfTextAreaConfig> from the same frame won't be visible yet)
 pub fn layout_nine_slice_frames(
-    cells: Query<(&NineSliceFrame, &TextAreaConfig), Or<(Changed<TextAreaConfig>, Added<NineSliceFrame>)>>,
+    cells: Query<(&NineSliceFrame, &MsdfTextAreaConfig), Or<(Changed<MsdfTextAreaConfig>, Added<NineSliceFrame>)>>,
     theme: Res<Theme>,
     mut corners: Query<(&CornerPosition, &mut Node), With<CornerMarker>>,
     mut edges: Query<(&EdgePosition, &mut Node), (With<EdgeMarker>, Without<CornerMarker>)>,

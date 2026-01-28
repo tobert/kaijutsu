@@ -1,14 +1,30 @@
-//! Text rendering module using glyphon + cosmic-text.
+//! Text rendering module using MSDF (Multi-channel Signed Distance Fields).
 //!
 //! Provides GPU-accelerated text rendering that integrates with Bevy's render pipeline.
-//! This module handles the low-level text rendering; cells use it via the CellEditor component.
+//! Uses cosmic-text for shaping/layout and MSDF textures for crisp rendering at any scale.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! cosmic-text (shaping + layout)
+//!     ↓
+//! MsdfTextBuffer (positioned glyphs)
+//!     ↓
+//! MsdfAtlas (glyph_id → texture region)
+//!     ↓
+//! msdf_text.wgsl (GPU rendering with effects)
+//! ```
 
+pub mod msdf;
 mod plugin;
-mod render;
 mod resources;
 
-pub use plugin::TextRenderPlugin;
-pub use resources::{
-    bevy_to_glyphon_color, GlyphonText, GlyphonUiText, SharedFontSystem, TextAreaConfig,
-    GlyphonTextBuffer, TextMetrics, UiTextPositionCache,
+pub use msdf::{
+    GlowConfig, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText, SdfTextEffects,
+    TextBounds, UiTextPositionCache,
 };
+pub use plugin::TextRenderPlugin;
+pub use resources::{bevy_to_cosmic_color, bevy_to_rgba8, SharedFontSystem, TextMetrics, TextResolution};
+
+// Re-export commonly used cosmic-text types
+pub use cosmic_text::{Attrs, Family, Metrics, Shaping};

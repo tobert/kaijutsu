@@ -7,7 +7,7 @@
 use bevy::prelude::*;
 
 use crate::cell::{CurrentMode, EditorMode, InputKind};
-use crate::text::{bevy_to_glyphon_color, GlyphonUiText};
+use crate::text::{bevy_to_rgba8, MsdfUiText};
 use crate::ui::theme::Theme;
 
 /// Marker component for the mode indicator text.
@@ -18,7 +18,7 @@ pub struct ModeIndicator;
 pub fn update_mode_indicator(
     mode: Res<CurrentMode>,
     theme: Res<Theme>,
-    mut indicators: Query<&mut GlyphonUiText, With<ModeIndicator>>,
+    mut indicators: Query<&mut MsdfUiText, With<ModeIndicator>>,
 ) {
     if !mode.is_changed() {
         return;
@@ -34,6 +34,6 @@ pub fn update_mode_indicator(
 
     for mut ui_text in indicators.iter_mut() {
         ui_text.text = mode.0.name().to_string();
-        ui_text.color = bevy_to_glyphon_color(color);
+        ui_text.color = bevy_to_rgba8(color);
     }
 }
