@@ -64,10 +64,19 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 /// Compute screen-space pixel range for adaptive anti-aliasing.
 /// This ensures consistent edge sharpness regardless of zoom level.
 fn screen_px_range(uv: vec2<f32>) -> f32 {
-    let screen_tex_size = vec2<f32>(1.0) / fwidth(uv);
     let atlas_size = vec2<f32>(textureDimensions(atlas_texture, 0));
-    let unit_range = vec2<f32>(uniforms.msdf_range) / atlas_size;
-    return max(0.5 * dot(unit_range, screen_tex_size), 1.0);
+    // Calculate how much UV changes per screen pixel
+    let uv_fwidth = fwidth(uv);
+    // Use the max change to be conservative (avoid aliasing)
+    let pixel_dist = max(uv_fwidth.x, uv_fwidth.y);
+    
+    // The range of the distance field in UV units
+    // msdf_range is in pixels, so we divide by atlas size
+    let unit_range = uniforms.msdf_range / atlas_size.x; // Assumes square pixels
+    
+    // Calculate range in screen pixels
+    // Value = (range_in_uv) / (uv_per_pixel)
+    return max(unit_range / pixel_dist, 1.0);
 }
 
 /// Sample MTSDF and compute alpha at a given bias.
@@ -83,8 +92,9 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
     let sd = min(msdf_sd, sample.a);
 
     let px_range = screen_px_range(uv);
-    // Sharp transition: multiplier converts SD units to screen pixels
-    let dist = (sd - bias) * px_range;
+    // Convert distance to screen pixels with steeper falloff
+    // Multiplying by 2.0 makes the transition sharper, reducing faint edge artifacts
+    let dist = (sd - bias) * px_range * 2.0;
     return clamp(dist + 0.5, 0.0, 1.0);
 }
 
@@ -164,36 +174,24 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // debug_mode 5: Show hard threshold (binary black/white at sd=0.5)
     if uniforms.debug_mode >= 3u {
         let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
-        let sd = median(sample.r, sample.g, sample.b);
+        let sd_msdf = median(sample.r, sample.g, sample.b);
+        let sd = min(sd_msdf, sample.a);
 
         if uniforms.debug_mode == 3u {
-            // Raw median distance: 0=black (outside), 0.5=gray (edge), 1=white (inside)
+            // Raw median distance
             return vec4<f32>(sd, sd, sd, 1.0);
         } else if uniforms.debug_mode == 4u {
-            // Computed alpha after screen_px_range adjustment
+            // Computed alpha
             let alpha = msdf_alpha_at(in.uv, 0.5);
             return vec4<f32>(alpha, alpha, alpha, 1.0);
         } else if uniforms.debug_mode == 5u {
-            // Hard threshold at sd=0.5 - shows exact glyph boundary
+            // Hard threshold
             if sd >= 0.5 {
                 return vec4<f32>(1.0, 1.0, 1.0, 1.0);
             } else {
                 return vec4<f32>(0.0, 0.0, 0.0, 1.0);
             }
         }
-    }
-
-    // Sample MTSDF and get signed distance using both channels
-    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let msdf_sd = median(sample.r, sample.g, sample.b);
-    // MTSDF: use alpha channel (true SDF) to correct corners
-    let sd = min(msdf_sd, sample.a);
-
-    // Early discard for pixels clearly outside the glyph.
-    // This prevents "ghosting" from overlapping glyph padding regions.
-    // Using 0.35 as threshold - far enough from 0.5 edge to preserve anti-aliasing.
-    if sd < 0.35 {
-        discard;
     }
 
     var output = vec4<f32>(0.0);
@@ -208,10 +206,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // === MAIN TEXT ===
-    // Use the already-sampled sd value for efficiency
-    let px_range = screen_px_range(in.uv);
-    let dist = (sd - 0.5) * px_range;
-    let text_alpha = clamp(dist + 0.5, 0.0, 1.0);
+    // Sample and get signed distance for early discard
+    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    let msdf_sd = median(sample.r, sample.g, sample.b);
+    let sd = min(msdf_sd, sample.a);
+
+    // Early discard for pixels clearly outside the glyph.
+    // Using a conservative threshold to preserve anti-aliasing at small sizes.
+    if sd < 0.2 {
+        discard;
+    }
+
+    let text_alpha = msdf_alpha_at(in.uv, 0.5);
 
     // Determine text color
     var text_color = in.color.rgb;

@@ -241,18 +241,12 @@ fn generate_glyph(
     // - msdfgen bitmap: Y=0 at bottom, Y increases UP
     // - Screen/pipeline: Y=0 at top, Y increases DOWN
     //
-    // The bitmap is sized to fit: bounds + padding (msdf_range on each side)
-    // The glyph origin (0, 0) in font units is at distance (-bounds.left) from
-    // the shape's left edge, plus padding.
+    // The bitmap is sized to fit the glyph bounds plus msdf_range padding on each side.
+    // The glyph origin (0, 0) in font units is at:
+    //   X: msdf_range pixels from left edge, plus offset for bounds.left
+    //   Y: msdf_range pixels from bottom edge, plus offset for bounds.bottom
     //
-    // For X (same direction in all coordinate systems):
-    //   origin_x = msdf_range + (-bounds.left) * px_per_unit
-    //
-    // For Y (msdfgen Y=0 at bottom):
-    //   origin_from_bottom = msdf_range + (-bounds.bottom) * px_per_unit
-    //   origin_from_top = height - origin_from_bottom
-    //
-    // We need anchor_y measured from TOP for screen coordinates.
+    // For screen coordinates, we need anchor_y from the TOP of the bitmap.
     let origin_bitmap_x = msdf_range - bounds.left * px_per_unit;
     let origin_from_bottom = msdf_range - bounds.bottom * px_per_unit;
     let origin_from_top = height as f64 - origin_from_bottom;
@@ -263,7 +257,7 @@ fn generate_glyph(
 
     // Debug logging for glyph generation
     trace!(
-        "MSDF gen glyph_id={}: bounds=({:.1},{:.1})→({:.1},{:.1}), units_per_em={}, px_per_unit={:.4}, \
+        "MSDF gen glyph_id={}: bounds=({:.1},{:.1})→({:.1},{:.1}), units_per_em={}, \
          bitmap={}x{}, origin_from_top={:.1}, anchor=({:.4}, {:.4}) em",
         glyph_id,
         bounds.left,
@@ -271,7 +265,6 @@ fn generate_glyph(
         bounds.left + bounds.width(),
         bounds.bottom + bounds.height(),
         units_per_em,
-        px_per_unit,
         width,
         height,
         origin_from_top,

@@ -113,11 +113,14 @@ impl MsdfAtlas {
 
         let texture = images.add(image);
 
+        // Padding must be >= MSDF range to prevent atlas bleeding when sampling
+        // with bilinear filtering near glyph edges
+        let padding = (Self::DEFAULT_RANGE as i32) + 2; // 8 + 2 = 10 pixels
         let packer_config = PackerConfig {
             width: width as i32,
             height: height as i32,
-            border_padding: 1,
-            rectangle_padding: 1,
+            border_padding: padding,
+            rectangle_padding: padding,
         };
 
         Self {
@@ -201,32 +204,14 @@ impl MsdfAtlas {
         }
     }
 
-    /// Insert a placeholder glyph (used when generation fails or for unknown glyphs).
+    /// Insert a placeholder glyph (used when generation fails or for unknown glyphs like space).
+    ///
+    /// For MSDF, we need all channels to be 0 (outside the glyph) so it renders as invisible.
     pub fn insert_placeholder(&mut self, key: GlyphKey) -> Option<AtlasRegion> {
-        const PLACEHOLDER_SIZE: u32 = 16;
+        const PLACEHOLDER_SIZE: u32 = 4; // Small since it's invisible anyway
 
-        // Create a simple rectangle placeholder
-        let mut data = vec![0u8; (PLACEHOLDER_SIZE * PLACEHOLDER_SIZE * 4) as usize];
-        for y in 0..PLACEHOLDER_SIZE {
-            for x in 0..PLACEHOLDER_SIZE {
-                let idx = ((y * PLACEHOLDER_SIZE + x) * 4) as usize;
-                // Create a bordered rectangle
-                let is_border = x == 0 || x == PLACEHOLDER_SIZE - 1 || y == 0 || y == PLACEHOLDER_SIZE - 1;
-                if is_border {
-                    // Border: white
-                    data[idx] = 255;     // R
-                    data[idx + 1] = 255; // G
-                    data[idx + 2] = 255; // B
-                    data[idx + 3] = 255; // A
-                } else {
-                    // Interior: transparent
-                    data[idx] = 0;
-                    data[idx + 1] = 0;
-                    data[idx + 2] = 0;
-                    data[idx + 3] = 0;
-                }
-            }
-        }
+        // All zeros = sd of 0 = fully outside glyph = invisible
+        let data = vec![0u8; (PLACEHOLDER_SIZE * PLACEHOLDER_SIZE * 4) as usize];
 
         self.insert(key, PLACEHOLDER_SIZE, PLACEHOLDER_SIZE, 0.0, 0.0, &data)
     }
