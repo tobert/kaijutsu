@@ -320,6 +320,72 @@ impl MsdfAtlas {
     pub fn regions_iter(&self) -> impl Iterator<Item = &AtlasRegion> {
         self.regions.values()
     }
+
+    /// Dump the atlas texture to a raw RGBA file for debugging.
+    ///
+    /// The output can be converted to PNG using imagemagick:
+    /// ```bash
+    /// convert -size 1024x1024 -depth 8 rgba:/tmp/msdf_atlas.raw /tmp/msdf_atlas.png
+    /// ```
+    ///
+    /// # Arguments
+    /// * `path` - Path to write the raw RGBA data
+    ///
+    /// # Returns
+    /// The atlas dimensions as (width, height) for the convert command
+    #[cfg(debug_assertions)]
+    pub fn dump_to_file(&self, path: &std::path::Path) -> std::io::Result<(u32, u32)> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&self.pixels)?;
+        info!(
+            "Dumped MSDF atlas ({}x{}, {} glyphs) to {:?}",
+            self.width,
+            self.height,
+            self.regions.len(),
+            path
+        );
+        info!(
+            "Convert with: convert -size {}x{} -depth 8 rgba:{} {}.png",
+            self.width,
+            self.height,
+            path.display(),
+            path.display()
+        );
+        Ok((self.width, self.height))
+    }
+
+    /// Get debug statistics about the atlas.
+    #[cfg(debug_assertions)]
+    pub fn debug_stats(&self) -> AtlasDebugStats {
+        let total_pixels = (self.width * self.height) as usize;
+        let used_pixels: usize = self.regions.values()
+            .map(|r| (r.width * r.height) as usize)
+            .sum();
+        let utilization = used_pixels as f32 / total_pixels as f32 * 100.0;
+
+        AtlasDebugStats {
+            width: self.width,
+            height: self.height,
+            glyph_count: self.regions.len(),
+            pending_count: self.pending.len(),
+            used_pixels,
+            utilization,
+        }
+    }
+}
+
+/// Debug statistics for the atlas.
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+#[allow(dead_code)] // Fields are read via Debug formatting
+pub struct AtlasDebugStats {
+    pub width: u32,
+    pub height: u32,
+    pub glyph_count: usize,
+    pub pending_count: usize,
+    pub used_pixels: usize,
+    pub utilization: f32,
 }
 
 #[cfg(test)]

@@ -19,6 +19,9 @@ use super::atlas::MsdfAtlas;
 use super::buffer::{MsdfTextAreaConfig, MsdfTextBuffer, PositionedGlyph, TextBounds};
 use super::{MsdfText, SdfTextEffects};
 
+/// MSDF textures are generated at 32 pixels per em.
+pub const MSDF_PX_PER_EM: f32 = 32.0;
+
 /// Label for the MSDF text render node.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 pub struct MsdfTextRenderNodeLabel;
@@ -375,10 +378,15 @@ pub fn prepare_msdf_texts(
     // Build vertex buffer
     let mut vertices: Vec<MsdfVertex> = Vec::new();
 
-    // MSDF textures are generated at 32 px/em
-    const MSDF_PX_PER_EM: f32 = 32.0;
+    // MSDF textures are generated at 32 px/em (use module constant)
+
+    #[cfg(debug_assertions)]
+    let mut debug_logged_first = false;
 
     for text in &extracted.texts {
+        #[cfg(debug_assertions)]
+        let mut first_glyph_in_text = true;
+
         for glyph in &text.glyphs {
             let Some(region) = atlas.regions.get(&glyph.key) else {
                 continue;
@@ -394,15 +402,36 @@ pub fn prepare_msdf_texts(
             let quad_height = region.height as f32 * msdf_scale;
 
             // Apply anchor offset to position the glyph correctly
-            // anchor is in em units, multiply by font_size to get pixels
-            // The anchor represents where the glyph origin is within the MSDF bitmap,
-            // so we ADD it to shift the quad left/up to align the origin with pen position
+            // anchor is in em units (fraction of 1em), multiply by font_size to get pixels
+            // SUBTRACT anchor to shift quad left/up so the glyph origin aligns with pen position
             let anchor_x = region.anchor_x * glyph.font_size;
             let anchor_y = region.anchor_y * glyph.font_size;
 
-            // Calculate screen positions with anchor offset
-            let px_x = text.left + (glyph.x + anchor_x) * text.scale;
+            let px_x = text.left + (glyph.x - anchor_x) * text.scale;
             let px_y = text.top + (glyph.y - anchor_y) * text.scale;
+
+            // Debug logging for first glyph of first text area
+            #[cfg(debug_assertions)]
+            if !debug_logged_first && first_glyph_in_text {
+                trace!(
+                    "MSDF vertex: glyph_id={}, pos=({:.1}, {:.1}), font_size={:.1}, msdf_scale={:.3}, \
+                     region={}x{}, quad={:.1}x{:.1}, anchor_em=({:.4}, {:.4}), anchor_px=({:.1}, {:.1}), \
+                     text_offset=({:.1}, {:.1}), scale={:.2}, final_px=({:.1}, {:.1})",
+                    glyph.key.glyph_id,
+                    glyph.x, glyph.y,
+                    glyph.font_size,
+                    msdf_scale,
+                    region.width, region.height,
+                    quad_width, quad_height,
+                    region.anchor_x, region.anchor_y,
+                    anchor_x, anchor_y,
+                    text.left, text.top,
+                    text.scale,
+                    px_x, px_y
+                );
+                debug_logged_first = true;
+                first_glyph_in_text = false;
+            }
 
             let x0 = px_x * 2.0 / resolution[0] - 1.0;
             let y0 = 1.0 - px_y * 2.0 / resolution[1];
@@ -410,7 +439,7 @@ pub fn prepare_msdf_texts(
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
             // Two triangles for the quad
-            // Note: Flip V coordinates because MSDF textures have origin at bottom-left
+            // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
             vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v1], color: glyph.color });
             vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color: glyph.color });
             vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color: glyph.color });
@@ -543,4 +572,146 @@ pub fn init_msdf_resources(
         bind_group: None,
         vertex_count: 0,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test anchor-to-pixel conversion.
+    ///
+    /// The anchor is stored in em units (fraction of 1em).
+    /// To convert to pixels: anchor_px = anchor_em * font_size
+    #[test]
+    fn anchor_to_pixel_conversion() {
+        let anchor_em: f32 = 0.25; // 1/4 em offset
+        let font_size: f32 = 16.0; // 16px font
+        let anchor_px = anchor_em * font_size;
+
+        assert!((anchor_px - 4.0).abs() < 0.001, "0.25em at 16px should be 4px");
+
+        // Test with larger font
+        let font_size_32: f32 = 32.0;
+        let anchor_px_32 = anchor_em * font_size_32;
+        assert!((anchor_px_32 - 8.0).abs() < 0.001, "0.25em at 32px should be 8px");
+    }
+
+    /// Test MSDF scale calculation.
+    ///
+    /// MSDF textures are generated at 32px/em. When rendering at a different
+    /// font size, we scale the atlas region accordingly.
+    #[test]
+    fn msdf_scale_calculation() {
+        // 16px font = half the MSDF generation size
+        let font_size: f32 = 16.0;
+        let scale = font_size / MSDF_PX_PER_EM;
+        assert!((scale - 0.5).abs() < 0.001, "16px font should be 0.5x scale");
+
+        // 32px font = same as MSDF generation size
+        let font_size_32: f32 = 32.0;
+        let scale_32 = font_size_32 / MSDF_PX_PER_EM;
+        assert!((scale_32 - 1.0).abs() < 0.001, "32px font should be 1.0x scale");
+
+        // 64px font = double the MSDF generation size
+        let font_size_64: f32 = 64.0;
+        let scale_64 = font_size_64 / MSDF_PX_PER_EM;
+        assert!((scale_64 - 2.0).abs() < 0.001, "64px font should be 2.0x scale");
+    }
+
+    /// Test quad size calculation from atlas region.
+    ///
+    /// The rendered quad size = region_size * msdf_scale
+    #[test]
+    fn quad_size_from_region() {
+        let region_width: f32 = 40.0; // MSDF was generated with 40px wide bitmap
+        let msdf_scale: f32 = 0.5; // 16px font
+        let quad_width = region_width * msdf_scale;
+
+        assert!((quad_width - 20.0).abs() < 0.001, "40px region at 0.5x scale = 20px quad");
+
+        // At native MSDF size
+        let msdf_scale_1: f32 = 1.0;
+        let quad_width_1 = region_width * msdf_scale_1;
+        assert!((quad_width_1 - 40.0).abs() < 0.001, "40px region at 1.0x scale = 40px quad");
+    }
+
+    /// Test final pixel position calculation.
+    ///
+    /// px_x = text.left + (glyph.x - anchor_px) * text.scale
+    /// px_y = text.top + (glyph.y - anchor_py) * text.scale
+    ///
+    /// The anchor represents where the glyph origin is within the MSDF bitmap.
+    /// We SUBTRACT the anchor to shift the quad so the origin aligns with pen position.
+    #[test]
+    fn final_pixel_position() {
+        let text_left: f32 = 100.0;
+        let text_top: f32 = 50.0;
+        let text_scale: f32 = 1.0;
+        let glyph_x: f32 = 10.0; // Pen position from layout
+        let glyph_y: f32 = 20.0; // Baseline position
+        let anchor_x_em: f32 = 0.125; // 1/8 em
+        let anchor_y_em: f32 = 0.25; // 1/4 em
+        let font_size: f32 = 16.0;
+
+        let anchor_x_px = anchor_x_em * font_size; // = 2.0
+        let anchor_y_px = anchor_y_em * font_size; // = 4.0
+
+        // Subtract anchor to shift quad left/up, aligning glyph origin with pen position
+        let px_x = text_left + (glyph_x - anchor_x_px) * text_scale;
+        let px_y = text_top + (glyph_y - anchor_y_px) * text_scale;
+
+        assert!((px_x - 108.0).abs() < 0.001, "px_x should be 100 + (10 - 2) = 108");
+        assert!((px_y - 66.0).abs() < 0.001, "px_y should be 50 + (20 - 4) = 66");
+    }
+
+    /// Test NDC (Normalized Device Coordinates) conversion.
+    ///
+    /// NDC x: px * 2 / width - 1  (maps 0..width to -1..1)
+    /// NDC y: 1 - py * 2 / height (maps 0..height to 1..-1, Y flipped)
+    #[test]
+    fn ndc_conversion() {
+        let resolution: [f32; 2] = [1280.0, 720.0];
+
+        // Center of screen
+        let px_x: f32 = 640.0;
+        let px_y: f32 = 360.0;
+        let ndc_x = px_x * 2.0 / resolution[0] - 1.0;
+        let ndc_y = 1.0 - px_y * 2.0 / resolution[1];
+
+        assert!(ndc_x.abs() < 0.001, "Center X should be 0.0 NDC");
+        assert!(ndc_y.abs() < 0.001, "Center Y should be 0.0 NDC");
+
+        // Top-left corner
+        let px_x2: f32 = 0.0;
+        let px_y2: f32 = 0.0;
+        let ndc_x = px_x2 * 2.0 / resolution[0] - 1.0;
+        let ndc_y = 1.0 - px_y2 * 2.0 / resolution[1];
+
+        assert!((ndc_x - (-1.0)).abs() < 0.001, "Top-left X should be -1.0 NDC");
+        assert!((ndc_y - 1.0).abs() < 0.001, "Top-left Y should be 1.0 NDC");
+    }
+
+    /// Test the complete vertex position calculation chain.
+    #[test]
+    fn complete_vertex_calculation() {
+        // Setup - mirroring the prepare_msdf_texts calculation
+        let text_left: f32 = 50.0;
+        let text_scale: f32 = 1.0;
+        let glyph_x: f32 = 0.0; // First glyph at origin
+        let font_size: f32 = 16.0;
+        let region_width: u32 = 40;
+        let region_anchor_x: f32 = 0.25; // em units (MSDF padding / px_per_em)
+
+        // Calculations (mirroring prepare_msdf_texts)
+        let msdf_scale = font_size / MSDF_PX_PER_EM; // 0.5
+        let quad_width = region_width as f32 * msdf_scale; // 20.0
+        let anchor_x = region_anchor_x * font_size; // 4.0
+        // Subtract anchor to align glyph origin with pen position
+        let px_x = text_left + (glyph_x - anchor_x) * text_scale; // 50 + (0 - 4) = 46
+
+        assert!((msdf_scale - 0.5).abs() < 0.001);
+        assert!((quad_width - 20.0).abs() < 0.001);
+        assert!((anchor_x - 4.0).abs() < 0.001);
+        assert!((px_x - 46.0).abs() < 0.001);
+    }
 }

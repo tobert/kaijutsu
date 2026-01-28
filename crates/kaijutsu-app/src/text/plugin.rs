@@ -15,6 +15,8 @@ use super::msdf::{
     MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode,
     MsdfUiText, UiTextPositionCache,
 };
+#[cfg(debug_assertions)]
+use super::msdf::MsdfDebugInfo;
 use super::resources::*;
 
 /// Plugin that enables MSDF text rendering in Bevy.
@@ -25,15 +27,22 @@ impl Plugin for TextRenderPlugin {
         // Main world resources
         app.init_resource::<SharedFontSystem>()
             .init_resource::<TextResolution>()
-            .init_resource::<TextMetrics>()
-            .add_systems(Update, (
+            .init_resource::<TextMetrics>();
+
+        #[cfg(debug_assertions)]
+        app.init_resource::<MsdfDebugInfo>();
+
+        app.add_systems(Update, (
                 update_text_resolution,
                 init_ui_text_buffers,
                 update_ui_text_buffers,
                 sync_ui_text_config_positions,
                 request_atlas_glyphs,
                 update_msdf_generator,
-            ).chain())
+            ).chain());
+
+        #[cfg(debug_assertions)]
+        app.add_systems(Update, debug_dump_atlas_on_f12)
             // Sync UI text positions after Bevy UI layout computes positions
             .add_systems(PostUpdate, sync_ui_text_positions.after(UiSystems::Layout));
 
@@ -238,5 +247,69 @@ fn update_ui_text_buffers(
             right: (position.left + position.width) as i32,
             bottom: (position.top + position.height) as i32,
         };
+    }
+}
+
+/// Debug system: dump MSDF atlas to file on F12 keypress.
+#[cfg(debug_assertions)]
+fn debug_dump_atlas_on_f12(
+    input: Res<ButtonInput<KeyCode>>,
+    atlas: Res<MsdfAtlas>,
+    mut debug_info: ResMut<MsdfDebugInfo>,
+    text_query: Query<&MsdfTextBuffer, With<MsdfText>>,
+) {
+    // Update debug info every frame
+    let stats = atlas.debug_stats();
+    debug_info.atlas_size = (stats.width, stats.height);
+    debug_info.atlas_glyph_count = stats.glyph_count;
+    debug_info.text_area_count = text_query.iter().count();
+    debug_info.glyph_count = text_query.iter().map(|b| b.glyphs().len()).sum();
+
+    // Dump atlas on F12
+    if input.just_pressed(KeyCode::F12) {
+        let path = std::path::Path::new("/tmp/msdf_atlas.raw");
+        match atlas.dump_to_file(path) {
+            Ok((w, h)) => {
+                info!("📊 Atlas stats: {:#?}", stats);
+                info!("🎯 Debug info: {} glyphs in {} text areas", debug_info.glyph_count, debug_info.text_area_count);
+
+                // Sample some glyphs for inspection
+                debug_info.sample_glyphs.clear();
+                for buffer in text_query.iter().take(3) {
+                    for glyph in buffer.glyphs().iter().take(5) {
+                        if let Some(region) = atlas.get(glyph.key) {
+                            const MSDF_PX_PER_EM: f32 = 32.0;
+                            let msdf_scale = glyph.font_size / MSDF_PX_PER_EM;
+                            debug_info.sample_glyphs.push(super::msdf::DebugGlyph {
+                                char_code: glyph.key.glyph_id,
+                                glyph_x: glyph.x,
+                                glyph_y: glyph.y,
+                                font_size: glyph.font_size,
+                                region_width: region.width,
+                                region_height: region.height,
+                                anchor_x: region.anchor_x,
+                                anchor_y: region.anchor_y,
+                                quad_width: region.width as f32 * msdf_scale,
+                                quad_height: region.height as f32 * msdf_scale,
+                            });
+                        }
+                    }
+                }
+                for (i, g) in debug_info.sample_glyphs.iter().enumerate() {
+                    trace!(
+                        "Sample glyph {}: glyph_id={}, pos=({:.1}, {:.1}), font_size={:.1}, region={}x{}, anchor=({:.3}, {:.3}), quad={:.1}x{:.1}",
+                        i, g.char_code, g.glyph_x, g.glyph_y, g.font_size,
+                        g.region_width, g.region_height, g.anchor_x, g.anchor_y,
+                        g.quad_width, g.quad_height
+                    );
+                }
+
+                info!(
+                    "💡 To view: convert -size {}x{} -depth 8 rgba:/tmp/msdf_atlas.raw /tmp/msdf_atlas.png && xdg-open /tmp/msdf_atlas.png",
+                    w, h
+                );
+            }
+            Err(e) => error!("Failed to dump atlas: {}", e),
+        }
     }
 }

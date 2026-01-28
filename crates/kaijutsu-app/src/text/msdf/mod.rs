@@ -145,3 +145,49 @@ pub struct UiTextPositionCache {
     /// Height of the text area.
     pub height: f32,
 }
+
+/// Debug information about MSDF text rendering.
+///
+/// This resource captures metrics about rendered glyphs for debugging
+/// and inspection via BRP tools.
+#[cfg(debug_assertions)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct MsdfDebugInfo {
+    /// Number of glyphs rendered in the last frame.
+    pub glyph_count: usize,
+    /// Number of text areas rendered.
+    pub text_area_count: usize,
+    /// Atlas dimensions.
+    pub atlas_size: (u32, u32),
+    /// Atlas glyph count.
+    pub atlas_glyph_count: usize,
+    /// Last few rendered glyph samples for inspection.
+    pub sample_glyphs: Vec<DebugGlyph>,
+}
+
+/// Debug info for a single glyph.
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, Default, Reflect)]
+pub struct DebugGlyph {
+    /// The character (if decodable).
+    pub char_code: u16,
+    /// Glyph X position from layout.
+    pub glyph_x: f32,
+    /// Glyph Y position from layout.
+    pub glyph_y: f32,
+    /// Font size for this glyph.
+    pub font_size: f32,
+    /// Atlas region width.
+    pub region_width: u32,
+    /// Atlas region height.
+    pub region_height: u32,
+    /// Anchor X in em units.
+    pub anchor_x: f32,
+    /// Anchor Y in em units.
+    pub anchor_y: f32,
+    /// Computed quad width in pixels.
+    pub quad_width: f32,
+    /// Computed quad height in pixels.
+    pub quad_height: f32,
+}

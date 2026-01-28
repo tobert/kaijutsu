@@ -232,8 +232,39 @@ fn generate_glyph(
         .collect();
 
     // Calculate anchor (offset for positioning)
-    let anchor_x = framing.translate.x as f32 / units_per_em as f32;
-    let anchor_y = framing.translate.y as f32 / units_per_em as f32;
+    // The MSDF bitmap has padding around the glyph (msdf_range pixels on each side).
+    // The glyph's origin within the bitmap depends on the shape's bounding box.
+    //
+    // For proper positioning: the anchor represents where the glyph origin is
+    // within the bitmap, in em units (so it scales with font_size).
+    //
+    // Use the shape bounds to find where origin (0,0) is relative to the bitmap.
+    // The bitmap left edge is at: bounds.left - (padding / scale)
+    // So origin is at: 0 - (bounds.left - padding/scale) = -bounds.left + padding/scale
+    let padding_units = msdf_range / px_per_unit; // padding in font units
+    let origin_in_bitmap_x = -bounds.left + padding_units;
+    let origin_in_bitmap_y = -bounds.bottom + padding_units;
+
+    // Convert to em units (fraction of 1em)
+    let anchor_x = (origin_in_bitmap_x * px_per_unit) as f32 / px_per_em as f32;
+    let anchor_y = (origin_in_bitmap_y * px_per_unit) as f32 / px_per_em as f32;
+
+    // Debug logging for glyph generation
+    trace!(
+        "MSDF gen glyph_id={}: bounds={:.1}x{:.1}, units_per_em={}, px_per_unit={:.4}, \
+         bitmap={}x{}, translate=({:.1}, {:.1}), anchor=({:.4}, {:.4}) em",
+        glyph_id,
+        bounds.width(),
+        bounds.height(),
+        units_per_em,
+        px_per_unit,
+        width,
+        height,
+        framing.translate.x,
+        framing.translate.y,
+        anchor_x,
+        anchor_y
+    );
 
     GeneratedGlyph {
         key,
