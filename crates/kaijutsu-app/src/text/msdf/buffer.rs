@@ -13,14 +13,12 @@ use super::atlas::GlyphKey;
 pub struct PositionedGlyph {
     /// Key for looking up in the atlas.
     pub key: GlyphKey,
-    /// X position in pixels.
+    /// X position in pixels (pen position from cosmic-text).
     pub x: f32,
-    /// Y position in pixels.
+    /// Y position in pixels (baseline from cosmic-text).
     pub y: f32,
-    /// Glyph width for quad generation.
-    pub width: f32,
-    /// Glyph height for quad generation.
-    pub height: f32,
+    /// Font size used for this glyph (needed to scale MSDF region).
+    pub font_size: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
 }
@@ -135,6 +133,7 @@ impl MsdfTextBuffer {
     /// Update positioned glyphs from buffer layout.
     fn update_glyphs(&mut self) {
         self.glyphs.clear();
+        let font_size = self.buffer.metrics().font_size;
 
         for run in self.buffer.layout_runs() {
             let line_y = run.line_y;
@@ -150,8 +149,7 @@ impl MsdfTextBuffer {
                     key,
                     x: glyph.x,
                     y: line_y,
-                    width: glyph.w,
-                    height: run.line_height,
+                    font_size,
                     color: self.default_color,
                 });
             }

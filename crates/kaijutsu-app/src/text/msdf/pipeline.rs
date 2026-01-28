@@ -375,6 +375,9 @@ pub fn prepare_msdf_texts(
     // Build vertex buffer
     let mut vertices: Vec<MsdfVertex> = Vec::new();
 
+    // MSDF textures are generated at 32 px/em
+    const MSDF_PX_PER_EM: f32 = 32.0;
+
     for text in &extracted.texts {
         for glyph in &text.glyphs {
             let Some(region) = atlas.regions.get(&glyph.key) else {
@@ -383,11 +386,28 @@ pub fn prepare_msdf_texts(
 
             let [u0, v0, u1, v1] = region.uv_rect(atlas.width, atlas.height);
 
-            // Calculate screen positions
-            let x0 = (text.left + glyph.x * text.scale) * 2.0 / resolution[0] - 1.0;
-            let y0 = 1.0 - (text.top + glyph.y * text.scale) * 2.0 / resolution[1];
-            let x1 = x0 + (glyph.width * text.scale) * 2.0 / resolution[0];
-            let y1 = y0 - (glyph.height * text.scale) * 2.0 / resolution[1];
+            // Scale from MSDF texture pixels to user's font size
+            let msdf_scale = glyph.font_size / MSDF_PX_PER_EM;
+
+            // Quad dimensions from atlas region, scaled to font size
+            let quad_width = region.width as f32 * msdf_scale;
+            let quad_height = region.height as f32 * msdf_scale;
+
+            // Apply anchor offset to position the glyph correctly
+            // anchor is in em units, multiply by font_size to get pixels
+            // The anchor represents where the glyph origin is within the MSDF bitmap,
+            // so we ADD it to shift the quad left/up to align the origin with pen position
+            let anchor_x = region.anchor_x * glyph.font_size;
+            let anchor_y = region.anchor_y * glyph.font_size;
+
+            // Calculate screen positions with anchor offset
+            let px_x = text.left + (glyph.x + anchor_x) * text.scale;
+            let px_y = text.top + (glyph.y - anchor_y) * text.scale;
+
+            let x0 = px_x * 2.0 / resolution[0] - 1.0;
+            let y0 = 1.0 - px_y * 2.0 / resolution[1];
+            let x1 = x0 + (quad_width * text.scale) * 2.0 / resolution[0];
+            let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
             // Two triangles for the quad
             // Note: Flip V coordinates because MSDF textures have origin at bottom-left
