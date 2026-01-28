@@ -15,7 +15,8 @@ struct Uniforms {
     rainbow: u32,
     glow_intensity: f32,
     glow_spread: f32,
-    _padding: f32,
+    // Debug mode: 0=off, 1=dots only, 2=dots+quads
+    debug_mode: u32,
     glow_color: vec4<f32>,
 }
 
@@ -63,18 +64,27 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 /// Compute screen-space pixel range for adaptive anti-aliasing.
 /// This ensures consistent edge sharpness regardless of zoom level.
 fn screen_px_range(uv: vec2<f32>) -> f32 {
-    let unit_range = vec2<f32>(uniforms.msdf_range) / vec2<f32>(textureDimensions(atlas_texture, 0));
     let screen_tex_size = vec2<f32>(1.0) / fwidth(uv);
+    let atlas_size = vec2<f32>(textureDimensions(atlas_texture, 0));
+    let unit_range = vec2<f32>(uniforms.msdf_range) / atlas_size;
     return max(0.5 * dot(unit_range, screen_tex_size), 1.0);
 }
 
-/// Sample MSDF and compute alpha at a given bias.
+/// Sample MTSDF and compute alpha at a given bias.
 /// bias = 0.5 for normal text, lower for glow/outline.
+///
+/// MTSDF stores the multi-channel SDF in RGB and the true SDF in alpha.
+/// Using min(msdf, true_sdf) corrects corner artifacts where MSDF median fails.
 fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
     let sample = textureSample(atlas_texture, atlas_sampler, uv);
-    let sd = median(sample.r, sample.g, sample.b);
+    // MSDF median from RGB channels
+    let msdf_sd = median(sample.r, sample.g, sample.b);
+    // MTSDF: use alpha channel (true SDF) to correct corners
+    let sd = min(msdf_sd, sample.a);
+
     let px_range = screen_px_range(uv);
-    let dist = px_range * (sd - bias);
+    // Sharp transition: multiplier converts SD units to screen pixels
+    let dist = (sd - bias) * px_range;
     return clamp(dist + 0.5, 0.0, 1.0);
 }
 
@@ -124,8 +134,68 @@ fn blend_over(base: vec4<f32>, layer: vec3<f32>, layer_alpha: f32) -> vec4<f32> 
 // FRAGMENT SHADER
 // ============================================================================
 
+// ============================================================================
+// DEBUG HELPERS
+// ============================================================================
+
+/// Check if this is a debug primitive (marked with special color encoding).
+/// Debug primitives have color.a < 0.01 and use color.rgb as solid color.
+fn is_debug_primitive(color: vec4<f32>) -> bool {
+    // Debug primitives use a near-zero alpha as a marker
+    return color.a < 0.01;
+}
+
+// ============================================================================
+// FRAGMENT SHADER
+// ============================================================================
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // === DEBUG PRIMITIVE RENDERING ===
+    // Debug primitives are marked with alpha < 0.01 and rendered as solid color
+    if is_debug_primitive(in.color) {
+        // Render debug geometry as solid color (the color encodes what type)
+        return vec4<f32>(in.color.rgb, 1.0);
+    }
+
+    // === SHADER DEBUG MODES ===
+    // debug_mode 3: Show raw median distance (grayscale)
+    // debug_mode 4: Show computed alpha (grayscale)
+    // debug_mode 5: Show hard threshold (binary black/white at sd=0.5)
+    if uniforms.debug_mode >= 3u {
+        let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+        let sd = median(sample.r, sample.g, sample.b);
+
+        if uniforms.debug_mode == 3u {
+            // Raw median distance: 0=black (outside), 0.5=gray (edge), 1=white (inside)
+            return vec4<f32>(sd, sd, sd, 1.0);
+        } else if uniforms.debug_mode == 4u {
+            // Computed alpha after screen_px_range adjustment
+            let alpha = msdf_alpha_at(in.uv, 0.5);
+            return vec4<f32>(alpha, alpha, alpha, 1.0);
+        } else if uniforms.debug_mode == 5u {
+            // Hard threshold at sd=0.5 - shows exact glyph boundary
+            if sd >= 0.5 {
+                return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+            } else {
+                return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            }
+        }
+    }
+
+    // Sample MTSDF and get signed distance using both channels
+    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    let msdf_sd = median(sample.r, sample.g, sample.b);
+    // MTSDF: use alpha channel (true SDF) to correct corners
+    let sd = min(msdf_sd, sample.a);
+
+    // Early discard for pixels clearly outside the glyph.
+    // This prevents "ghosting" from overlapping glyph padding regions.
+    // Using 0.35 as threshold - far enough from 0.5 edge to preserve anti-aliasing.
+    if sd < 0.35 {
+        discard;
+    }
+
     var output = vec4<f32>(0.0);
 
     // === GLOW LAYER ===
@@ -138,7 +208,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // === MAIN TEXT ===
-    let text_alpha = msdf_alpha_at(in.uv, 0.5);
+    // Use the already-sampled sd value for efficiency
+    let px_range = screen_px_range(in.uv);
+    let dist = (sd - 0.5) * px_range;
+    let text_alpha = clamp(dist + 0.5, 0.0, 1.0);
 
     // Determine text color
     var text_color = in.color.rgb;
@@ -146,13 +219,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
-    // Blend text on top
+    // Blend text
     output = blend_over(output, text_color, text_alpha * in.color.a);
-
-    // Discard fully transparent pixels for performance
-    if output.a < 0.001 {
-        discard;
-    }
 
     return output;
 }

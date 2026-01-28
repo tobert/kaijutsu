@@ -232,36 +232,49 @@ fn generate_glyph(
         .collect();
 
     // Calculate anchor (offset for positioning)
-    // The MSDF bitmap has padding around the glyph (msdf_range pixels on each side).
-    // The glyph's origin within the bitmap depends on the shape's bounding box.
     //
-    // For proper positioning: the anchor represents where the glyph origin is
-    // within the bitmap, in em units (so it scales with font_size).
+    // The anchor represents where the glyph origin (0, 0) ends up in the bitmap,
+    // expressed in em units (so it scales with font_size when rendering).
     //
-    // Use the shape bounds to find where origin (0,0) is relative to the bitmap.
-    // The bitmap left edge is at: bounds.left - (padding / scale)
-    // So origin is at: 0 - (bounds.left - padding/scale) = -bounds.left + padding/scale
-    let padding_units = msdf_range / px_per_unit; // padding in font units
-    let origin_in_bitmap_x = -bounds.left + padding_units;
-    let origin_in_bitmap_y = -bounds.bottom + padding_units;
+    // COORDINATE SYSTEMS:
+    // - Font units: origin at baseline/pen position, Y increases UP
+    // - msdfgen bitmap: Y=0 at bottom, Y increases UP
+    // - Screen/pipeline: Y=0 at top, Y increases DOWN
+    //
+    // The bitmap is sized to fit: bounds + padding (msdf_range on each side)
+    // The glyph origin (0, 0) in font units is at distance (-bounds.left) from
+    // the shape's left edge, plus padding.
+    //
+    // For X (same direction in all coordinate systems):
+    //   origin_x = msdf_range + (-bounds.left) * px_per_unit
+    //
+    // For Y (msdfgen Y=0 at bottom):
+    //   origin_from_bottom = msdf_range + (-bounds.bottom) * px_per_unit
+    //   origin_from_top = height - origin_from_bottom
+    //
+    // We need anchor_y measured from TOP for screen coordinates.
+    let origin_bitmap_x = msdf_range - bounds.left * px_per_unit;
+    let origin_from_bottom = msdf_range - bounds.bottom * px_per_unit;
+    let origin_from_top = height as f64 - origin_from_bottom;
 
-    // Convert to em units (fraction of 1em)
-    let anchor_x = (origin_in_bitmap_x * px_per_unit) as f32 / px_per_em as f32;
-    let anchor_y = (origin_in_bitmap_y * px_per_unit) as f32 / px_per_em as f32;
+    // Convert from bitmap pixels to em units
+    let anchor_x = origin_bitmap_x as f32 / px_per_em as f32;
+    let anchor_y = origin_from_top as f32 / px_per_em as f32;
 
     // Debug logging for glyph generation
     trace!(
-        "MSDF gen glyph_id={}: bounds={:.1}x{:.1}, units_per_em={}, px_per_unit={:.4}, \
-         bitmap={}x{}, translate=({:.1}, {:.1}), anchor=({:.4}, {:.4}) em",
+        "MSDF gen glyph_id={}: bounds=({:.1},{:.1})→({:.1},{:.1}), units_per_em={}, px_per_unit={:.4}, \
+         bitmap={}x{}, origin_from_top={:.1}, anchor=({:.4}, {:.4}) em",
         glyph_id,
-        bounds.width(),
-        bounds.height(),
+        bounds.left,
+        bounds.bottom,
+        bounds.left + bounds.width(),
+        bounds.bottom + bounds.height(),
         units_per_em,
         px_per_unit,
         width,
         height,
-        framing.translate.x,
-        framing.translate.y,
+        origin_from_top,
         anchor_x,
         anchor_y
     );

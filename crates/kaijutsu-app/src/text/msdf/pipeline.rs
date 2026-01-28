@@ -22,6 +22,113 @@ use super::{MsdfText, SdfTextEffects};
 /// MSDF textures are generated at 32 pixels per em.
 pub const MSDF_PX_PER_EM: f32 = 32.0;
 
+// ============================================================================
+// DEBUG GEOMETRY HELPERS
+// ============================================================================
+
+/// Debug color constants (using near-zero alpha as marker for shader).
+#[cfg(debug_assertions)]
+mod debug_colors {
+    /// Red for quad outlines.
+    pub const RED: [u8; 4] = [255, 50, 50, 1];
+    /// Green for pen position (glyph.x, glyph.y from cosmic-text).
+    pub const GREEN: [u8; 4] = [50, 255, 50, 1];
+    /// Blue for anchor point (where origin is in the MSDF bitmap).
+    pub const BLUE: [u8; 4] = [50, 100, 255, 1];
+    /// Yellow for quad top-left corner (final rendered position).
+    pub const YELLOW: [u8; 4] = [255, 255, 50, 1];
+}
+
+/// Generate a small dot (quad) at the given screen position.
+#[cfg(debug_assertions)]
+fn debug_dot(
+    vertices: &mut Vec<MsdfVertex>,
+    screen_x: f32,
+    screen_y: f32,
+    resolution: [f32; 2],
+    color: [u8; 4],
+) {
+    const DOT_SIZE: f32 = 4.0; // Dot size in pixels
+
+    let half = DOT_SIZE / 2.0;
+    let x0 = (screen_x - half) * 2.0 / resolution[0] - 1.0;
+    let y0 = 1.0 - (screen_y - half) * 2.0 / resolution[1];
+    let x1 = (screen_x + half) * 2.0 / resolution[0] - 1.0;
+    let y1 = 1.0 - (screen_y + half) * 2.0 / resolution[1];
+
+    // Dummy UV coords (shader ignores them for debug primitives)
+    let uv = [0.5, 0.5];
+
+    // Two triangles for the quad
+    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+}
+
+/// Generate a rectangle outline (4 thin quads) for the given screen rect.
+#[cfg(debug_assertions)]
+fn debug_rect_outline(
+    vertices: &mut Vec<MsdfVertex>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    resolution: [f32; 2],
+    color: [u8; 4],
+) {
+    const LINE_WIDTH: f32 = 1.5; // Line width in pixels
+
+    // Convert to NDC helper
+    let to_ndc = |px: f32, py: f32| -> [f32; 2] {
+        [px * 2.0 / resolution[0] - 1.0, 1.0 - py * 2.0 / resolution[1]]
+    };
+
+    let uv = [0.5, 0.5];
+
+    // Top edge
+    let [x0, y0] = to_ndc(x, y);
+    let [x1, y1] = to_ndc(x + width, y + LINE_WIDTH);
+    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+
+    // Bottom edge
+    let [x0, y0] = to_ndc(x, y + height - LINE_WIDTH);
+    let [x1, y1] = to_ndc(x + width, y + height);
+    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+
+    // Left edge
+    let [x0, y0] = to_ndc(x, y);
+    let [x1, y1] = to_ndc(x + LINE_WIDTH, y + height);
+    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+
+    // Right edge
+    let [x0, y0] = to_ndc(x + width - LINE_WIDTH, y);
+    let [x1, y1] = to_ndc(x + width, y + height);
+    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+}
+
 /// Label for the MSDF text render node.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 pub struct MsdfTextRenderNodeLabel;
@@ -54,8 +161,8 @@ pub struct MsdfUniforms {
     pub glow_intensity: f32,
     /// Glow spread in pixels.
     pub glow_spread: f32,
-    /// Padding for alignment.
-    _padding: f32,
+    /// Debug mode: 0=off, 1=dots, 2=dots+quads.
+    pub debug_mode: u32,
     /// Glow color.
     pub glow_color: [f32; 4],
 }
@@ -69,7 +176,7 @@ impl Default for MsdfUniforms {
             rainbow: 0,
             glow_intensity: 0.0,
             glow_spread: 2.0,
-            _padding: 0.0,
+            debug_mode: 0,
             glow_color: [0.4, 0.6, 1.0, 0.5],
         }
     }
@@ -109,6 +216,14 @@ pub struct ExtractedMsdfAtlas {
     pub height: u32,
     /// MSDF range in pixels.
     pub msdf_range: f32,
+}
+
+/// Extracted debug overlay state for render world.
+#[cfg(debug_assertions)]
+#[derive(Resource, Default)]
+pub struct ExtractedMsdfDebugMode {
+    /// Debug mode: 0=off, 1=dots, 2=dots+quads.
+    pub mode: u32,
 }
 
 /// Render world resources for MSDF text.
@@ -243,6 +358,7 @@ impl ViewNode for MsdfTextRenderNode {
 }
 
 /// Extract MSDF text areas from the main world.
+#[allow(clippy::type_complexity)]
 pub fn extract_msdf_texts(
     mut commands: Commands,
     // Cell text (MsdfTextBuffer + MsdfTextAreaConfig)
@@ -260,6 +376,9 @@ pub fn extract_msdf_texts(
     >,
     // Atlas data
     atlas: Extract<Res<MsdfAtlas>>,
+    // Debug overlay (only in debug builds)
+    #[cfg(debug_assertions)]
+    debug_overlay: Extract<Res<super::MsdfDebugOverlay>>,
 ) {
     // Extract atlas data for render world
     commands.insert_resource(ExtractedMsdfAtlas {
@@ -269,6 +388,13 @@ pub fn extract_msdf_texts(
         height: atlas.height,
         msdf_range: atlas.msdf_range,
     });
+
+    // Extract debug mode
+    #[cfg(debug_assertions)]
+    commands.insert_resource(ExtractedMsdfDebugMode {
+        mode: debug_overlay.mode.as_u32(),
+    });
+
     let mut texts = Vec::new();
 
     // Extract cell text (conversation blocks, prompt, etc.)
@@ -329,6 +455,8 @@ pub fn prepare_msdf_texts(
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
     windows: Res<bevy::render::view::ExtractedWindows>,
+    #[cfg(debug_assertions)]
+    debug_mode: Option<Res<ExtractedMsdfDebugMode>>,
 ) {
     let Some(extracted) = extracted else {
         return;
@@ -356,6 +484,12 @@ pub fn prepare_msdf_texts(
     let rainbow = effects.map(|e| e.rainbow).unwrap_or(false);
     let glow = effects.and_then(|e| e.glow.as_ref());
 
+    // Get debug mode from extracted resource
+    #[cfg(debug_assertions)]
+    let debug_mode_value = debug_mode.map(|d| d.mode).unwrap_or(0);
+    #[cfg(not(debug_assertions))]
+    let debug_mode_value = 0u32;
+
     // Update uniforms
     let uniforms = MsdfUniforms {
         resolution,
@@ -364,7 +498,7 @@ pub fn prepare_msdf_texts(
         rainbow: if rainbow { 1 } else { 0 },
         glow_intensity: glow.map(|g| g.intensity).unwrap_or(0.0),
         glow_spread: glow.map(|g| g.spread).unwrap_or(2.0),
-        _padding: 0.0,
+        debug_mode: debug_mode_value,
         glow_color: glow
             .map(|g| {
                 let c = g.color.to_linear();
@@ -447,6 +581,40 @@ pub fn prepare_msdf_texts(
             vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color: glyph.color });
             vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v0], color: glyph.color });
             vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color: glyph.color });
+
+            // === DEBUG GEOMETRY ===
+            // Generate debug visualization when debug mode is 1 or 2
+            // (Skip for shader debug modes 3, 4, 5 to not obscure the output)
+            #[cfg(debug_assertions)]
+            if debug_mode_value > 0 && debug_mode_value < 3 {
+                // Pen position from cosmic-text (green dot)
+                let pen_x = text.left + glyph.x * text.scale;
+                let pen_y = text.top + glyph.y * text.scale;
+                debug_dot(&mut vertices, pen_x, pen_y, resolution, debug_colors::GREEN);
+
+                // Anchor point in screen space (blue dot) - shows where glyph origin is in bitmap
+                // The anchor is the distance from bitmap origin to glyph origin
+                // So anchor position = pen position (conceptually, the anchor moves the quad so they align)
+                let anchor_screen_x = pen_x;
+                let anchor_screen_y = pen_y;
+                debug_dot(&mut vertices, anchor_screen_x, anchor_screen_y + 6.0, resolution, debug_colors::BLUE);
+
+                // Quad top-left corner (yellow dot)
+                debug_dot(&mut vertices, px_x, px_y, resolution, debug_colors::YELLOW);
+
+                // Quad outline (red) - only in mode 2
+                if debug_mode_value >= 2 {
+                    let scaled_quad_width = quad_width * text.scale;
+                    let scaled_quad_height = quad_height * text.scale;
+                    debug_rect_outline(
+                        &mut vertices,
+                        px_x, px_y,
+                        scaled_quad_width, scaled_quad_height,
+                        resolution,
+                        debug_colors::RED,
+                    );
+                }
+            }
         }
     }
 

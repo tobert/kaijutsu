@@ -191,3 +191,79 @@ pub struct DebugGlyph {
     /// Computed quad height in pixels.
     pub quad_height: f32,
 }
+
+/// Debug overlay mode for MSDF text rendering.
+///
+/// Toggle with F11. Shows visual debug information about glyph positioning.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum DebugOverlayMode {
+    /// Debug overlay disabled.
+    #[default]
+    Off,
+    /// Show dots: green=pen position, blue=anchor, yellow=quad corner.
+    Dots,
+    /// Show dots + red quad outlines.
+    DotsAndQuads,
+    /// Shader debug: show raw median distance (grayscale).
+    RawDistance,
+    /// Shader debug: show computed alpha (grayscale).
+    ComputedAlpha,
+    /// Shader debug: hard threshold at sd=0.5 (binary).
+    HardThreshold,
+}
+
+#[cfg(debug_assertions)]
+impl DebugOverlayMode {
+    /// Cycle to next debug mode.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Dots,
+            Self::Dots => Self::DotsAndQuads,
+            Self::DotsAndQuads => Self::RawDistance,
+            Self::RawDistance => Self::ComputedAlpha,
+            Self::ComputedAlpha => Self::HardThreshold,
+            Self::HardThreshold => Self::Off,
+        }
+    }
+
+    /// Get the numeric mode value for the shader uniform.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Dots => 1,
+            Self::DotsAndQuads => 2,
+            Self::RawDistance => 3,
+            Self::ComputedAlpha => 4,
+            Self::HardThreshold => 5,
+        }
+    }
+
+    /// Get human-readable description.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Dots => "DOTS (green=pen, blue=anchor, yellow=quad)",
+            Self::DotsAndQuads => "DOTS + QUADS (red outlines)",
+            Self::RawDistance => "RAW DISTANCE (grayscale MSDF median)",
+            Self::ComputedAlpha => "COMPUTED ALPHA (after px_range)",
+            Self::HardThreshold => "HARD THRESHOLD (binary at sd=0.5)",
+        }
+    }
+}
+
+/// Resource controlling MSDF debug visualization.
+///
+/// Press F11 to cycle through debug modes:
+/// - Off: Normal rendering
+/// - Dots: Shows pen position (green), anchor (blue), quad corner (yellow)
+/// - DotsAndQuads: Dots + red quad outlines
+#[cfg(debug_assertions)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct MsdfDebugOverlay {
+    /// Current debug mode.
+    pub mode: DebugOverlayMode,
+    /// Show metrics HUD with first glyph info.
+    pub show_hud: bool,
+}

@@ -16,8 +16,13 @@ use super::msdf::{
     MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
-use super::msdf::MsdfDebugInfo;
+use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
 use super::resources::*;
+
+/// Marker component for debug HUD text.
+#[cfg(debug_assertions)]
+#[derive(Component)]
+pub struct MsdfDebugHud;
 
 /// Plugin that enables MSDF text rendering in Bevy.
 pub struct TextRenderPlugin;
@@ -30,7 +35,8 @@ impl Plugin for TextRenderPlugin {
             .init_resource::<TextMetrics>();
 
         #[cfg(debug_assertions)]
-        app.init_resource::<MsdfDebugInfo>();
+        app.init_resource::<MsdfDebugInfo>()
+            .init_resource::<MsdfDebugOverlay>();
 
         app.add_systems(Update, (
                 update_text_resolution,
@@ -42,7 +48,12 @@ impl Plugin for TextRenderPlugin {
             ).chain());
 
         #[cfg(debug_assertions)]
-        app.add_systems(Update, debug_dump_atlas_on_f12)
+        app.add_systems(Update, (
+                debug_dump_atlas_on_f12,
+                debug_toggle_overlay_f11,
+                debug_manage_hud,
+                debug_update_hud,
+            ))
             // Sync UI text positions after Bevy UI layout computes positions
             .add_systems(PostUpdate, sync_ui_text_positions.after(UiSystems::Layout));
 
@@ -311,5 +322,157 @@ fn debug_dump_atlas_on_f12(
             }
             Err(e) => error!("Failed to dump atlas: {}", e),
         }
+    }
+}
+
+/// Debug system: toggle MSDF debug overlay with F11.
+#[cfg(debug_assertions)]
+fn debug_toggle_overlay_f11(
+    input: Res<ButtonInput<KeyCode>>,
+    mut debug_overlay: ResMut<MsdfDebugOverlay>,
+) {
+    if input.just_pressed(KeyCode::F11) {
+        debug_overlay.mode = debug_overlay.mode.next();
+        info!("🔍 MSDF debug overlay: {}", debug_overlay.mode.description());
+    }
+}
+
+/// Debug system: spawn/despawn debug HUD based on overlay mode.
+#[cfg(debug_assertions)]
+fn debug_manage_hud(
+    mut commands: Commands,
+    debug_overlay: Res<MsdfDebugOverlay>,
+    existing_hud: Query<Entity, With<MsdfDebugHud>>,
+) {
+    let should_show = debug_overlay.mode != DebugOverlayMode::Off;
+    let hud_exists = !existing_hud.is_empty();
+
+    if should_show && !hud_exists {
+        // Spawn debug HUD in top-right corner
+        commands.spawn((
+            MsdfDebugHud,
+            MsdfUiText::new("Debug HUD loading...")
+                .with_font_size(11.0)
+                .with_color(Color::srgba(0.0, 1.0, 0.5, 0.9)),
+            UiTextPositionCache::default(),
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(10.0),
+                top: Val::Px(10.0),
+                min_width: Val::Px(300.0),
+                min_height: Val::Px(150.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+            ZIndex(100), // On top of other UI
+        ));
+        info!("📊 Debug HUD spawned");
+    } else if !should_show && hud_exists {
+        // Despawn debug HUD
+        for entity in existing_hud.iter() {
+            commands.entity(entity).despawn();
+        }
+        info!("📊 Debug HUD despawned");
+    }
+}
+
+/// Debug system: update debug HUD with current metrics.
+#[cfg(debug_assertions)]
+fn debug_update_hud(
+    debug_overlay: Res<MsdfDebugOverlay>,
+    atlas: Res<MsdfAtlas>,
+    text_query: Query<(&MsdfTextBuffer, &MsdfTextAreaConfig), With<MsdfText>>,
+    mut hud_query: Query<&mut MsdfUiText, With<MsdfDebugHud>>,
+) {
+    // Only update if debug mode is on
+    if debug_overlay.mode == DebugOverlayMode::Off {
+        return;
+    }
+
+    // Get first glyph from first text area for metrics
+    let mut hud_text = String::new();
+    hud_text.push_str("=== MSDF Debug HUD ===\n\n");
+
+    // Find first text area with glyphs
+    for (buffer, config) in text_query.iter() {
+        let glyphs = buffer.glyphs();
+        if glyphs.is_empty() {
+            continue;
+        }
+
+        let glyph = &glyphs[0];
+        let font_size = glyph.font_size;
+
+        // Get region if available
+        if let Some(region) = atlas.get(glyph.key) {
+            const MSDF_PX_PER_EM: f32 = 32.0;
+            let msdf_scale = font_size / MSDF_PX_PER_EM;
+
+            let anchor_x_px = region.anchor_x * font_size;
+            let anchor_y_px = region.anchor_y * font_size;
+
+            let quad_width = region.width as f32 * msdf_scale;
+            let quad_height = region.height as f32 * msdf_scale;
+
+            let final_px_x = config.left + (glyph.x - anchor_x_px) * config.scale;
+            let final_px_y = config.top + (glyph.y - anchor_y_px) * config.scale;
+
+            hud_text.push_str(&format!(
+                "Glyph: id={}\n\
+                 Pen pos: ({:.1}, {:.1})\n\
+                 Font size: {:.1}px\n\
+                 MSDF scale: {:.3}\n\
+                 Text scale: {:.2}\n\
+                 \n\
+                 Region: {}x{} px\n\
+                 Anchor (em): ({:.4}, {:.4})\n\
+                 Anchor (px): ({:.1}, {:.1})\n\
+                 \n\
+                 Quad: {:.1}x{:.1} px\n\
+                 Final pos: ({:.1}, {:.1})\n\
+                 Text area: ({:.1}, {:.1})\n",
+                glyph.key.glyph_id,
+                glyph.x, glyph.y,
+                font_size,
+                msdf_scale,
+                config.scale,
+                region.width, region.height,
+                region.anchor_x, region.anchor_y,
+                anchor_x_px, anchor_y_px,
+                quad_width, quad_height,
+                final_px_x, final_px_y,
+                config.left, config.top,
+            ));
+        } else {
+            hud_text.push_str(&format!(
+                "Glyph: id={}\n\
+                 Pen pos: ({:.1}, {:.1})\n\
+                 Font size: {:.1}px\n\
+                 (Region not in atlas yet)\n",
+                glyph.key.glyph_id,
+                glyph.x, glyph.y,
+                font_size,
+            ));
+        }
+
+        // Only show first glyph
+        break;
+    }
+
+    if hud_text.len() == "=== MSDF Debug HUD ===\n\n".len() {
+        hud_text.push_str("No text areas with glyphs found.");
+    }
+
+    // Add legend
+    hud_text.push_str("\n--- Legend ---\n");
+    hud_text.push_str("Green: pen position\n");
+    hud_text.push_str("Blue: anchor (offset)\n");
+    hud_text.push_str("Yellow: quad corner\n");
+    hud_text.push_str("Red: quad outline\n");
+
+    // Update HUD text
+    for mut hud in hud_query.iter_mut() {
+        hud.text = hud_text.clone();
     }
 }
