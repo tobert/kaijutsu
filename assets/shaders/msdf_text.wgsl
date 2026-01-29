@@ -94,9 +94,8 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
 
     let px_range = screen_px_range(uv);
     // Convert distance to screen pixels
-    // Higher multiplier = sharper edges. At small sizes, softer AA makes text muddy.
-    // Using 4.0 for crisper text that remains readable at small font sizes.
-    let dist = (sd - bias) * px_range * 4.0;
+    // Multiplying by 2.0 provides good balance between sharpness and smoothness
+    let dist = (sd - bias) * px_range * 2.0;
     return clamp(dist + 0.5, 0.0, 1.0);
 }
 

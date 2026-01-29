@@ -1446,6 +1446,81 @@ fn no_at_14px_renders_correctly() {
     eprintln!("\n✓ NO renders correctly at 14px (letters may touch but are distinguishable)");
 }
 
+/// Diagnostic test: inspect cosmic-text glyph positions and offsets.
+/// This helps debug kerning issues by showing the raw values from cosmic-text.
+#[test]
+fn diagnostic_cosmic_text_positions() {
+    use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(14.0, 16.8); // 14px font, 1.2 line height
+
+    let mut buffer = Buffer::new(&mut font_system, metrics);
+    buffer.set_size(&mut font_system, Some(400.0), None);
+
+    let attrs = Attrs::new().family(cosmic_text::Family::SansSerif);
+    buffer.set_text(&mut font_system, "gray", &attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(&mut font_system, false);
+
+    eprintln!("\nCosmic-text glyph positions for 'gray' at 14px:");
+    eprintln!("================================================");
+
+    for run in buffer.layout_runs() {
+        eprintln!("Run line_y={}", run.line_y);
+        for glyph in run.glyphs {
+            let text = &"gray"[glyph.start..glyph.end];
+            eprintln!(
+                "  '{}' (glyph_id={}): x={:.2}, y={:.2}, w={:.2}, x_offset={:.2}, y_offset={:.2}",
+                text, glyph.glyph_id, glyph.x, glyph.y, glyph.w, glyph.x_offset, glyph.y_offset
+            );
+        }
+    }
+    eprintln!();
+}
+
+/// Test that "gray" at 14px renders with proper letter separation.
+/// This specifically tests the kerning bug reported by the user.
+#[test]
+fn gray_at_14px_letter_separation() {
+    let config = TestConfig::new("gray", 14.0, 100, 40, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let output = render_with_config(config);
+    output.save_png("gray_14px_separation");
+
+    // Analyze columns to find letter boundaries
+    let mut column_counts: Vec<(u32, u32)> = Vec::new();
+    for x in 0..output.width {
+        let mut count = 0u32;
+        for y in 0..output.height {
+            if output.pixel(x, y).is_visible() {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            column_counts.push((x, count));
+        }
+    }
+
+    eprintln!("\nColumn analysis for 'gray' at 14px:");
+    for (x, count) in &column_counts {
+        eprintln!("  col {:2}: {:2} pixels", x, count);
+    }
+
+    // Find bounding box
+    let bbox = output.bounding_box();
+    assert!(bbox.is_some(), "'gray' should render");
+    let (min_x, min_y, width, height) = bbox.unwrap();
+    eprintln!("\nBounding box: x={}, y={}, {}x{}", min_x, min_y, width, height);
+
+    // At 14px, "gray" should be roughly 28 pixels wide based on cosmic-text metrics
+    // (g=7.6 + r=5.7 + a=7.8 + y=7.0 = 28.1)
+    assert!(
+        width >= 20 && width <= 40,
+        "'gray' at 14px should be 20-40px wide, got {}",
+        width
+    );
+}
+
 /// Test that individual glyph rendering matches combined rendering.
 ///
 /// This verifies that when glyphs are rendered together, there's no

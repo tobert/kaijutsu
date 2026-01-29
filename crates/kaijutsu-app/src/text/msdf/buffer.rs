@@ -147,10 +147,12 @@ impl MsdfTextBuffer {
 
                 self.glyphs.push(PositionedGlyph {
                     key,
-                    // x is pen position, x_offset contains kerning and other per-glyph adjustments
-                    x: glyph.x + glyph.x_offset,
-                    // line_y is baseline position, glyph.y + y_offset for vertical adjustments
-                    y: line_y + glyph.y + glyph.y_offset,
+                    // cosmic-text's x is the pen position for this glyph
+                    // Note: x_offset/y_offset from cosmic-text are typically 0 for most fonts
+                    // and are already accounted for in the x position during layout
+                    x: glyph.x,
+                    // line_y is baseline position, glyph.y is vertical offset from baseline
+                    y: line_y + glyph.y,
                     font_size,
                     color: self.default_color,
                 });
