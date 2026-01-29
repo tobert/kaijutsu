@@ -294,7 +294,8 @@ impl Rgba {
     }
 
     fn is_visible(&self) -> bool {
-        self.a > 0
+        // Check for non-black pixels (background is black with full alpha)
+        self.r > 0 || self.g > 0 || self.b > 0
     }
 
     fn luminance(&self) -> f32 {
@@ -316,11 +317,11 @@ impl TestOutput {
         Rgba::from_slice(&self.pixels, offset)
     }
 
-    /// Count non-transparent pixels.
+    /// Count non-black pixels (visible text on black background).
     fn count_visible_pixels(&self) -> usize {
         (0..self.pixels.len())
             .step_by(4)
-            .filter(|&i| self.pixels[i + 3] > 0)
+            .filter(|&i| self.pixels[i] > 0 || self.pixels[i + 1] > 0 || self.pixels[i + 2] > 0)
             .count()
     }
 
@@ -705,12 +706,7 @@ fn kerning_av_tighter_than_aa() {
 /// Test 4: Font size affects render size.
 ///
 /// Larger font = larger rendered glyphs.
-///
-/// KNOWN BUG: Font size is not affecting rendered glyph size.
-/// Visual inspection shows 16px and 32px "A" render at the same size.
-/// This reveals a bug in font_size handling - likely in MsdfTextBuffer or prepare phase.
 #[test]
-#[ignore = "KNOWN BUG: font_size not affecting render size - needs fix"]
 fn font_size_affects_render() {
     let small = render_text_headless("A", 16.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
     let large = render_text_headless("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
