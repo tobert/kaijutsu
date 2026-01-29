@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 use bevy::render::{
     render_graph::{RenderGraphExt, ViewNodeRunner},
-    ExtractSchedule, Render, RenderApp, RenderPlugin,
+    ExtractSchedule, Render, RenderApp, RenderPlugin, RenderSystems,
 };
 use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;
@@ -101,7 +101,15 @@ impl Plugin for TextRenderPlugin {
         // Initialize render world resources
         render_app.init_resource::<MsdfTextPipeline>();
         render_app.insert_resource(font_system);
-        render_app.add_systems(Render, init_msdf_resources.run_if(not(resource_exists::<super::msdf::MsdfTextResources>)));
+
+        // Schedule init_msdf_resources to run in Prepare set (after ManageViews)
+        // This ensures ExtractedWindows.swap_chain_texture_format is populated
+        render_app.add_systems(
+            Render,
+            init_msdf_resources
+                .in_set(RenderSystems::Prepare)
+                .run_if(not(resource_exists::<super::msdf::MsdfTextResources>)),
+        );
     }
 }
 

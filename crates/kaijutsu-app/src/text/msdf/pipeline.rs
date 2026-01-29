@@ -9,7 +9,7 @@ use bevy::render::{
     render_graph::{NodeRunError, RenderGraphContext, RenderLabel, ViewNode},
     render_resource::*,
     renderer::{RenderContext, RenderDevice, RenderQueue},
-    view::ViewTarget,
+    view::{ExtractedWindows, ViewTarget},
     Extract,
 };
 use bevy::render::render_resource::binding_types::{sampler, texture_2d, uniform_buffer};
@@ -688,25 +688,41 @@ pub fn prepare_msdf_texts(
 
 /// Initialize MSDF text resources.
 ///
-/// Requires `ExtractedMsdfRenderConfig` to be present and initialized.
-/// Will skip initialization if the config is not ready.
+/// Requires either `ExtractedWindows` (for windowed mode) or `ExtractedMsdfRenderConfig`
+/// (for headless/test mode) to determine the surface format.
+///
+/// In windowed mode, queries `ExtractedWindows` for the primary window's swap chain format.
+/// In headless mode, falls back to `ExtractedMsdfRenderConfig.format`.
+///
+/// Will skip initialization if no format can be determined yet (defers to next frame).
 pub fn init_msdf_resources(
     device: Res<RenderDevice>,
     pipeline_res: Res<MsdfTextPipeline>,
     pipeline_cache: Res<PipelineCache>,
     mut commands: Commands,
+    extracted_windows: Option<Res<ExtractedWindows>>,
     render_config: Option<Res<ExtractedMsdfRenderConfig>>,
 ) {
-    // Require render config to be present and initialized
-    let Some(render_config) = render_config else {
+    // Try to get format from ExtractedWindows first (windowed mode)
+    // This is the authoritative source for the actual swap chain format
+    let format_from_window = extracted_windows
+        .as_ref()
+        .and_then(|windows| windows.primary)
+        .and_then(|entity| extracted_windows.as_ref()?.windows.get(&entity))
+        .and_then(|window| window.swap_chain_texture_format);
+
+    // Fall back to ExtractedMsdfRenderConfig (headless/test mode)
+    let format_from_config = render_config
+        .as_ref()
+        .filter(|c| c.initialized)
+        .map(|c| c.format);
+
+    // Use window format preferentially, fall back to config format
+    let Some(format) = format_from_window.or(format_from_config) else {
+        // No format available yet - defer to next frame
+        // This is normal on first frame before prepare_windows has run
         return;
     };
-    if !render_config.initialized {
-        return;
-    }
-
-    // Get format from extracted config
-    let format = render_config.format;
 
     // Create uniform buffer
     let uniform_buffer = device.create_buffer(&BufferDescriptor {

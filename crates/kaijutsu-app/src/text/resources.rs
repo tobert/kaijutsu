@@ -121,6 +121,9 @@ impl Default for MsdfRenderConfig {
     fn default() -> Self {
         Self {
             resolution: [0.0, 0.0],
+            // Use bevy_default() as fallback for headless/test mode.
+            // In windowed mode, init_msdf_resources queries ExtractedWindows for the
+            // actual swap chain format, which is the authoritative source.
             format: bevy::render::render_resource::TextureFormat::bevy_default(),
             initialized: false,
         }
@@ -130,6 +133,10 @@ impl Default for MsdfRenderConfig {
 #[allow(dead_code)]
 impl MsdfRenderConfig {
     /// Create a new initialized config with the given resolution.
+    ///
+    /// Uses `bevy_default()` format as fallback for headless/test mode.
+    /// In windowed mode, init_msdf_resources will query the actual swap chain format.
+    /// Use `with_format()` to override if needed.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             resolution: [width as f32, height as f32],
