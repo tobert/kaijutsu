@@ -290,7 +290,9 @@ impl Rgba {
     }
 
     fn is_opaque(&self) -> bool {
-        self.a > 128
+        // Check for bright pixels (white text on black background)
+        // Use luminance threshold to detect significant text pixels
+        self.luminance() > 0.5
     }
 
     fn is_visible(&self) -> bool {
@@ -633,12 +635,7 @@ fn text_renders_nonblank() {
 ///
 /// Using monospace font, all glyphs MUST be identical width.
 /// This catches the "letters too close together" bug.
-///
-/// KNOWN ISSUE: Detection algorithm struggles with close pipes.
-/// Visual inspection of /tmp/msdf_tests/mono_spacing_consistent.png shows
-/// the pipes ARE rendered but very close together - may indicate spacing bug.
 #[test]
-#[ignore = "Detection algorithm needs improvement - visually verify PNG output"]
 fn mono_spacing_consistent() {
     let output = render_text_headless("|||", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, true);
     output.save_png("mono_spacing_consistent");
