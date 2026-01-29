@@ -1479,7 +1479,6 @@ fn diagnostic_cosmic_text_positions() {
 }
 
 /// Test that "gray" at 14px renders with proper letter separation.
-/// This specifically tests the kerning bug reported by the user.
 #[test]
 fn gray_at_14px_letter_separation() {
     let config = TestConfig::new("gray", 14.0, 100, 40, false)
@@ -1519,6 +1518,45 @@ fn gray_at_14px_letter_separation() {
         "'gray' at 14px should be 20-40px wide, got {}",
         width
     );
+}
+
+/// Test "gray" at 15px (the actual app default font size).
+#[test]
+fn gray_at_15px_app_default() {
+    let config = TestConfig::new("gray", 15.0, 100, 40, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let output = render_with_config(config);
+    output.save_png("gray_15px_app_default");
+
+    let bbox = output.bounding_box();
+    assert!(bbox.is_some(), "'gray' should render at 15px");
+
+    let (min_x, _, width, _) = bbox.unwrap();
+    eprintln!("\n'gray' at 15px: starts at x={}, width={}", min_x, width);
+
+    // Should be slightly larger than 14px version
+    assert!(
+        width >= 22 && width <= 45,
+        "'gray' at 15px should be 22-45px wide, got {}",
+        width
+    );
+}
+
+/// Test "gray" at 15px with scale factor (simulates HiDPI).
+#[test]
+fn gray_scaled_hidpi() {
+    // Test with scale=1.5 (common HiDPI factor)
+    let config = TestConfig::new("gray", 15.0, 150, 60, false)
+        .with_font_family(TestFontFamily::SansSerif)
+        .with_scale(1.5);
+    let output = render_with_config(config);
+    output.save_png("gray_15px_scale_1_5");
+
+    let bbox = output.bounding_box();
+    assert!(bbox.is_some(), "'gray' should render with scale");
+
+    let (_, _, width, _) = bbox.unwrap();
+    eprintln!("\n'gray' at 15px scale=1.5: width={}", width);
 }
 
 /// Test that individual glyph rendering matches combined rendering.
