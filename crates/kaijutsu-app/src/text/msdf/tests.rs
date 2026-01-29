@@ -35,7 +35,7 @@ use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
 use crossbeam_channel::{Receiver, Sender};
 
-use super::{MsdfText, MsdfTextAreaConfig, MsdfTextBuffer};
+use super::{GlowConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, SdfTextEffects};
 use crate::text::plugin::TextRenderPlugin;
 use crate::text::resources::{MsdfRenderConfig, SharedFontSystem};
 
@@ -71,10 +71,59 @@ struct TestConfig {
     width: u32,
     height: u32,
     use_monospace: bool,
+    /// Text position offset from top-left.
+    left: f32,
+    top: f32,
+    /// Scale factor for text rendering.
+    scale: f32,
+    /// Text color.
+    color: Color,
+    /// Enable glow effect.
+    glow: bool,
     /// Frames remaining before capture.
     frames_remaining: u32,
     /// Whether we've received and processed the image.
     done: Arc<AtomicBool>,
+}
+
+impl TestConfig {
+    fn new(text: &str, font_size: f32, width: u32, height: u32, use_monospace: bool) -> Self {
+        Self {
+            text: text.to_string(),
+            font_size,
+            width,
+            height,
+            use_monospace,
+            left: 10.0,
+            top: 10.0,
+            scale: 1.0,
+            color: Color::WHITE,
+            glow: false,
+            frames_remaining: PRE_ROLL_FRAMES,
+            done: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn with_position(mut self, left: f32, top: f32) -> Self {
+        self.left = left;
+        self.top = top;
+        self
+    }
+
+    fn with_scale(mut self, scale: f32) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    fn with_color(mut self, color: Color) -> Self {
+        self.color = color;
+        self
+    }
+
+    fn with_glow(mut self) -> Self {
+        self.glow = true;
+        self
+    }
 }
 
 /// Component to track the render target image.
@@ -310,17 +359,31 @@ struct TestOutput {
     pixels: Vec<u8>,
     width: u32,
     height: u32,
+    /// Whether pixels are in BGRA order (true) or RGBA order (false).
+    is_bgra: bool,
 }
 
 impl TestOutput {
-    /// Get pixel at (x, y).
+    /// Get pixel at (x, y), converting from the buffer's format to RGBA.
     fn pixel(&self, x: u32, y: u32) -> Rgba {
         let offset = ((y * self.width + x) * 4) as usize;
-        Rgba::from_slice(&self.pixels, offset)
+        if self.is_bgra {
+            // BGRA layout: B at +0, G at +1, R at +2, A at +3
+            Rgba {
+                r: self.pixels[offset + 2],
+                g: self.pixels[offset + 1],
+                b: self.pixels[offset],
+                a: self.pixels[offset + 3],
+            }
+        } else {
+            // RGBA layout
+            Rgba::from_slice(&self.pixels, offset)
+        }
     }
 
     /// Count non-black pixels (visible text on black background).
     fn count_visible_pixels(&self) -> usize {
+        // For non-black detection, channel order doesn't matter - we just check if any RGB channel is non-zero
         (0..self.pixels.len())
             .step_by(4)
             .filter(|&i| self.pixels[i] > 0 || self.pixels[i + 1] > 0 || self.pixels[i + 2] > 0)
@@ -427,9 +490,19 @@ impl TestOutput {
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join(format!("{}.png", name));
 
+        // Convert to RGBA if needed (PNG expects RGBA)
+        let pixels: Vec<u8> = if self.is_bgra {
+            self.pixels
+                .chunks(4)
+                .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+                .collect()
+        } else {
+            self.pixels.clone()
+        };
+
         image::save_buffer(
             &path,
-            &self.pixels,
+            &pixels,
             self.width,
             self.height,
             image::ColorType::Rgba8,
@@ -448,18 +521,15 @@ fn render_text_headless(
     height: u32,
     use_monospace: bool,
 ) -> TestOutput {
+    let config = TestConfig::new(text, font_size, width, height, use_monospace);
+    render_with_config(config)
+}
+
+/// Render text with full configuration control.
+fn render_with_config(mut config: TestConfig) -> TestOutput {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let done = Arc::new(AtomicBool::new(false));
-
-    let config = TestConfig {
-        text: text.to_string(),
-        font_size,
-        width,
-        height,
-        use_monospace,
-        frames_remaining: PRE_ROLL_FRAMES,
-        done: done.clone(),
-    };
+    config.done = done.clone();
 
     // Find the workspace root for asset path
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -469,7 +539,14 @@ fn render_text_headless(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Create render config with test dimensions - MUST be done before TextRenderPlugin
-    let render_config = MsdfRenderConfig::new(width, height);
+    // Use Bgra8UnormSrgb to match the render target texture format created in setup_test_scene
+    let format = TextureFormat::Bgra8UnormSrgb;
+    let render_config = MsdfRenderConfig::new(config.width, config.height)
+        .with_format(format);
+    let width = config.width;
+    let height = config.height;
+    let is_bgra = matches!(format,
+        TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb);
 
     App::new()
         .add_plugins(
@@ -509,6 +586,7 @@ fn render_text_headless(
         pixels,
         width,
         height,
+        is_bgra,
     }
 }
 
@@ -528,7 +606,7 @@ fn setup_test_scene(
 
     // Create render target texture
     let mut render_target =
-        Image::new_target_texture(size.width, size.height, TextureFormat::bevy_default(), None);
+        Image::new_target_texture(size.width, size.height, TextureFormat::Bgra8UnormSrgb, None);
     render_target.texture_descriptor.usage |= TextureUsages::COPY_SRC;
     let render_target_handle = images.add(render_target);
 
@@ -559,25 +637,37 @@ fn setup_test_scene(
         let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
         let attrs = cosmic_text::Attrs::new().family(font_family);
         buffer.set_text(&mut fs, &config.text, attrs, cosmic_text::Shaping::Advanced);
+        buffer.set_color(config.color);
         buffer.visual_line_count(&mut fs, config.width as f32);
 
-        // Position text at top-left with some padding
+        // Position and scale from config
         let text_config = MsdfTextAreaConfig {
-            left: 10.0,
-            top: 10.0,
-            scale: 1.0,
+            left: config.left,
+            top: config.top,
+            scale: config.scale,
             bounds: super::TextBounds {
                 left: 0,
                 top: 0,
                 right: config.width as i32,
                 bottom: config.height as i32,
             },
-            default_color: Color::WHITE,
+            default_color: config.color,
+        };
+
+        // Build effects if enabled
+        let effects = if config.glow {
+            SdfTextEffects {
+                rainbow: false,
+                glow: Some(GlowConfig::default()),
+            }
+        } else {
+            SdfTextEffects::default()
         };
 
         commands.spawn((
             buffer,
             text_config,
+            effects,
             MsdfText,
             Visibility::Visible,
             InheritedVisibility::VISIBLE,
@@ -767,4 +857,212 @@ fn multi_char_sequence() {
         // Each character ~15-20px wide, so total ~45-60px minimum
         assert!(w >= 40, "ABC should be at least 40px wide, got {}", w);
     }
+}
+
+// ============================================================================
+// EXTENDED GPU TESTS
+// ============================================================================
+
+/// Test 6: Text wrapping produces multiple lines.
+///
+/// Long text should wrap at the boundary and produce taller output.
+#[test]
+fn text_wraps_to_multiple_lines() {
+    // Single line
+    let single = render_text_headless("Hello", 24.0, 200, 100, false);
+    // Text that should wrap (narrow width forces wrap)
+    let wrapped = render_text_headless("Hello World Test", 24.0, 80, 150, false);
+
+    single.save_png("wrap_single_line");
+    wrapped.save_png("wrap_multi_line");
+
+    let single_bbox = single.bounding_box();
+    let wrapped_bbox = wrapped.bounding_box();
+
+    match (single_bbox, wrapped_bbox) {
+        (Some((_, _, _, sh)), Some((_, _, _, wh))) => {
+            // Wrapped text should be taller (multiple lines)
+            assert!(
+                wh > sh,
+                "Wrapped text should be taller: single={}px, wrapped={}px",
+                sh, wh
+            );
+        }
+        _ => {
+            panic!("Couldn't measure text heights");
+        }
+    }
+}
+
+/// Test 7: Scale factor affects rendered size.
+///
+/// scale=2.0 should render text 2x larger.
+#[test]
+fn scale_factor_affects_size() {
+    let normal = render_text_headless("A", 16.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+
+    let config = TestConfig::new("A", 16.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false)
+        .with_scale(2.0);
+    let scaled = render_with_config(config);
+
+    normal.save_png("scale_normal");
+    scaled.save_png("scale_2x");
+
+    let normal_bbox = normal.bounding_box();
+    let scaled_bbox = scaled.bounding_box();
+
+    match (normal_bbox, scaled_bbox) {
+        (Some((_, _, nw, nh)), Some((_, _, sw, sh))) => {
+            let width_ratio = sw as f32 / nw as f32;
+            let height_ratio = sh as f32 / nh as f32;
+
+            assert!(
+                width_ratio > 1.7 && width_ratio < 2.3,
+                "scale=2.0 should ~double width: ratio={}",
+                width_ratio
+            );
+            assert!(
+                height_ratio > 1.7 && height_ratio < 2.3,
+                "scale=2.0 should ~double height: ratio={}",
+                height_ratio
+            );
+        }
+        _ => {
+            panic!("Couldn't measure bounding boxes");
+        }
+    }
+}
+
+/// Test 8: Text position offset works correctly.
+///
+/// Text at (100, 50) should have its bounding box start near that position.
+#[test]
+fn position_offset_works() {
+    let config = TestConfig::new("X", 24.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false)
+        .with_position(100.0, 50.0);
+    let output = render_with_config(config);
+    output.save_png("position_offset");
+
+    if let Some((x, y, _, _)) = output.bounding_box() {
+        // Allow some tolerance for anchor offset and antialiasing
+        assert!(
+            x >= 90 && x <= 120,
+            "Text at left=100 should start near x=100, got x={}",
+            x
+        );
+        assert!(
+            y >= 40 && y <= 70,
+            "Text at top=50 should start near y=50, got y={}",
+            y
+        );
+    } else {
+        panic!("Text should be visible");
+    }
+}
+
+/// Test 9: Colored text renders with that color.
+///
+/// Red text should have red pixels (r > g, r > b).
+#[test]
+fn colored_text_renders() {
+    let config = TestConfig::new("X", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false)
+        .with_color(Color::srgb(1.0, 0.0, 0.0)); // Pure red
+    let output = render_with_config(config);
+    output.save_png("colored_red");
+
+    // Find a bright pixel and check its color
+    // Note: pure red (255,0,0) has luminance ~0.3, so we use a lower threshold
+    let mut found_red = false;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            let px = output.pixel(x, y);
+            if px.luminance() > 0.2 {
+                // This is a text pixel - check it's reddish
+                if px.r > 200 && px.g < 100 && px.b < 100 {
+                    found_red = true;
+                    break;
+                }
+            }
+        }
+        if found_red {
+            break;
+        }
+    }
+
+    assert!(found_red, "Red text should have red pixels");
+}
+
+/// Test 10: Glow effect expands the visible area.
+///
+/// Text with glow should have more visible pixels than without.
+#[test]
+fn glow_effect_expands_bounds() {
+    let normal = render_text_headless("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+
+    let config = TestConfig::new("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false)
+        .with_glow();
+    let glowing = render_with_config(config);
+
+    normal.save_png("glow_off");
+    glowing.save_png("glow_on");
+
+    let normal_pixels = normal.count_visible_pixels();
+    let glow_pixels = glowing.count_visible_pixels();
+
+    // Glow should add pixels around the text
+    assert!(
+        glow_pixels > normal_pixels,
+        "Glow should add visible pixels: normal={}, glow={}",
+        normal_pixels, glow_pixels
+    );
+}
+
+/// Test 11: Punctuation and special characters render.
+///
+/// Common punctuation should produce visible output.
+#[test]
+fn punctuation_renders() {
+    let output = render_text_headless("!@#$%", 24.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+    output.save_png("punctuation");
+
+    let visible = output.count_visible_pixels();
+    assert!(
+        visible > 50,
+        "Punctuation should render visible pixels, got {}",
+        visible
+    );
+}
+
+/// Test 12: Numbers render correctly.
+#[test]
+fn numbers_render() {
+    let output = render_text_headless("0123456789", 24.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+    output.save_png("numbers");
+
+    // Should have a wide bounding box for 10 digits
+    if let Some((_, _, w, _)) = output.bounding_box() {
+        assert!(w >= 100, "10 digits should be at least 100px wide, got {}", w);
+    } else {
+        panic!("Numbers should be visible");
+    }
+}
+
+/// Test 13: Empty string doesn't crash and renders blank.
+#[test]
+fn empty_string_renders_blank() {
+    let output = render_text_headless("", 24.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+    output.save_png("empty_string");
+
+    let visible = output.count_visible_pixels();
+    assert_eq!(visible, 0, "Empty string should render no visible pixels");
+}
+
+/// Test 14: Whitespace-only string renders blank.
+#[test]
+fn whitespace_only_renders_blank() {
+    let output = render_text_headless("   ", 24.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+    output.save_png("whitespace_only");
+
+    let visible = output.count_visible_pixels();
+    assert_eq!(visible, 0, "Whitespace-only should render no visible pixels");
 }
