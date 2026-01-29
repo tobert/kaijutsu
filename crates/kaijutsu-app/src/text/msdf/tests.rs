@@ -63,6 +63,24 @@ struct MainWorldReceiver(Receiver<Vec<u8>>);
 #[derive(Resource, Clone)]
 struct RenderWorldSender(Sender<Vec<u8>>);
 
+/// Font family for tests.
+#[derive(Clone, Copy, Debug)]
+enum TestFontFamily {
+    Serif,
+    SansSerif,
+    Monospace,
+}
+
+impl TestFontFamily {
+    fn to_cosmic(&self) -> cosmic_text::Family<'static> {
+        match self {
+            TestFontFamily::Serif => cosmic_text::Family::Serif,
+            TestFontFamily::SansSerif => cosmic_text::Family::SansSerif,
+            TestFontFamily::Monospace => cosmic_text::Family::Monospace,
+        }
+    }
+}
+
 /// Test scene configuration.
 #[derive(Resource)]
 struct TestConfig {
@@ -70,7 +88,7 @@ struct TestConfig {
     font_size: f32,
     width: u32,
     height: u32,
-    use_monospace: bool,
+    font_family: TestFontFamily,
     /// Text position offset from top-left.
     left: f32,
     top: f32,
@@ -93,7 +111,11 @@ impl TestConfig {
             font_size,
             width,
             height,
-            use_monospace,
+            font_family: if use_monospace {
+                TestFontFamily::Monospace
+            } else {
+                TestFontFamily::Serif
+            },
             left: 10.0,
             top: 10.0,
             scale: 1.0,
@@ -122,6 +144,11 @@ impl TestConfig {
 
     fn with_glow(mut self) -> Self {
         self.glow = true;
+        self
+    }
+
+    fn with_font_family(mut self, family: TestFontFamily) -> Self {
+        self.font_family = family;
         self
     }
 }
@@ -447,6 +474,7 @@ impl TestOutput {
     }
 
     /// Measure gap between glyphs by finding columns with no/few pixels.
+    #[allow(dead_code)]
     fn measure_glyph_gap(&self, threshold: f32) -> Option<u32> {
         let mut gap_start = None;
         let mut gap_end = None;
@@ -624,11 +652,7 @@ fn setup_test_scene(
     commands.spawn(RenderTargetImage(render_target_handle));
 
     // Create MSDF text
-    let font_family = if config.use_monospace {
-        cosmic_text::Family::Monospace
-    } else {
-        cosmic_text::Family::Serif
-    };
+    let font_family = config.font_family.to_cosmic();
 
     // Initialize text buffer
     let metrics = cosmic_text::Metrics::new(config.font_size, config.font_size * 1.2);
@@ -757,35 +781,37 @@ fn mono_spacing_consistent() {
     }
 }
 
-/// Test 3: Kerning visible - AV should be tighter than AA.
+/// Test 3: Kerning visible - AV should be narrower than AA.
 ///
-/// Verifies that kerning pairs render correctly.
+/// Verifies that kerning pairs render correctly by measuring total width.
+/// With proper kerning, the V tucks under the A, making "AV" narrower than "AA".
 #[test]
-fn kerning_av_tighter_than_aa() {
+fn kerning_av_narrower_than_aa() {
     let av_output = render_text_headless("AV", 32.0, 150, DEFAULT_HEIGHT, false);
     let aa_output = render_text_headless("AA", 32.0, 150, DEFAULT_HEIGHT, false);
 
     av_output.save_png("kerning_av");
     aa_output.save_png("kerning_aa");
 
-    // Measure gaps
-    let av_gap = av_output.measure_glyph_gap(0.02);
-    let aa_gap = aa_output.measure_glyph_gap(0.02);
+    // Measure bounding box widths
+    let av_bbox = av_output.bounding_box();
+    let aa_bbox = aa_output.bounding_box();
 
-    // AV should have smaller gap due to kerning (V tucks under A)
-    match (av_gap, aa_gap) {
-        (Some(av), Some(aa)) => {
-            // Note: If kerning isn't working, they'll be similar
-            // We allow this test to pass but warn if kerning seems missing
-            if av >= aa {
-                eprintln!(
-                    "WARNING: AV gap ({}) >= AA gap ({}). Kerning may not be working.",
-                    av, aa
-                );
-            }
+    match (av_bbox, aa_bbox) {
+        (Some((_, _, av_width, _)), Some((_, _, aa_width, _))) => {
+            eprintln!("AV width: {}, AA width: {}", av_width, aa_width);
+
+            // AV should be at least 5% narrower than AA due to kerning
+            // (V tucks under A significantly in most fonts)
+            assert!(
+                av_width < aa_width,
+                "KERNING BROKEN: AV ({}) should be narrower than AA ({}) due to kern pair",
+                av_width,
+                aa_width
+            );
         }
         _ => {
-            eprintln!("WARNING: Couldn't measure glyph gaps reliably");
+            panic!("Could not measure bounding boxes for kerning test");
         }
     }
 }
@@ -1065,4 +1091,334 @@ fn whitespace_only_renders_blank() {
 
     let visible = output.count_visible_pixels();
     assert_eq!(visible, 0, "Whitespace-only should render no visible pixels");
+}
+
+// ============================================================================
+// NON-GPU LAYOUT TESTS (cosmic-text verification)
+// ============================================================================
+
+/// Test 15: Verify kerning at the cosmic-text layout level (no GPU).
+///
+/// This checks that cosmic-text applies kerning during shaping.
+/// The second glyph in "AV" should have a smaller x position than in "AA"
+/// due to the negative kern pair.
+#[test]
+fn cosmic_text_applies_kerning() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(32.0, 38.4);
+
+    // Create buffer for "AV"
+    let mut av_buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Serif);
+    av_buffer.set_text(&mut font_system, "AV", attrs.clone(), Shaping::Advanced);
+    av_buffer.visual_line_count(&mut font_system, 400.0);
+    let av_positions = av_buffer.glyph_positions();
+
+    // Create buffer for "AA"
+    let mut aa_buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    aa_buffer.set_text(&mut font_system, "AA", attrs, Shaping::Advanced);
+    aa_buffer.visual_line_count(&mut font_system, 400.0);
+    let aa_positions = aa_buffer.glyph_positions();
+
+    assert_eq!(av_positions.len(), 2, "AV should have 2 glyphs");
+    assert_eq!(aa_positions.len(), 2, "AA should have 2 glyphs");
+
+    // Both first glyphs (A) should start at same x
+    let av_first_x = av_positions[0].0;
+    let aa_first_x = aa_positions[0].0;
+    assert!(
+        (av_first_x - aa_first_x).abs() < 0.1,
+        "First A should be at same x: AV={}, AA={}",
+        av_first_x,
+        aa_first_x
+    );
+
+    // The second glyph should be at different x due to kerning
+    let av_second_x = av_positions[1].0;
+    let aa_second_x = aa_positions[1].0;
+
+    eprintln!("AV glyph positions: {:?}", av_positions);
+    eprintln!("AA glyph positions: {:?}", aa_positions);
+    eprintln!("AV second glyph x: {}", av_second_x);
+    eprintln!("AA second glyph x: {}", aa_second_x);
+
+    // V should be closer to A than the second A is (negative kern)
+    assert!(
+        av_second_x < aa_second_x,
+        "KERNING MISSING: V in 'AV' should be closer (x={}) than A in 'AA' (x={})",
+        av_second_x,
+        aa_second_x
+    );
+}
+
+/// Test 16: NORMAL text - investigate NO spacing bug.
+///
+/// The live app uses SansSerif at 14px. "NO" letters appear to touch.
+#[test]
+fn normal_text_spacing_sansserif() {
+    // Match live app: SansSerif at 14px
+    let config = TestConfig::new("NORMAL", 14.0, 200, 50, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let output = render_with_config(config);
+    output.save_png("normal_sansserif");
+
+    // Also test just "NO" to isolate
+    let no_config = TestConfig::new("NO", 14.0, 100, 50, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let no_output = render_with_config(no_config);
+    no_output.save_png("no_sansserif");
+
+    eprintln!("NORMAL (SansSerif) bounding box: {:?}", output.bounding_box());
+    eprintln!("NO (SansSerif) bounding box: {:?}", no_output.bounding_box());
+}
+
+/// Test 17: Compare Serif vs SansSerif for "NORMAL".
+#[test]
+fn normal_text_serif_vs_sansserif() {
+    // Serif version (what tests were using)
+    let serif_output = render_text_headless("NORMAL", 14.0, 200, 50, false);
+    serif_output.save_png("normal_serif");
+
+    // SansSerif version (what live app uses)
+    let sansserif_config = TestConfig::new("NORMAL", 14.0, 200, 50, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let sansserif_output = render_with_config(sansserif_config);
+    sansserif_output.save_png("normal_sansserif_compare");
+
+    eprintln!("Serif bbox: {:?}", serif_output.bounding_box());
+    eprintln!("SansSerif bbox: {:?}", sansserif_output.bounding_box());
+}
+
+/// Test 18: Check cosmic-text glyph positions for "NORMAL" in SansSerif.
+#[test]
+fn normal_sansserif_glyph_positions() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(14.0, 16.8); // 14px with 1.2x line height
+
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::SansSerif);
+    buffer.set_text(&mut font_system, "NORMAL", attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0);
+
+    let positions = buffer.glyph_positions();
+
+    eprintln!("NORMAL glyph positions ({} glyphs):", positions.len());
+    for (i, (x, y)) in positions.iter().enumerate() {
+        let ch = "NORMAL".chars().nth(i).unwrap_or('?');
+        eprintln!("  [{}] '{}': ({:.2}, {:.2})", i, ch, x, y);
+    }
+
+    // Check N-O gap (positions 0 and 1)
+    if positions.len() >= 2 {
+        let n_x = positions[0].0;
+        let o_x = positions[1].0;
+        let gap = o_x - n_x;
+        eprintln!("N-O gap: {:.2} (N at {:.2}, O at {:.2})", gap, n_x, o_x);
+
+        // N should take about 10px at 14px font size, so gap should be ~10+
+        assert!(
+            gap > 5.0,
+            "N-O gap ({:.2}) seems too small for 14px font",
+            gap
+        );
+    }
+}
+
+/// Test 19: Gap between two I letters must have at least one empty column.
+///
+/// This test renders "II" (two vertical bars) and verifies there's a gap.
+/// Using I avoids N's diagonal complicating the column analysis.
+/// If glyphs overlap with no empty column between them, the test fails.
+#[test]
+fn gap_between_simple_glyphs() {
+    // Render "II" at 32px SansSerif - two simple vertical bars
+    let config = TestConfig::new("II", 32.0, 150, 80, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let output = render_with_config(config);
+    output.save_png("no_gap_test");
+
+    // Scan columns to find glyph regions and gaps
+    // Use a luminance threshold to ignore faint antialiasing
+    // A column is "solid" if it has pixels above the threshold
+    const SOLID_THRESHOLD: f32 = 0.5; // Ignore faint AA pixels
+
+    let mut column_has_solid: Vec<bool> = Vec::new();
+    let mut column_max_lum: Vec<f32> = Vec::new();
+    for x in 0..output.width {
+        let mut max_lum: f32 = 0.0;
+        for y in 0..output.height {
+            let lum = output.pixel(x, y).luminance();
+            if lum > max_lum {
+                max_lum = lum;
+            }
+        }
+        column_max_lum.push(max_lum);
+        column_has_solid.push(max_lum > SOLID_THRESHOLD);
+    }
+
+    // Find transitions: solid -> gap -> solid indicates separation
+    // We expect: empty... solid(N)... gap... solid(O)... empty
+    let mut in_solid = false;
+    let mut glyph_regions: Vec<(u32, u32)> = Vec::new(); // (start, end) of each solid region
+    let mut current_start = 0u32;
+
+    for (x, &is_solid) in column_has_solid.iter().enumerate() {
+        if is_solid && !in_solid {
+            // Entering a solid region
+            current_start = x as u32;
+            in_solid = true;
+        } else if !is_solid && in_solid {
+            // Exiting a solid region
+            glyph_regions.push((current_start, x as u32 - 1));
+            in_solid = false;
+        }
+    }
+    // Handle case where glyph extends to the edge
+    if in_solid {
+        glyph_regions.push((current_start, output.width - 1));
+    }
+
+    eprintln!("Found {} glyph regions: {:?}", glyph_regions.len(), glyph_regions);
+
+    // Debug: print pixel values for each column if glyphs are merged
+    if glyph_regions.len() == 1 {
+        let (start, end) = glyph_regions[0];
+        eprintln!("\nColumn-by-column analysis (looking for the gap):");
+        for x in start..=end {
+            let mut max_luminance: f32 = 0.0;
+            let mut visible_count = 0;
+            for y in 0..output.height {
+                let p = output.pixel(x, y);
+                if p.is_visible() {
+                    visible_count += 1;
+                    let lum = p.luminance();
+                    if lum > max_luminance {
+                        max_luminance = lum;
+                    }
+                }
+            }
+            eprintln!("  col {:2}: {:2} visible, max_lum {:.3}", x, visible_count, max_luminance);
+        }
+    }
+
+    // For "NO" we expect 2 separate glyph regions with a gap between them
+    // If we only find 1 region, the glyphs are overlapping!
+    assert!(
+        glyph_regions.len() >= 2,
+        "GLYPH OVERLAP BUG: Expected 2 separate glyph regions for 'NO', but found {}. \
+         The glyphs are visually merged with no empty column between them! \
+         Regions found: {:?}",
+        glyph_regions.len(),
+        glyph_regions
+    );
+
+    // Measure the gap between the first two regions
+    if glyph_regions.len() >= 2 {
+        let gap_start = glyph_regions[0].1 + 1;
+        let gap_end = glyph_regions[1].0;
+        let gap_width = if gap_end > gap_start { gap_end - gap_start } else { 0 };
+        eprintln!(
+            "Gap between glyphs: columns {} to {} ({} empty columns)",
+            gap_start, gap_end, gap_width
+        );
+    }
+
+    // Debug: print pixel values for each column in the glyph region
+    if glyph_regions.len() == 1 {
+        let (start, end) = glyph_regions[0];
+        eprintln!("\nColumn-by-column analysis (where N ends, O begins):");
+        // Focus on the expected gap region (around x=20 based on cosmic-text positions)
+        for x in start..=end {
+            let mut max_luminance: f32 = 0.0;
+            let mut visible_count = 0;
+            for y in 0..output.height {
+                let p = output.pixel(x, y);
+                if p.is_visible() {
+                    visible_count += 1;
+                    let lum = p.luminance();
+                    if lum > max_luminance {
+                        max_luminance = lum;
+                    }
+                }
+            }
+            if visible_count > 0 {
+                eprintln!("  col {}: {} visible pixels, max luminance {:.3}", x, visible_count, max_luminance);
+            }
+        }
+    }
+}
+
+/// Test 20: "NO" at 14px must have an empty column between the letters.
+///
+/// At 14px SansSerif, "NO" should have at least one column with no visible
+/// pixels between N's right edge and O's left edge.
+///
+/// THIS TEST IS EXPECTED TO FAIL until the glyph overlap bug is fixed.
+#[test]
+fn no_at_14px_must_have_gap() {
+    // Match the exact live app configuration
+    let config = TestConfig::new("NO", 14.0, 80, 40, false)
+        .with_font_family(TestFontFamily::SansSerif);
+    let output = render_with_config(config);
+    output.save_png("no_14px_must_have_gap");
+
+    // Scan columns for visible pixels
+    let mut column_counts: Vec<(u32, u32)> = Vec::new();
+    for x in 0..output.width {
+        let mut count = 0u32;
+        for y in 0..output.height {
+            if output.pixel(x, y).is_visible() {
+                count += 1;
+            }
+        }
+        column_counts.push((x, count));
+    }
+
+    // Based on the column analysis:
+    // - N spans columns 10-20 (left bar at 10-11, diagonal 12-18, right bar 19-20)
+    // - O spans columns 21-32
+    // The transition is between col 20 (N's right edge) and col 21 (O's left edge)
+    //
+    // For there to be a VISIBLE gap, we need at least one column between N and O
+    // with ZERO pixels. Currently cols 20 and 21 both have pixels (14 and 12).
+
+    eprintln!("Column analysis for 'NO' at 14px:");
+    for (x, count) in &column_counts {
+        if *count > 0 {
+            eprintln!("  col {:2}: {:2} pixels", x, count);
+        }
+    }
+
+    // Find the transition zone: where N ends and O begins
+    // N's right bar should be around cols 19-20 (high pixel count ~14)
+    // O's left edge should start around col 21
+    // Check columns 19-22 for the transition
+    let transition_zone_start = 19u32;
+    let transition_zone_end = 22u32;
+
+    let transition_cols: Vec<_> = column_counts.iter()
+        .filter(|(x, _)| *x >= transition_zone_start && *x <= transition_zone_end)
+        .collect();
+
+    eprintln!("\nTransition zone (cols {}-{}):", transition_zone_start, transition_zone_end);
+    for (x, count) in &transition_cols {
+        eprintln!("  col {:2}: {:2} pixels", x, count);
+    }
+
+    // Check if there's at least one column with 0 pixels in the transition zone
+    let has_gap = transition_cols.iter().any(|(_, count)| *count == 0);
+
+    assert!(
+        has_gap,
+        "NO GAP BETWEEN N AND O: The transition zone (cols {}-{}) has no empty column. \
+         N's right edge (col 20: {} px) directly abuts O's left edge (col 21: {} px). \
+         The glyphs are visually merged - this is the rendering bug.",
+        transition_zone_start, transition_zone_end,
+        column_counts.iter().find(|(x, _)| *x == 20).map(|(_, c)| *c).unwrap_or(0),
+        column_counts.iter().find(|(x, _)| *x == 21).map(|(_, c)| *c).unwrap_or(0)
+    );
 }
