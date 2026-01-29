@@ -147,10 +147,10 @@ impl MsdfTextBuffer {
 
                 self.glyphs.push(PositionedGlyph {
                     key,
-                    x: glyph.x,
-                    // line_y is baseline position, glyph.y is vertical offset from baseline
-                    // (e.g., for superscripts, subscripts, or font-specific adjustments)
-                    y: line_y + glyph.y,
+                    // x is pen position, x_offset contains kerning and other per-glyph adjustments
+                    x: glyph.x + glyph.x_offset,
+                    // line_y is baseline position, glyph.y + y_offset for vertical adjustments
+                    y: line_y + glyph.y + glyph.y_offset,
                     font_size,
                     color: self.default_color,
                 });
