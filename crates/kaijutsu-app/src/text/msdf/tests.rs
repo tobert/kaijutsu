@@ -1352,14 +1352,14 @@ fn gap_between_simple_glyphs() {
     }
 }
 
-/// Test 20: "NO" at 14px renders correctly without overlap artifacts.
+/// Test 20: "NO" at 14px renders with proper letter separation.
 ///
-/// At 14px SansSerif, "NO" may not have an empty column between the letters
-/// due to the font's metrics at this size. This is expected behavior, not a bug.
+/// At 14px SansSerif, "NO" should have clear visual separation between letters.
+/// With proper MSDF rendering, the glyphs should not overlap or blend together.
 ///
 /// This test verifies:
 /// 1. Both N and O render with appropriate pixel counts
-/// 2. The letters are distinguishable (no excessive merging from overlap artifacts)
+/// 2. The letters have visible separation (gap or low-density transition zone)
 /// 3. Total width is reasonable for the font size
 #[test]
 fn no_at_14px_renders_correctly() {
@@ -1409,8 +1409,9 @@ fn no_at_14px_renders_correctly() {
         height
     );
 
-    // The transition zone (around cols 19-22) should show a change in pixel density
-    // indicating the boundary between N and O, even if there's no empty column
+    // Find the transition zone between N and O
+    // N ends around col 19, O starts around col 21
+    // We look for either a gap (empty column) or a low-density transition
     let transition_zone_start = 19u32;
     let transition_zone_end = 22u32;
 
@@ -1423,9 +1424,12 @@ fn no_at_14px_renders_correctly() {
         eprintln!("  col {:2}: {:2} pixels", x, count);
     }
 
-    // Verify N's right edge (col 19-20) has high pixel count (vertical bar)
-    // and O's left edge (col 21-22) shows the curved edge with fewer pixels
-    // This pattern indicates proper glyph separation even without an empty column
+    // Check that there's a clear transition between N and O
+    // This could be an empty column (gap) or a significant drop in pixel density
+    let col_19_count = column_counts.iter()
+        .find(|(x, _)| *x == 19)
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
     let col_20_count = column_counts.iter()
         .find(|(x, _)| *x == 20)
         .map(|(_, c)| *c)
@@ -1435,15 +1439,37 @@ fn no_at_14px_renders_correctly() {
         .map(|(_, c)| *c)
         .unwrap_or(0);
 
-    // N's right bar should have high pixel count, O's left edge typically fewer
-    // (O is curved, N has a straight vertical bar)
+    // N's right edge (col 19) should have visible pixels
     assert!(
-        col_20_count > 0 && col_21_count > 0,
-        "Both N (col 20: {}) and O (col 21: {}) should have visible pixels",
-        col_20_count, col_21_count
+        col_19_count > 0,
+        "N's right edge (col 19: {}) should have visible pixels",
+        col_19_count
     );
 
-    eprintln!("\n✓ NO renders correctly at 14px (letters may touch but are distinguishable)");
+    // O's left edge (col 21) should have visible pixels
+    assert!(
+        col_21_count > 0,
+        "O's left edge (col 21: {}) should have visible pixels",
+        col_21_count
+    );
+
+    // The transition (col 20) should either be empty or show reduced density
+    // indicating proper separation between the glyphs
+    let has_gap = col_20_count == 0;
+    let has_transition = col_20_count < col_19_count && col_20_count < col_21_count;
+
+    assert!(
+        has_gap || has_transition,
+        "Letters should have clear separation: col 19={}, col 20={}, col 21={} \
+         (expect col 20 to be empty or lower than neighbors)",
+        col_19_count, col_20_count, col_21_count
+    );
+
+    if has_gap {
+        eprintln!("\n✓ NO renders correctly at 14px with gap between letters");
+    } else {
+        eprintln!("\n✓ NO renders correctly at 14px with density transition between letters");
+    }
 }
 
 /// Diagnostic test: inspect cosmic-text glyph positions and offsets.
