@@ -1453,26 +1453,31 @@ fn diagnostic_cosmic_text_positions() {
     use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
     let mut font_system = FontSystem::new();
-    let metrics = Metrics::new(14.0, 16.8); // 14px font, 1.2 line height
+    let metrics = Metrics::new(15.0, 22.5); // 15px font, 1.5 line height (app default)
 
+    // Test with Monospace (what the app uses for content)
     let mut buffer = Buffer::new(&mut font_system, metrics);
     buffer.set_size(&mut font_system, Some(400.0), None);
 
-    let attrs = Attrs::new().family(cosmic_text::Family::SansSerif);
-    buffer.set_text(&mut font_system, "gray", &attrs, Shaping::Advanced, None);
+    let test_text = "skies of gray";
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, test_text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(&mut font_system, false);
 
-    eprintln!("\nCosmic-text glyph positions for 'gray' at 14px:");
-    eprintln!("================================================");
+    eprintln!("\nCosmic-text glyph positions for '{}' MONOSPACE at 15px:", test_text);
+    eprintln!("================================================================");
 
     for run in buffer.layout_runs() {
         eprintln!("Run line_y={}", run.line_y);
+        let mut prev_x = 0.0f32;
         for glyph in run.glyphs {
-            let text = &"gray"[glyph.start..glyph.end];
+            let text = &test_text[glyph.start..glyph.end];
+            let gap = glyph.x - prev_x;
             eprintln!(
-                "  '{}' (glyph_id={}): x={:.2}, y={:.2}, w={:.2}, x_offset={:.2}, y_offset={:.2}",
-                text, glyph.glyph_id, glyph.x, glyph.y, glyph.w, glyph.x_offset, glyph.y_offset
+                "  '{}' (glyph_id={:3}): x={:6.2}, w={:5.2}, gap_from_prev={:5.2}, x_offset={:.2}",
+                text, glyph.glyph_id, glyph.x, glyph.w, gap, glyph.x_offset
             );
+            prev_x = glyph.x + glyph.w;
         }
     }
     eprintln!();
@@ -1590,6 +1595,64 @@ fn monospace_text_kerning() {
     assert!(bbox.is_some(), "Text should render");
     let (min_x, _, width, height) = bbox.unwrap();
     eprintln!("\nBounding box: x={}, {}x{}", min_x, width, height);
+}
+
+/// Detailed pixel analysis for "ab" to check letter spacing.
+///
+/// This test renders just two letters and shows a visual map of where
+/// pixels are rendered, helping identify overlap or spacing issues.
+#[test]
+fn detailed_pixel_analysis_ab() {
+    let config = TestConfig::new("ab", 15.0, 50, 30, true); // monospace
+    let output = render_with_config(config);
+    output.save_png("monospace_ab_detail");
+
+    eprintln!("\n=== Pixel map for 'ab' monospace 15px ===");
+    eprintln!("Legend: . = empty, # = opaque, + = semi-transparent");
+
+    // Find vertical bounds of content
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).is_visible() {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    // Print pixel map showing actual color, not just alpha
+    for y in min_y.saturating_sub(1)..=(max_y + 1).min(output.height - 1) {
+        eprint!("y{:02}: ", y);
+        for x in 0..output.width.min(40) {
+            let pixel = output.pixel(x, y);
+            // Check if pixel is text (bright) or background (dark)
+            let brightness = (pixel.r as u16 + pixel.g as u16 + pixel.b as u16) / 3;
+            if brightness < 20 {
+                eprint!(".");  // dark = background
+            } else if brightness > 200 {
+                eprint!("#");  // bright = text
+            } else {
+                eprint!("+");  // mid = antialiasing
+            }
+        }
+        eprintln!();
+    }
+
+    // Show column-by-column alpha values for the middle row
+    let mid_y = (min_y + max_y) / 2;
+    eprintln!("\nAlpha values at y={} (middle of text):", mid_y);
+    for x in 0..output.width.min(40) {
+        let pixel = output.pixel(x, mid_y);
+        if pixel.a > 0 {
+            eprintln!("  x={:2}: alpha={:3}", x, pixel.a);
+        }
+    }
+
+    // Calculate where letter boundary should be (at 9px advance)
+    eprintln!("\nExpected: 'a' ends around x=19 (10+9), 'b' starts around x=19");
+    eprintln!("If letters overlap visually, there will be no empty columns around x=19");
 }
 
 /// Test that individual glyph rendering matches combined rendering.

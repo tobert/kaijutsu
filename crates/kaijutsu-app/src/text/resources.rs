@@ -60,7 +60,37 @@ pub struct SharedFontSystem(pub Arc<Mutex<FontSystem>>);
 
 impl Default for SharedFontSystem {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(FontSystem::new())))
+        Self::new()
+    }
+}
+
+impl SharedFontSystem {
+    /// Create a new SharedFontSystem with bundled Noto fonts.
+    ///
+    /// This ensures consistent rendering across different systems by loading
+    /// our own fonts rather than relying on system font fallback.
+    pub fn new() -> Self {
+        let mut font_system = FontSystem::new();
+
+        // Load bundled Noto fonts for consistent rendering
+        // These paths are relative to the working directory (project root)
+        let font_paths = [
+            "assets/fonts/NotoMono-Regular.ttf",
+            "assets/fonts/NotoSerif-Regular.ttf",
+            // Fallback to test location if fonts haven't been moved yet
+            "assets/test/fonts/NotoMono-Regular.ttf",
+            "assets/test/fonts/NotoSerif-Regular.ttf",
+        ];
+
+        for path in &font_paths {
+            let path = std::path::Path::new(path);
+            if path.exists() {
+                font_system.db_mut().load_font_file(path).ok();
+                info!("Loaded font: {}", path.display());
+            }
+        }
+
+        Self(Arc::new(Mutex::new(font_system)))
     }
 }
 
