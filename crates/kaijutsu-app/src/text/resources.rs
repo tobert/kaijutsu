@@ -94,21 +94,63 @@ pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Text Resolution
+// MSDF Render Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Current screen resolution for text rendering.
-#[derive(Resource, Clone, Copy)]
-pub struct TextResolution {
-    pub width: u32,
-    pub height: u32,
+/// Render configuration for MSDF text.
+///
+/// This is the **single source of truth** for MSDF rendering parameters.
+/// It must be explicitly set before rendering can occur.
+///
+/// In windowed mode: Set by `sync_render_config_from_window` system.
+/// In headless/test mode: Set directly by the test harness.
+///
+/// The render world extracts this resource - it never guesses or falls back.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct MsdfRenderConfig {
+    /// Viewport resolution in physical pixels.
+    pub resolution: [f32; 2],
+    /// Texture format for the render target.
+    pub format: bevy::render::render_resource::TextureFormat,
+    /// Whether this config has been initialized.
+    /// Systems will skip rendering if this is false.
+    pub initialized: bool,
 }
 
-impl Default for TextResolution {
+impl Default for MsdfRenderConfig {
     fn default() -> Self {
         Self {
-            width: 1280,
-            height: 800,
+            resolution: [0.0, 0.0],
+            format: bevy::render::render_resource::TextureFormat::bevy_default(),
+            initialized: false,
         }
+    }
+}
+
+#[allow(dead_code)]
+impl MsdfRenderConfig {
+    /// Create a new initialized config with the given resolution.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            resolution: [width as f32, height as f32],
+            format: bevy::render::render_resource::TextureFormat::bevy_default(),
+            initialized: true,
+        }
+    }
+
+    /// Create config with explicit format (for matching window swap chain).
+    pub fn with_format(mut self, format: bevy::render::render_resource::TextureFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.resolution[0] as u32
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.resolution[1] as u32
     }
 }

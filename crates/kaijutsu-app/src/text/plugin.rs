@@ -11,9 +11,9 @@ use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;
 
 use super::msdf::{
-    extract_msdf_texts, init_msdf_resources, prepare_msdf_texts, MsdfAtlas, MsdfGenerator,
-    MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode,
-    MsdfUiText, UiTextPositionCache,
+    extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
+    MsdfAtlas, MsdfGenerator, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
+    MsdfTextRenderNode, MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -31,7 +31,7 @@ impl Plugin for TextRenderPlugin {
     fn build(&self, app: &mut App) {
         // Main world resources
         app.init_resource::<SharedFontSystem>()
-            .init_resource::<TextResolution>()
+            .init_resource::<MsdfRenderConfig>()
             .init_resource::<TextMetrics>();
 
         #[cfg(debug_assertions)]
@@ -39,7 +39,7 @@ impl Plugin for TextRenderPlugin {
             .init_resource::<MsdfDebugOverlay>();
 
         app.add_systems(Update, (
-                update_text_resolution,
+                sync_render_config_from_window,
                 init_ui_text_buffers,
                 update_ui_text_buffers,
                 sync_ui_text_config_positions,
@@ -68,7 +68,7 @@ impl Plugin for TextRenderPlugin {
 
         render_app
             .init_resource::<super::msdf::ExtractedMsdfTexts>()
-            .add_systems(ExtractSchedule, extract_msdf_texts)
+            .add_systems(ExtractSchedule, (extract_msdf_render_config, extract_msdf_texts))
             .add_systems(Render, prepare_msdf_texts.run_if(resource_exists::<super::msdf::MsdfTextResources>));
 
         // Add render node to the graph - after Upscaling (final post-processing step)
@@ -105,27 +105,32 @@ impl Plugin for TextRenderPlugin {
     }
 }
 
-/// Update the text resolution and scale factor when the window resizes.
-fn update_text_resolution(
+/// Sync MSDF render config from the primary window.
+///
+/// In windowed mode, this updates resolution and marks the config as initialized.
+/// In headless mode (no window), this system does nothing - tests must set the config directly.
+fn sync_render_config_from_window(
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut resolution: ResMut<TextResolution>,
+    mut config: ResMut<MsdfRenderConfig>,
     mut text_metrics: ResMut<TextMetrics>,
 ) {
-    if let Ok(window) = windows.single() {
-        let new_width = window.physical_width();
-        let new_height = window.physical_height();
+    let Ok(window) = windows.single() else {
+        return;
+    };
 
-        if resolution.width != new_width || resolution.height != new_height {
-            resolution.width = new_width;
-            resolution.height = new_height;
-        }
+    let new_width = window.physical_width() as f32;
+    let new_height = window.physical_height() as f32;
 
-        // Update scale factor for DPI-aware text rendering
-        let scale = window.scale_factor();
-        if (text_metrics.scale_factor - scale).abs() > 0.01 {
-            text_metrics.scale_factor = scale;
-            info!("TextMetrics scale_factor updated: {:.2}", scale);
-        }
+    if config.resolution[0] != new_width || config.resolution[1] != new_height {
+        config.resolution = [new_width, new_height];
+        config.initialized = true;
+    }
+
+    // Update scale factor for DPI-aware text rendering
+    let scale = window.scale_factor();
+    if (text_metrics.scale_factor - scale).abs() > 0.01 {
+        text_metrics.scale_factor = scale;
+        info!("TextMetrics scale_factor updated: {:.2}", scale);
     }
 }
 

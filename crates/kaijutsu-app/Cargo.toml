@@ -51,3 +51,8 @@ capnp-rpc.workspace = true
 
 # Scripting (for theme system)
 rhai.workspace = true
+
+[dev-dependencies]
+# Image handling for GPU tests
+image = "0.25"
+crossbeam-channel = "0.5"

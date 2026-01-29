@@ -20,12 +20,15 @@ pub mod buffer;
 pub mod generator;
 pub mod pipeline;
 
+#[cfg(test)]
+mod tests;
+
 pub use atlas::MsdfAtlas;
 pub use buffer::{MsdfTextAreaConfig, MsdfTextBuffer, TextBounds};
 pub use generator::MsdfGenerator;
 pub use pipeline::{
-    extract_msdf_texts, init_msdf_resources, prepare_msdf_texts, ExtractedMsdfTexts,
-    MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
+    extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
+    ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
 };
 
 use bevy::prelude::*;

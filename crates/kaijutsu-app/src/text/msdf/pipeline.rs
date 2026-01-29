@@ -18,6 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use super::atlas::MsdfAtlas;
 use super::buffer::{MsdfTextAreaConfig, MsdfTextBuffer, PositionedGlyph, TextBounds};
 use super::{MsdfText, SdfTextEffects};
+use crate::text::resources::MsdfRenderConfig;
 
 /// MSDF textures are generated at 32 pixels per em.
 pub const MSDF_PX_PER_EM: f32 = 32.0;
@@ -224,6 +225,20 @@ pub struct ExtractedMsdfAtlas {
 pub struct ExtractedMsdfDebugMode {
     /// Debug mode: 0=off, 1=dots, 2=dots+quads.
     pub mode: u32,
+}
+
+/// Extracted render configuration for MSDF text.
+///
+/// Extracted from `MsdfRenderConfig` in the main world.
+/// The pipeline will not render if this is not present or not initialized.
+#[derive(Resource, Clone, Copy)]
+pub struct ExtractedMsdfRenderConfig {
+    /// Viewport resolution in physical pixels.
+    pub resolution: [f32; 2],
+    /// Texture format for the render target.
+    pub format: TextureFormat,
+    /// Whether this config is valid for rendering.
+    pub initialized: bool,
 }
 
 /// Render world resources for MSDF text.
@@ -444,20 +459,46 @@ pub fn extract_msdf_texts(
     commands.insert_resource(ExtractedMsdfTexts { texts });
 }
 
+/// Extract render configuration from main world.
+///
+/// This extracts `MsdfRenderConfig` so the render world has explicit access
+/// to resolution and format. If the config is not initialized, rendering will be skipped.
+pub fn extract_msdf_render_config(
+    mut commands: Commands,
+    config: Extract<Res<MsdfRenderConfig>>,
+) {
+    commands.insert_resource(ExtractedMsdfRenderConfig {
+        resolution: config.resolution,
+        format: config.format,
+        initialized: config.initialized,
+    });
+}
+
 /// Prepare MSDF text resources for rendering.
+///
+/// Requires `ExtractedMsdfRenderConfig` to be present and initialized.
+/// Will skip rendering if the config is not ready.
 pub fn prepare_msdf_texts(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline: Res<MsdfTextPipeline>,
     extracted: Option<Res<ExtractedMsdfTexts>>,
     atlas: Option<Res<ExtractedMsdfAtlas>>,
+    render_config: Option<Res<ExtractedMsdfRenderConfig>>,
     images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>,
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
-    windows: Res<bevy::render::view::ExtractedWindows>,
     #[cfg(debug_assertions)]
     debug_mode: Option<Res<ExtractedMsdfDebugMode>>,
 ) {
+    // Require render config to be present and initialized
+    let Some(render_config) = render_config else {
+        return;
+    };
+    if !render_config.initialized {
+        return;
+    }
+
     let Some(extracted) = extracted else {
         return;
     };
@@ -471,13 +512,8 @@ pub fn prepare_msdf_texts(
         return;
     }
 
-    // Get viewport resolution
-    let resolution = windows
-        .windows
-        .values()
-        .next()
-        .map(|w| [w.physical_width as f32, w.physical_height as f32])
-        .unwrap_or([1280.0, 720.0]);
+    // Get viewport resolution from extracted config
+    let resolution = render_config.resolution;
 
     // Determine effects from first text (simplified - could be per-text)
     let effects = extracted.texts.first().map(|t| &t.effects);
@@ -651,22 +687,26 @@ pub fn prepare_msdf_texts(
 }
 
 /// Initialize MSDF text resources.
+///
+/// Requires `ExtractedMsdfRenderConfig` to be present and initialized.
+/// Will skip initialization if the config is not ready.
 pub fn init_msdf_resources(
     device: Res<RenderDevice>,
     pipeline_res: Res<MsdfTextPipeline>,
     pipeline_cache: Res<PipelineCache>,
     mut commands: Commands,
-    windows: Res<bevy::render::view::ExtractedWindows>,
+    render_config: Option<Res<ExtractedMsdfRenderConfig>>,
 ) {
-    // Get surface format
-    let Some(format) = windows
-        .windows
-        .values()
-        .next()
-        .and_then(|w| w.swap_chain_texture_format)
-    else {
+    // Require render config to be present and initialized
+    let Some(render_config) = render_config else {
         return;
     };
+    if !render_config.initialized {
+        return;
+    }
+
+    // Get format from extracted config
+    let format = render_config.format;
 
     // Create uniform buffer
     let uniform_buffer = device.create_buffer(&BufferDescriptor {
