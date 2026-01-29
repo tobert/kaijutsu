@@ -241,14 +241,19 @@ fn generate_glyph(
     // - msdfgen bitmap: Y=0 at bottom, Y increases UP
     // - Screen/pipeline: Y=0 at top, Y increases DOWN
     //
-    // The bitmap is sized to fit the glyph bounds plus msdf_range padding on each side.
-    // The glyph origin (0, 0) in font units is at:
-    //   X: msdf_range pixels from left edge, plus offset for bounds.left
-    //   Y: msdf_range pixels from bottom edge, plus offset for bounds.bottom
-    //
-    // For screen coordinates, we need anchor_y from the TOP of the bitmap.
-    let origin_bitmap_x = msdf_range - bounds.left * px_per_unit;
-    let origin_from_bottom = msdf_range - bounds.bottom * px_per_unit;
+    // For small glyphs that get expanded to minimum size (16x16), autoframe
+    // centers the content. We need to account for the actual padding, not
+    // assume fixed msdf_range padding.
+    let content_width = bounds.width() * px_per_unit;
+    let content_height = bounds.height() * px_per_unit;
+    let actual_padding_x = (width as f64 - content_width) / 2.0;
+    let actual_padding_y = (height as f64 - content_height) / 2.0;
+
+    // Origin position: padding + offset from bounds edge to origin
+    // bounds.left is where the shape starts relative to origin (can be negative)
+    // So origin is at: padding + (-bounds.left * px_per_unit)
+    let origin_bitmap_x = actual_padding_x - bounds.left * px_per_unit;
+    let origin_from_bottom = actual_padding_y - bounds.bottom * px_per_unit;
     let origin_from_top = height as f64 - origin_from_bottom;
 
     // Convert from bitmap pixels to em units
