@@ -1559,6 +1559,39 @@ fn gray_scaled_hidpi() {
     eprintln!("\n'gray' at 15px scale=1.5: width={}", width);
 }
 
+/// Test monospace font which is what the app actually uses for content.
+#[test]
+fn monospace_text_kerning() {
+    // This is the actual app configuration: Monospace at 15px
+    let config = TestConfig::new("skies of gray", 15.0, 200, 40, true); // true = monospace
+    let output = render_with_config(config);
+    output.save_png("monospace_skies_of_gray");
+
+    // Analyze column spacing
+    let mut column_counts: Vec<(u32, u32)> = Vec::new();
+    for x in 0..output.width {
+        let mut count = 0u32;
+        for y in 0..output.height {
+            if output.pixel(x, y).is_visible() {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            column_counts.push((x, count));
+        }
+    }
+
+    eprintln!("\nColumn analysis for 'skies of gray' monospace 15px:");
+    for (x, count) in &column_counts {
+        eprintln!("  col {:3}: {:2} pixels", x, count);
+    }
+
+    let bbox = output.bounding_box();
+    assert!(bbox.is_some(), "Text should render");
+    let (min_x, _, width, height) = bbox.unwrap();
+    eprintln!("\nBounding box: x={}, {}x{}", min_x, width, height);
+}
+
 /// Test that individual glyph rendering matches combined rendering.
 ///
 /// This verifies that when glyphs are rendered together, there's no
