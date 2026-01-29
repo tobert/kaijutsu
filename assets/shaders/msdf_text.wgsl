@@ -25,7 +25,7 @@ struct Uniforms {
 @group(0) @binding(2) var atlas_sampler: sampler;
 
 struct VertexInput {
-    @location(0) position: vec2<f32>,
+    @location(0) position: vec3<f32>,  // x, y in NDC, z for depth testing
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
 }
@@ -44,10 +44,11 @@ struct VertexOutput {
 @vertex
 fn vertex(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    // Use z from input for depth testing (earlier glyphs have lower z, winning depth test)
+    out.clip_position = vec4<f32>(in.position.xy, in.position.z, 1.0);
     out.uv = in.uv;
     out.color = in.color;
-    out.screen_pos = (in.position + 1.0) * 0.5 * uniforms.resolution;
+    out.screen_pos = (in.position.xy + 1.0) * 0.5 * uniforms.resolution;
     return out;
 }
 
@@ -69,11 +70,11 @@ fn screen_px_range(uv: vec2<f32>) -> f32 {
     let uv_fwidth = fwidth(uv);
     // Use the max change to be conservative (avoid aliasing)
     let pixel_dist = max(uv_fwidth.x, uv_fwidth.y);
-    
+
     // The range of the distance field in UV units
     // msdf_range is in pixels, so we divide by atlas size
     let unit_range = uniforms.msdf_range / atlas_size.x; // Assumes square pixels
-    
+
     // Calculate range in screen pixels
     // Value = (range_in_uv) / (uv_per_pixel)
     return max(unit_range / pixel_dist, 1.0);
@@ -92,8 +93,8 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
     let sd = min(msdf_sd, sample.a);
 
     let px_range = screen_px_range(uv);
-    // Convert distance to screen pixels with steeper falloff
-    // Multiplying by 2.0 makes the transition sharper, reducing faint edge artifacts
+    // Convert distance to screen pixels
+    // Multiplying by 2.0 provides good balance between sharpness and smoothness
     let dist = (sd - bias) * px_range * 2.0;
     return clamp(dist + 0.5, 0.0, 1.0);
 }
@@ -133,11 +134,16 @@ fn rainbow_color(screen_x: f32, time: f32) -> vec3<f32> {
     return hsv_to_rgb(hue, 0.8, 1.0);
 }
 
-/// Blend a layer on top of base using alpha.
-fn blend_over(base: vec4<f32>, layer: vec3<f32>, layer_alpha: f32) -> vec4<f32> {
-    let blended = layer * layer_alpha + base.rgb * (1.0 - layer_alpha);
-    let alpha = layer_alpha + base.a * (1.0 - layer_alpha);
-    return vec4<f32>(blended, alpha);
+/// Blend a layer on top of base using premultiplied alpha.
+/// Both base and the result are in premultiplied form (rgb already multiplied by alpha).
+/// This prevents double-blending artifacts when adjacent glyph quads overlap.
+fn blend_over_premultiplied(base: vec4<f32>, layer_color: vec3<f32>, layer_alpha: f32) -> vec4<f32> {
+    // Premultiplied color for the layer
+    let premul_layer = layer_color * layer_alpha;
+    // Porter-Duff "over" with premultiplied alpha: dst' = src + dst * (1 - src_alpha)
+    let blended_rgb = premul_layer + base.rgb * (1.0 - layer_alpha);
+    let blended_alpha = layer_alpha + base.a * (1.0 - layer_alpha);
+    return vec4<f32>(blended_rgb, blended_alpha);
 }
 
 // ============================================================================
@@ -194,6 +200,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // === SAMPLE MSDF FOR TERRITORY CLAIM ===
+    // Sample the signed distance to determine if this pixel is "owned" by this glyph.
+    // Depth testing ensures the first glyph to render claims overlapping regions.
+    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
+    let msdf_sd = median(sample.r, sample.g, sample.b);
+    let sd = min(msdf_sd, sample.a);
+
+    // Discard pixels clearly outside this glyph's territory.
+    // The glyph edge is at sd=0.5. We use 0.45 as threshold to allow:
+    // - Antialiasing transition (0.45 to 0.50)
+    // - Glow effect which extends beyond the edge
+    // Depth testing ensures the first glyph wins in contested overlap regions.
+    if sd < 0.45 {
+        discard;
+    }
+
     var output = vec4<f32>(0.0);
 
     // === GLOW LAYER ===
@@ -202,21 +224,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // Sample at expanded distance for glow
         let glow_bias = 0.5 - uniforms.glow_spread * 0.05;
         let glow_alpha = msdf_alpha_at(in.uv, glow_bias) * uniforms.glow_intensity;
-        output = blend_over(output, uniforms.glow_color.rgb, glow_alpha * uniforms.glow_color.a);
+        output = blend_over_premultiplied(output, uniforms.glow_color.rgb, glow_alpha * uniforms.glow_color.a);
     }
 
     // === MAIN TEXT ===
-    // Sample and get signed distance for early discard
-    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let msdf_sd = median(sample.r, sample.g, sample.b);
-    let sd = min(msdf_sd, sample.a);
-
-    // Early discard for pixels clearly outside the glyph.
-    // Using a conservative threshold to preserve anti-aliasing at small sizes.
-    if sd < 0.2 {
-        discard;
-    }
-
     let text_alpha = msdf_alpha_at(in.uv, 0.5);
 
     // Determine text color
@@ -225,8 +236,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
-    // Blend text
-    output = blend_over(output, text_color, text_alpha * in.color.a);
+    // Blend text using premultiplied alpha
+    output = blend_over_premultiplied(output, text_color, text_alpha * in.color.a);
 
+    // Output is already in premultiplied form (rgb * alpha) which matches our blend state
     return output;
 }

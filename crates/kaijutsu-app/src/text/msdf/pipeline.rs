@@ -50,6 +50,7 @@ fn debug_dot(
     color: [u8; 4],
 ) {
     const DOT_SIZE: f32 = 4.0; // Dot size in pixels
+    const DEBUG_Z: f32 = 0.0; // Debug geometry renders in front
 
     let half = DOT_SIZE / 2.0;
     let x0 = (screen_x - half) * 2.0 / resolution[0] - 1.0;
@@ -61,12 +62,12 @@ fn debug_dot(
     let uv = [0.5, 0.5];
 
     // Two triangles for the quad
-    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
 }
 
 /// Generate a rectangle outline (4 thin quads) for the given screen rect.
@@ -81,6 +82,7 @@ fn debug_rect_outline(
     color: [u8; 4],
 ) {
     const LINE_WIDTH: f32 = 1.5; // Line width in pixels
+    const DEBUG_Z: f32 = 0.0; // Debug geometry renders in front
 
     // Convert to NDC helper
     let to_ndc = |px: f32, py: f32| -> [f32; 2] {
@@ -92,42 +94,42 @@ fn debug_rect_outline(
     // Top edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + width, y + LINE_WIDTH);
-    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
 
     // Bottom edge
     let [x0, y0] = to_ndc(x, y + height - LINE_WIDTH);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
 
     // Left edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + LINE_WIDTH, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
 
     // Right edge
     let [x0, y0] = to_ndc(x + width - LINE_WIDTH, y);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
 }
 
 /// Label for the MSDF text render node.
@@ -138,8 +140,9 @@ pub struct MsdfTextRenderNodeLabel;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct MsdfVertex {
-    /// Position in screen space.
-    pub position: [f32; 2],
+    /// Position in screen space (x, y) and depth (z).
+    /// Z is used for depth testing to prevent overlap artifacts.
+    pub position: [f32; 3],
     /// UV coordinates in atlas.
     pub uv: [f32; 2],
     /// Color (RGBA8).
@@ -251,6 +254,11 @@ pub struct MsdfTextResources {
     pub vertex_buffer: Option<Buffer>,
     pub bind_group: Option<BindGroup>,
     pub vertex_count: u32,
+    /// Depth texture for per-glyph depth testing.
+    pub depth_texture: Option<Texture>,
+    pub depth_texture_view: Option<TextureView>,
+    /// Cached resolution for depth texture recreation.
+    pub depth_texture_size: (u32, u32),
 }
 
 /// MSDF text render pipeline setup.
@@ -343,6 +351,11 @@ impl ViewNode for MsdfTextRenderNode {
             return Ok(());
         };
 
+        // Require depth texture for proper overlap handling
+        let Some(depth_texture_view) = &resources.depth_texture_view else {
+            return Ok(());
+        };
+
         let out_texture = view_target.out_texture();
 
         let mut render_pass = render_context.command_encoder().begin_render_pass(
@@ -357,7 +370,16 @@ impl ViewNode for MsdfTextRenderNode {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                // Use depth buffer for per-glyph depth testing
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: depth_texture_view,
+                    depth_ops: Some(Operations {
+                        // Clear depth buffer at start of each frame
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             },
@@ -553,6 +575,11 @@ pub fn prepare_msdf_texts(
     #[cfg(debug_assertions)]
     let mut debug_logged_first = false;
 
+    // Track glyph index for z-depth assignment.
+    // Each glyph gets a unique z-value so depth testing resolves overlaps.
+    // Earlier glyphs (lower index) have lower z and "win" in overlap regions.
+    let mut glyph_index: u32 = 0;
+
     for text in &extracted.texts {
         #[cfg(debug_assertions)]
         let mut first_glyph_in_text = true;
@@ -608,15 +635,21 @@ pub fn prepare_msdf_texts(
             let x1 = x0 + (quad_width * text.scale) * 2.0 / resolution[0];
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
+            // Z-depth: each glyph gets a unique depth value.
+            // Using small increments ensures depth buffer precision is sufficient.
+            // Earlier glyphs have lower z values, so they "win" in depth test (Less).
+            let z = glyph_index as f32 * 0.0001;
+            glyph_index += 1;
+
             // Two triangles for the quad
             // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
-            vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color });
 
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v0], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color });
 
             // === DEBUG GEOMETRY ===
             // Generate debug visualization when debug mode is 1 or 2
@@ -670,6 +703,30 @@ pub fn prepare_msdf_texts(
         }));
     } else if let Some(buffer) = &resources.vertex_buffer {
         queue.write_buffer(buffer, 0, vertex_data);
+    }
+
+    // Create or update depth texture if resolution changed
+    let width = resolution[0] as u32;
+    let height = resolution[1] as u32;
+    if resources.depth_texture_size != (width, height) && width > 0 && height > 0 {
+        let depth_texture = device.create_texture(&TextureDescriptor {
+            label: Some("msdf_depth_texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_texture_view = depth_texture.create_view(&TextureViewDescriptor::default());
+        resources.depth_texture = Some(depth_texture);
+        resources.depth_texture_view = Some(depth_texture_view);
+        resources.depth_texture_size = (width, height);
     }
 
     // Update bind group if atlas texture changed
@@ -737,19 +794,22 @@ pub fn init_msdf_resources(
         array_stride: std::mem::size_of::<MsdfVertex>() as u64,
         step_mode: VertexStepMode::Vertex,
         attributes: vec![
+            // Position (x, y, z) - z is used for depth testing
             VertexAttribute {
-                format: VertexFormat::Float32x2,
+                format: VertexFormat::Float32x3,
                 offset: 0,
                 shader_location: 0,
             },
+            // UV coordinates
             VertexAttribute {
                 format: VertexFormat::Float32x2,
-                offset: 8,
+                offset: 12, // 3 * sizeof(f32)
                 shader_location: 1,
             },
+            // Color (RGBA8)
             VertexAttribute {
                 format: VertexFormat::Unorm8x4,
-                offset: 16,
+                offset: 20, // 12 + 2 * sizeof(f32)
                 shader_location: 2,
             },
         ],
@@ -769,7 +829,15 @@ pub fn init_msdf_resources(
             topology: PrimitiveTopology::TriangleList,
             ..default()
         },
-        depth_stencil: None,
+        // Enable depth testing so each glyph "wins" in overlapping regions.
+        // Glyphs rendered first (lower z) take precedence, preventing double-blend.
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: CompareFunction::Less,
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
         multisample: MultisampleState {
             count: 1,
             mask: !0,
@@ -781,7 +849,22 @@ pub fn init_msdf_resources(
             entry_point: Some("fragment".into()),
             targets: vec![Some(ColorTargetState {
                 format,
-                blend: Some(BlendState::ALPHA_BLENDING),
+                // Premultiplied alpha blending prevents double-blending in overlap regions.
+                // When adjacent glyph quads overlap (due to MSDF padding), standard alpha
+                // blending compounds their antialiasing alpha, filling gaps that should be empty.
+                // With premultiplied alpha (src=ONE), each pixel's contribution is independent.
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        operation: BlendOperation::Add,
+                    },
+                }),
                 write_mask: ColorWrites::ALL,
             })],
         }),
@@ -795,6 +878,9 @@ pub fn init_msdf_resources(
         vertex_buffer: None,
         bind_group: None,
         vertex_count: 0,
+        depth_texture: None,
+        depth_texture_view: None,
+        depth_texture_size: (0, 0),
     });
 }
 
