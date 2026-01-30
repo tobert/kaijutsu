@@ -22,8 +22,16 @@ struct Uniforms {
     sdf_texel: vec2<f32>,
     // Hinting strength (0.0 = off, 1.0 = full)
     hint_amount: f32,
-    // Padding for alignment
-    _padding: f32,
+    // Stem darkening strength (0.0 = off, ~0.15 = ClearType-like, 0.5 = max)
+    // Thickens thin strokes at small font sizes - the #1 ClearType technique
+    stem_darkening: f32,
+    // TAA jitter offset in pixels (sub-pixel displacement for temporal accumulation)
+    // Applied to vertex positions to sample different sub-pixel locations each frame
+    jitter_offset: vec2<f32>,
+    // Current frame index in the TAA sequence (0-7)
+    taa_frame_index: u32,
+    // Whether TAA jitter is enabled (0 = off, 1 = on)
+    taa_enabled: u32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -34,6 +42,7 @@ struct VertexInput {
     @location(0) position: vec3<f32>,  // x, y in NDC, z for depth testing
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
 }
 
 struct VertexOutput {
@@ -41,6 +50,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) screen_pos: vec2<f32>,
+    @location(3) importance: f32,
 }
 
 // ============================================================================
@@ -50,11 +60,25 @@ struct VertexOutput {
 @vertex
 fn vertex(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
+
+    // Apply TAA jitter offset for temporal super-resolution
+    // The jitter is in pixels, convert to NDC by dividing by resolution and multiplying by 2
+    // (NDC range is -1 to 1, so 2 units total per axis)
+    var jittered_pos = in.position.xy;
+    if uniforms.taa_enabled != 0u {
+        // jitter_offset is in range [-0.5, 0.5] pixels
+        // Convert to NDC: offset_ndc = offset_px * 2.0 / resolution
+        let jitter_ndc = uniforms.jitter_offset * 2.0 / uniforms.resolution;
+        jittered_pos = jittered_pos + jitter_ndc;
+    }
+
     // Use z from input for depth testing (earlier glyphs have lower z, winning depth test)
-    out.clip_position = vec4<f32>(in.position.xy, in.position.z, 1.0);
+    out.clip_position = vec4<f32>(jittered_pos, in.position.z, 1.0);
     out.uv = in.uv;
     out.color = in.color;
+    // Screen pos should use original position, not jittered (for effects like rainbow)
     out.screen_pos = (in.position.xy + 1.0) * 0.5 * uniforms.resolution;
+    out.importance = in.importance;
     return out;
 }
 
@@ -105,7 +129,7 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
     return clamp(dist + 0.5, 0.0, 1.0);
 }
 
-/// Shader-based hinting using gradient detection.
+/// Shader-based hinting using gradient detection, with stem darkening and semantic weighting.
 ///
 /// This technique from webgl_fonts (astiopin) improves small text quality by:
 /// 1. Sampling neighboring texels to detect stroke direction
@@ -113,9 +137,18 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
 /// 3. Applying sharper AA for horizontal strokes (stems, crossbars)
 /// 4. Optionally darkening horizontal strokes for better weight
 ///
+/// Stem darkening (FreeType-style) thickens thin strokes at small sizes:
+/// - Shifts the SDF threshold inward proportional to 1/font_size
+/// - Makes 'i', 'l', 't' strokes match ClearType weight at 12-16px
+///
+/// Semantic weighting (importance) adjusts stroke weight based on context:
+/// - 0.0 = thin/faded (inactive, distant from cursor)
+/// - 0.5 = normal weight (default)
+/// - 1.0 = bold/emphasized (cursor proximity, agent activity, selection)
+///
 /// The result mimics TrueType hinting's focus on horizontal alignment,
 /// making stems and crossbars crisper at small sizes.
-fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32) -> f32 {
+fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
     // Sample center and neighbors
     let sample_c = textureSample(atlas_texture, atlas_sampler, uv);
     let sample_n = textureSample(atlas_texture, atlas_sampler, uv + vec2<f32>(0.0, uniforms.sdf_texel.y));
@@ -142,6 +175,23 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32) -> f32 {
     let px_range = screen_px_range(uv);
     let base_doffset = 0.5 / (px_range * 2.0);
 
+    // === STEM DARKENING ===
+    // At small font sizes, thin strokes appear too light. FreeType compensates
+    // by shifting the SDF threshold inward (lowering bias), making strokes wider.
+    // The darkening is inversely proportional to px_range (which correlates to font size).
+    // clamp(1.0 / px_range, 0.0, 0.5) gives ~0.5 at 2px range, ~0.1 at 10px range
+    let darkening = uniforms.stem_darkening * clamp(1.0 / px_range, 0.0, 0.5);
+
+    // === SEMANTIC WEIGHTING ===
+    // Adjust bias based on importance: lower bias = thicker strokes
+    // importance 0.0 → +0.02 (thinner/faded)
+    // importance 0.5 → 0.00 (normal)
+    // importance 1.0 → -0.015 (bolder)
+    let weight_adjust = mix(0.02, -0.015, importance);
+
+    // Combine darkening and weight adjustment
+    let effective_bias = bias - darkening + weight_adjust;
+
     // Apply different AA widths based on stroke direction
     // - Vertical strokes (vgrad ≈ 0): wider AA (horz_scale = 1.1)
     // - Horizontal strokes (vgrad ≈ 1): sharper AA (vert_scale = 0.6)
@@ -153,7 +203,8 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32) -> f32 {
     let doffset = mix(base_doffset, hinted_doffset, uniforms.hint_amount);
 
     // Compute alpha with smoothstep for antialiasing
-    var alpha = smoothstep(bias - doffset, bias + doffset, sd_c);
+    // Use effective_bias (with stem darkening + importance applied) instead of raw bias
+    var alpha = smoothstep(effective_bias - doffset, effective_bias + doffset, sd_c);
 
     // Optionally darken horizontal strokes slightly for better visual weight
     // This compensates for the sharper AA making them appear lighter
@@ -295,7 +346,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // The hinting varies AA width based on stroke direction:
     // - Horizontal strokes (stems, crossbars) get sharper edges
     // - Vertical strokes get wider AA to maintain smooth appearance
-    let text_alpha = msdf_alpha_hinted(in.uv, 0.5);
+    // Importance modulates stroke weight: 0.0 = thin/faded, 0.5 = normal, 1.0 = bold
+    let text_alpha = msdf_alpha_hinted(in.uv, 0.5, in.importance);
 
     // Determine text color
     var text_color = in.color.rgb;

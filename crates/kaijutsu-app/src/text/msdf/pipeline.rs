@@ -51,6 +51,7 @@ fn debug_dot(
 ) {
     const DOT_SIZE: f32 = 4.0; // Dot size in pixels
     const DEBUG_Z: f32 = 0.0; // Debug geometry renders in front
+    const DEBUG_IMPORTANCE: f32 = 0.5; // Normal weight for debug geometry
 
     let half = DOT_SIZE / 2.0;
     let x0 = (screen_x - half) * 2.0 / resolution[0] - 1.0;
@@ -62,12 +63,12 @@ fn debug_dot(
     let uv = [0.5, 0.5];
 
     // Two triangles for the quad
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
 }
 
 /// Generate a rectangle outline (4 thin quads) for the given screen rect.
@@ -83,6 +84,7 @@ fn debug_rect_outline(
 ) {
     const LINE_WIDTH: f32 = 1.5; // Line width in pixels
     const DEBUG_Z: f32 = 0.0; // Debug geometry renders in front
+    const DEBUG_IMPORTANCE: f32 = 0.5; // Normal weight for debug geometry
 
     // Convert to NDC helper
     let to_ndc = |px: f32, py: f32| -> [f32; 2] {
@@ -90,46 +92,47 @@ fn debug_rect_outline(
     };
 
     let uv = [0.5, 0.5];
+    let imp = DEBUG_IMPORTANCE;
 
     // Top edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + width, y + LINE_WIDTH);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Bottom edge
     let [x0, y0] = to_ndc(x, y + height - LINE_WIDTH);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Left edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + LINE_WIDTH, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Right edge
     let [x0, y0] = to_ndc(x + width - LINE_WIDTH, y);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 }
 
 /// Label for the MSDF text render node.
@@ -147,6 +150,9 @@ pub struct MsdfVertex {
     pub uv: [f32; 2],
     /// Color (RGBA8).
     pub color: [u8; 4],
+    /// Semantic importance (0.0 = faded/thin, 0.5 = normal, 1.0 = bold/emphasized).
+    /// Used by shader to adjust stroke weight based on cursor proximity or agent activity.
+    pub importance: f32,
 }
 
 /// GPU uniform for MSDF rendering.
@@ -175,8 +181,20 @@ pub struct MsdfUniforms {
     /// Hinting strength (0.0 = off, 1.0 = full).
     /// Controls how aggressively horizontal strokes are sharpened.
     pub hint_amount: f32,
-    /// Padding for 16-byte alignment.
-    pub _padding: f32,
+    /// Stem darkening strength (0.0 = off, ~0.15 = ClearType-like, 0.5 = max).
+    /// Thickens thin strokes at small font sizes by shifting the SDF threshold inward.
+    /// This is the #1 technique for matching ClearType quality at 12-16px sizes.
+    pub stem_darkening: f32,
+    /// TAA jitter offset in pixels (sub-pixel displacement for temporal accumulation).
+    /// Applied to vertex positions to sample different sub-pixel locations each frame.
+    /// Uses Halton(2,3) sequence for well-distributed 8-sample coverage.
+    pub jitter_offset: [f32; 2],
+    /// Current frame index in the TAA sequence (0-7, cycles).
+    /// Used for debugging and potential future confidence tracking.
+    pub taa_frame_index: u32,
+    /// Whether TAA jitter is enabled (0 = off, 1 = on).
+    /// Allows toggling jitter for A/B comparison without changing other settings.
+    pub taa_enabled: u32,
 }
 
 impl Default for MsdfUniforms {
@@ -192,9 +210,51 @@ impl Default for MsdfUniforms {
             glow_color: [0.4, 0.6, 1.0, 0.5],
             sdf_texel: [1.0 / 1024.0, 1.0 / 1024.0], // Default atlas size
             hint_amount: 0.8, // Enable hinting by default (80% strength)
-            _padding: 0.0,
+            // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
+            // Higher values (0.2-0.3) for heavier weight, 0.0 to disable
+            stem_darkening: 0.15,
+            jitter_offset: [0.0, 0.0],
+            taa_frame_index: 0,
+            taa_enabled: 1, // Enable TAA jitter by default
         }
     }
+}
+
+// ============================================================================
+// TAA JITTER SEQUENCE
+// ============================================================================
+
+/// TAA sample count for the Halton sequence.
+/// 8 samples provides good coverage with reasonable accumulation time.
+pub const TAA_SAMPLE_COUNT: u32 = 8;
+
+/// Halton sequence for TAA jitter (base 2, 3).
+///
+/// This sequence provides well-distributed sub-pixel offsets that:
+/// - Cover the pixel area uniformly over 8 frames
+/// - Have low discrepancy (avoid clustering)
+/// - Match Bevy's TAA implementation for consistency
+///
+/// Values are in range [-0.5, 0.5] (centered on pixel).
+const HALTON_SEQUENCE: [[f32; 2]; 8] = [
+    // Halton(2, 3) sequence, offset to center on pixel
+    [0.0, -0.3333333],     // n=1: (1/2, 1/3) - 0.5
+    [-0.25, 0.3333333],    // n=2: (1/4, 2/3) - 0.5
+    [0.25, -0.1111111],    // n=3: (3/4, 1/9) - 0.5
+    [-0.375, 0.2222222],   // n=4: (1/8, 4/9) - 0.5
+    [0.125, -0.4444444],   // n=5: (5/8, 7/9) - 0.5
+    [-0.125, 0.0555556],   // n=6: (3/8, 5/9) - 0.5
+    [0.375, 0.3888889],    // n=7: (7/8, 2/9) - 0.5
+    [-0.4375, -0.2777778], // n=8: (1/16, 8/9) - 0.5
+];
+
+/// Get the jitter offset for a given frame index.
+///
+/// Returns sub-pixel offset in range [-0.5, 0.5] for both x and y.
+/// The sequence cycles every `TAA_SAMPLE_COUNT` frames.
+#[inline]
+pub fn get_taa_jitter(frame_index: u32) -> [f32; 2] {
+    HALTON_SEQUENCE[(frame_index % TAA_SAMPLE_COUNT) as usize]
 }
 
 /// Extracted text area for rendering.
@@ -253,6 +313,27 @@ pub struct ExtractedMsdfRenderConfig {
     pub format: TextureFormat,
     /// Whether this config is valid for rendering.
     pub initialized: bool,
+}
+
+/// TAA state for MSDF text rendering.
+///
+/// Tracks the frame counter for Halton sequence jitter and TAA enable state.
+/// Lives in the render world and persists across frames.
+#[derive(Resource)]
+pub struct MsdfTextTaaState {
+    /// Current frame index in the TAA sequence (0 to TAA_SAMPLE_COUNT-1).
+    pub frame_index: u32,
+    /// Whether TAA jitter is enabled.
+    pub enabled: bool,
+}
+
+impl Default for MsdfTextTaaState {
+    fn default() -> Self {
+        Self {
+            frame_index: 0,
+            enabled: true, // Enable by default for quality
+        }
+    }
 }
 
 /// Render world resources for MSDF text.
@@ -507,6 +588,20 @@ pub fn extract_msdf_render_config(
     });
 }
 
+/// Extract TAA configuration from main world.
+///
+/// This syncs the `MsdfTaaConfig` resource (controlled by F10 toggle)
+/// to the render world's `MsdfTextTaaState`.
+pub fn extract_msdf_taa_config(
+    taa_config: Extract<Option<Res<super::MsdfTaaConfig>>>,
+    mut taa_state: ResMut<MsdfTextTaaState>,
+) {
+    // Sync enabled state from main world config
+    if let Some(config) = taa_config.as_ref() {
+        taa_state.enabled = config.enabled;
+    }
+}
+
 /// Prepare MSDF text resources for rendering.
 ///
 /// Requires `ExtractedMsdfRenderConfig` to be present and initialized.
@@ -521,6 +616,7 @@ pub fn prepare_msdf_texts(
     images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>,
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
+    mut taa_state: ResMut<MsdfTextTaaState>,
     #[cfg(debug_assertions)]
     debug_mode: Option<Res<ExtractedMsdfDebugMode>>,
 ) {
@@ -565,6 +661,17 @@ pub fn prepare_msdf_texts(
         1.0 / atlas.height as f32,
     ];
 
+    // === TAA JITTER ===
+    // Get jitter offset from Halton sequence and advance frame counter
+    let jitter_offset = if taa_state.enabled {
+        get_taa_jitter(taa_state.frame_index)
+    } else {
+        [0.0, 0.0]
+    };
+    let taa_frame_index = taa_state.frame_index;
+    // Advance frame counter for next frame (cycles through TAA_SAMPLE_COUNT)
+    taa_state.frame_index = (taa_state.frame_index + 1) % TAA_SAMPLE_COUNT;
+
     // Update uniforms
     let uniforms = MsdfUniforms {
         resolution,
@@ -582,7 +689,12 @@ pub fn prepare_msdf_texts(
             .unwrap_or([0.4, 0.6, 1.0, 0.5]),
         sdf_texel,
         hint_amount: 0.8, // 80% hinting strength - can be made configurable
-        _padding: 0.0,
+        // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
+        stem_darkening: 0.15,
+        // TAA jitter for temporal super-resolution
+        jitter_offset,
+        taa_frame_index,
+        taa_enabled: if taa_state.enabled { 1 } else { 0 },
     };
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -663,13 +775,14 @@ pub fn prepare_msdf_texts(
 
             // Two triangles for the quad
             // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
-            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color });
+            let imp = glyph.importance;
+            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
 
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
 
             // === DEBUG GEOMETRY ===
             // Generate debug visualization when debug mode is 1 or 2
@@ -810,6 +923,8 @@ pub fn init_msdf_resources(
     });
 
     // Create pipeline descriptor
+    // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) = 28 bytes
+    // Note: color is 4 bytes (u8x4), importance is 4 bytes (f32)
     let vertex_layout = VertexBufferLayout {
         array_stride: std::mem::size_of::<MsdfVertex>() as u64,
         step_mode: VertexStepMode::Vertex,
@@ -831,6 +946,12 @@ pub fn init_msdf_resources(
                 format: VertexFormat::Unorm8x4,
                 offset: 20, // 12 + 2 * sizeof(f32)
                 shader_location: 2,
+            },
+            // Importance (semantic weight for text emphasis)
+            VertexAttribute {
+                format: VertexFormat::Float32,
+                offset: 24, // 20 + 4 (color is 4 bytes)
+                shader_location: 3,
             },
         ],
     };
@@ -1043,5 +1164,88 @@ mod tests {
         assert!((quad_width - 20.0).abs() < 0.001);
         assert!((anchor_x - 4.0).abs() < 0.001);
         assert!((px_x - 46.0).abs() < 0.001);
+    }
+
+    // ========================================================================
+    // TAA JITTER TESTS
+    // ========================================================================
+
+    /// Test that the Halton sequence values are within expected range.
+    #[test]
+    fn halton_sequence_range() {
+        for i in 0..TAA_SAMPLE_COUNT {
+            let jitter = get_taa_jitter(i);
+            assert!(
+                jitter[0] >= -0.5 && jitter[0] <= 0.5,
+                "Jitter X at frame {} should be in [-0.5, 0.5], got {}",
+                i, jitter[0]
+            );
+            assert!(
+                jitter[1] >= -0.5 && jitter[1] <= 0.5,
+                "Jitter Y at frame {} should be in [-0.5, 0.5], got {}",
+                i, jitter[1]
+            );
+        }
+    }
+
+    /// Test that the Halton sequence cycles correctly.
+    #[test]
+    fn halton_sequence_cycles() {
+        for i in 0..TAA_SAMPLE_COUNT {
+            let jitter1 = get_taa_jitter(i);
+            let jitter2 = get_taa_jitter(i + TAA_SAMPLE_COUNT);
+            assert_eq!(jitter1, jitter2, "Sequence should cycle after {} samples", TAA_SAMPLE_COUNT);
+        }
+    }
+
+    /// Test that the Halton sequence provides diverse samples (no duplicates).
+    #[test]
+    fn halton_sequence_diversity() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..TAA_SAMPLE_COUNT {
+            let jitter = get_taa_jitter(i);
+            // Convert to string key for HashSet (floats aren't hashable)
+            let key = format!("{:.6},{:.6}", jitter[0], jitter[1]);
+            assert!(
+                seen.insert(key),
+                "Halton sequence should have unique samples, duplicate at frame {}",
+                i
+            );
+        }
+    }
+
+    /// Test NDC jitter conversion (as done in shader).
+    ///
+    /// The shader converts pixel jitter to NDC:
+    /// jitter_ndc = jitter_px * 2.0 / resolution
+    #[test]
+    fn jitter_to_ndc_conversion() {
+        let resolution = [1280.0_f32, 720.0_f32];
+
+        // Test 0.5 pixel jitter (max Halton value)
+        let jitter_px = [0.5_f32, 0.5_f32];
+        let jitter_ndc = [
+            jitter_px[0] * 2.0 / resolution[0],
+            jitter_px[1] * 2.0 / resolution[1],
+        ];
+
+        // 0.5 pixels at 1280px resolution = 0.5 * 2 / 1280 ≈ 0.00078125
+        assert!(
+            (jitter_ndc[0] - 0.00078125).abs() < 0.0001,
+            "X jitter NDC should be ~0.00078125, got {}",
+            jitter_ndc[0]
+        );
+        // 0.5 pixels at 720px resolution = 0.5 * 2 / 720 ≈ 0.00139
+        assert!(
+            (jitter_ndc[1] - 0.00138889).abs() < 0.0001,
+            "Y jitter NDC should be ~0.00139, got {}",
+            jitter_ndc[1]
+        );
+    }
+
+    /// Test TAA sample count is 8 (matching Bevy TAA).
+    #[test]
+    fn taa_sample_count_is_8() {
+        assert_eq!(TAA_SAMPLE_COUNT, 8, "TAA should use 8 samples like Bevy TAA");
     }
 }

@@ -30,8 +30,10 @@ pub use generator::MsdfGenerator;
 #[allow(unused_imports)]
 pub use generator::{FontMetricsCache, HintingMetrics};
 pub use pipeline::{
-    extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
+    extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
+    init_msdf_resources, prepare_msdf_texts,
     ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
+    MsdfTextTaaState,
 };
 
 use bevy::prelude::*;
@@ -273,3 +275,17 @@ pub struct MsdfDebugOverlay {
     /// Show metrics HUD with first glyph info.
     pub show_hud: bool,
 }
+
+/// Resource controlling TAA jitter for MSDF text.
+///
+/// Press F10 to toggle TAA jitter on/off for A/B quality comparison.
+/// When enabled, text is rendered with sub-pixel jitter each frame using
+/// a Halton(2,3) sequence, which improves edge quality through temporal
+/// super-resolution (when history accumulation is added in Phase 2+).
+#[derive(Resource, Default, Reflect, Clone, Copy)]
+#[reflect(Resource)]
+pub struct MsdfTaaConfig {
+    /// Whether TAA jitter is enabled (default: true).
+    pub enabled: bool,
+}
+

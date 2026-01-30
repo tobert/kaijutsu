@@ -26,6 +26,15 @@ pub struct PositionedGlyph {
     /// Currently tracked but not used - available for future LCD subpixel rendering.
     #[allow(dead_code)]
     pub subpixel_offset: f32,
+    /// Semantic importance for weight adjustment (0.0 = faded/thin, 1.0 = bold/emphasized).
+    /// Used by the shader to vary stroke weight based on context:
+    /// - Cursor proximity: glyphs near cursor are bolder
+    /// - Agent activity: code being edited by AI gets emphasis
+    /// - Selection: selected text rendered with heavier weight
+    ///
+    /// Currently passed through pipeline but cursor proximity calculation
+    /// will be implemented when cursor tracking is added.
+    pub importance: f32,
 }
 
 /// MSDF text buffer component.
@@ -202,6 +211,9 @@ impl MsdfTextBuffer {
                     color: self.default_color,
                     // Store fractional offset for potential subpixel rendering
                     subpixel_offset: baseline_offset,
+                    // Default importance 0.5 = normal weight
+                    // Will be updated by cursor proximity or agent activity
+                    importance: 0.5,
                 });
             }
         }

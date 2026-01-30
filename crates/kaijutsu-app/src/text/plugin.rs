@@ -11,9 +11,11 @@ use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;
 
 use super::msdf::{
-    extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
-    FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer,
-    MsdfTextPipeline, MsdfTextRenderNode, MsdfUiText, UiTextPositionCache,
+    extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
+    init_msdf_resources, prepare_msdf_texts,
+    FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfTaaConfig, MsdfText, MsdfTextAreaConfig,
+    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaState, MsdfUiText,
+    UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -33,7 +35,9 @@ impl Plugin for TextRenderPlugin {
         app.init_resource::<SharedFontSystem>()
             .init_resource::<MsdfRenderConfig>()
             .init_resource::<TextMetrics>()
-            .init_resource::<FontMetricsCache>();
+            .init_resource::<FontMetricsCache>()
+            // TAA config: enabled by default
+            .insert_resource(MsdfTaaConfig { enabled: true });
 
         #[cfg(debug_assertions)]
         app.init_resource::<MsdfDebugInfo>()
@@ -52,6 +56,7 @@ impl Plugin for TextRenderPlugin {
         app.add_systems(Update, (
                 debug_dump_atlas_on_f12,
                 debug_toggle_overlay_f11,
+                debug_toggle_taa_f10,
                 debug_manage_hud,
                 debug_update_hud,
             ))
@@ -69,7 +74,11 @@ impl Plugin for TextRenderPlugin {
 
         render_app
             .init_resource::<super::msdf::ExtractedMsdfTexts>()
-            .add_systems(ExtractSchedule, (extract_msdf_render_config, extract_msdf_texts))
+            .add_systems(ExtractSchedule, (
+                extract_msdf_render_config,
+                extract_msdf_texts,
+                extract_msdf_taa_config,
+            ))
             .add_systems(Render, prepare_msdf_texts.run_if(resource_exists::<super::msdf::MsdfTextResources>));
 
         // Add render node to the graph - after Upscaling (final post-processing step)
@@ -101,6 +110,7 @@ impl Plugin for TextRenderPlugin {
 
         // Initialize render world resources
         render_app.init_resource::<MsdfTextPipeline>();
+        render_app.init_resource::<MsdfTextTaaState>();
         render_app.insert_resource(font_system);
 
         // Schedule init_msdf_resources to run in Prepare set (after ManageViews)
@@ -350,6 +360,22 @@ fn debug_toggle_overlay_f11(
     if input.just_pressed(KeyCode::F11) {
         debug_overlay.mode = debug_overlay.mode.next();
         info!("🔍 MSDF debug overlay: {}", debug_overlay.mode.description());
+    }
+}
+
+/// Debug system: toggle TAA jitter with F10.
+///
+/// Toggles temporal anti-aliasing jitter on/off for A/B quality comparison.
+/// When enabled, text is rendered with sub-pixel jitter using a Halton(2,3) sequence.
+#[cfg(debug_assertions)]
+fn debug_toggle_taa_f10(
+    input: Res<ButtonInput<KeyCode>>,
+    mut taa_config: ResMut<MsdfTaaConfig>,
+) {
+    if input.just_pressed(KeyCode::F10) {
+        taa_config.enabled = !taa_config.enabled;
+        let status = if taa_config.enabled { "ON ✨" } else { "OFF" };
+        info!("🎯 MSDF TAA jitter: {}", status);
     }
 }
 

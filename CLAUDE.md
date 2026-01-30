@@ -276,3 +276,42 @@ fn handle_input(mut keyboard: MessageReader<KeyboardInput>) {
 - Bevy source: `~/src/bevy`
 - Text input example: `~/src/bevy/examples/input/text_input.rs`
 - Message example: `~/src/bevy/examples/ecs/message.rs`
+
+## Text Rendering Decisions
+
+### No LCD Subpixel AA
+
+**Do not pursue LCD subpixel antialiasing.**
+
+- OLED displays (Pentile, QD-OLED) have non-standard subpixel layouts that break RGB assumptions
+- Rotated monitors turn RGB into BGR or worse
+- Apple removed subpixel AA entirely in macOS Mojave (2018)
+- The "ClearType look" comes from stem darkening + gamma correction, not subpixels
+
+### MTSDF Over Direct Vector
+
+Dense code text (10k+ glyphs at 4K) is too ALU-heavy for per-pixel Bézier evaluation on integrated GPUs. MTSDF provides:
+
+- Constant-time fragment shader regardless of glyph complexity
+- Scalable rendering at any zoom level
+- Support for effects (glow, weight variation) without re-rasterizing
+
+### Core Quality Techniques
+
+| Technique | Implementation |
+|-----------|---------------|
+| **Stem darkening** | `stem_darkening` uniform (0.15 default) shifts SDF bias inversely proportional to font size. The #1 technique for ClearType-quality at 12-16px. |
+| **Shader hinting** | Gradient-based stroke detection (astiopin/webgl_fonts). Sharpens horizontal strokes, softens vertical for balanced weight. |
+| **Semantic weighting** | `importance` field on glyphs (0.0 = faded, 0.5 = normal, 1.0 = bold). Enables cursor proximity emphasis and agent activity highlighting. |
+| **Pixel alignment** | CPU-side baseline snapping + x-height grid fitting in `MsdfTextBuffer::update_glyphs()`. |
+
+### TAA Investigation
+
+Bevy 0.18 has TAA in `bevy_anti_alias::taa`. Key components:
+
+- `TemporalAntiAliasing` component enables TAA on cameras
+- `TemporalJitter` applies Halton(2,3) sequence offsets (8 samples)
+- Requires `DepthPrepass` + `MotionVectorPrepass`
+- Text could potentially use TAA for temporal super-resolution on static text
+
+**Note:** TAA is designed for 3D scenes. Integration with 2D text overlay would require investigation.
