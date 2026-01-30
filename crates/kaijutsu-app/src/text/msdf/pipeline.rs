@@ -754,7 +754,6 @@ impl ViewNode for MsdfTextRenderNode {
         // Choose render target: intermediate texture for TAA, ViewTarget otherwise
         let (render_target, load_op) = if taa_enabled {
             if let Some(intermediate_view) = &resources.intermediate_texture_view {
-                debug!("🎯 MSDF rendering to intermediate texture for TAA");
                 // Clear intermediate to transparent black
                 (intermediate_view as &TextureView, LoadOp::Clear(Default::default()))
             } else {
@@ -824,7 +823,6 @@ impl ViewNode for MsdfTextTaaNode {
     ) -> Result<(), NodeRunError> {
         // Check if TAA is enabled
         let Some(taa_state) = world.get_resource::<MsdfTextTaaState>() else {
-            debug!("🔍 TAA node: no MsdfTextTaaState resource");
             return Ok(());
         };
 
@@ -833,9 +831,7 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(());
         }
 
-        debug!("🎯 TAA node running (frame {})", taa_state.frame_index);
-
-        // Get required resources with diagnostics
+        // Get required resources
         let Some(taa_resources) = world.get_resource::<MsdfTextTaaResources>() else {
             warn!("⚠️ TAA node: no MsdfTextTaaResources");
             return Ok(());
@@ -866,8 +862,7 @@ impl ViewNode for MsdfTextTaaNode {
 
         let pipeline_cache = world.resource::<PipelineCache>();
         let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
-            debug!("🔄 TAA node: pipeline not yet compiled");
-            return Ok(());
+            return Ok(()); // Pipeline not yet compiled
         };
 
         // Need the blit bind group for second pass
@@ -875,8 +870,6 @@ impl ViewNode for MsdfTextTaaNode {
             warn!("⚠️ TAA node: no blit bind group");
             return Ok(());
         };
-
-        debug!("✅ TAA node: all resources ready, running blend + blit passes");
 
         // === PASS 1: TAA Blend ===
         // Blend intermediate (current jittered frame) + history_read → history_write
@@ -935,8 +928,6 @@ impl ViewNode for MsdfTextTaaNode {
             render_pass.set_bind_group(0, blit_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         }
-
-        debug!("✅ TAA blend + blit passes complete (frames_accumulated={})", taa_resources.frames_accumulated);
 
         // Note: History swap happens in prepare_msdf_texts next frame
         let _ = intermediate_view; // Used in bind_group creation
@@ -1089,7 +1080,6 @@ pub fn init_msdf_taa_resources(
 
     // Use the same format as the MSDF pipeline (from swap chain)
     let format = msdf_resources.format;
-    debug!("🎯 Initializing TAA resources with format {:?}", format);
 
     // Create history textures (same format as swap chain for copy to ViewTarget)
     let mut taa_resources = MsdfTextTaaResources::new(&device, width, height, format);
@@ -1408,7 +1398,6 @@ pub fn prepare_msdf_texts(
     // This must be checked every frame because TAA can be toggled and resources
     // may be initialized after the depth texture already exists.
     if taa_state.enabled && resources.intermediate_texture_view.is_none() && width > 0 && height > 0 {
-        debug!("🎯 Creating intermediate texture for TAA: {}x{} format={:?}", width, height, resources.format);
         let intermediate_texture = device.create_texture(&TextureDescriptor {
             label: Some("msdf_intermediate_texture"),
             size: Extent3d {
@@ -1460,7 +1449,6 @@ pub fn prepare_msdf_texts(
             if motion_magnitude > 0.001 {
                 // Camera moved - reset accumulation to avoid ghosting
                 taa_res.frames_accumulated = 0;
-                debug!("📷 Camera motion detected ({:.4}), resetting TAA accumulation", motion_magnitude);
             }
 
             // Update TAA uniforms
