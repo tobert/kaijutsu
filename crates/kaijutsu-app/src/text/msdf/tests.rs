@@ -662,7 +662,7 @@ fn setup_test_scene(
         let attrs = cosmic_text::Attrs::new().family(font_family);
         buffer.set_text(&mut fs, &config.text, attrs, cosmic_text::Shaping::Advanced);
         buffer.set_color(config.color);
-        buffer.visual_line_count(&mut fs, config.width as f32);
+        buffer.visual_line_count(&mut fs, config.width as f32, None);
 
         // Position and scale from config
         let text_config = MsdfTextAreaConfig {
@@ -1113,13 +1113,13 @@ fn cosmic_text_applies_kerning() {
     let mut av_buffer = MsdfTextBuffer::new(&mut font_system, metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::Serif);
     av_buffer.set_text(&mut font_system, "AV", attrs.clone(), Shaping::Advanced);
-    av_buffer.visual_line_count(&mut font_system, 400.0);
+    av_buffer.visual_line_count(&mut font_system, 400.0, None);
     let av_positions = av_buffer.glyph_positions();
 
     // Create buffer for "AA"
     let mut aa_buffer = MsdfTextBuffer::new(&mut font_system, metrics);
     aa_buffer.set_text(&mut font_system, "AA", attrs, Shaping::Advanced);
-    aa_buffer.visual_line_count(&mut font_system, 400.0);
+    aa_buffer.visual_line_count(&mut font_system, 400.0, None);
     let aa_positions = aa_buffer.glyph_positions();
 
     assert_eq!(av_positions.len(), 2, "AV should have 2 glyphs");
@@ -1202,7 +1202,7 @@ fn normal_sansserif_glyph_positions() {
     let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
     let attrs = Attrs::new().family(cosmic_text::Family::SansSerif);
     buffer.set_text(&mut font_system, "NORMAL", attrs, Shaping::Advanced);
-    buffer.visual_line_count(&mut font_system, 400.0);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
 
     let positions = buffer.glyph_positions();
 

@@ -15,17 +15,16 @@ use swash::FontRef;
 
 use super::atlas::{GlyphKey, MsdfAtlas};
 
-/// Font metrics needed for shader-based hinting.
+/// Font metrics needed for CPU-side pixel alignment.
 ///
 /// These metrics are extracted from font tables (OS/2) and used to:
 /// - Pixel-align baselines (ascent)
 /// - Grid-fit x-height/cap-height for crisper small text
 ///
-/// NOTE: Currently infrastructure for future pixel-alignment work.
-/// The shader-based hinting doesn't require these metrics, but CPU-side
-/// pixel-alignment (webgl_fonts technique) would use them.
+/// Used by `MsdfTextBuffer::update_glyphs()` to implement the webgl_fonts
+/// technique: snapping baselines to pixel boundaries and ensuring
+/// horizontal strokes land cleanly on pixel rows.
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)]
 pub struct HintingMetrics {
     /// Distance from baseline to top of lowercase 'x' (in font units).
     pub x_height: f32,
@@ -34,12 +33,13 @@ pub struct HintingMetrics {
     /// Distance from baseline to top of the alignment box (in font units).
     pub ascent: f32,
     /// Distance from baseline to bottom of the alignment box (in font units).
+    /// Currently tracked but not used - available for future layout improvements.
+    #[allow(dead_code)]
     pub descent: f32,
     /// Font design units per em.
     pub units_per_em: u16,
 }
 
-#[allow(dead_code)]
 impl HintingMetrics {
     /// Convert x_height from font units to em units.
     pub fn x_height_em(&self) -> f32 {
@@ -51,6 +51,7 @@ impl HintingMetrics {
     }
 
     /// Convert cap_height from font units to em units.
+    #[allow(dead_code)]
     pub fn cap_height_em(&self) -> f32 {
         if self.units_per_em > 0 {
             self.cap_height / self.units_per_em as f32
@@ -60,6 +61,7 @@ impl HintingMetrics {
     }
 
     /// Convert ascent from font units to em units.
+    #[allow(dead_code)]
     pub fn ascent_em(&self) -> f32 {
         if self.units_per_em > 0 {
             self.ascent / self.units_per_em as f32
@@ -72,16 +74,12 @@ impl HintingMetrics {
 /// Resource caching font metrics per font ID.
 ///
 /// Used by the text layout system to compute pixel-aligned baselines
-/// and x-height grid fitting for shader-based hinting.
-///
-/// NOTE: Infrastructure for future pixel-alignment work.
+/// and x-height grid fitting for crisper small text rendering.
 #[derive(Resource, Default)]
-#[allow(dead_code)]
 pub struct FontMetricsCache {
     metrics: HashMap<FontId, HintingMetrics>,
 }
 
-#[allow(dead_code)]
 impl FontMetricsCache {
     /// Get cached metrics for a font, or extract and cache them.
     pub fn get_or_extract(&mut self, font_system: &FontSystem, font_id: FontId) -> HintingMetrics {
@@ -102,7 +100,6 @@ impl FontMetricsCache {
 }
 
 /// Extract font metrics using swash.
-#[allow(dead_code)]
 fn extract_font_metrics(font_system: &FontSystem, font_id: FontId) -> HintingMetrics {
     let Some(font_data) = get_font_data_vec(font_system, font_id) else {
         warn!("Font data not found for font_id {:?}, using fallback metrics", font_id);

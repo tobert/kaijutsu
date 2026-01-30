@@ -20,7 +20,7 @@ mod plugin;
 mod resources;
 
 pub use msdf::{
-    MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText,
+    FontMetricsCache, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText,
     TextBounds, UiTextPositionCache,
 };
 pub use plugin::TextRenderPlugin;

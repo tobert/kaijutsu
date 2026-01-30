@@ -7,6 +7,7 @@ use bevy::prelude::*;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
 use super::atlas::GlyphKey;
+use super::generator::FontMetricsCache;
 
 /// A positioned glyph ready for rendering.
 #[derive(Clone, Debug)]
@@ -15,12 +16,16 @@ pub struct PositionedGlyph {
     pub key: GlyphKey,
     /// X position in pixels (pen position from cosmic-text).
     pub x: f32,
-    /// Y position in pixels (baseline from cosmic-text).
+    /// Y position in pixels (baseline from cosmic-text, pixel-aligned when metrics available).
     pub y: f32,
     /// Font size used for this glyph (needed to scale MSDF region).
     pub font_size: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
+    /// Fractional pixel offset from baseline snapping (for potential subpixel rendering).
+    /// Currently tracked but not used - available for future LCD subpixel rendering.
+    #[allow(dead_code)]
+    pub subpixel_offset: f32,
 }
 
 /// MSDF text buffer component.
@@ -115,7 +120,15 @@ impl MsdfTextBuffer {
     }
 
     /// Get the visual line count after wrapping.
-    pub fn visual_line_count(&mut self, font_system: &mut FontSystem, wrap_width: f32) -> usize {
+    ///
+    /// If a `FontMetricsCache` is provided, glyphs will be pixel-aligned for
+    /// crisper rendering at small font sizes (webgl_fonts technique).
+    pub fn visual_line_count(
+        &mut self,
+        font_system: &mut FontSystem,
+        wrap_width: f32,
+        metrics_cache: Option<&mut FontMetricsCache>,
+    ) -> usize {
         let width_changed = (self.cached_wrap_width - wrap_width).abs() > 1.0;
 
         if self.dirty || width_changed {
@@ -123,7 +136,7 @@ impl MsdfTextBuffer {
             self.buffer.shape_until_scroll(font_system, false);
             self.cached_visual_lines = self.buffer.layout_runs().count().max(1);
             self.cached_wrap_width = wrap_width;
-            self.update_glyphs();
+            self.update_glyphs(font_system, metrics_cache);
             self.dirty = false;
         }
 
@@ -131,30 +144,64 @@ impl MsdfTextBuffer {
     }
 
     /// Update positioned glyphs from buffer layout.
-    fn update_glyphs(&mut self) {
+    ///
+    /// Applies CPU-side pixel alignment when metrics are available:
+    /// 1. Snaps baseline (line_y) to nearest pixel
+    /// 2. Applies x-height grid fitting so lowercase letters span whole pixels
+    ///
+    /// This technique from webgl_fonts helps horizontal strokes land cleanly
+    /// on pixel rows instead of blurring across two.
+    fn update_glyphs(
+        &mut self,
+        font_system: &FontSystem,
+        mut metrics_cache: Option<&mut FontMetricsCache>,
+    ) {
         self.glyphs.clear();
         let font_size = self.buffer.metrics().font_size;
 
         for run in self.buffer.layout_runs() {
-            let line_y = run.line_y;
+            // Pixel-align baseline: snap line_y to nearest pixel
+            let line_y_snapped = run.line_y.round();
+            let baseline_offset = line_y_snapped - run.line_y;
 
             for glyph in run.glyphs {
-                // Get font ID and glyph ID directly from LayoutGlyph
                 let font_id = glyph.font_id;
                 let glyph_id = glyph.glyph_id;
-
                 let key = GlyphKey::new(font_id, glyph_id);
+
+                // Get font metrics if cache available
+                let metrics = metrics_cache
+                    .as_mut()
+                    .map(|c| c.get_or_extract(font_system, font_id));
+
+                // Apply x-height grid fitting if metrics available
+                // This ensures lowercase letters span whole pixels
+                let y_adjusted = if let Some(m) = metrics {
+                    let x_height_px = m.x_height_em() * font_size;
+                    if x_height_px > 0.1 {
+                        // Only apply if we have valid x-height
+                        let x_height_snapped = x_height_px.round();
+                        let scale_adjustment = x_height_snapped / x_height_px;
+
+                        // Apply scale adjustment to glyph's vertical offset
+                        line_y_snapped + (glyph.y * scale_adjustment)
+                    } else {
+                        line_y_snapped + glyph.y
+                    }
+                } else {
+                    line_y_snapped + glyph.y
+                };
 
                 self.glyphs.push(PositionedGlyph {
                     key,
                     // cosmic-text's x is the pen position for this glyph
-                    // Note: x_offset/y_offset from cosmic-text are typically 0 for most fonts
-                    // and are already accounted for in the x position during layout
                     x: glyph.x,
-                    // line_y is baseline position, glyph.y is vertical offset from baseline
-                    y: line_y + glyph.y,
+                    // Pixel-aligned baseline + grid-fitted vertical offset
+                    y: y_adjusted,
                     font_size,
                     color: self.default_color,
+                    // Store fractional offset for potential subpixel rendering
+                    subpixel_offset: baseline_offset,
                 });
             }
         }

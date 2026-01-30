@@ -11,7 +11,7 @@ use super::components::{
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
-use crate::text::{MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
+use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
 use crate::ui::format::format_for_display;
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 use crate::ui::theme::Theme;
@@ -2281,6 +2281,7 @@ pub fn layout_block_cells(
     registry: Res<ConversationRegistry>,
     current: Res<CurrentConversation>,
     font_system: Res<SharedFontSystem>,
+    mut metrics_cache: ResMut<FontMetricsCache>,
     windows: Query<&Window>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
@@ -2392,7 +2393,8 @@ pub fn layout_block_cells(
 
         // Compute height from visual line count (after text wrapping)
         // This shapes the buffer if needed and returns accurate wrapped line count
-        let line_count = buffer.visual_line_count(&mut font_system, wrap_width);
+        // Pixel alignment via metrics_cache helps small text render crisply
+        let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
         // Tight height: just the lines, minimal padding for future chrome
         let height = (line_count as f32) * layout.line_height + 4.0;
 

@@ -12,8 +12,8 @@ use bevy::window::PrimaryWindow;
 
 use super::msdf::{
     extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
-    MsdfAtlas, MsdfGenerator, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
-    MsdfTextRenderNode, MsdfUiText, UiTextPositionCache,
+    FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer,
+    MsdfTextPipeline, MsdfTextRenderNode, MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -32,7 +32,8 @@ impl Plugin for TextRenderPlugin {
         // Main world resources
         app.init_resource::<SharedFontSystem>()
             .init_resource::<MsdfRenderConfig>()
-            .init_resource::<TextMetrics>();
+            .init_resource::<TextMetrics>()
+            .init_resource::<FontMetricsCache>();
 
         #[cfg(debug_assertions)]
         app.init_resource::<MsdfDebugInfo>()
@@ -190,6 +191,7 @@ fn init_ui_text_buffers(
     mut commands: Commands,
     font_system: Res<SharedFontSystem>,
     _text_metrics: Res<TextMetrics>,
+    mut metrics_cache: ResMut<FontMetricsCache>,
     query: Query<(Entity, &MsdfUiText), (Without<MsdfTextBuffer>, Without<MsdfText>)>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -204,8 +206,8 @@ fn init_ui_text_buffers(
         let attrs = cosmic_text::Attrs::new().family(ui_text.family);
         buffer.set_text(&mut font_system, &ui_text.text, attrs, cosmic_text::Shaping::Advanced);
 
-        // Shape the text (triggers glyph generation)
-        buffer.visual_line_count(&mut font_system, 800.0);
+        // Shape the text (triggers glyph generation) with pixel alignment
+        buffer.visual_line_count(&mut font_system, 800.0, Some(&mut metrics_cache));
 
         // Add buffer and marker components
         commands.entity(entity).insert((
@@ -247,6 +249,7 @@ fn sync_ui_text_config_positions(
 /// Update MsdfTextBuffer when MsdfUiText text changes.
 fn update_ui_text_buffers(
     font_system: Res<SharedFontSystem>,
+    mut metrics_cache: ResMut<FontMetricsCache>,
     mut query: Query<(&MsdfUiText, &mut MsdfTextBuffer, &UiTextPositionCache, &mut MsdfTextAreaConfig), Changed<MsdfUiText>>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -258,9 +261,9 @@ fn update_ui_text_buffers(
         let attrs = cosmic_text::Attrs::new().family(ui_text.family);
         buffer.set_text(&mut font_system, &ui_text.text, attrs, cosmic_text::Shaping::Advanced);
 
-        // Re-shape with position width
+        // Re-shape with position width and pixel alignment
         let width = position.width.max(100.0);
-        buffer.visual_line_count(&mut font_system, width);
+        buffer.visual_line_count(&mut font_system, width, Some(&mut metrics_cache));
 
         // Update config position
         config.left = position.left;
