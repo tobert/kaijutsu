@@ -362,6 +362,10 @@ pub struct MsdfTextTaaResources {
     pub frames_accumulated: u32,
     /// Cached resolution for detecting resize.
     pub resolution: (u32, u32),
+    /// Cached render pipeline for TAA blend.
+    pub pipeline: Option<CachedRenderPipelineId>,
+    /// Bind group for TAA (uniforms, current, history, sampler).
+    pub bind_group: Option<BindGroup>,
 }
 
 impl MsdfTextTaaResources {
@@ -422,6 +426,8 @@ impl MsdfTextTaaResources {
             read_from_a: true,
             frames_accumulated: 0,
             resolution: (width, height),
+            pipeline: None,
+            bind_group: None,
         }
     }
 
@@ -481,6 +487,8 @@ pub struct MsdfTextResources {
     /// Only used when TAA is enabled.
     pub intermediate_texture: Option<Texture>,
     pub intermediate_texture_view: Option<TextureView>,
+    /// Texture format used for the pipeline (for creating compatible textures).
+    pub format: TextureFormat,
 }
 
 /// MSDF text render pipeline setup.
@@ -671,16 +679,32 @@ impl ViewNode for MsdfTextRenderNode {
             return Ok(());
         };
 
-        let out_texture = view_target.out_texture();
+        // Check if TAA is enabled - if so, render to intermediate texture
+        let taa_state = world.get_resource::<MsdfTextTaaState>();
+        let taa_enabled = taa_state.map(|s| s.enabled).unwrap_or(false);
+
+        // Choose render target: intermediate texture for TAA, ViewTarget otherwise
+        let (render_target, load_op) = if taa_enabled {
+            if let Some(intermediate_view) = &resources.intermediate_texture_view {
+                debug!("🎯 MSDF rendering to intermediate texture for TAA");
+                // Clear intermediate to transparent black
+                (intermediate_view as &TextureView, LoadOp::Clear(Default::default()))
+            } else {
+                warn!("⚠️ TAA enabled but no intermediate texture - falling back to ViewTarget");
+                (view_target.out_texture(), LoadOp::Load)
+            }
+        } else {
+            (view_target.out_texture(), LoadOp::Load)
+        };
 
         let mut render_pass = render_context.command_encoder().begin_render_pass(
             &RenderPassDescriptor {
                 label: Some("msdf_text_render_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: out_texture,
+                    view: render_target,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Load,
+                        load: load_op,
                         store: StoreOp::Store,
                     },
                     depth_slice: None,
@@ -726,12 +750,13 @@ impl ViewNode for MsdfTextTaaNode {
     fn run(
         &self,
         _graph: &mut RenderGraphContext,
-        _render_context: &mut RenderContext,
-        _view_target: &ViewTarget,
+        render_context: &mut RenderContext,
+        view_target: &ViewTarget,
         world: &World,
     ) -> Result<(), NodeRunError> {
         // Check if TAA is enabled
         let Some(taa_state) = world.get_resource::<MsdfTextTaaState>() else {
+            debug!("🔍 TAA node: no MsdfTextTaaState resource");
             return Ok(());
         };
 
@@ -740,22 +765,77 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(());
         }
 
-        // Check for TAA resources
+        debug!("🎯 TAA node running (frame {})", taa_state.frame_index);
+
+        // Get required resources with diagnostics
         let Some(taa_resources) = world.get_resource::<MsdfTextTaaResources>() else {
+            warn!("⚠️ TAA node: no MsdfTextTaaResources");
             return Ok(());
         };
 
-        // TODO: Phase 3b complete implementation
-        // 1. Read from intermediate texture (MSDF output)
-        // 2. Read from history texture (taa_resources.read_view())
-        // 3. Run TAA blend shader
-        // 4. Write to ViewTarget
-        // 5. Copy result to history write buffer
-        //
-        // For now, this is a placeholder. The jitter is applied but not accumulated.
-        // Full implementation requires intermediate texture plumbing.
+        let Some(msdf_resources) = world.get_resource::<MsdfTextResources>() else {
+            warn!("⚠️ TAA node: no MsdfTextResources");
+            return Ok(());
+        };
 
-        let _ = taa_resources; // Suppress unused warning
+        // Need intermediate texture for TAA to work
+        let Some(intermediate_view) = &msdf_resources.intermediate_texture_view else {
+            warn!("⚠️ TAA node: no intermediate texture view");
+            return Ok(());
+        };
+
+        // Need the bind group
+        let Some(bind_group) = &taa_resources.bind_group else {
+            warn!("⚠️ TAA node: no bind group (frames_accumulated={})", taa_resources.frames_accumulated);
+            return Ok(());
+        };
+
+        // Get cached pipeline
+        let Some(pipeline_id) = taa_resources.pipeline else {
+            warn!("⚠️ TAA node: no pipeline ID");
+            return Ok(());
+        };
+
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
+            debug!("🔄 TAA node: pipeline not yet compiled");
+            return Ok(());
+        };
+
+        debug!("✅ TAA node: all resources ready, running blend pass");
+
+        // Run TAA blend pass
+        // Renders fullscreen triangle that samples intermediate + history, outputs to ViewTarget
+        let out_texture = view_target.out_texture();
+
+        let mut render_pass = render_context.command_encoder().begin_render_pass(
+            &RenderPassDescriptor {
+                label: Some("msdf_taa_blend_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: out_texture,
+                    resolve_target: None,
+                    ops: Operations {
+                        // Load existing scene, blend text on top
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            },
+        );
+
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        // Draw fullscreen triangle (3 vertices, shader generates positions)
+        render_pass.draw(0..3, 0..1);
+
+        debug!("✅ TAA blend pass complete");
+
+        // Note: History swap happens in prepare_msdf_texts next frame
+        let _ = intermediate_view; // Used in bind_group creation
 
         Ok(())
     }
@@ -879,12 +959,15 @@ pub fn extract_msdf_taa_config(
 
 /// Initialize TAA resources when resolution is available.
 ///
-/// Creates the history textures for temporal accumulation.
-/// Runs once when `MsdfTextTaaResources` doesn't exist and config is ready.
+/// Creates the history textures for temporal accumulation and queues the TAA pipeline.
+/// Runs once when `MsdfTextTaaResources` doesn't exist and `MsdfTextResources` exists.
 pub fn init_msdf_taa_resources(
     mut commands: Commands,
     device: Res<RenderDevice>,
     render_config: Option<Res<ExtractedMsdfRenderConfig>>,
+    msdf_resources: Res<MsdfTextResources>,
+    taa_pipeline: Res<MsdfTextTaaPipeline>,
+    pipeline_cache: Res<PipelineCache>,
 ) {
     let Some(config) = render_config else {
         return;
@@ -900,9 +983,48 @@ pub fn init_msdf_taa_resources(
         return;
     }
 
-    let taa_resources = MsdfTextTaaResources::new(&device, width, height);
+    // Use the same format as the MSDF pipeline (from swap chain)
+    let format = msdf_resources.format;
+    debug!("🎯 Initializing TAA resources with format {:?}", format);
+
+    // Create history textures
+    let mut taa_resources = MsdfTextTaaResources::new(&device, width, height);
+
+    // Queue the TAA blend pipeline
+    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("msdf_taa_blend_pipeline".into()),
+        layout: vec![taa_pipeline.bind_group_layout_descriptor.clone()],
+        push_constant_ranges: vec![],
+        vertex: VertexState {
+            shader: taa_pipeline.shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vertex".into()),
+            // Fullscreen triangle - no vertex buffers needed
+            buffers: vec![],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            ..default()
+        },
+        depth_stencil: None, // No depth for fullscreen pass
+        multisample: MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: taa_pipeline.shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fragment".into()),
+            targets: vec![Some(ColorTargetState {
+                format, // Use same format as MSDF pipeline (from swap chain)
+                // Alpha blending to composite text on top of scene
+                blend: Some(BlendState::ALPHA_BLENDING),
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
+
+    taa_resources.pipeline = Some(pipeline_id);
     commands.insert_resource(taa_resources);
-    info!("📺 Initialized TAA history textures: {}x{}", width, height);
+    info!("📺 Initialized TAA resources: {}x{} format={:?}", width, height, format);
 }
 
 /// Prepare MSDF text resources for rendering.
@@ -913,6 +1035,7 @@ pub fn prepare_msdf_texts(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline: Res<MsdfTextPipeline>,
+    taa_pipeline: Res<MsdfTextTaaPipeline>,
     extracted: Option<Res<ExtractedMsdfTexts>>,
     atlas: Option<Res<ExtractedMsdfAtlas>>,
     render_config: Option<Res<ExtractedMsdfRenderConfig>>,
@@ -920,7 +1043,7 @@ pub fn prepare_msdf_texts(
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
     mut taa_state: ResMut<MsdfTextTaaState>,
-    taa_resources: Option<ResMut<MsdfTextTaaResources>>,
+    mut taa_resources: Option<ResMut<MsdfTextTaaResources>>,
     #[cfg(debug_assertions)]
     debug_mode: Option<Res<ExtractedMsdfDebugMode>>,
 ) {
@@ -933,7 +1056,7 @@ pub fn prepare_msdf_texts(
     }
 
     // Handle TAA resources resize if needed
-    if let Some(mut taa_res) = taa_resources {
+    if let Some(ref mut taa_res) = taa_resources {
         let width = render_config.resolution[0] as u32;
         let height = render_config.resolution[1] as u32;
         taa_res.resize_if_needed(&device, width, height);
@@ -1171,6 +1294,34 @@ pub fn prepare_msdf_texts(
         resources.depth_texture = Some(depth_texture);
         resources.depth_texture_view = Some(depth_texture_view);
         resources.depth_texture_size = (width, height);
+        // Mark intermediate texture for recreation at new size
+        resources.intermediate_texture = None;
+        resources.intermediate_texture_view = None;
+    }
+
+    // Create intermediate texture for TAA if needed (separate from depth texture)
+    // This must be checked every frame because TAA can be toggled and resources
+    // may be initialized after the depth texture already exists.
+    if taa_state.enabled && resources.intermediate_texture_view.is_none() && width > 0 && height > 0 {
+        debug!("🎯 Creating intermediate texture for TAA: {}x{} format={:?}", width, height, resources.format);
+        let intermediate_texture = device.create_texture(&TextureDescriptor {
+            label: Some("msdf_intermediate_texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            // Use the same format as the pipeline (from swap chain)
+            format: resources.format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let intermediate_view = intermediate_texture.create_view(&TextureViewDescriptor::default());
+        resources.intermediate_texture = Some(intermediate_texture);
+        resources.intermediate_texture_view = Some(intermediate_view);
     }
 
     // Update bind group if atlas texture changed
@@ -1184,6 +1335,36 @@ pub fn prepare_msdf_texts(
                 &gpu_image.sampler,
             )),
         ));
+    }
+
+    // Update TAA bind group if we have TAA resources and intermediate texture
+    if let Some(intermediate_view) = &resources.intermediate_texture_view {
+        if let Some(taa_res) = &mut taa_resources {
+            // Update TAA uniforms
+            let taa_uniforms = TaaUniforms {
+                resolution,
+                frames_accumulated: taa_res.frames_accumulated,
+                taa_enabled: if taa_state.enabled { 1 } else { 0 },
+                camera_motion: [0.0, 0.0], // Static text, no camera motion yet
+                _padding: [0.0, 0.0],
+            };
+            queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
+
+            // Create TAA bind group: uniforms, current (intermediate), history, sampler
+            taa_res.bind_group = Some(device.create_bind_group(
+                "msdf_taa_bind_group",
+                &taa_pipeline.bind_group_layout,
+                &BindGroupEntries::sequential((
+                    taa_pipeline.uniform_buffer.as_entire_binding(),
+                    intermediate_view,
+                    taa_res.read_view(),
+                    &taa_res.history_sampler,
+                )),
+            ));
+
+            // Swap history textures for next frame and increment accumulation counter
+            taa_res.swap();
+        }
     }
 }
 
@@ -1335,6 +1516,7 @@ pub fn init_msdf_resources(
         depth_texture_size: (0, 0),
         intermediate_texture: None,
         intermediate_texture_view: None,
+        format, // Store the format used for pipeline creation
     });
 }
 
