@@ -32,8 +32,9 @@ pub use generator::{FontMetricsCache, HintingMetrics};
 pub use pipeline::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
     init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
-    ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
-    MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources, MsdfTextTaaState,
+    ExtractedCameraMotion, ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode,
+    MsdfTextResources, MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources,
+    MsdfTextTaaState,
 };
 
 use bevy::prelude::*;
@@ -287,5 +288,22 @@ pub struct MsdfDebugOverlay {
 pub struct MsdfTaaConfig {
     /// Whether TAA jitter is enabled (default: true).
     pub enabled: bool,
+}
+
+/// Resource tracking camera motion for TAA reprojection.
+///
+/// Tracks the previous frame's camera position to compute motion delta.
+/// Used by TAA to reproject history samples when the camera moves.
+#[derive(Resource, Default, Clone)]
+pub struct MsdfCameraMotion {
+    /// Previous frame's camera translation (world space).
+    pub prev_translation: Vec2,
+    /// Current frame's camera translation (world space).
+    pub curr_translation: Vec2,
+    /// Computed motion delta in screen UV space.
+    /// This is what gets passed to the TAA shader.
+    pub motion_uv: Vec2,
+    /// Whether we have valid previous frame data.
+    pub initialized: bool,
 }
 

@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 use bevy::render::{
     render_graph::{RenderGraphExt, ViewNodeRunner},
-    ExtractSchedule, Render, RenderApp, RenderPlugin, RenderSystems,
+    Extract, ExtractSchedule, Render, RenderApp, RenderPlugin, RenderSystems,
 };
 use bevy::ui::{ComputedNode, UiGlobalTransform, UiSystems};
 use bevy::window::PrimaryWindow;
@@ -13,9 +13,10 @@ use bevy::window::PrimaryWindow;
 use super::msdf::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
     init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
-    FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfTaaConfig, MsdfText, MsdfTextAreaConfig,
-    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaNode, MsdfTextTaaPipeline,
-    MsdfTextTaaResources, MsdfTextTaaState, MsdfUiText, UiTextPositionCache,
+    ExtractedCameraMotion, FontMetricsCache, MsdfAtlas, MsdfCameraMotion, MsdfGenerator,
+    MsdfTaaConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
+    MsdfTextRenderNode, MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources,
+    MsdfTextTaaState, MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -36,6 +37,7 @@ impl Plugin for TextRenderPlugin {
             .init_resource::<MsdfRenderConfig>()
             .init_resource::<TextMetrics>()
             .init_resource::<FontMetricsCache>()
+            .init_resource::<MsdfCameraMotion>()
             // TAA config: enabled by default
             .insert_resource(MsdfTaaConfig { enabled: true });
 
@@ -45,6 +47,7 @@ impl Plugin for TextRenderPlugin {
 
         app.add_systems(Update, (
                 sync_render_config_from_window,
+                track_camera_motion,
                 init_ui_text_buffers,
                 update_ui_text_buffers,
                 sync_ui_text_config_positions,
@@ -78,6 +81,7 @@ impl Plugin for TextRenderPlugin {
                 extract_msdf_render_config,
                 extract_msdf_texts,
                 extract_msdf_taa_config,
+                extract_camera_motion,
             ))
             .add_systems(Render, prepare_msdf_texts.run_if(resource_exists::<super::msdf::MsdfTextResources>));
 
@@ -172,6 +176,58 @@ fn sync_render_config_from_window(
         text_metrics.scale_factor = scale;
         info!("TextMetrics scale_factor updated: {:.2}", scale);
     }
+}
+
+/// Track camera motion for TAA reprojection.
+///
+/// Computes the motion delta between current and previous frame's camera position.
+/// The delta is stored in UV space for direct use by the TAA shader.
+fn track_camera_motion(
+    camera_query: Query<&Transform, With<Camera2d>>,
+    config: Res<MsdfRenderConfig>,
+    mut motion: ResMut<MsdfCameraMotion>,
+) {
+    let Ok(transform) = camera_query.single() else {
+        return;
+    };
+
+    // Get current camera position (2D, ignore Z)
+    let curr = Vec2::new(transform.translation.x, transform.translation.y);
+
+    if motion.initialized {
+        // Compute delta: how much did the camera move?
+        let delta = curr - motion.prev_translation;
+
+        // Convert to UV space: delta_uv = delta_world / (viewport_size / 2)
+        // For orthographic 2D, viewport_size in world units = resolution (assuming scale 1)
+        // Motion in UV space tells the shader where to sample history
+        let viewport = Vec2::new(config.resolution[0], config.resolution[1]);
+        if viewport.x > 0.0 && viewport.y > 0.0 {
+            // Normalize to UV space (0-1 range = full screen)
+            // Camera moving right → text appears to move left → sample history from right
+            motion.motion_uv = delta / viewport;
+        }
+    } else {
+        // First frame - no valid delta yet
+        motion.motion_uv = Vec2::ZERO;
+        motion.initialized = true;
+    }
+
+    // Store for next frame
+    motion.prev_translation = motion.curr_translation;
+    motion.curr_translation = curr;
+}
+
+/// Extract camera motion for render world.
+///
+/// Copies the computed motion delta to the render world for TAA reprojection.
+fn extract_camera_motion(
+    mut commands: Commands,
+    motion: Extract<Res<MsdfCameraMotion>>,
+) {
+    commands.insert_resource(ExtractedCameraMotion {
+        motion_uv: [motion.motion_uv.x, motion.motion_uv.y],
+    });
 }
 
 /// Update MSDF generator - poll for completed tasks and queue pending glyphs.

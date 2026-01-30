@@ -315,6 +315,15 @@ pub struct ExtractedMsdfRenderConfig {
     pub initialized: bool,
 }
 
+/// Extracted camera motion for TAA reprojection.
+///
+/// Contains the motion delta in UV space for history sampling offset.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct ExtractedCameraMotion {
+    /// Motion delta in UV space (0-1 = full screen).
+    pub motion_uv: [f32; 2],
+}
+
 /// TAA state for MSDF text rendering.
 ///
 /// Tracks the frame counter for Halton sequence jitter and TAA enable state.
@@ -1134,6 +1143,7 @@ pub fn prepare_msdf_texts(
     extracted: Option<Res<ExtractedMsdfTexts>>,
     atlas: Option<Res<ExtractedMsdfAtlas>>,
     render_config: Option<Res<ExtractedMsdfRenderConfig>>,
+    camera_motion: Option<Res<ExtractedCameraMotion>>,
     images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>,
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
@@ -1442,12 +1452,23 @@ pub fn prepare_msdf_texts(
                 taa_res.swap();
             }
 
+            // Get camera motion for reprojection (or zero if not available)
+            let motion = camera_motion.as_ref().map(|m| m.motion_uv).unwrap_or([0.0, 0.0]);
+
+            // Reset accumulation on significant camera motion (prevents ghosting)
+            let motion_magnitude = (motion[0] * motion[0] + motion[1] * motion[1]).sqrt();
+            if motion_magnitude > 0.001 {
+                // Camera moved - reset accumulation to avoid ghosting
+                taa_res.frames_accumulated = 0;
+                debug!("📷 Camera motion detected ({:.4}), resetting TAA accumulation", motion_magnitude);
+            }
+
             // Update TAA uniforms
             let taa_uniforms = TaaUniforms {
                 resolution,
                 frames_accumulated: taa_res.frames_accumulated,
                 taa_enabled: if taa_state.enabled { 1 } else { 0 },
-                camera_motion: [0.0, 0.0], // Static text, no camera motion yet
+                camera_motion: motion,
                 _padding: [0.0, 0.0],
             };
             queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
