@@ -31,9 +31,9 @@ pub use generator::MsdfGenerator;
 pub use generator::{FontMetricsCache, HintingMetrics};
 pub use pipeline::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
-    init_msdf_resources, prepare_msdf_texts,
+    init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
     ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
-    MsdfTextTaaState,
+    MsdfTextTaaResources, MsdfTextTaaState,
 };
 
 use bevy::prelude::*;

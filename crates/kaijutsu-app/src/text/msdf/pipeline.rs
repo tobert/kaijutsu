@@ -336,6 +336,132 @@ impl Default for MsdfTextTaaState {
     }
 }
 
+/// TAA history textures for temporal accumulation.
+///
+/// Uses ping-pong double buffering: each frame reads from one texture
+/// and writes the blended result to the other, then swaps.
+///
+/// History format: RGBA16Float for HDR-capable accumulation with precision.
+#[derive(Resource)]
+pub struct MsdfTextTaaResources {
+    /// History texture A (ping).
+    pub history_a: Texture,
+    /// History texture B (pong).
+    pub history_b: Texture,
+    /// Texture view for history A.
+    pub history_a_view: TextureView,
+    /// Texture view for history B.
+    pub history_b_view: TextureView,
+    /// Sampler for reading history textures.
+    pub history_sampler: Sampler,
+    /// Which history texture to read from this frame (true = A, false = B).
+    /// Flips each frame after the TAA pass writes.
+    pub read_from_a: bool,
+    /// Total frames accumulated (for confidence tracking).
+    /// Resets on resolution change or when TAA is toggled.
+    pub frames_accumulated: u32,
+    /// Cached resolution for detecting resize.
+    pub resolution: (u32, u32),
+}
+
+impl MsdfTextTaaResources {
+    /// Create new TAA resources for the given resolution.
+    pub fn new(device: &RenderDevice, width: u32, height: u32) -> Self {
+        let size = Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        // RGBA16Float for HDR accumulation with good precision
+        let format = TextureFormat::Rgba16Float;
+
+        let descriptor = TextureDescriptor {
+            label: Some("msdf_taa_history"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+
+        let history_a = device.create_texture(&TextureDescriptor {
+            label: Some("msdf_taa_history_a"),
+            ..descriptor
+        });
+        let history_b = device.create_texture(&TextureDescriptor {
+            label: Some("msdf_taa_history_b"),
+            ..descriptor
+        });
+
+        let history_a_view = history_a.create_view(&TextureViewDescriptor::default());
+        let history_b_view = history_b.create_view(&TextureViewDescriptor::default());
+
+        // Linear sampler for smooth history reads
+        let history_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("msdf_taa_history_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Nearest,
+            ..default()
+        });
+
+        Self {
+            history_a,
+            history_b,
+            history_a_view,
+            history_b_view,
+            history_sampler,
+            read_from_a: true,
+            frames_accumulated: 0,
+            resolution: (width, height),
+        }
+    }
+
+    /// Recreate textures if resolution changed.
+    pub fn resize_if_needed(&mut self, device: &RenderDevice, width: u32, height: u32) {
+        if self.resolution != (width, height) && width > 0 && height > 0 {
+            *self = Self::new(device, width, height);
+        }
+    }
+
+    /// Get the history texture view to read from this frame.
+    pub fn read_view(&self) -> &TextureView {
+        if self.read_from_a {
+            &self.history_a_view
+        } else {
+            &self.history_b_view
+        }
+    }
+
+    /// Get the history texture view to write to this frame.
+    pub fn write_view(&self) -> &TextureView {
+        if self.read_from_a {
+            &self.history_b_view
+        } else {
+            &self.history_a_view
+        }
+    }
+
+    /// Swap read/write textures for next frame.
+    pub fn swap(&mut self) {
+        self.read_from_a = !self.read_from_a;
+        self.frames_accumulated = self.frames_accumulated.saturating_add(1);
+    }
+
+    /// Reset accumulation (e.g., after camera movement or TAA toggle).
+    pub fn reset_accumulation(&mut self) {
+        self.frames_accumulated = 0;
+    }
+}
+
 /// Render world resources for MSDF text.
 #[derive(Resource)]
 #[allow(dead_code)]
@@ -602,6 +728,34 @@ pub fn extract_msdf_taa_config(
     }
 }
 
+/// Initialize TAA resources when resolution is available.
+///
+/// Creates the history textures for temporal accumulation.
+/// Runs once when `MsdfTextTaaResources` doesn't exist and config is ready.
+pub fn init_msdf_taa_resources(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    render_config: Option<Res<ExtractedMsdfRenderConfig>>,
+) {
+    let Some(config) = render_config else {
+        return;
+    };
+    if !config.initialized {
+        return;
+    }
+
+    let width = config.resolution[0] as u32;
+    let height = config.resolution[1] as u32;
+
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let taa_resources = MsdfTextTaaResources::new(&device, width, height);
+    commands.insert_resource(taa_resources);
+    info!("📺 Initialized TAA history textures: {}x{}", width, height);
+}
+
 /// Prepare MSDF text resources for rendering.
 ///
 /// Requires `ExtractedMsdfRenderConfig` to be present and initialized.
@@ -617,6 +771,7 @@ pub fn prepare_msdf_texts(
     time: Res<Time>,
     mut resources: ResMut<MsdfTextResources>,
     mut taa_state: ResMut<MsdfTextTaaState>,
+    taa_resources: Option<ResMut<MsdfTextTaaResources>>,
     #[cfg(debug_assertions)]
     debug_mode: Option<Res<ExtractedMsdfDebugMode>>,
 ) {
@@ -626,6 +781,13 @@ pub fn prepare_msdf_texts(
     };
     if !render_config.initialized {
         return;
+    }
+
+    // Handle TAA resources resize if needed
+    if let Some(mut taa_res) = taa_resources {
+        let width = render_config.resolution[0] as u32;
+        let height = render_config.resolution[1] as u32;
+        taa_res.resize_if_needed(&device, width, height);
     }
 
     let Some(extracted) = extracted else {

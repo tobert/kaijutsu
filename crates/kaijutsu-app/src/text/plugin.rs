@@ -12,10 +12,10 @@ use bevy::window::PrimaryWindow;
 
 use super::msdf::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
-    init_msdf_resources, prepare_msdf_texts,
+    init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
     FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfTaaConfig, MsdfText, MsdfTextAreaConfig,
-    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaState, MsdfUiText,
-    UiTextPositionCache,
+    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaResources, MsdfTextTaaState,
+    MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -120,6 +120,16 @@ impl Plugin for TextRenderPlugin {
             init_msdf_resources
                 .in_set(RenderSystems::Prepare)
                 .run_if(not(resource_exists::<super::msdf::MsdfTextResources>)),
+        );
+
+        // Schedule init_msdf_taa_resources to run after main resources exist
+        // Creates history textures for temporal accumulation
+        render_app.add_systems(
+            Render,
+            init_msdf_taa_resources
+                .in_set(RenderSystems::Prepare)
+                .run_if(resource_exists::<super::msdf::MsdfTextResources>)
+                .run_if(not(resource_exists::<MsdfTextTaaResources>)),
         );
     }
 }
