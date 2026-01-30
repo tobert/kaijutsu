@@ -33,7 +33,7 @@ pub use pipeline::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
     init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
     ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
-    MsdfTextTaaResources, MsdfTextTaaState,
+    MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources, MsdfTextTaaState,
 };
 
 use bevy::prelude::*;

@@ -14,8 +14,8 @@ use super::msdf::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
     init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
     FontMetricsCache, MsdfAtlas, MsdfGenerator, MsdfTaaConfig, MsdfText, MsdfTextAreaConfig,
-    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaResources, MsdfTextTaaState,
-    MsdfUiText, UiTextPositionCache,
+    MsdfTextBuffer, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextTaaNode, MsdfTextTaaPipeline,
+    MsdfTextTaaResources, MsdfTextTaaState, MsdfUiText, UiTextPositionCache,
 };
 #[cfg(debug_assertions)]
 use super::msdf::{DebugOverlayMode, MsdfDebugInfo, MsdfDebugOverlay};
@@ -81,14 +81,24 @@ impl Plugin for TextRenderPlugin {
             ))
             .add_systems(Render, prepare_msdf_texts.run_if(resource_exists::<super::msdf::MsdfTextResources>));
 
-        // Add render node to the graph - after Upscaling (final post-processing step)
+        // Add render nodes to the graph - after Upscaling (final post-processing step)
+        // MSDF renders text, then TAA blends with history
         use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
         render_app
             .add_render_graph_node::<ViewNodeRunner<MsdfTextRenderNode>>(
                 Core2d,
                 MsdfTextRenderNode::NAME,
             )
-            .add_render_graph_edges(Core2d, (Node2d::Upscaling, MsdfTextRenderNode::NAME));
+            .add_render_graph_node::<ViewNodeRunner<MsdfTextTaaNode>>(
+                Core2d,
+                MsdfTextTaaNode::NAME,
+            )
+            // Order: Upscaling → MSDF → TAA
+            .add_render_graph_edges(Core2d, (
+                Node2d::Upscaling,
+                MsdfTextRenderNode::NAME,
+                MsdfTextTaaNode::NAME,
+            ));
     }
 
     fn finish(&self, app: &mut App) {
@@ -110,6 +120,7 @@ impl Plugin for TextRenderPlugin {
 
         // Initialize render world resources
         render_app.init_resource::<MsdfTextPipeline>();
+        render_app.init_resource::<MsdfTextTaaPipeline>();
         render_app.init_resource::<MsdfTextTaaState>();
         render_app.insert_resource(font_system);
 

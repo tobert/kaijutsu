@@ -477,6 +477,10 @@ pub struct MsdfTextResources {
     pub depth_texture_view: Option<TextureView>,
     /// Cached resolution for depth texture recreation.
     pub depth_texture_size: (u32, u32),
+    /// Intermediate texture for TAA - MSDF renders here, TAA blends to ViewTarget.
+    /// Only used when TAA is enabled.
+    pub intermediate_texture: Option<Texture>,
+    pub intermediate_texture_view: Option<TextureView>,
 }
 
 /// MSDF text render pipeline setup.
@@ -526,6 +530,99 @@ impl FromWorld for MsdfTextPipeline {
             bind_group_layout,
             bind_group_layout_descriptor,
             shader,
+        }
+    }
+}
+
+// ============================================================================
+// TAA PIPELINE
+// ============================================================================
+
+/// GPU uniform for TAA blend pass.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, ShaderType)]
+pub struct TaaUniforms {
+    /// Resolution for UV calculations.
+    pub resolution: [f32; 2],
+    /// Number of frames accumulated.
+    pub frames_accumulated: u32,
+    /// Whether TAA is enabled.
+    pub taa_enabled: u32,
+    /// Camera motion delta (for Phase 4 reprojection).
+    pub camera_motion: [f32; 2],
+    /// Padding for 16-byte alignment.
+    pub _padding: [f32; 2],
+}
+
+impl Default for TaaUniforms {
+    fn default() -> Self {
+        Self {
+            resolution: [1280.0, 720.0],
+            frames_accumulated: 0,
+            taa_enabled: 1,
+            camera_motion: [0.0, 0.0],
+            _padding: [0.0, 0.0],
+        }
+    }
+}
+
+/// Label for the TAA blend render node.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+pub struct MsdfTextTaaNodeLabel;
+
+/// TAA blend pipeline setup.
+#[derive(Resource)]
+pub struct MsdfTextTaaPipeline {
+    pub bind_group_layout: BindGroupLayout,
+    pub bind_group_layout_descriptor: BindGroupLayoutDescriptor,
+    pub shader: Handle<Shader>,
+    pub uniform_buffer: Buffer,
+}
+
+impl FromWorld for MsdfTextTaaPipeline {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>();
+        let asset_server = world.resource::<AssetServer>();
+
+        // TAA bind group: uniforms, current texture, history texture, sampler
+        let entries = BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (
+                // Uniforms
+                uniform_buffer::<TaaUniforms>(false),
+                // Current (intermediate) texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // History texture
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                // Sampler
+                sampler(SamplerBindingType::Filtering),
+            ),
+        );
+
+        let bind_group_layout = device.create_bind_group_layout(
+            Some("msdf_taa_bind_group_layout"),
+            &entries,
+        );
+
+        let bind_group_layout_descriptor = BindGroupLayoutDescriptor::new(
+            "msdf_taa_bind_group_layout",
+            entries.to_vec().as_slice(),
+        );
+
+        let shader = asset_server.load("shaders/msdf_text_taa.wgsl");
+
+        let uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("msdf_taa_uniform_buffer"),
+            size: std::mem::size_of::<TaaUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            bind_group_layout,
+            bind_group_layout_descriptor,
+            shader,
+            uniform_buffer,
         }
     }
 }
@@ -607,6 +704,58 @@ impl ViewNode for MsdfTextRenderNode {
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_vertex_buffer(0, *vertex_buffer.slice(..));
         render_pass.draw(0..resources.vertex_count, 0..1);
+
+        Ok(())
+    }
+}
+
+/// TAA blend render node.
+///
+/// Reads from intermediate texture and history, blends, and outputs to ViewTarget.
+/// When TAA is disabled, this node does nothing (MSDF renders directly to ViewTarget).
+#[derive(Default)]
+pub struct MsdfTextTaaNode;
+
+impl MsdfTextTaaNode {
+    pub const NAME: MsdfTextTaaNodeLabel = MsdfTextTaaNodeLabel;
+}
+
+impl ViewNode for MsdfTextTaaNode {
+    type ViewQuery = &'static ViewTarget;
+
+    fn run(
+        &self,
+        _graph: &mut RenderGraphContext,
+        _render_context: &mut RenderContext,
+        _view_target: &ViewTarget,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        // Check if TAA is enabled
+        let Some(taa_state) = world.get_resource::<MsdfTextTaaState>() else {
+            return Ok(());
+        };
+
+        if !taa_state.enabled {
+            // TAA disabled - MSDF already rendered directly to ViewTarget
+            return Ok(());
+        }
+
+        // Check for TAA resources
+        let Some(taa_resources) = world.get_resource::<MsdfTextTaaResources>() else {
+            return Ok(());
+        };
+
+        // TODO: Phase 3b complete implementation
+        // 1. Read from intermediate texture (MSDF output)
+        // 2. Read from history texture (taa_resources.read_view())
+        // 3. Run TAA blend shader
+        // 4. Write to ViewTarget
+        // 5. Copy result to history write buffer
+        //
+        // For now, this is a placeholder. The jitter is applied but not accumulated.
+        // Full implementation requires intermediate texture plumbing.
+
+        let _ = taa_resources; // Suppress unused warning
 
         Ok(())
     }
@@ -1184,6 +1333,8 @@ pub fn init_msdf_resources(
         depth_texture: None,
         depth_texture_view: None,
         depth_texture_size: (0, 0),
+        intermediate_texture: None,
+        intermediate_texture_view: None,
     });
 }
 
