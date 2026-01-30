@@ -18,6 +18,8 @@ bevy_brp_extras.workspace = true  # includes RemotePlugin
 
 # Text rendering (MSDF-based)
 cosmic-text.workspace = true
+# Font metrics for shader-based hinting
+swash = "0.2"
 
 # MSDF generation
 msdfgen = { git = "https://github.com/katyo/msdfgen-rs", rev = "5e62bcf", default-features = false, features = ["ttf-parser"] }

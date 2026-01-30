@@ -169,6 +169,14 @@ pub struct MsdfUniforms {
     pub debug_mode: u32,
     /// Glow color.
     pub glow_color: [f32; 4],
+    /// SDF texel size (1.0 / atlas_width, 1.0 / atlas_height) for neighbor sampling.
+    /// Used by shader-based hinting to detect stroke direction via gradient.
+    pub sdf_texel: [f32; 2],
+    /// Hinting strength (0.0 = off, 1.0 = full).
+    /// Controls how aggressively horizontal strokes are sharpened.
+    pub hint_amount: f32,
+    /// Padding for 16-byte alignment.
+    pub _padding: f32,
 }
 
 impl Default for MsdfUniforms {
@@ -182,6 +190,9 @@ impl Default for MsdfUniforms {
             glow_spread: 2.0,
             debug_mode: 0,
             glow_color: [0.4, 0.6, 1.0, 0.5],
+            sdf_texel: [1.0 / 1024.0, 1.0 / 1024.0], // Default atlas size
+            hint_amount: 0.8, // Enable hinting by default (80% strength)
+            _padding: 0.0,
         }
     }
 }
@@ -548,6 +559,12 @@ pub fn prepare_msdf_texts(
     #[cfg(not(debug_assertions))]
     let debug_mode_value = 0u32;
 
+    // Compute SDF texel size for gradient sampling in shader
+    let sdf_texel = [
+        1.0 / atlas.width as f32,
+        1.0 / atlas.height as f32,
+    ];
+
     // Update uniforms
     let uniforms = MsdfUniforms {
         resolution,
@@ -563,6 +580,9 @@ pub fn prepare_msdf_texts(
                 [c.red, c.green, c.blue, c.alpha]
             })
             .unwrap_or([0.4, 0.6, 1.0, 0.5]),
+        sdf_texel,
+        hint_amount: 0.8, // 80% hinting strength - can be made configurable
+        _padding: 0.0,
     };
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

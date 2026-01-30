@@ -18,6 +18,12 @@ struct Uniforms {
     // Debug mode: 0=off, 1=dots only, 2=dots+quads
     debug_mode: u32,
     glow_color: vec4<f32>,
+    // SDF texel size (1/atlas_width, 1/atlas_height) for gradient sampling
+    sdf_texel: vec2<f32>,
+    // Hinting strength (0.0 = off, 1.0 = full)
+    hint_amount: f32,
+    // Padding for alignment
+    _padding: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -97,6 +103,63 @@ fn msdf_alpha_at(uv: vec2<f32>, bias: f32) -> f32 {
     // Multiplying by 2.0 provides good balance between sharpness and smoothness
     let dist = (sd - bias) * px_range * 2.0;
     return clamp(dist + 0.5, 0.0, 1.0);
+}
+
+/// Shader-based hinting using gradient detection.
+///
+/// This technique from webgl_fonts (astiopin) improves small text quality by:
+/// 1. Sampling neighboring texels to detect stroke direction
+/// 2. Applying wider AA for vertical strokes (which appear thinner)
+/// 3. Applying sharper AA for horizontal strokes (stems, crossbars)
+/// 4. Optionally darkening horizontal strokes for better weight
+///
+/// The result mimics TrueType hinting's focus on horizontal alignment,
+/// making stems and crossbars crisper at small sizes.
+fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32) -> f32 {
+    // Sample center and neighbors
+    let sample_c = textureSample(atlas_texture, atlas_sampler, uv);
+    let sample_n = textureSample(atlas_texture, atlas_sampler, uv + vec2<f32>(0.0, uniforms.sdf_texel.y));
+    let sample_e = textureSample(atlas_texture, atlas_sampler, uv + vec2<f32>(uniforms.sdf_texel.x, 0.0));
+
+    // Get signed distances using MTSDF (median + alpha correction)
+    let sd_c = min(median(sample_c.r, sample_c.g, sample_c.b), sample_c.a);
+    let sd_n = min(median(sample_n.r, sample_n.g, sample_n.b), sample_n.a);
+    let sd_e = min(median(sample_e.r, sample_e.g, sample_e.b), sample_e.a);
+
+    // Compute gradient (perpendicular to stroke edge)
+    // sgrad = (change in east direction, change in north direction)
+    let sgrad = vec2<f32>(sd_e - sd_c, sd_n - sd_c);
+    let sgrad_len = max(length(sgrad), 1.0 / 128.0); // Prevent division by zero
+    let grad = sgrad / sgrad_len;
+
+    // vgrad: 0.0 = vertical stroke edge (horizontal gradient)
+    //        1.0 = horizontal stroke edge (vertical gradient)
+    // Vertical strokes (like 'l', 'I') have horizontal gradients (grad.y ≈ 0)
+    // Horizontal strokes (crossbar of 'T', 'H') have vertical gradients (grad.y ≈ 1)
+    let vgrad = abs(grad.y);
+
+    // Compute base distance offset for antialiasing
+    let px_range = screen_px_range(uv);
+    let base_doffset = 0.5 / (px_range * 2.0);
+
+    // Apply different AA widths based on stroke direction
+    // - Vertical strokes (vgrad ≈ 0): wider AA (horz_scale = 1.1)
+    // - Horizontal strokes (vgrad ≈ 1): sharper AA (vert_scale = 0.6)
+    let horz_scale = 1.1;  // Wider AA for vertical strokes (they appear thinner)
+    let vert_scale = 0.6;  // Sharper AA for horizontal strokes (makes stems crisper)
+    let hinted_doffset = mix(base_doffset * horz_scale, base_doffset * vert_scale, vgrad);
+
+    // Interpolate between unhinted and hinted based on hint_amount
+    let doffset = mix(base_doffset, hinted_doffset, uniforms.hint_amount);
+
+    // Compute alpha with smoothstep for antialiasing
+    var alpha = smoothstep(bias - doffset, bias + doffset, sd_c);
+
+    // Optionally darken horizontal strokes slightly for better visual weight
+    // This compensates for the sharper AA making them appear lighter
+    alpha = pow(alpha, 1.0 + 0.2 * vgrad * uniforms.hint_amount);
+
+    return alpha;
 }
 
 // ============================================================================
@@ -228,7 +291,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // === MAIN TEXT ===
-    let text_alpha = msdf_alpha_at(in.uv, 0.5);
+    // Use hinted alpha for main text to improve small text quality
+    // The hinting varies AA width based on stroke direction:
+    // - Horizontal strokes (stems, crossbars) get sharper edges
+    // - Vertical strokes get wider AA to maintain smooth appearance
+    let text_alpha = msdf_alpha_hinted(in.uv, 0.5);
 
     // Determine text color
     var text_color = in.color.rgb;

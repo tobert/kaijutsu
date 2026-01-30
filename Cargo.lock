@@ -4862,6 +4862,7 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+ "swash",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

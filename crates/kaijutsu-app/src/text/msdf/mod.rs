@@ -26,6 +26,9 @@ mod tests;
 pub use atlas::MsdfAtlas;
 pub use buffer::{MsdfTextAreaConfig, MsdfTextBuffer, TextBounds};
 pub use generator::MsdfGenerator;
+// Font metrics infrastructure for future pixel-alignment work
+#[allow(unused_imports)]
+pub use generator::{FontMetricsCache, HintingMetrics};
 pub use pipeline::{
     extract_msdf_render_config, extract_msdf_texts, init_msdf_resources, prepare_msdf_texts,
     ExtractedMsdfTexts, MsdfTextPipeline, MsdfTextRenderNode, MsdfTextResources,
