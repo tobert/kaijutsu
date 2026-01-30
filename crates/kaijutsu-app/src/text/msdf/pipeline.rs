@@ -340,8 +340,6 @@ impl Default for MsdfTextTaaState {
 ///
 /// Uses ping-pong double buffering: each frame reads from one texture
 /// and writes the blended result to the other, then swaps.
-///
-/// History format: RGBA16Float for HDR-capable accumulation with precision.
 #[derive(Resource)]
 pub struct MsdfTextTaaResources {
     /// History texture A (ping).
@@ -362,6 +360,8 @@ pub struct MsdfTextTaaResources {
     pub frames_accumulated: u32,
     /// Cached resolution for detecting resize.
     pub resolution: (u32, u32),
+    /// Texture format (matches swap chain for copy to ViewTarget).
+    pub format: TextureFormat,
     /// Cached render pipeline for TAA blend.
     pub pipeline: Option<CachedRenderPipelineId>,
     /// Bind group for TAA (uniforms, current, history, sampler).
@@ -370,15 +370,24 @@ pub struct MsdfTextTaaResources {
 
 impl MsdfTextTaaResources {
     /// Create new TAA resources for the given resolution.
-    pub fn new(device: &RenderDevice, width: u32, height: u32) -> Self {
+    ///
+    /// `format` should match ViewTarget's main_texture_format() for copy compatibility.
+    /// Bevy uses Rgba8Unorm internally (linear), with sRGB views for display.
+    pub fn new(device: &RenderDevice, width: u32, height: u32, format: TextureFormat) -> Self {
         let size = Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
 
-        // RGBA16Float for HDR accumulation with good precision
-        let format = TextureFormat::Rgba16Float;
+        // Use linear format matching ViewTarget's main_texture_format()
+        // Bevy uses Rgba8Unorm/Bgra8Unorm internally, not sRGB
+        // view_formats allows sRGB interpretation when rendering
+        let base_format = match format {
+            TextureFormat::Bgra8UnormSrgb => TextureFormat::Bgra8Unorm,
+            TextureFormat::Rgba8UnormSrgb => TextureFormat::Rgba8Unorm,
+            other => other, // Keep as-is for HDR or other formats
+        };
 
         let descriptor = TextureDescriptor {
             label: Some("msdf_taa_history"),
@@ -386,11 +395,17 @@ impl MsdfTextTaaResources {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format,
+            format: base_format,
             usage: TextureUsages::TEXTURE_BINDING
                 | TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
                 | TextureUsages::COPY_DST,
-            view_formats: &[],
+            // Allow sRGB view for rendering
+            view_formats: match base_format {
+                TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
+                TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
+                _ => &[],
+            },
         };
 
         let history_a = device.create_texture(&TextureDescriptor {
@@ -402,8 +417,21 @@ impl MsdfTextTaaResources {
             ..descriptor
         });
 
-        let history_a_view = history_a.create_view(&TextureViewDescriptor::default());
-        let history_b_view = history_b.create_view(&TextureViewDescriptor::default());
+        // Create sRGB views for rendering (shader expects sRGB)
+        let srgb_format = match base_format {
+            TextureFormat::Bgra8Unorm => Some(TextureFormat::Bgra8UnormSrgb),
+            TextureFormat::Rgba8Unorm => Some(TextureFormat::Rgba8UnormSrgb),
+            _ => None,
+        };
+
+        let history_a_view = history_a.create_view(&TextureViewDescriptor {
+            format: srgb_format,
+            ..default()
+        });
+        let history_b_view = history_b.create_view(&TextureViewDescriptor {
+            format: srgb_format,
+            ..default()
+        });
 
         // Linear sampler for smooth history reads
         let history_sampler = device.create_sampler(&SamplerDescriptor {
@@ -426,6 +454,7 @@ impl MsdfTextTaaResources {
             read_from_a: true,
             frames_accumulated: 0,
             resolution: (width, height),
+            format: base_format, // Store base format for copy compatibility
             pipeline: None,
             bind_group: None,
         }
@@ -434,7 +463,17 @@ impl MsdfTextTaaResources {
     /// Recreate textures if resolution changed.
     pub fn resize_if_needed(&mut self, device: &RenderDevice, width: u32, height: u32) {
         if self.resolution != (width, height) && width > 0 && height > 0 {
-            *self = Self::new(device, width, height);
+            let format = self.format;
+            *self = Self::new(device, width, height, format);
+        }
+    }
+
+    /// Get the history texture to write to this frame.
+    pub fn write_texture(&self) -> &Texture {
+        if self.read_from_a {
+            &self.history_b
+        } else {
+            &self.history_a
         }
     }
 
@@ -457,9 +496,9 @@ impl MsdfTextTaaResources {
     }
 
     /// Swap read/write textures for next frame.
+    /// Does NOT increment frames_accumulated - caller is responsible for that.
     pub fn swap(&mut self) {
         self.read_from_a = !self.read_from_a;
-        self.frames_accumulated = self.frames_accumulated.saturating_add(1);
     }
 
     /// Reset accumulation (e.g., after camera movement or TAA toggle).
@@ -804,35 +843,46 @@ impl ViewNode for MsdfTextTaaNode {
 
         debug!("✅ TAA node: all resources ready, running blend pass");
 
-        // Run TAA blend pass
-        // Renders fullscreen triangle that samples intermediate + history, outputs to ViewTarget
+        // Render TAA blend directly to ViewTarget
         let out_texture = view_target.out_texture();
 
-        let mut render_pass = render_context.command_encoder().begin_render_pass(
-            &RenderPassDescriptor {
-                label: Some("msdf_taa_blend_pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: out_texture,
-                    resolve_target: None,
-                    ops: Operations {
-                        // Load existing scene, blend text on top
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            },
-        );
+        {
+            let mut render_pass = render_context.command_encoder().begin_render_pass(
+                &RenderPassDescriptor {
+                    label: Some("msdf_taa_blend_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: out_texture,
+                        resolve_target: None,
+                        ops: Operations {
+                            // Load existing scene, blend text on top
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                },
+            );
 
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, bind_group, &[]);
-        // Draw fullscreen triangle (3 vertices, shader generates positions)
-        render_pass.draw(0..3, 0..1);
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, bind_group, &[]);
+            // Draw fullscreen triangle (3 vertices, shader generates positions)
+            render_pass.draw(0..3, 0..1);
+        }
 
-        debug!("✅ TAA blend pass complete");
+        // TODO: Copy ViewTarget to history for proper accumulation
+        // Currently disabled due to format mismatch (ViewTarget=Rgba, history=Bgra on some platforms)
+        // Options to fix:
+        // 1. Query ViewTarget.main_texture_format() and create history to match
+        // 2. Use a blit shader instead of copy for format conversion
+        // 3. Render TAA to history first, then blit to ViewTarget
+        //
+        // For now, TAA renders but doesn't accumulate (each frame is independent)
+        let _ = taa_resources.write_texture(); // Suppress warning
+
+        debug!("✅ TAA blend pass complete (accumulation disabled)");
 
         // Note: History swap happens in prepare_msdf_texts next frame
         let _ = intermediate_view; // Used in bind_group creation
@@ -987,8 +1037,8 @@ pub fn init_msdf_taa_resources(
     let format = msdf_resources.format;
     debug!("🎯 Initializing TAA resources with format {:?}", format);
 
-    // Create history textures
-    let mut taa_resources = MsdfTextTaaResources::new(&device, width, height);
+    // Create history textures (same format as swap chain for copy to ViewTarget)
+    let mut taa_resources = MsdfTextTaaResources::new(&device, width, height, format);
 
     // Queue the TAA blend pipeline
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
@@ -1340,6 +1390,13 @@ pub fn prepare_msdf_texts(
     // Update TAA bind group if we have TAA resources and intermediate texture
     if let Some(intermediate_view) = &resources.intermediate_texture_view {
         if let Some(taa_res) = &mut taa_resources {
+            // Swap history textures FIRST (applies last frame's render result)
+            // This must happen BEFORE creating the bind group so read_view() is correct
+            // On first frame, frames_accumulated is 0 so this is a no-op
+            if taa_res.frames_accumulated > 0 {
+                taa_res.swap();
+            }
+
             // Update TAA uniforms
             let taa_uniforms = TaaUniforms {
                 resolution,
@@ -1350,7 +1407,9 @@ pub fn prepare_msdf_texts(
             };
             queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
 
-            // Create TAA bind group: uniforms, current (intermediate), history, sampler
+            // Create TAA bind group: uniforms, current (intermediate), history read, sampler
+            // read_view() returns the texture with accumulated history to sample from
+            // write_view() will be the render target in the TAA node
             taa_res.bind_group = Some(device.create_bind_group(
                 "msdf_taa_bind_group",
                 &taa_pipeline.bind_group_layout,
@@ -1362,8 +1421,8 @@ pub fn prepare_msdf_texts(
                 )),
             ));
 
-            // Swap history textures for next frame and increment accumulation counter
-            taa_res.swap();
+            // Increment accumulation counter (swap already happened above)
+            taa_res.frames_accumulated = taa_res.frames_accumulated.saturating_add(1);
         }
     }
 }
