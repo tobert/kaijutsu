@@ -340,6 +340,10 @@ impl Default for MsdfTextTaaState {
 ///
 /// Uses ping-pong double buffering: each frame reads from one texture
 /// and writes the blended result to the other, then swaps.
+///
+/// Flow each frame:
+/// 1. TAA blend: intermediate + history_read → history_write
+/// 2. Blit: history_write → ViewTarget (handles format conversion)
 #[derive(Resource)]
 pub struct MsdfTextTaaResources {
     /// History texture A (ping).
@@ -360,12 +364,15 @@ pub struct MsdfTextTaaResources {
     pub frames_accumulated: u32,
     /// Cached resolution for detecting resize.
     pub resolution: (u32, u32),
-    /// Texture format (matches swap chain for copy to ViewTarget).
+    /// Texture format for history textures (internal format, not swap chain).
     pub format: TextureFormat,
     /// Cached render pipeline for TAA blend.
     pub pipeline: Option<CachedRenderPipelineId>,
-    /// Bind group for TAA (uniforms, current, history, sampler).
+    /// Bind group for TAA blend pass (uniforms, intermediate, history_read, sampler).
     pub bind_group: Option<BindGroup>,
+    /// Bind group for blit pass (uniforms, history_write, dummy, sampler).
+    /// Uses TAA shader with taa_enabled=0 for passthrough.
+    pub blit_bind_group: Option<BindGroup>,
 }
 
 impl MsdfTextTaaResources {
@@ -454,9 +461,10 @@ impl MsdfTextTaaResources {
             read_from_a: true,
             frames_accumulated: 0,
             resolution: (width, height),
-            format: base_format, // Store base format for copy compatibility
+            format: base_format, // Store base format for history textures
             pipeline: None,
             bind_group: None,
+            blit_bind_group: None,
         }
     }
 
@@ -623,7 +631,10 @@ pub struct MsdfTextTaaPipeline {
     pub bind_group_layout: BindGroupLayout,
     pub bind_group_layout_descriptor: BindGroupLayoutDescriptor,
     pub shader: Handle<Shader>,
+    /// Uniform buffer for TAA blend pass.
     pub uniform_buffer: Buffer,
+    /// Uniform buffer for blit pass (passthrough with taa_enabled=0).
+    pub blit_uniform_buffer: Buffer,
 }
 
 impl FromWorld for MsdfTextTaaPipeline {
@@ -665,11 +676,20 @@ impl FromWorld for MsdfTextTaaPipeline {
             mapped_at_creation: false,
         });
 
+        // Separate uniform buffer for blit pass (always passthrough)
+        let blit_uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("msdf_taa_blit_uniform_buffer"),
+            size: std::mem::size_of::<TaaUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             bind_group_layout,
             bind_group_layout_descriptor,
             shader,
             uniform_buffer,
+            blit_uniform_buffer,
         }
     }
 }
@@ -841,21 +861,27 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(());
         };
 
-        debug!("✅ TAA node: all resources ready, running blend pass");
+        // Need the blit bind group for second pass
+        let Some(blit_bind_group) = &taa_resources.blit_bind_group else {
+            warn!("⚠️ TAA node: no blit bind group");
+            return Ok(());
+        };
 
-        // Render TAA blend directly to ViewTarget
-        let out_texture = view_target.out_texture();
+        debug!("✅ TAA node: all resources ready, running blend + blit passes");
 
+        // === PASS 1: TAA Blend ===
+        // Blend intermediate (current jittered frame) + history_read → history_write
+        // This accumulates the temporal information in the history texture
         {
             let mut render_pass = render_context.command_encoder().begin_render_pass(
                 &RenderPassDescriptor {
                     label: Some("msdf_taa_blend_pass"),
                     color_attachments: &[Some(RenderPassColorAttachment {
-                        view: out_texture,
+                        view: taa_resources.write_view(),
                         resolve_target: None,
                         ops: Operations {
-                            // Load existing scene, blend text on top
-                            load: LoadOp::Load,
+                            // Clear history_write before blending
+                            load: LoadOp::Clear(Default::default()),
                             store: StoreOp::Store,
                         },
                         depth_slice: None,
@@ -872,17 +898,36 @@ impl ViewNode for MsdfTextTaaNode {
             render_pass.draw(0..3, 0..1);
         }
 
-        // TODO: Copy ViewTarget to history for proper accumulation
-        // Currently disabled due to format mismatch (ViewTarget=Rgba, history=Bgra on some platforms)
-        // Options to fix:
-        // 1. Query ViewTarget.main_texture_format() and create history to match
-        // 2. Use a blit shader instead of copy for format conversion
-        // 3. Render TAA to history first, then blit to ViewTarget
-        //
-        // For now, TAA renders but doesn't accumulate (each frame is independent)
-        let _ = taa_resources.write_texture(); // Suppress warning
+        // === PASS 2: Blit to ViewTarget ===
+        // Copy history_write → ViewTarget
+        // Uses TAA shader with taa_enabled=0 for passthrough (handles format conversion)
+        {
+            let out_texture = view_target.out_texture();
+            let mut render_pass = render_context.command_encoder().begin_render_pass(
+                &RenderPassDescriptor {
+                    label: Some("msdf_taa_blit_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: out_texture,
+                        resolve_target: None,
+                        ops: Operations {
+                            // Load existing scene content, blend text on top
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                },
+            );
 
-        debug!("✅ TAA blend pass complete (accumulation disabled)");
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, blit_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        debug!("✅ TAA blend + blit passes complete (frames_accumulated={})", taa_resources.frames_accumulated);
 
         // Note: History swap happens in prepare_msdf_texts next frame
         let _ = intermediate_view; // Used in bind_group creation
@@ -1407,9 +1452,9 @@ pub fn prepare_msdf_texts(
             };
             queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
 
-            // Create TAA bind group: uniforms, current (intermediate), history read, sampler
+            // Create TAA blend bind group: uniforms, intermediate, history_read, sampler
             // read_view() returns the texture with accumulated history to sample from
-            // write_view() will be the render target in the TAA node
+            // write_view() will be the render target in the TAA blend pass
             taa_res.bind_group = Some(device.create_bind_group(
                 "msdf_taa_bind_group",
                 &taa_pipeline.bind_group_layout,
@@ -1417,6 +1462,29 @@ pub fn prepare_msdf_texts(
                     taa_pipeline.uniform_buffer.as_entire_binding(),
                     intermediate_view,
                     taa_res.read_view(),
+                    &taa_res.history_sampler,
+                )),
+            ));
+
+            // Write blit uniforms (passthrough mode: taa_enabled=0)
+            let blit_uniforms = TaaUniforms {
+                resolution,
+                frames_accumulated: 0, // Not used in passthrough
+                taa_enabled: 0,        // Passthrough mode - just sample current texture
+                camera_motion: [0.0, 0.0],
+                _padding: [0.0, 0.0],
+            };
+            queue.write_buffer(&taa_pipeline.blit_uniform_buffer, 0, bytemuck::bytes_of(&blit_uniforms));
+
+            // Create blit bind group: uniforms, write_view (blended result), dummy history, sampler
+            // The shader in passthrough mode ignores history and just outputs current_texture
+            taa_res.blit_bind_group = Some(device.create_bind_group(
+                "msdf_taa_blit_bind_group",
+                &taa_pipeline.bind_group_layout,
+                &BindGroupEntries::sequential((
+                    taa_pipeline.blit_uniform_buffer.as_entire_binding(),
+                    taa_res.write_view(), // The blended result to output to ViewTarget
+                    taa_res.read_view(),  // Dummy - not used in passthrough mode
                     &taa_res.history_sampler,
                 )),
             ));
