@@ -163,9 +163,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let accumulation_factor = min(f32(uniforms.frames_accumulated), 8.0) / 8.0;
     let blend_weight = mix(0.5, 0.1, accumulation_factor);
 
-    // Blend current and clipped history
-    let blended = mix(clipped_history, current.rgb, blend_weight);
+    // Blend current and clipped history (both RGB and alpha)
+    // Alpha also jitters at edges, so must be accumulated for stable output
+    let blended_rgb = mix(clipped_history, current.rgb, blend_weight);
+    let blended_alpha = mix(history.a, current.a, blend_weight);
 
-    // Preserve alpha from current frame
-    return vec4<f32>(blended, current.a);
+    return vec4<f32>(blended_rgb, blended_alpha);
 }
