@@ -356,8 +356,12 @@ impl Default for MsdfTextTaaState {
 #[derive(Resource)]
 pub struct MsdfTextTaaResources {
     /// History texture A (ping).
+    /// Note: Field appears unused but owns the GPU texture that history_a_view references.
+    #[allow(dead_code)]
     pub history_a: Texture,
     /// History texture B (pong).
+    /// Note: Field appears unused but owns the GPU texture that history_b_view references.
+    #[allow(dead_code)]
     pub history_b: Texture,
     /// Texture view for history A.
     pub history_a_view: TextureView,
@@ -485,15 +489,6 @@ impl MsdfTextTaaResources {
         }
     }
 
-    /// Get the history texture to write to this frame.
-    pub fn write_texture(&self) -> &Texture {
-        if self.read_from_a {
-            &self.history_b
-        } else {
-            &self.history_a
-        }
-    }
-
     /// Get the history texture view to read from this frame.
     pub fn read_view(&self) -> &TextureView {
         if self.read_from_a {
@@ -516,11 +511,6 @@ impl MsdfTextTaaResources {
     /// Does NOT increment frames_accumulated - caller is responsible for that.
     pub fn swap(&mut self) {
         self.read_from_a = !self.read_from_a;
-    }
-
-    /// Reset accumulation (e.g., after camera movement or TAA toggle).
-    pub fn reset_accumulation(&mut self) {
-        self.frames_accumulated = 0;
     }
 }
 
