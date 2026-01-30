@@ -333,6 +333,44 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.input_backdrop_color = c;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Font rendering quality (MSDF text)
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(v) = get_float(&scope, "font_stem_darkening") {
+        theme.font_stem_darkening = v;
+    }
+    if let Some(v) = get_float(&scope, "font_hint_amount") {
+        theme.font_hint_amount = v;
+    }
+    if let Some(v) = get_bool(&scope, "font_taa_enabled") {
+        theme.font_taa_enabled = v;
+    }
+    if let Some(v) = get_float(&scope, "font_horz_scale") {
+        theme.font_horz_scale = v;
+    }
+    if let Some(v) = get_float(&scope, "font_vert_scale") {
+        theme.font_vert_scale = v;
+    }
+    if let Some(v) = get_float(&scope, "font_text_bias") {
+        theme.font_text_bias = v;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Font effects (MSDF text)
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(v) = get_float(&scope, "font_glow_intensity") {
+        theme.font_glow_intensity = v;
+    }
+    if let Some(v) = get_float(&scope, "font_glow_spread") {
+        theme.font_glow_spread = v;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "font_glow_color") {
+        theme.font_glow_color = c;
+    }
+    if let Some(v) = get_bool(&scope, "font_rainbow") {
+        theme.font_rainbow = v;
+    }
+
     Ok(theme)
 }
 
@@ -377,6 +415,11 @@ fn get_vec4(scope: &Scope, name: &str) -> Option<Vec4> {
 /// Extract a float from scope.
 fn get_float(scope: &Scope, name: &str) -> Option<f32> {
     scope.get_value::<f64>(name).map(|v| v as f32)
+}
+
+/// Extract a bool from scope.
+fn get_bool(scope: &Scope, name: &str) -> Option<bool> {
+    scope.get_value::<bool>(name)
 }
 
 /// Extract ANSI colors from scope.
@@ -447,5 +490,37 @@ mod tests {
         let srgba = theme.panel_bg.to_srgba();
         assert!((srgba.red - 0.1).abs() < 0.01);
         assert!((srgba.alpha - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_font_rendering_params() {
+        let script = r##"
+            let font_stem_darkening = 0.25;
+            let font_hint_amount = 0.5;
+            let font_taa_enabled = false;
+            let font_horz_scale = 1.2;
+            let font_vert_scale = 0.7;
+            let font_text_bias = 0.48;
+            let font_glow_intensity = 0.8;
+            let font_glow_spread = 5.0;
+            let font_glow_color = rgba(1.0, 0.0, 0.5, 0.8);
+            let font_rainbow = true;
+        "##;
+
+        let theme = parse_theme_script(script).unwrap();
+        assert!((theme.font_stem_darkening - 0.25).abs() < 0.01);
+        assert!((theme.font_hint_amount - 0.5).abs() < 0.01);
+        assert!(!theme.font_taa_enabled);
+        assert!((theme.font_horz_scale - 1.2).abs() < 0.01);
+        assert!((theme.font_vert_scale - 0.7).abs() < 0.01);
+        assert!((theme.font_text_bias - 0.48).abs() < 0.01);
+        assert!((theme.font_glow_intensity - 0.8).abs() < 0.01);
+        assert!((theme.font_glow_spread - 5.0).abs() < 0.01);
+        let glow_srgba = theme.font_glow_color.to_srgba();
+        assert!((glow_srgba.red - 1.0).abs() < 0.01);
+        assert!((glow_srgba.green - 0.0).abs() < 0.01);
+        assert!((glow_srgba.blue - 0.5).abs() < 0.01);
+        assert!((glow_srgba.alpha - 0.8).abs() < 0.01);
+        assert!(theme.font_rainbow);
     }
 }

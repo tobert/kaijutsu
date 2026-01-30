@@ -191,6 +191,37 @@ pub struct Theme {
     pub input_overlay_width_pct: f32,
     /// Backdrop color when in overlay mode
     pub input_backdrop_color: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Font Rendering Quality (MSDF text)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Stem darkening strength (0.0-0.5). Thickens thin strokes at small font sizes.
+    /// ~0.15 = ClearType-like weight for 12-16px text.
+    pub font_stem_darkening: f32,
+    /// Hinting strength (0.0-1.0). Sharpens horizontal strokes (stems, crossbars).
+    pub font_hint_amount: f32,
+    /// Enable temporal anti-aliasing for smoother text edges.
+    pub font_taa_enabled: bool,
+    /// Horizontal stroke AA scale (1.0-1.3). Wider AA for vertical strokes.
+    pub font_horz_scale: f32,
+    /// Vertical stroke AA scale (0.5-0.8). Sharper AA for horizontal strokes.
+    pub font_vert_scale: f32,
+    /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
+    pub font_text_bias: f32,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Font Effects (MSDF text)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Glow intensity (0.0-1.0). 0 = off.
+    pub font_glow_intensity: f32,
+    /// Glow spread in pixels (0.5-10.0).
+    pub font_glow_spread: f32,
+    /// Glow color.
+    pub font_glow_color: Color,
+    /// Enable rainbow color cycling effect.
+    pub font_rainbow: bool,
 }
 
 impl Default for Theme {
@@ -283,6 +314,20 @@ impl Default for Theme {
             input_docked_height: 80.0,
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
+
+            // Font rendering quality defaults
+            font_stem_darkening: 0.15,  // ClearType-like weight for small text
+            font_hint_amount: 0.8,      // Strong hinting for crisp stems
+            font_taa_enabled: true,     // Temporal AA for smoother edges
+            font_horz_scale: 1.1,       // Wider AA for vertical strokes
+            font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
+            font_text_bias: 0.5,        // Standard SDF threshold
+
+            // Font effects defaults
+            font_glow_intensity: 0.0,   // Glow off by default
+            font_glow_spread: 2.0,
+            font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
+            font_rainbow: false,
         }
     }
 }

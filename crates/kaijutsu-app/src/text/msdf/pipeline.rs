@@ -195,6 +195,17 @@ pub struct MsdfUniforms {
     /// Whether TAA jitter is enabled (0 = off, 1 = on).
     /// Allows toggling jitter for A/B comparison without changing other settings.
     pub taa_enabled: u32,
+    /// Horizontal stroke AA scale (1.0-1.3). Wider AA for vertical strokes.
+    /// Higher values = softer vertical edges.
+    pub horz_scale: f32,
+    /// Vertical stroke AA scale (0.5-0.8). Sharper AA for horizontal strokes.
+    /// Lower values = crisper horizontal edges (stems, crossbars).
+    pub vert_scale: f32,
+    /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
+    /// Default 0.5 is the edge of the signed distance field.
+    pub text_bias: f32,
+    /// Padding for 16-byte alignment (3 u32s + 3 f32s = 24 bytes → pad to 32).
+    pub _padding: f32,
 }
 
 impl Default for MsdfUniforms {
@@ -216,6 +227,10 @@ impl Default for MsdfUniforms {
             jitter_offset: [0.0, 0.0],
             taa_frame_index: 0,
             taa_enabled: 1, // Enable TAA jitter by default
+            horz_scale: 1.1, // Wider AA for vertical strokes
+            vert_scale: 0.6, // Sharper AA for horizontal strokes
+            text_bias: 0.5,  // Standard SDF threshold
+            _padding: 0.0,
         }
     }
 }
@@ -303,7 +318,7 @@ pub struct ExtractedMsdfDebugMode {
 
 /// Extracted render configuration for MSDF text.
 ///
-/// Extracted from `MsdfRenderConfig` in the main world.
+/// Extracted from `MsdfRenderConfig` and `Theme` in the main world.
 /// The pipeline will not render if this is not present or not initialized.
 #[derive(Resource, Clone, Copy)]
 pub struct ExtractedMsdfRenderConfig {
@@ -313,6 +328,31 @@ pub struct ExtractedMsdfRenderConfig {
     pub format: TextureFormat,
     /// Whether this config is valid for rendering.
     pub initialized: bool,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Font rendering parameters (from Theme)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Stem darkening strength (0.0-0.5).
+    pub stem_darkening: f32,
+    /// Hinting strength (0.0-1.0).
+    pub hint_amount: f32,
+    /// TAA enabled flag.
+    pub taa_enabled: bool,
+    /// Horizontal stroke AA scale.
+    pub horz_scale: f32,
+    /// Vertical stroke AA scale.
+    pub vert_scale: f32,
+    /// SDF threshold for text rendering.
+    pub text_bias: f32,
+    /// Glow intensity (0.0-1.0).
+    pub glow_intensity: f32,
+    /// Glow spread in pixels.
+    pub glow_spread: f32,
+    /// Glow color [r, g, b, a].
+    pub glow_color: [f32; 4],
+    /// Rainbow effect enabled.
+    pub rainbow: bool,
 }
 
 /// Extracted camera motion for TAA reprojection.
@@ -1015,16 +1055,35 @@ pub fn extract_msdf_texts(
 
 /// Extract render configuration from main world.
 ///
-/// This extracts `MsdfRenderConfig` so the render world has explicit access
-/// to resolution and format. If the config is not initialized, rendering will be skipped.
+/// This extracts `MsdfRenderConfig` and `Theme` so the render world has explicit access
+/// to resolution, format, and font rendering parameters.
+/// If the config is not initialized, rendering will be skipped.
+/// Theme is optional - defaults are used when not available (e.g., in tests).
 pub fn extract_msdf_render_config(
     mut commands: Commands,
     config: Extract<Res<MsdfRenderConfig>>,
+    theme: Extract<Option<Res<crate::ui::theme::Theme>>>,
 ) {
+    // Use theme values or fall back to defaults for test/headless scenarios
+    let default_theme = crate::ui::theme::Theme::default();
+    let theme = theme.as_ref().map(|t| t.as_ref()).unwrap_or(&default_theme);
+
+    let glow_srgba = theme.font_glow_color.to_srgba();
     commands.insert_resource(ExtractedMsdfRenderConfig {
         resolution: config.resolution,
         format: config.format,
         initialized: config.initialized,
+        // Font rendering parameters from Theme
+        stem_darkening: theme.font_stem_darkening,
+        hint_amount: theme.font_hint_amount,
+        taa_enabled: theme.font_taa_enabled,
+        horz_scale: theme.font_horz_scale,
+        vert_scale: theme.font_vert_scale,
+        text_bias: theme.font_text_bias,
+        glow_intensity: theme.font_glow_intensity,
+        glow_spread: theme.font_glow_spread,
+        glow_color: [glow_srgba.red, glow_srgba.green, glow_srgba.blue, glow_srgba.alpha],
+        rainbow: theme.font_rainbow,
     });
 }
 
@@ -1164,9 +1223,24 @@ pub fn prepare_msdf_texts(
     let resolution = render_config.resolution;
 
     // Determine effects from first text (simplified - could be per-text)
+    // Per-entity effects override theme defaults when set
     let effects = extracted.texts.first().map(|t| &t.effects);
-    let rainbow = effects.map(|e| e.rainbow).unwrap_or(false);
-    let glow = effects.and_then(|e| e.glow.as_ref());
+    let entity_rainbow = effects.map(|e| e.rainbow).unwrap_or(false);
+    let entity_glow = effects.and_then(|e| e.glow.as_ref());
+
+    // Use entity effects if set, otherwise fall back to theme defaults
+    let rainbow = entity_rainbow || render_config.rainbow;
+    let (glow_intensity, glow_spread, glow_color) = match entity_glow {
+        Some(g) => {
+            let c = g.color.to_linear();
+            (g.intensity, g.spread, [c.red, c.green, c.blue, c.alpha])
+        }
+        None if render_config.glow_intensity > 0.0 => {
+            // Use theme glow settings
+            (render_config.glow_intensity, render_config.glow_spread, render_config.glow_color)
+        }
+        None => (0.0, 2.0, [0.4, 0.6, 1.0, 0.5]),
+    };
 
     // Get debug mode from extracted resource
     #[cfg(debug_assertions)]
@@ -1181,6 +1255,10 @@ pub fn prepare_msdf_texts(
     ];
 
     // === TAA JITTER ===
+    // TAA state is controlled by theme.font_taa_enabled
+    // Sync it from the extracted config each frame
+    taa_state.enabled = render_config.taa_enabled;
+
     // Get jitter offset from Halton sequence and advance frame counter
     let jitter_offset = if taa_state.enabled {
         get_taa_jitter(taa_state.frame_index)
@@ -1191,29 +1269,29 @@ pub fn prepare_msdf_texts(
     // Advance frame counter for next frame (cycles through TAA_SAMPLE_COUNT)
     taa_state.frame_index = (taa_state.frame_index + 1) % TAA_SAMPLE_COUNT;
 
-    // Update uniforms
+    // Update uniforms - use theme values for rendering parameters
     let uniforms = MsdfUniforms {
         resolution,
         msdf_range: atlas.msdf_range,
         time: time.elapsed_secs(),
         rainbow: if rainbow { 1 } else { 0 },
-        glow_intensity: glow.map(|g| g.intensity).unwrap_or(0.0),
-        glow_spread: glow.map(|g| g.spread).unwrap_or(2.0),
+        glow_intensity,
+        glow_spread,
         debug_mode: debug_mode_value,
-        glow_color: glow
-            .map(|g| {
-                let c = g.color.to_linear();
-                [c.red, c.green, c.blue, c.alpha]
-            })
-            .unwrap_or([0.4, 0.6, 1.0, 0.5]),
+        glow_color,
         sdf_texel,
-        hint_amount: 0.8, // 80% hinting strength - can be made configurable
-        // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
-        stem_darkening: 0.15,
+        // Use theme values for rendering quality parameters
+        hint_amount: render_config.hint_amount,
+        stem_darkening: render_config.stem_darkening,
         // TAA jitter for temporal super-resolution
         jitter_offset,
         taa_frame_index,
         taa_enabled: if taa_state.enabled { 1 } else { 0 },
+        // Shader hinting scale parameters from theme
+        horz_scale: render_config.horz_scale,
+        vert_scale: render_config.vert_scale,
+        text_bias: render_config.text_bias,
+        _padding: 0.0,
     };
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

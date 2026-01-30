@@ -32,6 +32,14 @@ struct Uniforms {
     taa_frame_index: u32,
     // Whether TAA jitter is enabled (0 = off, 1 = on)
     taa_enabled: u32,
+    // Horizontal stroke AA scale (1.0-1.3). Wider AA for vertical strokes.
+    horz_scale: f32,
+    // Vertical stroke AA scale (0.5-0.8). Sharper AA for horizontal strokes.
+    vert_scale: f32,
+    // SDF threshold for text rendering (0.45-0.55). Default 0.5.
+    text_bias: f32,
+    // Padding for alignment
+    _padding: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -193,11 +201,10 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
     let effective_bias = bias - darkening + weight_adjust;
 
     // Apply different AA widths based on stroke direction
-    // - Vertical strokes (vgrad ≈ 0): wider AA (horz_scale = 1.1)
-    // - Horizontal strokes (vgrad ≈ 1): sharper AA (vert_scale = 0.6)
-    let horz_scale = 1.1;  // Wider AA for vertical strokes (they appear thinner)
-    let vert_scale = 0.6;  // Sharper AA for horizontal strokes (makes stems crisper)
-    let hinted_doffset = mix(base_doffset * horz_scale, base_doffset * vert_scale, vgrad);
+    // - Vertical strokes (vgrad ≈ 0): wider AA (horz_scale, default 1.1)
+    // - Horizontal strokes (vgrad ≈ 1): sharper AA (vert_scale, default 0.6)
+    // These values come from theme.rhai for hot-reload tuning
+    let hinted_doffset = mix(base_doffset * uniforms.horz_scale, base_doffset * uniforms.vert_scale, vgrad);
 
     // Interpolate between unhinted and hinted based on hint_amount
     let doffset = mix(base_doffset, hinted_doffset, uniforms.hint_amount);
@@ -301,12 +308,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             // Raw median distance
             return vec4<f32>(sd, sd, sd, 1.0);
         } else if uniforms.debug_mode == 4u {
-            // Computed alpha
-            let alpha = msdf_alpha_at(in.uv, 0.5);
+            // Computed alpha (uses text_bias from theme)
+            let alpha = msdf_alpha_at(in.uv, uniforms.text_bias);
             return vec4<f32>(alpha, alpha, alpha, 1.0);
         } else if uniforms.debug_mode == 5u {
-            // Hard threshold
-            if sd >= 0.5 {
+            // Hard threshold (uses text_bias from theme)
+            if sd >= uniforms.text_bias {
                 return vec4<f32>(1.0, 1.0, 1.0, 1.0);
             } else {
                 return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -335,8 +342,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // === GLOW LAYER ===
     // Render glow first (behind text) if enabled
     if uniforms.glow_intensity > 0.0 {
-        // Sample at expanded distance for glow
-        let glow_bias = 0.5 - uniforms.glow_spread * 0.05;
+        // Sample at expanded distance for glow (relative to text_bias)
+        let glow_bias = uniforms.text_bias - uniforms.glow_spread * 0.05;
         let glow_alpha = msdf_alpha_at(in.uv, glow_bias) * uniforms.glow_intensity;
         output = blend_over_premultiplied(output, uniforms.glow_color.rgb, glow_alpha * uniforms.glow_color.a);
     }
@@ -347,7 +354,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // - Horizontal strokes (stems, crossbars) get sharper edges
     // - Vertical strokes get wider AA to maintain smooth appearance
     // Importance modulates stroke weight: 0.0 = thin/faded, 0.5 = normal, 1.0 = bold
-    let text_alpha = msdf_alpha_hinted(in.uv, 0.5, in.importance);
+    // text_bias from theme controls overall stroke thickness (default 0.5)
+    let text_alpha = msdf_alpha_hinted(in.uv, uniforms.text_bias, in.importance);
 
     // Determine text color
     var text_color = in.color.rgb;
