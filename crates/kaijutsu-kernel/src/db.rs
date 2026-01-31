@@ -4,6 +4,8 @@
 
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
+use std::str::FromStr;
+use strum::EnumString;
 
 /// Database handle for document persistence.
 pub struct DocumentDb {
@@ -25,13 +27,16 @@ pub struct DocumentMeta {
 /// Type of document content.
 ///
 /// Role distinctions (User/Model/System) stay at the block level via `Role` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[strum(ascii_case_insensitive)]
 pub enum DocumentKind {
     /// Interactive human/model dialog
+    #[strum(serialize = "conversation", serialize = "output", serialize = "system", serialize = "user_message", serialize = "agent_message")]
     Conversation,
     /// Executable code
     Code,
     /// Static markdown/text
+    #[strum(serialize = "text", serialize = "markdown")]
     Text,
     /// Git-backed document (repo:branch → 1 doc, file → 1 block)
     Git,
@@ -47,17 +52,12 @@ impl DocumentKind {
         }
     }
 
+    /// Parse from string (case-insensitive).
+    ///
+    /// Supports legacy aliases: "markdown" → Text, "output"/"system"/"user_message"/"agent_message" → Conversation.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "conversation" => Some(DocumentKind::Conversation),
-            "code" => Some(DocumentKind::Code),
-            "text" => Some(DocumentKind::Text),
-            "git" => Some(DocumentKind::Git),
-            // Legacy mappings for DB compatibility
-            "markdown" => Some(DocumentKind::Text),
-            "output" | "system" | "user_message" | "agent_message" => Some(DocumentKind::Conversation),
-            _ => None,
-        }
+        <Self as FromStr>::from_str(s).ok()
     }
 }
 

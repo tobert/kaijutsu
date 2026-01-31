@@ -27,6 +27,9 @@ parking_lot = "0.12"
 # Persistence
 rusqlite.workspace = true
 
+# Enum string conversion
+strum = { version = "0.26", features = ["derive"] }
+
 # Scripting
 rhai.workspace = true
 

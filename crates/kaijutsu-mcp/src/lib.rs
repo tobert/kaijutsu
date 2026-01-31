@@ -8,395 +8,33 @@
 //!
 //! - **Local**: In-memory ephemeral store for testing
 //! - **Remote**: SSH + Cap'n Proto RPC to kaijutsu-server (shared state)
+//!
+//! ## Module Structure
+//!
+//! - `models`: Request and response types for MCP tools
+//! - `helpers`: Parsing and utility functions
+//! - `tree`: DAG visualization as ASCII tree
+
+mod helpers;
+mod models;
+mod tree;
 
 use regex::Regex;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router,
 };
-use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{SshConfig, connect_ssh};
-use kaijutsu_crdt::{BlockId, BlockKind, ConversationDAG, Role, Status};
+use kaijutsu_crdt::ConversationDAG;
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store};
 
-// ============================================================================
-// Request Types
-// ============================================================================
-
-/// Create a new document for collaborative editing.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DocCreateRequest {
-    /// Unique document identifier
-    #[schemars(description = "Unique document identifier")]
-    pub id: String,
-    /// Document type: conversation, code, text, or git
-    #[schemars(description = "Document type: conversation, code, text, or git")]
-    pub kind: String,
-    /// Programming language (for code documents)
-    #[schemars(description = "Programming language (for code documents)")]
-    pub language: Option<String>,
-}
-
-/// Delete a document.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DocDeleteRequest {
-    /// Document ID to delete
-    #[schemars(description = "Document ID to delete")]
-    pub id: String,
-}
-
-/// Create a new block within a document.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockCreateRequest {
-    /// Document ID to create block in
-    #[schemars(description = "Document ID to create block in")]
-    pub document_id: String,
-    /// Parent block ID for DAG relationship (omit for root)
-    #[schemars(description = "Parent block ID for DAG relationship (omit for root)")]
-    pub parent_id: Option<String>,
-    /// Block to insert after (for ordering)
-    #[schemars(description = "Block ID to insert after (for ordering)")]
-    pub after_id: Option<String>,
-    /// Role: user, model, system, or tool
-    #[schemars(description = "Role: user, model, system, or tool")]
-    pub role: String,
-    /// Block kind: text, thinking, tool_call, or tool_result
-    #[schemars(description = "Block kind: text, thinking, tool_call, or tool_result")]
-    pub kind: String,
-    /// Initial content
-    #[schemars(description = "Initial text content")]
-    pub content: Option<String>,
-}
-
-/// Read block content.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockReadRequest {
-    /// Block ID to read (format: document_id/agent_id/seq)
-    #[schemars(description = "Block ID to read (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-    /// Include line numbers in output
-    #[schemars(description = "Include line numbers in output (default: true)")]
-    #[serde(default = "default_true")]
-    pub line_numbers: bool,
-    /// Line range [start, end) to read (0-indexed)
-    #[schemars(description = "Line range [start, end) to read (0-indexed, exclusive end)")]
-    pub range: Option<Vec<u32>>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Append text to a block (streaming-friendly).
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockAppendRequest {
-    /// Block ID to append to
-    #[schemars(description = "Block ID to append to (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-    /// Text to append
-    #[schemars(description = "Text to append")]
-    pub text: String,
-}
-
-/// Edit operation within a block.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum EditOp {
-    /// Insert text before a line
-    Insert {
-        #[schemars(description = "Line number to insert before (0-indexed)")]
-        line: u32,
-        #[schemars(description = "Content to insert")]
-        content: String,
-    },
-    /// Delete lines [start, end)
-    Delete {
-        #[schemars(description = "Start line (0-indexed)")]
-        start_line: u32,
-        #[schemars(description = "End line (exclusive)")]
-        end_line: u32,
-    },
-    /// Replace lines with new content
-    Replace {
-        #[schemars(description = "Start line (0-indexed)")]
-        start_line: u32,
-        #[schemars(description = "End line (exclusive)")]
-        end_line: u32,
-        #[schemars(description = "Replacement content")]
-        content: String,
-        /// Expected text for compare-and-set validation
-        #[schemars(description = "Expected text for CAS validation (fails if mismatch)")]
-        #[serde(default)]
-        expected_text: Option<String>,
-    },
-}
-
-/// Edit a block with line-based operations.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockEditRequest {
-    /// Block ID to edit
-    #[schemars(description = "Block ID to edit (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-    /// Edit operations to apply atomically
-    #[schemars(description = "Edit operations to apply atomically")]
-    pub operations: Vec<EditOp>,
-}
-
-/// List blocks with optional filters.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockListRequest {
-    /// Filter to specific document
-    #[schemars(description = "Filter to specific document ID")]
-    pub document_id: Option<String>,
-    /// Filter by block kind
-    #[schemars(description = "Filter by block kind: text, thinking, tool_call, tool_result")]
-    pub kind: Option<String>,
-    /// Filter by status
-    #[schemars(description = "Filter by status: pending, running, done, error")]
-    pub status: Option<String>,
-    /// Filter by role
-    #[schemars(description = "Filter by role: user, model, system, tool")]
-    pub role: Option<String>,
-}
-
-/// Set block status.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockStatusRequest {
-    /// Block ID to update
-    #[schemars(description = "Block ID to update (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-    /// New status: pending, running, done, or error
-    #[schemars(description = "New status: pending, running, done, or error")]
-    pub status: String,
-}
-
-/// Search across blocks.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct KernelSearchRequest {
-    /// Regex pattern to search for
-    #[schemars(description = "Regex pattern to search for")]
-    pub query: String,
-    /// Limit search to specific document
-    #[schemars(description = "Limit search to specific document ID")]
-    pub document_id: Option<String>,
-    /// Filter by block kind
-    #[schemars(description = "Filter by block kind: text, thinking, tool_call, tool_result")]
-    pub kind: Option<String>,
-    /// Filter by role
-    #[schemars(description = "Filter by role: user, model, system, tool")]
-    pub role: Option<String>,
-    /// Context lines around matches
-    #[schemars(description = "Lines of context before/after each match (default: 2)")]
-    #[serde(default = "default_context")]
-    pub context_lines: u32,
-    /// Maximum matches to return
-    #[schemars(description = "Maximum matches to return (default: 100)")]
-    #[serde(default = "default_max_matches")]
-    pub max_matches: usize,
-}
-
-fn default_context() -> u32 {
-    2
-}
-
-fn default_max_matches() -> usize {
-    100
-}
-
-/// Display a document's conversation DAG as an ASCII tree.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DocTreeRequest {
-    /// Document ID to visualize
-    #[schemars(description = "Document ID to visualize")]
-    pub document_id: String,
-    /// Maximum tree depth to display
-    #[schemars(description = "Maximum tree depth to display (omit for full tree)")]
-    pub max_depth: Option<u32>,
-    /// Show tool_call and tool_result as separate expanded nodes
-    #[schemars(description = "Show tool_call and tool_result as separate nodes (default: false, collapsed shows as single line)")]
-    #[serde(default)]
-    pub expand_tools: bool,
-}
-
-/// Inspect CRDT internals of a block for debugging.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockInspectRequest {
-    /// Block ID to inspect
-    #[schemars(description = "Block ID to inspect (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-}
-
-/// Get version history of a block.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct BlockHistoryRequest {
-    /// Block ID to get history for
-    #[schemars(description = "Block ID to get history for (format: document_id/agent_id/seq)")]
-    pub block_id: String,
-    /// Maximum number of versions to show
-    #[schemars(description = "Maximum number of versions to show (default: all)")]
-    pub limit: Option<u32>,
-}
-
-// ============================================================================
-// Response Types
-// ============================================================================
-
-/// Document info for listing.
-#[derive(Debug, Serialize)]
-struct DocumentInfo {
-    id: String,
-    kind: String,
-    language: Option<String>,
-    block_count: usize,
-}
-
-/// Block summary for listing.
-#[derive(Debug, Serialize)]
-struct BlockSummary {
-    block_id: String,
-    parent_id: Option<String>,
-    role: String,
-    kind: String,
-    status: String,
-    summary: String,
-}
-
-/// Search match result.
-#[derive(Debug, Serialize)]
-struct SearchMatch {
-    document_id: String,
-    block_id: String,
-    line: u32,
-    content: String,
-    before: Vec<String>,
-    after: Vec<String>,
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Parse document kind from string.
-fn parse_document_kind(s: &str) -> Option<DocumentKind> {
-    match s.to_lowercase().as_str() {
-        "conversation" => Some(DocumentKind::Conversation),
-        "code" => Some(DocumentKind::Code),
-        "text" => Some(DocumentKind::Text),
-        "git" => Some(DocumentKind::Git),
-        _ => None,
-    }
-}
-
-/// Parse role from string.
-fn parse_role(s: &str) -> Option<Role> {
-    match s.to_lowercase().as_str() {
-        "user" | "human" => Some(Role::User),
-        "model" | "assistant" | "agent" => Some(Role::Model),
-        "system" => Some(Role::System),
-        "tool" => Some(Role::Tool),
-        _ => None,
-    }
-}
-
-/// Parse block kind from string.
-fn parse_block_kind(s: &str) -> Option<BlockKind> {
-    match s.to_lowercase().as_str() {
-        "text" => Some(BlockKind::Text),
-        "thinking" => Some(BlockKind::Thinking),
-        "tool_call" | "toolcall" => Some(BlockKind::ToolCall),
-        "tool_result" | "toolresult" => Some(BlockKind::ToolResult),
-        _ => None,
-    }
-}
-
-/// Parse status from string.
-fn parse_status(s: &str) -> Option<Status> {
-    match s.to_lowercase().as_str() {
-        "pending" => Some(Status::Pending),
-        "running" | "active" => Some(Status::Running),
-        "done" | "complete" | "completed" => Some(Status::Done),
-        "error" => Some(Status::Error),
-        _ => None,
-    }
-}
-
-/// Parse block ID from key string.
-fn parse_block_id(s: &str) -> Option<BlockId> {
-    BlockId::from_key(s)
-}
-
-/// Find a block across all documents, returning (document_id, BlockId).
-fn find_block(store: &SharedBlockStore, block_id_str: &str) -> Option<(String, BlockId)> {
-    let block_id = parse_block_id(block_id_str)?;
-
-    for document_id in store.list_ids() {
-        if let Some(entry) = store.get(&document_id) {
-            for snapshot in entry.doc.blocks_ordered() {
-                if snapshot.id == block_id {
-                    return Some((document_id.clone(), block_id));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Add line numbers to content.
-fn content_with_line_numbers(content: &str) -> String {
-    content
-        .lines()
-        .enumerate()
-        .map(|(i, line)| format!("{:4}→{}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Extract lines with numbers for a range.
-fn extract_lines_with_numbers(content: &str, start: u32, end: u32) -> String {
-    content
-        .lines()
-        .enumerate()
-        .skip(start as usize)
-        .take((end.saturating_sub(start)) as usize)
-        .map(|(i, line)| format!("{:4}→{}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Count lines in content.
-fn line_count(content: &str) -> usize {
-    if content.is_empty() {
-        0
-    } else {
-        content.lines().count()
-    }
-}
-
-/// Convert line number to byte offset.
-fn line_to_byte_offset(content: &str, line: u32) -> Option<usize> {
-    let mut offset = 0;
-    for (i, l) in content.lines().enumerate() {
-        if i == line as usize {
-            return Some(offset);
-        }
-        offset += l.len() + 1; // +1 for newline
-    }
-    // Line at end
-    if line as usize == content.lines().count() {
-        return Some(content.len());
-    }
-    None
-}
-
-/// Convert line range to byte range.
-fn line_range_to_byte_range(content: &str, start_line: u32, end_line: u32) -> Option<(usize, usize)> {
-    let start = line_to_byte_offset(content, start_line)?;
-    let end = line_to_byte_offset(content, end_line)?;
-    Some((start, end))
-}
+// Re-export public types
+pub use models::*;
+use helpers::*;
+use tree::format_dag_tree;
 
 // ============================================================================
 // Backend Abstraction
@@ -1140,114 +778,128 @@ impl KaijutsuMcp {
 
         output
     }
-}
 
-/// Format a DAG as ASCII tree lines.
-fn format_dag_tree(dag: &ConversationDAG, max_depth: Option<u32>, expand_tools: bool) -> Vec<String> {
-    let mut lines = Vec::new();
+    #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.")]
+    fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
+        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+            Some(r) => r,
+            None => return format!("Error: block '{}' not found", req.block_id),
+        };
 
-    for (idx, root_id) in dag.roots.iter().enumerate() {
-        let is_last_root = idx == dag.roots.len() - 1;
-        format_dag_node(dag, root_id, 0, "", is_last_root, max_depth, expand_tools, &mut lines);
-    }
+        let entry = match self.store().get(&document_id) {
+            Some(e) => e,
+            None => return format!("Error: document not found"),
+        };
 
-    lines
-}
+        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
+            Some(s) => s,
+            None => return format!("Error: block not found"),
+        };
 
-/// Recursively format a DAG node and its children.
-fn format_dag_node(
-    dag: &ConversationDAG,
-    block_id: &BlockId,
-    depth: usize,
-    prefix: &str,
-    is_last: bool,
-    max_depth: Option<u32>,
-    expand_tools: bool,
-    lines: &mut Vec<String>,
-) {
-    // Check max depth
-    if let Some(max) = max_depth {
-        if depth as u32 > max {
-            return;
+        let current = &snapshot.content;
+
+        // If no original provided, just show current content summary
+        let original = match req.original {
+            Some(ref orig) => orig,
+            None => {
+                let mut output = String::new();
+                output.push_str(&format!("block: {}\n", req.block_id));
+                output.push_str(&format!("{}\n", "─".repeat(40)));
+                output.push_str(&format!("No original text provided for comparison.\n"));
+                output.push_str(&format!("Current content ({} lines, {} bytes):\n\n",
+                    line_count(current), current.len()));
+                output.push_str(current);
+                return output;
+            }
+        };
+
+        // Generate unified diff
+        let mut output = String::new();
+        output.push_str(&format!("diff {}\n", req.block_id));
+        output.push_str(&format!("{}\n", "─".repeat(40)));
+
+        let orig_lines: Vec<&str> = original.lines().collect();
+        let curr_lines: Vec<&str> = current.lines().collect();
+
+        // Simple line-by-line diff
+        let max_lines = orig_lines.len().max(curr_lines.len());
+        let mut has_changes = false;
+
+        for i in 0..max_lines {
+            let orig_line = orig_lines.get(i).copied();
+            let curr_line = curr_lines.get(i).copied();
+
+            match (orig_line, curr_line) {
+                (Some(o), Some(c)) if o == c => {
+                    output.push_str(&format!("  {}\n", o));
+                }
+                (Some(o), Some(c)) => {
+                    output.push_str(&format!("- {}\n", o));
+                    output.push_str(&format!("+ {}\n", c));
+                    has_changes = true;
+                }
+                (Some(o), None) => {
+                    output.push_str(&format!("- {}\n", o));
+                    has_changes = true;
+                }
+                (None, Some(c)) => {
+                    output.push_str(&format!("+ {}\n", c));
+                    has_changes = true;
+                }
+                (None, None) => {}
+            }
         }
+
+        if !has_changes {
+            output.push_str("\n(no changes)\n");
+        }
+
+        output
     }
 
-    let block = match dag.get(block_id) {
-        Some(b) => b,
-        None => return,
-    };
+    #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.")]
+    fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {
+        let entry = match self.store().get(&req.document_id) {
+            Some(e) => e,
+            None => return format!("Error: document '{}' not found", req.document_id),
+        };
 
-    // Build connector
-    let connector = if depth == 0 {
-        ""
-    } else if is_last {
-        "└─ "
-    } else {
-        "├─ "
-    };
+        let blocks = entry.doc.blocks_ordered();
+        let steps = req.steps.min(blocks.len() as u32) as usize;
 
-    // Format block ID as agent/seq
-    let short_id = format!("{}/{}", block_id.agent_id, block_id.seq);
+        let mut output = String::new();
+        output.push_str(&format!("doc_undo {} --dry-run\n", req.document_id));
+        output.push_str(&format!("{}\n", "─".repeat(40)));
+        output.push_str(&format!("Preview of {} most recent block{}:\n\n",
+            steps, if steps == 1 { "" } else { "s" }));
 
-    // Format role/kind
-    let role_kind = format!("[{}/{}]", block.role.as_str(), block.kind.as_str());
+        if blocks.is_empty() {
+            output.push_str("(no blocks in document)\n");
+            return output;
+        }
 
-    // Format content summary (truncated)
-    let summary = format_content_summary(&block.content, 40);
+        // Show most recent blocks (in reverse order - newest first)
+        for (idx, snapshot) in blocks.iter().rev().take(steps).enumerate() {
+            let content_preview = if snapshot.content.len() > 50 {
+                let truncated: String = snapshot.content.chars().take(50).collect();
+                format!("{}...", truncated.replace('\n', "\\n"))
+            } else {
+                snapshot.content.replace('\n', "\\n")
+            };
 
-    // Check if this is a tool_call with a single tool_result child (for collapsing)
-    let children = dag.get_children(block_id);
-    let can_collapse = !expand_tools
-        && block.kind == BlockKind::ToolCall
-        && children.len() == 1
-        && dag.get(&children[0]).map(|c| c.kind == BlockKind::ToolResult).unwrap_or(false);
+            output.push_str(&format!("  {}. [{}] {} \"{}\" at pos {}\n",
+                idx + 1,
+                snapshot.author,
+                snapshot.kind.as_str(),
+                content_preview,
+                snapshot.id.seq
+            ));
+        }
 
-    if can_collapse {
-        // Collapsed tool format: tool_name(...) → ✓/✗
-        let result_block = dag.get(&children[0]).unwrap();
-        let tool_name = block.tool_name.as_deref().unwrap_or("tool");
-        let status_icon = if result_block.is_error { "✗" } else { "✓" };
+        output.push_str(&format!("\n⚠️  Undo is not yet implemented. This is a dry-run preview only.\n"));
+        output.push_str(&format!("    Full undo would require storing undo stack or computing inverse operations.\n"));
 
-        let line = format!("{}{}{}({}) → {}",
-            prefix, connector, tool_name, summary, status_icon);
-        lines.push(line);
-
-        // Skip children since we collapsed them
-        return;
-    }
-
-    // Normal format
-    let line = format!("{}{}{} {} \"{}\"",
-        prefix, connector, short_id, role_kind, summary);
-    lines.push(line);
-
-    // Process children
-    let children = dag.get_children(block_id);
-    let child_prefix = if depth == 0 {
-        ""
-    } else if is_last {
-        &format!("{}   ", prefix)
-    } else {
-        &format!("{}│  ", prefix)
-    };
-
-    for (i, child_id) in children.iter().enumerate() {
-        let is_last_child = i == children.len() - 1;
-        format_dag_node(dag, child_id, depth + 1, child_prefix, is_last_child, max_depth, expand_tools, lines);
-    }
-}
-
-/// Format content as a truncated summary.
-fn format_content_summary(content: &str, max_chars: usize) -> String {
-    // Take first line only and truncate
-    let first_line = content.lines().next().unwrap_or("");
-    let trimmed = first_line.trim();
-
-    if trimmed.chars().count() <= max_chars {
-        trimmed.to_string()
-    } else {
-        let truncated: String = trimmed.chars().take(max_chars - 3).collect();
-        format!("{}...", truncated)
+        output
     }
 }
 
@@ -1607,5 +1259,119 @@ mod tests {
         assert!(result.contains("Invalid line range 5-10"));
         assert!(result.contains("block has 1 line"));
         assert!(result.contains("valid range: 0-1"));
+    }
+
+    #[test]
+    fn test_block_diff() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "diff-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "diff-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("Hello\nWorld\nFoo".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let block_id = parsed["block_id"].as_str().unwrap();
+
+        // Test diff with original
+        let result = mcp.block_diff(Parameters(BlockDiffRequest {
+            block_id: block_id.to_string(),
+            original: Some("Hello\nOld\nFoo".to_string()),
+        }));
+
+        assert!(result.contains("diff"));
+        assert!(result.contains("- Old"));
+        assert!(result.contains("+ World"));
+        assert!(result.contains("  Hello")); // Unchanged line
+
+        // Test diff without original (shows summary)
+        let result = mcp.block_diff(Parameters(BlockDiffRequest {
+            block_id: block_id.to_string(),
+            original: None,
+        }));
+
+        assert!(result.contains("No original text provided"));
+        assert!(result.contains("3 lines"));
+    }
+
+    #[test]
+    fn test_doc_undo() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "undo-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        // Create a few blocks
+        mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "undo-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("First block".to_string()),
+        }));
+
+        mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "undo-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "model".to_string(),
+            kind: "text".to_string(),
+            content: Some("Second block".to_string()),
+        }));
+
+        // Test doc_undo dry-run
+        let result = mcp.doc_undo(Parameters(DocUndoRequest {
+            document_id: "undo-test".to_string(),
+            steps: 2,
+        }));
+
+        assert!(result.contains("doc_undo"));
+        assert!(result.contains("--dry-run"));
+        assert!(result.contains("2 most recent blocks"));
+        assert!(result.contains("text"));
+        assert!(result.contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_block_diff_no_changes() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "diff-same".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "diff-same".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("Same content".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let block_id = parsed["block_id"].as_str().unwrap();
+
+        // Test diff with identical original
+        let result = mcp.block_diff(Parameters(BlockDiffRequest {
+            block_id: block_id.to_string(),
+            original: Some("Same content".to_string()),
+        }));
+
+        assert!(result.contains("(no changes)"));
     }
 }

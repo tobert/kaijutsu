@@ -4,6 +4,8 @@
 //! All blocks are CRDT-tracked via the unified diamond-types OpLog.
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use strum::EnumString;
 
 /// Globally unique block identifier.
 ///
@@ -62,13 +64,16 @@ impl std::fmt::Display for BlockId {
 ///
 /// Uses User/Model terminology to reflect collaborative peer model
 /// rather than hierarchical Human/Agent relationship.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
 pub enum Role {
     /// User (person at keyboard).
     #[default]
+    #[strum(serialize = "user", serialize = "human")]
     User,
     /// Model (AI model - Claude, GPT, etc.).
+    #[strum(serialize = "model", serialize = "assistant", serialize = "agent")]
     Model,
     /// System message (errors, notifications).
     System,
@@ -78,14 +83,11 @@ pub enum Role {
 
 impl Role {
     /// Parse from string (case-insensitive).
+    ///
+    /// Supports aliases: "human" → User, "assistant"/"agent" → Model.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "user" => Some(Role::User),
-            "model" => Some(Role::Model),
-            "system" => Some(Role::System),
-            "tool" => Some(Role::Tool),
-            _ => None,
-        }
+        <Self as FromStr>::from_str(s).ok()
     }
 
     /// Convert to string representation.
@@ -106,15 +108,18 @@ impl std::fmt::Display for Role {
 }
 
 /// Execution status for blocks (CRDT-synced).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
 pub enum Status {
     /// Queued, not started.
     #[default]
     Pending,
     /// In progress (streaming, executing).
+    #[strum(serialize = "running", serialize = "active")]
     Running,
     /// Completed successfully.
+    #[strum(serialize = "done", serialize = "complete", serialize = "completed")]
     Done,
     /// Failed with error.
     Error,
@@ -122,14 +127,11 @@ pub enum Status {
 
 impl Status {
     /// Parse from string (case-insensitive).
+    ///
+    /// Supports aliases: "active" → Running, "complete"/"completed" → Done.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "pending" => Some(Status::Pending),
-            "running" => Some(Status::Running),
-            "done" => Some(Status::Done),
-            "error" => Some(Status::Error),
-            _ => None,
-        }
+        <Self as FromStr>::from_str(s).ok()
     }
 
     /// Convert to string representation.
@@ -160,8 +162,9 @@ impl std::fmt::Display for Status {
 }
 
 /// Block content type (what kind of content this block holds).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
 pub enum BlockKind {
     /// Main text response.
     #[default]
@@ -169,27 +172,30 @@ pub enum BlockKind {
     /// Extended thinking/reasoning - collapsible.
     Thinking,
     /// Tool invocation - content (input JSON) is streamable via Text CRDT.
+    #[serde(rename = "tool_call")]
+    #[strum(serialize = "tool_call", serialize = "toolcall")]
     ToolCall,
     /// Tool result - content is streamable via Text CRDT.
+    #[serde(rename = "tool_result")]
+    #[strum(serialize = "tool_result", serialize = "toolresult")]
     ToolResult,
     /// Shell command entered by user (kaish REPL).
+    #[serde(rename = "shell_command")]
+    #[strum(serialize = "shell_command", serialize = "shellcommand")]
     ShellCommand,
     /// Shell command output/result (stdout, exit code).
+    #[serde(rename = "shell_output")]
+    #[strum(serialize = "shell_output", serialize = "shelloutput")]
     ShellOutput,
 }
 
 impl BlockKind {
     /// Parse from string (case-insensitive).
+    ///
+    /// Supports aliases: "toolcall" → ToolCall, "toolresult" → ToolResult, etc.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "text" => Some(BlockKind::Text),
-            "thinking" => Some(BlockKind::Thinking),
-            "tool_call" | "toolcall" => Some(BlockKind::ToolCall),
-            "tool_result" | "toolresult" => Some(BlockKind::ToolResult),
-            "shell_command" | "shellcommand" => Some(BlockKind::ShellCommand),
-            "shell_output" | "shelloutput" => Some(BlockKind::ShellOutput),
-            _ => None,
-        }
+        <Self as FromStr>::from_str(s).ok()
     }
 
     /// Convert to string representation.
@@ -518,15 +524,21 @@ mod tests {
 
     #[test]
     fn test_role_parsing() {
+        // Test basic parsing
         assert_eq!(Role::from_str("user"), Some(Role::User));
         assert_eq!(Role::from_str("MODEL"), Some(Role::Model));
         assert_eq!(Role::from_str("System"), Some(Role::System));
         assert_eq!(Role::from_str("tool"), Some(Role::Tool));
         assert_eq!(Role::from_str("invalid"), None);
+        // Test aliases
+        assert_eq!(Role::from_str("human"), Some(Role::User));
+        assert_eq!(Role::from_str("assistant"), Some(Role::Model));
+        assert_eq!(Role::from_str("agent"), Some(Role::Model));
     }
 
     #[test]
     fn test_status_parsing() {
+        // Test basic parsing
         assert_eq!(Status::from_str("pending"), Some(Status::Pending));
         assert_eq!(Status::from_str("RUNNING"), Some(Status::Running));
         assert_eq!(Status::from_str("Done"), Some(Status::Done));
@@ -535,6 +547,10 @@ mod tests {
         assert!(Status::Error.is_terminal());
         assert!(!Status::Pending.is_terminal());
         assert!(Status::Running.is_active());
+        // Test aliases
+        assert_eq!(Status::from_str("active"), Some(Status::Running));
+        assert_eq!(Status::from_str("complete"), Some(Status::Done));
+        assert_eq!(Status::from_str("completed"), Some(Status::Done));
     }
 
     #[test]
