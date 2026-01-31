@@ -11,12 +11,49 @@ into the distributed algorithm to equalize access and handle different networks.
 ## Quick Start
 
 ```bash
+# First time: add your SSH key
+cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --nick amy --admin
+
 # Terminal 1: Server
 cargo run -p kaijutsu-server
 
 # Terminal 2: Client
 cargo run -p kaijutsu-app
 ```
+
+## SSH Authentication
+
+The server uses SQLite-backed public key authentication. Keys must be registered before connecting.
+
+### Key Management
+
+```bash
+# Add a key (with nick and admin flag)
+kaijutsu-server add-key ~/.ssh/id_ed25519.pub --nick amy --admin
+
+# Import from authorized_keys (first key becomes admin if DB empty)
+kaijutsu-server import ~/.ssh/authorized_keys
+
+# List users and keys
+kaijutsu-server list-users
+kaijutsu-server list-keys [nick]
+
+# Rename a user
+kaijutsu-server set-nick old-nick new-nick
+```
+
+### Identity
+
+Each key maps to a user with:
+- **nick**: Short identifier used in RPC (e.g., "amy", "claude")
+- **display_name**: Full name (defaults to key comment)
+- **is_admin**: Admin privileges flag
+
+Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to rename.
+
+### Database Location
+
+`~/.local/share/kaijutsu/auth.db` (XDG compliant)
 
 ## Architecture
 

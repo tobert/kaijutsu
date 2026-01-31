@@ -297,7 +297,8 @@ fn init_ui_text_buffers(
         buffer.visual_line_count(&mut font_system, 800.0, Some(&mut metrics_cache));
 
         // Add buffer and marker components
-        commands.entity(entity).insert((
+        // Use try_insert to gracefully handle entity despawns between query and command application
+        commands.entity(entity).try_insert((
             buffer,
             MsdfText,
             MsdfTextAreaConfig::default(),

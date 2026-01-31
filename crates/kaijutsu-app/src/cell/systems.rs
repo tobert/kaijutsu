@@ -349,7 +349,8 @@ pub fn init_cell_buffers(
             cosmic_text::Shaping::Advanced,
         );
 
-        commands.entity(entity).insert(buffer);
+        // Use try_insert to gracefully handle entity despawns between query and command application
+        commands.entity(entity).try_insert(buffer);
         info!("Initialized MsdfTextBuffer for entity {:?}", entity);
     }
 }
@@ -2138,7 +2139,8 @@ pub fn init_role_header_buffers(
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
 
-        commands.entity(entity).insert(buffer);
+        // Use try_insert to gracefully handle entity despawns between query and command application
+        commands.entity(entity).try_insert(buffer);
     }
 }
 
@@ -2156,7 +2158,8 @@ pub fn init_block_cell_buffers(
     for entity in block_cells.iter() {
         let metrics = text_metrics.scaled_cell_metrics();
         let buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        commands.entity(entity).insert(buffer);
+        // Use try_insert to gracefully handle entity despawns between query and command application
+        commands.entity(entity).try_insert(buffer);
     }
 }
 
