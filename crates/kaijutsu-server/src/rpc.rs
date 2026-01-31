@@ -1875,6 +1875,125 @@ impl kernel::Server for KernelImpl {
             Ok(())
         })
     }
+
+    // =========================================================================
+    // Shell state (cwd, last result)
+    // =========================================================================
+
+    fn get_cwd(
+        self: Rc<Self>,
+        _params: kernel::GetCwdParams,
+        mut results: kernel::GetCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+            };
+
+            let cwd = if let Some(kaish) = kaish {
+                kaish.cwd().await
+            } else {
+                std::path::PathBuf::from("/docs")
+            };
+
+            results.get().set_path(&cwd.to_string_lossy());
+            Ok(())
+        })
+    }
+
+    fn set_cwd(
+        self: Rc<Self>,
+        params: kernel::SetCwdParams,
+        mut results: kernel::SetCwdResults,
+    ) -> Promise<(), capnp::Error> {
+        let path = match params.get().and_then(|p| p.get_path()) {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid path: {}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("missing path: {}", e))),
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            // set_cwd doesn't return a Result in kaish
+            kaish.set_cwd(std::path::PathBuf::from(&path)).await;
+            results.get().set_success(true);
+            results.get().set_error("");
+            Ok(())
+        })
+    }
+
+    fn get_last_result(
+        self: Rc<Self>,
+        _params: kernel::GetLastResultParams,
+        mut results: kernel::GetLastResultResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+            };
+
+            let last_result = if let Some(kaish) = kaish {
+                kaish.last_result().await
+            } else {
+                None
+            };
+
+            let mut result_builder = results.get().init_result();
+            if let Some(exec_result) = last_result {
+                result_builder.set_code(exec_result.code);
+                result_builder.set_ok(exec_result.ok());
+                result_builder.set_stdout(exec_result.out.as_bytes());
+                result_builder.set_stderr(&exec_result.err);
+
+                // Serialize data if present (convert kaish Value to JSON)
+                if let Some(ref data) = exec_result.data {
+                    let json_value = crate::kaish_backend::kaish_value_to_json(data);
+                    result_builder.set_data(&serde_json::to_string(&json_value).unwrap_or_default());
+                }
+
+                // Serialize display hint
+                let hint = crate::embedded_kaish::convert_display_hint(&exec_result.hint);
+                if let Some(hint_json) = crate::embedded_kaish::serialize_display_hint(&hint) {
+                    result_builder.set_hint(&hint_json);
+                }
+            } else {
+                // No last result - return empty/zero values
+                result_builder.set_code(0);
+                result_builder.set_ok(true);
+                result_builder.set_stdout(&[]);
+                result_builder.set_stderr("");
+                result_builder.set_data("");
+                result_builder.set_hint("");
+            }
+
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================

@@ -126,6 +126,21 @@ impl EmbeddedKaish {
         // Nothing to do - kernel will be dropped
         Ok(())
     }
+
+    /// Get current working directory.
+    pub async fn cwd(&self) -> std::path::PathBuf {
+        self.kernel.cwd().await
+    }
+
+    /// Set current working directory.
+    pub async fn set_cwd(&self, path: std::path::PathBuf) {
+        self.kernel.set_cwd(path).await
+    }
+
+    /// Get the last execution result ($?).
+    pub async fn last_result(&self) -> Option<ExecResult> {
+        Some(self.kernel.last_result().await)
+    }
 }
 
 // ============================================================================

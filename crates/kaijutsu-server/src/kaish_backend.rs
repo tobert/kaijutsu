@@ -819,7 +819,7 @@ fn tool_args_to_json(args: &ToolArgs) -> JsonValue {
 }
 
 /// Convert a kaish Value to JSON.
-fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
+pub fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
     use kaish_kernel::ast::Value;
     match value {
         Value::String(s) => JsonValue::String(s.clone()),

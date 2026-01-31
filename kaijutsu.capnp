@@ -88,6 +88,16 @@ struct HistoryEntry {
   timestamp @2 :UInt64;
 }
 
+# Result from shell command execution (matches kaish ExecResult)
+struct ShellExecResult {
+  code @0 :Int64;           # Exit code (0 = success)
+  ok @1 :Bool;              # Convenience: code == 0
+  stdout @2 :Data;          # Raw stdout bytes
+  stderr @3 :Text;          # Stderr as text
+  data @4 :Text;            # JSON-encoded parsed data (if applicable)
+  hint @5 :Text;            # JSON-encoded DisplayHint for tables/trees
+}
+
 # ============================================================================
 # Seat & Context Types
 # ============================================================================
@@ -267,6 +277,11 @@ interface Kernel {
   # Shell execution (kaish REPL with block output)
   # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
   shellExecute @29 (code :Text, documentId :Text) -> (commandBlockId :BlockId);
+
+  # Shell state (kaish working directory and last result)
+  getCwd @30 () -> (path :Text);
+  setCwd @31 (path :Text) -> (success :Bool, error :Text);
+  getLastResult @32 () -> (result :ShellExecResult);
 }
 
 # ============================================================================
