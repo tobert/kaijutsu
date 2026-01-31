@@ -2,6 +2,7 @@
 //!
 //! SSH + Cap'n Proto server for kaijutsu.
 
+pub mod auth_db;
 pub mod composite_backend;
 pub mod constants;
 pub mod embedded_kaish;
@@ -17,6 +18,7 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
+pub use auth_db::{AuthDb, User, SshKey};
 pub use composite_backend::CompositeBackend;
 pub use embedded_kaish::EmbeddedKaish;
 pub use git_backend::{
@@ -26,4 +28,4 @@ pub use git_backend::{
 pub use kaish::KaishProcess;
 pub use kaish_backend::KaijutsuBackend;
 pub use rpc::WorldImpl;
-pub use ssh::{SshServer, SshServerConfig};
+pub use ssh::{KeySource, SshServer, SshServerConfig};
