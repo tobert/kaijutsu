@@ -253,6 +253,45 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Create a document from serialized oplog bytes (for sync from server).
+    ///
+    /// This reconstructs a document's full CRDT history from the server's oplog.
+    /// Used for initial sync when connecting to a kaijutsu-server.
+    pub fn create_document_from_oplog(
+        &self,
+        id: DocumentId,
+        kind: DocumentKind,
+        language: Option<String>,
+        oplog_bytes: &[u8],
+    ) -> Result<(), String> {
+        if self.documents.contains_key(&id) {
+            return Err(format!("Document {} already exists", id));
+        }
+
+        let agent_id = self.agent_id();
+        let doc = BlockDocument::from_oplog(&id, &agent_id, oplog_bytes)
+            .map_err(|e| format!("Failed to create document from oplog: {}", e))?;
+
+        let version = doc.version();
+        let entry = DocumentEntry {
+            doc,
+            kind,
+            language,
+            version: AtomicU64::new(version),
+            last_agent: RwLock::new(agent_id.clone()),
+        };
+        self.documents.insert(id.clone(), entry);
+
+        // Broadcast event
+        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
+            document_id: id,
+            kind,
+            agent_id,
+        });
+
+        Ok(())
+    }
+
     /// Get a document for reading.
     pub fn get(&self, id: &str) -> Option<dashmap::mapref::one::Ref<'_, DocumentId, DocumentEntry>> {
         self.documents.get(id)

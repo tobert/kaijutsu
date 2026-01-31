@@ -1,0 +1,39 @@
+[package]
+name = "kaijutsu-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server exposing kaijutsu CRDT kernel to Claude Code, Gemini CLI, and opencode"
+
+[[bin]]
+name = "kaijutsu-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+kaijutsu-kernel = { workspace = true }
+kaijutsu-crdt = { workspace = true }
+kaijutsu-client = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+whoami = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# MCP server
+rmcp = { path = "../../../rmcp/crates/rmcp", features = ["server", "macros", "transport-io"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = { version = "1.0", features = ["chrono04"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Regex for search
+regex = "1"
