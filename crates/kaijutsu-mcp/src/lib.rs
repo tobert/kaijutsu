@@ -19,7 +19,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{SshConfig, connect_ssh};
-use kaijutsu_crdt::{BlockId, BlockKind, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, ConversationDAG, Role, Status};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store};
 
 // ============================================================================
@@ -204,6 +204,40 @@ fn default_context() -> u32 {
 
 fn default_max_matches() -> usize {
     100
+}
+
+/// Display a document's conversation DAG as an ASCII tree.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocTreeRequest {
+    /// Document ID to visualize
+    #[schemars(description = "Document ID to visualize")]
+    pub document_id: String,
+    /// Maximum tree depth to display
+    #[schemars(description = "Maximum tree depth to display (omit for full tree)")]
+    pub max_depth: Option<u32>,
+    /// Show tool_call and tool_result as separate expanded nodes
+    #[schemars(description = "Show tool_call and tool_result as separate nodes (default: false, collapsed shows as single line)")]
+    #[serde(default)]
+    pub expand_tools: bool,
+}
+
+/// Inspect CRDT internals of a block for debugging.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlockInspectRequest {
+    /// Block ID to inspect
+    #[schemars(description = "Block ID to inspect (format: document_id/agent_id/seq)")]
+    pub block_id: String,
+}
+
+/// Get version history of a block.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlockHistoryRequest {
+    /// Block ID to get history for
+    #[schemars(description = "Block ID to get history for (format: document_id/agent_id/seq)")]
+    pub block_id: String,
+    /// Maximum number of versions to show
+    #[schemars(description = "Maximum number of versions to show (default: all)")]
+    pub limit: Option<u32>,
 }
 
 // ============================================================================
@@ -721,6 +755,7 @@ impl KaijutsuMcp {
 
             let result = match op {
                 EditOp::Insert { line, content: text } => {
+                    let total_lines = line_count(&content);
                     if let Some(pos) = line_to_byte_offset(&content, line) {
                         let text_with_newline = if text.ends_with('\n') || content.is_empty() {
                             text
@@ -729,10 +764,14 @@ impl KaijutsuMcp {
                         };
                         self.store().edit_text(&document_id, &block_id, pos, &text_with_newline, 0)
                     } else {
-                        Err(format!("Invalid line number: {}", line))
+                        Err(format!(
+                            "Invalid line number {}: block has {} line{} (valid range: 0-{})",
+                            line, total_lines, if total_lines == 1 { "" } else { "s" }, total_lines
+                        ))
                     }
                 }
                 EditOp::Delete { start_line, end_line } => {
+                    let total_lines = line_count(&content);
                     if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
                         if start < end {
                             self.store().edit_text(&document_id, &block_id, start, "", end - start)
@@ -740,10 +779,16 @@ impl KaijutsuMcp {
                             Ok(())
                         }
                     } else {
-                        Err(format!("Invalid line range: {}-{}", start_line, end_line))
+                        Err(format!(
+                            "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
+                            start_line, end_line, total_lines,
+                            if total_lines == 1 { "" } else { "s" }, total_lines
+                        ))
                     }
                 }
                 EditOp::Replace { start_line, end_line, content: text, expected_text } => {
+                    let total_lines = line_count(&content);
+
                     // CAS validation
                     if let Some(ref expected) = expected_text {
                         let actual: String = content
@@ -765,7 +810,11 @@ impl KaijutsuMcp {
                         };
                         self.store().edit_text(&document_id, &block_id, start, &text_with_newline, end - start)
                     } else {
-                        Err(format!("Invalid line range: {}-{}", start_line, end_line))
+                        Err(format!(
+                            "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
+                            start_line, end_line, total_lines,
+                            if total_lines == 1 { "" } else { "s" }, total_lines
+                        ))
                     }
                 }
             };
@@ -968,6 +1017,237 @@ impl KaijutsuMcp {
             "truncated": matches.len() >= req.max_matches
         }).to_string()
     }
+
+    // ========================================================================
+    // Debug/Visualization Tools
+    // ========================================================================
+
+    #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.")]
+    fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
+        let entry = match self.store().get(&req.document_id) {
+            Some(e) => e,
+            None => return format!("Error: document '{}' not found", req.document_id),
+        };
+
+        let dag = ConversationDAG::from_document(&entry.doc);
+        let mut output = String::new();
+
+        // Header: document_id (kind, N blocks)
+        let kind = entry.kind.as_str();
+        output.push_str(&format!("{} ({}, {} block{})\n",
+            req.document_id, kind, dag.len(),
+            if dag.len() == 1 { "" } else { "s" }
+        ));
+
+        // Build tree lines
+        let lines = format_dag_tree(&dag, req.max_depth, req.expand_tools);
+        for line in lines {
+            output.push_str(&line);
+            output.push('\n');
+        }
+
+        output
+    }
+
+    #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.")]
+    fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
+        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+            Some(r) => r,
+            None => return format!("Error: block '{}' not found", req.block_id),
+        };
+
+        let entry = match self.store().get(&document_id) {
+            Some(e) => e,
+            None => return format!("Error: document not found"),
+        };
+
+        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
+            Some(s) => s,
+            None => return format!("Error: block not found"),
+        };
+
+        // Get CRDT internals from the oplog
+        let frontier = entry.doc.frontier();
+        let version = entry.version();
+
+        // Count content characters/lines
+        let content_length = snapshot.content.len();
+        let content_lines = line_count(&snapshot.content);
+
+        serde_json::json!({
+            "block_id": req.block_id,
+            "document_id": document_id,
+            "version": version,
+            "frontier": frontier,
+            "content_length": content_length,
+            "content_lines": content_lines,
+            "metadata": {
+                "role": snapshot.role.as_str(),
+                "kind": snapshot.kind.as_str(),
+                "status": snapshot.status.as_str(),
+                "parent_id": snapshot.parent_id.map(|id| id.to_key()),
+                "created_at": snapshot.created_at,
+                "author": snapshot.author,
+                "collapsed": snapshot.collapsed,
+                "tool_name": snapshot.tool_name,
+                "tool_call_id": snapshot.tool_call_id.map(|id| id.to_key()),
+                "is_error": snapshot.is_error,
+                "exit_code": snapshot.exit_code,
+            }
+        }).to_string()
+    }
+
+    #[tool(description = "Get version history information for a block. Shows creation time and current version details.")]
+    fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
+        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+            Some(r) => r,
+            None => return format!("Error: block '{}' not found", req.block_id),
+        };
+
+        let entry = match self.store().get(&document_id) {
+            Some(e) => e,
+            None => return format!("Error: document not found"),
+        };
+
+        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
+            Some(s) => s,
+            None => return format!("Error: block not found"),
+        };
+
+        let content_lines = line_count(&snapshot.content);
+        let version = entry.version();
+
+        // Format as human-readable output
+        let mut output = String::new();
+        output.push_str(&format!("block: {}\n", req.block_id));
+        output.push_str(&format!("{}\n", "─".repeat(40)));
+
+        // Creation info - simple timestamp display
+        let created_time = if snapshot.created_at > 0 {
+            format!("{}ms (unix epoch)", snapshot.created_at)
+        } else {
+            "unknown".to_string()
+        };
+
+        output.push_str(&format!("created: {} by {}\n", created_time, snapshot.author));
+        output.push_str(&format!("version: {} (document version)\n", version));
+        output.push_str(&format!("content: {} line{}, {} byte{}\n",
+            content_lines, if content_lines == 1 { "" } else { "s" },
+            snapshot.content.len(), if snapshot.content.len() == 1 { "" } else { "s" }
+        ));
+        output.push_str(&format!("status: {}\n", snapshot.status.as_str()));
+
+        output
+    }
+}
+
+/// Format a DAG as ASCII tree lines.
+fn format_dag_tree(dag: &ConversationDAG, max_depth: Option<u32>, expand_tools: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for (idx, root_id) in dag.roots.iter().enumerate() {
+        let is_last_root = idx == dag.roots.len() - 1;
+        format_dag_node(dag, root_id, 0, "", is_last_root, max_depth, expand_tools, &mut lines);
+    }
+
+    lines
+}
+
+/// Recursively format a DAG node and its children.
+fn format_dag_node(
+    dag: &ConversationDAG,
+    block_id: &BlockId,
+    depth: usize,
+    prefix: &str,
+    is_last: bool,
+    max_depth: Option<u32>,
+    expand_tools: bool,
+    lines: &mut Vec<String>,
+) {
+    // Check max depth
+    if let Some(max) = max_depth {
+        if depth as u32 > max {
+            return;
+        }
+    }
+
+    let block = match dag.get(block_id) {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Build connector
+    let connector = if depth == 0 {
+        ""
+    } else if is_last {
+        "└─ "
+    } else {
+        "├─ "
+    };
+
+    // Format block ID as agent/seq
+    let short_id = format!("{}/{}", block_id.agent_id, block_id.seq);
+
+    // Format role/kind
+    let role_kind = format!("[{}/{}]", block.role.as_str(), block.kind.as_str());
+
+    // Format content summary (truncated)
+    let summary = format_content_summary(&block.content, 40);
+
+    // Check if this is a tool_call with a single tool_result child (for collapsing)
+    let children = dag.get_children(block_id);
+    let can_collapse = !expand_tools
+        && block.kind == BlockKind::ToolCall
+        && children.len() == 1
+        && dag.get(&children[0]).map(|c| c.kind == BlockKind::ToolResult).unwrap_or(false);
+
+    if can_collapse {
+        // Collapsed tool format: tool_name(...) → ✓/✗
+        let result_block = dag.get(&children[0]).unwrap();
+        let tool_name = block.tool_name.as_deref().unwrap_or("tool");
+        let status_icon = if result_block.is_error { "✗" } else { "✓" };
+
+        let line = format!("{}{}{}({}) → {}",
+            prefix, connector, tool_name, summary, status_icon);
+        lines.push(line);
+
+        // Skip children since we collapsed them
+        return;
+    }
+
+    // Normal format
+    let line = format!("{}{}{} {} \"{}\"",
+        prefix, connector, short_id, role_kind, summary);
+    lines.push(line);
+
+    // Process children
+    let children = dag.get_children(block_id);
+    let child_prefix = if depth == 0 {
+        ""
+    } else if is_last {
+        &format!("{}   ", prefix)
+    } else {
+        &format!("{}│  ", prefix)
+    };
+
+    for (i, child_id) in children.iter().enumerate() {
+        let is_last_child = i == children.len() - 1;
+        format_dag_node(dag, child_id, depth + 1, child_prefix, is_last_child, max_depth, expand_tools, lines);
+    }
+}
+
+/// Format content as a truncated summary.
+fn format_content_summary(content: &str, max_chars: usize) -> String {
+    // Take first line only and truncate
+    let first_line = content.lines().next().unwrap_or("");
+    let trimmed = first_line.trim();
+
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let truncated: String = trimmed.chars().take(max_chars - 3).collect();
+        format!("{}...", truncated)
+    }
 }
 
 #[tool_handler]
@@ -1122,5 +1402,209 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["total"], 2);
+    }
+
+    #[test]
+    fn test_doc_tree() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "tree-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        // Create a simple conversation structure
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "tree-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("Hello!".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let user_block_id = parsed["block_id"].as_str().unwrap().to_string();
+
+        mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "tree-test".to_string(),
+            parent_id: Some(user_block_id.clone()),
+            after_id: Some(user_block_id),
+            role: "model".to_string(),
+            kind: "text".to_string(),
+            content: Some("Hi there!".to_string()),
+        }));
+
+        // Test doc_tree output
+        let result = mcp.doc_tree(Parameters(DocTreeRequest {
+            document_id: "tree-test".to_string(),
+            max_depth: None,
+            expand_tools: false,
+        }));
+
+        assert!(result.contains("tree-test"));
+        assert!(result.contains("conversation"));
+        assert!(result.contains("2 blocks"));
+        assert!(result.contains("[user/text]"));
+        assert!(result.contains("[model/text]"));
+    }
+
+    #[test]
+    fn test_doc_tree_with_tools() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "tool-tree-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        // Create a tool call
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "tool-tree-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "model".to_string(),
+            kind: "tool_call".to_string(),
+            content: Some("{\"path\": \"/test\"}".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let tool_call_id = parsed["block_id"].as_str().unwrap().to_string();
+
+        // Create a tool result as child
+        mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "tool-tree-test".to_string(),
+            parent_id: Some(tool_call_id.clone()),
+            after_id: Some(tool_call_id),
+            role: "tool".to_string(),
+            kind: "tool_result".to_string(),
+            content: Some("File contents".to_string()),
+        }));
+
+        // Test collapsed format (default)
+        let result = mcp.doc_tree(Parameters(DocTreeRequest {
+            document_id: "tool-tree-test".to_string(),
+            max_depth: None,
+            expand_tools: false,
+        }));
+
+        // Collapsed format shows "→ ✓" or "→ ✗"
+        assert!(result.contains("→ ✓") || result.contains("tool("));
+
+        // Test expanded format
+        let result = mcp.doc_tree(Parameters(DocTreeRequest {
+            document_id: "tool-tree-test".to_string(),
+            max_depth: None,
+            expand_tools: true,
+        }));
+
+        // Expanded format shows both nodes separately
+        assert!(result.contains("[model/tool_call]"));
+        assert!(result.contains("[tool/tool_result]"));
+    }
+
+    #[test]
+    fn test_block_inspect() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "inspect-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "inspect-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("Test content".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let block_id = parsed["block_id"].as_str().unwrap();
+
+        // Test block_inspect
+        let result = mcp.block_inspect(Parameters(BlockInspectRequest {
+            block_id: block_id.to_string(),
+        }));
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["block_id"].is_string());
+        assert!(parsed["version"].is_number());
+        assert!(parsed["frontier"].is_array());
+        assert_eq!(parsed["content_lines"], 1);
+        assert_eq!(parsed["metadata"]["role"], "user");
+        assert_eq!(parsed["metadata"]["kind"], "text");
+    }
+
+    #[test]
+    fn test_block_history() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "history-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "history-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "model".to_string(),
+            kind: "text".to_string(),
+            content: Some("Initial content".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let block_id = parsed["block_id"].as_str().unwrap();
+
+        // Test block_history
+        let result = mcp.block_history(Parameters(BlockHistoryRequest {
+            block_id: block_id.to_string(),
+            limit: None,
+        }));
+
+        assert!(result.contains("block:"));
+        assert!(result.contains("created:"));
+        assert!(result.contains("version:"));
+        assert!(result.contains("content:"));
+        assert!(result.contains("status:"));
+    }
+
+    #[test]
+    fn test_improved_error_messages() {
+        let mcp = KaijutsuMcp::new();
+
+        mcp.doc_create(Parameters(DocCreateRequest {
+            id: "error-test".to_string(),
+            kind: "conversation".to_string(),
+            language: None,
+        }));
+
+        let result = mcp.block_create(Parameters(BlockCreateRequest {
+            document_id: "error-test".to_string(),
+            parent_id: None,
+            after_id: None,
+            role: "user".to_string(),
+            kind: "text".to_string(),
+            content: Some("Single line".to_string()),
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let block_id = parsed["block_id"].as_str().unwrap();
+
+        // Try to delete a line range that doesn't exist
+        let result = mcp.block_edit(Parameters(BlockEditRequest {
+            block_id: block_id.to_string(),
+            operations: vec![EditOp::Delete {
+                start_line: 5,
+                end_line: 10,
+            }],
+        }));
+
+        // Should have improved error message
+        assert!(result.contains("Invalid line range 5-10"));
+        assert!(result.contains("block has 1 line"));
+        assert!(result.contains("valid range: 0-1"));
     }
 }

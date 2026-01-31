@@ -22,6 +22,38 @@ and show you a demo.
 
 -Amy
 
+## MCP Server
+
+Kaijutsu exposes its CRDT kernel via [Model Context Protocol][mcp], letting
+Claude Code, Gemini CLI, and other MCP clients collaborate on shared documents.
+
+```bash
+cargo run -p kaijutsu-mcp
+```
+
+### Tools
+
+| Category | Tools |
+|----------|-------|
+| **Documents** | `doc_create`, `doc_list`, `doc_delete`, `doc_tree` |
+| **Blocks** | `block_create`, `block_read`, `block_append`, `block_edit`, `block_list`, `block_status` |
+| **Debug** | `block_inspect`, `block_history`, `kernel_search` |
+
+### Example: Visualize Conversation DAG
+
+```
+❯ mcp__kaijutsu__doc_tree(document_id: "lobby@main")
+
+lobby@main (conversation, 6 blocks)
+server/0 [user/text] "write a haiku about haikus"
+block_create({) → ✓
+server/3 [model/text] "I've written a haiku about haikus!..."
+```
+
+Tool calls collapse to a single line by default. See [crates/kaijutsu-mcp/README.md](crates/kaijutsu-mcp/README.md) for full documentation.
+
+[mcp]: https://modelcontextprotocol.io/
+
 ## Forked Dependencies
 
 We maintain forks of several dependencies with fixes or extensions we need. These will be upstreamed once proven out:
