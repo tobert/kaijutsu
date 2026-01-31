@@ -1,17 +1,14 @@
-//! Integration tests for kaijutsu RPC
+//! Integration tests for kaijutsu RPC over SSH
 //!
-//! Tests the client-server interaction over TCP (bypassing SSH for simplicity).
+//! Uses ephemeral SSH keys generated in memory for testing.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::task::LocalSet;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_client::{RpcClient, RpcError};
-use kaijutsu_server::rpc::{ServerState, WorldImpl};
+use kaijutsu_client::{KeySource, RpcClient, SshConfig};
+use kaijutsu_server::{SshServer, SshServerConfig};
 
 /// Helper to run async test code that requires LocalSet (for capnp-rpc)
 fn run_local<F: std::future::Future<Output = ()>>(f: F) {
@@ -23,53 +20,50 @@ fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     rt.block_on(local.run_until(f));
 }
 
-/// Start a server on an ephemeral port and return the address
-async fn start_server() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// Start an SSH server on an ephemeral port and return the address
+async fn start_server() -> SocketAddr {
+    // Bind to port 0 to get an ephemeral port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    drop(listener); // Release so server can bind
 
-    // Spawn server accept loop
+    let config = SshServerConfig::ephemeral(addr.port());
+
+    // Spawn server in background
     tokio::task::spawn_local(async move {
-        while let Ok((stream, _peer)) = listener.accept().await {
-            tokio::task::spawn_local(handle_connection(stream));
+        let server = SshServer::new(config);
+        if let Err(e) = server.run().await {
+            log::error!("Server error: {}", e);
         }
     });
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     addr
 }
 
-async fn handle_connection(stream: TcpStream) {
-    let stream = stream.compat();
-    let (reader, writer) = futures::AsyncReadExt::split(stream);
+/// Connect to server with ephemeral key
+async fn connect_client(addr: SocketAddr) -> RpcClient {
+    let config = SshConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        username: "test_user".to_string(),
+        key_source: KeySource::ephemeral(),
+    };
 
-    // Create server state with a test username
-    let state = Rc::new(RefCell::new(ServerState::new("test_user".to_string())));
-    let world = WorldImpl::new(state);
-    let client: kaijutsu_server::kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
-
-    let network = twoparty::VatNetwork::new(
-        reader,
-        writer,
-        rpc_twoparty_capnp::Side::Server,
-        Default::default(),
-    );
-    let rpc_system = RpcSystem::new(Box::new(network), Some(client.clone().client));
-
-    if let Err(e) = rpc_system.await {
-        log::error!("RPC system error: {}", e);
-    }
-}
-
-async fn connect_client(addr: std::net::SocketAddr) -> Result<RpcClient, RpcError> {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    RpcClient::from_stream(stream.compat()).await
+    let mut ssh_client = kaijutsu_client::SshClient::new(config);
+    let channels = ssh_client.connect().await.expect("SSH connect failed");
+    RpcClient::new(channels.rpc.into_stream())
+        .await
+        .expect("RPC client init failed")
 }
 
 #[test]
 fn test_whoami() {
     run_local(async {
         let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
+        let client = connect_client(addr).await;
 
         let identity = client.whoami().await.unwrap();
         assert_eq!(identity.username, "test_user");
@@ -81,7 +75,7 @@ fn test_whoami() {
 fn test_list_kernels_empty() {
     run_local(async {
         let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
+        let client = connect_client(addr).await;
 
         let kernels = client.list_kernels().await.unwrap();
         assert!(kernels.is_empty(), "Expected no kernels initially");
@@ -92,7 +86,7 @@ fn test_list_kernels_empty() {
 fn test_attach_kernel_creates_kernel() {
     run_local(async {
         let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
+        let client = connect_client(addr).await;
 
         // Attach to a kernel (should auto-create for now)
         let kernel = client.attach_kernel("test-kernel").await.unwrap();
@@ -106,7 +100,7 @@ fn test_attach_kernel_creates_kernel() {
 fn test_kernel_appears_in_list() {
     run_local(async {
         let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
+        let client = connect_client(addr).await;
 
         // Attach to a kernel
         let _kernel = client.attach_kernel("listed-kernel").await.unwrap();
@@ -122,7 +116,7 @@ fn test_kernel_appears_in_list() {
 fn test_create_kernel_with_config() {
     run_local(async {
         let addr = start_server().await;
-        let client = connect_client(addr).await.unwrap();
+        let client = connect_client(addr).await;
 
         let config = kaijutsu_client::KernelConfig {
             name: "feature/test".to_string(),
@@ -135,6 +129,3 @@ fn test_create_kernel_with_config() {
         assert_eq!(info.name, "feature/test");
     });
 }
-
-// NOTE: Tests for execute() and command_history() require kaish binary
-// which is not currently available. Re-add when kaish is integrated.

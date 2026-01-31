@@ -482,6 +482,7 @@ impl KaijutsuMcp {
             host: host.to_string(),
             port,
             username: whoami::username(),
+            ..SshConfig::default()
         };
 
         tracing::debug!(?config, "Connecting via SSH");

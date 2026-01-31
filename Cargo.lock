@@ -4924,6 +4924,7 @@ dependencies = [
  "futures",
  "kaijutsu-crdt",
  "log",
+ "rand 0.8.5",
  "russh",
  "serde_json",
  "thiserror 2.0.18",

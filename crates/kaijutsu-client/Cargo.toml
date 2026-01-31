@@ -11,6 +11,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
+rand.workspace = true
 log.workspace = true
 thiserror.workspace = true
 whoami.workspace = true

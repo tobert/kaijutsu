@@ -16,7 +16,7 @@ pub use rpc::{
     Completion, CompletionKind, ConsentMode, Context, DocumentState, HistoryEntry, Identity,
     KernelConfig, KernelHandle, KernelInfo, MountSpec, RpcClient, RpcError, SeatId, SeatInfo,
 };
-pub use ssh::{SshChannels, SshClient, SshConfig, SshError};
+pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 
 /// Connect to a server via SSH and return an RPC client
 ///
