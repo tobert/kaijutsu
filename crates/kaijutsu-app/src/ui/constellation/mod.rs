@@ -16,12 +16,14 @@
 //! - Connections: Lines with distance falloff glow
 //! - States: Idle (dim), active (bright), streaming (particle flow), error (red)
 
+mod mini;
 mod render;
 
 use bevy::prelude::*;
 use kaijutsu_client::SeatInfo;
 
 // Render module provides visual systems (used by the plugin internally)
+// Mini module provides render-to-texture previews for constellation nodes
 
 /// Plugin for constellation-based context navigation
 pub struct ConstellationPlugin;
@@ -49,6 +51,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add rendering systems from the render module
         render::setup_constellation_rendering(app);
+
+        // Add mini-render systems for context previews
+        mini::setup_mini_render_systems(app);
     }
 }
 

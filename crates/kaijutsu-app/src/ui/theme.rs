@@ -383,9 +383,9 @@ impl Default for Theme {
             font_rainbow: false,
 
             // Constellation defaults - bioluminescent aesthetic
-            constellation_layout_radius: 200.0,
-            constellation_node_size: 48.0,
-            constellation_node_size_focused: 64.0,
+            constellation_layout_radius: 250.0,
+            constellation_node_size: 96.0,
+            constellation_node_size_focused: 128.0,
             constellation_node_glow_idle: Color::srgba(0.3, 0.4, 0.5, 0.3),
             constellation_node_glow_active: Color::srgba(0.34, 0.65, 1.0, 0.7),    // Cyan
             constellation_node_glow_streaming: Color::srgba(0.4, 0.8, 0.4, 0.8),   // Green

@@ -9,6 +9,7 @@
 use bevy::prelude::*;
 
 use super::{
+    mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
     ConstellationMode, ConstellationNode, OrbitalAnimation,
 };
@@ -19,6 +20,10 @@ use crate::ui::theme::{color_to_vec4, Theme};
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstellationRendering;
 
+/// Marker component for nodes that have a mini-render attached
+#[derive(Component)]
+pub struct HasMiniRender;
+
 /// Setup the constellation rendering systems
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
@@ -28,6 +33,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             sync_constellation_visibility,
             spawn_context_nodes,
             spawn_connection_lines,
+            attach_mini_renders,
             update_node_visuals,
             update_connection_visuals,
             despawn_removed_nodes,
@@ -161,6 +167,7 @@ fn spawn_context_nodes(
         let material = pulse_materials.add(create_node_material(node.activity, &theme));
 
         // Spawn the node entity as a child of the container
+        // Note: mini-render textures are attached by attach_mini_renders system
         let node_entity = commands
             .spawn((
                 ConstellationNode {
@@ -177,6 +184,8 @@ fn spawn_context_nodes(
                 },
                 // Use PulseRingMaterial for glowing orb effect
                 MaterialNode(material),
+                // Enable interaction for click-to-focus
+                Interaction::None,
             ))
             .with_children(|parent| {
                 // Inner label showing context name (truncated)
@@ -209,6 +218,48 @@ fn spawn_context_nodes(
             "Spawned constellation node for {} at {:?}",
             node.context_id, node.position
         );
+    }
+}
+
+/// Attach mini-render textures to nodes that don't have them yet
+fn attach_mini_renders(
+    mut commands: Commands,
+    mini_registry: Res<MiniRenderRegistry>,
+    nodes: Query<(Entity, &ConstellationNode), Without<HasMiniRender>>,
+) {
+    for (entity, node) in nodes.iter() {
+        // Find mini-render for this context
+        if let Some(entry) = mini_registry
+            .renders
+            .iter()
+            .find(|r| r.context_id == node.context_id)
+        {
+            // Add mini-render image as child of the node
+            let mini_child = commands
+                .spawn((
+                    ImageNode::new(entry.image.clone()),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        // Center the preview inside the orb
+                        left: Val::Percent(10.0),
+                        top: Val::Percent(10.0),
+                        width: Val::Percent(80.0),
+                        height: Val::Percent(80.0),
+                        border_radius: BorderRadius::all(Val::Percent(50.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                ))
+                .id();
+
+            commands.entity(entity).add_child(mini_child);
+            commands.entity(entity).insert(HasMiniRender);
+
+            info!(
+                "Attached mini-render to constellation node: {}",
+                node.context_id
+            );
+        }
     }
 }
 
