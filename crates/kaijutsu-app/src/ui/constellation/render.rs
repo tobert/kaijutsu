@@ -189,22 +189,34 @@ fn spawn_context_nodes(
             ))
             .with_children(|parent| {
                 // Inner label showing context name (truncated)
-                let label = truncate_context_name(&node.seat_info.id.context, 8);
-                parent.spawn((
-                    crate::text::MsdfUiText::new(&label)
-                        .with_font_size(10.0)
-                        .with_color(theme.fg),
-                    crate::text::UiTextPositionCache::default(),
-                    Node {
-                        position_type: PositionType::Absolute,
-                        bottom: Val::Px(-16.0), // Below the orb
-                        left: Val::Px(0.0),
-                        width: Val::Px(node_size),
-                        min_height: Val::Px(12.0),
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                ));
+                // Wrapped in a semi-transparent background for contrast
+                let label = truncate_context_name(&node.seat_info.id.context, 12);
+                parent
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(-24.0), // Below the orb
+                            left: Val::Percent(50.0),
+                            margin: UiRect::left(Val::Px(-60.0)), // Center the label
+                            width: Val::Px(120.0),
+                            min_height: Val::Px(20.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(theme.panel_bg.with_alpha(0.85)),
+                    ))
+                    .with_children(|label_bg| {
+                        label_bg.spawn((
+                            crate::text::MsdfUiText::new(&label)
+                                .with_font_size(12.0)
+                                .with_color(theme.fg), // Bright foreground on dark bg
+                            crate::text::UiTextPositionCache::default(),
+                            Node::default(),
+                        ));
+                    });
             })
             .id();
 
