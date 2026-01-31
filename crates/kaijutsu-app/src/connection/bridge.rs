@@ -21,7 +21,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for LLM prompt operations (now returns immediately, streaming happens async)
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
+use crate::constants::DEFAULT_KERNEL_ID;
 
 /// Commands sent from Bevy to the connection thread
 #[derive(Debug)]
@@ -29,8 +29,6 @@ use crate::constants::{DEFAULT_KERNEL_ID, DEFAULT_SERVER_ADDRESS};
 pub enum ConnectionCommand {
     /// Connect to a server via SSH
     ConnectSsh { config: SshConfig },
-    /// Connect to a local TCP server (for testing)
-    ConnectTcp { addr: String },
     /// Disconnect from server
     Disconnect,
     /// Get current identity
@@ -190,8 +188,8 @@ pub struct ConnectionState {
     pub connected: bool,
     pub identity: Option<Identity>,
     pub current_kernel: Option<KernelInfo>,
-    /// Target address for (re)connection
-    pub target_addr: String,
+    /// SSH configuration for (re)connection
+    pub ssh_config: SshConfig,
     /// Whether auto-reconnect is enabled
     pub auto_reconnect: bool,
     /// Current reconnect attempt (0 = not reconnecting)
@@ -208,7 +206,7 @@ impl Default for ConnectionState {
             connected: false,
             identity: None,
             current_kernel: None,
-            target_addr: DEFAULT_SERVER_ADDRESS.to_string(),
+            ssh_config: SshConfig::default(),
             auto_reconnect: true,
             reconnect_attempt: 0,
             last_attempt: None,
@@ -328,8 +326,8 @@ fn auto_reconnect_system(
     cmds: Res<ConnectionCommands>,
     mut events: MessageWriter<ConnectionEvent>,
 ) {
-    // Skip if connected, auto-reconnect disabled, or no target
-    if state.connected || !state.auto_reconnect || state.target_addr.is_empty() {
+    // Skip if connected or auto-reconnect disabled
+    if state.connected || !state.auto_reconnect {
         return;
     }
 
@@ -355,9 +353,10 @@ fn auto_reconnect_system(
         // Update state
         state.last_attempt = Some(Instant::now());
 
-        // Send connect command
-        let addr = state.target_addr.clone();
-        cmds.send(ConnectionCommand::ConnectTcp { addr });
+        // Send connect command via SSH
+        cmds.send(ConnectionCommand::ConnectSsh {
+            config: state.ssh_config.clone(),
+        });
     }
 }
 
@@ -387,8 +386,6 @@ async fn connection_loop(
     evt_tx: &mpsc::UnboundedSender<ConnectionEvent>,
 ) {
     use kaijutsu_client::SshClient;
-    use tokio::net::TcpStream;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let mut _ssh_client: Option<SshClient> = None;
     let mut rpc_client: Option<RpcClient> = None;
@@ -424,31 +421,6 @@ async fn connection_loop(
                     Err(e) => {
                         let _ = evt_tx.send(ConnectionEvent::ConnectionFailed(format!(
                             "SSH failed: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-
-            ConnectionCommand::ConnectTcp { addr } => {
-                log::info!("Connecting via TCP to {}", addr);
-
-                match TcpStream::connect(&addr).await {
-                    Ok(stream) => match RpcClient::from_stream(stream.compat()).await {
-                        Ok(rpc) => {
-                            rpc_client = Some(rpc);
-                            let _ = evt_tx.send(ConnectionEvent::Connected);
-                        }
-                        Err(e) => {
-                            let _ = evt_tx.send(ConnectionEvent::ConnectionFailed(format!(
-                                "RPC init failed: {}",
-                                e
-                            )));
-                        }
-                    },
-                    Err(e) => {
-                        let _ = evt_tx.send(ConnectionEvent::ConnectionFailed(format!(
-                            "TCP connect failed: {}",
                             e
                         )));
                     }

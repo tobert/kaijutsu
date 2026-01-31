@@ -2,15 +2,22 @@
 //!
 //! Accepts SSH connections and provides Cap'n Proto RPC over channels.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use russh::keys::ssh_key;
 use russh::keys::PrivateKey;
 use russh::server::{self, Auth, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
+use tokio_util::compat::TokioAsyncReadCompatExt;
+
+use crate::kaijutsu_capnp;
+use crate::rpc::{ServerState, WorldImpl};
 
 /// SSH server configuration
 #[derive(Clone)]
@@ -80,6 +87,7 @@ impl server::Server for Server {
 /// Handler for a single SSH connection
 struct ConnectionHandler {
     username: Option<String>,
+    #[allow(dead_code)]
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -97,6 +105,30 @@ impl ConnectionHandler {
     }
 }
 
+/// Run Cap'n Proto RPC over an SSH channel stream
+async fn run_rpc(stream: russh::ChannelStream<Msg>, username: String) {
+    let stream = stream.compat();
+    let (reader, writer) = futures::AsyncReadExt::split(stream);
+
+    let state = Rc::new(RefCell::new(ServerState::new(username.clone())));
+    let world = WorldImpl::new(state);
+    let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
+
+    let network = twoparty::VatNetwork::new(
+        reader,
+        writer,
+        rpc_twoparty_capnp::Side::Server,
+        Default::default(),
+    );
+    let rpc_system = RpcSystem::new(Box::new(network), Some(client.clone().client));
+
+    log::info!("RPC session started for user: {}", username);
+    if let Err(e) = rpc_system.await {
+        log::error!("RPC system error for {}: {}", username, e);
+    }
+    log::info!("RPC session ended for user: {}", username);
+}
+
 impl server::Handler for ConnectionHandler {
     type Error = russh::Error;
 
@@ -105,8 +137,24 @@ impl server::Handler for ConnectionHandler {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        log::debug!("Channel {} opened", channel.id());
+        log::info!("Channel {} opened, starting RPC handler", channel.id());
         self.channels.insert(channel.id(), ChannelState::default());
+
+        let stream = channel.into_stream();
+        let username = self.username.clone().unwrap_or_else(|| "anonymous".into());
+
+        // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet)
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for RPC");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                run_rpc(stream, username).await;
+            });
+        });
+
         Ok(true)
     }
 
@@ -118,19 +166,6 @@ impl server::Handler for ConnectionHandler {
         log::info!("Auth attempt from user: {}", user);
         self.username = Some(user.to_string());
         Ok(Auth::Accept)
-    }
-
-    async fn data(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        log::debug!("Received {} bytes on channel {}", data.len(), channel);
-
-        // For now, echo back
-        session.data(channel, CryptoVec::from_slice(data))?;
-        Ok(())
     }
 
     async fn channel_close(
