@@ -99,12 +99,14 @@ pub struct MsdfUiText {
 #[allow(dead_code)]
 impl MsdfUiText {
     /// Create a new UI text with default settings.
+    ///
+    /// Uses "Noto Sans" by name so the system can provide language/emoji coverage.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             color: [255, 255, 255, 255],
             metrics: Metrics::new(16.0, 20.0),
-            family: Family::SansSerif,
+            family: Family::Name("Noto Sans"),
         }
     }
 

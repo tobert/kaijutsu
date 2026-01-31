@@ -341,7 +341,7 @@ pub fn init_cell_buffers(
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
 
         // Initialize with current editor text
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(
             &mut font_system,
             &editor.text(),
@@ -436,7 +436,7 @@ pub fn sync_cell_buffers(
     };
 
     for (editor, mut buffer) in cells.iter_mut() {
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
 
         // Use block-formatted text if we have blocks, otherwise use raw text
         let display_text = if editor.has_blocks() {
@@ -1465,7 +1465,7 @@ pub fn spawn_expanded_block_view(
         let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
 
         let color = block_color(block, &theme);
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
         drop(fs);
 
@@ -1556,7 +1556,7 @@ pub fn sync_expanded_block_content(
 
         // Update text if changed
         let mut fs = font_system.0.lock().unwrap();
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
         drop(fs);
 
@@ -2135,7 +2135,7 @@ pub fn init_role_header_buffers(
             kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
             kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
         };
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
 
         commands.entity(entity).insert(buffer);
@@ -2232,7 +2232,7 @@ pub fn sync_block_cell_buffers(
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
         let text = format_single_block(block);
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Monospace);
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
 
         // Apply block-specific color based on BlockKind and Role
