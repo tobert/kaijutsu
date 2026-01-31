@@ -339,6 +339,12 @@ pub struct ExtractedMsdfRenderConfig {
     pub hint_amount: f32,
     /// TAA enabled flag.
     pub taa_enabled: bool,
+    /// Number of frames for TAA to converge (4-16).
+    pub taa_convergence_frames: u32,
+    /// Initial blend weight (0.3-0.9).
+    pub taa_initial_weight: f32,
+    /// Final blend weight (0.05-0.3).
+    pub taa_final_weight: f32,
     /// Horizontal stroke AA scale.
     pub horz_scale: f32,
     /// Vertical stroke AA scale.
@@ -644,8 +650,14 @@ pub struct TaaUniforms {
     pub taa_enabled: u32,
     /// Camera motion delta (for Phase 4 reprojection).
     pub camera_motion: [f32; 2],
+    /// Number of frames to converge (f32 for shader math).
+    pub convergence_frames: f32,
+    /// Initial blend weight (first frame opacity).
+    pub initial_weight: f32,
+    /// Final blend weight (steady-state blend).
+    pub final_weight: f32,
     /// Padding for 16-byte alignment.
-    pub _padding: [f32; 2],
+    pub _padding: f32,
 }
 
 impl Default for TaaUniforms {
@@ -655,7 +667,10 @@ impl Default for TaaUniforms {
             frames_accumulated: 0,
             taa_enabled: 1,
             camera_motion: [0.0, 0.0],
-            _padding: [0.0, 0.0],
+            convergence_frames: 8.0,
+            initial_weight: 0.5,
+            final_weight: 0.1,
+            _padding: 0.0,
         }
     }
 }
@@ -1084,6 +1099,10 @@ pub fn extract_msdf_render_config(
         glow_spread: theme.font_glow_spread,
         glow_color: [glow_srgba.red, glow_srgba.green, glow_srgba.blue, glow_srgba.alpha],
         rainbow: theme.font_rainbow,
+        // TAA convergence parameters
+        taa_convergence_frames: theme.font_taa_convergence_frames,
+        taa_initial_weight: theme.font_taa_initial_weight,
+        taa_final_weight: theme.font_taa_final_weight,
     });
 }
 
@@ -1519,13 +1538,16 @@ pub fn prepare_msdf_texts(
                 taa_res.frames_accumulated = 0;
             }
 
-            // Update TAA uniforms
+            // Update TAA uniforms with configurable convergence parameters
             let taa_uniforms = TaaUniforms {
                 resolution,
                 frames_accumulated: taa_res.frames_accumulated,
                 taa_enabled: if taa_state.enabled { 1 } else { 0 },
                 camera_motion: motion,
-                _padding: [0.0, 0.0],
+                convergence_frames: render_config.taa_convergence_frames as f32,
+                initial_weight: render_config.taa_initial_weight,
+                final_weight: render_config.taa_final_weight,
+                _padding: 0.0,
             };
             queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
 
@@ -1549,7 +1571,11 @@ pub fn prepare_msdf_texts(
                 frames_accumulated: 0, // Not used in passthrough
                 taa_enabled: 0,        // Passthrough mode - just sample current texture
                 camera_motion: [0.0, 0.0],
-                _padding: [0.0, 0.0],
+                // Values don't matter for passthrough, use defaults
+                convergence_frames: 8.0,
+                initial_weight: 0.5,
+                final_weight: 0.1,
+                _padding: 0.0,
             };
             queue.write_buffer(&taa_pipeline.blit_uniform_buffer, 0, bytemuck::bytes_of(&blit_uniforms));
 

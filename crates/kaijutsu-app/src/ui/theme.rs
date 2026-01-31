@@ -203,6 +203,12 @@ pub struct Theme {
     pub font_hint_amount: f32,
     /// Enable temporal anti-aliasing for smoother text edges.
     pub font_taa_enabled: bool,
+    /// Number of frames for TAA to converge (4-16). Lower = faster fade-in.
+    pub font_taa_convergence_frames: u32,
+    /// Initial blend weight (0.3-0.9). Higher = more visible on first frame.
+    pub font_taa_initial_weight: f32,
+    /// Final blend weight (0.05-0.3). Lower = more temporal smoothing.
+    pub font_taa_final_weight: f32,
     /// Horizontal stroke AA scale (1.0-1.3). Wider AA for vertical strokes.
     pub font_horz_scale: f32,
     /// Vertical stroke AA scale (0.5-0.8). Sharper AA for horizontal strokes.
@@ -319,6 +325,9 @@ impl Default for Theme {
             font_stem_darkening: 0.15,  // ClearType-like weight for small text
             font_hint_amount: 0.8,      // Strong hinting for crisp stems
             font_taa_enabled: true,     // Temporal AA for smoother edges
+            font_taa_convergence_frames: 8, // 8 frames to converge (~133ms at 60fps)
+            font_taa_initial_weight: 0.5,   // 50% current frame weight initially
+            font_taa_final_weight: 0.1,     // 10% current frame weight at convergence
             font_horz_scale: 1.1,       // Wider AA for vertical strokes
             font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
             font_text_bias: 0.5,        // Standard SDF threshold

@@ -20,8 +20,12 @@ struct TaaUniforms {
     // Camera motion delta for reprojection (Phase 4)
     // For now, assume static text (0, 0)
     camera_motion: vec2<f32>,
+    // Configurable convergence parameters
+    convergence_frames: f32,  // Number of frames to converge (default: 8)
+    initial_weight: f32,      // Initial blend weight (default: 0.5)
+    final_weight: f32,        // Final blend weight (default: 0.1)
     // Padding for alignment
-    _padding: vec2<f32>,
+    _padding: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: TaaUniforms;
@@ -158,10 +162,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let clipped_history = ycocg_to_rgb(clipped_ycocg);
 
     // Compute blend weight based on accumulated frames
-    // Start with high current weight (0.5), reduce as more frames accumulate
-    // After 8 frames, settle at 0.1 (10% current, 90% history)
-    let accumulation_factor = min(f32(uniforms.frames_accumulated), 8.0) / 8.0;
-    let blend_weight = mix(0.5, 0.1, accumulation_factor);
+    // Start with initial_weight, reduce to final_weight as frames accumulate
+    // Uses configurable convergence_frames for tunable fade-in timing
+    let accumulation_factor = min(f32(uniforms.frames_accumulated), uniforms.convergence_frames) / uniforms.convergence_frames;
+    let blend_weight = mix(uniforms.initial_weight, uniforms.final_weight, accumulation_factor);
 
     // Blend current and clipped history (both RGB and alpha)
     // Alpha also jitters at edges, so must be accumulated for stable output
