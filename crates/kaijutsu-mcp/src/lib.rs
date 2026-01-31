@@ -27,9 +27,11 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+use std::sync::{Arc, Mutex};
+
 use kaijutsu_client::{SshConfig, connect_ssh};
-use kaijutsu_crdt::ConversationDAG;
-use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store};
+use kaijutsu_crdt::{ConversationDAG, LV};
+use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
 pub use models::*;
@@ -54,16 +56,23 @@ pub enum Backend {
 
 /// Remote backend state - cached from initial connection.
 ///
-/// Note: Cap'n Proto RPC types are !Send, so we sync state at connection
-/// and store it locally. The RpcClient/KernelHandle stay in the LocalSet.
+/// Note: Cap'n Proto RPC types are !Send, which conflicts with rmcp's
+/// Send+Sync requirement. We store connection info and reconnect when
+/// pushing ops to the server.
 #[derive(Clone)]
 pub struct RemoteState {
     /// The document ID from our seat
     pub document_id: String,
     /// Kernel ID we connected to
     pub kernel_id: String,
-    /// Local cache of synced state
+    /// Local cache of synced state (with FlowBus for local event tracking)
     pub store: SharedBlockStore,
+    /// Connection info for reconnecting
+    pub host: String,
+    pub port: u16,
+    /// Server's frontier at last sync (used to calculate ops to push)
+    /// Protected by Arc<Mutex<>> for thread-safe updates
+    pub last_sync_frontier: Arc<Mutex<Vec<LV>>>,
 }
 
 // ============================================================================
@@ -108,9 +117,9 @@ impl KaijutsuMcp {
     ///
     /// Uses ssh-agent for authentication. Must be called within a `LocalSet`.
     ///
-    /// Syncs initial state from the server into a local cache, then returns
-    /// a KaijutsuMcp that operates on that cache. The RPC connection is closed
-    /// after initial sync (phase 1 - read-only sync).
+    /// Syncs initial state from the server into a local cache. The connection
+    /// is closed after sync due to rmcp's Send+Sync requirements conflicting
+    /// with Cap'n Proto's !Send types. Push operations reconnect as needed.
     pub async fn connect(
         host: &str,
         port: u16,
@@ -135,8 +144,13 @@ impl KaijutsuMcp {
             "Connected to server"
         );
 
-        // Sync document state into local store
-        let store = shared_block_store("mcp-remote");
+        // Create store with FlowBus for local event tracking
+        let block_flows = shared_block_flow_bus(1024);
+        let store = std::sync::Arc::new(
+            kaijutsu_kernel::BlockStore::with_flows("mcp-remote", block_flows.clone())
+        );
+
+        // Sync document state from server
         let doc_state = kernel.get_document_state(&seat.document_id).await?;
 
         // Create the document from the server's oplog
@@ -162,8 +176,19 @@ impl KaijutsuMcp {
             ).map_err(|e| anyhow::anyhow!(e))?;
         }
 
-        // Detach cleanly (the kernel handle drops, but we do it explicitly)
-        // Note: In phase 2, we'd keep the connection for writes
+        // Get the local frontier after syncing (this represents what we received from server)
+        let frontier = store.frontier(&doc_state.document_id)
+            .unwrap_or_default();
+
+        tracing::debug!(
+            doc = %doc_state.document_id,
+            frontier = ?frontier,
+            "Initial sync complete, recorded frontier"
+        );
+
+        // Detach cleanly - we'll reconnect for push operations
+        // Note: Real-time subscription requires a different architecture
+        // that can maintain a persistent connection outside the MCP handler
         kernel.detach().await?;
 
         Ok(Self {
@@ -171,6 +196,9 @@ impl KaijutsuMcp {
                 document_id: seat.document_id,
                 kernel_id: kernel_id.to_string(),
                 store,
+                host: host.to_string(),
+                port,
+                last_sync_frontier: Arc::new(Mutex::new(frontier)),
             }),
             tool_router: Self::tool_router(),
         })
@@ -182,6 +210,81 @@ impl KaijutsuMcp {
             Backend::Local(store) => store,
             Backend::Remote(remote) => &remote.store,
         }
+    }
+
+    /// Get the remote state if connected to a server.
+    fn remote(&self) -> Option<&RemoteState> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::Remote(remote) => Some(remote),
+        }
+    }
+
+    /// Push local changes to the server (async, requires LocalSet context).
+    ///
+    /// Returns the number of ops pushed and the new ack version.
+    pub async fn push_to_server(&self) -> Result<(usize, u64), anyhow::Error> {
+        let remote = self.remote()
+            .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
+
+        // Get ops since last sync
+        let frontier = remote.last_sync_frontier.lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+            .clone();
+
+        let ops = remote.store.ops_since(&remote.document_id, &frontier)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        // Serialize ops for transmission
+        let ops_bytes = serde_json::to_vec(&ops)
+            .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
+
+        if ops_bytes.len() <= 2 {
+            // Empty ops (just "[]" or "{}")
+            tracing::debug!("No ops to push");
+            return Ok((0, 0));
+        }
+
+        tracing::debug!(
+            doc = %remote.document_id,
+            ops_bytes = ops_bytes.len(),
+            "Pushing ops to server"
+        );
+
+        // Reconnect to server
+        let config = SshConfig {
+            host: remote.host.clone(),
+            port: remote.port,
+            username: whoami::username(),
+            ..SshConfig::default()
+        };
+
+        let client = connect_ssh(config).await?;
+        let kernel = client.attach_kernel(&remote.kernel_id).await?;
+
+        // Push ops
+        let ack_version = kernel.push_ops(&remote.document_id, &ops_bytes).await?;
+
+        // Update last sync frontier to current local frontier
+        let new_frontier = remote.store.frontier(&remote.document_id)
+            .unwrap_or_default();
+
+        *remote.last_sync_frontier.lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))? = new_frontier;
+
+        // Detach
+        kernel.detach().await?;
+
+        tracing::info!(
+            doc = %remote.document_id,
+            ack_version,
+            "Pushed ops successfully"
+        );
+
+        // Estimate ops count (rough, based on serialized size)
+        let ops_count = ops_bytes.len() / 50; // Rough estimate
+
+        Ok((ops_count.max(1), ack_version))
     }
 }
 

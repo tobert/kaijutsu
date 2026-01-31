@@ -54,6 +54,6 @@ pub use vfs::{
 };
 pub use mcp_pool::{McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo};
 pub use flows::{
-    BlockFlow, FlowBus, FlowMessage, HasSubject, SharedBlockFlowBus, Subscription,
+    BlockFlow, FlowBus, FlowMessage, HasSubject, OpSource, SharedBlockFlowBus, Subscription,
     matches_pattern, shared_block_flow_bus,
 };
