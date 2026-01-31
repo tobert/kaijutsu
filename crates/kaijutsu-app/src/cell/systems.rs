@@ -495,10 +495,16 @@ pub fn compute_cell_heights(
 /// Layout the prompt cell at the bottom of the window.
 /// Uses full window width minus margins for a wide input area.
 pub fn layout_prompt_cell_position(
-    mut cells: Query<(&CellState, &mut MsdfTextAreaConfig), With<PromptCell>>,
+    mut cells: Query<(&CellState, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), With<PromptCell>>,
     pos: Res<InputPosition>,
     layout: Res<WorkspaceLayout>,
+    font_system: Res<SharedFontSystem>,
+    mut metrics_cache: ResMut<FontMetricsCache>,
 ) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
     // Use InputPosition for positioning (computed from presence/dock/window)
     // Add padding inside the frame for the text
     let padding = 20.0;
@@ -506,8 +512,12 @@ pub fn layout_prompt_cell_position(
     let text_top = pos.y + padding * 0.5;
     let text_width = pos.width - (padding * 2.0);
 
-    for (state, mut config) in cells.iter_mut() {
+    for (state, mut buffer, mut config) in cells.iter_mut() {
         let height = state.computed_height.max(layout.prompt_min_height);
+
+        // Shape the text and generate glyphs - this is the critical step!
+        // Without this call, buffer.glyphs() returns empty and no text renders.
+        buffer.visual_line_count(&mut font_system, text_width, Some(&mut metrics_cache));
 
         config.left = text_left;
         config.top = text_top;
