@@ -485,7 +485,7 @@ fn debug_manage_hud(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
-            ZIndex(100), // On top of other UI
+            ZIndex(crate::constants::ZLayer::HUD),
         ));
         info!("📊 Debug HUD spawned");
     } else if !should_show && hud_exists {

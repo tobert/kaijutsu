@@ -228,6 +228,50 @@ pub struct Theme {
     pub font_glow_color: Color,
     /// Enable rainbow color cycling effect.
     pub font_rainbow: bool,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Constellation Configuration
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Base radius for circular node layout (pixels)
+    pub constellation_layout_radius: f32,
+    /// Node orb size when idle (pixels)
+    pub constellation_node_size: f32,
+    /// Node orb size when focused (pixels)
+    pub constellation_node_size_focused: f32,
+    /// Node glow color for idle state
+    pub constellation_node_glow_idle: Color,
+    /// Node glow color for active state
+    pub constellation_node_glow_active: Color,
+    /// Node glow color for streaming state
+    pub constellation_node_glow_streaming: Color,
+    /// Node glow color for error state
+    pub constellation_node_glow_error: Color,
+    /// Connection line glow intensity (0.0-1.0)
+    pub constellation_connection_glow: f32,
+    /// Connection line color
+    pub constellation_connection_color: Color,
+    /// Max particles per context for streaming effects
+    pub constellation_particle_budget: u32,
+    /// Animation speed for orbital mode (radians/sec)
+    pub constellation_orbital_speed: f32,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HUD Configuration
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Panel background color for HUD widgets
+    pub hud_panel_bg: Color,
+    /// Panel border/glow color
+    pub hud_panel_glow: Color,
+    /// Panel glow intensity (0.0-1.0)
+    pub hud_panel_glow_intensity: f32,
+    /// Orbital HUD curve radius (for curved edge style)
+    pub hud_orbital_curve_radius: f32,
+    /// Text color for HUD content
+    pub hud_text_color: Color,
+    /// Font size for HUD text
+    pub hud_font_size: f32,
 }
 
 impl Default for Theme {
@@ -337,6 +381,27 @@ impl Default for Theme {
             font_glow_spread: 2.0,
             font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
             font_rainbow: false,
+
+            // Constellation defaults - bioluminescent aesthetic
+            constellation_layout_radius: 200.0,
+            constellation_node_size: 48.0,
+            constellation_node_size_focused: 64.0,
+            constellation_node_glow_idle: Color::srgba(0.3, 0.4, 0.5, 0.3),
+            constellation_node_glow_active: Color::srgba(0.34, 0.65, 1.0, 0.7),    // Cyan
+            constellation_node_glow_streaming: Color::srgba(0.4, 0.8, 0.4, 0.8),   // Green
+            constellation_node_glow_error: Color::srgba(0.97, 0.38, 0.45, 0.8),    // Red
+            constellation_connection_glow: 0.4,
+            constellation_connection_color: Color::srgba(0.49, 0.85, 0.82, 0.5),   // Cyan
+            constellation_particle_budget: 500,
+            constellation_orbital_speed: 0.1,
+
+            // HUD defaults - glowing panel aesthetic
+            hud_panel_bg: Color::srgba(0.05, 0.07, 0.09, 0.85),
+            hud_panel_glow: Color::srgba(0.49, 0.85, 0.82, 0.5),  // Cyan glow
+            hud_panel_glow_intensity: 0.4,
+            hud_orbital_curve_radius: 20.0,
+            hud_text_color: Color::srgb(0.7, 0.72, 0.78),
+            hud_font_size: 11.0,
         }
     }
 }

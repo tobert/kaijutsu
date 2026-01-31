@@ -371,6 +371,65 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.font_rainbow = v;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Constellation configuration
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(v) = get_float(&scope, "constellation_layout_radius") {
+        theme.constellation_layout_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "constellation_node_size") {
+        theme.constellation_node_size = v;
+    }
+    if let Some(v) = get_float(&scope, "constellation_node_size_focused") {
+        theme.constellation_node_size_focused = v;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_idle") {
+        theme.constellation_node_glow_idle = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_active") {
+        theme.constellation_node_glow_active = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_streaming") {
+        theme.constellation_node_glow_streaming = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_error") {
+        theme.constellation_node_glow_error = c;
+    }
+    if let Some(v) = get_float(&scope, "constellation_connection_glow") {
+        theme.constellation_connection_glow = v;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "constellation_connection_color") {
+        theme.constellation_connection_color = c;
+    }
+    if let Some(v) = get_int(&scope, "constellation_particle_budget") {
+        theme.constellation_particle_budget = v;
+    }
+    if let Some(v) = get_float(&scope, "constellation_orbital_speed") {
+        theme.constellation_orbital_speed = v;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HUD configuration
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(c) = get_color_with_alpha(&scope, "hud_panel_bg") {
+        theme.hud_panel_bg = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "hud_panel_glow") {
+        theme.hud_panel_glow = c;
+    }
+    if let Some(v) = get_float(&scope, "hud_panel_glow_intensity") {
+        theme.hud_panel_glow_intensity = v;
+    }
+    if let Some(v) = get_float(&scope, "hud_orbital_curve_radius") {
+        theme.hud_orbital_curve_radius = v;
+    }
+    if let Some(c) = get_color(&scope, "hud_text_color") {
+        theme.hud_text_color = c;
+    }
+    if let Some(v) = get_float(&scope, "hud_font_size") {
+        theme.hud_font_size = v;
+    }
+
     Ok(theme)
 }
 
@@ -415,6 +474,11 @@ fn get_vec4(scope: &Scope, name: &str) -> Option<Vec4> {
 /// Extract a float from scope.
 fn get_float(scope: &Scope, name: &str) -> Option<f32> {
     scope.get_value::<f64>(name).map(|v| v as f32)
+}
+
+/// Extract an integer from scope (as u32).
+fn get_int(scope: &Scope, name: &str) -> Option<u32> {
+    scope.get_value::<i64>(name).map(|v| v as u32)
 }
 
 /// Extract a bool from scope.

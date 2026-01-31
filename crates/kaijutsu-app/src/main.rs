@@ -88,6 +88,10 @@ fn main() {
         .add_plugins(dashboard::DashboardPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
+        // Constellation - context navigation as visual node graph
+        .add_plugins(ui::constellation::ConstellationPlugin)
+        // HUD system - configurable overlay panels
+        .add_plugins(ui::hud::HudPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
         // Startup
@@ -240,7 +244,7 @@ fn setup_ui(
                     flex_direction: FlexDirection::Column,
                     ..default()
                 },
-                ZIndex(10),
+                ZIndex(constants::ZLayer::CONTENT),
             ))
             .with_children(|content| {
                 // ───────────────────────────────────────────────────────────
@@ -374,7 +378,7 @@ fn setup_input_layer(
             // No layout - children use absolute positioning
             ..default()
         },
-        ZIndex(100),
+        ZIndex(constants::ZLayer::MODAL),
         // Start hidden - visibility controlled by InputPresence
         Visibility::Hidden,
     ))

@@ -128,7 +128,7 @@ pub fn spawn_seat_dropdown(commands: &mut Commands, theme: &Theme) -> Entity {
             },
             BorderColor::all(theme.border),
             BackgroundColor(theme.panel_bg),
-            ZIndex(200), // Above everything
+            ZIndex(crate::constants::ZLayer::DROPDOWN),
             Visibility::Hidden, // Also hide for glyphon text rendering
         ))
         .with_children(|dropdown| {

@@ -748,7 +748,7 @@ pub fn spawn_cursor(
             },
             BackgroundColor(Color::NONE),  // Explicit transparent - let shader handle all rendering
             MaterialNode(material),
-            ZIndex(20), // Above text, below modals
+            ZIndex(crate::constants::ZLayer::CURSOR),
             Visibility::Hidden, // Start hidden until we have a focused cell
         ))
         .id();
