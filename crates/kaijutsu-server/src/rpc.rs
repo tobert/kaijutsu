@@ -2130,6 +2130,263 @@ impl kernel::Server for KernelImpl {
             Ok(())
         })
     }
+
+    // =========================================================================
+    // Git Repository Management
+    // =========================================================================
+
+    fn register_repo(
+        self: Rc<Self>,
+        params: kernel::RegisterRepoParams,
+        mut results: kernel::RegisterRepoResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let name = pry!(pry!(params_reader.get_name()).to_str()).to_owned();
+        let path = pry!(pry!(params_reader.get_path()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            match kaish.register_repo(&name, &path) {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn unregister_repo(
+        self: Rc<Self>,
+        params: kernel::UnregisterRepoParams,
+        mut results: kernel::UnregisterRepoResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let name = pry!(pry!(params_reader.get_name()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            match kaish.unregister_repo(&name) {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn list_repos(
+        self: Rc<Self>,
+        _params: kernel::ListReposParams,
+        mut results: kernel::ListReposResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let repos = kaish.list_repos();
+            let mut repos_builder = results.get().init_repos(repos.len() as u32);
+            for (i, repo) in repos.iter().enumerate() {
+                repos_builder.set(i as u32, repo);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn switch_branch(
+        self: Rc<Self>,
+        params: kernel::SwitchBranchParams,
+        mut results: kernel::SwitchBranchResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let repo = pry!(pry!(params_reader.get_repo()).to_str()).to_owned();
+        let branch = pry!(pry!(params_reader.get_branch()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            match kaish.switch_branch(&repo, &branch).await {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn list_branches(
+        self: Rc<Self>,
+        params: kernel::ListBranchesParams,
+        mut results: kernel::ListBranchesResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let repo = pry!(pry!(params_reader.get_repo()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            match kaish.list_branches(&repo) {
+                Ok(branches) => {
+                    let mut branches_builder = results.get().init_branches(branches.len() as u32);
+                    for (i, branch) in branches.iter().enumerate() {
+                        branches_builder.set(i as u32, branch);
+                    }
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().init_branches(0);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_current_branch(
+        self: Rc<Self>,
+        params: kernel::GetCurrentBranchParams,
+        mut results: kernel::GetCurrentBranchResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let repo = pry!(pry!(params_reader.get_repo()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let branch = kaish.get_current_branch(&repo).unwrap_or_default();
+            results.get().set_branch(&branch);
+            Ok(())
+        })
+    }
+
+    fn flush_git(
+        self: Rc<Self>,
+        _params: kernel::FlushGitParams,
+        mut results: kernel::FlushGitResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            match kaish.flush_git().await {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn set_attribution(
+        self: Rc<Self>,
+        params: kernel::SetAttributionParams,
+        _results: kernel::SetAttributionResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let source = pry!(pry!(params_reader.get_source()).to_str()).to_owned();
+        let command = pry!(pry!(params_reader.get_command()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+            };
+
+            if let Some(kaish) = kaish {
+                let cmd = if command.is_empty() { None } else { Some(command.as_str()) };
+                kaish.set_pending_attribution(&source, cmd);
+            }
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================

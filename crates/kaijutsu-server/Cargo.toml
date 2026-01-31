@@ -30,6 +30,11 @@ uuid = { version = "1.0", features = ["v4"] }
 dirs = "5"
 serde_json = "1"
 parking_lot = "0.12"
+dashmap = "6"
+tracing = "0.1"
+
+# File watching for external tool changes (cargo, clippy, etc.)
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 
 # No separate russh-keys needed - russh 0.56 includes keys module
 

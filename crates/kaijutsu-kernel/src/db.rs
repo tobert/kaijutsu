@@ -33,6 +33,8 @@ pub enum DocumentKind {
     Code,
     /// Static markdown/text
     Text,
+    /// Git-backed document (repo:branch → 1 doc, file → 1 block)
+    Git,
 }
 
 impl DocumentKind {
@@ -41,6 +43,7 @@ impl DocumentKind {
             DocumentKind::Conversation => "conversation",
             DocumentKind::Code => "code",
             DocumentKind::Text => "text",
+            DocumentKind::Git => "git",
         }
     }
 
@@ -49,6 +52,7 @@ impl DocumentKind {
             "conversation" => Some(DocumentKind::Conversation),
             "code" => Some(DocumentKind::Code),
             "text" => Some(DocumentKind::Text),
+            "git" => Some(DocumentKind::Git),
             // Legacy mappings for DB compatibility
             "markdown" => Some(DocumentKind::Text),
             "output" | "system" | "user_message" | "agent_message" => Some(DocumentKind::Conversation),

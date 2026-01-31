@@ -296,6 +296,16 @@ interface Kernel {
   readBlob @34 (id :Text) -> (data :Data);
   deleteBlob @35 (id :Text) -> (success :Bool);
   listBlobs @36 () -> (refs :List(BlobRef));
+
+  # Git repository management (CRDT-backed worktrees)
+  registerRepo @37 (name :Text, path :Text) -> (success :Bool, error :Text);
+  unregisterRepo @38 (name :Text) -> (success :Bool, error :Text);
+  listRepos @39 () -> (repos :List(Text));
+  switchBranch @40 (repo :Text, branch :Text) -> (success :Bool, error :Text);
+  listBranches @41 (repo :Text) -> (branches :List(Text), error :Text);
+  getCurrentBranch @42 (repo :Text) -> (branch :Text);
+  flushGit @43 () -> (success :Bool, error :Text);
+  setAttribution @44 (source :Text, command :Text);
 }
 
 # ============================================================================
