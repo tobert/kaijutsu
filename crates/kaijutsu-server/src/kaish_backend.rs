@@ -507,6 +507,42 @@ impl KernelBackend for KaijutsuBackend {
         }
     }
 
+    async fn rename(&self, from: &Path, to: &Path) -> BackendResult<()> {
+        // For blocks: rename is conceptually a copy + delete
+        // For now, return InvalidOperation since block IDs are immutable
+        match (self.resolve_path(from), self.resolve_path(to)) {
+            (PathResolution::Block(from_doc, _from_id), PathResolution::Block(to_doc, _to_id))
+                if from_doc == to_doc =>
+            {
+                // Same document: could implement as copy content + delete old block
+                Err(BackendError::InvalidOperation(
+                    "block rename not supported - use block_create + block_delete".into(),
+                ))
+            }
+            _ => Err(BackendError::InvalidOperation(
+                "rename only supported within same document".into(),
+            )),
+        }
+    }
+
+    async fn read_link(&self, _path: &Path) -> BackendResult<std::path::PathBuf> {
+        // CRDT blocks don't have symlinks
+        Err(BackendError::InvalidOperation(
+            "symlinks not supported in CRDT blocks".into(),
+        ))
+    }
+
+    async fn symlink(&self, _target: &Path, _link: &Path) -> BackendResult<()> {
+        Err(BackendError::InvalidOperation(
+            "symlinks not supported in CRDT blocks".into(),
+        ))
+    }
+
+    fn resolve_real_path(&self, _path: &Path) -> Option<std::path::PathBuf> {
+        // CRDT blocks have no filesystem path
+        None
+    }
+
     // =========================================================================
     // Tool Dispatch
     // =========================================================================
@@ -793,6 +829,15 @@ fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::Null => JsonValue::Null,
+        // Pass through Json values directly
+        Value::Json(json) => json.clone(),
+        // Serialize Blob references as JSON object
+        Value::Blob(blob_ref) => serde_json::json!({
+            "_type": "blob",
+            "id": blob_ref.id,
+            "size": blob_ref.size,
+            "content_type": blob_ref.content_type,
+        }),
     }
 }
 

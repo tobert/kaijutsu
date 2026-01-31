@@ -29,14 +29,13 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use kaish_kernel::interpreter::{DisplayHint as KaishDisplayHint, EntryType as KaishEntryType, ExecResult};
-use kaish_kernel::{Kernel as KaishKernel, KernelConfig as KaishConfig};
+use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 
-// TODO: Re-enable once path routing is fixed
-// use crate::kaish_backend::KaijutsuBackend;
+use crate::kaish_backend::KaijutsuBackend;
 
 /// Embedded kaish executor backed by CRDT blocks.
 ///
@@ -68,32 +67,26 @@ impl EmbeddedKaish {
     /// ```
     pub fn new(
         name: &str,
-        _blocks: SharedBlockStore,
-        _kernel: Arc<KaijutsuKernel>,
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
     ) -> Result<Self> {
-        // TODO: Re-enable KaijutsuBackend for CRDT block integration once path routing is fixed
-        // For now, use a standard kaish kernel with local filesystem access
-        // let backend: Arc<dyn KernelBackend> = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        // Create the CRDT-backed backend for file operations
+        let backend: Arc<dyn KernelBackend> = Arc::new(KaijutsuBackend::new(blocks, kernel));
 
-        // Configure kaish kernel
-        // TODO: local_root should come from kernel config / mounts, not hardcoded
-        // Mounts: /mnt/local -> $HOME/src, /tmp -> MemoryFs (built into kaish)
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let src_dir = std::path::PathBuf::from(&home).join("src");
+        // Configure kaish kernel to start in /docs namespace
         let config = KaishConfig {
             name: name.to_string(),
-            persist: false, // kaijutsu handles persistence
-            mount_local: true,
-            local_root: Some(src_dir),
-            cwd: std::path::PathBuf::from("/mnt/local"),
-            skip_validation: false, // run pre-execution validator
+            mount_local: false, // Don't mount local fs - use backend
+            local_root: None,
+            cwd: std::path::PathBuf::from("/docs"),
+            skip_validation: false,
         };
 
-        // Create standard kaish kernel (mounts local fs at /mnt/local)
-        let kernel = KaishKernel::new(config)?;
+        // Create kaish kernel with our CRDT backend
+        let kaish_kernel = KaishKernel::with_backend(backend, config)?;
 
         Ok(Self {
-            kernel,
+            kernel: kaish_kernel,
             name: name.to_string(),
         })
     }

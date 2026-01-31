@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use kaish_kernel::lexer::Token;
+use kaish_kernel::lexer::{Token, TokenCategory};
 use kaish_kernel::parser;
 
 /// Result of validating a kaish command.
@@ -146,61 +146,22 @@ pub fn tokenize(input: &str) -> Vec<SpannedToken> {
 }
 
 /// Classify a token for syntax highlighting.
+///
+/// Uses kaish's `TokenCategory` for stable classification that doesn't break
+/// when new tokens are added to the lexer.
 fn classify_token(token: &Token) -> TokenKind {
-    match token {
-        // Keywords
-        Token::If | Token::Then | Token::Else | Token::Elif | Token::Fi
-        | Token::For | Token::In | Token::Do | Token::Done
-        | Token::While | Token::Case | Token::Esac
-        | Token::Function | Token::Return | Token::Break | Token::Continue | Token::Exit
-        | Token::Set | Token::Local
-        | Token::True | Token::False => TokenKind::Keyword,
-
-        // Type keywords
-        Token::TypeString | Token::TypeInt | Token::TypeFloat | Token::TypeBool => TokenKind::Keyword,
-
-        // Strings
-        Token::String(_) | Token::SingleString(_) | Token::HereDoc(_) => TokenKind::String,
-
-        // Numbers
-        Token::Int(_) | Token::Float(_) => TokenKind::Number,
-
-        // Variables
-        Token::VarRef(_) | Token::SimpleVarRef(_) | Token::Positional(_)
-        | Token::AllArgs | Token::ArgCount | Token::VarLength(_) => TokenKind::Variable,
-
-        // Flags
-        Token::LongFlag(_) | Token::ShortFlag(_) | Token::PlusFlag(_) | Token::DoubleDash => TokenKind::Flag,
-
-        // Operators
-        Token::Pipe | Token::And | Token::Or | Token::Amp
-        | Token::Eq | Token::EqEq | Token::NotEq | Token::Match | Token::NotMatch
-        | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq
-        | Token::GtGt | Token::Stderr | Token::Both | Token::HereDocStart => TokenKind::Operator,
-
-        // Punctuation
-        Token::Semi | Token::DoubleSemi | Token::Colon | Token::Comma | Token::Dot
-        | Token::LParen | Token::RParen
-        | Token::LBrace | Token::RBrace
-        | Token::LBracket | Token::RBracket
-        | Token::Bang | Token::Question | Token::Star => TokenKind::Punctuation,
-
-        // Comments and newlines
-        Token::Comment => TokenKind::Comment,
-        Token::Newline | Token::LineContinuation => TokenKind::Punctuation,
-
-        // Paths
-        Token::Path(_) => TokenKind::Path,
-
-        // Command substitution
-        Token::CmdSubstStart => TokenKind::Operator,
-        Token::Arithmetic(_) => TokenKind::Number,
-
-        // Commands/identifiers
-        Token::Ident(_) => TokenKind::Command,
-
-        // Invalid tokens
-        Token::InvalidNumberIdent | Token::InvalidFloatNoLeading | Token::InvalidFloatNoTrailing => TokenKind::Error,
+    match token.category() {
+        TokenCategory::Keyword => TokenKind::Keyword,
+        TokenCategory::Operator => TokenKind::Operator,
+        TokenCategory::String => TokenKind::String,
+        TokenCategory::Number => TokenKind::Number,
+        TokenCategory::Variable => TokenKind::Variable,
+        TokenCategory::Flag => TokenKind::Flag,
+        TokenCategory::Punctuation => TokenKind::Punctuation,
+        TokenCategory::Comment => TokenKind::Comment,
+        TokenCategory::Path => TokenKind::Path,
+        TokenCategory::Command => TokenKind::Command,
+        TokenCategory::Error => TokenKind::Error,
     }
 }
 

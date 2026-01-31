@@ -15,7 +15,7 @@ use crate::constants::{KAISH_SHUTDOWN_WAIT, KAISH_SOCKET_RETRY_INTERVAL, KAISH_S
 
 use kaish_client::{ClientError, IpcClient, KernelClient};
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::state::paths::runtime_dir;
+use kaish_kernel::paths::runtime_dir;
 
 /// A kaish kernel running as a subprocess.
 ///
