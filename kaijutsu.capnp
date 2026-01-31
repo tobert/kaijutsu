@@ -98,6 +98,13 @@ struct ShellExecResult {
   hint @5 :Text;            # JSON-encoded DisplayHint for tables/trees
 }
 
+# Reference to binary data in blob storage (/v/blobs/{id})
+struct BlobRef {
+  id @0 :Text;              # Unique blob identifier
+  size @1 :UInt64;          # Size in bytes
+  contentType @2 :Text;     # MIME type (e.g., "image/png")
+}
+
 # ============================================================================
 # Seat & Context Types
 # ============================================================================
@@ -282,6 +289,13 @@ interface Kernel {
   getCwd @30 () -> (path :Text);
   setCwd @31 (path :Text) -> (success :Bool, error :Text);
   getLastResult @32 () -> (result :ShellExecResult);
+
+  # Blob storage (in-memory, size-capped)
+  # Blobs are stored at /v/blobs/{id} in kaish's VFS
+  writeBlob @33 (data :Data, contentType :Text) -> (ref :BlobRef);
+  readBlob @34 (id :Text) -> (data :Data);
+  deleteBlob @35 (id :Text) -> (success :Bool);
+  listBlobs @36 () -> (refs :List(BlobRef));
 }
 
 # ============================================================================

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use kaish_kernel::interpreter::{DisplayHint as KaishDisplayHint, EntryType as KaishEntryType, ExecResult};
+use kaish_kernel::vfs::Filesystem;
 use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
 use kaijutsu_kernel::block_store::SharedBlockStore;
@@ -141,6 +142,87 @@ impl EmbeddedKaish {
     pub async fn last_result(&self) -> Option<ExecResult> {
         Some(self.kernel.last_result().await)
     }
+
+    // =========================================================================
+    // Blob Storage (via kaish VFS at /v/blobs/)
+    // =========================================================================
+
+    /// Write a blob and return its reference.
+    pub async fn write_blob(&self, data: &[u8], content_type: &str) -> Result<BlobInfo> {
+        let vfs = self.kernel.vfs();
+        let id = generate_blob_id();
+        let path = std::path::PathBuf::from(format!("/v/blobs/{}", id));
+
+        vfs.write(&path, data).await
+            .map_err(|e| anyhow::anyhow!("failed to write blob: {}", e))?;
+
+        Ok(BlobInfo {
+            id,
+            size: data.len() as u64,
+            content_type: content_type.to_string(),
+        })
+    }
+
+    /// Read a blob by ID.
+    pub async fn read_blob(&self, id: &str) -> Result<Vec<u8>> {
+        let vfs = self.kernel.vfs();
+        let path = std::path::PathBuf::from(format!("/v/blobs/{}", id));
+
+        vfs.read(&path).await
+            .map_err(|e| anyhow::anyhow!("failed to read blob {}: {}", id, e))
+    }
+
+    /// Delete a blob by ID.
+    pub async fn delete_blob(&self, id: &str) -> Result<bool> {
+        let vfs = self.kernel.vfs();
+        let path = std::path::PathBuf::from(format!("/v/blobs/{}", id));
+
+        match vfs.remove(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::anyhow!("failed to delete blob {}: {}", id, e)),
+        }
+    }
+
+    /// List all blobs.
+    pub async fn list_blobs(&self) -> Result<Vec<BlobInfo>> {
+        let vfs = self.kernel.vfs();
+        let path = std::path::PathBuf::from("/v/blobs");
+
+        let entries = vfs.list(&path).await
+            .map_err(|e| anyhow::anyhow!("failed to list blobs: {}", e))?;
+
+        let mut blobs = Vec::new();
+        for entry in entries {
+            let blob_path = path.join(&entry.name);
+            if let Ok(meta) = vfs.stat(&blob_path).await {
+                blobs.push(BlobInfo {
+                    id: entry.name,
+                    size: meta.size,
+                    content_type: "application/octet-stream".to_string(), // TODO: store metadata
+                });
+            }
+        }
+        Ok(blobs)
+    }
+}
+
+/// Information about a stored blob.
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    pub id: String,
+    pub size: u64,
+    pub content_type: String,
+}
+
+/// Generate a unique blob ID.
+fn generate_blob_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}", timestamp)
 }
 
 // ============================================================================

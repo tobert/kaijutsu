@@ -1994,6 +1994,142 @@ impl kernel::Server for KernelImpl {
             Ok(())
         })
     }
+
+    // =========================================================================
+    // Blob Storage
+    // =========================================================================
+
+    fn write_blob(
+        self: Rc<Self>,
+        params: kernel::WriteBlobParams,
+        mut results: kernel::WriteBlobResults,
+    ) -> Promise<(), capnp::Error> {
+        // Extract and copy data before async block
+        let params_reader = pry!(params.get());
+        let data = pry!(params_reader.get_data()).to_vec();
+        let content_type = pry!(pry!(params_reader.get_content_type()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let blob_info = kaish.write_blob(&data, &content_type).await
+                .map_err(|e| capnp::Error::failed(format!("write_blob failed: {}", e)))?;
+
+            let mut ref_builder = results.get().init_ref();
+            ref_builder.set_id(&blob_info.id);
+            ref_builder.set_size(blob_info.size);
+            ref_builder.set_content_type(&blob_info.content_type);
+
+            Ok(())
+        })
+    }
+
+    fn read_blob(
+        self: Rc<Self>,
+        params: kernel::ReadBlobParams,
+        mut results: kernel::ReadBlobResults,
+    ) -> Promise<(), capnp::Error> {
+        let id = match params.get().and_then(|p| p.get_id()) {
+            Ok(id) => match id.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid id: {}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("missing id: {}", e))),
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let data = kaish.read_blob(&id).await
+                .map_err(|e| capnp::Error::failed(format!("read_blob failed: {}", e)))?;
+
+            results.get().set_data(&data);
+            Ok(())
+        })
+    }
+
+    fn delete_blob(
+        self: Rc<Self>,
+        params: kernel::DeleteBlobParams,
+        mut results: kernel::DeleteBlobResults,
+    ) -> Promise<(), capnp::Error> {
+        let id = match params.get().and_then(|p| p.get_id()) {
+            Ok(id) => match id.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid id: {}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("missing id: {}", e))),
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let success = kaish.delete_blob(&id).await
+                .map_err(|e| capnp::Error::failed(format!("delete_blob failed: {}", e)))?;
+
+            results.get().set_success(success);
+            Ok(())
+        })
+    }
+
+    fn list_blobs(
+        self: Rc<Self>,
+        _params: kernel::ListBlobsParams,
+        mut results: kernel::ListBlobsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let blobs = kaish.list_blobs().await
+                .map_err(|e| capnp::Error::failed(format!("list_blobs failed: {}", e)))?;
+
+            let mut refs_builder = results.get().init_refs(blobs.len() as u32);
+            for (i, blob) in blobs.iter().enumerate() {
+                let mut ref_builder = refs_builder.reborrow().get(i as u32);
+                ref_builder.set_id(&blob.id);
+                ref_builder.set_size(blob.size);
+                ref_builder.set_content_type(&blob.content_type);
+            }
+
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================
