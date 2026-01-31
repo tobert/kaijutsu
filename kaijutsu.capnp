@@ -306,6 +306,10 @@ interface Kernel {
   getCurrentBranch @42 (repo :Text) -> (branch :Text);
   flushGit @43 () -> (success :Bool, error :Text);
   setAttribution @44 (source :Text, command :Text);
+
+  # Push CRDT operations from client to server for bidirectional sync
+  # Returns ack version so client knows ops were accepted and ordered
+  pushOps @45 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
 }
 
 # ============================================================================

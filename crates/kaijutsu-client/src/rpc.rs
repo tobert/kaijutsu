@@ -324,6 +324,18 @@ impl KernelHandle {
     // NOTE: apply_block_op was removed - the unified CRDT model uses SerializedOps
     // for replication. See BlockDocument::ops_since() and apply_ops() in kaijutsu-crdt.
 
+    /// Push CRDT operations to the server for bidirectional sync.
+    ///
+    /// Returns the acknowledged version so the client knows ops were accepted.
+    /// The ops should be serialized using serde_json from SerializedOpsOwned.
+    pub async fn push_ops(&self, document_id: &str, ops: &[u8]) -> Result<u64, RpcError> {
+        let mut request = self.kernel.push_ops_request();
+        request.get().set_document_id(document_id);
+        request.get().set_ops(ops);
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_ack_version())
+    }
+
     /// Get document state (blocks and CRDT oplog)
     pub async fn get_document_state(
         &self,

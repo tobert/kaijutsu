@@ -1126,7 +1126,7 @@ impl kernel::Server for KernelImpl {
                 while let Some(msg) = sub.recv().await {
                     // Each branch sends its own request type; we convert the result to bool
                     let success = match msg.payload {
-                        BlockFlow::Inserted { ref document_id, ref block, ref after_id, ref ops } => {
+                        BlockFlow::Inserted { ref document_id, ref block, ref after_id, ref ops, .. } => {
                             let mut req = callback.on_block_inserted_request();
                             {
                                 let mut params = req.get();
@@ -1145,7 +1145,7 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Deleted { ref document_id, ref block_id } => {
+                        BlockFlow::Deleted { ref document_id, ref block_id, .. } => {
                             let mut req = callback.on_block_deleted_request();
                             {
                                 let mut params = req.get();
@@ -1157,7 +1157,7 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::StatusChanged { ref document_id, ref block_id, status } => {
+                        BlockFlow::StatusChanged { ref document_id, ref block_id, status, .. } => {
                             let mut req = callback.on_block_status_changed_request();
                             {
                                 let mut params = req.get();
@@ -1170,7 +1170,7 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::CollapsedChanged { ref document_id, ref block_id, collapsed } => {
+                        BlockFlow::CollapsedChanged { ref document_id, ref block_id, collapsed, .. } => {
                             let mut req = callback.on_block_collapsed_request();
                             {
                                 let mut params = req.get();
@@ -1183,7 +1183,7 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Moved { ref document_id, ref block_id, ref after_id } => {
+                        BlockFlow::Moved { ref document_id, ref block_id, ref after_id, .. } => {
                             let mut req = callback.on_block_moved_request();
                             {
                                 let mut params = req.get();
@@ -1202,7 +1202,7 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::TextOps { ref document_id, ref block_id, ref ops } => {
+                        BlockFlow::TextOps { ref document_id, ref block_id, ref ops, .. } => {
                             let mut req = callback.on_block_text_ops_request();
                             {
                                 let mut params = req.get();
@@ -2386,6 +2386,55 @@ impl kernel::Server for KernelImpl {
             }
             Ok(())
         })
+    }
+
+    fn push_ops(
+        self: Rc<Self>,
+        params: kernel::PushOpsParams,
+        mut results: kernel::PushOpsResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let ops_data = pry!(params_reader.get_ops()).to_vec();
+
+        log::debug!("push_ops called for document {} with {} bytes", document_id, ops_data.len());
+
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k,
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "kernel '{}' not found",
+                    self.kernel_id
+                )));
+            }
+        };
+
+        // Deserialize the CRDT ops
+        let serialized_ops: kaijutsu_crdt::SerializedOpsOwned = match serde_json::from_slice(&ops_data) {
+            Ok(ops) => ops,
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "failed to deserialize ops: {}",
+                    e
+                )));
+            }
+        };
+
+        // Merge the ops into the document
+        let ack_version = match kernel.documents.merge_ops_owned(&document_id, serialized_ops) {
+            Ok(version) => version,
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "failed to merge ops: {}",
+                    e
+                )));
+            }
+        };
+
+        log::debug!("push_ops merged successfully, new version: {}", ack_version);
+        results.get().set_ack_version(ack_version);
+        Promise::ok(())
     }
 }
 

@@ -22,7 +22,7 @@ use kaijutsu_crdt::{
 };
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
-use crate::flows::{BlockFlow, SharedBlockFlowBus};
+use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
 
 /// Thread-safe database handle.
 type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
@@ -412,6 +412,7 @@ impl BlockStore {
             block: snapshot,
             after_id,
             ops,
+            source: OpSource::Local,
         });
 
         Ok(block_id)
@@ -453,6 +454,7 @@ impl BlockStore {
             block: snapshot,
             after_id,
             ops,
+            source: OpSource::Local,
         });
 
         Ok(block_id)
@@ -495,6 +497,7 @@ impl BlockStore {
             block: snapshot,
             after_id,
             ops,
+            source: OpSource::Local,
         });
 
         Ok(block_id)
@@ -520,6 +523,7 @@ impl BlockStore {
             document_id: document_id.to_string(),
             block_id: block_id.clone(),
             status,
+            source: OpSource::Local,
         });
 
         Ok(())
@@ -555,6 +559,7 @@ impl BlockStore {
             document_id: document_id.to_string(),
             block_id: block_id.clone(),
             ops,
+            source: OpSource::Local,
         });
 
         Ok(())
@@ -601,6 +606,7 @@ impl BlockStore {
             document_id: document_id.to_string(),
             block_id: block_id.clone(),
             ops,
+            source: OpSource::Local,
         });
 
         Ok(())
@@ -621,6 +627,7 @@ impl BlockStore {
             document_id: document_id.to_string(),
             block_id: block_id.clone(),
             collapsed,
+            source: OpSource::Local,
         });
 
         Ok(())
@@ -640,6 +647,7 @@ impl BlockStore {
         self.emit(BlockFlow::Deleted {
             document_id: document_id.to_string(),
             block_id: block_id.clone(),
+            source: OpSource::Local,
         });
 
         Ok(())
@@ -659,6 +667,18 @@ impl BlockStore {
     pub fn merge_ops(&self, document_id: &str, ops: SerializedOps<'_>) -> Result<u64, String> {
         let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         entry.doc.merge_ops(ops).map_err(|e| e.to_string())?;
+        let version = entry.doc.version();
+        entry.version.store(version, Ordering::SeqCst);
+        Ok(version)
+    }
+
+    /// Merge remote operations into a document (owned variant).
+    ///
+    /// Use this when receiving serialized ops that have been deserialized
+    /// into the owned form (e.g., from network RPC via pushOps).
+    pub fn merge_ops_owned(&self, document_id: &str, ops: SerializedOpsOwned) -> Result<u64, String> {
+        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+        entry.doc.merge_ops_owned(ops).map_err(|e| e.to_string())?;
         let version = entry.doc.version();
         entry.version.store(version, Ordering::SeqCst);
         Ok(version)
