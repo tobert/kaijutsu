@@ -71,6 +71,8 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<ChasingBorderMaterial>::default(),
             // Text effects
             UiMaterialPlugin::<TextGlowMaterial>::default(),
+            // Constellation effects
+            UiMaterialPlugin::<ConnectionLineMaterial>::default(),
         ))
         // Register frame types for BRP reflection
         .register_type::<FramePiece>()
@@ -101,6 +103,7 @@ fn update_shader_time(
     mut error_materials: ResMut<Assets<ErrorFrameMaterial>>,
     mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
     mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
+    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -140,6 +143,11 @@ fn update_shader_time(
 
     // Text effects
     for (_, mat) in text_glow_materials.iter_mut() {
+        mat.time.x = t;
+    }
+
+    // Constellation effects
+    for (_, mat) in connection_materials.iter_mut() {
         mat.time.x = t;
     }
 }
@@ -499,6 +507,65 @@ impl TextGlowMaterial {
 impl UiMaterial for TextGlowMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/text_glow.wgsl".into()
+    }
+}
+
+// ============================================================================
+// CONNECTION LINE MATERIAL
+// ============================================================================
+
+/// Glowing line effect for constellation connections.
+///
+/// Renders a line between two points with animated glow, energy flow,
+/// and activity-based intensity. Used for connecting constellation nodes.
+///
+/// The shader corrects for aspect ratio to ensure circular (not elliptical) glow.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct ConnectionLineMaterial {
+    /// Line color (RGBA)
+    #[uniform(0)]
+    pub color: Vec4,
+    /// Parameters: x=glow_width, y=intensity, z=flow_speed, w=unused
+    #[uniform(1)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time, y=activity_level (0-1)
+    #[uniform(2)]
+    pub time: Vec4,
+    /// Endpoints: x0, y0, x1, y1 (normalized 0-1 relative to the material's node)
+    #[uniform(3)]
+    pub endpoints: Vec4,
+    /// Dimensions: x=width, y=height, z=aspect (w/h), w=falloff
+    /// Used to correct for non-square containers
+    #[uniform(4)]
+    pub dimensions: Vec4,
+}
+
+impl Default for ConnectionLineMaterial {
+    fn default() -> Self {
+        Self {
+            color: Vec4::new(0.34, 0.65, 1.0, 0.6), // Cyan
+            params: Vec4::new(0.08, 0.8, 0.5, 0.0), // glow_width, intensity, flow_speed, unused
+            time: Vec4::new(0.0, 0.5, 0.0, 0.0),    // time, activity
+            endpoints: Vec4::new(0.0, 0.5, 1.0, 0.5), // Horizontal line by default
+            dimensions: Vec4::new(100.0, 100.0, 1.0, 4.0), // width, height, aspect, falloff
+        }
+    }
+}
+
+impl ConnectionLineMaterial {
+    /// Create a connection line with specified dimensions for aspect ratio correction
+    pub fn with_dimensions(width: f32, height: f32) -> Self {
+        let aspect = width / height.max(1.0);
+        Self {
+            dimensions: Vec4::new(width, height, aspect, 4.0),
+            ..Default::default()
+        }
+    }
+}
+
+impl UiMaterial for ConnectionLineMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/connection_line.wgsl".into()
     }
 }
 

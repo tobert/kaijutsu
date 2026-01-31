@@ -9,9 +9,10 @@
 use bevy::prelude::*;
 
 use super::{
-    ActivityState, Constellation, ConstellationContainer, ConstellationMode, ConstellationNode,
+    ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
+    ConstellationMode, ConstellationNode, OrbitalAnimation,
 };
-use crate::shaders::PulseRingMaterial;
+use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
 use crate::ui::theme::{color_to_vec4, Theme};
 
 /// System set for constellation rendering
@@ -26,8 +27,11 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_constellation_container,
             sync_constellation_visibility,
             spawn_context_nodes,
+            spawn_connection_lines,
             update_node_visuals,
+            update_connection_visuals,
             despawn_removed_nodes,
+            despawn_removed_connections,
         )
             .chain()
             .in_set(ConstellationRendering),
@@ -211,6 +215,7 @@ fn spawn_context_nodes(
 /// Update visual properties of existing nodes based on state changes
 fn update_node_visuals(
     constellation: Res<Constellation>,
+    orbital: Res<OrbitalAnimation>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     mut nodes: Query<(
@@ -219,7 +224,9 @@ fn update_node_visuals(
         &MaterialNode<PulseRingMaterial>,
     )>,
 ) {
-    if !constellation.is_changed() {
+    // Update when constellation changes OR orbital animation is active and changed
+    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
+    if !needs_update {
         return;
     }
 
@@ -278,6 +285,206 @@ fn despawn_removed_nodes(
         if constellation.node_by_id(&marker.context_id).is_none() {
             commands.entity(entity).despawn();
             info!("Despawned constellation node: {}", marker.context_id);
+        }
+    }
+}
+
+/// Spawn connection lines between constellation nodes
+fn spawn_connection_lines(
+    mut commands: Commands,
+    constellation: Res<Constellation>,
+    theme: Res<Theme>,
+    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    container: Query<Entity, With<ConstellationContainer>>,
+    existing_connections: Query<&ConstellationConnection>,
+) {
+    let Ok(container_entity) = container.single() else {
+        return;
+    };
+
+    // Only spawn connections when we have 2+ nodes
+    if constellation.nodes.len() < 2 {
+        return;
+    }
+
+    // Build list of existing connections
+    let existing: Vec<(String, String)> = existing_connections
+        .iter()
+        .map(|c| (c.from.clone(), c.to.clone()))
+        .collect();
+
+    // Generate connections for adjacent nodes (circular layout)
+    let node_count = constellation.nodes.len();
+    for i in 0..node_count {
+        let next_i = (i + 1) % node_count;
+        let from_id = &constellation.nodes[i].context_id;
+        let to_id = &constellation.nodes[next_i].context_id;
+
+        // Skip if connection already exists
+        if existing.iter().any(|(f, t)| f == from_id && t == to_id) {
+            continue;
+        }
+
+        let from_node = &constellation.nodes[i];
+        let to_node = &constellation.nodes[next_i];
+
+        // Calculate bounding box for the connection line
+        let min_x = from_node.position.x.min(to_node.position.x);
+        let max_x = from_node.position.x.max(to_node.position.x);
+        let min_y = from_node.position.y.min(to_node.position.y);
+        let max_y = from_node.position.y.max(to_node.position.y);
+
+        // Add padding so the line isn't clipped
+        let padding = theme.constellation_node_size;
+        let width = (max_x - min_x).max(padding);
+        let height = (max_y - min_y).max(padding);
+
+        // Container center offset
+        let container_center =
+            theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
+
+        // Calculate endpoints relative to the connection's bounding box (0-1 UV space)
+        let rel_from_x = (from_node.position.x - min_x + padding / 2.0) / (width + padding);
+        let rel_from_y = (from_node.position.y - min_y + padding / 2.0) / (height + padding);
+        let rel_to_x = (to_node.position.x - min_x + padding / 2.0) / (width + padding);
+        let rel_to_y = (to_node.position.y - min_y + padding / 2.0) / (height + padding);
+
+        // Calculate activity level based on both nodes
+        let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
+
+        // Calculate aspect ratio for shader
+        let mat_width = width + padding;
+        let mat_height = height + padding;
+        let aspect = mat_width / mat_height.max(1.0);
+
+        // Create connection material with aspect ratio correction
+        let material = connection_materials.add(ConnectionLineMaterial {
+            color: color_to_vec4(theme.constellation_connection_color),
+            params: Vec4::new(
+                0.08,                              // glow_width
+                theme.constellation_connection_glow, // intensity
+                0.5,                               // flow_speed
+                0.0,                               // unused
+            ),
+            time: Vec4::new(0.0, activity, 0.0, 0.0),
+            endpoints: Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y),
+            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0), // width, height, aspect, falloff
+        });
+
+        // Spawn connection line entity
+        let connection_entity = commands
+            .spawn((
+                ConstellationConnection {
+                    from: from_id.clone(),
+                    to: to_id.clone(),
+                },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(container_center + min_x - padding / 2.0),
+                    top: Val::Px(container_center + min_y - padding / 2.0),
+                    width: Val::Px(width + padding),
+                    height: Val::Px(height + padding),
+                    ..default()
+                },
+                MaterialNode(material),
+                // Render behind nodes
+                ZIndex(-1),
+            ))
+            .id();
+
+        commands.entity(container_entity).add_child(connection_entity);
+
+        info!(
+            "Spawned connection line: {} -> {}",
+            from_id, to_id
+        );
+    }
+}
+
+/// Update connection line visuals based on node activity and positions
+fn update_connection_visuals(
+    constellation: Res<Constellation>,
+    orbital: Res<OrbitalAnimation>,
+    theme: Res<Theme>,
+    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut connections: Query<(
+        &ConstellationConnection,
+        &mut Node,
+        &MaterialNode<ConnectionLineMaterial>,
+    )>,
+) {
+    // Update when constellation changes OR orbital animation is active and changed
+    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
+    if !needs_update {
+        return;
+    }
+
+    let padding = theme.constellation_node_size;
+    let container_center =
+        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
+
+    for (marker, mut node_style, material_node) in connections.iter_mut() {
+        let from_node = constellation.node_by_id(&marker.from);
+        let to_node = constellation.node_by_id(&marker.to);
+
+        if let (Some(from), Some(to)) = (from_node, to_node) {
+            // Recalculate bounding box (positions may have changed in orbital mode)
+            let min_x = from.position.x.min(to.position.x);
+            let max_x = from.position.x.max(to.position.x);
+            let min_y = from.position.y.min(to.position.y);
+            let max_y = from.position.y.max(to.position.y);
+
+            let width = (max_x - min_x).max(padding);
+            let height = (max_y - min_y).max(padding);
+
+            // Update node position
+            node_style.left = Val::Px(container_center + min_x - padding / 2.0);
+            node_style.top = Val::Px(container_center + min_y - padding / 2.0);
+            node_style.width = Val::Px(width + padding);
+            node_style.height = Val::Px(height + padding);
+
+            if let Some(mat) = connection_materials.get_mut(material_node.0.id()) {
+                // Update activity level
+                let activity =
+                    (from.activity.glow_intensity() + to.activity.glow_intensity()) / 2.0;
+                mat.time.y = activity;
+
+                // Update color intensity based on activity
+                mat.params.y = theme.constellation_connection_glow * (0.5 + activity * 0.5);
+
+                // Update endpoint positions relative to bounding box
+                let mat_width = width + padding;
+                let mat_height = height + padding;
+                let rel_from_x = (from.position.x - min_x + padding / 2.0) / mat_width;
+                let rel_from_y = (from.position.y - min_y + padding / 2.0) / mat_height;
+                let rel_to_x = (to.position.x - min_x + padding / 2.0) / mat_width;
+                let rel_to_y = (to.position.y - min_y + padding / 2.0) / mat_height;
+                mat.endpoints = Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y);
+
+                // Update dimensions for aspect ratio correction
+                let aspect = mat_width / mat_height.max(1.0);
+                mat.dimensions = Vec4::new(mat_width, mat_height, aspect, 4.0);
+            }
+        }
+    }
+}
+
+/// Despawn connection lines for removed connections
+fn despawn_removed_connections(
+    mut commands: Commands,
+    constellation: Res<Constellation>,
+    connections: Query<(Entity, &ConstellationConnection)>,
+) {
+    for (entity, marker) in connections.iter() {
+        let from_exists = constellation.node_by_id(&marker.from).is_some();
+        let to_exists = constellation.node_by_id(&marker.to).is_some();
+
+        if !from_exists || !to_exists {
+            commands.entity(entity).despawn();
+            info!(
+                "Despawned connection line: {} -> {}",
+                marker.from, marker.to
+            );
         }
     }
 }

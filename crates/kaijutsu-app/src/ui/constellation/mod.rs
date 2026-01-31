@@ -29,6 +29,7 @@ pub struct ConstellationPlugin;
 impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Constellation>()
+            .init_resource::<OrbitalAnimation>()
             .register_type::<ConstellationMode>()
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
@@ -40,6 +41,7 @@ impl Plugin for ConstellationPlugin {
                     track_seat_events,
                     handle_mode_toggle,
                     handle_focus_navigation,
+                    update_orbital_animation,
                     update_node_positions,
                 )
                     .chain(),
@@ -53,6 +55,16 @@ impl Plugin for ConstellationPlugin {
 // ============================================================================
 // CORE DATA MODEL
 // ============================================================================
+
+/// Orbital animation state - decoupled from Constellation to avoid triggering
+/// change detection on all Constellation readers every frame during orbital mode.
+#[derive(Resource, Default)]
+pub struct OrbitalAnimation {
+    /// Current rotation angle in radians (accumulates over time)
+    pub angle: f32,
+    /// Whether orbital mode is active (cached to avoid reading Constellation)
+    pub active: bool,
+}
 
 /// Constellation of contexts - the spatial navigation model
 #[derive(Resource, Default)]
@@ -407,25 +419,62 @@ fn handle_focus_navigation(
     }
 }
 
-/// Update node positions based on layout strategy
-fn update_node_positions(mut constellation: ResMut<Constellation>) {
-    if !constellation.is_changed() {
-        return;
+/// Update orbital animation state (runs every frame in orbital mode, but doesn't
+/// trigger change detection on Constellation)
+fn update_orbital_animation(
+    constellation: Res<Constellation>,
+    time: Res<Time>,
+    theme: Res<crate::ui::theme::Theme>,
+    mut orbital: ResMut<OrbitalAnimation>,
+) {
+    let is_orbital = constellation.mode == ConstellationMode::Orbital;
+
+    // Track mode changes
+    if orbital.active != is_orbital {
+        orbital.active = is_orbital;
     }
 
+    // Accumulate angle in orbital mode
+    if is_orbital {
+        orbital.angle += time.delta_secs() * theme.constellation_orbital_speed;
+        // Wrap to prevent float precision issues over long sessions
+        if orbital.angle > std::f32::consts::TAU {
+            orbital.angle -= std::f32::consts::TAU;
+        }
+    }
+}
+
+/// Update node positions based on layout strategy
+/// Only mutates Constellation when layout actually changes (not every frame in orbital)
+fn update_node_positions(
+    mut constellation: ResMut<Constellation>,
+    orbital: Res<OrbitalAnimation>,
+    theme: Res<crate::ui::theme::Theme>,
+) {
     let node_count = constellation.nodes.len();
     if node_count == 0 {
         return;
     }
 
+    // Only recalculate positions when:
+    // - Constellation data changed (new node, focus change, etc.)
+    // - Orbital animation is active AND orbital angle changed
+    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
+    if !needs_update {
+        return;
+    }
+
+    let orbital_offset = if orbital.active { orbital.angle } else { 0.0 };
+
     match constellation.layout {
         LayoutStrategy::Circular => {
             // Position nodes in a circle around center
-            let radius = 200.0; // Base radius in pixels
+            let radius = theme.constellation_layout_radius;
             let angle_step = std::f32::consts::TAU / node_count as f32;
 
             for (i, node) in constellation.nodes.iter_mut().enumerate() {
-                let angle = angle_step * i as f32 - std::f32::consts::FRAC_PI_2; // Start at top
+                let base_angle = angle_step * i as f32 - std::f32::consts::FRAC_PI_2; // Start at top
+                let angle = base_angle + orbital_offset;
                 node.position = Vec2::new(angle.cos() * radius, angle.sin() * radius);
             }
         }

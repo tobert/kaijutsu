@@ -92,6 +92,8 @@ fn main() {
         .add_plugins(ui::constellation::ConstellationPlugin)
         // HUD system - configurable overlay panels
         .add_plugins(ui::hud::HudPlugin)
+        // Animation tweening for smooth mode transitions
+        .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
         // Startup

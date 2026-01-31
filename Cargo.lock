@@ -1804,6 +1804,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_tweening"
+version = "0.14.0"
+source = "git+https://github.com/djeedai/bevy_tweening?branch=main#a6712d5a7886d7d3b2e71ebff8ad37f8f9311524"
+dependencies = [
+ "bevy",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bevy_ui"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4882,6 +4891,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_brp_extras",
+ "bevy_tweening",
  "bytemuck",
  "capnp 0.25.0",
  "capnp-rpc 0.25.0",

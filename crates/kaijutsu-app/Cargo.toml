@@ -15,6 +15,7 @@ logos = "0.15"  # For Token::lexer trait
 
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
+bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
 
 # Text rendering (MSDF-based)
 cosmic-text.workspace = true
