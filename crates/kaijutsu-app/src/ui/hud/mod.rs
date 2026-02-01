@@ -1,7 +1,11 @@
 //! HUD System - Configurable heads-up display panels
 //!
 //! HUDs are glowing overlay panels that display contextual information.
-//! Configuration is loaded from `~/.config/kaijutsu/hud.rhai`.
+//!
+//! ## Configuration
+//!
+//! Currently hardcoded in `load_hud_config()`.
+//! TODO: Load from `~/.config/kaijutsu/hud.rhai`
 //!
 //! ## HUD Styles
 //!
@@ -20,7 +24,7 @@
 
 mod widgets;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 
@@ -36,7 +40,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudConfig>()
-            .init_resource::<McpPollCache>()
+            .init_resource::<ToolPollCache>()
             .register_type::<HudPosition>()
             .register_type::<HudStyle>()
             .register_type::<HudVisibility>()
@@ -44,10 +48,11 @@ impl Plugin for HudPlugin {
             .add_systems(
                 Update,
                 (
+                    despawn_removed_huds,
                     spawn_configured_huds,
                     update_hud_visibility,
-                    poll_mcp_widgets,
-                    handle_mcp_results,
+                    poll_tool_widgets,
+                    handle_tool_results,
                     update_widget_content,
                 )
                     .chain(),
@@ -59,7 +64,7 @@ impl Plugin for HudPlugin {
 // CONFIGURATION
 // ============================================================================
 
-/// HUD configuration loaded from Rhai
+/// HUD configuration (currently hardcoded, Rhai loading planned)
 #[derive(Resource, Default)]
 pub struct HudConfig {
     /// Configured HUD definitions
@@ -68,24 +73,27 @@ pub struct HudConfig {
     pub loaded: bool,
 }
 
-/// Cache for MCP tool polling results
+/// Timeout for pending tool poll requests (prevents deadlock on dropped responses)
+const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cache for tool polling results
 #[derive(Resource, Default)]
-pub struct McpPollCache {
+pub struct ToolPollCache {
     /// Cached results keyed by (server, tool)
-    pub results: std::collections::HashMap<(String, String), CachedMcpResult>,
-    /// Tools currently waiting for results
-    pub pending: std::collections::HashSet<(String, String)>,
+    pub results: std::collections::HashMap<(String, String), CachedToolResult>,
+    /// Tools currently waiting for results, with request timestamp
+    pub pending: std::collections::HashMap<(String, String), Instant>,
 }
 
-/// A cached MCP tool result
-pub struct CachedMcpResult {
+/// A cached tool result
+pub struct CachedToolResult {
     /// The raw JSON value (for tools that need it)
     #[allow(dead_code)]
     pub value: serde_json::Value,
     /// Formatted display string
     pub display: String,
     /// When this result was fetched
-    pub timestamp: std::time::Instant,
+    pub timestamp: Instant,
 }
 
 /// Definition of a single HUD panel
@@ -181,8 +189,8 @@ pub enum HudContent {
     BuildStatus,
     /// Connection status widget (server connectivity, identity)
     ConnectionStatus,
-    /// MCP tool polling
-    McpPoll {
+    /// Tool polling (calls kernel's tool registry, e.g. MCP tools)
+    ToolPoll {
         server: String,
         tool: String,
         interval_ms: u32,
@@ -271,6 +279,26 @@ fn load_hud_config(mut config: ResMut<HudConfig>) {
 
     config.loaded = true;
     info!("Loaded {} HUD definitions", config.huds.len());
+}
+
+/// Remove HUDs that are no longer in the config
+fn despawn_removed_huds(
+    mut commands: Commands,
+    config: Res<HudConfig>,
+    huds: Query<(Entity, &Hud)>,
+) {
+    // Only check when config changes
+    if !config.is_changed() {
+        return;
+    }
+
+    for (entity, hud) in huds.iter() {
+        let still_exists = config.huds.iter().any(|d| d.name == hud.name);
+        if !still_exists {
+            commands.entity(entity).despawn(); // Bevy 0.18: despawn handles children
+            info!("Despawned removed HUD: {}", hud.name);
+        }
+    }
 }
 
 /// Spawn HUD entities from configuration
@@ -417,7 +445,7 @@ fn update_widget_content(
     constellation: Res<crate::ui::constellation::Constellation>,
     dashboard: Res<crate::dashboard::DashboardState>,
     conn_state: Res<ConnectionState>,
-    mcp_cache: Res<McpPollCache>,
+    tool_cache: Res<ToolPollCache>,
     mut hud_texts: Query<(&HudText, &mut crate::text::MsdfUiText)>,
 ) {
     for (hud_text, mut text) in hud_texts.iter_mut() {
@@ -430,11 +458,11 @@ fn update_widget_content(
             HudContent::Keybinds => generate_keybinds_content(&constellation),
             HudContent::SessionInfo => generate_session_info(&constellation, &dashboard),
             HudContent::AgentStatus => generate_agent_status(&constellation),
-            HudContent::GitStatus => generate_git_status(&mcp_cache),
+            HudContent::GitStatus => generate_git_status(&tool_cache),
             HudContent::BuildStatus => generate_build_status(),
             HudContent::ConnectionStatus => generate_connection_status(&conn_state),
-            HudContent::McpPoll { server, tool, .. } => {
-                generate_mcp_poll_content(&mcp_cache, server, tool)
+            HudContent::ToolPoll { server, tool, .. } => {
+                generate_tool_poll_content(&tool_cache, server, tool)
             }
         };
     }
@@ -505,7 +533,7 @@ fn generate_build_status() -> String {
         .unwrap_or_else(|_| "build: ?".to_string())
 }
 
-fn generate_git_status(cache: &McpPollCache) -> String {
+fn generate_git_status(cache: &ToolPollCache) -> String {
     cache
         .results
         .get(&("git".to_string(), "status".to_string()))
@@ -513,7 +541,7 @@ fn generate_git_status(cache: &McpPollCache) -> String {
         .unwrap_or_else(|| "git: ...".to_string())
 }
 
-fn generate_mcp_poll_content(cache: &McpPollCache, server: &str, tool: &str) -> String {
+fn generate_tool_poll_content(cache: &ToolPollCache, server: &str, tool: &str) -> String {
     cache
         .results
         .get(&(server.to_string(), tool.to_string()))
@@ -522,13 +550,13 @@ fn generate_mcp_poll_content(cache: &McpPollCache, server: &str, tool: &str) -> 
 }
 
 // ============================================================================
-// MCP POLLING SYSTEMS
+// TOOL POLLING SYSTEMS
 // ============================================================================
 
-/// Poll MCP tools based on configured intervals
-fn poll_mcp_widgets(
+/// Poll tools based on configured intervals (handles both ToolPoll and GitStatus)
+fn poll_tool_widgets(
     config: Res<HudConfig>,
-    mut cache: ResMut<McpPollCache>,
+    mut cache: ResMut<ToolPollCache>,
     conn: Res<ConnectionCommands>,
     conn_state: Res<ConnectionState>,
 ) {
@@ -538,26 +566,42 @@ fn poll_mcp_widgets(
     }
 
     for hud in &config.huds {
-        if let HudContent::McpPoll {
-            server,
-            tool,
-            interval_ms,
-        } = &hud.content
-        {
+        // Get polling config - either explicit ToolPoll or implicit for GitStatus
+        let poll_config = match &hud.content {
+            HudContent::ToolPoll {
+                server,
+                tool,
+                interval_ms,
+            } => Some((server.clone(), tool.clone(), *interval_ms)),
+            HudContent::GitStatus => {
+                // GitStatus implicitly polls git/status every 5 seconds
+                Some(("git".to_string(), "status".to_string(), 5000))
+            }
+            _ => None,
+        };
+
+        if let Some((server, tool, interval_ms)) = poll_config {
             let key = (server.clone(), tool.clone());
 
-            // Check if we should poll
+            // Check if we should poll (interval elapsed)
             let should_poll = cache
                 .results
                 .get(&key)
-                .map(|r| r.timestamp.elapsed().as_millis() > *interval_ms as u128)
+                .map(|r| r.timestamp.elapsed().as_millis() > interval_ms as u128)
                 .unwrap_or(true);
 
-            if should_poll && !cache.pending.contains(&key) {
-                cache.pending.insert(key);
+            // Check if pending request timed out (prevents deadlock on dropped responses)
+            let is_pending = cache
+                .pending
+                .get(&key)
+                .map(|sent_at| sent_at.elapsed() < PENDING_TIMEOUT)
+                .unwrap_or(false);
+
+            if should_poll && !is_pending {
+                cache.pending.insert(key, Instant::now());
                 conn.send(ConnectionCommand::CallMcpTool {
-                    server: server.clone(),
-                    tool: tool.clone(),
+                    server,
+                    tool,
                     args: serde_json::Value::Null,
                 });
             }
@@ -565,10 +609,10 @@ fn poll_mcp_widgets(
     }
 }
 
-/// Handle MCP tool results and update cache
-fn handle_mcp_results(
+/// Handle tool results and update cache
+fn handle_tool_results(
     mut events: MessageReader<ConnectionEvent>,
-    mut cache: ResMut<McpPollCache>,
+    mut cache: ResMut<ToolPollCache>,
 ) {
     for event in events.read() {
         if let ConnectionEvent::McpToolResult {
@@ -581,13 +625,13 @@ fn handle_mcp_results(
             cache.pending.remove(&key);
 
             let (value, display) = match result {
-                Ok(v) => (v.clone(), format_mcp_result(server, tool, v)),
+                Ok(v) => (v.clone(), format_tool_result(server, tool, v)),
                 Err(e) => (serde_json::Value::Null, format!("err: {}", e)),
             };
 
             cache.results.insert(
                 key,
-                CachedMcpResult {
+                CachedToolResult {
                     value,
                     display,
                     timestamp: Instant::now(),
@@ -597,8 +641,8 @@ fn handle_mcp_results(
     }
 }
 
-/// Format MCP tool results for display
-fn format_mcp_result(server: &str, tool: &str, value: &serde_json::Value) -> String {
+/// Format tool results for display
+fn format_tool_result(server: &str, tool: &str, value: &serde_json::Value) -> String {
     match (server, tool) {
         ("git", "status") => {
             // Parse git status JSON into compact display
