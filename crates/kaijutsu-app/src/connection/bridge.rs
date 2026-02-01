@@ -73,6 +73,14 @@ pub enum ConnectionCommand {
         command: String,
         cell_id: String,
     },
+
+    // MCP operations
+    /// Call an MCP tool on the server
+    CallMcpTool {
+        server: String,
+        tool: String,
+        args: serde_json::Value,
+    },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -165,6 +173,12 @@ pub enum ConnectionEvent {
         cell_id: String,
         block_id: kaijutsu_crdt::BlockId,
         after_id: Option<kaijutsu_crdt::BlockId>,
+    },
+    /// MCP tool call result
+    McpToolResult {
+        server: String,
+        tool: String,
+        result: Result<serde_json::Value, String>,
     },
 }
 
@@ -781,6 +795,51 @@ async fn connection_loop(
                     let _ = evt_tx.send(ConnectionEvent::Error(
                         format!("Not attached to kernel '{}' - attach first", kernel_name)
                     ));
+                }
+            }
+
+            // MCP tool operations
+            ConnectionCommand::CallMcpTool { server, tool, args } => {
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.call_mcp_tool(&server, &tool, &args)).await {
+                        Ok(Ok(result)) => {
+                            let value = if result.success {
+                                Ok(serde_json::from_str(&result.content).unwrap_or(serde_json::Value::String(result.content)))
+                            } else {
+                                Err(result.content)
+                            };
+                            let _ = evt_tx.send(ConnectionEvent::McpToolResult { server, tool, result: value });
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during MCP tool call: {}", err_str);
+                                rpc_client = None;
+                                current_kernel = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::McpToolResult {
+                                    server,
+                                    tool,
+                                    result: Err(err_str),
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("MCP tool call timed out");
+                            let _ = evt_tx.send(ConnectionEvent::McpToolResult {
+                                server,
+                                tool,
+                                result: Err("MCP tool call timed out".into()),
+                            });
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::McpToolResult {
+                        server,
+                        tool,
+                        result: Err("Not attached to a kernel".into()),
+                    });
                 }
             }
         }

@@ -457,6 +457,36 @@ impl KernelHandle {
         request.send().promise.await?;
         Ok(())
     }
+
+    // =========================================================================
+    // MCP Tool operations
+    // =========================================================================
+
+    /// Call an MCP tool
+    ///
+    /// Invokes a tool on a registered MCP server and returns the result.
+    pub async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<McpToolResult, RpcError> {
+        let mut request = self.kernel.call_mcp_tool_request();
+        {
+            let mut call = request.get().init_call();
+            call.set_server(server);
+            call.set_tool(tool);
+            call.set_arguments(&serde_json::to_string(arguments).unwrap_or_default());
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+
+        Ok(McpToolResult {
+            success: result.get_success(),
+            content: result.get_content()?.to_string()?,
+            is_error: result.get_is_error(),
+        })
+    }
 }
 
 /// Helper to parse block ID from Cap'n Proto
@@ -627,6 +657,14 @@ pub struct DocumentState {
     pub version: u64,
     /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
     pub ops: Vec<u8>,
+}
+
+/// Result from an MCP tool call
+#[derive(Debug, Clone)]
+pub struct McpToolResult {
+    pub success: bool,
+    pub content: String,
+    pub is_error: bool,
 }
 
 // ============================================================================

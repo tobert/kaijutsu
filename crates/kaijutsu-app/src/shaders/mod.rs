@@ -73,6 +73,8 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<TextGlowMaterial>::default(),
             // Constellation effects
             UiMaterialPlugin::<ConnectionLineMaterial>::default(),
+            // HUD panel effects
+            UiMaterialPlugin::<HudPanelMaterial>::default(),
         ))
         // Register frame types for BRP reflection
         .register_type::<FramePiece>()
@@ -104,6 +106,7 @@ fn update_shader_time(
     mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
     mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -148,6 +151,11 @@ fn update_shader_time(
 
     // Constellation effects
     for (_, mat) in connection_materials.iter_mut() {
+        mat.time.x = t;
+    }
+
+    // HUD panel effects
+    for (_, mat) in hud_panel_materials.iter_mut() {
         mat.time.x = t;
     }
 }
@@ -566,6 +574,59 @@ impl ConnectionLineMaterial {
 impl UiMaterial for ConnectionLineMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/connection_line.wgsl".into()
+    }
+}
+
+// ============================================================================
+// HUD PANEL MATERIAL
+// ============================================================================
+
+/// Panel background with edge glow for HUD widgets.
+///
+/// Creates a rectangular panel with subtle edge glow effects.
+/// Used by the HUD system for Panel-style widgets.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct HudPanelMaterial {
+    /// Base panel color (RGBA)
+    #[uniform(0)]
+    pub color: Vec4,
+    /// Edge glow color (RGBA)
+    #[uniform(1)]
+    pub glow_color: Vec4,
+    /// Parameters: x=glow_intensity, y=border_radius, z=pulse_speed, w=reserved
+    #[uniform(2)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time
+    #[uniform(3)]
+    pub time: Vec4,
+}
+
+impl Default for HudPanelMaterial {
+    fn default() -> Self {
+        Self {
+            color: Vec4::new(0.05, 0.05, 0.1, 0.85), // Dark panel background
+            glow_color: Vec4::new(0.34, 0.65, 1.0, 0.8), // Cyan glow
+            params: Vec4::new(0.5, 0.0, 1.5, 0.0), // intensity, radius, speed
+            time: Vec4::ZERO,
+        }
+    }
+}
+
+impl HudPanelMaterial {
+    /// Create a panel with custom glow color
+    pub fn with_glow(glow_color: Color, intensity: f32) -> Self {
+        let c = glow_color.to_linear();
+        Self {
+            glow_color: Vec4::new(c.red, c.green, c.blue, 0.8),
+            params: Vec4::new(intensity, 0.0, 1.5, 0.0),
+            ..Default::default()
+        }
+    }
+}
+
+impl UiMaterial for HudPanelMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/hud_panel.wgsl".into()
     }
 }
 
