@@ -176,12 +176,20 @@ pub struct SeatInfo {
     pub cursor_block: Option<String>,
 }
 
+/// A document attached to a context
+#[derive(Debug, Clone)]
+pub struct ContextDocument {
+    pub id: String,
+    pub attached_by: String,  // nick:instance
+    pub attached_at: u64,     // Unix timestamp ms
+}
+
 /// A context within a kernel
 #[derive(Debug, Clone)]
 pub struct ContextState {
     pub name: String,
-    pub documents: Vec<String>,  // Document IDs attached to this context
-    pub seats: Vec<SeatId>,      // Seats currently in this context
+    pub documents: Vec<ContextDocument>,  // Documents attached to this context
+    pub seats: Vec<SeatId>,               // Seats currently in this context
 }
 
 impl ContextState {
@@ -1453,8 +1461,39 @@ impl kernel::Server for KernelImpl {
             for (i, ctx) in contexts.iter().enumerate() {
                 let mut c = ctx_list.reborrow().get(i as u32);
                 c.set_name(&ctx.name);
-                c.set_document_count(ctx.documents.len() as u32);
-                c.set_seat_count(ctx.seats.len() as u32);
+
+                // Populate documents list
+                let mut docs = c.reborrow().init_documents(ctx.documents.len() as u32);
+                for (j, doc) in ctx.documents.iter().enumerate() {
+                    let mut d = docs.reborrow().get(j as u32);
+                    d.set_id(&doc.id);
+                    d.set_attached_by(&doc.attached_by);
+                    d.set_attached_at(doc.attached_at);
+                }
+
+                // Populate seats list
+                let mut seats = c.reborrow().init_seats(ctx.seats.len() as u32);
+                for (j, seat_id) in ctx.seats.iter().enumerate() {
+                    // Find the seat info from my_seats
+                    if let Some(seat_info) = state.my_seats.get(&seat_id.key()) {
+                        let mut s = seats.reborrow().get(j as u32);
+                        let mut id = s.reborrow().init_id();
+                        id.set_nick(&seat_info.id.nick);
+                        id.set_instance(&seat_info.id.instance);
+                        id.set_kernel(&seat_info.id.kernel);
+                        id.set_context(&seat_info.id.context);
+                        s.set_owner(&seat_info.owner);
+                        s.set_status(match seat_info.status {
+                            SeatStatus::Active => crate::kaijutsu_capnp::SeatStatus::Active,
+                            SeatStatus::Idle => crate::kaijutsu_capnp::SeatStatus::Idle,
+                            SeatStatus::Away => crate::kaijutsu_capnp::SeatStatus::Away,
+                        });
+                        s.set_last_activity(seat_info.last_activity);
+                        if let Some(ref cursor) = seat_info.cursor_block {
+                            s.set_cursor_block(cursor);
+                        }
+                    }
+                }
             }
         }
         Promise::ok(())
@@ -1515,51 +1554,14 @@ impl kernel::Server for KernelImpl {
             state_ref.current_seat = Some(seat_id);
         }
 
-        // Get main_document_id for this kernel
-        let cell_id = {
-            let state_ref = state.borrow();
-            state_ref.kernels.get(&kernel_id)
-                .map(|k| k.main_document_id.clone())
-                .unwrap_or_else(|| format!("{}@main", kernel_id))
+        // Create and return SeatHandle capability
+        let seat_handle = SeatHandleImpl {
+            state: state.clone(),
+            seat_id: seat_info.id.clone(),
+            kernel_id: kernel_id.clone(),
         };
 
-        // Build result
-        {
-            let mut seat = results.get().init_seat();
-            let mut id = seat.reborrow().init_id();
-            id.set_nick(&seat_info.id.nick);
-            id.set_instance(&seat_info.id.instance);
-            id.set_kernel(&seat_info.id.kernel);
-            id.set_context(&seat_info.id.context);
-
-            seat.set_owner(&seat_info.owner);
-            seat.set_status(crate::kaijutsu_capnp::SeatStatus::Active);
-            seat.set_last_activity(seat_info.last_activity);
-            seat.set_document_id(&cell_id);
-        }
-
-        Promise::ok(())
-    }
-
-    fn leave_seat(
-        self: Rc<Self>,
-        _params: kernel::LeaveSeatParams,
-        _results: kernel::LeaveSeatResults,
-    ) -> Promise<(), capnp::Error> {
-        let mut state_ref = self.state.borrow_mut();
-        let kernel_id = &self.kernel_id;
-
-        if let Some(seat_id) = state_ref.current_seat.take() {
-            // Remove from kernel's context
-            if let Some(kernel) = state_ref.kernels.get_mut(kernel_id) {
-                if let Some(context) = kernel.contexts.get_mut(&seat_id.context) {
-                    context.seats.retain(|s| s != &seat_id);
-                }
-            }
-
-            // Remove from user's seats
-            state_ref.my_seats.remove(&seat_id.key());
-        }
+        results.get().set_seat(capnp_rpc::new_client(seat_handle));
 
         Promise::ok(())
     }
@@ -3284,6 +3286,116 @@ fn parse_block_snapshot(
         is_error: reader.get_is_error(),
         display_hint,
     })
+}
+
+// ============================================================================
+// SeatHandle Implementation
+// ============================================================================
+
+use crate::kaijutsu_capnp::seat_handle;
+
+/// Implementation of the SeatHandle capability.
+/// Represents a user's "seat" in a context - their position and cursor.
+struct SeatHandleImpl {
+    state: Rc<RefCell<ServerState>>,
+    seat_id: SeatId,
+    kernel_id: String,
+}
+
+impl seat_handle::Server for SeatHandleImpl {
+    fn get_state(
+        self: Rc<Self>,
+        _params: seat_handle::GetStateParams,
+        mut results: seat_handle::GetStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.borrow();
+        if let Some(seat_info) = state.my_seats.get(&self.seat_id.key()) {
+            let mut info = results.get().init_info();
+            let mut id = info.reborrow().init_id();
+            id.set_nick(&seat_info.id.nick);
+            id.set_instance(&seat_info.id.instance);
+            id.set_kernel(&seat_info.id.kernel);
+            id.set_context(&seat_info.id.context);
+
+            info.set_owner(&seat_info.owner);
+            info.set_status(match seat_info.status {
+                SeatStatus::Active => crate::kaijutsu_capnp::SeatStatus::Active,
+                SeatStatus::Idle => crate::kaijutsu_capnp::SeatStatus::Idle,
+                SeatStatus::Away => crate::kaijutsu_capnp::SeatStatus::Away,
+            });
+            info.set_last_activity(seat_info.last_activity);
+            if let Some(ref cursor) = seat_info.cursor_block {
+                info.set_cursor_block(cursor);
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn update_cursor(
+        self: Rc<Self>,
+        params: seat_handle::UpdateCursorParams,
+        _results: seat_handle::UpdateCursorResults,
+    ) -> Promise<(), capnp::Error> {
+        let block_id = pry!(pry!(params.get()).get_block_id());
+        let block_id = pry!(block_id.to_str()).to_owned();
+
+        let mut state = self.state.borrow_mut();
+        if let Some(seat_info) = state.my_seats.get_mut(&self.seat_id.key()) {
+            seat_info.cursor_block = Some(block_id);
+            seat_info.last_activity = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_millis() as u64;
+        }
+        Promise::ok(())
+    }
+
+    fn set_status(
+        self: Rc<Self>,
+        params: seat_handle::SetStatusParams,
+        _results: seat_handle::SetStatusResults,
+    ) -> Promise<(), capnp::Error> {
+        let status = pry!(pry!(params.get()).get_status());
+
+        let mut state = self.state.borrow_mut();
+        if let Some(seat_info) = state.my_seats.get_mut(&self.seat_id.key()) {
+            seat_info.status = match status {
+                crate::kaijutsu_capnp::SeatStatus::Active => SeatStatus::Active,
+                crate::kaijutsu_capnp::SeatStatus::Idle => SeatStatus::Idle,
+                crate::kaijutsu_capnp::SeatStatus::Away => SeatStatus::Away,
+            };
+            seat_info.last_activity = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_millis() as u64;
+        }
+        Promise::ok(())
+    }
+
+    fn leave(
+        self: Rc<Self>,
+        _params: seat_handle::LeaveParams,
+        _results: seat_handle::LeaveResults,
+    ) -> Promise<(), capnp::Error> {
+        let mut state = self.state.borrow_mut();
+
+        // Remove from kernel's context
+        if let Some(kernel) = state.kernels.get_mut(&self.kernel_id) {
+            if let Some(context) = kernel.contexts.get_mut(&self.seat_id.context) {
+                context.seats.retain(|s| s != &self.seat_id);
+            }
+        }
+
+        // Remove from user's seats
+        state.my_seats.remove(&self.seat_id.key());
+
+        // Clear current seat if it was this one
+        if state.current_seat.as_ref() == Some(&self.seat_id) {
+            state.current_seat = None;
+        }
+
+        Promise::ok(())
+    }
 }
 
 // ============================================================================

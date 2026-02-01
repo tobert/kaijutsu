@@ -17,7 +17,50 @@ struct KernelInfo {
   name @1 :Text;
   userCount @2 :UInt32;
   agentCount @3 :UInt32;
-  # Future: mounts, lease status, consent mode
+  contexts @4 :List(Context);       # Contexts within this kernel
+  seatCount @5 :UInt32;             # Total seats across all contexts
+}
+
+# ============================================================================
+# Seat and Context Types (Lobby Experience)
+# ============================================================================
+
+# Seat identifier - the 4-tuple that identifies a seat
+struct SeatId {
+  nick @0 :Text;          # Display name, user-chosen: "amy", "refactor-bot"
+  instance @1 :Text;      # Device/model variant: "laptop", "haiku"
+  kernel @2 :Text;        # Kernel name: "kaijutsu-dev"
+  context @3 :Text;       # Context name: "refactor"
+}
+
+# Seat status
+enum SeatStatus {
+  active @0;              # Currently engaged
+  idle @1;                # Connected but not actively working
+  away @2;                # Stepped away
+}
+
+# Information about a seat
+struct SeatInfo {
+  id @0 :SeatId;
+  owner @1 :Text;                   # Strong identity: username from SSH auth
+  status @2 :SeatStatus;
+  lastActivity @3 :UInt64;          # Unix timestamp ms
+  cursorBlock @4 :Text;             # Which block they're focused on
+}
+
+# A document attached to a context
+struct ContextDocument {
+  id @0 :Text;                      # Block/document ID
+  attachedBy @1 :Text;              # Who attached it (seat nick:instance)
+  attachedAt @2 :UInt64;            # When it was attached (unix timestamp ms)
+}
+
+# A context within a kernel
+struct Context {
+  name @0 :Text;
+  documents @1 :List(ContextDocument);
+  seats @2 :List(SeatInfo);
 }
 
 struct KernelConfig {
@@ -103,41 +146,6 @@ struct BlobRef {
   id @0 :Text;              # Unique blob identifier
   size @1 :UInt64;          # Size in bytes
   contentType @2 :Text;     # MIME type (e.g., "image/png")
-}
-
-# ============================================================================
-# Seat & Context Types
-# ============================================================================
-
-# Unique identifier for a seat - the 4-tuple that identifies a user's position
-struct SeatId {
-  nick @0 :Text;              # Display name (user-chosen): "amy", "refactor-bot"
-  instance @1 :Text;          # Device/model variant: "laptop", "haiku"
-  kernel @2 :Text;            # Kernel name: "kaijutsu-dev"
-  context @3 :Text;           # Context within the kernel: "refactor", "planning"
-}
-
-enum SeatStatus {
-  active @0;
-  idle @1;
-  away @2;
-}
-
-# Information about a seat (occupied position in a kernel/context)
-struct SeatInfo {
-  id @0 :SeatId;
-  owner @1 :Text;             # Strong identity: username from SSH auth
-  status @2 :SeatStatus;
-  lastActivity @3 :UInt64;    # Unix timestamp in milliseconds
-  cursorBlock @4 :Text;       # Which block they're focused on (optional)
-  documentId @5 :Text;        # The kernel's main document ID for this seat
-}
-
-# A context within a kernel - a collection of documents with a focus scope
-struct Context {
-  name @0 :Text;
-  documentCount @1 :UInt32;   # Number of documents attached
-  seatCount @2 :UInt32;       # Number of active seats
 }
 
 # ============================================================================
@@ -228,7 +236,8 @@ interface World {
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
 
   # Seat management (cross-kernel)
-  listMySeats @4 () -> (seats :List(SeatInfo));
+  takeSeat @4 (seat :SeatId) -> (handle :SeatHandle);
+  listMySeats @5 () -> (seats :List(SeatInfo));
 }
 
 interface Kernel {
@@ -272,49 +281,89 @@ interface Kernel {
 
   # Context & seat management
   listContexts @22 () -> (contexts :List(Context));
-  joinContext @23 (contextName :Text, instance :Text) -> (seat :SeatInfo);
-  leaveSeat @24 ();
+  createContext @23 (name :Text) -> (context :Context);
+  joinContext @24 (contextName :Text, instance :Text) -> (seat :SeatHandle);
+  attachDocument @25 (contextName :Text, documentId :Text);
+  detachDocument @26 (contextName :Text, documentId :Text);
 
   # MCP (Model Context Protocol) management
-  registerMcp @25 (config :McpServerConfig) -> (info :McpServerInfo);
-  unregisterMcp @26 (name :Text);
-  listMcpServers @27 () -> (servers :List(McpServerInfo));
-  callMcpTool @28 (call :McpToolCall) -> (result :McpToolResult);
+  registerMcp @27 (config :McpServerConfig) -> (info :McpServerInfo);
+  unregisterMcp @28 (name :Text);
+  listMcpServers @29 () -> (servers :List(McpServerInfo));
+  callMcpTool @30 (call :McpToolCall) -> (result :McpToolResult);
 
   # Shell execution (kaish REPL with block output)
   # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
-  shellExecute @29 (code :Text, documentId :Text) -> (commandBlockId :BlockId);
+  shellExecute @31 (code :Text, documentId :Text) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
-  getCwd @30 () -> (path :Text);
-  setCwd @31 (path :Text) -> (success :Bool, error :Text);
-  getLastResult @32 () -> (result :ShellExecResult);
+  getCwd @32 () -> (path :Text);
+  setCwd @33 (path :Text) -> (success :Bool, error :Text);
+  getLastResult @34 () -> (result :ShellExecResult);
 
   # Blob storage (in-memory, size-capped)
   # Blobs are stored at /v/blobs/{id} in kaish's VFS
-  writeBlob @33 (data :Data, contentType :Text) -> (ref :BlobRef);
-  readBlob @34 (id :Text) -> (data :Data);
-  deleteBlob @35 (id :Text) -> (success :Bool);
-  listBlobs @36 () -> (refs :List(BlobRef));
+  writeBlob @35 (data :Data, contentType :Text) -> (ref :BlobRef);
+  readBlob @36 (id :Text) -> (data :Data);
+  deleteBlob @37 (id :Text) -> (success :Bool);
+  listBlobs @38 () -> (refs :List(BlobRef));
 
   # Git repository management (CRDT-backed worktrees)
-  registerRepo @37 (name :Text, path :Text) -> (success :Bool, error :Text);
-  unregisterRepo @38 (name :Text) -> (success :Bool, error :Text);
-  listRepos @39 () -> (repos :List(Text));
-  switchBranch @40 (repo :Text, branch :Text) -> (success :Bool, error :Text);
-  listBranches @41 (repo :Text) -> (branches :List(Text), error :Text);
-  getCurrentBranch @42 (repo :Text) -> (branch :Text);
-  flushGit @43 () -> (success :Bool, error :Text);
-  setAttribution @44 (source :Text, command :Text);
+  registerRepo @39 (name :Text, path :Text) -> (success :Bool, error :Text);
+  unregisterRepo @40 (name :Text) -> (success :Bool, error :Text);
+  listRepos @41 () -> (repos :List(Text));
+  switchBranch @42 (repo :Text, branch :Text) -> (success :Bool, error :Text);
+  listBranches @43 (repo :Text) -> (branches :List(Text), error :Text);
+  getCurrentBranch @44 (repo :Text) -> (branch :Text);
+  flushGit @45 () -> (success :Bool, error :Text);
+  setAttribution @46 (source :Text, command :Text);
 
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
-  pushOps @45 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
+  pushOps @47 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
-  listMcpResources @46 (server :Text) -> (resources :List(McpResource));
-  readMcpResource @47 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
-  subscribeMcpResources @48 (callback :ResourceEvents);
+  listMcpResources @48 (server :Text) -> (resources :List(McpResource));
+  readMcpResource @49 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
+  subscribeMcpResources @50 (callback :ResourceEvents);
+
+  # MCP Roots (client advertises workspaces to servers)
+  setMcpRoots @51 (roots :List(McpRoot));
+
+  # MCP Prompts (poll-based with optional caching)
+  listMcpPrompts @52 (server :Text) -> (prompts :List(McpPrompt));
+  getMcpPrompt @53 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+
+  # MCP Progress (push-based streaming)
+  subscribeMcpProgress @54 (callback :ProgressEvents);
+
+  # MCP Elicitation (server-initiated requests for user input)
+  subscribeMcpElicitations @55 (callback :ElicitationEvents);
+
+  # MCP Completion (request/response)
+  completeMcp @56 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+
+  # MCP Logging
+  setMcpLogLevel @57 (server :Text, level :Text);
+  subscribeMcpLogs @58 (callback :LoggingEvents);
+
+  # MCP Cancellation
+  cancelMcpRequest @59 (server :Text, requestId :Text);
+}
+
+# Capability for interacting with a seat
+interface SeatHandle {
+  # Get current seat state
+  getState @0 () -> (info :SeatInfo);
+
+  # Update cursor position (which block we're focused on)
+  updateCursor @1 (blockId :Text);
+
+  # Set our status
+  setStatus @2 (status :SeatStatus);
+
+  # Leave the seat ("get up from the meeting")
+  leave @3 ();
 }
 
 # ============================================================================
@@ -519,6 +568,91 @@ interface ResourceEvents {
   onResourceUpdated @0 (server :Text, uri :Text, contents :McpResourceContents, hasContents :Bool);
   # Called when a server's resource list changes (resources added or removed)
   onResourceListChanged @1 (server :Text, resources :List(McpResource), hasResources :Bool);
+}
+
+# MCP Root - workspace directory advertised to servers
+struct McpRoot {
+  uri @0 :Text;              # file:// URI for the root
+  name @1 :Text;             # Optional display name
+  hasName @2 :Bool;
+}
+
+# MCP Prompt - reusable prompt template from a server
+struct McpPrompt {
+  name @0 :Text;             # Prompt identifier
+  title @1 :Text;            # Optional display title
+  hasTitle @2 :Bool;
+  description @3 :Text;      # Optional description
+  hasDescription @4 :Bool;
+  arguments @5 :List(McpPromptArgument);
+}
+
+struct McpPromptArgument {
+  name @0 :Text;             # Argument name
+  title @1 :Text;            # Optional title
+  hasTitle @2 :Bool;
+  description @3 :Text;      # Optional description
+  hasDescription @4 :Bool;
+  required @5 :Bool;         # Whether the argument is required
+}
+
+struct McpPromptMessage {
+  role @0 :Text;             # "user" or "assistant"
+  content @1 :Text;          # Message content
+}
+
+# MCP Progress - updates during long-running operations
+struct McpProgress {
+  server @0 :Text;           # Server name
+  token @1 :Text;            # Progress token
+  progress @2 :Float64;      # Current progress value
+  total @3 :Float64;         # Total value if known
+  hasTotal @4 :Bool;
+  message @5 :Text;          # Human-readable message
+  hasMessage @6 :Bool;
+}
+
+interface ProgressEvents {
+  onProgress @0 (progress :McpProgress);
+}
+
+# MCP Elicitation - server requests user input
+struct McpElicitationRequest {
+  requestId @0 :Text;        # Unique request ID
+  server @1 :Text;           # Server name
+  message @2 :Text;          # Message to display
+  schema @3 :Text;           # JSON Schema for response validation
+  hasSchema @4 :Bool;
+}
+
+struct McpElicitationResponse {
+  action @0 :Text;           # "accept", "decline", or "cancel"
+  content @1 :Text;          # JSON response data
+  hasContent @2 :Bool;
+}
+
+interface ElicitationEvents {
+  onRequest @0 (request :McpElicitationRequest) -> (response :McpElicitationResponse);
+}
+
+# MCP Completion - argument value suggestions
+struct McpCompletionResult {
+  values @0 :List(Text);     # Suggested completions
+  total @1 :UInt32;          # Total available if known
+  hasTotal @2 :Bool;
+}
+
+# MCP Logging - log messages from servers
+struct McpLogMessage {
+  server @0 :Text;           # Server name
+  level @1 :Text;            # Log level (error, warn, info, debug)
+  logger @2 :Text;           # Logger name
+  hasLogger @3 :Bool;
+  data @4 :Text;             # JSON log data
+}
+
+interface LoggingEvents {
+  onLog @0 (log :McpLogMessage);
 }
 
 # ============================================================================

@@ -74,12 +74,7 @@ impl RpcClient {
 
         let mut result = Vec::with_capacity(kernels.len() as usize);
         for kernel in kernels.iter() {
-            result.push(KernelInfo {
-                id: kernel.get_id()?.to_string()?,
-                name: kernel.get_name()?.to_string()?,
-                user_count: kernel.get_user_count(),
-                agent_count: kernel.get_agent_count(),
-            });
+            result.push(parse_kernel_info(&kernel)?);
         }
         Ok(result)
     }
@@ -118,7 +113,25 @@ impl RpcClient {
         Ok(KernelHandle { kernel })
     }
 
-    /// List user's active seats across all kernels
+    /// Take a seat in a kernel context
+    pub async fn take_seat(&self, seat_id: &SeatId) -> Result<SeatHandle, RpcError> {
+        let mut request = self.world.take_seat_request();
+        {
+            let mut id = request.get().init_seat();
+            id.set_nick(&seat_id.nick);
+            id.set_instance(&seat_id.instance);
+            id.set_kernel(&seat_id.kernel);
+            id.set_context(&seat_id.context);
+        }
+        let response = request.send().promise.await?;
+        let handle = response.get()?.get_handle()?;
+        Ok(SeatHandle {
+            handle,
+            id: seat_id.clone(),
+        })
+    }
+
+    /// List all seats owned by current user
     pub async fn list_my_seats(&self) -> Result<Vec<SeatInfo>, RpcError> {
         let request = self.world.list_my_seats_request();
         let response = request.send().promise.await?;
@@ -126,17 +139,7 @@ impl RpcClient {
 
         let mut result = Vec::with_capacity(seats.len() as usize);
         for seat in seats.iter() {
-            let id_reader = seat.get_id()?;
-            result.push(SeatInfo {
-                id: SeatId {
-                    nick: id_reader.get_nick()?.to_string()?,
-                    instance: id_reader.get_instance()?.to_string()?,
-                    kernel: id_reader.get_kernel()?.to_string()?,
-                    context: id_reader.get_context()?.to_string()?,
-                },
-                owner: seat.get_owner()?.to_string()?,
-                document_id: seat.get_document_id()?.to_string()?,
-            });
+            result.push(parse_seat_info(&seat)?);
         }
         Ok(result)
     }
@@ -158,39 +161,72 @@ pub struct KernelInfo {
     pub name: String,
     pub user_count: u32,
     pub agent_count: u32,
+    pub contexts: Vec<Context>,
+    pub seat_count: u32,
 }
 
 // ============================================================================
-// Seat & Context Types (client-side stubs for dashboard wiring)
+// Seat and Context Types
 // ============================================================================
 
-/// Unique identifier for a seat - the 4-tuple that identifies a user's position
+/// Seat identifier - the 4-tuple
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatId {
-    /// Display name (user-chosen): "amy", "refactor-bot"
     pub nick: String,
-    /// Device/model variant: "laptop", "haiku"
     pub instance: String,
-    /// Kernel name: "kaijutsu-dev"
     pub kernel: String,
-    /// Context within the kernel: "refactor", "planning"
     pub context: String,
 }
 
-/// Information about a seat (occupied position in a kernel/context)
+impl SeatId {
+    /// Create a new SeatId
+    pub fn new(nick: impl Into<String>, instance: impl Into<String>, kernel: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            nick: nick.into(),
+            instance: instance.into(),
+            kernel: kernel.into(),
+            context: context.into(),
+        }
+    }
+
+    /// Format as display string: @nick:instance@kernel:context
+    pub fn display(&self) -> String {
+        format!("@{}:{}@{}:{}", self.nick, self.instance, self.kernel, self.context)
+    }
+}
+
+/// Seat status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatStatus {
+    Active,
+    Idle,
+    Away,
+}
+
+/// Info about a seat
 #[derive(Debug, Clone)]
 pub struct SeatInfo {
     pub id: SeatId,
-    /// Strong identity: username from SSH auth
     pub owner: String,
-    /// The kernel's main document ID for this seat
-    pub document_id: String,
+    pub status: SeatStatus,
+    pub last_activity: u64,
+    pub cursor_block: Option<String>,
 }
 
-/// A context within a kernel - a collection of documents with a focus scope
+/// Document attached to a context
+#[derive(Debug, Clone)]
+pub struct ContextDocument {
+    pub id: String,
+    pub attached_by: String,
+    pub attached_at: u64,
+}
+
+/// Context within a kernel
 #[derive(Debug, Clone)]
 pub struct Context {
     pub name: String,
+    pub documents: Vec<ContextDocument>,
+    pub seats: Vec<SeatInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,12 +261,72 @@ impl KernelHandle {
         let request = self.kernel.get_info_request();
         let response = request.send().promise.await?;
         let info = response.get()?.get_info()?;
-        Ok(KernelInfo {
-            id: info.get_id()?.to_string()?,
-            name: info.get_name()?.to_string()?,
-            user_count: info.get_user_count(),
-            agent_count: info.get_agent_count(),
+        parse_kernel_info(&info)
+    }
+
+    // =========================================================================
+    // Context management
+    // =========================================================================
+
+    /// List all contexts in this kernel
+    pub async fn list_contexts(&self) -> Result<Vec<Context>, RpcError> {
+        let request = self.kernel.list_contexts_request();
+        let response = request.send().promise.await?;
+        let contexts = response.get()?.get_contexts()?;
+
+        let mut result = Vec::with_capacity(contexts.len() as usize);
+        for ctx in contexts.iter() {
+            result.push(parse_context(&ctx)?);
+        }
+        Ok(result)
+    }
+
+    /// Create a new context
+    pub async fn create_context(&self, name: &str) -> Result<Context, RpcError> {
+        let mut request = self.kernel.create_context_request();
+        request.get().set_name(name);
+        let response = request.send().promise.await?;
+        let ctx = response.get()?.get_context()?;
+        parse_context(&ctx)
+    }
+
+    /// Join a context (creates if doesn't exist)
+    pub async fn join_context(&self, context_name: &str, instance: &str) -> Result<SeatHandle, RpcError> {
+        let mut request = self.kernel.join_context_request();
+        request.get().set_context_name(context_name);
+        request.get().set_instance(instance);
+        let response = request.send().promise.await?;
+        let handle = response.get()?.get_seat()?;
+
+        // Note: We don't know the nick here since it's derived server-side
+        // The caller should get the actual seat info from the handle
+        Ok(SeatHandle {
+            handle,
+            id: SeatId {
+                nick: String::new(), // Will be filled in by get_state()
+                instance: instance.to_string(),
+                kernel: String::new(),
+                context: context_name.to_string(),
+            },
         })
+    }
+
+    /// Attach a document to a context
+    pub async fn attach_document(&self, context_name: &str, document_id: &str) -> Result<(), RpcError> {
+        let mut request = self.kernel.attach_document_request();
+        request.get().set_context_name(context_name);
+        request.get().set_document_id(document_id);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Detach a document from a context
+    pub async fn detach_document(&self, context_name: &str, document_id: &str) -> Result<(), RpcError> {
+        let mut request = self.kernel.detach_document_request();
+        request.get().set_context_name(context_name);
+        request.get().set_document_id(document_id);
+        request.send().promise.await?;
+        Ok(())
     }
 
     // kaish execution methods
@@ -408,57 +504,6 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Context & Seat operations
-    // =========================================================================
-
-    /// List contexts in this kernel
-    pub async fn list_contexts(&self) -> Result<Vec<Context>, RpcError> {
-        let request = self.kernel.list_contexts_request();
-        let response = request.send().promise.await?;
-        let contexts = response.get()?.get_contexts()?;
-
-        let mut result = Vec::with_capacity(contexts.len() as usize);
-        for ctx in contexts.iter() {
-            result.push(Context {
-                name: ctx.get_name()?.to_string()?,
-            });
-        }
-        Ok(result)
-    }
-
-    /// Join a context (creates a seat)
-    pub async fn join_context(
-        &self,
-        context_name: &str,
-        instance: &str,
-    ) -> Result<SeatInfo, RpcError> {
-        let mut request = self.kernel.join_context_request();
-        request.get().set_context_name(context_name);
-        request.get().set_instance(instance);
-        let response = request.send().promise.await?;
-        let seat = response.get()?.get_seat()?;
-        let id_reader = seat.get_id()?;
-
-        Ok(SeatInfo {
-            id: SeatId {
-                nick: id_reader.get_nick()?.to_string()?,
-                instance: id_reader.get_instance()?.to_string()?,
-                kernel: id_reader.get_kernel()?.to_string()?,
-                context: id_reader.get_context()?.to_string()?,
-            },
-            owner: seat.get_owner()?.to_string()?,
-            document_id: seat.get_document_id()?.to_string()?,
-        })
-    }
-
-    /// Leave current seat
-    pub async fn leave_seat(&self) -> Result<(), RpcError> {
-        let request = self.kernel.leave_seat_request();
-        request.send().promise.await?;
-        Ok(())
-    }
-
-    // =========================================================================
     // MCP Tool operations
     // =========================================================================
 
@@ -578,6 +623,143 @@ impl KernelHandle {
         request.send().promise.await?;
         Ok(())
     }
+}
+
+// ============================================================================
+// SeatHandle
+// ============================================================================
+
+/// Handle to an active seat
+pub struct SeatHandle {
+    handle: crate::kaijutsu_capnp::seat_handle::Client,
+    id: SeatId,
+}
+
+impl SeatHandle {
+    /// Get seat ID
+    pub fn id(&self) -> &SeatId {
+        &self.id
+    }
+
+    /// Get current seat state
+    pub async fn get_state(&self) -> Result<SeatInfo, RpcError> {
+        let request = self.handle.get_state_request();
+        let response = request.send().promise.await?;
+        let info = response.get()?.get_info()?;
+        parse_seat_info(&info)
+    }
+
+    /// Update cursor position
+    pub async fn update_cursor(&self, block_id: &str) -> Result<(), RpcError> {
+        let mut request = self.handle.update_cursor_request();
+        request.get().set_block_id(block_id);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Set seat status
+    pub async fn set_status(&self, status: SeatStatus) -> Result<(), RpcError> {
+        let mut request = self.handle.set_status_request();
+        request.get().set_status(match status {
+            SeatStatus::Active => crate::kaijutsu_capnp::SeatStatus::Active,
+            SeatStatus::Idle => crate::kaijutsu_capnp::SeatStatus::Idle,
+            SeatStatus::Away => crate::kaijutsu_capnp::SeatStatus::Away,
+        });
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Leave the seat
+    pub async fn leave(self) -> Result<(), RpcError> {
+        let request = self.handle.leave_request();
+        request.send().promise.await?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Helper to parse SeatInfo from Cap'n Proto
+fn parse_seat_info(
+    reader: &crate::kaijutsu_capnp::seat_info::Reader<'_>,
+) -> Result<SeatInfo, RpcError> {
+    let id_reader = reader.get_id()?;
+    let id = SeatId {
+        nick: id_reader.get_nick()?.to_string()?,
+        instance: id_reader.get_instance()?.to_string()?,
+        kernel: id_reader.get_kernel()?.to_string()?,
+        context: id_reader.get_context()?.to_string()?,
+    };
+
+    let status = match reader.get_status()? {
+        crate::kaijutsu_capnp::SeatStatus::Active => SeatStatus::Active,
+        crate::kaijutsu_capnp::SeatStatus::Idle => SeatStatus::Idle,
+        crate::kaijutsu_capnp::SeatStatus::Away => SeatStatus::Away,
+    };
+
+    let cursor_block = {
+        let s = reader.get_cursor_block()?.to_string()?;
+        if s.is_empty() { None } else { Some(s) }
+    };
+
+    Ok(SeatInfo {
+        id,
+        owner: reader.get_owner()?.to_string()?,
+        status,
+        last_activity: reader.get_last_activity(),
+        cursor_block,
+    })
+}
+
+/// Helper to parse Context from Cap'n Proto
+fn parse_context(
+    reader: &crate::kaijutsu_capnp::context::Reader<'_>,
+) -> Result<Context, RpcError> {
+    let name = reader.get_name()?.to_string()?;
+
+    let docs_reader = reader.get_documents()?;
+    let mut documents = Vec::with_capacity(docs_reader.len() as usize);
+    for doc in docs_reader.iter() {
+        documents.push(ContextDocument {
+            id: doc.get_id()?.to_string()?,
+            attached_by: doc.get_attached_by()?.to_string()?,
+            attached_at: doc.get_attached_at(),
+        });
+    }
+
+    let seats_reader = reader.get_seats()?;
+    let mut seats = Vec::with_capacity(seats_reader.len() as usize);
+    for seat in seats_reader.iter() {
+        seats.push(parse_seat_info(&seat)?);
+    }
+
+    Ok(Context {
+        name,
+        documents,
+        seats,
+    })
+}
+
+/// Helper to parse KernelInfo from Cap'n Proto
+fn parse_kernel_info(
+    reader: &crate::kaijutsu_capnp::kernel_info::Reader<'_>,
+) -> Result<KernelInfo, RpcError> {
+    let contexts_reader = reader.get_contexts()?;
+    let mut contexts = Vec::with_capacity(contexts_reader.len() as usize);
+    for ctx in contexts_reader.iter() {
+        contexts.push(parse_context(&ctx)?);
+    }
+
+    Ok(KernelInfo {
+        id: reader.get_id()?.to_string()?,
+        name: reader.get_name()?.to_string()?,
+        user_count: reader.get_user_count(),
+        agent_count: reader.get_agent_count(),
+        contexts,
+        seat_count: reader.get_seat_count(),
+    })
 }
 
 /// Helper to parse block ID from Cap'n Proto

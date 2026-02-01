@@ -65,4 +65,11 @@ pub use flows::{
     matches_pattern, shared_block_flow_bus,
     // Resource flow types
     ResourceFlow, SharedResourceFlowBus, shared_resource_flow_bus,
+    // Progress flow types
+    ProgressFlow, SharedProgressFlowBus, shared_progress_flow_bus,
+    // Elicitation flow types
+    ElicitationFlow, ElicitationAction, ElicitationResponse,
+    SharedElicitationFlowBus, shared_elicitation_flow_bus,
+    // Logging flow types
+    LoggingFlow, SharedLoggingFlowBus, shared_logging_flow_bus,
 };

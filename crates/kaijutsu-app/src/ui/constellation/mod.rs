@@ -290,7 +290,7 @@ fn track_seat_events(
     for event in events.read() {
         match event {
             ConnectionEvent::SeatTaken { seat } => {
-                info!("Constellation: Adding node for context '{}' (doc: {})", seat.id.context, seat.document_id);
+                info!("Constellation: Adding node for context '{}' (kernel: {})", seat.id.context, seat.id.kernel);
                 constellation.add_node(seat.clone());
             }
             ConnectionEvent::SeatLeft => {

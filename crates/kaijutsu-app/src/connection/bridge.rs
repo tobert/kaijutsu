@@ -419,6 +419,7 @@ async fn connection_loop(
     let mut _ssh_client: Option<SshClient> = None;
     let mut rpc_client: Option<RpcClient> = None;
     let mut current_kernel: Option<KernelHandle> = None;
+    let mut current_seat: Option<kaijutsu_client::SeatHandle> = None;
 
     loop {
         let Some(cmd) = cmd_rx.recv().await else {
@@ -713,35 +714,44 @@ async fn connection_loop(
             ConnectionCommand::JoinContext { context, instance } => {
                 if let Some(kernel) = &current_kernel {
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
-                        Ok(Ok(seat)) => {
-                            // Use the document_id provided by the server (kernel's main document)
-                            let document_id = seat.document_id.clone();
+                        Ok(Ok(handle)) => {
+                            // Get SeatInfo from the handle
+                            match handle.get_state().await {
+                                Ok(seat_info) => {
+                                    // Use the kernel's main document for this context
+                                    let document_id = format!("{}@{}", seat_info.id.kernel, seat_info.id.context);
 
-                            // Send SeatTaken FIRST - dashboard sets up conversation
-                            let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                                    // Send SeatTaken FIRST - dashboard sets up conversation
+                                    let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat: seat_info });
 
-                            // THEN fetch initial document state for frontier-based sync
-                            // This provides the full oplog so the client can merge incremental ops
-                            // Must come after SeatTaken so the document exists when we sync
-                            match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
-                                Ok(Ok(state)) => {
-                                    log::info!(
-                                        "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
-                                        document_id,
-                                        state.blocks.len(),
-                                        state.ops.len()
-                                    );
-                                    let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
-                                        cell_id: state.document_id,
-                                        ops: state.ops,
-                                        blocks: state.blocks,
-                                    });
+                                    // Store the seat handle for later leave operations
+                                    current_seat = Some(handle);
+
+                                    // THEN fetch initial document state for frontier-based sync
+                                    match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
+                                        Ok(Ok(state)) => {
+                                            log::info!(
+                                                "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
+                                                document_id,
+                                                state.blocks.len(),
+                                                state.ops.len()
+                                            );
+                                            let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
+                                                cell_id: state.document_id,
+                                                ops: state.ops,
+                                                blocks: state.blocks,
+                                            });
+                                        }
+                                        Ok(Err(e)) => {
+                                            log::warn!("Failed to get initial block state: {}", e);
+                                        }
+                                        Err(_) => {
+                                            log::warn!("get_document_state timed out for {}", document_id);
+                                        }
+                                    }
                                 }
-                                Ok(Err(e)) => {
-                                    log::warn!("Failed to get initial block state: {}", e);
-                                }
-                                Err(_) => {
-                                    log::warn!("get_document_state timed out for {}", document_id);
+                                Err(e) => {
+                                    let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to get seat state: {}", e)));
                                 }
                             }
                         }
@@ -759,8 +769,8 @@ async fn connection_loop(
             }
 
             ConnectionCommand::LeaveSeat => {
-                if let Some(kernel) = &current_kernel {
-                    match timeout(RPC_TIMEOUT, kernel.leave_seat()).await {
+                if let Some(seat) = current_seat.take() {
+                    match timeout(RPC_TIMEOUT, seat.leave()).await {
                         Ok(Ok(())) => {
                             let _ = evt_tx.send(ConnectionEvent::SeatLeft);
                         }
@@ -773,7 +783,7 @@ async fn connection_loop(
                         }
                     }
                 } else {
-                    // If not attached, just send the event
+                    // If no current seat, just send the event
                     let _ = evt_tx.send(ConnectionEvent::SeatLeft);
                 }
             }
@@ -790,33 +800,44 @@ async fn connection_loop(
                     // TODO: Check if we need to switch kernels first
                     // For now, just join the context with the given instance
                     match timeout(RPC_TIMEOUT, kernel.join_context(&context, &instance)).await {
-                        Ok(Ok(seat)) => {
-                            // Use the document_id provided by the server (kernel's main document)
-                            let document_id = seat.document_id.clone();
+                        Ok(Ok(handle)) => {
+                            // Get SeatInfo from the handle
+                            match handle.get_state().await {
+                                Ok(seat_info) => {
+                                    // Use the kernel's main document for this context
+                                    let document_id = format!("{}@{}", seat_info.id.kernel, seat_info.id.context);
 
-                            // Send SeatTaken FIRST - dashboard sets up conversation
-                            let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat });
+                                    // Send SeatTaken FIRST - dashboard sets up conversation
+                                    let _ = evt_tx.send(ConnectionEvent::SeatTaken { seat: seat_info });
 
-                            // THEN fetch initial document state for frontier-based sync
-                            match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
-                                Ok(Ok(state)) => {
-                                    log::info!(
-                                        "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
-                                        document_id,
-                                        state.blocks.len(),
-                                        state.ops.len()
-                                    );
-                                    let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
-                                        cell_id: state.document_id,
-                                        ops: state.ops,
-                                        blocks: state.blocks,
-                                    });
+                                    // Store the seat handle for later leave operations
+                                    current_seat = Some(handle);
+
+                                    // THEN fetch initial document state for frontier-based sync
+                                    match timeout(RPC_TIMEOUT, kernel.get_document_state(&document_id)).await {
+                                        Ok(Ok(state)) => {
+                                            log::info!(
+                                                "Fetched initial state for document_id={}: {} blocks, {} bytes oplog",
+                                                document_id,
+                                                state.blocks.len(),
+                                                state.ops.len()
+                                            );
+                                            let _ = evt_tx.send(ConnectionEvent::BlockCellInitialState {
+                                                cell_id: state.document_id,
+                                                ops: state.ops,
+                                                blocks: state.blocks,
+                                            });
+                                        }
+                                        Ok(Err(e)) => {
+                                            log::warn!("Failed to get initial block state: {}", e);
+                                        }
+                                        Err(_) => {
+                                            log::warn!("get_document_state timed out for {}", document_id);
+                                        }
+                                    }
                                 }
-                                Ok(Err(e)) => {
-                                    log::warn!("Failed to get initial block state: {}", e);
-                                }
-                                Err(_) => {
-                                    log::warn!("get_document_state timed out for {}", document_id);
+                                Err(e) => {
+                                    let _ = evt_tx.send(ConnectionEvent::Error(format!("Failed to get seat state: {}", e)));
                                 }
                             }
                         }

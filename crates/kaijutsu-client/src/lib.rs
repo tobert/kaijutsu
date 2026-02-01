@@ -13,11 +13,10 @@ pub mod kaijutsu_capnp {
 }
 
 pub use rpc::{
-    Completion, CompletionKind, ConsentMode, Context, DocumentState, HistoryEntry, Identity,
-    KernelConfig, KernelHandle, KernelInfo, McpToolResult, MountSpec, RpcClient, RpcError, SeatId,
-    SeatInfo,
-    // MCP Resource types
-    McpResource, McpResourceContents,
+    Completion, CompletionKind, ConsentMode, Context, ContextDocument, DocumentState,
+    HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo, McpResource,
+    McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, SeatHandle,
+    SeatId, SeatInfo, SeatStatus,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 

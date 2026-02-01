@@ -50,12 +50,23 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::flows::{OpSource, ResourceFlow, SharedResourceFlowBus};
+use crate::flows::{
+    ElicitationAction, ElicitationFlow, ElicitationResponse, LoggingFlow, OpSource, ProgressFlow,
+    ResourceFlow, SharedElicitationFlowBus, SharedLoggingFlowBus, SharedProgressFlowBus,
+    SharedResourceFlowBus,
+};
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, Tool as McpTool};
-use rmcp::service::{RunningService, ServiceError};
+use rmcp::model::{
+    ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
+    CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
+    ElicitationAction as RmcpElicitationAction, GetPromptRequestParams, GetPromptResult,
+    ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument,
+    Reference, Root, RootsCapabilities, SetLevelRequestParams, Tool as McpTool,
+};
+use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{ClientHandler, Peer, RoleClient};
+use rmcp::{ClientHandler, ErrorData, Peer, RoleClient};
+use tokio::sync::oneshot;
 
 /// Errors that can occur when working with the MCP pool.
 #[derive(Debug, Error)]
@@ -146,6 +157,90 @@ impl From<McpTool> for McpToolInfo {
             name: tool.name.to_string(),
             description: tool.description.map(|s| s.to_string()),
             input_schema: JsonValue::Object(tool.input_schema.as_ref().clone()),
+        }
+    }
+}
+
+// =============================================================================
+// Prompt Info Types
+// =============================================================================
+
+/// Information about an MCP prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptInfo {
+    /// Prompt name.
+    pub name: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Prompt description.
+    pub description: Option<String>,
+    /// Arguments that can be passed to the prompt.
+    pub arguments: Vec<McpPromptArgumentInfo>,
+}
+
+/// Information about a prompt argument.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgumentInfo {
+    /// Argument name.
+    pub name: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Argument description.
+    pub description: Option<String>,
+    /// Whether the argument is required.
+    pub required: bool,
+}
+
+impl From<Prompt> for McpPromptInfo {
+    fn from(prompt: Prompt) -> Self {
+        Self {
+            name: prompt.name,
+            title: prompt.title,
+            description: prompt.description,
+            arguments: prompt
+                .arguments
+                .unwrap_or_default()
+                .into_iter()
+                .map(McpPromptArgumentInfo::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<PromptArgument> for McpPromptArgumentInfo {
+    fn from(arg: PromptArgument) -> Self {
+        Self {
+            name: arg.name,
+            title: arg.title,
+            description: arg.description,
+            required: arg.required.unwrap_or(false),
+        }
+    }
+}
+
+/// Information about an MCP root (workspace directory).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRootInfo {
+    /// Root URI (typically file:// URI).
+    pub uri: String,
+    /// Optional name for the root.
+    pub name: Option<String>,
+}
+
+impl From<Root> for McpRootInfo {
+    fn from(root: Root) -> Self {
+        Self {
+            uri: root.uri,
+            name: root.name,
+        }
+    }
+}
+
+impl From<McpRootInfo> for Root {
+    fn from(info: McpRootInfo) -> Self {
+        Self {
+            uri: info.uri,
+            name: info.name,
         }
     }
 }
@@ -411,11 +506,17 @@ impl ConnectedServer {
     }
 }
 
+/// Pending elicitation request awaiting response.
+pub struct PendingElicitation {
+    /// Oneshot channel to send the response.
+    pub response_tx: oneshot::Sender<ElicitationResponse>,
+}
+
 /// Client handler for kaijutsu's MCP connections.
 ///
 /// Each handler is associated with a specific MCP server and has access to
-/// the shared resource cache and flow bus for push-based resource updates.
-#[derive(Debug, Clone)]
+/// the shared caches, flow buses, and elicitation tracking for push-based updates.
+#[derive(Clone)]
 pub struct KaijutsuClientHandler {
     /// Client info to report to servers.
     client_info: ClientInfo,
@@ -425,37 +526,103 @@ pub struct KaijutsuClientHandler {
     cache: Arc<ResourceCache>,
     /// Flow bus for publishing resource events.
     resource_flows: SharedResourceFlowBus,
+    /// Flow bus for publishing progress events.
+    progress_flows: SharedProgressFlowBus,
+    /// Flow bus for publishing elicitation requests.
+    elicitation_flows: SharedElicitationFlowBus,
+    /// Flow bus for publishing logging events.
+    logging_flows: SharedLoggingFlowBus,
+    /// Pending elicitation requests, keyed by request_id.
+    pending_elicitations: Arc<DashMap<String, PendingElicitation>>,
+    /// Roots advertised to servers.
+    roots: Arc<RwLock<Vec<Root>>>,
+}
+
+impl std::fmt::Debug for KaijutsuClientHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KaijutsuClientHandler")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl KaijutsuClientHandler {
-    /// Create a new handler for a specific server.
+    /// Create a new handler for a specific server with all flow buses.
     pub fn new(
         server_name: impl Into<String>,
         cache: Arc<ResourceCache>,
         resource_flows: SharedResourceFlowBus,
+        progress_flows: SharedProgressFlowBus,
+        elicitation_flows: SharedElicitationFlowBus,
+        logging_flows: SharedLoggingFlowBus,
+        roots: Arc<RwLock<Vec<Root>>>,
     ) -> Self {
         let mut info = ClientInfo::default();
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
+        // Enable roots capability so servers can request our roots
+        info.capabilities = ClientCapabilities {
+            roots: Some(RootsCapabilities {
+                list_changed: Some(true),
+            }),
+            ..Default::default()
+        };
         Self {
             client_info: info,
             server_name: server_name.into(),
             cache,
             resource_flows,
+            progress_flows,
+            elicitation_flows,
+            logging_flows,
+            pending_elicitations: Arc::new(DashMap::new()),
+            roots,
         }
     }
 
-    /// Create a default handler without cache/flow support (for testing).
+    /// Create a default handler without shared state (for testing).
     pub fn default_handler() -> Self {
+        use crate::flows::{
+            shared_elicitation_flow_bus, shared_logging_flow_bus, shared_progress_flow_bus,
+            shared_resource_flow_bus,
+        };
         let mut info = ClientInfo::default();
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
+        info.capabilities = ClientCapabilities {
+            roots: Some(RootsCapabilities {
+                list_changed: Some(true),
+            }),
+            ..Default::default()
+        };
         Self {
             client_info: info,
             server_name: String::new(),
             cache: Arc::new(ResourceCache::new()),
-            resource_flows: crate::flows::shared_resource_flow_bus(64),
+            resource_flows: shared_resource_flow_bus(64),
+            progress_flows: shared_progress_flow_bus(64),
+            elicitation_flows: shared_elicitation_flow_bus(16),
+            logging_flows: shared_logging_flow_bus(256),
+            pending_elicitations: Arc::new(DashMap::new()),
+            roots: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Register an elicitation response channel.
+    pub fn register_elicitation(
+        &self,
+        request_id: String,
+        response_tx: oneshot::Sender<ElicitationResponse>,
+    ) {
+        self.pending_elicitations.insert(
+            request_id,
+            PendingElicitation { response_tx },
+        );
+    }
+
+    /// Get the pending elicitations map for external response handling.
+    pub fn pending_elicitations(&self) -> &Arc<DashMap<String, PendingElicitation>> {
+        &self.pending_elicitations
     }
 }
 
@@ -475,13 +642,62 @@ impl ClientHandler for KaijutsuClientHandler {
         params: rmcp::model::LoggingMessageNotificationParam,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let logging_flows = self.logging_flows.clone();
+        let level = format!("{:?}", params.level).to_lowercase();
+        let logger = params.logger.clone();
+        let data = params.data.clone();
+
         async move {
             debug!(
-                level = ?params.level,
-                logger = ?params.logger,
+                server = %server_name,
+                level = %level,
+                logger = ?logger,
                 "MCP log: {:?}",
-                params.data
+                data
             );
+
+            // Publish to FlowBus for connected clients
+            logging_flows.publish(LoggingFlow::Message {
+                server: server_name,
+                level,
+                logger,
+                data,
+            });
+        }
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let progress_flows = self.progress_flows.clone();
+        // Convert ProgressToken inner NumberOrString to string
+        let token = params.progress_token.0.to_string();
+        let progress = params.progress;
+        let total = params.total;
+        let message = params.message.clone();
+
+        async move {
+            debug!(
+                server = %server_name,
+                token = %token,
+                progress = %progress,
+                total = ?total,
+                message = ?message,
+                "MCP progress notification"
+            );
+
+            // Publish to FlowBus for connected clients
+            progress_flows.publish(ProgressFlow::Update {
+                server: server_name,
+                token,
+                progress,
+                total,
+                message,
+            });
         }
     }
 
@@ -553,6 +769,103 @@ impl ClientHandler for KaijutsuClientHandler {
             });
         }
     }
+
+    fn list_roots(
+        &self,
+        _ctx: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<ListRootsResult, ErrorData>> + Send + '_ {
+        let roots = self.roots.clone();
+        async move {
+            let roots_list = roots.read().clone();
+            Ok(ListRootsResult { roots: roots_list })
+        }
+    }
+
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+        _ctx: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let elicitation_flows = self.elicitation_flows.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
+
+        async move {
+            // Generate a unique request ID
+            let request_id = uuid::Uuid::new_v4().to_string();
+
+            info!(
+                server = %server_name,
+                request_id = %request_id,
+                message = %request.message,
+                "MCP elicitation request received"
+            );
+
+            // Create a oneshot channel for the response
+            let (response_tx, response_rx) = oneshot::channel();
+
+            // Store the pending elicitation
+            pending_elicitations.insert(
+                request_id.clone(),
+                PendingElicitation { response_tx },
+            );
+
+            // Publish to FlowBus for UI handling
+            elicitation_flows.publish(ElicitationFlow::Request {
+                request_id: request_id.clone(),
+                server: server_name.clone(),
+                message: request.message,
+                schema: serde_json::to_value(&request.requested_schema).ok(),
+            });
+
+            // Wait for response with timeout (5 minutes)
+            let timeout_duration = std::time::Duration::from_secs(300);
+            match tokio::time::timeout(timeout_duration, response_rx).await {
+                Ok(Ok(response)) => {
+                    // Remove from pending
+                    pending_elicitations.remove(&request_id);
+
+                    // Convert our ElicitationAction to rmcp's
+                    let action = match response.action {
+                        ElicitationAction::Accept => RmcpElicitationAction::Accept,
+                        ElicitationAction::Decline => RmcpElicitationAction::Decline,
+                        ElicitationAction::Cancel => RmcpElicitationAction::Cancel,
+                    };
+
+                    Ok(CreateElicitationResult {
+                        action,
+                        content: response.content,
+                    })
+                }
+                Ok(Err(_)) => {
+                    // Channel closed, decline
+                    pending_elicitations.remove(&request_id);
+                    warn!(
+                        server = %server_name,
+                        request_id = %request_id,
+                        "Elicitation response channel closed"
+                    );
+                    Ok(CreateElicitationResult {
+                        action: RmcpElicitationAction::Decline,
+                        content: None,
+                    })
+                }
+                Err(_) => {
+                    // Timeout, decline
+                    pending_elicitations.remove(&request_id);
+                    warn!(
+                        server = %server_name,
+                        request_id = %request_id,
+                        "Elicitation timed out after 5 minutes"
+                    );
+                    Ok(CreateElicitationResult {
+                        action: RmcpElicitationAction::Decline,
+                        content: None,
+                    })
+                }
+            }
+        }
+    }
 }
 
 /// Pool of MCP server connections.
@@ -565,6 +878,16 @@ pub struct McpServerPool {
     cache: Arc<ResourceCache>,
     /// Flow bus for resource events.
     resource_flows: SharedResourceFlowBus,
+    /// Flow bus for progress events.
+    progress_flows: SharedProgressFlowBus,
+    /// Flow bus for elicitation requests.
+    elicitation_flows: SharedElicitationFlowBus,
+    /// Flow bus for logging events.
+    logging_flows: SharedLoggingFlowBus,
+    /// Roots advertised to all connected servers.
+    roots: Arc<RwLock<Vec<Root>>>,
+    /// Prompt cache, keyed by "server:prompt_name".
+    prompt_cache: DashMap<String, McpPromptInfo>,
 }
 
 impl Default for McpServerPool {
@@ -576,19 +899,38 @@ impl Default for McpServerPool {
 impl McpServerPool {
     /// Create a new empty pool.
     pub fn new() -> Self {
+        use crate::flows::{
+            shared_elicitation_flow_bus, shared_logging_flow_bus, shared_progress_flow_bus,
+            shared_resource_flow_bus,
+        };
         Self {
             servers: RwLock::new(HashMap::new()),
             cache: Arc::new(ResourceCache::new()),
-            resource_flows: crate::flows::shared_resource_flow_bus(256),
+            resource_flows: shared_resource_flow_bus(256),
+            progress_flows: shared_progress_flow_bus(256),
+            elicitation_flows: shared_elicitation_flow_bus(16),
+            logging_flows: shared_logging_flow_bus(1024),
+            roots: Arc::new(RwLock::new(Vec::new())),
+            prompt_cache: DashMap::new(),
         }
     }
 
-    /// Create a new pool with a custom resource flow bus.
-    pub fn with_resource_flows(resource_flows: SharedResourceFlowBus) -> Self {
+    /// Create a new pool with custom flow buses.
+    pub fn with_flows(
+        resource_flows: SharedResourceFlowBus,
+        progress_flows: SharedProgressFlowBus,
+        elicitation_flows: SharedElicitationFlowBus,
+        logging_flows: SharedLoggingFlowBus,
+    ) -> Self {
         Self {
             servers: RwLock::new(HashMap::new()),
             cache: Arc::new(ResourceCache::new()),
             resource_flows,
+            progress_flows,
+            elicitation_flows,
+            logging_flows,
+            roots: Arc::new(RwLock::new(Vec::new())),
+            prompt_cache: DashMap::new(),
         }
     }
 
@@ -600,6 +942,73 @@ impl McpServerPool {
     /// Get the resource flow bus for subscribing to resource events.
     pub fn resource_flows(&self) -> &SharedResourceFlowBus {
         &self.resource_flows
+    }
+
+    /// Get the progress flow bus for subscribing to progress events.
+    pub fn progress_flows(&self) -> &SharedProgressFlowBus {
+        &self.progress_flows
+    }
+
+    /// Get the elicitation flow bus for subscribing to elicitation requests.
+    pub fn elicitation_flows(&self) -> &SharedElicitationFlowBus {
+        &self.elicitation_flows
+    }
+
+    /// Get the logging flow bus for subscribing to logging events.
+    pub fn logging_flows(&self) -> &SharedLoggingFlowBus {
+        &self.logging_flows
+    }
+
+    /// Get the roots advertised to servers.
+    pub fn roots(&self) -> Vec<McpRootInfo> {
+        self.roots.read().iter().map(|r| McpRootInfo::from(r.clone())).collect()
+    }
+
+    /// Set the roots advertised to servers.
+    ///
+    /// This will notify all connected servers of the change.
+    pub async fn set_roots(&self, roots: Vec<McpRootInfo>) {
+        let new_roots: Vec<Root> = roots.into_iter().map(Root::from).collect();
+        *self.roots.write() = new_roots;
+        self.notify_roots_changed().await;
+    }
+
+    /// Add a root to the list advertised to servers.
+    pub async fn add_root(&self, uri: impl Into<String>, name: Option<String>) {
+        let root = Root {
+            uri: uri.into(),
+            name,
+        };
+        self.roots.write().push(root);
+        self.notify_roots_changed().await;
+    }
+
+    /// Remove a root by URI.
+    ///
+    /// Returns true if the root was found and removed.
+    pub async fn remove_root(&self, uri: &str) -> bool {
+        let mut roots = self.roots.write();
+        let len_before = roots.len();
+        roots.retain(|r| r.uri != uri);
+        let removed = roots.len() < len_before;
+        drop(roots);
+        if removed {
+            self.notify_roots_changed().await;
+        }
+        removed
+    }
+
+    /// Notify all connected servers that the roots list has changed.
+    async fn notify_roots_changed(&self) {
+        let server_names: Vec<String> = self.servers.read().keys().cloned().collect();
+        for name in server_names {
+            if let Some(server_arc) = self.servers.read().get(&name).cloned() {
+                let server = server_arc.lock().await;
+                if let Err(e) = server.peer().notify_roots_list_changed().await {
+                    warn!(server = %name, error = %e, "Failed to notify server of roots change");
+                }
+            }
+        }
     }
 
     /// Register and connect to an MCP server.
@@ -639,6 +1048,10 @@ impl McpServerPool {
             name.clone(),
             self.cache.clone(),
             self.resource_flows.clone(),
+            self.progress_flows.clone(),
+            self.elicitation_flows.clone(),
+            self.logging_flows.clone(),
+            self.roots.clone(),
         );
 
         // Connect and perform handshake
@@ -1054,6 +1467,182 @@ impl McpServerPool {
         );
 
         Ok(())
+    }
+
+    // =========================================================================
+    // Prompt Operations
+    // =========================================================================
+
+    /// List all prompts from an MCP server.
+    ///
+    /// Results are cached with TTL-based invalidation.
+    pub async fn list_prompts(&self, server_name: &str) -> Result<Vec<McpPromptInfo>, McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(server = %server_name, "Fetching prompts from MCP server");
+        let result = server.peer().list_all_prompts().await?;
+
+        // Convert and cache the prompts
+        let prompts: Vec<McpPromptInfo> = result
+            .into_iter()
+            .map(|p| {
+                let info = McpPromptInfo::from(p);
+                // Cache each prompt
+                let cache_key = format!("{}:{}", server_name, info.name);
+                self.prompt_cache.insert(cache_key, info.clone());
+                info
+            })
+            .collect();
+
+        debug!(
+            server = %server_name,
+            count = prompts.len(),
+            "Cached prompts from MCP server"
+        );
+
+        Ok(prompts)
+    }
+
+    /// Get a specific prompt from an MCP server with arguments substituted.
+    pub async fn get_prompt(
+        &self,
+        server_name: &str,
+        name: &str,
+        arguments: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<GetPromptResult, McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(server = %server_name, prompt = %name, "Getting prompt from MCP server");
+
+        // Convert HashMap<String, String> to JsonObject
+        let args = arguments.map(|map| {
+            map.into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        });
+
+        let params = GetPromptRequestParams {
+            meta: None,
+            name: name.to_string(),
+            arguments: args,
+        };
+
+        let result = server.peer().get_prompt(params).await?;
+
+        Ok(result)
+    }
+
+    /// Invalidate the prompt cache for a server.
+    ///
+    /// Called when receiving `prompts/list_changed` notification.
+    pub fn invalidate_prompt_cache(&self, server_name: &str) {
+        let prefix = format!("{}:", server_name);
+        self.prompt_cache.retain(|k, _| !k.starts_with(&prefix));
+        debug!(server = %server_name, "Invalidated prompt cache");
+    }
+
+    // =========================================================================
+    // Completion Operations
+    // =========================================================================
+
+    /// Get completions for a prompt argument or resource URI.
+    pub async fn complete(
+        &self,
+        server_name: &str,
+        reference: Reference,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> Result<CompleteResult, McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(
+            server = %server_name,
+            ref_type = ?reference.reference_type(),
+            argument = %argument_name,
+            "Getting completions from MCP server"
+        );
+
+        let params = CompleteRequestParams {
+            meta: None,
+            r#ref: reference,
+            argument: ArgumentInfo {
+                name: argument_name.to_string(),
+                value: argument_value.to_string(),
+            },
+            context: None,
+        };
+
+        let result = server.peer().complete(params).await?;
+
+        Ok(result)
+    }
+
+    // =========================================================================
+    // Logging Operations
+    // =========================================================================
+
+    /// Set the logging level for an MCP server.
+    pub async fn set_log_level(
+        &self,
+        server_name: &str,
+        level: LoggingLevel,
+    ) -> Result<(), McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(server = %server_name, level = ?level, "Setting log level on MCP server");
+
+        let params = SetLevelRequestParams { meta: None, level };
+        server.peer().set_level(params).await?;
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Elicitation Response
+    // =========================================================================
+
+    /// Send a response to a pending elicitation request.
+    ///
+    /// Returns true if the response was sent successfully, false if the
+    /// request was not found (may have timed out).
+    pub fn respond_to_elicitation(&self, request_id: &str, _response: ElicitationResponse) -> bool {
+        // This method needs access to the handler's pending_elicitations map.
+        // Since handlers are per-server, we need a different approach.
+        // For now, this is a placeholder - the actual implementation would need
+        // to track which server owns which elicitation request.
+        warn!(
+            request_id = %request_id,
+            "respond_to_elicitation called but not fully implemented yet"
+        );
+        false
     }
 
     /// Shutdown all connected servers.

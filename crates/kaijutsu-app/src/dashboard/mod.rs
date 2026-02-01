@@ -371,9 +371,9 @@ fn handle_dashboard_events(
                 // BlockCellInitialState event (sent after SeatTaken) sets up the document
                 // from full oplog and establishes the frontier for incremental sync.
 
-                // Use the document_id from the seat (server provides the main document ID)
+                // Derive document_id from kernel and context
                 // This ensures the client uses the same document_id the server uses for BlockInserted events
-                let document_id = seat.document_id.clone();
+                let document_id = format!("{}@{}", seat.id.kernel, seat.id.context);
 
                 // Idempotency: Only create conversation if it doesn't already exist.
                 // Duplicate SeatTaken events (e.g., from dialog input leak) must NOT

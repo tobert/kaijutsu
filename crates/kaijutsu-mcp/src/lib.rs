@@ -136,11 +136,15 @@ impl KaijutsuMcp {
 
         let client = connect_ssh(config).await?;
         let kernel = client.attach_kernel(kernel_id).await?;
-        let seat = kernel.join_context("default", "mcp-server").await?;
+        let seat_handle = kernel.join_context("default", "mcp-server").await?;
+        let seat_info = seat_handle.get_state().await?;
+
+        // Derive document_id from kernel and context
+        let document_id = format!("{}@{}", seat_info.id.kernel, seat_info.id.context);
 
         tracing::info!(
             kernel = %kernel_id,
-            document_id = %seat.document_id,
+            document_id = %document_id,
             "Connected to server"
         );
 
@@ -151,7 +155,7 @@ impl KaijutsuMcp {
         );
 
         // Sync document state from server
-        let doc_state = kernel.get_document_state(&seat.document_id).await?;
+        let doc_state = kernel.get_document_state(&document_id).await?;
 
         // Create the document from the server's oplog
         if !doc_state.ops.is_empty() {
@@ -193,7 +197,7 @@ impl KaijutsuMcp {
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
-                document_id: seat.document_id,
+                document_id,
                 kernel_id: kernel_id.to_string(),
                 store,
                 host: host.to_string(),

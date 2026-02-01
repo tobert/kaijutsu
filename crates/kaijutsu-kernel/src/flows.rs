@@ -561,6 +561,203 @@ impl HasSubject for ResourceFlow {
 }
 
 // ============================================================================
+// Progress Flow Events
+// ============================================================================
+
+/// Progress notification events from MCP servers during long-running operations.
+///
+/// These events are emitted when MCP servers send progress updates during tool calls
+/// or other long operations. The push model ensures clients can show real-time progress.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ProgressFlow {
+    /// Progress update during an operation.
+    Update {
+        /// The MCP server name.
+        server: String,
+        /// Progress token identifying the operation.
+        token: String,
+        /// Current progress value.
+        progress: f64,
+        /// Total value if known.
+        total: Option<f64>,
+        /// Human-readable message.
+        message: Option<String>,
+    },
+}
+
+impl ProgressFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Update { .. } => "progress.update",
+        }
+    }
+
+    /// Get the server name for this event.
+    pub fn server(&self) -> &str {
+        match self {
+            Self::Update { server, .. } => server,
+        }
+    }
+}
+
+impl HasSubject for ProgressFlow {
+    fn subject(&self) -> &str {
+        ProgressFlow::subject(self)
+    }
+}
+
+// ============================================================================
+// Elicitation Flow Events
+// ============================================================================
+
+/// Action to take in response to an elicitation request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElicitationAction {
+    /// Accept the elicitation with provided content.
+    Accept,
+    /// Decline the elicitation.
+    Decline,
+    /// Cancel the elicitation.
+    Cancel,
+}
+
+impl Default for ElicitationAction {
+    fn default() -> Self {
+        Self::Decline
+    }
+}
+
+impl std::fmt::Display for ElicitationAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accept => write!(f, "accept"),
+            Self::Decline => write!(f, "decline"),
+            Self::Cancel => write!(f, "cancel"),
+        }
+    }
+}
+
+impl std::str::FromStr for ElicitationAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "accept" => Ok(Self::Accept),
+            "decline" => Ok(Self::Decline),
+            "cancel" => Ok(Self::Cancel),
+            _ => Err(format!("invalid elicitation action: {}", s)),
+        }
+    }
+}
+
+/// Response to an elicitation request.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ElicitationResponse {
+    /// Action taken (accept, decline, cancel).
+    pub action: ElicitationAction,
+    /// Content provided if action is Accept.
+    pub content: Option<serde_json::Value>,
+}
+
+/// Elicitation request events from MCP servers that require client response.
+///
+/// These events are emitted when MCP servers need user input or confirmation.
+/// The server waits for a response through the provided oneshot channel.
+///
+/// Note: The response_tx is not serializable, so ElicitationFlow itself
+/// uses a separate request_id for tracking. The actual channel is managed
+/// by the McpServerPool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ElicitationFlow {
+    /// Elicitation request from a server.
+    Request {
+        /// Unique identifier for this request.
+        request_id: String,
+        /// The MCP server name.
+        server: String,
+        /// Human-readable message/prompt.
+        message: String,
+        /// JSON Schema for expected response format (if any).
+        schema: Option<serde_json::Value>,
+    },
+}
+
+impl ElicitationFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Request { .. } => "elicitation.request",
+        }
+    }
+
+    /// Get the server name for this event.
+    pub fn server(&self) -> &str {
+        match self {
+            Self::Request { server, .. } => server,
+        }
+    }
+
+    /// Get the request ID for this event.
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Request { request_id, .. } => request_id,
+        }
+    }
+}
+
+impl HasSubject for ElicitationFlow {
+    fn subject(&self) -> &str {
+        ElicitationFlow::subject(self)
+    }
+}
+
+// ============================================================================
+// Logging Flow Events
+// ============================================================================
+
+/// Log message events from MCP servers.
+///
+/// While logging can be polled, this provides an optional push mechanism
+/// for clients that want real-time log streaming.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LoggingFlow {
+    /// Log message from an MCP server.
+    Message {
+        /// The MCP server name.
+        server: String,
+        /// Log level (debug, info, warning, error).
+        level: String,
+        /// Logger name (if available).
+        logger: Option<String>,
+        /// Log data (typically JSON).
+        data: serde_json::Value,
+    },
+}
+
+impl LoggingFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Message { .. } => "logging.message",
+        }
+    }
+
+    /// Get the server name for this event.
+    pub fn server(&self) -> &str {
+        match self {
+            Self::Message { server, .. } => server,
+        }
+    }
+}
+
+impl HasSubject for LoggingFlow {
+    fn subject(&self) -> &str {
+        LoggingFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
@@ -570,6 +767,15 @@ pub type SharedBlockFlowBus = Arc<FlowBus<BlockFlow>>;
 /// Thread-safe handle to a ResourceFlow bus.
 pub type SharedResourceFlowBus = Arc<FlowBus<ResourceFlow>>;
 
+/// Thread-safe handle to a ProgressFlow bus.
+pub type SharedProgressFlowBus = Arc<FlowBus<ProgressFlow>>;
+
+/// Thread-safe handle to an ElicitationFlow bus.
+pub type SharedElicitationFlowBus = Arc<FlowBus<ElicitationFlow>>;
+
+/// Thread-safe handle to a LoggingFlow bus.
+pub type SharedLoggingFlowBus = Arc<FlowBus<LoggingFlow>>;
+
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
     Arc::new(FlowBus::new(capacity))
@@ -577,6 +783,21 @@ pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
 
 /// Create a new shared resource flow bus.
 pub fn shared_resource_flow_bus(capacity: usize) -> SharedResourceFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared progress flow bus.
+pub fn shared_progress_flow_bus(capacity: usize) -> SharedProgressFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared elicitation flow bus.
+pub fn shared_elicitation_flow_bus(capacity: usize) -> SharedElicitationFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared logging flow bus.
+pub fn shared_logging_flow_bus(capacity: usize) -> SharedLoggingFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
@@ -766,5 +987,132 @@ mod tests {
 
         let _sub = bus.subscribe("block.*");
         assert_eq!(bus.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn test_progress_flow_subjects() {
+        let flow = ProgressFlow::Update {
+            server: "test-server".into(),
+            token: "token-123".into(),
+            progress: 50.0,
+            total: Some(100.0),
+            message: Some("Processing...".into()),
+        };
+
+        assert_eq!(flow.subject(), "progress.update");
+        assert_eq!(flow.server(), "test-server");
+    }
+
+    #[tokio::test]
+    async fn test_progress_flow_publish_subscribe() {
+        let bus = shared_progress_flow_bus(16);
+        let mut sub = bus.subscribe("progress.*");
+
+        bus.publish(ProgressFlow::Update {
+            server: "git".into(),
+            token: "op-1".into(),
+            progress: 25.0,
+            total: Some(100.0),
+            message: Some("Cloning...".into()),
+        });
+
+        let msg = sub.try_recv().expect("should have message");
+        assert_eq!(msg.subject, "progress.update");
+        match msg.payload {
+            ProgressFlow::Update { server, progress, .. } => {
+                assert_eq!(server, "git");
+                assert!((progress - 25.0).abs() < f64::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn test_elicitation_action_parsing() {
+        assert_eq!("accept".parse::<ElicitationAction>().unwrap(), ElicitationAction::Accept);
+        assert_eq!("decline".parse::<ElicitationAction>().unwrap(), ElicitationAction::Decline);
+        assert_eq!("cancel".parse::<ElicitationAction>().unwrap(), ElicitationAction::Cancel);
+        assert_eq!("ACCEPT".parse::<ElicitationAction>().unwrap(), ElicitationAction::Accept);
+        assert!("invalid".parse::<ElicitationAction>().is_err());
+    }
+
+    #[test]
+    fn test_elicitation_flow_subjects() {
+        let flow = ElicitationFlow::Request {
+            request_id: "req-123".into(),
+            server: "auth-server".into(),
+            message: "Please confirm".into(),
+            schema: None,
+        };
+
+        assert_eq!(flow.subject(), "elicitation.request");
+        assert_eq!(flow.server(), "auth-server");
+        assert_eq!(flow.request_id(), "req-123");
+    }
+
+    #[tokio::test]
+    async fn test_elicitation_flow_publish_subscribe() {
+        let bus = shared_elicitation_flow_bus(16);
+        let mut sub = bus.subscribe("elicitation.*");
+
+        bus.publish(ElicitationFlow::Request {
+            request_id: "req-1".into(),
+            server: "oauth".into(),
+            message: "Enter code".into(),
+            schema: Some(serde_json::json!({"type": "string"})),
+        });
+
+        let msg = sub.try_recv().expect("should have message");
+        assert_eq!(msg.subject, "elicitation.request");
+        match msg.payload {
+            ElicitationFlow::Request { request_id, server, message, schema } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(server, "oauth");
+                assert_eq!(message, "Enter code");
+                assert!(schema.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn test_logging_flow_subjects() {
+        let flow = LoggingFlow::Message {
+            server: "debug-server".into(),
+            level: "info".into(),
+            logger: Some("main".into()),
+            data: serde_json::json!({"event": "started"}),
+        };
+
+        assert_eq!(flow.subject(), "logging.message");
+        assert_eq!(flow.server(), "debug-server");
+    }
+
+    #[tokio::test]
+    async fn test_logging_flow_publish_subscribe() {
+        let bus = shared_logging_flow_bus(16);
+        let mut sub = bus.subscribe("logging.*");
+
+        bus.publish(LoggingFlow::Message {
+            server: "app".into(),
+            level: "warning".into(),
+            logger: None,
+            data: serde_json::json!("rate limit approaching"),
+        });
+
+        let msg = sub.try_recv().expect("should have message");
+        assert_eq!(msg.subject, "logging.message");
+        match msg.payload {
+            LoggingFlow::Message { server, level, logger, .. } => {
+                assert_eq!(server, "app");
+                assert_eq!(level, "warning");
+                assert!(logger.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_elicitation_response_default() {
+        let response = ElicitationResponse::default();
+        assert_eq!(response.action, ElicitationAction::Decline);
+        assert!(response.content.is_none());
     }
 }
