@@ -180,6 +180,21 @@ pub enum ConnectionEvent {
         tool: String,
         result: Result<serde_json::Value, String>,
     },
+
+    // MCP Resource events (push notifications from server)
+    /// A resource was updated on an MCP server
+    ResourceUpdated {
+        server: String,
+        uri: String,
+        /// Contents if available (may be None, requiring a fetch)
+        contents: Option<kaijutsu_client::McpResourceContents>,
+    },
+    /// An MCP server's resource list changed
+    ResourceListChanged {
+        server: String,
+        /// Resources if available (may be None, requiring a list call)
+        resources: Option<Vec<kaijutsu_client::McpResource>>,
+    },
 }
 
 /// Resource holding the command sender
@@ -501,6 +516,17 @@ async fn connection_loop(
                                 log::info!("Subscribed to block events for kernel {}", id);
                             }
 
+                            // Subscribe to MCP resource events for push notifications
+                            let res_callback = ResourceEventsCallback {
+                                evt_tx: evt_tx.clone(),
+                            };
+                            let res_client = capnp_rpc::new_client(res_callback);
+                            if let Err(e) = kernel.subscribe_mcp_resources(res_client).await {
+                                log::warn!("Resource subscription failed: {}", e);
+                            } else {
+                                log::info!("Subscribed to MCP resource events for kernel {}", id);
+                            }
+
                             current_kernel = Some(kernel);
                             let _ = evt_tx.send(ConnectionEvent::AttachedKernel(info));
                         }
@@ -540,6 +566,17 @@ async fn connection_loop(
                                     log::warn!("Block subscription failed: {}", e);
                                 } else {
                                     log::info!("Subscribed to block events for new kernel {}", info.id);
+                                }
+
+                                // Subscribe to MCP resource events for push notifications
+                                let res_callback = ResourceEventsCallback {
+                                    evt_tx: evt_tx.clone(),
+                                };
+                                let res_client = capnp_rpc::new_client(res_callback);
+                                if let Err(e) = kernel.subscribe_mcp_resources(res_client).await {
+                                    log::warn!("Resource subscription failed: {}", e);
+                                } else {
+                                    log::info!("Subscribed to MCP resource events for new kernel {}", info.id);
                                 }
 
                                 current_kernel = Some(kernel);
@@ -1208,4 +1245,151 @@ fn parse_block_snapshot(
         is_error: reader.get_is_error(),
         display_hint,
     })
+}
+
+// ============================================================================
+// Resource Events Callback
+// ============================================================================
+
+use kaijutsu_client::kaijutsu_capnp::resource_events;
+
+/// Callback struct for receiving MCP resource events from the server.
+struct ResourceEventsCallback {
+    evt_tx: mpsc::UnboundedSender<ConnectionEvent>,
+}
+
+#[allow(refining_impl_trait)]
+impl resource_events::Server for ResourceEventsCallback {
+    fn on_resource_updated(
+        self: Rc<Self>,
+        params: resource_events::OnResourceUpdatedParams,
+        _results: resource_events::OnResourceUpdatedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let server = match params.get_server() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let uri = match params.get_uri() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        // Parse contents if present
+        let contents = if params.get_has_contents() {
+            match params.get_contents() {
+                Ok(c) => parse_resource_contents(&c).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::ResourceUpdated {
+            server,
+            uri,
+            contents,
+        });
+        Promise::ok(())
+    }
+
+    fn on_resource_list_changed(
+        self: Rc<Self>,
+        params: resource_events::OnResourceListChangedParams,
+        _results: resource_events::OnResourceListChangedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let server = match params.get_server() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        // Parse resources if present
+        let resources = if params.get_has_resources() {
+            match params.get_resources() {
+                Ok(list) => {
+                    let mut result = Vec::with_capacity(list.len() as usize);
+                    for r in list.iter() {
+                        if let Ok(res) = parse_mcp_resource(&r) {
+                            result.push(res);
+                        }
+                    }
+                    Some(result)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let _ = self.evt_tx.send(ConnectionEvent::ResourceListChanged {
+            server,
+            resources,
+        });
+        Promise::ok(())
+    }
+}
+
+/// Helper to parse MCP resource from Cap'n Proto
+fn parse_mcp_resource(
+    reader: &kaijutsu_client::kaijutsu_capnp::mcp_resource::Reader<'_>,
+) -> Result<kaijutsu_client::McpResource, capnp::Error> {
+    Ok(kaijutsu_client::McpResource {
+        uri: reader.get_uri()?.to_str()?.to_owned(),
+        name: reader.get_name()?.to_str()?.to_owned(),
+        description: if reader.get_has_description() {
+            Some(reader.get_description()?.to_str()?.to_owned())
+        } else {
+            None
+        },
+        mime_type: if reader.get_has_mime_type() {
+            Some(reader.get_mime_type()?.to_str()?.to_owned())
+        } else {
+            None
+        },
+    })
+}
+
+/// Helper to parse MCP resource contents from Cap'n Proto
+fn parse_resource_contents(
+    reader: &kaijutsu_client::kaijutsu_capnp::mcp_resource_contents::Reader<'_>,
+) -> Result<kaijutsu_client::McpResourceContents, capnp::Error> {
+    let uri = reader.get_uri()?.to_str()?.to_owned();
+    let mime_type = if reader.get_has_mime_type() {
+        Some(reader.get_mime_type()?.to_str()?.to_owned())
+    } else {
+        None
+    };
+
+    use kaijutsu_client::kaijutsu_capnp::mcp_resource_contents::Which;
+    match reader.which()? {
+        Which::Text(text) => Ok(kaijutsu_client::McpResourceContents::Text {
+            uri,
+            mime_type,
+            text: text?.to_str()?.to_owned(),
+        }),
+        Which::Blob(blob) => Ok(kaijutsu_client::McpResourceContents::Blob {
+            uri,
+            mime_type,
+            blob: blob?.to_vec(),
+        }),
+    }
 }

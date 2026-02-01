@@ -2479,6 +2479,175 @@ impl kernel::Server for KernelImpl {
         results.get().set_ack_version(ack_version);
         Promise::ok(())
     }
+
+    // =========================================================================
+    // MCP Resource Operations
+    // =========================================================================
+
+    fn list_mcp_resources(
+        self: Rc<Self>,
+        params: kernel::ListMcpResourcesParams,
+        mut results: kernel::ListMcpResourcesResults,
+    ) -> Promise<(), capnp::Error> {
+        let server = pry!(pry!(pry!(params.get()).get_server()).to_str()).to_owned();
+        log::debug!("list_mcp_resources: server={}", server);
+
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+
+        Promise::from_future(async move {
+            match mcp_pool.list_resources(&server).await {
+                Ok(resources) => {
+                    let mut list = results.get().init_resources(resources.len() as u32);
+                    for (i, res) in resources.iter().enumerate() {
+                        let mut builder = list.reborrow().get(i as u32);
+                        builder.set_uri(&res.uri);
+                        builder.set_name(res.name.as_deref().unwrap_or(""));
+                        builder.set_has_description(res.description.is_some());
+                        if let Some(desc) = &res.description {
+                            builder.set_description(desc);
+                        }
+                        builder.set_has_mime_type(res.mime_type.is_some());
+                        if let Some(mime) = &res.mime_type {
+                            builder.set_mime_type(mime);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(capnp::Error::failed(format!(
+                    "failed to list resources: {}",
+                    e
+                ))),
+            }
+        })
+    }
+
+    fn read_mcp_resource(
+        self: Rc<Self>,
+        params: kernel::ReadMcpResourceParams,
+        mut results: kernel::ReadMcpResourceResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let server = pry!(pry!(params_reader.get_server()).to_str()).to_owned();
+        let uri = pry!(pry!(params_reader.get_uri()).to_str()).to_owned();
+        log::debug!("read_mcp_resource: server={}, uri={}", server, uri);
+
+        let mcp_pool = self.state.borrow().mcp_pool.clone();
+
+        Promise::from_future(async move {
+            match mcp_pool.read_resource(&server, &uri).await {
+                Ok(contents) => {
+                    results.get().set_has_contents(true);
+                    let mut contents_builder = results.get().init_contents();
+                    contents_builder.set_uri(&uri);
+
+                    match contents {
+                        kaijutsu_kernel::McpResourceContents::TextResourceContents {
+                            mime_type, text, ..
+                        } => {
+                            contents_builder.set_has_mime_type(mime_type.is_some());
+                            if let Some(mime) = &mime_type {
+                                contents_builder.set_mime_type(mime);
+                            }
+                            contents_builder.set_text(&text);
+                        }
+                        kaijutsu_kernel::McpResourceContents::BlobResourceContents {
+                            mime_type, blob, ..
+                        } => {
+                            contents_builder.set_has_mime_type(mime_type.is_some());
+                            if let Some(mime) = &mime_type {
+                                contents_builder.set_mime_type(mime);
+                            }
+                            // blob is base64-encoded string in rmcp, store as-is
+                            // (clients will need to decode)
+                            contents_builder.set_blob(blob.as_bytes());
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    results.get().set_has_contents(false);
+                    Err(capnp::Error::failed(format!(
+                        "failed to read resource: {}",
+                        e
+                    )))
+                }
+            }
+        })
+    }
+
+    fn subscribe_mcp_resources(
+        self: Rc<Self>,
+        params: kernel::SubscribeMcpResourcesParams,
+        _results: kernel::SubscribeMcpResourcesResults,
+    ) -> Promise<(), capnp::Error> {
+        let callback = pry!(pry!(params.get()).get_callback());
+
+        let state = self.state.borrow();
+        let mcp_pool = state.mcp_pool.clone();
+        let kernel_id = self.kernel_id.clone();
+        drop(state);
+
+        // Get the resource flow bus from the MCP pool
+        let resource_flows = mcp_pool.resource_flows().clone();
+
+        // Spawn a bridge task that forwards ResourceFlow events to the callback
+        // Use spawn_local because Cap'n Proto callbacks are not Send
+        tokio::task::spawn_local(async move {
+            let mut sub = resource_flows.subscribe("resource.*");
+            log::debug!("Started ResourceFlow subscription for kernel {}", kernel_id);
+
+            while let Some(msg) = sub.recv().await {
+                let success = match msg.payload {
+                    kaijutsu_kernel::ResourceFlow::Updated {
+                        ref server,
+                        ref uri,
+                        ..
+                    } => {
+                        // Notify-then-fetch pattern: we only send the notification.
+                        // Content is not included; clients should call readMcpResource().
+                        let mut req = callback.on_resource_updated_request();
+                        {
+                            let mut params = req.get();
+                            params.set_server(server);
+                            params.set_uri(uri);
+                            params.set_has_contents(false);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                    kaijutsu_kernel::ResourceFlow::ListChanged {
+                        ref server,
+                        ..
+                    } => {
+                        // Notify-then-fetch pattern: we only send the notification.
+                        // Resource list is not included; clients should call listMcpResources().
+                        let mut req = callback.on_resource_list_changed_request();
+                        {
+                            let mut params = req.get();
+                            params.set_server(server);
+                            params.set_has_resources(false);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                    // Subscribed/Unsubscribed are internal events, no need to forward
+                    kaijutsu_kernel::ResourceFlow::Subscribed { .. }
+                    | kaijutsu_kernel::ResourceFlow::Unsubscribed { .. } => true,
+                };
+
+                // If callback fails (client disconnected), stop the bridge task
+                if !success {
+                    log::debug!(
+                        "ResourceFlow bridge task for kernel {} stopping: callback failed",
+                        kernel_id
+                    );
+                    break;
+                }
+            }
+
+            log::debug!("ResourceFlow bridge task for kernel {} ended", kernel_id);
+        });
+
+        Promise::ok(())
+    }
 }
 
 // ============================================================================

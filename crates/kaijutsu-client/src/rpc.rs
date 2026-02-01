@@ -487,6 +487,97 @@ impl KernelHandle {
             is_error: result.get_is_error(),
         })
     }
+
+    // =========================================================================
+    // MCP Resource operations (push-first with caching)
+    // =========================================================================
+
+    /// List resources from an MCP server
+    ///
+    /// Returns a list of resources available from the specified server.
+    /// Results may be cached on the server for efficiency.
+    pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, RpcError> {
+        let mut request = self.kernel.list_mcp_resources_request();
+        request.get().set_server(server);
+        let response = request.send().promise.await?;
+        let resources = response.get()?.get_resources()?;
+
+        let mut result = Vec::with_capacity(resources.len() as usize);
+        for r in resources.iter() {
+            result.push(McpResource {
+                uri: r.get_uri()?.to_string()?,
+                name: r.get_name()?.to_string()?,
+                description: if r.get_has_description() {
+                    Some(r.get_description()?.to_string()?)
+                } else {
+                    None
+                },
+                mime_type: if r.get_has_mime_type() {
+                    Some(r.get_mime_type()?.to_string()?)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(result)
+    }
+
+    /// Read a resource from an MCP server
+    ///
+    /// Returns the contents of the specified resource.
+    /// Results may be cached on the server for efficiency.
+    pub async fn read_mcp_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<Option<McpResourceContents>, RpcError> {
+        let mut request = self.kernel.read_mcp_resource_request();
+        request.get().set_server(server);
+        request.get().set_uri(uri);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+
+        if !result.get_has_contents() {
+            return Ok(None);
+        }
+
+        let contents = result.get_contents()?;
+        let uri = contents.get_uri()?.to_string()?;
+        let mime_type = if contents.get_has_mime_type() {
+            Some(contents.get_mime_type()?.to_string()?)
+        } else {
+            None
+        };
+
+        // Check which union variant is set
+        use crate::kaijutsu_capnp::mcp_resource_contents::Which;
+        match contents.which()? {
+            Which::Text(text) => Ok(Some(McpResourceContents::Text {
+                uri,
+                mime_type,
+                text: text?.to_string()?,
+            })),
+            Which::Blob(blob) => Ok(Some(McpResourceContents::Blob {
+                uri,
+                mime_type,
+                blob: blob?.to_vec(),
+            })),
+        }
+    }
+
+    /// Subscribe to MCP resource events
+    ///
+    /// The callback will receive notifications when resources are updated
+    /// or when a server's resource list changes.
+    pub async fn subscribe_mcp_resources(
+        &self,
+        callback: crate::kaijutsu_capnp::resource_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_mcp_resources_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
 }
 
 /// Helper to parse block ID from Cap'n Proto
@@ -665,6 +756,36 @@ pub struct McpToolResult {
     pub success: bool,
     pub content: String,
     pub is_error: bool,
+}
+
+/// Information about an MCP resource
+#[derive(Debug, Clone)]
+pub struct McpResource {
+    /// Resource URI (e.g., "file:///path/to/file")
+    pub uri: String,
+    /// Resource name
+    pub name: String,
+    /// Optional description
+    pub description: Option<String>,
+    /// Optional MIME type
+    pub mime_type: Option<String>,
+}
+
+/// Contents of an MCP resource
+#[derive(Debug, Clone)]
+pub enum McpResourceContents {
+    /// Text content
+    Text {
+        uri: String,
+        mime_type: Option<String>,
+        text: String,
+    },
+    /// Binary content (already decoded from base64)
+    Blob {
+        uri: String,
+        mime_type: Option<String>,
+        blob: Vec<u8>,
+    },
 }
 
 // ============================================================================

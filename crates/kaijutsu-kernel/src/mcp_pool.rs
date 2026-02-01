@@ -38,8 +38,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -47,6 +49,8 @@ use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::flows::{OpSource, ResourceFlow, SharedResourceFlowBus};
 
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, Tool as McpTool};
 use rmcp::service::{RunningService, ServiceError};
@@ -146,6 +150,249 @@ impl From<McpTool> for McpToolInfo {
     }
 }
 
+// =============================================================================
+// Resource Cache
+// =============================================================================
+
+/// Information about a cached MCP resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceInfo {
+    /// Resource URI.
+    pub uri: String,
+    /// Resource name.
+    pub name: Option<String>,
+    /// Resource description.
+    pub description: Option<String>,
+    /// MIME type.
+    pub mime_type: Option<String>,
+}
+
+/// Cached resource entry with content and metadata.
+#[derive(Debug, Clone)]
+pub struct CachedResource {
+    /// Resource metadata.
+    pub info: McpResourceInfo,
+    /// Cached content (serialized ResourceContents).
+    pub content: Option<Vec<u8>>,
+    /// When this entry was last refreshed.
+    pub last_refresh: Instant,
+    /// Number of active subscribers (if > 0, TTL is disabled).
+    pub subscriber_count: u32,
+}
+
+impl CachedResource {
+    /// Create a new cached resource entry.
+    pub fn new(info: McpResourceInfo) -> Self {
+        Self {
+            info,
+            content: None,
+            last_refresh: Instant::now(),
+            subscriber_count: 0,
+        }
+    }
+
+    /// Check if this entry is stale based on TTL.
+    pub fn is_stale(&self, ttl: Duration) -> bool {
+        // If there are active subscribers, the resource stays fresh
+        if self.subscriber_count > 0 {
+            return false;
+        }
+        self.last_refresh.elapsed() > ttl
+    }
+
+    /// Mark this entry as refreshed.
+    pub fn touch(&mut self) {
+        self.last_refresh = Instant::now();
+    }
+}
+
+/// Cache for MCP resources, keyed by "server:uri".
+///
+/// Thread-safe via DashMap. Supports TTL-based invalidation
+/// and subscriber tracking.
+#[derive(Debug)]
+pub struct ResourceCache {
+    /// Cached resources, keyed by "server:uri".
+    entries: DashMap<String, CachedResource>,
+    /// Resources grouped by server for list operations.
+    server_resources: DashMap<String, Vec<String>>,
+    /// Default TTL for cache entries (5 minutes).
+    default_ttl: Duration,
+}
+
+impl Default for ResourceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResourceCache {
+    /// Default TTL: 5 minutes.
+    pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+
+    /// Create a new resource cache with default TTL.
+    pub fn new() -> Self {
+        Self {
+            entries: DashMap::new(),
+            server_resources: DashMap::new(),
+            default_ttl: Self::DEFAULT_TTL,
+        }
+    }
+
+    /// Create a new resource cache with custom TTL.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            entries: DashMap::new(),
+            server_resources: DashMap::new(),
+            default_ttl: ttl,
+        }
+    }
+
+    /// Generate a cache key from server and URI.
+    pub fn cache_key(server: &str, uri: &str) -> String {
+        format!("{}:{}", server, uri)
+    }
+
+    /// Get a cached resource if it exists and is not stale.
+    pub fn get(&self, server: &str, uri: &str) -> Option<CachedResource> {
+        let key = Self::cache_key(server, uri);
+        self.entries.get(&key).and_then(|entry| {
+            if entry.is_stale(self.default_ttl) {
+                None
+            } else {
+                Some(entry.clone())
+            }
+        })
+    }
+
+    /// Get a cached resource even if stale (for background refresh).
+    pub fn get_any(&self, server: &str, uri: &str) -> Option<CachedResource> {
+        let key = Self::cache_key(server, uri);
+        self.entries.get(&key).map(|entry| entry.clone())
+    }
+
+    /// Insert or update a cached resource.
+    pub fn insert(&self, server: &str, info: McpResourceInfo, content: Option<Vec<u8>>) {
+        let key = Self::cache_key(server, &info.uri);
+        let uri = info.uri.clone();
+
+        // Update or insert the entry
+        self.entries
+            .entry(key)
+            .and_modify(|entry| {
+                entry.info = info.clone();
+                entry.content = content.clone();
+                entry.touch();
+            })
+            .or_insert_with(|| {
+                let mut entry = CachedResource::new(info);
+                entry.content = content;
+                entry
+            });
+
+        // Track this resource under its server
+        self.server_resources
+            .entry(server.to_string())
+            .or_default()
+            .push(uri);
+    }
+
+    /// Update just the content of a cached resource.
+    pub fn update_content(&self, server: &str, uri: &str, content: Vec<u8>) {
+        let key = Self::cache_key(server, uri);
+        if let Some(mut entry) = self.entries.get_mut(&key) {
+            entry.content = Some(content);
+            entry.touch();
+        }
+    }
+
+    /// Invalidate a specific resource (marks as stale by setting last_refresh to epoch).
+    pub fn invalidate(&self, server: &str, uri: &str) {
+        let key = Self::cache_key(server, uri);
+        if let Some(mut entry) = self.entries.get_mut(&key) {
+            // Set to a time long ago so it's definitely stale
+            entry.last_refresh = Instant::now() - (self.default_ttl * 2);
+        }
+    }
+
+    /// Invalidate all resources for a server.
+    pub fn invalidate_server(&self, server: &str) {
+        if let Some(uris) = self.server_resources.get(server) {
+            for uri in uris.iter() {
+                self.invalidate(server, uri);
+            }
+        }
+    }
+
+    /// Remove a specific resource from the cache.
+    pub fn remove(&self, server: &str, uri: &str) {
+        let key = Self::cache_key(server, uri);
+        self.entries.remove(&key);
+
+        // Also remove from server tracking
+        if let Some(mut uris) = self.server_resources.get_mut(server) {
+            uris.retain(|u| u != uri);
+        }
+    }
+
+    /// Remove all resources for a server.
+    pub fn remove_server(&self, server: &str) {
+        if let Some((_, uris)) = self.server_resources.remove(server) {
+            for uri in uris {
+                let key = Self::cache_key(server, &uri);
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    /// Get all cached resources for a server.
+    pub fn list_for_server(&self, server: &str) -> Vec<McpResourceInfo> {
+        self.server_resources
+            .get(server)
+            .map(|uris| {
+                uris.iter()
+                    .filter_map(|uri| {
+                        let key = Self::cache_key(server, uri);
+                        self.entries.get(&key).map(|e| e.info.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Increment subscriber count for a resource.
+    pub fn add_subscriber(&self, server: &str, uri: &str) {
+        let key = Self::cache_key(server, uri);
+        if let Some(mut entry) = self.entries.get_mut(&key) {
+            entry.subscriber_count += 1;
+        }
+    }
+
+    /// Decrement subscriber count for a resource.
+    pub fn remove_subscriber(&self, server: &str, uri: &str) {
+        let key = Self::cache_key(server, uri);
+        if let Some(mut entry) = self.entries.get_mut(&key) {
+            entry.subscriber_count = entry.subscriber_count.saturating_sub(1);
+        }
+    }
+
+    /// Get the number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Clear all cached entries.
+    pub fn clear(&self) {
+        self.entries.clear();
+        self.server_resources.clear();
+    }
+}
+
 /// A connected MCP server with its running service.
 struct ConnectedServer {
     /// The configuration used to start this server (for reconnection).
@@ -166,20 +413,55 @@ impl ConnectedServer {
 
 /// Client handler for kaijutsu's MCP connections.
 ///
-/// This is a minimal handler that logs notifications but otherwise
-/// delegates to the default behavior.
+/// Each handler is associated with a specific MCP server and has access to
+/// the shared resource cache and flow bus for push-based resource updates.
 #[derive(Debug, Clone)]
 pub struct KaijutsuClientHandler {
     /// Client info to report to servers.
     client_info: ClientInfo,
+    /// The MCP server name this handler is for.
+    server_name: String,
+    /// Shared resource cache for invalidation on notifications.
+    cache: Arc<ResourceCache>,
+    /// Flow bus for publishing resource events.
+    resource_flows: SharedResourceFlowBus,
+}
+
+impl KaijutsuClientHandler {
+    /// Create a new handler for a specific server.
+    pub fn new(
+        server_name: impl Into<String>,
+        cache: Arc<ResourceCache>,
+        resource_flows: SharedResourceFlowBus,
+    ) -> Self {
+        let mut info = ClientInfo::default();
+        info.client_info.name = "kaijutsu".into();
+        info.client_info.version = env!("CARGO_PKG_VERSION").into();
+        Self {
+            client_info: info,
+            server_name: server_name.into(),
+            cache,
+            resource_flows,
+        }
+    }
+
+    /// Create a default handler without cache/flow support (for testing).
+    pub fn default_handler() -> Self {
+        let mut info = ClientInfo::default();
+        info.client_info.name = "kaijutsu".into();
+        info.client_info.version = env!("CARGO_PKG_VERSION").into();
+        Self {
+            client_info: info,
+            server_name: String::new(),
+            cache: Arc::new(ResourceCache::new()),
+            resource_flows: crate::flows::shared_resource_flow_bus(64),
+        }
+    }
 }
 
 impl Default for KaijutsuClientHandler {
     fn default() -> Self {
-        let mut info = ClientInfo::default();
-        info.client_info.name = "kaijutsu".into();
-        info.client_info.version = env!("CARGO_PKG_VERSION").into();
-        Self { client_info: info }
+        Self::default_handler()
     }
 }
 
@@ -212,6 +494,65 @@ impl ClientHandler for KaijutsuClientHandler {
             // TODO: refresh tools cache
         }
     }
+
+    fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let uri = params.uri.clone();
+        let cache = self.cache.clone();
+        let resource_flows = self.resource_flows.clone();
+
+        async move {
+            info!(
+                server = %server_name,
+                uri = %uri,
+                "MCP resource updated notification"
+            );
+
+            // Remove cache entry to force re-fetch on next read.
+            // Using remove() instead of invalidate() avoids a race condition where
+            // a concurrent read_resource() could overwrite the invalidation with stale data.
+            cache.remove(&server_name, &uri);
+
+            // Publish to FlowBus for connected clients
+            resource_flows.publish(ResourceFlow::Updated {
+                server: server_name,
+                uri,
+                content: None, // Content needs to be fetched by client
+                source: OpSource::Remote,
+            });
+        }
+    }
+
+    fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let cache = self.cache.clone();
+        let resource_flows = self.resource_flows.clone();
+
+        async move {
+            info!(
+                server = %server_name,
+                "MCP resource list changed notification"
+            );
+
+            // Remove all cached resources for this server to force re-fetch.
+            // Using remove_server() instead of invalidate_server() avoids race conditions.
+            cache.remove_server(&server_name);
+
+            // Publish to FlowBus for connected clients
+            resource_flows.publish(ResourceFlow::ListChanged {
+                server: server_name,
+                resources: None, // List needs to be re-fetched by client
+                source: OpSource::Remote,
+            });
+        }
+    }
 }
 
 /// Pool of MCP server connections.
@@ -220,8 +561,10 @@ impl ClientHandler for KaijutsuClientHandler {
 pub struct McpServerPool {
     /// Connected servers, keyed by name.
     servers: RwLock<HashMap<String, Arc<Mutex<ConnectedServer>>>>,
-    /// Default client handler.
-    handler: KaijutsuClientHandler,
+    /// Shared resource cache for all MCP servers.
+    cache: Arc<ResourceCache>,
+    /// Flow bus for resource events.
+    resource_flows: SharedResourceFlowBus,
 }
 
 impl Default for McpServerPool {
@@ -235,8 +578,28 @@ impl McpServerPool {
     pub fn new() -> Self {
         Self {
             servers: RwLock::new(HashMap::new()),
-            handler: KaijutsuClientHandler::default(),
+            cache: Arc::new(ResourceCache::new()),
+            resource_flows: crate::flows::shared_resource_flow_bus(256),
         }
+    }
+
+    /// Create a new pool with a custom resource flow bus.
+    pub fn with_resource_flows(resource_flows: SharedResourceFlowBus) -> Self {
+        Self {
+            servers: RwLock::new(HashMap::new()),
+            cache: Arc::new(ResourceCache::new()),
+            resource_flows,
+        }
+    }
+
+    /// Get the shared resource cache.
+    pub fn cache(&self) -> &Arc<ResourceCache> {
+        &self.cache
+    }
+
+    /// Get the resource flow bus for subscribing to resource events.
+    pub fn resource_flows(&self) -> &SharedResourceFlowBus {
+        &self.resource_flows
     }
 
     /// Register and connect to an MCP server.
@@ -271,8 +634,15 @@ impl McpServerPool {
         let transport = TokioChildProcess::new(cmd.configure(|_| {}))
             .map_err(|e| McpPoolError::SpawnError(e.to_string()))?;
 
+        // Create a handler for this specific server with cache and flow access
+        let handler = KaijutsuClientHandler::new(
+            name.clone(),
+            self.cache.clone(),
+            self.resource_flows.clone(),
+        );
+
         // Connect and perform handshake
-        let service = rmcp::serve_client(self.handler.clone(), transport)
+        let service = rmcp::serve_client(handler, transport)
             .await
             .map_err(|e| McpPoolError::InitError(e.to_string()))?;
 
@@ -478,6 +848,212 @@ impl McpServerPool {
         server.tools = tools.clone();
 
         Ok(tools)
+    }
+
+    // =========================================================================
+    // Resource Operations
+    // =========================================================================
+
+    /// List all resources from an MCP server.
+    ///
+    /// Uses cache if available and not stale, otherwise fetches from server.
+    /// Results are cached for future calls.
+    pub async fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, McpPoolError> {
+        // Check cache first
+        let cached = self.cache.list_for_server(server_name);
+        if !cached.is_empty() {
+            debug!(server = %server_name, count = cached.len(), "Returning cached resources");
+            return Ok(cached);
+        }
+
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(server = %server_name, "Fetching resources from MCP server");
+        let result = server.peer().list_all_resources().await?;
+
+        // Convert and cache the resources
+        let resources: Vec<McpResourceInfo> = result
+            .into_iter()
+            .map(|r| {
+                let info = McpResourceInfo {
+                    uri: r.uri.clone(),
+                    name: Some(r.name.clone()),
+                    description: r.description.clone(),
+                    mime_type: r.mime_type.clone(),
+                };
+                // Cache each resource
+                self.cache.insert(server_name, info.clone(), None);
+                info
+            })
+            .collect();
+
+        debug!(
+            server = %server_name,
+            count = resources.len(),
+            "Cached resources from MCP server"
+        );
+
+        Ok(resources)
+    }
+
+    /// Read a resource from an MCP server.
+    ///
+    /// Uses cache if available and not stale, otherwise fetches from server.
+    /// Results are cached for future calls.
+    pub async fn read_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<rmcp::model::ResourceContents, McpPoolError> {
+        // Check cache for content
+        if let Some(cached) = self.cache.get(server_name, uri) {
+            if let Some(content_bytes) = &cached.content {
+                if let Ok(contents) = serde_json::from_slice::<rmcp::model::ResourceContents>(content_bytes) {
+                    debug!(server = %server_name, uri = %uri, "Returning cached resource content");
+                    return Ok(contents);
+                }
+            }
+        }
+
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        debug!(server = %server_name, uri = %uri, "Reading resource from MCP server");
+        let result = server
+            .peer()
+            .read_resource(rmcp::model::ReadResourceRequestParams {
+                uri: uri.to_string(),
+                meta: None,
+            })
+            .await?;
+
+        // Get the first content (typical case)
+        let contents = result
+            .contents
+            .into_iter()
+            .next()
+            .ok_or_else(|| McpPoolError::ToolNotFound {
+                server: server_name.to_string(),
+                tool: format!("resource:{}", uri),
+            })?;
+
+        // Cache the content
+        if let Ok(content_bytes) = serde_json::to_vec(&contents) {
+            self.cache.update_content(server_name, uri, content_bytes);
+        }
+
+        Ok(contents)
+    }
+
+    /// Subscribe to resource updates from an MCP server.
+    ///
+    /// Sends a subscription request to the MCP server and increments the local
+    /// subscriber count, which disables TTL-based cache expiration.
+    pub async fn subscribe_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+        subscriber_id: &str,
+    ) -> Result<(), McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        // Send subscription request to the MCP server
+        debug!(server = %server_name, uri = %uri, "Sending MCP resource subscription");
+        server
+            .peer()
+            .subscribe(rmcp::model::SubscribeRequestParams {
+                uri: uri.to_string(),
+                meta: None,
+            })
+            .await?;
+
+        // Update local subscriber count
+        self.cache.add_subscriber(server_name, uri);
+
+        // Publish subscription event
+        self.resource_flows.publish(ResourceFlow::Subscribed {
+            server: server_name.to_string(),
+            uri: uri.to_string(),
+            subscriber_id: subscriber_id.to_string(),
+        });
+
+        info!(
+            server = %server_name,
+            uri = %uri,
+            subscriber = %subscriber_id,
+            "Resource subscription added"
+        );
+
+        Ok(())
+    }
+
+    /// Unsubscribe from resource updates.
+    ///
+    /// Sends an unsubscribe request to the MCP server and decrements the local
+    /// subscriber count. When count reaches zero, TTL-based cache expiration is re-enabled.
+    pub async fn unsubscribe_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+        subscriber_id: &str,
+    ) -> Result<(), McpPoolError> {
+        let server_arc = self
+            .servers
+            .read()
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
+
+        let server = server_arc.lock().await;
+
+        // Send unsubscribe request to the MCP server
+        debug!(server = %server_name, uri = %uri, "Sending MCP resource unsubscription");
+        server
+            .peer()
+            .unsubscribe(rmcp::model::UnsubscribeRequestParams {
+                uri: uri.to_string(),
+                meta: None,
+            })
+            .await?;
+
+        // Update local subscriber count
+        self.cache.remove_subscriber(server_name, uri);
+
+        // Publish unsubscription event
+        self.resource_flows.publish(ResourceFlow::Unsubscribed {
+            server: server_name.to_string(),
+            uri: uri.to_string(),
+            subscriber_id: subscriber_id.to_string(),
+        });
+
+        info!(
+            server = %server_name,
+            uri = %uri,
+            subscriber = %subscriber_id,
+            "Resource subscription removed"
+        );
+
+        Ok(())
     }
 
     /// Shutdown all connected servers.

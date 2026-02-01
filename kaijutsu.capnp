@@ -310,6 +310,11 @@ interface Kernel {
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
   pushOps @45 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
+
+  # MCP Resource management (push-first with caching)
+  listMcpResources @46 (server :Text) -> (resources :List(McpResource));
+  readMcpResource @47 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
+  subscribeMcpResources @48 (callback :ResourceEvents);
 }
 
 # ============================================================================
@@ -485,6 +490,35 @@ struct McpToolResult {
   success @0 :Bool;
   content @1 :Text;           # Result content (text)
   isError @2 :Bool;           # True if the tool returned an error
+}
+
+# MCP Resource Types
+
+struct McpResource {
+  uri @0 :Text;               # Resource URI (e.g., "file:///path/to/file")
+  name @1 :Text;              # Resource name
+  description @2 :Text;       # Optional description
+  mimeType @3 :Text;          # Optional MIME type
+  hasDescription @4 :Bool;    # True if description is set
+  hasMimeType @5 :Bool;       # True if mimeType is set
+}
+
+struct McpResourceContents {
+  uri @0 :Text;               # Resource URI
+  mimeType @1 :Text;          # MIME type of content
+  hasMimeType @2 :Bool;       # True if mimeType is set
+  union {
+    text @3 :Text;            # Text content
+    blob @4 :Data;            # Binary content (base64 on wire)
+  }
+}
+
+# Callback interface for receiving MCP resource events from the server
+interface ResourceEvents {
+  # Called when a resource's content is updated
+  onResourceUpdated @0 (server :Text, uri :Text, contents :McpResourceContents, hasContents :Bool);
+  # Called when a server's resource list changes (resources added or removed)
+  onResourceListChanged @1 (server :Text, resources :List(McpResource), hasResources :Bool);
 }
 
 # ============================================================================

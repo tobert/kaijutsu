@@ -52,8 +52,17 @@ pub use vfs::{
     backends::{LocalBackend, MemoryBackend},
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
-pub use mcp_pool::{McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo};
+pub use mcp_pool::{
+    McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo,
+    // Resource types
+    CachedResource, McpResourceInfo, ResourceCache,
+};
+
+// Re-export rmcp types needed for resource handling
+pub use rmcp::model::ResourceContents as McpResourceContents;
 pub use flows::{
     BlockFlow, FlowBus, FlowMessage, HasSubject, OpSource, SharedBlockFlowBus, Subscription,
     matches_pattern, shared_block_flow_bus,
+    // Resource flow types
+    ResourceFlow, SharedResourceFlowBus, shared_resource_flow_bus,
 };

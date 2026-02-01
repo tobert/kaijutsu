@@ -469,14 +469,114 @@ impl<T: Clone> std::fmt::Debug for Subscription<T> {
 }
 
 // ============================================================================
+// Resource Flow Events
+// ============================================================================
+
+/// Resource-related flow events for MCP resource push notifications.
+///
+/// These events are emitted when MCP servers notify us of resource changes.
+/// The push-first model means we invalidate cache and broadcast immediately.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ResourceFlow {
+    /// A resource's content was updated.
+    Updated {
+        /// The MCP server name (e.g., "git", "files").
+        server: String,
+        /// The resource URI.
+        uri: String,
+        /// Serialized resource contents (if available from notification).
+        /// None means the content should be fetched on demand.
+        content: Option<Vec<u8>>,
+        /// Origin of this operation.
+        source: OpSource,
+    },
+
+    /// The server's resource list changed (resources added or removed).
+    ListChanged {
+        /// The MCP server name.
+        server: String,
+        /// Serialized list of resources (if available).
+        /// None means the list should be re-fetched.
+        resources: Option<Vec<u8>>,
+        /// Origin of this operation.
+        source: OpSource,
+    },
+
+    /// A subscription was added for a resource.
+    Subscribed {
+        /// The MCP server name.
+        server: String,
+        /// The resource URI.
+        uri: String,
+        /// Identifier of the subscriber (e.g., kernel ID, client ID).
+        subscriber_id: String,
+    },
+
+    /// A subscription was removed for a resource.
+    Unsubscribed {
+        /// The MCP server name.
+        server: String,
+        /// The resource URI.
+        uri: String,
+        /// Identifier of the subscriber.
+        subscriber_id: String,
+    },
+}
+
+impl ResourceFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Updated { .. } => "resource.updated",
+            Self::ListChanged { .. } => "resource.list_changed",
+            Self::Subscribed { .. } => "resource.subscribed",
+            Self::Unsubscribed { .. } => "resource.unsubscribed",
+        }
+    }
+
+    /// Get the server name for this event.
+    pub fn server(&self) -> &str {
+        match self {
+            Self::Updated { server, .. }
+            | Self::ListChanged { server, .. }
+            | Self::Subscribed { server, .. }
+            | Self::Unsubscribed { server, .. } => server,
+        }
+    }
+
+    /// Get the source of this event (Local or Remote).
+    pub fn source(&self) -> OpSource {
+        match self {
+            Self::Updated { source, .. } | Self::ListChanged { source, .. } => *source,
+            // Subscribed/Unsubscribed are always local operations
+            Self::Subscribed { .. } | Self::Unsubscribed { .. } => OpSource::Local,
+        }
+    }
+}
+
+impl HasSubject for ResourceFlow {
+    fn subject(&self) -> &str {
+        ResourceFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
 /// Thread-safe handle to a BlockFlow bus.
 pub type SharedBlockFlowBus = Arc<FlowBus<BlockFlow>>;
 
+/// Thread-safe handle to a ResourceFlow bus.
+pub type SharedResourceFlowBus = Arc<FlowBus<ResourceFlow>>;
+
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared resource flow bus.
+pub fn shared_resource_flow_bus(capacity: usize) -> SharedResourceFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
