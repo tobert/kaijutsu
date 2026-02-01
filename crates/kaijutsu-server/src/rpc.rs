@@ -1547,6 +1547,19 @@ impl kernel::Server for KernelImpl {
                     .entry(context_name.clone())
                     .or_insert_with(|| ContextState::new(context_name.clone()))
                     .seats.push(seat_id.clone());
+
+                // Auto-create the document for this context if it doesn't exist
+                let doc_id = format!("{}@{}", kernel_id, context_name);
+                if !kernel.documents.contains(&doc_id) {
+                    log::info!("Auto-creating document {} for context", doc_id);
+                    if let Err(e) = kernel.documents.create_document(
+                        doc_id.clone(),
+                        DocumentKind::Conversation,
+                        None,
+                    ) {
+                        log::error!("Failed to create document {}: {}", doc_id, e);
+                    }
+                }
             }
 
             // Track seat in user's seats
