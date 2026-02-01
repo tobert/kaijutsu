@@ -3480,7 +3480,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4464,7 +4464,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5040,7 +5040,7 @@ dependencies = [
 [[package]]
 name = "kaish-client"
 version = "0.1.0"
-source = "git+https://github.com/tobert/kaish?branch=main#ed09c8cfd43941afb367ce553f66080501260018"
+source = "git+https://github.com/tobert/kaish?branch=main#678f8830ca18c5681b025cbba7f5e2184faac88f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5059,7 +5059,7 @@ dependencies = [
 [[package]]
 name = "kaish-kernel"
 version = "0.1.0"
-source = "git+https://github.com/tobert/kaish?branch=main#ed09c8cfd43941afb367ce553f66080501260018"
+source = "git+https://github.com/tobert/kaish?branch=main#678f8830ca18c5681b025cbba7f5e2184faac88f"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5090,7 +5090,7 @@ dependencies = [
 [[package]]
 name = "kaish-schema"
 version = "0.1.0"
-source = "git+https://github.com/tobert/kaish?branch=main#ed09c8cfd43941afb367ce553f66080501260018"
+source = "git+https://github.com/tobert/kaish?branch=main#678f8830ca18c5681b025cbba7f5e2184faac88f"
 dependencies = [
  "capnp 0.21.7",
  "capnpc 0.21.4",
@@ -7473,7 +7473,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7486,7 +7486,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8070,6 +8070,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -8245,7 +8246,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9297,7 +9298,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
