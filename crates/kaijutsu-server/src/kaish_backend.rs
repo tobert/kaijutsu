@@ -29,7 +29,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::Value as JsonValue;
 
 use kaijutsu_crdt::BlockId;
@@ -60,19 +59,12 @@ pub struct KaijutsuBackend {
     blocks: SharedBlockStore,
     /// The kaijutsu kernel for tool dispatch.
     kernel: Arc<KaijutsuKernel>,
-    /// Cached tool schemas for help (reserved for future use).
-    #[allow(dead_code)]
-    tool_schemas: RwLock<Vec<ToolSchema>>,
 }
 
 impl KaijutsuBackend {
     /// Create a new backend with block store and kaijutsu kernel.
     pub fn new(blocks: SharedBlockStore, kernel: Arc<KaijutsuKernel>) -> Self {
-        Self {
-            blocks,
-            kernel,
-            tool_schemas: RwLock::new(Vec::new()),
-        }
+        Self { blocks, kernel }
     }
 
     /// Resolve a VFS path to a document ID and optional block ID.
@@ -104,21 +96,6 @@ impl KaijutsuBackend {
             }
             _ => PathResolution::Invalid(format!("unsupported path: {}", path_str)),
         }
-    }
-
-    /// Find a block by ID across all documents.
-    #[allow(dead_code)]
-    fn find_block(&self, block_id: &BlockId) -> Option<(String, BlockId)> {
-        for doc_id in self.blocks.list_ids() {
-            if let Some(entry) = self.blocks.get(&doc_id) {
-                for snapshot in entry.doc.blocks_ordered() {
-                    if &snapshot.id == block_id {
-                        return Some((doc_id, block_id.clone()));
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Convert kaijutsu ToolInfo to kaish ToolInfo format.

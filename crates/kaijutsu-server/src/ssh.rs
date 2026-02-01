@@ -4,7 +4,6 @@
 //! Public key authentication with user identity from SQLite.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -250,13 +249,6 @@ struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     allow_anonymous: bool,
     identity: Option<Identity>,
-    #[allow(dead_code)]
-    channels: HashMap<ChannelId, ChannelState>,
-}
-
-#[derive(Default)]
-struct ChannelState {
-    // Will hold channel-specific state
 }
 
 impl ConnectionHandler {
@@ -266,7 +258,6 @@ impl ConnectionHandler {
             peer_addr,
             allow_anonymous,
             identity: None,
-            channels: HashMap::new(),
         }
     }
 }
@@ -333,7 +324,6 @@ impl server::Handler for ConnectionHandler {
             identity.nick,
             identity.display_name
         );
-        self.channels.insert(channel.id(), ChannelState::default());
 
         let stream = channel.into_stream();
 
@@ -511,7 +501,6 @@ impl server::Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         log::debug!("Channel {} closed", channel);
-        self.channels.remove(&channel);
         Ok(())
     }
 }
