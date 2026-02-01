@@ -1,23 +1,17 @@
 //! Display hint formatting for Bevy UI rendering.
 //!
 //! This module provides functions to format output based on display hints
-//! for different audiences:
-//! - **UI/Human**: Pretty tables, traditional trees, colors
-//! - **Model/Agent**: Token-efficient compact formats
+//! for human-friendly UI display: pretty tables, traditional trees, etc.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use kaijutsu_app::ui::format::{format_for_display, format_for_model};
+//! use kaijutsu_app::ui::format::format_for_display;
 //!
 //! let content = "file1.txt\nfile2.txt";
 //! let hint_json = r#"{"type":"table","rows":[["file1.txt"],["file2.txt"]]}"#;
 //!
-//! // For UI display
 //! let pretty = format_for_display(content, Some(hint_json));
-//!
-//! // For model consumption
-//! let compact = format_for_model(content, Some(hint_json));
 //! ```
 
 use kaijutsu_kernel::tools::{DisplayHint, EntryType};
@@ -27,26 +21,17 @@ use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 pub struct FormattedOutput {
     /// The formatted text content.
     pub text: String,
-    /// Whether this output has special formatting applied.
-    #[allow(dead_code)]
-    pub is_formatted: bool,
 }
 
 impl FormattedOutput {
     /// Create plain output without special formatting.
     pub fn plain(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_formatted: false,
-        }
+        Self { text: text.into() }
     }
 
     /// Create styled output with special formatting.
     pub fn styled(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_formatted: true,
-        }
+        Self { text: text.into() }
     }
 }
 
@@ -77,35 +62,6 @@ pub fn format_for_display(content: &str, hint_json: Option<&str>) -> FormattedOu
         }
 
         DisplayHint::Tree { traditional, .. } => FormattedOutput::styled(traditional),
-    }
-}
-
-/// Format output for model/agent consumption (token-efficient).
-///
-/// Returns compact formats suitable for LLM context:
-/// - Tables → newline-separated list (from raw content)
-/// - Trees → compact brace notation
-/// - Formatted → pre-rendered model format
-/// - None → raw content
-#[allow(dead_code)]
-pub fn format_for_model(content: &str, hint_json: Option<&str>) -> String {
-    let Some(json) = hint_json else {
-        return content.to_string();
-    };
-
-    let Ok(hint) = serde_json::from_str::<DisplayHint>(json) else {
-        return content.to_string();
-    };
-
-    match hint {
-        DisplayHint::None => content.to_string(),
-
-        DisplayHint::Formatted { model, .. } => model,
-
-        // For tables, raw content is already the compact format (one item per line)
-        DisplayHint::Table { .. } => content.to_string(),
-
-        DisplayHint::Tree { compact, .. } => compact,
     }
 }
 
@@ -211,7 +167,6 @@ mod tests {
     fn test_format_plain() {
         let output = format_for_display("hello world", None);
         assert_eq!(output.text, "hello world");
-        assert!(!output.is_formatted);
     }
 
     #[test]
@@ -223,10 +178,6 @@ mod tests {
 
         let display = format_for_display("raw", Some(&hint));
         assert_eq!(display.text, "Pretty Output");
-        assert!(display.is_formatted);
-
-        let model = format_for_model("raw", Some(&hint));
-        assert_eq!(model, "compact");
     }
 
     #[test]
@@ -241,12 +192,8 @@ mod tests {
         }).unwrap();
 
         let display = format_for_display("foo.rs\nbar.rs", Some(&hint));
-        assert!(display.is_formatted);
         assert!(display.text.contains("Name"));
         assert!(display.text.contains("foo.rs"));
-
-        let model = format_for_model("foo.rs\nbar.rs", Some(&hint));
-        assert_eq!(model, "foo.rs\nbar.rs");
     }
 
     #[test]
@@ -260,9 +207,6 @@ mod tests {
 
         let display = format_for_display("", Some(&hint));
         assert!(display.text.contains("└──"));
-
-        let model = format_for_model("", Some(&hint));
-        assert_eq!(model, "project/{src/}");
     }
 
     #[test]

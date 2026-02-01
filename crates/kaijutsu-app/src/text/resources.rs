@@ -98,20 +98,6 @@ impl SharedFontSystem {
 // Color Conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Convert Bevy Color to cosmic-text Color.
-///
-/// Uses sRGB color space - cosmic-text expects 0-255 sRGB values.
-#[allow(dead_code)]
-pub fn bevy_to_cosmic_color(color: Color) -> cosmic_text::Color {
-    let srgba = color.to_srgba();
-    cosmic_text::Color::rgba(
-        (srgba.red * 255.0) as u8,
-        (srgba.green * 255.0) as u8,
-        (srgba.blue * 255.0) as u8,
-        (srgba.alpha * 255.0) as u8,
-    )
-}
-
 /// Convert Bevy Color to RGBA8 array.
 pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
     let srgba = color.to_srgba();
