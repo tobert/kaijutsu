@@ -19,6 +19,7 @@ pub mod seat_selector;
 
 use bevy::prelude::*;
 use kaijutsu_client::{Context, KernelInfo, SeatInfo};
+use tracing::trace;
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
 use crate::shaders::nine_slice::{ChasingBorder, ChasingBorderMaterial};
@@ -373,19 +374,27 @@ fn handle_dashboard_events(
                 // Use the document_id from the seat (server provides the main document ID)
                 // This ensures the client uses the same document_id the server uses for BlockInserted events
                 let document_id = seat.document_id.clone();
-                let agent_id = format!("user:{}", whoami::username());
 
-                // Create conversation using the server-provided document_id
-                // (with_id uses the ID for BlockDocument::new which sets document_id)
-                let conv = kaijutsu_kernel::Conversation::with_id(
-                    &document_id,  // becomes both conversation ID and doc document_id
-                    &document_id,  // name (display)
-                    &agent_id,
-                );
-                registry.add(conv);
+                // Idempotency: Only create conversation if it doesn't already exist.
+                // Duplicate SeatTaken events (e.g., from dialog input leak) must NOT
+                // reset CRDT state, or incremental ops will fail with DataMissing.
+                if registry.get(&document_id).is_none() {
+                    let agent_id = format!("user:{}", whoami::username());
+
+                    // Create conversation using the server-provided document_id
+                    // (with_id uses the ID for BlockDocument::new which sets document_id)
+                    let conv = kaijutsu_kernel::Conversation::with_id(
+                        &document_id,  // becomes both conversation ID and doc document_id
+                        &document_id,  // name (display)
+                        &agent_id,
+                    );
+                    registry.add(conv);
+                    info!("Created conversation for document {}", document_id);
+                } else {
+                    trace!("SeatTaken for existing conversation {}, skipping creation", document_id);
+                }
+
                 current_conv.0 = Some(document_id.clone());
-
-                info!("Created conversation for document {}", document_id);
 
                 // Transition to Conversation screen
                 next_screen.set(AppScreen::Conversation);

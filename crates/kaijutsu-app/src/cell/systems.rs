@@ -114,11 +114,18 @@ pub fn handle_mode_switch(
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
     mut presence: ResMut<InputPresence>,
+    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     prompt_cells: Query<&CellEditor, With<PromptCell>>,
     screen: Res<State<AppScreen>>,
 ) {
     // Clear consumed keys from last frame
     consumed.0.clear();
+
+    // Skip when a modal dialog is open to prevent mode changes during dialog input
+    if modal_open.is_some_and(|m| m.0) {
+        for _ in key_events.read() {} // Consume events
+        return;
+    }
 
     // Mode switching works globally - no focus required.
     // Focus determines which cell receives text input, not mode switching.
@@ -211,10 +218,17 @@ pub fn handle_cell_input(
     mut key_events: MessageReader<KeyboardInput>,
     focused: Res<FocusedCell>,
     mode: Res<CurrentMode>,
+    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     consumed: Res<ConsumedModeKeys>,
     mut editors: Query<&mut CellEditor>,
     prompt_cells: Query<Entity, With<PromptCell>>,
 ) {
+    // Skip when a modal dialog is open to prevent input leakage
+    if modal_open.is_some_and(|m| m.0) {
+        for _ in key_events.read() {} // Consume events
+        return;
+    }
+
     let Some(focused_entity) = focused.0 else {
         return;
     };
@@ -930,11 +944,20 @@ pub fn handle_prompt_submit(
     mut key_events: MessageReader<KeyboardInput>,
     focused: Res<FocusedCell>,
     mode: Res<CurrentMode>,
+    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut editors: Query<&mut CellEditor>,
     prompt_cells: Query<Entity, With<PromptCell>>,
     mut submit_events: MessageWriter<PromptSubmitted>,
 ) {
+    // Skip when a modal dialog is open to prevent input leakage
+    if modal_open.is_some_and(|m| m.0) {
+        // Consume the keyboard events even though we're not processing them,
+        // to prevent other systems from seeing stale events after the modal closes
+        for _ in key_events.read() {}
+        return;
+    }
+
     // Only handle in Input modes (Chat or Shell)
     if !mode.0.accepts_input() {
         return;

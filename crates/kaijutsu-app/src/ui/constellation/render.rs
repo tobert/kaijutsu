@@ -9,6 +9,7 @@
 use bevy::prelude::*;
 
 use super::{
+    create_dialog::{spawn_create_context_node, CreateContextNode},
     mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
     ConstellationMode, ConstellationNode, OrbitalAnimation,
@@ -32,6 +33,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_constellation_container,
             sync_constellation_visibility,
             spawn_context_nodes,
+            spawn_create_node,
             spawn_connection_lines,
             attach_mini_renders,
             update_node_visuals,
@@ -231,6 +233,31 @@ fn spawn_context_nodes(
             node.context_id, node.position
         );
     }
+}
+
+/// Spawn the "+" create context node (runs once per container)
+fn spawn_create_node(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
+    container: Query<Entity, With<ConstellationContainer>>,
+    existing_create_nodes: Query<Entity, With<CreateContextNode>>,
+) {
+    // Don't spawn if already exists
+    if !existing_create_nodes.is_empty() {
+        return;
+    }
+
+    let Ok(container_entity) = container.single() else {
+        return;
+    };
+
+    spawn_create_context_node(
+        &mut commands,
+        container_entity,
+        &theme,
+        &mut pulse_materials,
+    );
 }
 
 /// Attach mini-render textures to nodes that don't have them yet

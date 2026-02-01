@@ -15,12 +15,17 @@
 //! - Nodes: Glowing orbs with activity-based pulse
 //! - Connections: Lines with distance falloff glow
 //! - States: Idle (dim), active (bright), streaming (particle flow), error (red)
+//! - "+" node: Create new contexts by clicking
 
+mod create_dialog;
 mod mini;
 mod render;
 
 use bevy::prelude::*;
 use kaijutsu_client::SeatInfo;
+
+// Re-export ModalDialogOpen for use by other systems (e.g., prompt input)
+pub use create_dialog::ModalDialogOpen;
 
 // Render module provides visual systems (used by the plugin internally)
 // Mini module provides render-to-texture previews for constellation nodes
@@ -54,6 +59,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add mini-render systems for context previews
         mini::setup_mini_render_systems(app);
+
+        // Add create context dialog systems
+        create_dialog::setup_create_dialog_systems(app);
     }
 }
 
@@ -114,12 +122,15 @@ impl Constellation {
 
     /// Add a new context node
     pub fn add_node(&mut self, seat_info: SeatInfo) {
+        // Use context name as the unique identifier (not document_id which may be shared)
+        let context_id = seat_info.id.context.clone();
+
         // Check if node already exists
-        if self.node_by_id(&seat_info.document_id).is_some() {
+        if self.node_by_id(&context_id).is_some() {
+            info!("Constellation: Node for context {} already exists, skipping", context_id);
             return;
         }
 
-        let context_id = seat_info.document_id.clone();
         let node = ContextNode {
             context_id: context_id.clone(),
             seat_info,
@@ -327,7 +338,7 @@ fn track_seat_events(
     for event in events.read() {
         match event {
             ConnectionEvent::SeatTaken { seat } => {
-                info!("Constellation: Adding node for context {}", seat.document_id);
+                info!("Constellation: Adding node for context '{}' (doc: {})", seat.id.context, seat.document_id);
                 constellation.add_node(seat.clone());
             }
             ConnectionEvent::SeatLeft => {
@@ -347,8 +358,14 @@ fn handle_mode_toggle(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
     current_mode: Res<crate::cell::CurrentMode>,
+    modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
 ) {
+    // Skip when a modal dialog is open
+    if modal_open.0 {
+        return;
+    }
+
     // Only in Conversation state and Normal mode
     if *screen.get() != crate::ui::state::AppScreen::Conversation {
         return;
@@ -369,9 +386,15 @@ fn handle_focus_navigation(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
     current_mode: Res<crate::cell::CurrentMode>,
+    modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
     mut pending_g: Local<bool>,
 ) {
+    // Skip when a modal dialog is open
+    if modal_open.0 {
+        return;
+    }
+
     // Only in Conversation state and Normal mode
     if *screen.get() != crate::ui::state::AppScreen::Conversation {
         return;

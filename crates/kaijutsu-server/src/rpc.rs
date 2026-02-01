@@ -17,6 +17,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
+use crate::context_engine::{ContextEngine, ContextManager};
 use crate::embedded_kaish::EmbeddedKaish;
 
 use kaijutsu_kernel::{
@@ -40,7 +41,20 @@ use serde_json;
 // ============================================================================
 
 /// Register block tools with a kernel.
-async fn register_block_tools(kernel: &Arc<Kernel>, documents: SharedBlockStore) {
+async fn register_block_tools(
+    kernel: &Arc<Kernel>,
+    documents: SharedBlockStore,
+    context_manager: Arc<ContextManager>,
+) {
+    // context - Context management (new, switch, list)
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("context", "Manage conversation contexts (new, switch, list)", "kernel"),
+            Arc::new(ContextEngine::new(context_manager)),
+        )
+        .await;
+    kernel.equip("context").await;
+
     // block_create - Create a new block
     kernel
         .register_tool_with_engine(
@@ -302,6 +316,8 @@ pub struct KernelState {
     pub main_document_id: String,
     /// Contexts within this kernel (for seat management)
     pub contexts: HashMap<String, ContextState>,
+    /// Thread-safe context manager for shell access
+    pub context_manager: Arc<ContextManager>,
 }
 
 #[derive(Clone, Copy)]
@@ -403,9 +419,22 @@ impl world::Server for WorldImpl {
                 // Ensure main document exists (convention ID)
                 let main_document_id = ensure_main_document(&documents, &id)?;
 
-                // Register block tools
+                // Get identity for context manager
+                let nick = {
+                    let state_ref = state.borrow();
+                    state_ref.identity.username.clone()
+                };
+
+                // Create context manager for this kernel
+                let context_manager = Arc::new(ContextManager::new(
+                    nick,
+                    id.clone(),
+                    uuid::Uuid::new_v4().to_string(), // instance ID
+                ));
+
+                // Register block tools (including context engine)
                 let kernel_arc = Arc::new(kernel);
-                register_block_tools(&kernel_arc, documents.clone()).await;
+                register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
                 // Create default context
                 let mut contexts = HashMap::new();
@@ -424,6 +453,7 @@ impl world::Server for WorldImpl {
                         documents,
                         main_document_id,
                         contexts,
+                        context_manager,
                     },
                 );
             }
@@ -473,9 +503,22 @@ impl world::Server for WorldImpl {
             // Ensure main document exists (convention ID)
             let main_document_id = ensure_main_document(&documents, &id)?;
 
-            // Register block tools
+            // Get identity for context manager
+            let nick = {
+                let state_ref = state.borrow();
+                state_ref.identity.username.clone()
+            };
+
+            // Create context manager for this kernel
+            let context_manager = Arc::new(ContextManager::new(
+                nick,
+                id.clone(),
+                uuid::Uuid::new_v4().to_string(), // instance ID
+            ));
+
+            // Register block tools (including context engine)
             let kernel_arc = Arc::new(kernel);
-            register_block_tools(&kernel_arc, documents.clone()).await;
+            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -495,6 +538,7 @@ impl world::Server for WorldImpl {
                         documents,
                         main_document_id,
                         contexts,
+                        context_manager,
                     },
                 );
             }
