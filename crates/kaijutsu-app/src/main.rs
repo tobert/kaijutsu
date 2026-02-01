@@ -92,6 +92,8 @@ fn main() {
         .add_plugins(ui::constellation::ConstellationPlugin)
         // HUD system - configurable overlay panels
         .add_plugins(ui::hud::HudPlugin)
+        // Layout system - RON-driven view layouts
+        .add_plugins(ui::layout::LayoutPlugin)
         // Animation tweening for smooth mode transitions
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
@@ -251,54 +253,22 @@ fn setup_ui(
             .with_children(|content| {
                 // ───────────────────────────────────────────────────────────
                 // CONVERSATION VIEW (hidden when in Dashboard state)
+                // Children (DagView, InputShadow) spawned by layout system
                 // ───────────────────────────────────────────────────────────
-                content
-                    .spawn((
-                        ui::state::ConversationRoot,
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Percent(100.0),
-                            flex_direction: FlexDirection::Column,
-                            display: Display::None, // Hidden by default, shown via state transition
-                            ..default()
-                        },
-                        Visibility::Hidden, // Hidden by default (glyphon needs this too)
-                    ))
-                    .with_children(|conv| {
-                        // Conversation area - content clips but scroll handled by custom system
-                        // (Overflow::scroll_y() consumes wheel events, we want our own handler)
-                        conv.spawn((
-                            cell::ConversationContainer,
-                            Node {
-                                flex_grow: 1.0,
-                                flex_direction: FlexDirection::Column,
-                                overflow: Overflow::clip(),
-                                padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
-                                ..default()
-                            },
-                        ));
-
-                        // ─────────────────────────────────────────────────────
-                        // INPUT SHADOW - reserves space at bottom for docked input
-                        // When minimized, this has 0 height (input hidden completely)
-                        // When docked, this reserves space and the 9-slice frame floats over it
-                        // ─────────────────────────────────────────────────────
-                        conv.spawn((
-                            ui::state::InputShadow,
-                            // PromptContainer triggers spawn_prompt_cell system
-                            cell::PromptContainer,
-                            Node {
-                                width: Val::Percent(100.0),
-                                // Height controlled by sync_input_shadow_height system
-                                // 0 when minimized, docked_height when docked
-                                min_height: Val::Px(0.0),
-                                ..default()
-                            },
-                        ));
-                    });
+                content.spawn((
+                    ui::state::ConversationRoot,
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        display: Display::None, // Hidden by default, shown via state transition
+                        ..default()
+                    },
+                    Visibility::Hidden, // Hidden by default (glyphon needs this too)
+                ));
 
                 // Dashboard view is spawned by DashboardPlugin in setup_dashboard
-                // It will be a child of the same parent (ContentArea) with Display::Flex by default
+                // Dashboard children also spawned by layout system
             });
 
             // ═══════════════════════════════════════════════════════════════

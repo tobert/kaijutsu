@@ -1,0 +1,39 @@
+// Dashboard view layout
+//
+// The lobby/selection view for choosing kernels, contexts, and seats.
+//
+// Structure:
+// ┌────────────────────────────────────────────────────────┐
+// │                    Dashboard                          │
+// │  ┌──────────┬───────────┬────────────────────────┐   │
+// │  │ KERNELS  │ CONTEXTS  │      YOUR SEATS        │   │
+// │  │          │           │                        │   │
+// │  │ [lobby]  │ [default] │  • amy@local           │   │
+// │  │ [test]   │ [coding]  │  • claude@prod         │   │
+// │  │          │           │                        │   │
+// │  └──────────┴───────────┴────────────────────────┘   │
+// │                                                       │
+// │                    [Take Seat]                        │
+// └────────────────────────────────────────────────────────┘
+(
+    name: "dashboard",
+    root: Container(
+        direction: Column,
+        children: [
+            // Three-column selection area
+            Container(
+                direction: Row,
+                children: [
+                    Panel(id: "KernelList", flex: 1.0),
+                    Panel(id: "ContextList", flex: 1.0),
+                    Panel(id: "SeatsList", flex: 1.0),
+                ],
+                flex: 1.0,
+            ),
+            // Seat selector (dropdown + button)
+            Panel(id: "SeatSelector", flex: 0.0),
+        ],
+        flex: 1.0,
+    ),
+    huds: [],
+)

@@ -102,6 +102,37 @@ impl View {
             View::Conversation { .. } | View::ExpandedBlock { .. } => AppScreen::Conversation,
         }
     }
+
+    /// Get the RON layout preset name for this view.
+    ///
+    /// Maps view variants to layout file names in assets/layouts/.
+    pub fn layout_name(&self) -> &'static str {
+        match self {
+            View::Dashboard => "dashboard",
+            View::Conversation { .. } => "conversation",
+            View::ExpandedBlock { .. } => "expanded_block",
+        }
+    }
+
+    /// Get the root container type for this view.
+    ///
+    /// Used by the layout reconciler to find the correct parent entity.
+    pub fn root_container(&self) -> ViewRootContainer {
+        match self {
+            View::Dashboard => ViewRootContainer::Dashboard,
+            View::Conversation { .. } => ViewRootContainer::Conversation,
+            View::ExpandedBlock { .. } => ViewRootContainer::Conversation, // Overlay on conversation
+        }
+    }
+}
+
+/// Identifies which root container a view uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewRootContainer {
+    /// Dashboard root (DashboardRoot marker)
+    Dashboard,
+    /// Conversation root (ConversationRoot marker)
+    Conversation,
 }
 
 /// Stack of views for navigation.

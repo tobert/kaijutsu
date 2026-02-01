@@ -1,0 +1,39 @@
+// Conversation view layout
+//
+// The main view for chat/shell interaction with the kernel.
+//
+// NOTE: This layout only includes panels that have been migrated to the
+// layout system. Other UI elements (ConstellationMini, InputFrame, PromptCell)
+// are still spawned by their respective systems.
+//
+// Structure:
+// ┌────────────────────────────────────────────────────────┐
+// │                     Content Area                       │
+// │  ┌────────────────────────────────────────────────┐   │
+// │  │                  DagView                       │   │
+// │  │              (scrollable blocks)               │   │
+// │  └────────────────────────────────────────────────┘   │
+// │  ┌────────────────────────────────────────────────┐   │
+// │  │ InputShadow (reserves flex space)              │   │
+// │  └────────────────────────────────────────────────┘   │
+// └────────────────────────────────────────────────────────┘
+(
+    name: "conversation",
+    root: Container(
+        direction: Column,
+        children: [
+            // Main content area - DAG view for conversation blocks
+            Panel(id: "DagView", flex: 1.0),
+            // Input shadow - reserves space at bottom for docked input
+            // The actual input frame floats over this via the InputLayer system
+            Panel(id: "InputShadow", flex: 0.0),
+        ],
+        flex: 1.0,
+    ),
+    huds: [
+        (position: TopRight, widget: "session_info"),
+        (position: TopLeft, widget: "connection_status"),
+        (position: BottomRight, widget: "keybinds"),
+        (position: BottomLeft, widget: "build_status"),
+    ],
+)

@@ -116,7 +116,7 @@ pub struct HudDefinition {
 }
 
 /// Screen position for HUD placement
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect, serde::Deserialize)]
 pub enum HudPosition {
     #[default]
     TopRight,

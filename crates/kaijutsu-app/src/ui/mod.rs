@@ -2,6 +2,8 @@ pub mod constellation;
 pub mod debug;
 pub mod format;
 pub mod hud;
+pub mod layout;
+pub mod layout_reconciler;
 pub mod mode_indicator;
 pub mod state;
 pub mod theme;
