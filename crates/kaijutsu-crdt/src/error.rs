@@ -29,10 +29,6 @@ pub enum CrdtError {
     #[error("block already exists: {0:?}")]
     DuplicateBlock(BlockId),
 
-    /// Agent ID mismatch.
-    #[error("agent ID mismatch: expected {expected}, got {got}")]
-    AgentMismatch { expected: String, got: String },
-
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
