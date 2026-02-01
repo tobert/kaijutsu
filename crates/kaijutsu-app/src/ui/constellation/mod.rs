@@ -86,12 +86,8 @@ pub struct Constellation {
     pub nodes: Vec<ContextNode>,
     /// Currently focused context ID (center of constellation)
     pub focus_id: Option<String>,
-    /// Visible relationship lines between nodes
-    pub connections: Vec<Connection>,
     /// Current view mode
     pub mode: ConstellationMode,
-    /// Layout algorithm for positioning nodes
-    pub layout: LayoutStrategy,
     /// Alternate context ID (for Ctrl-^ switching)
     pub alternate_id: Option<String>,
 }
@@ -136,7 +132,6 @@ impl Constellation {
             seat_info,
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
-            mini_render: None,
             entity: None,
         };
 
@@ -221,35 +216,8 @@ pub struct ContextNode {
     pub position: Vec2,
     /// Current activity state (affects visual rendering)
     pub activity: ActivityState,
-    /// Cached mini-render texture (for Map mode)
-    pub mini_render: Option<Handle<Image>>,
     /// Entity ID when spawned
     pub entity: Option<Entity>,
-}
-
-/// Connection line between nodes
-#[derive(Clone, Debug)]
-pub struct Connection {
-    /// Source node context ID
-    pub from: String,
-    /// Target node context ID
-    pub to: String,
-    /// Connection type (affects visual style)
-    pub kind: ConnectionKind,
-    /// Glow intensity (0.0-1.0, based on activity)
-    pub glow_intensity: f32,
-}
-
-/// Type of connection between nodes
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConnectionKind {
-    /// Normal relationship (same kernel)
-    #[default]
-    Related,
-    /// Parent-child (forked from)
-    ParentChild,
-    /// Data flow (streaming from one to another)
-    DataFlow,
 }
 
 /// Activity state of a context node
@@ -307,17 +275,6 @@ impl ConstellationMode {
     }
 }
 
-/// Strategy for laying out nodes in the constellation
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LayoutStrategy {
-    /// Circular layout around center
-    #[default]
-    Circular,
-    /// Force-directed graph layout
-    ForceDirected,
-    /// Manual positions (user-arranged)
-    Manual,
-}
 
 // ============================================================================
 // SYSTEMS
@@ -467,7 +424,7 @@ fn update_orbital_animation(
     }
 }
 
-/// Update node positions based on layout strategy
+/// Update node positions using circular layout
 /// Only mutates Constellation when layout actually changes (not every frame in orbital)
 fn update_node_positions(
     mut constellation: ResMut<Constellation>,
@@ -489,25 +446,14 @@ fn update_node_positions(
 
     let orbital_offset = if orbital.active { orbital.angle } else { 0.0 };
 
-    match constellation.layout {
-        LayoutStrategy::Circular => {
-            // Position nodes in a circle around center
-            let radius = theme.constellation_layout_radius;
-            let angle_step = std::f32::consts::TAU / node_count as f32;
+    // Position nodes in a circle around center
+    let radius = theme.constellation_layout_radius;
+    let angle_step = std::f32::consts::TAU / node_count as f32;
 
-            for (i, node) in constellation.nodes.iter_mut().enumerate() {
-                let base_angle = angle_step * i as f32 - std::f32::consts::FRAC_PI_2; // Start at top
-                let angle = base_angle + orbital_offset;
-                node.position = Vec2::new(angle.cos() * radius, angle.sin() * radius);
-            }
-        }
-        LayoutStrategy::ForceDirected => {
-            // TODO: Implement force-directed layout
-            // For now, fall back to circular
-        }
-        LayoutStrategy::Manual => {
-            // Don't update positions - user has arranged them
-        }
+    for (i, node) in constellation.nodes.iter_mut().enumerate() {
+        let base_angle = angle_step * i as f32 - std::f32::consts::FRAC_PI_2; // Start at top
+        let angle = base_angle + orbital_offset;
+        node.position = Vec2::new(angle.cos() * radius, angle.sin() * radius);
     }
 }
 

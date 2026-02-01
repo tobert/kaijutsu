@@ -18,10 +18,7 @@ pub const MINI_RENDER_SIZE: u32 = 192;
 
 /// Component marking a mini-render camera
 #[derive(Component)]
-pub struct MiniRenderCamera {
-    /// Context ID this camera renders
-    pub context_id: String,
-}
+pub struct MiniRenderCamera;
 
 /// Component marking a mini-render root UI node
 #[derive(Component)]
@@ -115,9 +112,7 @@ fn spawn_mini_renders(
                     ..default()
                 },
                 RenderTarget::Image(image_handle.clone().into()),
-                MiniRenderCamera {
-                    context_id: ctx_node.context_id.clone(),
-                },
+                MiniRenderCamera,
             ))
             .id();
 
