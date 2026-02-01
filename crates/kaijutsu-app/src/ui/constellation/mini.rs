@@ -30,13 +30,6 @@ pub struct MiniRenderRoot {
     pub context_id: String,
 }
 
-/// Component on constellation nodes that displays mini-render textures
-#[derive(Component)]
-pub struct MiniRenderDisplay {
-    /// Handle to the rendered texture
-    pub image: Handle<Image>,
-}
-
 /// Resource tracking mini-render state
 #[derive(Resource, Default)]
 pub struct MiniRenderRegistry {

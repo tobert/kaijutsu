@@ -560,16 +560,6 @@ impl Default for ConnectionLineMaterial {
     }
 }
 
-impl ConnectionLineMaterial {
-    /// Create a connection line with specified dimensions for aspect ratio correction
-    pub fn with_dimensions(width: f32, height: f32) -> Self {
-        let aspect = width / height.max(1.0);
-        Self {
-            dimensions: Vec4::new(width, height, aspect, 4.0),
-            ..Default::default()
-        }
-    }
-}
 
 impl UiMaterial for ConnectionLineMaterial {
     fn fragment_shader() -> ShaderRef {
@@ -612,17 +602,6 @@ impl Default for HudPanelMaterial {
     }
 }
 
-impl HudPanelMaterial {
-    /// Create a panel with custom glow color
-    pub fn with_glow(glow_color: Color, intensity: f32) -> Self {
-        let c = glow_color.to_linear();
-        Self {
-            glow_color: Vec4::new(c.red, c.green, c.blue, 0.8),
-            params: Vec4::new(intensity, 0.0, 1.5, 0.0),
-            ..Default::default()
-        }
-    }
-}
 
 impl UiMaterial for HudPanelMaterial {
     fn fragment_shader() -> ShaderRef {

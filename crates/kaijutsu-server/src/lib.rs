@@ -10,7 +10,6 @@ pub mod embedded_kaish;
 pub mod git_backend;
 pub mod kaish;
 pub mod kaish_backend;
-pub mod kaish_engine;
 pub mod rpc;
 pub mod ssh;
 

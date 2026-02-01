@@ -282,11 +282,6 @@ impl ActivityState {
             Self::Completed => 0.7,
         }
     }
-
-    /// Check if this state shows particle effects
-    pub fn has_particles(&self) -> bool {
-        matches!(self, Self::Streaming | Self::Completed | Self::Error)
-    }
 }
 
 /// View mode for the constellation
