@@ -161,6 +161,27 @@ Two execution modes:
 - `/docs/{doc_id}/_meta` — document metadata
 - Tool calls route through kernel's ToolRegistry
 
+#### Virtual Paths (`/v/*`)
+
+EmbeddedKaish uses `VirtualOverlayBackend` for virtual filesystem paths:
+
+| Path | Purpose |
+|------|---------|
+| `/v/jobs/{id}/stdout` | Live stdout from background command |
+| `/v/jobs/{id}/stderr` | Live stderr from background command |
+| `/v/jobs/{id}/status` | Job status: `running`, `done:0`, `failed:N` |
+| `/v/jobs/{id}/command` | Original command string |
+| `/v/blobs/*` | Blob storage (images, binaries) |
+| `/v/scratch/*` | Ephemeral scratch space |
+
+**Example: Monitor a cargo build**
+```bash
+cargo build &          # Start background build (job 1)
+cat /v/jobs/1/status   # Check if running
+cat /v/jobs/1/stdout   # View build output
+cat /v/jobs/1/stderr   # View errors/warnings
+```
+
 ## Crate Structure
 
 ```
