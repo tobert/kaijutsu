@@ -105,6 +105,20 @@ impl BlockCursor {
 // CELL EDITOR COMPONENT
 // ============================================================================
 
+/// Cached cursor screen position (row, col).
+///
+/// This avoids O(N) string scans every frame by caching the computed
+/// position until the document version changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CursorCache {
+    /// Cached row (0-indexed)
+    pub row: usize,
+    /// Cached column (0-indexed)
+    pub col: usize,
+    /// Document version when cache was computed
+    pub version: u64,
+}
+
 /// Text editor state for a cell.
 ///
 /// The `doc` field (BlockDocument) is the single source of truth for all content.
@@ -116,6 +130,9 @@ pub struct CellEditor {
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
+
+    /// Cached screen position for cursor rendering.
+    pub cursor_cache: CursorCache,
 }
 
 impl Default for CellEditor {
@@ -132,6 +149,7 @@ impl CellEditor {
         Self {
             doc: BlockDocument::new(&cell_id, &agent_id),
             cursor: BlockCursor::default(),
+            cursor_cache: CursorCache::default(),
         }
     }
 

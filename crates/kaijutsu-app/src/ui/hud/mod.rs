@@ -38,6 +38,8 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudConfig>()
+            .init_resource::<WidgetCache>()
+            .init_resource::<WidgetPollTimer>()
             .register_type::<HudPosition>()
             .register_type::<HudStyle>()
             .register_type::<HudVisibility>()
@@ -45,6 +47,7 @@ impl Plugin for HudPlugin {
             .add_systems(
                 Update,
                 (
+                    poll_widget_data,
                     despawn_removed_huds,
                     spawn_configured_huds,
                     update_hud_visibility,
@@ -52,6 +55,33 @@ impl Plugin for HudPlugin {
                 )
                     .chain(),
             );
+    }
+}
+
+// ============================================================================
+// WIDGET CACHE (Performance optimization)
+// ============================================================================
+
+/// Cached widget data - updated by polling, read by render systems.
+///
+/// This decouples expensive widget content generation (file I/O, string formatting)
+/// from the render loop. Polling happens on a timer; rendering reads from memory.
+#[derive(Resource, Default)]
+pub struct WidgetCache {
+    pub build_status: String,
+    pub keybinds: String,
+    pub session_info: String,
+    pub connection_status: String,
+}
+
+/// Timer for widget polling.
+#[derive(Resource)]
+pub struct WidgetPollTimer(pub Timer);
+
+impl Default for WidgetPollTimer {
+    fn default() -> Self {
+        // Poll every 500ms - fast enough for responsiveness, slow enough to not waste cycles
+        Self(Timer::from_seconds(0.5, TimerMode::Repeating))
     }
 }
 
@@ -398,25 +428,54 @@ fn update_hud_visibility(
     }
 }
 
-/// Update widget content text
-fn update_widget_content(
-    config: Res<HudConfig>,
-    constellation: Res<crate::ui::constellation::Constellation>,
+/// Poll and cache widget data on a timer.
+///
+/// This is the only system that performs file I/O or expensive string formatting.
+/// Runs every 500ms instead of every frame.
+fn poll_widget_data(
+    time: Res<Time>,
+    mut timer: ResMut<WidgetPollTimer>,
+    mut cache: ResMut<WidgetCache>,
+    constellation: Res<Constellation>,
     dashboard: Res<crate::dashboard::DashboardState>,
     conn_state: Res<ConnectionState>,
+) {
+    if !timer.0.tick(time.delta()).just_finished() {
+        return;
+    }
+
+    // Regenerate all widget content when timer fires
+    cache.build_status = generate_build_status();
+    cache.keybinds = generate_keybinds_content(&constellation);
+    cache.session_info = generate_session_info(&constellation, &dashboard);
+    cache.connection_status = generate_connection_status(&conn_state);
+}
+
+/// Update widget content text from cache.
+///
+/// Runs every frame but only reads from memory. The actual content generation
+/// happens in poll_widget_data on a timer.
+fn update_widget_content(
+    config: Res<HudConfig>,
+    cache: Res<WidgetCache>,
     mut hud_texts: Query<(&HudText, &mut crate::text::MsdfUiText)>,
 ) {
+    // Early return if cache hasn't changed
+    if !cache.is_changed() {
+        return;
+    }
+
     for (hud_text, mut text) in hud_texts.iter_mut() {
         // Find the content type for this HUD
         let def = config.huds.iter().find(|d| d.name == hud_text.hud_name);
         let Some(def) = def else { continue };
 
-        // Generate content based on widget type
+        // Read from cache instead of regenerating
         text.text = match &def.content {
-            HudContent::Keybinds => generate_keybinds_content(&constellation),
-            HudContent::SessionInfo => generate_session_info(&constellation, &dashboard),
-            HudContent::BuildStatus => generate_build_status(),
-            HudContent::ConnectionStatus => generate_connection_status(&conn_state),
+            HudContent::Keybinds => cache.keybinds.clone(),
+            HudContent::SessionInfo => cache.session_info.clone(),
+            HudContent::BuildStatus => cache.build_status.clone(),
+            HudContent::ConnectionStatus => cache.connection_status.clone(),
         };
     }
 }

@@ -776,7 +776,7 @@ pub fn update_cursor(
     focused: Res<FocusedCell>,
     mode: Res<CurrentMode>,
     cursor_entity: Res<CursorEntity>,
-    cells: Query<(&CellEditor, &MsdfTextAreaConfig)>,
+    mut cells: Query<(&mut CellEditor, &MsdfTextAreaConfig)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
@@ -796,7 +796,7 @@ pub fn update_cursor(
         return;
     };
 
-    let Ok((editor, config)) = cells.get(focused_entity) else {
+    let Ok((mut editor, config)) = cells.get_mut(focused_entity) else {
         *visibility = Visibility::Hidden;
         return;
     };
@@ -804,8 +804,8 @@ pub fn update_cursor(
     // Show cursor
     *visibility = Visibility::Inherited;
 
-    // Calculate cursor position by walking blocks directly
-    let (row, col) = cursor_position(editor);
+    // Calculate cursor position (uses cache to avoid O(N) scan every frame)
+    let (row, col) = cursor_position(&mut editor);
 
     // Position relative to cell bounds using TextMetrics for consistency
     let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
@@ -843,7 +843,28 @@ pub fn update_cursor(
 }
 
 /// Calculate cursor row and column by walking blocks directly.
-fn cursor_position(editor: &CellEditor) -> (usize, usize) {
+///
+/// Uses a cache to avoid O(N) string scans every frame. The cache is invalidated
+/// when the document version changes (on any edit operation).
+fn cursor_position(editor: &mut CellEditor) -> (usize, usize) {
+    let current_version = editor.version();
+
+    // Return cached position if still valid
+    if editor.cursor_cache.version == current_version {
+        return (editor.cursor_cache.row, editor.cursor_cache.col);
+    }
+
+    // Compute position and cache it
+    let (row, col) = compute_cursor_position(editor);
+    editor.cursor_cache.row = row;
+    editor.cursor_cache.col = col;
+    editor.cursor_cache.version = current_version;
+
+    (row, col)
+}
+
+/// Internal: compute cursor position by walking blocks (O(N) string scan).
+fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
     let Some(ref cursor_block_id) = editor.cursor.block_id else {
         return (0, 0);
     };
@@ -1359,6 +1380,11 @@ pub fn highlight_focused_block(
     main_cells: Query<&CellEditor, With<MainCell>>,
     theme: Res<Theme>,
 ) {
+    // Early return if no focused blocks - skip HashMap allocation entirely
+    if focused_configs.is_empty() {
+        return;
+    }
+
     // For now, we indicate focus by slightly brightening the text color
     // Future: could add a background highlight or border via a separate UI element
 
@@ -2227,11 +2253,24 @@ pub fn sync_block_cell_buffers(
         return;
     };
 
+    let doc_version = editor.version();
+
+    // Check if ANY blocks need updating before allocating HashMaps
+    // This is an O(N) check but avoids HashMap allocation when nothing changed
+    let needs_update = container.block_cells.iter().any(|e| {
+        block_cells
+            .get(*e)
+            .map(|(bc, _, _)| bc.last_render_version < doc_version)
+            .unwrap_or(false)
+    });
+
+    if !needs_update {
+        return;
+    }
+
     let Ok(mut font_system) = font_system.0.lock() else {
         return;
     };
-
-    let doc_version = editor.version();
 
     // Get ordered blocks for role transition detection
     let blocks_ordered = editor.blocks();
