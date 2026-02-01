@@ -97,8 +97,7 @@ impl AuthDb {
 
     /// Default database path: ~/.local/share/kaijutsu/auth.db
     pub fn default_path() -> std::path::PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+        kaish_kernel::xdg_data_home()
             .join("kaijutsu")
             .join("auth.db")
     }

@@ -79,13 +79,9 @@ impl EmbeddedKaish {
         let backend: Arc<dyn KernelBackend> = Arc::new(KaijutsuBackend::new(blocks, kernel));
 
         // Configure kaish kernel to start in /docs namespace
-        let config = KaishConfig {
-            name: name.to_string(),
-            mount_local: false, // Don't mount local fs - use backend
-            local_root: None,
-            cwd: std::path::PathBuf::from("/docs"),
-            skip_validation: false,
-        };
+        // Use isolated mode since all file ops go through the CRDT backend
+        let config = KaishConfig::isolated()
+            .with_cwd(std::path::PathBuf::from("/docs"));
 
         // Create kaish kernel with our CRDT backend
         let kaish_kernel = KaishKernel::with_backend(backend, config)?;
@@ -135,13 +131,9 @@ impl EmbeddedKaish {
         ));
 
         // Configure kaish kernel to start in /docs namespace
-        let config = KaishConfig {
-            name: name.to_string(),
-            mount_local: false,
-            local_root: None,
-            cwd: std::path::PathBuf::from("/docs"),
-            skip_validation: false,
-        };
+        // Use isolated mode since all file ops go through the composite backend
+        let config = KaishConfig::isolated()
+            .with_cwd(std::path::PathBuf::from("/docs"));
 
         let kaish_kernel = KaishKernel::with_backend(composite, config)?;
 

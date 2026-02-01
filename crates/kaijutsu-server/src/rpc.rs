@@ -255,9 +255,10 @@ pub struct Identity {
 /// Creates the directory if it doesn't exist.
 /// Returns: ~/.local/share/kaijutsu/kernels/{kernel_id}/
 fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let dir = base.join("kaijutsu").join("kernels").join(kernel_id);
+    let dir = kaish_kernel::xdg_data_home()
+        .join("kaijutsu")
+        .join("kernels")
+        .join(kernel_id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("Failed to create kernel data dir {:?}: {}", dir, e);
     }
@@ -407,11 +408,10 @@ impl world::Server for WorldImpl {
                 let kernel = Kernel::with_flows(&id, block_flows.clone()).await;
 
                 // Mount user's home directory at /home (read-only for now)
-                if let Some(home) = dirs::home_dir() {
-                    kernel
-                        .mount("/home", LocalBackend::read_only(home))
-                        .await;
-                }
+                let home = kaish_kernel::home_dir();
+                kernel
+                    .mount("/home", LocalBackend::read_only(home))
+                    .await;
 
                 // Create block store with database persistence and shared FlowBus
                 let documents = create_block_store_with_db(&id, block_flows);
@@ -491,11 +491,10 @@ impl world::Server for WorldImpl {
             let kernel = Kernel::with_flows(&name, block_flows.clone()).await;
 
             // Mount user's home directory at /home (read-only for now)
-            if let Some(home) = dirs::home_dir() {
-                kernel
-                    .mount("/home", LocalBackend::read_only(home))
-                    .await;
-            }
+            let home = kaish_kernel::home_dir();
+            kernel
+                .mount("/home", LocalBackend::read_only(home))
+                .await;
 
             // Create block store with database persistence and shared FlowBus
             let documents = create_block_store_with_db(&id, block_flows);

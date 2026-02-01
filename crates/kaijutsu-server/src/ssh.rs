@@ -35,8 +35,7 @@ pub enum KeySource {
 impl KeySource {
     /// Default persistent key path: ~/.local/share/kaijutsu/host_key
     pub fn default_path() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+        kaish_kernel::xdg_data_home()
             .join("kaijutsu")
             .join("host_key")
     }
