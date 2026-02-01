@@ -213,7 +213,7 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                 ..default()
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
-            ZIndex(100),
+            ZIndex(crate::constants::ZLayer::MODAL),
             // Capture interactions to prevent click-through
             Interaction::None,
         ))
