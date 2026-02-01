@@ -83,8 +83,9 @@ impl EmbeddedKaish {
         let config = KaishConfig::isolated()
             .with_cwd(std::path::PathBuf::from("/docs"));
 
-        // Create kaish kernel with our CRDT backend
-        let kaish_kernel = KaishKernel::with_backend(backend, config)?;
+        // Create kaish kernel with our CRDT backend and /v/* virtual path support
+        // This enables /v/jobs for job observability (agents can monitor cargo builds)
+        let kaish_kernel = KaishKernel::with_backend_and_virtual_paths(backend, config)?;
 
         Ok(Self {
             kernel: kaish_kernel,
@@ -135,7 +136,9 @@ impl EmbeddedKaish {
         let config = KaishConfig::isolated()
             .with_cwd(std::path::PathBuf::from("/docs"));
 
-        let kaish_kernel = KaishKernel::with_backend(composite, config)?;
+        // Create kaish kernel with our composite backend and /v/* virtual path support
+        // This enables /v/jobs for job observability (agents can monitor cargo builds)
+        let kaish_kernel = KaishKernel::with_backend_and_virtual_paths(composite, config)?;
 
         Ok(Self {
             kernel: kaish_kernel,
