@@ -5,9 +5,9 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ConversationScrollState, CurrentMode, EditorMode, FocusedCell, InputKind, MainCell,
-    PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
+    ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusedCell, InputKind,
+    MainCell, PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
@@ -99,6 +99,13 @@ pub fn spawn_cell(
 #[derive(Resource, Default)]
 pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
 
+/// Clear consumed keys at the start of each frame.
+///
+/// This must run before any system that reads or writes to ConsumedModeKeys.
+pub fn clear_consumed_keys(mut consumed: ResMut<ConsumedModeKeys>) {
+    consumed.0.clear();
+}
+
 /// Handle vim-style mode switching with input presence transitions.
 ///
 /// Key bindings:
@@ -109,6 +116,7 @@ pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
 /// - `:` in Normal → Command mode (no presence change)
 ///
 /// Note: Chat/Shell modes only allowed in Conversation screen.
+/// Note: Keys already in ConsumedModeKeys are skipped (e.g., `i` consumed by block editing)
 pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
@@ -118,8 +126,8 @@ pub fn handle_mode_switch(
     prompt_cells: Query<&CellEditor, With<PromptCell>>,
     screen: Res<State<AppScreen>>,
 ) {
-    // Clear consumed keys from last frame
-    consumed.0.clear();
+    // Note: consumed.0.clear() happens in clear_consumed_keys system
+    // which runs at the start of each frame, before block editing and mode switching
 
     // Skip when a modal dialog is open to prevent mode changes during dialog input
     if modal_open.is_some_and(|m| m.0) {
@@ -136,6 +144,11 @@ pub fn handle_mode_switch(
             continue;
         }
 
+        // Skip keys already consumed by earlier systems (e.g., block editing)
+        if consumed.0.contains(&event.key_code) {
+            continue;
+        }
+
         match mode.0 {
             EditorMode::Normal => {
                 // Input modes only make sense in Conversation screen
@@ -145,7 +158,7 @@ pub fn handle_mode_switch(
                 }
 
                 // In normal mode:
-                // - i enters Chat (docked)
+                // - i enters Chat (docked) - unless consumed by block editing
                 // - Space enters Chat (overlay)
                 // - ` (backtick) enters Shell
                 // - : also enters Shell (kaish handles commands natively)
@@ -154,7 +167,6 @@ pub fn handle_mode_switch(
                     KeyCode::KeyI => {
                         mode.0 = EditorMode::Input(InputKind::Chat);
                         presence.0 = InputPresenceKind::Docked;
-                        consumed.0.insert(KeyCode::KeyI);
                         info!("Mode: CHAT, Presence: DOCKED");
                     }
                     KeyCode::Space => {
@@ -1110,18 +1122,27 @@ pub fn handle_prompt_submitted(
 }
 
 /// Auto-focus the prompt cell when entering Input mode.
-/// In conversation UI, input modes always mean typing in the prompt.
+///
+/// In conversation UI, input modes normally mean typing in the prompt.
+/// However, if a BlockCell is being edited (has EditingBlockCell marker),
+/// we skip this to let the block keep focus.
 pub fn auto_focus_prompt(
     mode: Res<CurrentMode>,
     mut focused: ResMut<FocusedCell>,
     prompt_entity: Res<PromptCellEntity>,
+    editing_blocks: Query<Entity, With<EditingBlockCell>>,
 ) {
     // Only when entering Input mode
     if !mode.is_changed() || !mode.0.accepts_input() {
         return;
     }
 
-    // Always focus the prompt when entering Input mode
+    // Don't steal focus if we're editing a BlockCell
+    if !editing_blocks.is_empty() {
+        return;
+    }
+
+    // Focus the prompt when entering Input mode (no block being edited)
     if let Some(entity) = prompt_entity.0 {
         focused.0 = Some(entity);
         info!("Focused prompt cell for {} mode", mode.0.name());
@@ -2830,4 +2851,331 @@ pub fn sync_presence_with_screen(
             }
         }
     }
+}
+
+// ============================================================================
+// BLOCK CELL EDITING SYSTEMS (Phase 1: Unified Edit Model)
+// ============================================================================
+//
+// These systems enable editing any BlockCell, not just the PromptCell.
+// The core insight: "mode emerges from focus + edit state, not a global switch"
+//
+// Flow:
+// 1. User navigates with j/k to focus a BlockCell (existing navigate_blocks system)
+// 2. User presses 'i' to enter edit mode on the focused block
+// 3. Keyboard input goes to that block via CRDT operations
+// 4. User presses Escape to exit edit mode
+
+/// Handle entering/exiting edit mode on a focused BlockCell.
+///
+/// Key bindings:
+/// - `i` in Normal mode with FocusedBlockCell → Enter edit mode on that block
+/// - `Escape` in edit mode → Exit edit mode, return to Normal
+///
+/// This system modifies mode_switch behavior:
+/// - When a BlockCell is focused, `i` edits that block instead of the prompt
+/// - When no BlockCell is focused, `i` still goes to the prompt (existing behavior)
+pub fn handle_block_edit_mode(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<CurrentMode>,
+    mut consumed: ResMut<ConsumedModeKeys>,
+    screen: Res<State<AppScreen>>,
+    focus: Res<ConversationFocus>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    _containers: Query<&BlockCellContainer>,
+    focused_block_cells: Query<Entity, With<FocusedBlockCell>>,
+    editing_block_cells: Query<Entity, With<EditingBlockCell>>,
+) {
+    // Only in Conversation screen
+    if *screen.get() != AppScreen::Conversation {
+        return;
+    }
+
+    // Handle `i` to enter edit mode on focused BlockCell
+    if mode.0 == EditorMode::Normal && keys.just_pressed(KeyCode::KeyI) {
+        // Check if there's a focused BlockCell to edit
+        if let Ok(focused_entity) = focused_block_cells.single() {
+            // Get the block info to validate it's editable
+            if let Some(ref block_id) = focus.block_id {
+                // Check if this block exists and is editable
+                // For now, only User and Text blocks are editable
+                if let Some(main_ent) = main_entity.0 {
+                    if let Ok(editor) = main_cells.get(main_ent) {
+                        let blocks = editor.blocks();
+                        if let Some(block) = blocks.iter().find(|b| &b.id == block_id) {
+                            // Only allow editing User role Text blocks for now
+                            // (extending to other types is future work)
+                            if block.role == kaijutsu_crdt::Role::User
+                                && block.kind == BlockKind::Text
+                            {
+                                // Enter edit mode on this block
+                                let content_len = block.content.len();
+                                commands.entity(focused_entity).insert((
+                                    EditingBlockCell,
+                                    BlockEditCursor { offset: content_len },
+                                ));
+
+                                // Set mode to Input (Chat) - this enables cursor rendering
+                                mode.0 = EditorMode::Input(InputKind::Chat);
+                                consumed.0.insert(KeyCode::KeyI);
+                                info!(
+                                    "Entered edit mode on block {:?} (User Text, {} chars)",
+                                    block_id, content_len
+                                );
+                                return;
+                            } else {
+                                info!(
+                                    "Block {:?} is {:?}/{:?} - not editable (only User Text)",
+                                    block_id, block.role, block.kind
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // No focused block or not editable - fall through to default `i` behavior
+        // (which is handled by handle_mode_switch)
+    }
+
+    // Handle Escape to exit edit mode
+    if mode.0.accepts_input() && keys.just_pressed(KeyCode::Escape) {
+        // Check if we're editing a BlockCell
+        for entity in editing_block_cells.iter() {
+            // Remove edit markers
+            commands
+                .entity(entity)
+                .remove::<EditingBlockCell>()
+                .remove::<BlockEditCursor>();
+            info!("Exited edit mode on block cell {:?}", entity);
+        }
+        // Note: mode.0 will be set to Normal by handle_mode_switch
+    }
+}
+
+/// Handle keyboard input for editing BlockCells.
+///
+/// Routes text input to the editing block via CRDT operations on the MainCell's
+/// BlockDocument. This ensures all edits are properly tracked and synced.
+pub fn handle_block_cell_input(
+    mut key_events: MessageReader<KeyboardInput>,
+    mode: Res<CurrentMode>,
+    consumed: Res<ConsumedModeKeys>,
+    main_entity: Res<MainCellEntity>,
+    mut main_cells: Query<&mut CellEditor, With<MainCell>>,
+    mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
+) {
+    // Only process input in Input modes
+    if !mode.0.accepts_input() {
+        return;
+    }
+
+    // Get the editing block cell (if any)
+    let Ok((block_cell, mut cursor)) = editing_cells.single_mut() else {
+        return; // No block being edited
+    };
+
+    // Get the main cell editor for CRDT operations
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+    let Ok(mut editor) = main_cells.get_mut(main_ent) else {
+        return;
+    };
+
+    // Skip on frame when mode changes
+    if mode.is_changed() {
+        for _ in key_events.read() {} // Consume events
+        return;
+    }
+
+    for event in key_events.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+
+        // Skip keys consumed by mode switching
+        if consumed.0.contains(&event.key_code) {
+            continue;
+        }
+
+        // Handle special keys
+        match event.key_code {
+            KeyCode::Backspace => {
+                if cursor.offset > 0 {
+                    // Find previous character boundary
+                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                        let text = &block.content;
+                        let mut new_offset = cursor.offset.saturating_sub(1);
+                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                            new_offset -= 1;
+                        }
+                        let delete_len = cursor.offset - new_offset;
+                        if editor
+                            .doc
+                            .edit_text(&block_cell.block_id, new_offset, "", delete_len)
+                            .is_ok()
+                        {
+                            cursor.offset = new_offset;
+                        }
+                    }
+                }
+                continue;
+            }
+            KeyCode::Delete => {
+                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                    let text = &block.content;
+                    if cursor.offset < text.len() {
+                        let mut end = cursor.offset + 1;
+                        while end < text.len() && !text.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        let delete_len = end - cursor.offset;
+                        let _ = editor
+                            .doc
+                            .edit_text(&block_cell.block_id, cursor.offset, "", delete_len);
+                    }
+                }
+                continue;
+            }
+            KeyCode::Enter => {
+                // Insert newline in block content
+                if editor
+                    .doc
+                    .edit_text(&block_cell.block_id, cursor.offset, "\n", 0)
+                    .is_ok()
+                {
+                    cursor.offset += 1;
+                }
+                continue;
+            }
+            KeyCode::ArrowLeft => {
+                if cursor.offset > 0 {
+                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                        let text = &block.content;
+                        let mut new_offset = cursor.offset - 1;
+                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                            new_offset -= 1;
+                        }
+                        cursor.offset = new_offset;
+                    }
+                }
+                continue;
+            }
+            KeyCode::ArrowRight => {
+                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                    let text = &block.content;
+                    if cursor.offset < text.len() {
+                        let mut new_offset = cursor.offset + 1;
+                        while new_offset < text.len() && !text.is_char_boundary(new_offset) {
+                            new_offset += 1;
+                        }
+                        cursor.offset = new_offset;
+                    }
+                }
+                continue;
+            }
+            KeyCode::Home => {
+                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                    let text = &block.content;
+                    let before_cursor = &text[..cursor.offset];
+                    cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                }
+                continue;
+            }
+            KeyCode::End => {
+                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                    let text = &block.content;
+                    let after_cursor = &text[cursor.offset..];
+                    cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        // Handle text input
+        if let Some(ref text) = event.text {
+            for c in text.chars() {
+                if c.is_control() {
+                    continue;
+                }
+                let s = c.to_string();
+                if editor
+                    .doc
+                    .edit_text(&block_cell.block_id, cursor.offset, &s, 0)
+                    .is_ok()
+                {
+                    cursor.offset += s.len();
+                }
+            }
+        }
+    }
+}
+
+/// Update cursor rendering to show cursor in editing BlockCell.
+///
+/// When a BlockCell is being edited, the cursor should render at that block's
+/// position, not in the PromptCell.
+pub fn update_block_edit_cursor(
+    editing_cells: Query<(&BlockCell, &BlockEditCursor, &BlockCellLayout, &MsdfTextAreaConfig), With<EditingBlockCell>>,
+    cursor_entity: Res<CursorEntity>,
+    mode: Res<CurrentMode>,
+    mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
+    main_entity: Res<MainCellEntity>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    text_metrics: Res<TextMetrics>,
+) {
+    // Only when editing a block
+    let Ok((block_cell, cursor, _layout, config)) = editing_cells.single() else {
+        return;
+    };
+
+    let Some(cursor_ent) = cursor_entity.0 else {
+        return;
+    };
+
+    let Ok((mut node, mut visibility)) = cursor_query.get_mut(cursor_ent) else {
+        return;
+    };
+
+    // Get block content for cursor position calculation
+    let Some(main_ent) = main_entity.0 else {
+        return;
+    };
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+
+    let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) else {
+        return;
+    };
+
+    // Calculate cursor row/col within block content
+    let text = &block.content;
+    let offset = cursor.offset.min(text.len());
+    let before_cursor = &text[..offset];
+    let row = before_cursor.matches('\n').count();
+    let col = before_cursor
+        .rfind('\n')
+        .map(|pos| offset - pos - 1)
+        .unwrap_or(offset);
+
+    // Show cursor in edit mode
+    *visibility = if mode.0.accepts_input() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
+    // Position cursor relative to block cell's text area
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let line_height = text_metrics.cell_line_height;
+    let x = config.left + (col as f32 * char_width);
+    let y = config.top + (row as f32 * line_height);
+
+    node.left = Val::Px(x - 2.0);
+    node.top = Val::Px(y);
 }

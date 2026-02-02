@@ -60,12 +60,25 @@ impl Plugin for CellPlugin {
             .init_resource::<InputPosition>()
             .init_resource::<InputShadowHeight>()
             // Input and mode handling (mode_switch must run before cell_input)
+            // Block edit mode intercepts `i` when a BlockCell is focused
             .add_systems(
                 Update,
                 (
-                    systems::handle_mode_switch,
+                    // Clear consumed keys at start of frame before any input handling
+                    systems::clear_consumed_keys,
+                    // Block edit mode must run BEFORE mode_switch to intercept `i`
+                    // when a BlockCell is focused
+                    systems::handle_block_edit_mode
+                        .after(systems::clear_consumed_keys)
+                        .before(systems::handle_mode_switch),
+                    systems::handle_mode_switch
+                        .after(systems::clear_consumed_keys),
                     // Auto-focus prompt when entering INSERT mode (after mode switch, before input)
                     systems::auto_focus_prompt.after(systems::handle_mode_switch),
+                    // Block cell input runs before prompt submit to handle editing blocks
+                    systems::handle_block_cell_input
+                        .after(systems::handle_block_edit_mode)
+                        .before(systems::handle_prompt_submit),
                     // Prompt submit must run before cell_input to intercept Enter in prompt
                     systems::handle_prompt_submit.after(systems::auto_focus_prompt),
                     systems::handle_cell_input.after(systems::handle_prompt_submit),
@@ -192,11 +205,16 @@ impl Plugin for CellPlugin {
                 ),
             )
             // Cursor
+            // update_block_edit_cursor handles cursor when editing a BlockCell
+            // update_cursor handles cursor in PromptCell
             .add_systems(
                 Update,
                 (
                     systems::spawn_cursor,
                     systems::update_cursor,
+                    // Block edit cursor overrides prompt cursor when editing a block
+                    systems::update_block_edit_cursor
+                        .after(systems::update_cursor),
                 ),
             )
             // Input area positioning and visibility

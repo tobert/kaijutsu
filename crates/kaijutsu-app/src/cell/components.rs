@@ -510,6 +510,28 @@ impl ConversationFocus {
 #[derive(Component)]
 pub struct FocusedBlockCell;
 
+/// Marker for a block cell that is currently being edited.
+///
+/// When this marker is present on a BlockCell entity, the block receives
+/// keyboard input and the cursor is displayed within it. This is the core
+/// of the "any block can be edited" model.
+///
+/// Added when: User presses `i` with a FocusedBlockCell active
+/// Removed when: User presses `Escape` to exit edit mode
+#[derive(Component)]
+pub struct EditingBlockCell;
+
+/// Tracks the edit cursor position within an editing block.
+///
+/// This is separate from CellEditor's cursor because BlockCells don't have
+/// a full CellEditor - they render from the MainCell's BlockDocument.
+/// The cursor is an offset within the block's content string.
+#[derive(Component, Default)]
+pub struct BlockEditCursor {
+    /// Character offset within the block's content.
+    pub offset: usize,
+}
+
 /// Resource tracking CRDT sync state for frontier-based incremental updates.
 ///
 /// This is a thin wrapper around [`SyncManager`](super::sync::SyncManager) that

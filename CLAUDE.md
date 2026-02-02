@@ -127,10 +127,24 @@ The main UI area manages cognitive load, not just chat history.
 | Mode | Purpose | Enter | Exit |
 |------|---------|-------|------|
 | Normal | Navigate, read | `Esc` | - |
-| Chat | LLM prompts | `i` | `Esc` |
-| Shell | kaish commands | `s` | `Esc` |
-| Command | Slash commands | `:` | `Esc` |
+| Chat | LLM prompts / edit | `i` | `Esc` |
+| Shell | kaish commands | `` ` `` or `:` | `Esc` |
 | Visual | Selection | `v` | `Esc` |
+
+### Unified Edit Model (Phase 1)
+
+Any block can be edited, not just the prompt. Mode emerges from focus + edit state:
+
+1. **Navigate blocks**: `j`/`k` in Normal mode to focus conversation blocks
+2. **Edit focused block**: `i` on a focused User Text block enters edit mode
+3. **Edit prompt**: `i` or `Space` with no block focused goes to the prompt
+
+Key components:
+- `FocusedBlockCell` marker: which BlockCell is highlighted via j/k
+- `EditingBlockCell` marker: which BlockCell is actively being edited
+- `BlockEditCursor` component: cursor offset within an editing block
+
+Edits go through CRDT operations on the MainCell's BlockDocument, ensuring all changes are properly tracked and synced.
 
 ## Key Patterns
 
