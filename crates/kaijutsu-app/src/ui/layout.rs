@@ -388,7 +388,7 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
             .id()
     });
 
-    // InputShadow - reserves space at bottom for docked input
+    // InputShadow - reserves space at bottom for docked input (legacy)
     registry.register_with_builder("InputShadow", |commands, ctx| {
         commands
             .spawn((
@@ -401,6 +401,36 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
                     min_height: Val::Px(0.0),
                     ..default()
                 },
+            ))
+            .id()
+    });
+
+    // ComposeBlock - inline editable block at end of conversation
+    // This is the "compose block" that replaces the floating prompt
+    registry.register_with_builder("ComposeBlock", |commands, ctx| {
+        commands
+            .spawn((
+                crate::cell::ComposeBlock::default(),
+                crate::text::MsdfText,
+                crate::text::MsdfTextAreaConfig::default(),
+                Node {
+                    width: Val::Percent(100.0),
+                    min_height: Val::Px(60.0),
+                    padding: UiRect::all(Val::Px(12.0)),
+                    margin: UiRect::new(
+                        Val::Px(40.0),  // left margin matches conversation blocks
+                        Val::Px(40.0),  // right margin
+                        Val::Px(8.0),   // top margin
+                        Val::Px(16.0),  // bottom margin
+                    ),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    flex_grow: ctx.flex,
+                    ..default()
+                },
+                // Distinct border color for compose block
+                BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
+                BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
             ))
             .id()
     });

@@ -24,9 +24,9 @@
         children: [
             // Main content area - DAG view for conversation blocks
             Panel(id: "DagView", flex: 1.0),
-            // Input shadow - reserves space at bottom for docked input
-            // The actual input frame floats over this via the InputLayer system
-            Panel(id: "InputShadow", flex: 0.0),
+            // Compose block - inline editable input at bottom of conversation
+            // Replaces the floating prompt with an inline block
+            Panel(id: "ComposeBlock", flex: 0.0),
         ],
         flex: 1.0,
     ),

@@ -23,7 +23,7 @@ mod systems;
 
 // Re-export public API
 pub use components::{
-    Cell, CellEditor, ConversationContainer, CurrentMode, EditorMode, FocusedCell,
+    Cell, CellEditor, ComposeBlock, ConversationContainer, CurrentMode, EditorMode, FocusedCell,
     FocusedBlockCell, InputKind, MainCell, PromptContainer,
 };
 pub use plugin::CellPlugin;

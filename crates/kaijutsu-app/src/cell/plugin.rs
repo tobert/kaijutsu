@@ -193,6 +193,18 @@ impl Plugin for CellPlugin {
                         .after(systems::spawn_expanded_block_view),
                 ),
             )
+            // Compose block systems (inline input at bottom of conversation)
+            .add_systems(
+                Update,
+                (
+                    systems::init_compose_block_buffer,
+                    systems::handle_compose_block_input
+                        .after(systems::handle_mode_switch)
+                        .before(systems::handle_prompt_submit),
+                    systems::sync_compose_block_buffer
+                        .after(systems::handle_compose_block_input),
+                ),
+            )
             // 9-slice frame system
             .add_systems(
                 Update,

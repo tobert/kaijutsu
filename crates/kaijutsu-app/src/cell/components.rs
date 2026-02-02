@@ -630,6 +630,93 @@ pub struct PromptContainer;
 #[reflect(Component)]
 pub struct PromptCell;
 
+/// Marker for the compose block - an inline editable block at the end of conversation.
+///
+/// The compose block is the "unified edit model" replacement for the floating prompt:
+/// - Renders inline with conversation blocks (scrolls with content)
+/// - Always editable (no need to enter edit mode)
+/// - Styled like a user block but with distinct border
+/// - Submitting creates a new block and clears the compose area
+///
+/// This makes the input area part of the conversation flow rather than
+/// a separate floating element.
+#[derive(Component, Reflect, Default)]
+#[reflect(Component)]
+pub struct ComposeBlock {
+    /// Current text content (before submission)
+    pub text: String,
+    /// Cursor position within the text
+    pub cursor: usize,
+}
+
+impl ComposeBlock {
+    /// Insert text at cursor position
+    pub fn insert(&mut self, s: &str) {
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    /// Delete character before cursor (backspace)
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            // Find the previous char boundary
+            let prev = self.text[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.text.drain(prev..self.cursor);
+            self.cursor = prev;
+        }
+    }
+
+    /// Delete character after cursor (delete)
+    pub fn delete(&mut self) {
+        if self.cursor < self.text.len() {
+            // Find the next char boundary
+            let next = self.text[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.text.len());
+            self.text.drain(self.cursor..next);
+        }
+    }
+
+    /// Move cursor left
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.text[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Move cursor right
+    pub fn move_right(&mut self) {
+        if self.cursor < self.text.len() {
+            self.cursor = self.text[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor + i)
+                .unwrap_or(self.text.len());
+        }
+    }
+
+    /// Clear and return the text (for submission)
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    /// Check if the compose block is empty
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
 /// Marker for the main conversation view cell.
 ///
 /// NOTE: MainCell no longer renders directly - it holds the CellEditor

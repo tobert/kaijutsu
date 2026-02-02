@@ -6,8 +6,8 @@ use bevy::prelude::*;
 
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusedCell, InputKind,
-    MainCell, PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusedCell,
+    InputKind, MainCell, PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
@@ -3194,4 +3194,127 @@ pub fn update_block_edit_cursor(
 
     node.left = Val::Px(x - 2.0);
     node.top = Val::Px(y);
+}
+
+// ============================================================================
+// COMPOSE BLOCK SYSTEMS
+// ============================================================================
+
+/// Initialize MsdfTextBuffer for ComposeBlock entities.
+pub fn init_compose_block_buffer(
+    mut commands: Commands,
+    compose_blocks: Query<Entity, (With<ComposeBlock>, With<MsdfText>, Without<MsdfTextBuffer>)>,
+    font_system: Res<SharedFontSystem>,
+    text_metrics: Res<TextMetrics>,
+) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    for entity in compose_blocks.iter() {
+        let metrics = text_metrics.scaled_cell_metrics();
+        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+
+        // Initialize with placeholder text
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
+        buffer.set_text(&mut font_system, "Type here...", attrs, cosmic_text::Shaping::Advanced);
+
+        commands.entity(entity).insert(buffer);
+        info!("Initialized ComposeBlock buffer");
+    }
+}
+
+/// Handle keyboard input for ComposeBlock.
+///
+/// When in INSERT mode with ComposeBlock focused, process text input,
+/// cursor movement, and submit on Enter.
+pub fn handle_compose_block_input(
+    mut keyboard: MessageReader<KeyboardInput>,
+    mode: Res<CurrentMode>,
+    screen: Res<State<AppScreen>>,
+    mut compose_blocks: Query<&mut ComposeBlock>,
+    mut submit_writer: MessageWriter<PromptSubmitted>,
+) {
+    // Only handle in Conversation screen
+    if *screen.get() != AppScreen::Conversation {
+        return;
+    }
+
+    // Only handle in INSERT mode (Chat or Shell)
+    if !mode.0.accepts_input() {
+        return;
+    }
+
+    let Ok(mut compose) = compose_blocks.single_mut() else {
+        return;
+    };
+
+    for event in keyboard.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+
+        use bevy::input::keyboard::Key;
+        match (&event.logical_key, &event.text) {
+            // Enter submits (without Shift)
+            (Key::Enter, _) => {
+                if !compose.is_empty() {
+                    let text = compose.take();
+                    info!("ComposeBlock submitted: {} chars", text.len());
+                    submit_writer.write(PromptSubmitted { text });
+                }
+            }
+            // Backspace
+            (Key::Backspace, _) => {
+                compose.backspace();
+            }
+            // Delete
+            (Key::Delete, _) => {
+                compose.delete();
+            }
+            // Arrow keys
+            (Key::ArrowLeft, _) => {
+                compose.move_left();
+            }
+            (Key::ArrowRight, _) => {
+                compose.move_right();
+            }
+            // Text input
+            (_, Some(text)) => {
+                compose.insert(text);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Sync ComposeBlock text to its MsdfTextBuffer.
+pub fn sync_compose_block_buffer(
+    font_system: Res<SharedFontSystem>,
+    theme: Res<Theme>,
+    mut compose_blocks: Query<(&ComposeBlock, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), Changed<ComposeBlock>>,
+) {
+    let Ok(mut font_system) = font_system.0.lock() else {
+        return;
+    };
+
+    for (compose, mut buffer, mut config) in compose_blocks.iter_mut() {
+        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
+
+        // Show placeholder when empty
+        let display_text = if compose.is_empty() {
+            "Type here..."
+        } else {
+            &compose.text
+        };
+
+        buffer.set_text(&mut font_system, display_text, attrs, cosmic_text::Shaping::Advanced);
+
+        // Use user block color for compose block
+        config.default_color = if compose.is_empty() {
+            theme.fg_dim // Placeholder is dimmed
+        } else {
+            theme.block_user // User input color
+        };
+    }
 }
