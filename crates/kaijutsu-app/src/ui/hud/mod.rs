@@ -40,9 +40,12 @@ impl Plugin for HudPlugin {
         app.init_resource::<HudConfig>()
             .init_resource::<WidgetCache>()
             .init_resource::<WidgetPollTimer>()
+            .init_resource::<FocusedHud>()
             .register_type::<HudPosition>()
             .register_type::<HudStyle>()
             .register_type::<HudVisibility>()
+            .register_type::<FocusedHud>()
+            .add_message::<HudConfigChanged>()
             .add_systems(Startup, load_hud_config)
             .add_systems(
                 Update,
@@ -52,6 +55,11 @@ impl Plugin for HudPlugin {
                     spawn_configured_huds,
                     update_hud_visibility,
                     update_widget_content,
+                    handle_hud_navigation_keys,
+                    update_hud_focus_visual,
+                    spawn_config_editor,
+                    despawn_config_editor,
+                    handle_config_changes,
                 )
                     .chain(),
             );
@@ -204,6 +212,59 @@ pub enum HudVisibility {
 }
 
 // ============================================================================
+// FOCUS STATE
+// ============================================================================
+
+/// Tracks which HUD widget is currently focused for editing.
+///
+/// When a HUD is focused:
+/// - It shows a visual highlight
+/// - Pressing 'i' enters config editing mode
+/// - j/k navigates between HUDs
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct FocusedHud {
+    /// The focused HUD entity, if any
+    pub entity: Option<Entity>,
+    /// Whether we're in HUD navigation mode (H key toggles)
+    pub navigation_active: bool,
+    /// Whether we're editing the focused HUD's config
+    pub editing: bool,
+}
+
+impl FocusedHud {
+    /// Check if a specific entity is focused
+    pub fn is_focused(&self, entity: Entity) -> bool {
+        self.entity == Some(entity)
+    }
+
+    /// Focus a HUD entity
+    pub fn focus(&mut self, entity: Entity) {
+        self.entity = Some(entity);
+        self.navigation_active = true;
+    }
+
+    /// Clear focus and exit navigation mode
+    pub fn clear(&mut self) {
+        self.entity = None;
+        self.navigation_active = false;
+        self.editing = false;
+    }
+
+    /// Enter config editing mode for the focused HUD
+    pub fn start_editing(&mut self) {
+        if self.entity.is_some() {
+            self.editing = true;
+        }
+    }
+
+    /// Exit config editing mode
+    pub fn stop_editing(&mut self) {
+        self.editing = false;
+    }
+}
+
+// ============================================================================
 // COMPONENTS
 // ============================================================================
 
@@ -214,10 +275,33 @@ pub struct Hud {
     pub name: String,
 }
 
+/// Marker indicating a HUD can be focused for config editing
+#[derive(Component, Default)]
+pub struct HudFocusable;
+
 /// Marker for the HUD content text
 #[derive(Component)]
 pub struct HudText {
     pub hud_name: String,
+}
+
+/// Marker for the config editor overlay
+#[derive(Component)]
+#[allow(dead_code)] // Fields used for future live editing feature
+pub struct HudConfigEditor {
+    /// Which HUD is being edited
+    pub hud_name: String,
+    /// Original config text (for comparison)
+    pub original: String,
+    /// Current edited text
+    pub current: String,
+}
+
+/// Message sent when config editing is confirmed
+#[derive(bevy::ecs::prelude::Message, Clone)]
+pub struct HudConfigChanged {
+    pub hud_name: String,
+    pub new_config: String,
 }
 
 // ============================================================================
@@ -348,6 +432,7 @@ fn spawn_configured_huds(
             Hud {
                 name: def.name.clone(),
             },
+            HudFocusable,
             Node {
                 position_type: PositionType::Absolute,
                 top,
@@ -356,8 +441,10 @@ fn spawn_configured_huds(
                 left,
                 padding: UiRect::all(Val::Px(8.0)),
                 min_width: Val::Px(120.0),
+                border: UiRect::all(Val::Px(2.0)), // Reserve space for focus border
                 ..default()
             },
+            BorderColor::all(Color::NONE), // Invisible by default, shown when focused
             ZIndex(crate::constants::ZLayer::HUD),
         ));
 
@@ -521,4 +608,281 @@ fn generate_build_status() -> String {
     std::fs::read_to_string("/tmp/kj.status")
         .map(|s| s.lines().next().unwrap_or("?").to_string())
         .unwrap_or_else(|_| "build: ?".to_string())
+}
+
+// ============================================================================
+// HUD NAVIGATION SYSTEMS
+// ============================================================================
+
+/// Handle keyboard navigation for HUD focus.
+///
+/// - `H` (shift+h): Toggle HUD navigation mode
+/// - `j`/`k`: Move focus between HUDs (when in navigation mode)
+/// - `i`: Enter config editing mode for focused HUD
+/// - `Esc`: Exit navigation/editing mode
+fn handle_hud_navigation_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    screen: Res<State<crate::ui::state::AppScreen>>,
+    current_mode: Res<crate::cell::CurrentMode>,
+    mut focused_hud: ResMut<FocusedHud>,
+    focusable_huds: Query<Entity, With<HudFocusable>>,
+) {
+    // Only in Conversation state and Normal mode (not editing a cell)
+    if *screen.get() != crate::ui::state::AppScreen::Conversation {
+        return;
+    }
+    if current_mode.0 != crate::cell::EditorMode::Normal {
+        return;
+    }
+
+    // Don't handle keys if we're editing a HUD config
+    if focused_hud.editing {
+        // Escape exits editing mode
+        if keys.just_pressed(KeyCode::Escape) {
+            focused_hud.stop_editing();
+            info!("Exited HUD config editing");
+        }
+        return;
+    }
+
+    // Shift+H toggles HUD navigation mode
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if shift && keys.just_pressed(KeyCode::KeyH) {
+        if focused_hud.navigation_active {
+            focused_hud.clear();
+            info!("Exited HUD navigation mode");
+        } else {
+            // Focus the first HUD
+            if let Some(first) = focusable_huds.iter().next() {
+                focused_hud.focus(first);
+                info!("Entered HUD navigation mode");
+            }
+        }
+        return;
+    }
+
+    // Only process navigation keys when in navigation mode
+    if !focused_hud.navigation_active {
+        return;
+    }
+
+    // Escape clears focus
+    if keys.just_pressed(KeyCode::Escape) {
+        focused_hud.clear();
+        info!("Exited HUD navigation mode");
+        return;
+    }
+
+    // i enters editing mode
+    if keys.just_pressed(KeyCode::KeyI) && focused_hud.entity.is_some() {
+        focused_hud.start_editing();
+        info!("Entered HUD config editing mode");
+        return;
+    }
+
+    // j/k navigate between HUDs
+    let huds: Vec<Entity> = focusable_huds.iter().collect();
+    if huds.is_empty() {
+        return;
+    }
+
+    let current_idx = focused_hud
+        .entity
+        .and_then(|e| huds.iter().position(|&h| h == e))
+        .unwrap_or(0);
+
+    if keys.just_pressed(KeyCode::KeyJ) {
+        // Next HUD
+        let next_idx = (current_idx + 1) % huds.len();
+        focused_hud.entity = Some(huds[next_idx]);
+    } else if keys.just_pressed(KeyCode::KeyK) {
+        // Previous HUD
+        let prev_idx = if current_idx == 0 {
+            huds.len() - 1
+        } else {
+            current_idx - 1
+        };
+        focused_hud.entity = Some(huds[prev_idx]);
+    }
+}
+
+/// Update visual appearance of HUDs based on focus state.
+///
+/// Focused HUDs show a bright border, unfocused ones hide the border.
+fn update_hud_focus_visual(
+    focused_hud: Res<FocusedHud>,
+    theme: Res<crate::ui::theme::Theme>,
+    mut huds: Query<(Entity, &mut BorderColor), With<HudFocusable>>,
+) {
+    if !focused_hud.is_changed() {
+        return;
+    }
+
+    for (entity, mut border_color) in huds.iter_mut() {
+        if focused_hud.is_focused(entity) {
+            // Show bright focus border
+            let focus_color = if focused_hud.editing {
+                theme.accent2 // Different color when editing
+            } else {
+                theme.accent // Normal focus color
+            };
+            *border_color = BorderColor::all(focus_color);
+        } else {
+            // Hide border
+            *border_color = BorderColor::all(Color::NONE);
+        }
+    }
+}
+
+/// Spawn config editor overlay when entering edit mode.
+fn spawn_config_editor(
+    mut commands: Commands,
+    focused_hud: Res<FocusedHud>,
+    config: Res<HudConfig>,
+    theme: Res<crate::ui::theme::Theme>,
+    huds: Query<&Hud>,
+    existing_editor: Query<Entity, With<HudConfigEditor>>,
+) {
+    // Only spawn when just started editing
+    if !focused_hud.is_changed() || !focused_hud.editing {
+        return;
+    }
+
+    // Don't spawn if already exists
+    if !existing_editor.is_empty() {
+        return;
+    }
+
+    // Find the focused HUD's name
+    let Some(hud_entity) = focused_hud.entity else {
+        return;
+    };
+    let Ok(hud) = huds.get(hud_entity) else {
+        return;
+    };
+
+    // Find the config definition
+    let Some(def) = config.huds.iter().find(|d| d.name == hud.name) else {
+        return;
+    };
+
+    // Generate config text in a readable format
+    let config_text = format!(
+        "# HUD Configuration: {}\n\
+         # Edit values below, press Esc to save\n\
+         \n\
+         name: \"{}\"\n\
+         position: {:?}\n\
+         style: {:?}\n\
+         visibility: {:?}\n\
+         glow_intensity: {:.2}\n",
+        def.name,
+        def.name,
+        def.position,
+        def.style,
+        def.visibility,
+        def.glow.intensity,
+    );
+
+    // Spawn the config editor overlay
+    commands.spawn((
+        HudConfigEditor {
+            hud_name: hud.name.clone(),
+            original: config_text.clone(),
+            current: config_text.clone(),
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(25.0),
+            top: Val::Percent(20.0),
+            width: Val::Percent(50.0),
+            min_height: Val::Px(200.0),
+            padding: UiRect::all(Val::Px(16.0)),
+            flex_direction: FlexDirection::Column,
+            border: UiRect::all(Val::Px(2.0)),
+            border_radius: BorderRadius::all(Val::Px(8.0)),
+            ..default()
+        },
+        BackgroundColor(theme.panel_bg),
+        BorderColor::all(theme.accent2),
+        ZIndex(crate::constants::ZLayer::MODAL),
+    ))
+    .with_children(|parent| {
+        // Title
+        parent.spawn((
+            crate::text::MsdfUiText::new(&format!("Config: {}", hud.name))
+                .with_font_size(16.0)
+                .with_color(theme.accent),
+            crate::text::UiTextPositionCache::default(),
+            Node {
+                margin: UiRect::bottom(Val::Px(12.0)),
+                min_height: Val::Px(20.0),
+                ..default()
+            },
+        ));
+
+        // Config content (read-only display for now)
+        parent.spawn((
+            crate::text::MsdfUiText::new(&config_text)
+                .with_font_size(12.0)
+                .with_color(theme.fg),
+            crate::text::UiTextPositionCache::default(),
+            Node {
+                min_height: Val::Px(120.0),
+                ..default()
+            },
+        ));
+
+        // Instructions
+        parent.spawn((
+            crate::text::MsdfUiText::new("Press Esc to close • Full editing coming soon")
+                .with_font_size(11.0)
+                .with_color(theme.fg_dim),
+            crate::text::UiTextPositionCache::default(),
+            Node {
+                margin: UiRect::top(Val::Px(12.0)),
+                min_height: Val::Px(16.0),
+                ..default()
+            },
+        ));
+    });
+
+    info!("Spawned config editor for HUD: {}", hud.name);
+}
+
+/// Despawn config editor when exiting edit mode.
+fn despawn_config_editor(
+    mut commands: Commands,
+    focused_hud: Res<FocusedHud>,
+    editors: Query<Entity, With<HudConfigEditor>>,
+) {
+    // Only despawn when editing state changed to false
+    if !focused_hud.is_changed() || focused_hud.editing {
+        return;
+    }
+
+    for entity in editors.iter() {
+        commands.entity(entity).despawn();
+        info!("Despawned config editor");
+    }
+}
+
+/// Handle config change events (placeholder for future implementation).
+fn handle_config_changes(
+    mut events: MessageReader<HudConfigChanged>,
+    mut _config: ResMut<HudConfig>,
+) {
+    for event in events.read() {
+        info!(
+            "Config change for HUD '{}': {}",
+            event.hud_name,
+            event.new_config.lines().next().unwrap_or("")
+        );
+
+        // TODO: Parse the config text and update HudConfig
+        // This would involve:
+        // 1. Parse the key-value pairs from the text
+        // 2. Update the corresponding HudDefinition
+        // 3. The spawn/update systems will react to the config change
+    }
 }
