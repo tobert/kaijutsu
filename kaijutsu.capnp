@@ -223,6 +223,81 @@ interface KernelOutput {
 }
 
 # ============================================================================
+# Agent Types (Phase 2: Collaborative Canvas)
+# ============================================================================
+
+# Configuration for attaching an agent
+struct AgentConfig {
+  nick @0 :Text;              # Display name: "spell-check", "claude-review"
+  instance @1 :Text;          # Instance ID: "quick", "deep", "haiku"
+  provider @2 :Text;          # LLM provider: "anthropic", "openai", "local"
+  modelId @3 :Text;           # Model: "claude-3-haiku", "gpt-4-mini"
+  capabilities @4 :List(AgentCapability);  # What this agent can do
+}
+
+# Information about an attached agent
+struct AgentInfo {
+  nick @0 :Text;              # Display name
+  instance @1 :Text;          # Instance ID
+  provider @2 :Text;          # LLM provider
+  modelId @3 :Text;           # Model
+  capabilities @4 :List(AgentCapability);  # What this agent can do
+  status @5 :AgentStatus;     # Current agent status
+  attachedAt @6 :UInt64;      # Unix timestamp ms
+  lastActivity @7 :UInt64;    # Unix timestamp ms
+}
+
+# Agent capabilities - what actions an agent can perform
+enum AgentCapability {
+  spellCheck @0;              # Quick spell-checking
+  grammar @1;                 # Grammar correction
+  format @2;                  # Code/text formatting
+  review @3;                  # Code/content review (slower, thoughtful)
+  generate @4;                # Content generation
+  refactor @5;                # Code refactoring suggestions
+  explain @6;                 # Explain selected content
+  translate @7;               # Translation to other languages
+  summarize @8;               # Summarize long content
+  custom @9;                  # Custom capability (specified via action string)
+}
+
+# Agent status
+enum AgentStatus {
+  ready @0;                   # Available to handle requests
+  busy @1;                    # Currently processing a request
+  offline @2;                 # Not currently responding
+}
+
+# Agent activity event
+struct AgentActivityEvent {
+  agent @0 :Text;             # Agent nick
+  union {
+    started :group {          # Agent started working on content
+      blockId @1 :BlockId;
+      action @2 :Text;
+    }
+    progress :group {         # Agent is making progress
+      blockId @3 :BlockId;
+      message @4 :Text;
+      percent @5 :Float32;    # 0.0 to 1.0
+    }
+    completed :group {        # Agent finished
+      blockId @6 :BlockId;
+      success @7 :Bool;
+    }
+    cursorMoved :group {      # Agent cursor position changed
+      blockId @8 :BlockId;
+      offset @9 :UInt64;
+    }
+  }
+}
+
+# Callback for receiving agent activity events
+interface AgentEvents {
+  onActivity @0 (event :AgentActivityEvent);
+}
+
+# ============================================================================
 # Server Interfaces
 # ============================================================================
 
@@ -349,6 +424,31 @@ interface Kernel {
 
   # MCP Cancellation
   cancelMcpRequest @59 (server :Text, requestId :Text);
+
+  # ============================================================================
+  # Agent Attachment (Phase 2: Collaborative Canvas)
+  # ============================================================================
+  # Agents are autonomous participants that can edit content alongside humans.
+  # Each agent gets a seat and can be invoked on focused content.
+
+  # Attach an agent to this kernel
+  # The agent will be given a seat and can participate in all contexts
+  attachAgent @60 (config :AgentConfig) -> (info :AgentInfo);
+
+  # List all attached agents on this kernel
+  listAgents @61 () -> (agents :List(AgentInfo));
+
+  # Detach an agent from this kernel
+  detachAgent @62 (nick :Text);
+
+  # Update agent capabilities
+  setAgentCapabilities @63 (nick :Text, capabilities :List(AgentCapability));
+
+  # Invoke an agent on a specific block (e.g., spell-check focused content)
+  invokeAgent @64 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
+
+  # Subscribe to agent activity events
+  subscribeAgentEvents @65 (callback :AgentEvents);
 }
 
 # Capability for interacting with a seat

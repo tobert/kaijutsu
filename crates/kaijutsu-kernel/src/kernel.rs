@@ -13,6 +13,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::agents::{
+    AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
+    AgentStatus,
+};
 use crate::control::ConsentMode;
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmRegistry, LlmResult};
@@ -38,6 +42,8 @@ pub struct Kernel {
     tools: RwLock<ToolRegistry>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
+    /// Agent registry (behind RwLock for interior mutability).
+    agents: RwLock<AgentRegistry>,
     /// Consent mode (collaborative vs autonomous).
     consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
@@ -75,6 +81,7 @@ impl Kernel {
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
+            agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
@@ -91,6 +98,7 @@ impl Kernel {
             state: RwLock::new(KernelState::with_id(id, &name)),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
+            agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
@@ -110,6 +118,7 @@ impl Kernel {
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
+            agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
         }
@@ -402,6 +411,94 @@ impl Kernel {
     }
 
     // ========================================================================
+    // Agents
+    // ========================================================================
+
+    /// Attach an agent to this kernel.
+    ///
+    /// The agent will be able to participate in editing alongside users.
+    pub async fn attach_agent(&self, config: AgentConfig) -> Result<AgentInfo, AgentError> {
+        self.agents.write().await.attach(config)
+    }
+
+    /// Detach an agent from this kernel.
+    pub async fn detach_agent(&self, nick: &str) -> Option<AgentInfo> {
+        self.agents.write().await.detach(nick)
+    }
+
+    /// Get information about an attached agent.
+    pub async fn get_agent(&self, nick: &str) -> Option<AgentInfo> {
+        self.agents.read().await.get(nick).cloned()
+    }
+
+    /// List all attached agents.
+    pub async fn list_agents(&self) -> Vec<AgentInfo> {
+        self.agents.read().await.list().into_iter().cloned().collect()
+    }
+
+    /// Get agents with a specific capability.
+    pub async fn agents_with_capability(&self, cap: AgentCapability) -> Vec<AgentInfo> {
+        self.agents
+            .read()
+            .await
+            .with_capability(cap)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Update an agent's capabilities.
+    pub async fn set_agent_capabilities(
+        &self,
+        nick: &str,
+        capabilities: Vec<AgentCapability>,
+    ) -> Result<(), AgentError> {
+        self.agents
+            .write()
+            .await
+            .set_capabilities(nick, capabilities)
+    }
+
+    /// Update an agent's status.
+    pub async fn set_agent_status(&self, nick: &str, status: AgentStatus) -> Result<(), AgentError> {
+        self.agents.write().await.set_status(nick, status)
+    }
+
+    /// Subscribe to agent activity events.
+    pub async fn subscribe_agent_events(&self) -> tokio::sync::broadcast::Receiver<AgentActivityEvent> {
+        self.agents.read().await.subscribe()
+    }
+
+    /// Emit an agent activity event.
+    pub async fn emit_agent_event(&self, event: AgentActivityEvent) {
+        // Extract agent nick for updating last_activity
+        let agent_nick = match &event {
+            AgentActivityEvent::Started { agent, .. } => agent.clone(),
+            AgentActivityEvent::Progress { agent, .. } => agent.clone(),
+            AgentActivityEvent::Completed { agent, .. } => agent.clone(),
+            AgentActivityEvent::CursorMoved { agent, .. } => agent.clone(),
+        };
+
+        // Update last_activity
+        if let Some(agent) = self.agents.write().await.get_mut(&agent_nick) {
+            agent.touch();
+        }
+
+        // Emit the event
+        self.agents.read().await.emit(event);
+    }
+
+    /// Get the agent registry (for direct access).
+    pub fn agents(&self) -> &RwLock<AgentRegistry> {
+        &self.agents
+    }
+
+    /// Count of attached agents.
+    pub async fn agent_count(&self) -> usize {
+        self.agents.read().await.count()
+    }
+
+    // ========================================================================
     // Fork / Thread
     // ========================================================================
 
@@ -423,11 +520,15 @@ impl Kernel {
 
         // Note: FlowBus is independent - forked kernels have their own event streams
 
+        // Note: Agents are not copied - forked kernels start fresh
+        // This matches tool/LLM behavior
+
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
+            agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
@@ -444,6 +545,9 @@ impl Kernel {
         // Note: LLM providers are not shared - threaded kernels get fresh registry
         // This avoids credential sharing and allows per-thread provider config
 
+        // Note: Agents are not shared - threaded kernels get fresh registry
+        // This matches LLM provider behavior
+
         // Share the FlowBus - threaded kernels share event streams
         let block_flows = Arc::clone(&self.block_flows);
 
@@ -452,6 +556,7 @@ impl Kernel {
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             llm: RwLock::new(LlmRegistry::new()),
+            agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
         }

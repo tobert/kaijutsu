@@ -32,6 +32,8 @@ use kaijutsu_kernel::{
     // FlowBus
     BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
     block_store::BlockStore,
+    // Agents
+    AgentCapability, AgentConfig, AgentInfo, AgentStatus, AgentActivityEvent,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -2662,6 +2664,374 @@ impl kernel::Server for KernelImpl {
         });
 
         Promise::ok(())
+    }
+
+    // ========================================================================
+    // Agent Attachment (Phase 2: Collaborative Canvas)
+    // ========================================================================
+
+    fn attach_agent(
+        self: Rc<Self>,
+        params: kernel::AttachAgentParams,
+        mut results: kernel::AttachAgentResults,
+    ) -> Promise<(), capnp::Error> {
+        let config_reader = pry!(pry!(params.get()).get_config());
+
+        // Extract config fields
+        let nick = pry!(config_reader.get_nick()).to_str().unwrap_or("unknown").to_owned();
+        let instance = pry!(config_reader.get_instance()).to_str().unwrap_or("default").to_owned();
+        let provider = pry!(config_reader.get_provider()).to_str().unwrap_or("unknown").to_owned();
+        let model_id = pry!(config_reader.get_model_id()).to_str().unwrap_or("unknown").to_owned();
+
+        // Extract capabilities
+        let caps_reader = pry!(config_reader.get_capabilities());
+        let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
+            .filter_map(|i| {
+                caps_reader.get(i).map(|c| capnp_to_agent_capability(c)).ok().flatten()
+            })
+            .collect();
+
+        let config = AgentConfig {
+            nick,
+            instance,
+            provider,
+            model_id,
+            capabilities,
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kernel = {
+                let state_ref = state.borrow();
+                state_ref
+                    .kernels
+                    .get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?
+            };
+
+            let agent_info = kernel
+                .attach_agent(config)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("failed to attach agent: {}", e)))?;
+
+            // Build response
+            let mut info = results.get().init_info();
+            set_agent_info(&mut info, &agent_info);
+
+            Ok(())
+        })
+    }
+
+    fn list_agents(
+        self: Rc<Self>,
+        _params: kernel::ListAgentsParams,
+        mut results: kernel::ListAgentsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let agents = {
+                let state_ref = state.borrow();
+                let kernel = state_ref
+                    .kernels
+                    .get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.list_agents().await
+            };
+
+            let mut list = results.get().init_agents(agents.len() as u32);
+            for (i, agent) in agents.iter().enumerate() {
+                let mut a = list.reborrow().get(i as u32);
+                set_agent_info(&mut a, agent);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn detach_agent(
+        self: Rc<Self>,
+        params: kernel::DetachAgentParams,
+        _results: kernel::DetachAgentResults,
+    ) -> Promise<(), capnp::Error> {
+        let nick = pry!(pry!(pry!(params.get()).get_nick()).to_str()).to_owned();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kernel = {
+                let state_ref = state.borrow();
+                state_ref
+                    .kernels
+                    .get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?
+            };
+
+            kernel.detach_agent(&nick).await;
+            Ok(())
+        })
+    }
+
+    fn set_agent_capabilities(
+        self: Rc<Self>,
+        params: kernel::SetAgentCapabilitiesParams,
+        _results: kernel::SetAgentCapabilitiesResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let nick = pry!(pry!(params_reader.get_nick()).to_str()).to_owned();
+        let caps_reader = pry!(params_reader.get_capabilities());
+
+        let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
+            .filter_map(|i| {
+                caps_reader.get(i).map(|c| capnp_to_agent_capability(c)).ok().flatten()
+            })
+            .collect();
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kernel = {
+                let state_ref = state.borrow();
+                state_ref
+                    .kernels
+                    .get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?
+            };
+
+            kernel
+                .set_agent_capabilities(&nick, capabilities)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("failed to set capabilities: {}", e)))?;
+
+            Ok(())
+        })
+    }
+
+    fn invoke_agent(
+        self: Rc<Self>,
+        params: kernel::InvokeAgentParams,
+        mut results: kernel::InvokeAgentResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let nick = pry!(pry!(params_reader.get_nick()).to_str()).to_owned();
+        let block_id_reader = pry!(params_reader.get_block_id());
+        let action = pry!(pry!(params_reader.get_action()).to_str()).to_owned();
+
+        // Parse block ID
+        let block_id = kaijutsu_crdt::BlockId {
+            document_id: pry!(block_id_reader.get_document_id()).to_str().unwrap_or("").to_owned(),
+            agent_id: pry!(block_id_reader.get_agent_id()).to_str().unwrap_or("").to_owned(),
+            seq: block_id_reader.get_seq(),
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kernel = {
+                let state_ref = state.borrow();
+                state_ref
+                    .kernels
+                    .get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?
+            };
+
+            // Generate a request ID for tracking
+            let request_id = uuid::Uuid::new_v4().to_string();
+
+            // Emit a started event
+            kernel
+                .emit_agent_event(AgentActivityEvent::Started {
+                    agent: nick.clone(),
+                    block_id: block_id.to_string(),
+                    action: action.clone(),
+                })
+                .await;
+
+            // TODO: Actually invoke the agent's capability here
+            // For now, just emit a completed event
+            kernel
+                .emit_agent_event(AgentActivityEvent::Completed {
+                    agent: nick.clone(),
+                    block_id: block_id.to_string(),
+                    success: true,
+                })
+                .await;
+
+            results.get().set_request_id(&request_id);
+            Ok(())
+        })
+    }
+
+    fn subscribe_agent_events(
+        self: Rc<Self>,
+        params: kernel::SubscribeAgentEventsParams,
+        _results: kernel::SubscribeAgentEventsResults,
+    ) -> Promise<(), capnp::Error> {
+        let callback = pry!(pry!(params.get()).get_callback());
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        // Spawn a bridge task that forwards AgentActivityEvent to the callback
+        tokio::task::spawn_local(async move {
+            let mut receiver = {
+                let state_ref = state.borrow();
+                if let Some(kernel_state) = state_ref.kernels.get(&kernel_id) {
+                    kernel_state.kernel.subscribe_agent_events().await
+                } else {
+                    log::warn!("Kernel {} not found for agent event subscription", kernel_id);
+                    return;
+                }
+            };
+
+            log::debug!("Started agent event subscription for kernel {}", kernel_id);
+
+            while let Ok(event) = receiver.recv().await {
+                let success = match &event {
+                    AgentActivityEvent::Started { agent, block_id: _, action } => {
+                        let mut req = callback.on_activity_request();
+                        {
+                            let mut params = req.get().init_event();
+                            params.set_agent(agent);
+                            let mut started = params.init_started();
+                            // Parse block_id string back to components - simplified for now
+                            started.reborrow().init_block_id();
+                            started.set_action(action);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                    AgentActivityEvent::Progress { agent, block_id: _, message, percent } => {
+                        let mut req = callback.on_activity_request();
+                        {
+                            let mut params = req.get().init_event();
+                            params.set_agent(agent);
+                            let mut progress = params.init_progress();
+                            progress.reborrow().init_block_id();
+                            progress.set_message(message);
+                            progress.set_percent(*percent);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                    AgentActivityEvent::Completed { agent, block_id: _, success: ok } => {
+                        let mut req = callback.on_activity_request();
+                        {
+                            let mut params = req.get().init_event();
+                            params.set_agent(agent);
+                            let mut completed = params.init_completed();
+                            completed.reborrow().init_block_id();
+                            completed.set_success(*ok);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                    AgentActivityEvent::CursorMoved { agent, block_id: _, offset } => {
+                        let mut req = callback.on_activity_request();
+                        {
+                            let mut params = req.get().init_event();
+                            params.set_agent(agent);
+                            let mut cursor = params.init_cursor_moved();
+                            cursor.reborrow().init_block_id();
+                            cursor.set_offset(*offset);
+                        }
+                        req.send().promise.await.is_ok()
+                    }
+                };
+
+                if !success {
+                    log::debug!(
+                        "Agent event bridge task for kernel {} stopping: callback failed",
+                        kernel_id
+                    );
+                    break;
+                }
+            }
+
+            log::debug!("Agent event bridge task for kernel {} ended", kernel_id);
+        });
+
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Agent Helper Functions
+// ============================================================================
+
+use crate::kaijutsu_capnp::{
+    AgentCapability as CapnpAgentCapability,
+    AgentStatus as CapnpAgentStatus,
+};
+
+/// Convert capnp AgentCapability to kernel AgentCapability.
+fn capnp_to_agent_capability(cap: CapnpAgentCapability) -> Option<AgentCapability> {
+    match cap {
+        CapnpAgentCapability::SpellCheck => Some(AgentCapability::SpellCheck),
+        CapnpAgentCapability::Grammar => Some(AgentCapability::Grammar),
+        CapnpAgentCapability::Format => Some(AgentCapability::Format),
+        CapnpAgentCapability::Review => Some(AgentCapability::Review),
+        CapnpAgentCapability::Generate => Some(AgentCapability::Generate),
+        CapnpAgentCapability::Refactor => Some(AgentCapability::Refactor),
+        CapnpAgentCapability::Explain => Some(AgentCapability::Explain),
+        CapnpAgentCapability::Translate => Some(AgentCapability::Translate),
+        CapnpAgentCapability::Summarize => Some(AgentCapability::Summarize),
+        CapnpAgentCapability::Custom => Some(AgentCapability::Custom),
+    }
+}
+
+/// Set AgentInfo fields on a Cap'n Proto builder.
+fn set_agent_info(builder: &mut agent_info::Builder, info: &AgentInfo) {
+    builder.set_nick(&info.nick);
+    builder.set_instance(&info.instance);
+    builder.set_provider(&info.provider);
+    builder.set_model_id(&info.model_id);
+
+    // Set capabilities
+    let caps_len = info.capabilities.len() as u32;
+    let mut caps = builder.reborrow().init_capabilities(caps_len);
+    for (i, cap) in info.capabilities.iter().enumerate() {
+        caps.set(i as u32, agent_capability_to_capnp(*cap));
+    }
+
+    // Set status
+    builder.set_status(agent_status_to_capnp(info.status));
+
+    // Set timestamps
+    builder.set_attached_at(info.attached_at);
+    builder.set_last_activity(info.last_activity);
+}
+
+/// Convert kernel AgentCapability to capnp.
+fn agent_capability_to_capnp(cap: AgentCapability) -> CapnpAgentCapability {
+    match cap {
+        AgentCapability::SpellCheck => CapnpAgentCapability::SpellCheck,
+        AgentCapability::Grammar => CapnpAgentCapability::Grammar,
+        AgentCapability::Format => CapnpAgentCapability::Format,
+        AgentCapability::Review => CapnpAgentCapability::Review,
+        AgentCapability::Generate => CapnpAgentCapability::Generate,
+        AgentCapability::Refactor => CapnpAgentCapability::Refactor,
+        AgentCapability::Explain => CapnpAgentCapability::Explain,
+        AgentCapability::Translate => CapnpAgentCapability::Translate,
+        AgentCapability::Summarize => CapnpAgentCapability::Summarize,
+        AgentCapability::Custom => CapnpAgentCapability::Custom,
+    }
+}
+
+/// Convert kernel AgentStatus to capnp.
+fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
+    match status {
+        AgentStatus::Ready => CapnpAgentStatus::Ready,
+        AgentStatus::Busy => CapnpAgentStatus::Busy,
+        AgentStatus::Offline => CapnpAgentStatus::Offline,
     }
 }
 

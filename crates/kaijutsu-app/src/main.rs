@@ -20,6 +20,7 @@ use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod agents;
 mod cell;
 mod commands;
 mod connection;
@@ -76,6 +77,8 @@ fn main() {
         .add_plugins(text::TextRenderPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
+        // Agent attachment and collaboration
+        .add_plugins(agents::AgentsPlugin)
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
