@@ -24,6 +24,8 @@ mod render;
 use bevy::prelude::*;
 use kaijutsu_client::SeatInfo;
 
+use crate::agents::AgentActivityMessage;
+
 // Re-export ModalDialogOpen for use by other systems (e.g., prompt input)
 pub use create_dialog::ModalDialogOpen;
 
@@ -37,17 +39,24 @@ impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Constellation>()
             .init_resource::<OrbitalAnimation>()
+            .init_resource::<ConstellationZoom>()
             .register_type::<ConstellationMode>()
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()
             .register_type::<ConstellationConnection>()
+            .register_type::<ConstellationZoom>()
             .add_systems(
                 Update,
                 (
                     track_seat_events,
+                    track_agent_activity,
+                    handle_zoom_input,
+                    interpolate_zoom,
+                    sync_zoom_to_mode,
                     handle_mode_toggle,
                     handle_focus_navigation,
+                    handle_node_click,
                     update_orbital_animation,
                     update_node_positions,
                 )
@@ -77,6 +86,56 @@ pub struct OrbitalAnimation {
     pub angle: f32,
     /// Whether orbital mode is active (cached to avoid reading Constellation)
     pub active: bool,
+}
+
+/// Zoom state for constellation navigation.
+///
+/// Zoom level controls the transition between focused and constellation views:
+/// - 0.0 = Fully zoomed in (Focused mode, single context visible)
+/// - 1.0 = Fully zoomed out (Map mode, all contexts visible)
+///
+/// The zoom level smoothly interpolates for visual effect.
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
+pub struct ConstellationZoom {
+    /// Current zoom level (0.0 = focused, 1.0 = map)
+    pub level: f32,
+    /// Target zoom level for smooth interpolation
+    pub target: f32,
+    /// Interpolation speed (higher = snappier)
+    pub speed: f32,
+}
+
+impl Default for ConstellationZoom {
+    fn default() -> Self {
+        Self {
+            level: 0.0,
+            target: 0.0,
+            speed: 8.0, // Smooth but responsive
+        }
+    }
+}
+
+impl ConstellationZoom {
+    /// Zoom out by a step (toward constellation view)
+    pub fn zoom_out(&mut self, step: f32) {
+        self.target = (self.target + step).min(1.0);
+    }
+
+    /// Zoom in by a step (toward focused view)
+    pub fn zoom_in(&mut self, step: f32) {
+        self.target = (self.target - step).max(0.0);
+    }
+
+    /// Check if we're in "zoomed out" territory (should show constellation)
+    pub fn is_zoomed_out(&self) -> bool {
+        self.level > 0.3
+    }
+
+    /// Check if we're fully zoomed in
+    pub fn is_fully_focused(&self) -> bool {
+        self.level < 0.1
+    }
 }
 
 /// Constellation of contexts - the spatial navigation model
@@ -301,6 +360,155 @@ fn track_seat_events(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Track agent activity events to update node visual state.
+///
+/// When agents start/complete work, update the corresponding node's
+/// ActivityState to provide visual feedback in the constellation.
+fn track_agent_activity(
+    mut constellation: ResMut<Constellation>,
+    mut events: MessageReader<AgentActivityMessage>,
+) {
+    for event in events.read() {
+        // Update the focused node's activity based on agent events
+        // (In the future, we could map block_id to context for more precision)
+        match event {
+            AgentActivityMessage::Started { nick, action, .. } => {
+                info!("Agent {} started: {}", nick, action);
+                if let Some(node) = constellation.focused_node_mut() {
+                    node.activity = ActivityState::Streaming;
+                }
+            }
+            AgentActivityMessage::Progress { .. } => {
+                // Keep streaming state during progress
+                if let Some(node) = constellation.focused_node_mut() {
+                    if node.activity != ActivityState::Streaming {
+                        node.activity = ActivityState::Streaming;
+                    }
+                }
+            }
+            AgentActivityMessage::Completed { success, .. } => {
+                if let Some(node) = constellation.focused_node_mut() {
+                    node.activity = if *success {
+                        ActivityState::Completed
+                    } else {
+                        ActivityState::Error
+                    };
+                }
+            }
+            AgentActivityMessage::CursorMoved { .. } => {
+                // Cursor movement indicates active editing
+                if let Some(node) = constellation.focused_node_mut() {
+                    if node.activity == ActivityState::Idle {
+                        node.activity = ActivityState::Active;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle mouse wheel zoom to reveal/hide constellation.
+///
+/// Scroll up = zoom out (reveal constellation nodes)
+/// Scroll down = zoom in (focus on current context)
+fn handle_zoom_input(
+    mut mouse_wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    screen: Res<State<crate::ui::state::AppScreen>>,
+    current_mode: Res<crate::cell::CurrentMode>,
+    modal_open: Res<ModalDialogOpen>,
+    mut zoom: ResMut<ConstellationZoom>,
+) {
+    // Skip when a modal dialog is open
+    if modal_open.0 {
+        return;
+    }
+
+    // Only in Conversation state and Normal mode
+    if *screen.get() != crate::ui::state::AppScreen::Conversation {
+        return;
+    }
+    if current_mode.0 != crate::cell::EditorMode::Normal {
+        return;
+    }
+
+    // Zoom step per scroll unit
+    const ZOOM_STEP: f32 = 0.15;
+
+    for event in mouse_wheel.read() {
+        // Positive y = scroll up = zoom out (show constellation)
+        // Negative y = scroll down = zoom in (hide constellation)
+        if event.y > 0.0 {
+            zoom.zoom_out(ZOOM_STEP);
+        } else if event.y < 0.0 {
+            zoom.zoom_in(ZOOM_STEP);
+        }
+    }
+}
+
+/// Smoothly interpolate zoom level toward target.
+fn interpolate_zoom(
+    time: Res<Time>,
+    mut zoom: ResMut<ConstellationZoom>,
+) {
+    // Skip if already at target
+    if (zoom.level - zoom.target).abs() < 0.001 {
+        if zoom.level != zoom.target {
+            zoom.level = zoom.target;
+        }
+        return;
+    }
+
+    // Lerp toward target
+    let dt = time.delta_secs();
+    zoom.level = zoom.level + (zoom.target - zoom.level) * zoom.speed * dt;
+}
+
+/// Sync constellation mode based on zoom level.
+///
+/// When zoom crosses thresholds, switch between Focused and Map modes.
+fn sync_zoom_to_mode(
+    zoom: Res<ConstellationZoom>,
+    mut constellation: ResMut<Constellation>,
+) {
+    if !zoom.is_changed() {
+        return;
+    }
+
+    // Threshold for mode switching (with hysteresis to prevent flicker)
+    let should_show_constellation = zoom.is_zoomed_out();
+    let is_in_focused = matches!(constellation.mode, ConstellationMode::Focused);
+
+    if should_show_constellation && is_in_focused {
+        constellation.mode = ConstellationMode::Map;
+        info!("Zoom: switched to Map mode (level: {:.2})", zoom.level);
+    } else if !should_show_constellation && !is_in_focused && zoom.is_fully_focused() {
+        constellation.mode = ConstellationMode::Focused;
+        info!("Zoom: switched to Focused mode (level: {:.2})", zoom.level);
+    }
+}
+
+/// Handle clicks on constellation nodes to focus that context.
+fn handle_node_click(
+    mut constellation: ResMut<Constellation>,
+    nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
+) {
+    for (interaction, node) in nodes.iter() {
+        if *interaction == Interaction::Pressed {
+            // Don't switch if already focused
+            if constellation.focus_id.as_deref() == Some(&node.context_id) {
+                continue;
+            }
+
+            info!("Clicked constellation node: {}", node.context_id);
+            constellation.focus(&node.context_id);
+
+            // TODO: Trigger context switch via RPC
+            // For now, just update the focus - actual context loading would
+            // need to send an event to the connection bridge
         }
     }
 }

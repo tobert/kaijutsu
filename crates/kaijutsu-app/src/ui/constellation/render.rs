@@ -12,7 +12,7 @@ use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
     mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
-    ConstellationMode, ConstellationNode, OrbitalAnimation,
+    ConstellationMode, ConstellationNode, ConstellationZoom, OrbitalAnimation,
 };
 use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
 use crate::ui::theme::{color_to_vec4, Theme};
@@ -302,10 +302,16 @@ fn attach_mini_renders(
     }
 }
 
-/// Update visual properties of existing nodes based on state changes
+/// Update visual properties of existing nodes based on state changes.
+///
+/// Implements 2.5D depth effect:
+/// - Focused node: full size, full opacity (z=0)
+/// - Adjacent nodes: 80% size, 70% opacity (z=-1)
+/// - Distant nodes: 60% size, 50% opacity (z=-2+)
 fn update_node_visuals(
     constellation: Res<Constellation>,
     orbital: Res<OrbitalAnimation>,
+    zoom: Res<ConstellationZoom>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     mut nodes: Query<(
@@ -314,8 +320,10 @@ fn update_node_visuals(
         &MaterialNode<PulseRingMaterial>,
     )>,
 ) {
-    // Update when constellation changes OR orbital animation is active and changed
-    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
+    // Update when constellation, zoom, or orbital animation changes
+    let needs_update = constellation.is_changed()
+        || zoom.is_changed()
+        || (orbital.active && orbital.is_changed());
     if !needs_update {
         return;
     }
@@ -324,10 +332,49 @@ fn update_node_visuals(
     let focused_size = theme.constellation_node_size_focused;
     let container_center = theme.constellation_layout_radius + focused_size / 2.0;
 
+    // Find focused node index for depth calculation
+    let focused_idx = constellation.focus_id.as_ref().and_then(|id| {
+        constellation.nodes.iter().position(|n| &n.context_id == id)
+    });
+    let node_count = constellation.nodes.len();
+
     for (marker, mut node_style, material_node) in nodes.iter_mut() {
         if let Some(ctx_node) = constellation.node_by_id(&marker.context_id) {
             let is_focused = constellation.focus_id.as_deref() == Some(&ctx_node.context_id);
-            let size = if is_focused { focused_size } else { node_size };
+
+            // Calculate depth based on distance from focused node in circular arrangement
+            let depth = if let Some(focus_idx) = focused_idx {
+                let node_idx = constellation.nodes.iter()
+                    .position(|n| n.context_id == ctx_node.context_id)
+                    .unwrap_or(0);
+
+                // Circular distance (shortest path in either direction)
+                let dist = if node_count > 0 {
+                    let forward = (node_idx as i32 - focus_idx as i32).unsigned_abs() as usize;
+                    let backward = node_count - forward;
+                    forward.min(backward)
+                } else {
+                    0
+                };
+                dist
+            } else {
+                0
+            };
+
+            // Depth affects scale and opacity (blend based on zoom level)
+            // At zoom 0 (focused), all nodes equal; at zoom 1 (map), depth applies
+            let depth_factor = match depth {
+                0 => 1.0,   // Focused: full size
+                1 => 0.85,  // Adjacent: slightly smaller
+                _ => 0.70,  // Distant: noticeably smaller
+            };
+
+            // Blend depth effect with zoom level (more pronounced when zoomed out)
+            let effective_depth_factor = 1.0 - (1.0 - depth_factor) * zoom.level;
+
+            // Calculate size with depth scaling
+            let base_size = if is_focused { focused_size } else { node_size };
+            let size = base_size * effective_depth_factor;
             let half_size = size / 2.0;
 
             // Update position and size (relative to container center)
@@ -336,7 +383,7 @@ fn update_node_visuals(
             node_style.width = Val::Px(size);
             node_style.height = Val::Px(size);
 
-            // Update material properties based on activity
+            // Update material properties based on activity and depth
             if let Some(mat) = pulse_materials.get_mut(material_node.0.id()) {
                 let color = activity_to_color(ctx_node.activity, &theme);
                 mat.color = color_to_vec4(color);
@@ -351,13 +398,24 @@ fn update_node_visuals(
                     ActivityState::Completed => 0.5,
                 };
 
+                // Opacity based on focus state and depth
+                let depth_opacity = match depth {
+                    0 => 0.9,   // Focused: fully visible
+                    1 => 0.75,  // Adjacent: slightly faded
+                    _ => 0.55,  // Distant: noticeably faded
+                };
+
+                // Blend depth opacity with zoom level
+                let base_opacity = if is_focused { 0.9 } else { 0.7 };
+                let effective_opacity = base_opacity - (base_opacity - depth_opacity) * zoom.level;
+
                 // Increase intensity for focused node
                 if is_focused {
                     mat.params.y = 0.08; // thicker rings
-                    mat.color.w = 0.9;   // more opaque
+                    mat.color.w = effective_opacity;
                 } else {
                     mat.params.y = 0.05;
-                    mat.color.w = 0.7;
+                    mat.color.w = effective_opacity;
                 }
             }
         }
