@@ -10,7 +10,7 @@ use bevy::prelude::*;
 pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, Role};
 
 /// Unique identifier for a cell.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect)]
 pub struct CellId(pub String);
 
 impl CellId {
@@ -51,7 +51,8 @@ pub enum CellKind {
 ///
 /// When attached to a cell (like MainCell), the cell's content
 /// is synced with the conversation's BlockDocument.
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Reflect)]
+#[reflect(Component)]
 pub struct ViewingConversation {
     /// ID of the conversation this cell is viewing.
     pub conversation_id: String,
@@ -60,7 +61,8 @@ pub struct ViewingConversation {
 }
 
 /// Core cell component - the fundamental content primitive.
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct Cell {
     /// Unique identifier
     pub id: CellId,
@@ -83,9 +85,10 @@ impl Default for Cell {
 // ============================================================================
 
 /// Cursor position within a block document.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Reflect)]
 pub struct BlockCursor {
     /// Which block the cursor is in.
+    #[reflect(ignore)]
     pub block_id: Option<BlockId>,
     /// Character offset within the block.
     pub offset: usize,
@@ -109,7 +112,7 @@ impl BlockCursor {
 ///
 /// This avoids O(N) string scans every frame by caching the computed
 /// position until the document version changes.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Reflect)]
 pub struct CursorCache {
     /// Cached row (0-indexed)
     pub row: usize,
@@ -123,6 +126,9 @@ pub struct CursorCache {
 ///
 /// The `doc` field (BlockDocument) is the single source of truth for all content.
 /// All modifications go through the BlockDocument's CRDT operations.
+///
+/// Note: Not reflectable due to BlockDocument lacking Default.
+/// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
 pub struct CellEditor {
     /// Block document - the source of truth for all content.
@@ -350,7 +356,8 @@ impl CellEditor {
 // ============================================================================
 
 /// Position of a cell in the workspace grid.
-#[derive(Component, Default, Clone, Copy)]
+#[derive(Component, Default, Clone, Copy, Reflect)]
+#[reflect(Component)]
 pub struct CellPosition {
     /// Row (0-indexed)
     pub row: u32,
@@ -363,7 +370,8 @@ impl CellPosition {
 }
 
 /// Visual state of a cell.
-#[derive(Component, Default, Clone)]
+#[derive(Component, Default, Clone, Reflect)]
+#[reflect(Component)]
 pub struct CellState {
     /// Whether this cell is collapsed (children hidden)
     pub collapsed: bool,
@@ -458,7 +466,8 @@ impl EditorMode {
 pub struct CurrentMode(pub EditorMode);
 
 /// Resource tracking which cell has keyboard focus.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
 pub struct FocusedCell(pub Option<Entity>);
 
 // ============================================================================
@@ -528,7 +537,8 @@ impl std::ops::DerefMut for DocumentSyncState {
 }
 
 /// Configuration for workspace layout.
-#[derive(Resource)]
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
 pub struct WorkspaceLayout {
     /// Minimum cell height
     pub min_cell_height: f32,
@@ -764,6 +774,8 @@ impl LayoutGeneration {
 /// - Change tracking (for efficient streaming updates)
 ///
 /// FUTURE: May gain focus/input capabilities for threaded conversations.
+///
+/// Note: Not reflectable due to BlockId lacking Default.
 #[derive(Component, Debug)]
 pub struct BlockCell {
     /// The block ID this cell represents.
@@ -788,11 +800,13 @@ impl BlockCell {
 /// Container that tracks all BlockCell entities for a conversation view.
 ///
 /// Attached to the entity that owns the conversation display (e.g., MainCell parent).
-#[derive(Component, Debug, Default)]
+#[derive(Component, Debug, Default, Reflect)]
+#[reflect(Component)]
 pub struct BlockCellContainer {
     /// Ordered list of BlockCell entities.
     pub block_cells: Vec<Entity>,
     /// Map from block ID to entity for fast lookup.
+    #[reflect(ignore)]
     pub block_to_entity: std::collections::HashMap<BlockId, Entity>,
     /// Role header entities (one per role transition).
     pub role_headers: Vec<Entity>,
@@ -823,7 +837,8 @@ impl BlockCellContainer {
 }
 
 /// Computed layout for a block cell.
-#[derive(Component, Debug, Default)]
+#[derive(Component, Debug, Default, Reflect)]
+#[reflect(Component)]
 pub struct BlockCellLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
@@ -839,6 +854,8 @@ pub struct BlockCellLayout {
 
 /// Role header entity that appears before first block of each turn.
 /// Rendered as a styled, distinct header separate from block content.
+///
+/// Note: Not fully reflectable due to BlockId lacking Default.
 #[derive(Component, Debug, Clone)]
 pub struct RoleHeader {
     /// The role this header represents.
@@ -848,7 +865,8 @@ pub struct RoleHeader {
 }
 
 /// Layout information for a role header.
-#[derive(Component, Debug, Default)]
+#[derive(Component, Debug, Default, Reflect)]
+#[reflect(Component)]
 pub struct RoleHeaderLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,

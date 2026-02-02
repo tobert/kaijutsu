@@ -3,9 +3,10 @@
 use bevy::prelude::*;
 
 use super::components::{
+    BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ConversationContainer, ConversationFocus, ConversationScrollState, CurrentMode,
     DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell, PromptCell,
-    PromptContainer, PromptSubmitted, WorkspaceLayout,
+    PromptContainer, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -28,7 +29,18 @@ impl Plugin for CellPlugin {
             .register_type::<PromptContainer>()
             .register_type::<PromptCell>()
             .register_type::<MainCell>()
-            .register_type::<PromptSubmitted>();
+            .register_type::<PromptSubmitted>()
+            // Additional types for debugging
+            .register_type::<CellId>()
+            .register_type::<Cell>()
+            .register_type::<ViewingConversation>()
+            .register_type::<CellPosition>()
+            .register_type::<CellState>()
+            .register_type::<FocusedCell>()
+            .register_type::<WorkspaceLayout>()
+            .register_type::<BlockCellContainer>()
+            .register_type::<BlockCellLayout>()
+            .register_type::<RoleHeaderLayout>();
 
         app.init_resource::<FocusedCell>()
             .init_resource::<CurrentMode>()

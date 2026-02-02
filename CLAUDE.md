@@ -282,6 +282,35 @@ When Claude runs in a graphical session, use `mcp__bevy_brp__*` tools directly i
 | Claude SSH'd to headless terminal | `contrib/kj` + runner script |
 | Slow/unstable network | `contrib/kj` (cargo watch handles rebuilds) |
 
+### BRP-Reflectable Types for Debugging
+
+Many cell and UI components are registered for BRP reflection, enabling runtime inspection:
+
+**Resources** (use `world_get_resources`):
+- `kaijutsu_app::cell::components::WorkspaceLayout` — margins, line height, cell limits
+- `kaijutsu_app::cell::components::FocusedCell` — which entity has keyboard focus
+- `kaijutsu_app::cell::components::ConversationScrollState` — scroll offset, content height, following mode
+- `kaijutsu_app::cell::components::CurrentMode` — Normal/Input(Chat|Shell)/Visual
+
+**Components** (use `world_query` with filter):
+- `Cell`, `CellId`, `CellPosition`, `CellState` — cell identity and visual state
+- `ViewingConversation` — conversation_id, last_sync_version (0 = empty doc)
+- `BlockCellContainer` — block_cells Vec<Entity>, role_headers (HashMap is ignored)
+- `BlockCellLayout`, `RoleHeaderLayout` — y_offset, height, indent for layout debugging
+
+**Not reflectable** (contain CRDT types without Default):
+- `CellEditor` — contains BlockDocument
+- `BlockCell` — contains BlockId
+- `RoleHeader` — contains BlockId
+
+Example debug query:
+```
+mcp__bevy_brp__world_query(
+  data={"components": ["kaijutsu_app::cell::components::BlockCellContainer"]},
+  filter={"with": ["kaijutsu_app::cell::components::MainCell"]}
+)
+```
+
 ## Git Conventions
 
 Follow typical open source conventions for commits. This project is still in early phases of development and we are working on main.
