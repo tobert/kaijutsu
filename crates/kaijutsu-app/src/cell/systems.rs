@@ -15,6 +15,7 @@ use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConf
 use crate::ui::format::format_for_display;
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
 use crate::ui::theme::Theme;
+use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
 // LAYOUT CONSTANTS
@@ -2102,16 +2103,24 @@ pub fn spawn_block_cells(
         container.remove(entity);
     }
 
+    // Get the current document version for timeline visibility
+    let current_version = editor.version();
+
     // Find blocks to add (in document but not in container)
     for block_id in &current_blocks {
         if !container.contains(block_id) {
-            // Spawn new BlockCell
+            // Spawn new BlockCell with timeline visibility tracking
             let entity = commands
                 .spawn((
                     BlockCell::new(block_id.clone()),
                     BlockCellLayout::default(),
                     MsdfText,
                     MsdfTextAreaConfig::default(),
+                    TimelineVisibility {
+                        created_at_version: current_version,
+                        opacity: 1.0,
+                        is_past: false,
+                    },
                 ))
                 .id();
             container.add(block_id.clone(), entity);
@@ -2256,7 +2265,7 @@ pub fn sync_block_cell_buffers(
     main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig)>,
+    mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
@@ -2281,7 +2290,7 @@ pub fn sync_block_cell_buffers(
     let needs_update = container.block_cells.iter().any(|e| {
         block_cells
             .get(*e)
-            .map(|(bc, _, _)| bc.last_render_version < doc_version)
+            .map(|(bc, _, _, _)| bc.last_render_version < doc_version)
             .unwrap_or(false)
     });
 
@@ -2311,7 +2320,7 @@ pub fn sync_block_cell_buffers(
 
     let mut layout_changed = false;
     for entity in &container.block_cells {
-        let Ok((mut block_cell, mut buffer, mut config)) = block_cells.get_mut(*entity) else {
+        let Ok((mut block_cell, mut buffer, mut config, timeline_vis)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2332,7 +2341,14 @@ pub fn sync_block_cell_buffers(
         buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
 
         // Apply block-specific color based on BlockKind and Role
-        let color = block_color(block, &theme);
+        let base_color = block_color(block, &theme);
+
+        // Apply timeline visibility opacity (dimmed when viewing historical states)
+        let color = if let Some(vis) = timeline_vis {
+            base_color.with_alpha(base_color.alpha() * vis.opacity)
+        } else {
+            base_color
+        };
         config.default_color = color;
 
         // Track line count for layout dirty detection

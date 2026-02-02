@@ -7,7 +7,6 @@ use bevy::ui::ComputedNode;
 
 use super::components::*;
 use crate::cell::{CellEditor, CurrentMode, MainCell};
-use crate::ui::theme::Theme;
 
 // ============================================================================
 // VERSION SYNC
@@ -173,16 +172,19 @@ pub fn update_fill_width(
 ///
 /// Blocks created after the viewing position are hidden or dimmed.
 /// This creates the visual "time travel" effect.
+///
+/// Note: This system only updates the TimelineVisibility component.
+/// The actual opacity application happens in sync_block_cell_buffers
+/// which reads the opacity and applies it to the text color.
 pub fn update_block_visibility(
     timeline: Res<TimelineState>,
-    mut block_query: Query<(&mut TimelineVisibility, &mut BackgroundColor)>,
-    theme: Res<Theme>,
+    mut block_query: Query<&mut TimelineVisibility>,
 ) {
     if !timeline.is_changed() {
         return;
     }
 
-    for (mut vis, mut bg) in block_query.iter_mut() {
+    for mut vis in block_query.iter_mut() {
         let is_past = vis.created_at_version > timeline.viewing_version;
         vis.is_past = is_past;
 
@@ -196,10 +198,6 @@ pub fn update_block_visibility(
             // Past and current blocks are fully visible
             vis.opacity = 1.0;
         }
-
-        // Apply opacity to background
-        let base_alpha = theme.panel_bg.alpha();
-        bg.0 = bg.0.with_alpha(base_alpha * vis.opacity);
     }
 }
 
