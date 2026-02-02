@@ -97,6 +97,8 @@ fn main() {
         .add_plugins(ui::hud::HudPlugin)
         // Layout system - RON-driven view layouts
         .add_plugins(ui::layout::LayoutPlugin)
+        // Timeline navigation - temporal scrubbing through history
+        .add_plugins(ui::timeline::TimelinePlugin)
         // Animation tweening for smooth mode transitions
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai

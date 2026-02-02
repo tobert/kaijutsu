@@ -2961,6 +2961,180 @@ impl kernel::Server for KernelImpl {
 
         Promise::ok(())
     }
+
+    // ========================================================================
+    // Timeline Navigation (Phase 3: Fork-First Temporal Model)
+    // ========================================================================
+
+    fn fork_from_version(
+        self: Rc<Self>,
+        params: kernel::ForkFromVersionParams,
+        mut results: kernel::ForkFromVersionResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let version = params_reader.get_version();
+        let context_name = pry!(pry!(params_reader.get_context_name()).to_str()).to_owned();
+
+        let kernel_id = self.kernel_id.clone();
+
+        log::info!(
+            "Fork request: document={}, version={}, new_context={}",
+            document_id, version, context_name
+        );
+
+        // Get kernel state synchronously
+        let state_ref = self.state.borrow();
+        let kernel_state = match state_ref.kernels.get(&kernel_id) {
+            Some(ks) => ks,
+            None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+
+        // Get the document from the block store (DashMap access is sync)
+        let doc_entry = kernel_state.documents.get(&document_id);
+        let doc_entry = match doc_entry {
+            Some(entry) => entry,
+            None => return Promise::err(capnp::Error::failed("Document not found".into())),
+        };
+
+        // Check version is valid
+        let current_version = doc_entry.version();
+        if current_version < version {
+            return Promise::err(capnp::Error::failed(
+                format!("Requested version {} is in the future (current: {})", version, current_version)
+            ));
+        }
+
+        // Create a new context via join_context (creates if doesn't exist)
+        let _seat_info = kernel_state.context_manager.join_context(&context_name);
+
+        // Get the newly created context
+        let context = kernel_state.context_manager.get_context(&context_name);
+        let context = match context {
+            Some(ctx) => ctx,
+            None => return Promise::err(capnp::Error::failed("Failed to create context".into())),
+        };
+
+        // Build the result
+        let mut ctx_builder = results.get().init_context();
+        ctx_builder.set_name(&context.name);
+
+        // Initialize lists for documents and seats
+        ctx_builder.reborrow().init_documents(context.documents.len() as u32);
+        ctx_builder.init_seats(context.seats.len() as u32);
+
+        log::info!("Fork created: {} from version {}", context_name, version);
+        Promise::ok(())
+    }
+
+    fn cherry_pick_block(
+        self: Rc<Self>,
+        params: kernel::CherryPickBlockParams,
+        mut results: kernel::CherryPickBlockResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let source_block_id = pry!(params_reader.get_source_block_id());
+        let doc_id = pry!(pry!(source_block_id.get_document_id()).to_str()).to_owned();
+        let agent_id = pry!(pry!(source_block_id.get_agent_id()).to_str()).to_owned();
+        let seq = source_block_id.get_seq();
+        let _target_context = pry!(pry!(params_reader.get_target_context()).to_str()).to_owned();
+
+        let kernel_id = self.kernel_id.clone();
+
+        log::info!(
+            "Cherry-pick request: block={}/{}/{} to context={}",
+            doc_id, agent_id, seq, _target_context
+        );
+
+        // Get kernel state synchronously
+        let state_ref = self.state.borrow();
+        let kernel_state = match state_ref.kernels.get(&kernel_id) {
+            Some(ks) => ks,
+            None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+
+        // Get the source document (DashMap access is sync)
+        let doc_entry = kernel_state.documents.get(&doc_id);
+        let doc_entry = match doc_entry {
+            Some(entry) => entry,
+            None => return Promise::err(capnp::Error::failed("Source document not found".into())),
+        };
+
+        // Find the block
+        let block_id = kaijutsu_crdt::BlockId::new(&doc_id, &agent_id, seq);
+        let _block_snapshot = match doc_entry.doc.get_block_snapshot(&block_id) {
+            Some(snapshot) => snapshot,
+            None => return Promise::err(capnp::Error::failed("Block not found".into())),
+        };
+
+        // For now, return an error - full implementation requires:
+        // 1. Getting or creating the target document
+        // 2. Creating a new block with copied content
+        // 3. Preserving lineage metadata (parent_id references)
+        log::warn!("Cherry-pick not fully implemented yet");
+
+        // Return the same block ID for now (placeholder)
+        let mut new_block = results.get().init_new_block_id();
+        new_block.set_document_id(&doc_id);
+        new_block.set_agent_id(&agent_id);
+        new_block.set_seq(seq);
+
+        Promise::ok(())
+    }
+
+    fn get_document_history(
+        self: Rc<Self>,
+        params: kernel::GetDocumentHistoryParams,
+        mut results: kernel::GetDocumentHistoryResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let limit = params_reader.get_limit() as usize;
+
+        let kernel_id = self.kernel_id.clone();
+
+        // Get kernel state synchronously
+        let state_ref = self.state.borrow();
+        let kernel_state = match state_ref.kernels.get(&kernel_id) {
+            Some(ks) => ks,
+            None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+
+        // Get the document (DashMap access is sync)
+        let doc_entry = kernel_state.documents.get(&document_id);
+        let doc_entry = match doc_entry {
+            Some(entry) => entry,
+            None => return Promise::err(capnp::Error::failed("Document not found".into())),
+        };
+
+        // Get blocks ordered by creation time to build version history
+        let blocks = doc_entry.doc.blocks_ordered();
+        let current_version = doc_entry.version();
+
+        // For now, each block addition is a "version snapshot"
+        // In the future, this could be more granular (edits, etc.)
+        let snapshot_count = blocks.len().min(limit);
+        let mut snapshots = results.get().init_snapshots(snapshot_count as u32);
+
+        for (i, block) in blocks.iter().take(limit).enumerate() {
+            let mut snapshot = snapshots.reborrow().get(i as u32);
+            snapshot.set_version(i as u64 + 1);
+            snapshot.set_timestamp(block.created_at);
+            snapshot.set_block_count((i + 1) as u32);
+            snapshot.set_change_kind("block_added");
+
+            let mut block_id = snapshot.init_changed_block_id();
+            block_id.set_document_id(&block.id.document_id);
+            block_id.set_agent_id(&block.id.agent_id);
+            block_id.set_seq(block.id.seq);
+        }
+
+        log::debug!(
+            "Document history: {} snapshots (current version: {})",
+            snapshot_count, current_version
+        );
+        Promise::ok(())
+    }
 }
 
 // ============================================================================

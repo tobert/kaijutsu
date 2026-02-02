@@ -449,6 +449,24 @@ interface Kernel {
 
   # Subscribe to agent activity events
   subscribeAgentEvents @65 (callback :AgentEvents);
+
+  # ============================================================================
+  # Timeline Navigation (Phase 3: Fork-First Temporal Model)
+  # ============================================================================
+  # Navigate through document history with fork and cherry-pick operations.
+  # The past is read-only, but forking is ubiquitous.
+
+  # Fork from a specific document version
+  # Creates a new context branching from the given historical point
+  forkFromVersion @66 (documentId :Text, version :UInt64, contextName :Text) -> (context :Context);
+
+  # Cherry-pick a block into another context (carries lineage)
+  # The block's history is preserved, enabling "why did we decide X?" queries
+  cherryPickBlock @67 (sourceBlockId :BlockId, targetContext :Text) -> (newBlockId :BlockId);
+
+  # Get document version history for timeline scrubber
+  # Returns list of significant versions (block additions, major edits)
+  getDocumentHistory @68 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
 }
 
 # Capability for interacting with a seat
@@ -582,6 +600,15 @@ struct DocumentState {
   blocks @1 :List(BlockSnapshot);
   version @2 :UInt64;
   ops @3 :Data;  # Full oplog bytes for CRDT sync
+}
+
+# Snapshot of a document version for timeline navigation
+struct VersionSnapshot {
+  version @0 :UInt64;         # Document version number
+  timestamp @1 :UInt64;       # Unix millis when this version was created
+  blockCount @2 :UInt32;      # Number of blocks at this version
+  changeKind @3 :Text;        # Type of change: "block_added", "edit", "status_change"
+  changedBlockId @4 :BlockId; # The block that changed (if applicable)
 }
 
 # Callback for receiving block updates from server
