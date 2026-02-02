@@ -9,7 +9,7 @@ description = "Block-based CRDT document model for Kaijutsu"
 [dependencies]
 # Unified CRDT library with Map/Set/Register/Text support
 # Provides all CRDT types needed for block document model
-diamond-types.workspace = true
+facet.workspace = true
 
 # SmartString (same as diamond-types uses)
 smartstring = "1.0"

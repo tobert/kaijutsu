@@ -1,10 +1,10 @@
 //! CRDT operation serialization helpers.
 //!
-//! With the unified diamond-types, operations are handled internally via `SerializedOps`.
+//! With the unified facet library, operations are handled internally via `SerializedOps`.
 //! This module re-exports the relevant types for convenience.
 
-// Re-export key types from diamond-types for sync operations
-pub use diamond_types::{SerializedOps, SerializedOpsOwned, LV};
+// Re-export key types from facet for sync operations
+pub use facet::{SerializedOps, SerializedOpsOwned, LV};
 
 /// Frontier type alias for clarity.
 /// A frontier represents a version vector - the set of latest operations seen.
@@ -12,37 +12,45 @@ pub type Frontier = Vec<LV>;
 
 #[cfg(test)]
 mod tests {
-    use diamond_types::{OpLog, CreateValue, Primitive, ROOT_CRDT_ID};
+    use facet::Document;
 
     #[test]
     fn test_ops_sync() {
         // Create two documents
-        let mut oplog1 = OpLog::new();
-        let mut oplog2 = OpLog::new();
+        let mut doc_a = Document::new();
+        let mut doc_b = Document::new();
 
-        let alice = oplog1.cg.get_or_create_agent_id("alice");
-        let bob = oplog2.cg.get_or_create_agent_id("bob");
+        let alice = doc_a.get_or_create_agent("alice");
+        let bob = doc_b.get_or_create_agent("bob");
 
         // Alice makes changes
-        oplog1.local_map_set(alice, ROOT_CRDT_ID, "key",
-            CreateValue::Primitive(Primitive::I64(42)));
+        doc_a.transact(alice, |tx| {
+            tx.root().set("key", 42i64);
+        });
 
-        // Sync to Bob - ops_since returns SerializedOps<'_> borrowed from oplog1
-        let ops = oplog1.ops_since(&[]);
-        oplog2.merge_ops(ops).unwrap();
+        // Sync to Bob - ops_since returns SerializedOps<'_> borrowed from doc_a
+        let ops = doc_a.ops_since(&[]).into();
+        doc_b.merge_ops(ops).unwrap();
 
         // They should converge
-        assert_eq!(oplog1.checkout(), oplog2.checkout());
+        assert_eq!(
+            doc_a.root().get("key").unwrap().as_int(),
+            doc_b.root().get("key").unwrap().as_int()
+        );
 
         // Bob makes changes
-        oplog2.local_map_set(bob, ROOT_CRDT_ID, "key2",
-            CreateValue::Primitive(Primitive::Str("hello".into())));
+        doc_b.transact(bob, |tx| {
+            tx.root().set("key2", "hello");
+        });
 
         // Sync back to Alice
-        let ops = oplog2.ops_since(&[]);
-        oplog1.merge_ops(ops).unwrap();
+        let ops = doc_b.ops_since(&[]).into();
+        doc_a.merge_ops(ops).unwrap();
 
         // Should still converge
-        assert_eq!(oplog1.checkout(), oplog2.checkout());
+        assert_eq!(
+            doc_a.root().get("key2").unwrap().as_str(),
+            doc_b.root().get("key2").unwrap().as_str()
+        );
     }
 }

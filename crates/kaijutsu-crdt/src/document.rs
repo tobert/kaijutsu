@@ -1,7 +1,7 @@
-//! Block document with unified CRDT using diamond-types.
+//! Block document with unified CRDT using facet.
 //!
-//! Uses the diamond-types fork (github.com/tobert/diamond-types, branch feat/maps-and-uuids)
-//! which provides unified OpLog with Map, Set, Register, and Text CRDTs.
+//! Uses the facet library (github.com/tobert/facet) which provides a unified
+//! Document API with Map, Set, Register, and Text CRDTs.
 //!
 //! # DAG Model
 //!
@@ -10,23 +10,18 @@
 //! - Multiple children (parallel tool calls, multiple response blocks)
 //! - Role and status for conversation flow tracking
 
-use diamond_types::{
-    AgentId, CRDTKind, CreateValue, OpLog, Primitive, SerializedOps, SerializedOpsOwned,
-    ROOT_CRDT_ID, LV,
-};
-use diamond_types::list::operation::TextOperation;
-use smartstring::alias::String as SmartString;
+use facet::{Document, AgentId, SerializedOps, SerializedOpsOwned, LV};
 
 use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 
-/// Block document backed by unified diamond-types OpLog.
+/// Block document backed by facet Document.
 ///
 /// # Document Structure
 ///
 /// ```text
 /// ROOT (Map)
 /// ├── blocks (Set<string>)          # OR-Set of block ID keys
-/// ├── order:<id> -> f64             # Fractional index for ordering
+/// ├── order:<id> -> i64             # Fractional index for ordering (scaled by 1M)
 /// └── block:<id> (Map)              # Per-block data
 ///     ├── parent_id (Str | null)    # DAG edge - write once
 ///     ├── role (Str)                # human/agent/system/tool
@@ -47,7 +42,7 @@ use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 ///
 /// # Convergence
 ///
-/// All operations go through the unified OpLog, ensuring:
+/// All operations go through the facet Document, ensuring:
 /// - Maps use LWW (Last-Write-Wins) semantics
 /// - Sets use OR-Set (add-wins) semantics
 /// - Text uses sequence CRDT for character-level merging
@@ -59,14 +54,11 @@ pub struct BlockDocument {
     /// Agent ID string for this instance.
     agent_id_str: String,
 
-    /// Agent ID (numeric) in the OpLog.
+    /// Agent ID (numeric) in the Document.
     agent: AgentId,
 
-    /// Unified operation log for all CRDT operations.
-    pub oplog: OpLog,
-
-    /// LV (Local Version) of the blocks Set CRDT.
-    blocks_set_lv: LV,
+    /// Facet Document containing all CRDT state.
+    doc: Document,
 
     /// Next sequence number for block IDs (agent-local).
     next_seq: u64,
@@ -81,23 +73,19 @@ impl BlockDocument {
         let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
-        let mut oplog = OpLog::new();
-        let agent = oplog.cg.get_or_create_agent_id(&agent_id_str);
+        let mut doc = Document::new();
+        let agent = doc.get_or_create_agent(&agent_id_str);
 
-        // Create the blocks Set at ROOT_CRDT_ID["blocks"]
-        let blocks_set_lv = oplog.local_map_set(
-            agent,
-            ROOT_CRDT_ID,
-            "blocks",
-            CreateValue::NewCRDT(CRDTKind::Set),
-        );
+        // Create the blocks Set at ROOT["blocks"]
+        doc.transact(agent, |tx| {
+            tx.root().create_set("blocks");
+        });
 
         Self {
             document_id,
             agent_id_str,
             agent,
-            oplog,
-            blocks_set_lv,
+            doc,
             next_seq: 0,
             version: 0,
         }
@@ -111,23 +99,18 @@ impl BlockDocument {
         let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
-        let oplog = OpLog::new();
-        // Don't create blocks Set - it will come from merged ops
-        // blocks_set_lv will be looked up after first merge
+        let mut doc = Document::new();
+        let agent = doc.get_or_create_agent(&agent_id_str);
 
         Self {
             document_id,
             agent_id_str,
-            agent: 0, // Will be set on first local operation
-            oplog,
-            blocks_set_lv: 0, // Invalid until ops are merged
+            agent,
+            doc,
             next_seq: 0,
             version: 0,
         }
     }
-
-    // NOTE: refresh_after_merge was removed - we need a proper sync protocol
-    // where the server sends the full oplog on initial connect.
 
     // =========================================================================
     // Accessors
@@ -150,7 +133,9 @@ impl BlockDocument {
 
     /// Get the number of blocks.
     pub fn block_count(&self) -> usize {
-        self.oplog.checkout_set(self.blocks_set_lv).len()
+        self.doc.get_set(&["blocks"])
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     /// Check if the document is empty.
@@ -161,32 +146,25 @@ impl BlockDocument {
     /// Get block IDs in document order.
     fn block_ids_ordered(&self) -> Vec<BlockId> {
         // Get all block IDs from the Set
-        let block_keys = self.oplog.checkout_set(self.blocks_set_lv);
+        let Some(blocks_set) = self.doc.get_set(&["blocks"]) else {
+            return Vec::new();
+        };
 
         // Collect (order_value, block_id) pairs
-        let mut ordered: Vec<(f64, BlockId)> = block_keys
+        let mut ordered: Vec<(f64, BlockId)> = blocks_set
             .iter()
-            .filter_map(|p| {
-                if let Primitive::Str(key) = p {
-                    let block_id = BlockId::from_key(key)?;
-                    let order_key = format!("order:{}", key);
+            .filter_map(|v| {
+                let key = v.as_str()?;
+                let block_id = BlockId::from_key(key)?;
+                let order_key = format!("order:{}", key);
 
-                    // Get order value from map
-                    let checkout = self.oplog.checkout();
-                    let order_val = checkout.get(&SmartString::from(order_key.as_str()))
-                        .and_then(|v| {
-                            if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() {
-                                Some(*n as f64 / 1_000_000.0)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0.0);
+                // Get order value from root map
+                let order_val = self.doc.root().get(&order_key)
+                    .and_then(|v| v.as_int())
+                    .map(|n| n as f64 / 1_000_000.0)
+                    .unwrap_or(0.0);
 
-                    Some((order_val, block_id))
-                } else {
-                    None
-                }
+                Some((order_val, block_id))
             })
             .collect();
 
@@ -207,86 +185,87 @@ impl BlockDocument {
     /// Get a block snapshot by ID.
     pub fn get_block_snapshot(&self, id: &BlockId) -> Option<BlockSnapshot> {
         let block_key = format!("block:{}", id.to_key());
-        let checkout = self.oplog.checkout();
+        let block_map = self.doc.get_map(&[&block_key])?;
 
-        let block_map = checkout.get(&SmartString::from(block_key.as_str()))?;
+        // Extract fields from the block map
+        let kind_str = block_map.get("kind")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "text".to_string());
+        let kind = BlockKind::from_str(&kind_str).unwrap_or_default();
 
-        if let diamond_types::DTValue::Map(map) = block_map.as_ref() {
-            // Extract fields from the block map
-            let kind_str = map.get(&SmartString::from("kind"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
-                .unwrap_or("text");
-            let kind = BlockKind::from_str(kind_str).unwrap_or_default();
+        let role_str = block_map.get("role")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "human".to_string());
+        let role = Role::from_str(&role_str).unwrap_or_default();
 
-            let role_str = map.get(&SmartString::from("role"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
-                .unwrap_or("human");
-            let role = Role::from_str(role_str).unwrap_or_default();
+        let status_str = block_map.get("status")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "done".to_string());
+        let status = Status::from_str(&status_str).unwrap_or(Status::Done);
 
-            let status_str = map.get(&SmartString::from("status"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.as_str()) } else { None })
-                .unwrap_or("done");
-            let status = Status::from_str(status_str).unwrap_or(Status::Done);
+        let author = block_map.get("author")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
 
-            let author = map.get(&SmartString::from("author"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None })
-                .unwrap_or_default();
+        let created_at = block_map.get("created_at")
+            .and_then(|v| v.as_int())
+            .map(|n| n as u64)
+            .unwrap_or(0);
 
-            let created_at = map.get(&SmartString::from("created_at"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as u64) } else { None })
-                .unwrap_or(0);
+        let content = block_map.get_text("content")
+            .map(|t| t.content())
+            .unwrap_or_default();
 
-            let content = map.get(&SmartString::from("content"))
-                .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { Some(s.clone()) } else { None })
-                .unwrap_or_default();
+        let collapsed = block_map.get("collapsed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-            let collapsed = map.get(&SmartString::from("collapsed"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
-                .unwrap_or(false);
+        let parent_id = block_map.get("parent_id")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| BlockId::from_key(&s));
 
-            let parent_id = map.get(&SmartString::from("parent_id"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { BlockId::from_key(s) } else { None });
+        // Tool-specific fields
+        let tool_name = block_map.get("tool_name")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-            // Tool-specific fields
-            let tool_name = map.get(&SmartString::from("tool_name"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None });
+        let tool_input = block_map.get_text("tool_input")
+            .and_then(|t| {
+                let json_str = t.content();
+                serde_json::from_str(&json_str).ok()
+            });
 
-            let tool_input = map.get(&SmartString::from("tool_input"))
-                .and_then(|v| if let diamond_types::DTValue::Text(s) = v.as_ref() { serde_json::from_str(s).ok() } else { None });
+        let tool_call_id = block_map.get("tool_call_id")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| BlockId::from_key(&s));
 
-            let tool_call_id = map.get(&SmartString::from("tool_call_id"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { BlockId::from_key(s) } else { None });
+        let exit_code = block_map.get("exit_code")
+            .and_then(|v| v.as_int())
+            .map(|n| n as i32);
 
-            let exit_code = map.get(&SmartString::from("exit_code"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as i32) } else { None });
+        let is_error = block_map.get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-            let is_error = map.get(&SmartString::from("is_error"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Bool(b)) = v.as_ref() { Some(*b) } else { None })
-                .unwrap_or(false);
+        let display_hint = block_map.get("display_hint")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-            let display_hint = map.get(&SmartString::from("display_hint"))
-                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::Str(s)) = v.as_ref() { Some(s.to_string()) } else { None });
-
-            Some(BlockSnapshot {
-                id: id.clone(),
-                parent_id,
-                role,
-                status,
-                kind,
-                content,
-                collapsed,
-                author,
-                created_at,
-                tool_name,
-                tool_input,
-                tool_call_id,
-                exit_code,
-                is_error,
-                display_hint,
-            })
-        } else {
-            None
-        }
+        Some(BlockSnapshot {
+            id: id.clone(),
+            parent_id,
+            role,
+            status,
+            kind,
+            content,
+            collapsed,
+            author,
+            created_at,
+            tool_name,
+            tool_input,
+            tool_call_id,
+            exit_code,
+            is_error,
+            display_hint,
+        })
     }
 
     /// Get full text content (concatenation of all blocks).
@@ -366,9 +345,9 @@ impl BlockDocument {
                     // Get order of first block and go before it
                     let first_key = ordered[0].to_key();
                     let order_key = format!("order:{}", first_key);
-                    let checkout = self.oplog.checkout();
-                    let first_order = checkout.get(&SmartString::from(order_key.as_str()))
-                        .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                    let first_order = self.doc.root().get(&order_key)
+                        .and_then(|v| v.as_int())
+                        .map(|n| n as f64 / 1_000_000.0)
                         .unwrap_or(1.0);
                     first_order / 2.0
                 }
@@ -380,17 +359,18 @@ impl BlockDocument {
                     Some(idx) => {
                         let after_key = ordered[idx].to_key();
                         let order_key = format!("order:{}", after_key);
-                        let checkout = self.oplog.checkout();
-                        let after_order = checkout.get(&SmartString::from(order_key.as_str()))
-                            .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                        let after_order = self.doc.root().get(&order_key)
+                            .and_then(|v| v.as_int())
+                            .map(|n| n as f64 / 1_000_000.0)
                             .unwrap_or(1.0);
 
                         if idx + 1 < ordered.len() {
                             // There's a next block
                             let next_key = ordered[idx + 1].to_key();
                             let next_order_key = format!("order:{}", next_key);
-                            let next_order = checkout.get(&SmartString::from(next_order_key.as_str()))
-                                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                            let next_order = self.doc.root().get(&next_order_key)
+                                .and_then(|v| v.as_int())
+                                .map(|n| n as f64 / 1_000_000.0)
                                 .unwrap_or(after_order + 2.0);
                             (after_order + next_order) / 2.0
                         } else {
@@ -403,9 +383,9 @@ impl BlockDocument {
                         if let Some(last) = ordered.last() {
                             let last_key = last.to_key();
                             let order_key = format!("order:{}", last_key);
-                            let checkout = self.oplog.checkout();
-                            let last_order = checkout.get(&SmartString::from(order_key.as_str()))
-                                .and_then(|v| if let diamond_types::DTValue::Primitive(Primitive::I64(n)) = v.as_ref() { Some(*n as f64 / 1_000_000.0) } else { None })
+                            let last_order = self.doc.root().get(&order_key)
+                                .and_then(|v| v.as_int())
+                                .map(|n| n as f64 / 1_000_000.0)
                                 .unwrap_or(1.0);
                             last_order + 1.0
                         } else {
@@ -415,6 +395,13 @@ impl BlockDocument {
                 }
             }
         }
+    }
+
+    /// Check if a block exists in the Set.
+    fn block_exists(&self, key: &str) -> bool {
+        self.doc.get_set(&["blocks"])
+            .map(|s| s.contains_str(key))
+            .unwrap_or(false)
     }
 
     /// Insert a new block with full DAG support.
@@ -591,23 +578,20 @@ impl BlockDocument {
         let block_key = id.to_key();
 
         // Check for duplicate
-        let existing = self.oplog.checkout_set(self.blocks_set_lv);
-        if existing.contains(&Primitive::Str(SmartString::from(block_key.as_str()))) {
+        if self.block_exists(&block_key) {
             return Err(CrdtError::DuplicateBlock(id));
         }
 
         // Validate reference if provided
         if let Some(after_id) = after {
-            let after_key = Primitive::Str(SmartString::from(after_id.to_key().as_str()));
-            if !existing.contains(&after_key) {
+            if !self.block_exists(&after_id.to_key()) {
                 return Err(CrdtError::InvalidReference(after_id.clone()));
             }
         }
 
         // Validate parent if provided
         if let Some(parent) = parent_id {
-            let parent_key = Primitive::Str(SmartString::from(parent.to_key().as_str()));
-            if !existing.contains(&parent_key) {
+            if !self.block_exists(&parent.to_key()) {
                 return Err(CrdtError::InvalidReference(parent.clone()));
             }
         }
@@ -615,155 +599,95 @@ impl BlockDocument {
         // Calculate order index
         let order_index = self.calc_order_index(after);
 
-        // Add block ID to the blocks Set
-        self.oplog.local_set_add(
-            self.agent,
-            self.blocks_set_lv,
-            Primitive::Str(SmartString::from(block_key.as_str())),
-        );
-
-        // Store order index (as i64 scaled by 1M for precision)
-        let order_key = format!("order:{}", block_key);
-        self.oplog.local_map_set(
-            self.agent,
-            ROOT_CRDT_ID,
-            &order_key,
-            CreateValue::Primitive(Primitive::I64((order_index * 1_000_000.0) as i64)),
-        );
-
-        // Create block map
-        let block_map_key = format!("block:{}", block_key);
-        let block_map_lv = self.oplog.local_map_set(
-            self.agent,
-            ROOT_CRDT_ID,
-            &block_map_key,
-            CreateValue::NewCRDT(CRDTKind::Map),
-        );
-
         // Get timestamp
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        // Store block metadata
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "author",
-            CreateValue::Primitive(Primitive::Str(SmartString::from(author.as_str()))),
-        );
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "created_at",
-            CreateValue::Primitive(Primitive::I64(created_at)),
-        );
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "kind",
-            CreateValue::Primitive(Primitive::Str(SmartString::from(kind.as_str()))),
-        );
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "role",
-            CreateValue::Primitive(Primitive::Str(SmartString::from(role.as_str()))),
-        );
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "status",
-            CreateValue::Primitive(Primitive::Str(SmartString::from(Status::Done.as_str()))),
-        );
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "collapsed",
-            CreateValue::Primitive(Primitive::Bool(false)),
-        );
+        // All mutations in a single transaction
+        let block_map_key = format!("block:{}", block_key);
+        let order_key = format!("order:{}", block_key);
 
-        // Store parent_id if present
-        if let Some(parent) = parent_id {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "parent_id",
-                CreateValue::Primitive(Primitive::Str(SmartString::from(parent.to_key().as_str()))),
-            );
-        }
-
-        // Create text CRDT for content
-        let text_lv = self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "content",
-            CreateValue::NewCRDT(CRDTKind::Text),
-        );
-        if !content.is_empty() {
-            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(0, &content));
-        }
-
-        // Tool-specific fields
-        if let Some(name) = tool_name {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "tool_name",
-                CreateValue::Primitive(Primitive::Str(SmartString::from(name.as_str()))),
-            );
-        }
-
-        if let Some(input) = tool_input {
-            // Store tool_input as Text CRDT for streaming support
-            let input_json = serde_json::to_string(&input).unwrap_or_default();
-            let input_lv = self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "tool_input",
-                CreateValue::NewCRDT(CRDTKind::Text),
-            );
-            if !input_json.is_empty() {
-                self.oplog.local_text_op(self.agent, input_lv, TextOperation::new_insert(0, &input_json));
+        self.doc.transact(self.agent, |tx| {
+            // Add block ID to the blocks Set
+            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+                blocks_set.add_str(&block_key);
             }
-        }
 
-        if let Some(tcid) = tool_call_id {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "tool_call_id",
-                CreateValue::Primitive(Primitive::Str(SmartString::from(tcid.to_key().as_str()))),
-            );
-        }
+            // Store order index (as i64 scaled by 1M for precision)
+            tx.root().set(&order_key, (order_index * 1_000_000.0) as i64);
 
-        if let Some(code) = exit_code {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "exit_code",
-                CreateValue::Primitive(Primitive::I64(code as i64)),
-            );
-        }
+            // Create block map and collect text IDs to fill later
+            // (We need to do this in two phases to satisfy the borrow checker)
+            let (text_id, tool_input_id) = {
+                let block_map_id = tx.root().create_map(&block_map_key);
+                let mut block_map = tx.map_by_id(block_map_id);
 
-        if is_error {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "is_error",
-                CreateValue::Primitive(Primitive::Bool(true)),
-            );
-        }
+                // Store block metadata
+                block_map.set("author", author.as_str());
+                block_map.set("created_at", created_at);
+                block_map.set("kind", kind.as_str());
+                block_map.set("role", role.as_str());
+                block_map.set("status", Status::Done.as_str());
+                block_map.set("collapsed", false);
 
-        if let Some(hint) = display_hint {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "display_hint",
-                CreateValue::Primitive(Primitive::Str(SmartString::from(hint.as_str()))),
-            );
-        }
+                // Store parent_id if present
+                if let Some(parent) = parent_id {
+                    block_map.set("parent_id", parent.to_key().as_str());
+                }
+
+                // Create text CRDTs
+                let text_id = block_map.create_text("content");
+
+                // Tool-specific fields
+                if let Some(ref name) = tool_name {
+                    block_map.set("tool_name", name.as_str());
+                }
+
+                let tool_input_id = if tool_input.is_some() {
+                    Some(block_map.create_text("tool_input"))
+                } else {
+                    None
+                };
+
+                if let Some(ref tcid) = tool_call_id {
+                    block_map.set("tool_call_id", tcid.to_key().as_str());
+                }
+
+                if let Some(code) = exit_code {
+                    block_map.set("exit_code", code as i64);
+                }
+
+                if is_error {
+                    block_map.set("is_error", true);
+                }
+
+                if let Some(ref hint) = display_hint {
+                    block_map.set("display_hint", hint.as_str());
+                }
+
+                (text_id, tool_input_id)
+            };
+
+            // Now fill in text content (block_map is dropped, so we can borrow tx again)
+            if !content.is_empty() {
+                if let Some(mut text) = tx.text_by_id(text_id) {
+                    text.insert(0, &content);
+                }
+            }
+
+            if let Some(ref input) = tool_input {
+                if let Some(input_id) = tool_input_id {
+                    let input_json = serde_json::to_string(input).unwrap_or_default();
+                    if !input_json.is_empty() {
+                        if let Some(mut input_text) = tx.text_by_id(input_id) {
+                            input_text.insert(0, &input_json);
+                        }
+                    }
+                }
+            }
+        });
 
         self.version += 1;
         Ok(())
@@ -777,14 +701,12 @@ impl BlockDocument {
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
         let block_key = format!("block:{}", id.to_key());
-        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
 
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "status",
-            CreateValue::Primitive(Primitive::Str(SmartString::from(status.as_str()))),
-        );
+        self.doc.transact(self.agent, |tx| {
+            if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                block_map.set("status", status.as_str());
+            }
+        });
 
         self.version += 1;
         Ok(())
@@ -799,15 +721,13 @@ impl BlockDocument {
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
         let block_key = format!("block:{}", id.to_key());
-        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
 
         if let Some(h) = hint {
-            self.oplog.local_map_set(
-                self.agent,
-                block_map_lv,
-                "display_hint",
-                CreateValue::Primitive(Primitive::Str(SmartString::from(h))),
-            );
+            self.doc.transact(self.agent, |tx| {
+                if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                    block_map.set("display_hint", h);
+                }
+            });
         }
         // If hint is None, we don't need to do anything - it's already not set
 
@@ -818,16 +738,18 @@ impl BlockDocument {
     /// Delete a block.
     pub fn delete_block(&mut self, id: &BlockId) -> Result<()> {
         let block_key = id.to_key();
-        let key_primitive = Primitive::Str(SmartString::from(block_key.as_str()));
 
         // Check if block exists
-        let existing = self.oplog.checkout_set(self.blocks_set_lv);
-        if !existing.contains(&key_primitive) {
+        if !self.block_exists(&block_key) {
             return Err(CrdtError::BlockNotFound(id.clone()));
         }
 
         // Remove from blocks Set
-        self.oplog.local_set_remove(self.agent, self.blocks_set_lv, key_primitive);
+        self.doc.transact(self.agent, |tx| {
+            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+                blocks_set.remove_str(&block_key);
+            }
+        });
 
         // Note: The block map and order entries remain in the oplog but are
         // effectively orphaned. This is fine for CRDT semantics.
@@ -839,22 +761,6 @@ impl BlockDocument {
     // =========================================================================
     // Text Operations
     // =========================================================================
-
-    /// Get the text CRDT LV for a block (if it has one).
-    fn get_block_text_lv(&self, id: &BlockId) -> Option<LV> {
-        let block_key = format!("block:{}", id.to_key());
-
-        // Navigate to block:id/content
-        let path = [block_key.as_str(), "content"];
-
-        // Check if this path exists and is a Text CRDT
-        let (kind, lv) = self.oplog.crdt_at_path(&path);
-        if kind == CRDTKind::Text {
-            Some(lv)
-        } else {
-            None
-        }
-    }
 
     /// Edit text within a block.
     ///
@@ -870,17 +776,13 @@ impl BlockDocument {
         delete: usize,
     ) -> Result<()> {
         // Verify block exists
-        let _snapshot = self.get_block_snapshot(id)
+        let snapshot = self.get_block_snapshot(id)
             .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
 
-        let text_lv = self.get_block_text_lv(id)
-            .ok_or_else(|| CrdtError::Internal(format!("block {} has no text CRDT", id)))?;
-
-        // Get current length
-        let current_text = self.oplog.checkout_text(text_lv);
-        let len = current_text.len_chars();
+        let block_key = format!("block:{}", id.to_key());
 
         // Validate position
+        let len = snapshot.content.chars().count();
         if pos > len {
             return Err(CrdtError::PositionOutOfBounds { pos, len });
         }
@@ -892,12 +794,16 @@ impl BlockDocument {
         }
 
         // Apply operations
-        if delete > 0 {
-            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_delete(pos..pos + delete));
-        }
-        if !insert.is_empty() {
-            self.oplog.local_text_op(self.agent, text_lv, TextOperation::new_insert(pos, insert));
-        }
+        self.doc.transact(self.agent, |tx| {
+            if let Some(mut text) = tx.get_text_mut(&[&block_key, "content"]) {
+                if delete > 0 {
+                    text.delete(pos..pos + delete);
+                }
+                if !insert.is_empty() {
+                    text.insert(pos, insert);
+                }
+            }
+        });
 
         self.version += 1;
         Ok(())
@@ -925,14 +831,12 @@ impl BlockDocument {
         }
 
         let block_key = format!("block:{}", id.to_key());
-        let (_, block_map_lv) = self.oplog.crdt_at_path(&[block_key.as_str()]);
 
-        self.oplog.local_map_set(
-            self.agent,
-            block_map_lv,
-            "collapsed",
-            CreateValue::Primitive(Primitive::Bool(collapsed)),
-        );
+        self.doc.transact(self.agent, |tx| {
+            if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                block_map.set("collapsed", collapsed);
+            }
+        });
 
         self.version += 1;
         Ok(())
@@ -944,18 +848,15 @@ impl BlockDocument {
     /// beginning if `after_id` is None.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         let block_key = id.to_key();
-        let key_primitive = Primitive::Str(SmartString::from(block_key.as_str()));
 
         // Check if block exists
-        let existing = self.oplog.checkout_set(self.blocks_set_lv);
-        if !existing.contains(&key_primitive) {
+        if !self.block_exists(&block_key) {
             return Err(CrdtError::BlockNotFound(id.clone()));
         }
 
         // Validate reference if provided
         if let Some(after_id) = after {
-            let after_key = Primitive::Str(SmartString::from(after_id.to_key().as_str()));
-            if !existing.contains(&after_key) {
+            if !self.block_exists(&after_id.to_key()) {
                 return Err(CrdtError::InvalidReference(after_id.clone()));
             }
         }
@@ -965,12 +866,9 @@ impl BlockDocument {
 
         // Update order key
         let order_key = format!("order:{}", block_key);
-        self.oplog.local_map_set(
-            self.agent,
-            ROOT_CRDT_ID,
-            &order_key,
-            CreateValue::Primitive(Primitive::I64((order_index * 1_000_000.0) as i64)),
-        );
+        self.doc.transact(self.agent, |tx| {
+            tx.root().set(&order_key, (order_index * 1_000_000.0) as i64);
+        });
 
         self.version += 1;
         Ok(())
@@ -982,28 +880,17 @@ impl BlockDocument {
 
     /// Get operations since a frontier for replication.
     pub fn ops_since(&self, frontier: &[LV]) -> SerializedOpsOwned {
-        self.oplog.ops_since(frontier).into()
+        self.doc.ops_since(frontier).into()
     }
 
     /// Merge remote operations.
     ///
-    /// Accepts borrowed `SerializedOps` to avoid lifetime conversion issues.
     /// Use `ops_since()` to get operations, and pass them directly here.
     pub fn merge_ops(&mut self, ops: SerializedOps<'_>) -> Result<()> {
-        self.oplog.merge_ops(ops)
+        self.doc.merge_ops_borrowed(ops)
             .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
 
-        // Update next_seq if needed
-        let blocks = self.oplog.checkout_set(self.blocks_set_lv);
-        for p in blocks.iter() {
-            if let Primitive::Str(key) = p
-                && let Some(block_id) = BlockId::from_key(key)
-                    && block_id.agent_id == self.agent_id_str {
-                        self.next_seq = self.next_seq.max(block_id.seq + 1);
-                    }
-        }
-
-        self.version += 1;
+        self.refresh_after_merge();
         Ok(())
     }
 
@@ -1012,26 +899,34 @@ impl BlockDocument {
     /// Use this when receiving serialized ops that have been deserialized
     /// into the owned form (e.g., from network RPC).
     pub fn merge_ops_owned(&mut self, ops: SerializedOpsOwned) -> Result<()> {
-        self.oplog.merge_ops_owned(ops)
+        self.doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
 
+        self.refresh_after_merge();
+        Ok(())
+    }
+
+    /// Refresh internal state after merging operations.
+    fn refresh_after_merge(&mut self) {
         // Update next_seq if needed
-        let blocks = self.oplog.checkout_set(self.blocks_set_lv);
-        for p in blocks.iter() {
-            if let Primitive::Str(key) = p
-                && let Some(block_id) = BlockId::from_key(key)
-                    && block_id.agent_id == self.agent_id_str {
-                        self.next_seq = self.next_seq.max(block_id.seq + 1);
+        if let Some(blocks_set) = self.doc.get_set(&["blocks"]) {
+            for v in blocks_set.iter() {
+                if let Some(key) = v.as_str() {
+                    if let Some(block_id) = BlockId::from_key(key) {
+                        if block_id.agent_id == self.agent_id_str {
+                            self.next_seq = self.next_seq.max(block_id.seq + 1);
+                        }
                     }
+                }
+            }
         }
 
         self.version += 1;
-        Ok(())
     }
 
     /// Get the current frontier (version) for sync.
     pub fn frontier(&self) -> Vec<LV> {
-        self.oplog.cg.version.as_ref().to_vec()
+        self.doc.version().as_ref().to_vec()
     }
 
     // =========================================================================
@@ -1053,7 +948,7 @@ impl BlockDocument {
     ///
     /// This is the proper way to initialize a client document for sync.
     /// Instead of creating an independent oplog root (which breaks causality),
-    /// we start with an empty OpLog and merge the server's full oplog.
+    /// we start with an empty Document and merge the server's full oplog.
     ///
     /// # Arguments
     ///
@@ -1073,34 +968,33 @@ impl BlockDocument {
         let document_id = document_id.into();
         let agent_id_str = agent_id.into();
 
-        // Start with empty oplog (no independent "blocks" Set!)
-        let mut oplog = OpLog::new();
+        // Start with empty document (no independent "blocks" Set!)
+        let mut doc = Document::new();
 
         // Merge server's full oplog
         let ops: SerializedOpsOwned = serde_json::from_slice(oplog_bytes)
             .map_err(|e| CrdtError::Internal(format!("deserialize oplog: {}", e)))?;
-        oplog
-            .merge_ops_owned(ops)
+        doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;
 
-        // Find blocks_set_lv from merged oplog by looking up ROOT["blocks"]
-        let (kind, blocks_set_lv) = oplog.crdt_at_path(&["blocks"]);
-        if kind != CRDTKind::Set {
+        // Verify blocks set exists
+        if doc.get_set(&["blocks"]).is_none() {
             return Err(CrdtError::Internal(
                 "oplog missing 'blocks' Set at root".into(),
             ));
         }
 
-        let agent = oplog.cg.get_or_create_agent_id(&agent_id_str);
+        let agent = doc.get_or_create_agent(&agent_id_str);
 
         // Calculate next_seq from existing blocks (avoid ID collisions)
         let mut next_seq = 0u64;
-        let blocks = oplog.checkout_set(blocks_set_lv);
-        for p in blocks.iter() {
-            if let Primitive::Str(key) = p {
-                if let Some(block_id) = BlockId::from_key(key) {
-                    if block_id.agent_id == agent_id_str {
-                        next_seq = next_seq.max(block_id.seq + 1);
+        if let Some(blocks_set) = doc.get_set(&["blocks"]) {
+            for v in blocks_set.iter() {
+                if let Some(key) = v.as_str() {
+                    if let Some(block_id) = BlockId::from_key(key) {
+                        if block_id.agent_id == agent_id_str {
+                            next_seq = next_seq.max(block_id.seq + 1);
+                        }
                     }
                 }
             }
@@ -1108,15 +1002,14 @@ impl BlockDocument {
 
         // Use block count as initial version - ensures non-zero if content exists
         // This makes sync detect the document has changed from an empty state
-        let block_count = oplog.checkout_set(blocks_set_lv).len();
+        let block_count = doc.get_set(&["blocks"]).map(|s| s.len()).unwrap_or(0);
         let version = if block_count > 0 { block_count as u64 } else { 0 };
 
         Ok(Self {
             document_id,
             agent_id_str,
             agent,
-            oplog,
-            blocks_set_lv,
+            doc,
             next_seq,
             version,
         })
@@ -1490,6 +1383,8 @@ mod tests {
     /// the "blocks" Set creation, allowing the client to merge successfully.
     #[test]
     fn test_sync_succeeds_with_full_oplog() {
+        use facet::Document;
+
         // === Server side ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
 
@@ -1508,22 +1403,20 @@ mod tests {
 
         // === Client side ===
         // Client needs an empty document (no independent "blocks" Set)
-        // Create a new OpLog directly to simulate a clean sync client
-        let mut client_oplog = OpLog::new();
+        // Create a new Document directly to simulate a clean sync client
+        let mut client_doc = Document::new();
 
         // Merge the full ops - this should work because it includes "blocks" Set creation
-        let result = client_oplog.merge_ops_owned(full_ops.clone());
+        let result = client_doc.merge_ops(full_ops);
 
         assert!(
             result.is_ok(),
             "Full oplog merge should succeed: {:?}", result
         );
 
-        // Verify client oplog has operations (simple sanity check)
-        // The full checkout should contain the "blocks" key and the block data
-        let checkout = client_oplog.checkout();
+        // Verify client doc has the blocks key
         assert!(
-            checkout.get(&SmartString::from("blocks")).is_some(),
+            client_doc.root().contains_key("blocks"),
             "Client should have 'blocks' key after merging full oplog"
         );
     }
@@ -1534,13 +1427,15 @@ mod tests {
     /// incremental ops should merge correctly.
     #[test]
     fn test_incremental_sync_after_full_sync() {
+        use facet::Document;
+
         // === Initial full sync ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
         let full_ops = server.ops_since(&[]);
 
-        // Client creates empty oplog and merges full state
-        let mut client_oplog = OpLog::new();
-        client_oplog.merge_ops_owned(full_ops).expect("initial sync should work");
+        // Client creates empty doc and merges full state
+        let mut client_doc = Document::new();
+        client_doc.merge_ops(full_ops).expect("initial sync should work");
 
         // === Server continues ===
         let frontier_before_block = server.frontier();
@@ -1558,7 +1453,7 @@ mod tests {
         let incremental_ops = server.ops_since(&frontier_before_block);
 
         // Client merges incremental ops - should work now because roots match
-        let result = client_oplog.merge_ops_owned(incremental_ops);
+        let result = client_doc.merge_ops(incremental_ops);
 
         assert!(
             result.is_ok(),
@@ -1617,6 +1512,8 @@ mod tests {
     /// Test text streaming sync (append operations).
     #[test]
     fn test_text_streaming_sync() {
+        use facet::Document;
+
         // === Initial setup ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
         let block_id = server.insert_block(
@@ -1630,8 +1527,8 @@ mod tests {
 
         // Full sync to client
         let full_ops = server.ops_since(&[]);
-        let mut client_oplog = OpLog::new();
-        client_oplog.merge_ops_owned(full_ops).expect("initial sync");
+        let mut client_doc = Document::new();
+        client_doc.merge_ops(full_ops).expect("initial sync");
 
         // === Streaming ===
         // Server appends text in chunks
@@ -1642,7 +1539,7 @@ mod tests {
             server.append_text(&block_id, chunk).unwrap();
 
             let chunk_ops = server.ops_since(&frontier_before);
-            client_oplog.merge_ops_owned(chunk_ops)
+            client_doc.merge_ops(chunk_ops)
                 .expect(&format!("merging chunk '{}' should work", chunk));
         }
 
@@ -1650,7 +1547,7 @@ mod tests {
         let server_content = server.get_block_snapshot(&block_id).unwrap().content;
         assert_eq!(server_content, "Hello World!");
 
-        // For client verification, we'd need to wrap the oplog in BlockDocument
+        // For client verification, we'd need to wrap the doc in BlockDocument
         // For now, just verify the merge succeeded without errors
     }
 }

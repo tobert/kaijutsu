@@ -65,8 +65,8 @@ bevy_brp_extras = { git = "https://github.com/tobert/bevy_brp", branch = "fix/se
 cosmic-text = "0.16"
 
 # CRDT + Persistence
-# Using forked diamond-types with Map/Set/Register support
-diamond-types = { git = "https://github.com/tobert/diamond-types", branch = "feat/maps-and-uuids", features = ["serde"] }
+# Using facet - unified CRDT library forked from diamond-types (local source for development)
+facet = { path = "../facet", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting

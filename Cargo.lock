@@ -3111,26 +3111,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diamond-types"
-version = "2.0.0"
-source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#26e6666b962ee6c60b4e369eb53bda06efee951a"
-dependencies = [
- "bumpalo",
- "crc",
- "humansize",
- "jumprope",
- "lazy_static",
- "libc",
- "lz4_flex",
- "num_enum",
- "rle",
- "serde",
- "smallvec 2.0.0-alpha.12",
- "smartstring",
- "str_indices",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3543,6 +3523,25 @@ dependencies = [
  "rayon-core",
  "smallvec 1.15.1",
  "zune-inflate",
+]
+
+[[package]]
+name = "facet"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "crc",
+ "humansize",
+ "jumprope",
+ "lazy_static",
+ "libc",
+ "lz4_flex",
+ "num_enum",
+ "rle",
+ "serde",
+ "smallvec 2.0.0-alpha.12",
+ "smartstring",
+ "str_indices",
 ]
 
 [[package]]
@@ -4954,7 +4953,7 @@ dependencies = [
 name = "kaijutsu-crdt"
 version = "0.1.0"
 dependencies = [
- "diamond-types",
+ "facet",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -4971,8 +4970,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dashmap",
- "diamond-types",
  "dunce",
+ "facet",
  "kaijutsu-crdt",
  "parking_lot",
  "regex",
@@ -7261,7 +7260,6 @@ dependencies = [
 [[package]]
 name = "rle"
 version = "0.2.0"
-source = "git+https://github.com/tobert/diamond-types?branch=feat%2Fmaps-and-uuids#26e6666b962ee6c60b4e369eb53bda06efee951a"
 dependencies = [
  "smallvec 2.0.0-alpha.12",
 ]
