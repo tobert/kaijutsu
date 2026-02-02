@@ -48,6 +48,12 @@ pub enum LayoutNode {
         /// Flex grow factor (default 1.0)
         #[serde(default = "default_flex")]
         flex: f32,
+        /// Padding in pixels (applied to all sides)
+        #[serde(default)]
+        padding: f32,
+        /// Gap between children in pixels (row_gap for Column, column_gap for Row)
+        #[serde(default)]
+        gap: f32,
     },
     /// Panel node - references a registered panel type
     Panel {
@@ -412,12 +418,68 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     // DASHBOARD VIEW PANELS
     // =========================================================================
 
-    // Dashboard panels - currently no builders, use placeholders
-    // TODO: Move dashboard column spawning to builders
+    // Dashboard columns - spawn marker that filler system detects
+    // The filler adds chasing border decoration and inner scrollable container
+    registry.register_with_builder("KernelList", |commands, ctx| {
+        commands
+            .spawn((
+                crate::dashboard::KernelListColumn,
+                Node {
+                    flex_grow: ctx.flex,
+                    flex_direction: FlexDirection::Column,
+                    ..default()
+                },
+            ))
+            .id()
+    });
+
+    registry.register_with_builder("ContextList", |commands, ctx| {
+        commands
+            .spawn((
+                crate::dashboard::ContextListColumn,
+                Node {
+                    flex_grow: ctx.flex,
+                    flex_direction: FlexDirection::Column,
+                    ..default()
+                },
+            ))
+            .id()
+    });
+
+    registry.register_with_builder("SeatsList", |commands, ctx| {
+        commands
+            .spawn((
+                crate::dashboard::SeatsListColumn,
+                Node {
+                    flex_grow: ctx.flex,
+                    flex_direction: FlexDirection::Column,
+                    ..default()
+                },
+            ))
+            .id()
+    });
+
+    // DashboardFooter - the Take Seat footer row
+    registry.register_with_builder("DashboardFooter", |commands, ctx| {
+        commands
+            .spawn((
+                crate::dashboard::DashboardFooter,
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_grow: ctx.flex,
+                    padding: UiRect::all(Val::Px(20.0)),
+                    border: UiRect::top(Val::Px(1.0)),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                },
+            ))
+            .id()
+    });
+
+    // SeatSelector stays in header chrome (not part of dashboard layout)
     registry.register("SeatSelector");
-    registry.register("KernelList");
-    registry.register("ContextList");
-    registry.register("SeatsList");
 
     // =========================================================================
     // OVERLAY PANELS
@@ -564,6 +626,7 @@ mod tests {
                 direction,
                 children,
                 flex,
+                ..
             } => {
                 assert_eq!(direction, LayoutDirection::Column);
                 assert_eq!(flex, 1.0);

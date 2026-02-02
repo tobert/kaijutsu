@@ -22,7 +22,7 @@ use kaijutsu_client::{Context, KernelInfo, SeatInfo};
 use tracing::trace;
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
-use crate::shaders::nine_slice::{ChasingBorder, ChasingBorderMaterial};
+use crate::shaders::nine_slice::ChasingBorder;
 use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
@@ -42,8 +42,8 @@ pub struct DashboardPlugin;
 impl Plugin for DashboardPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DashboardState>()
-            // PostStartup ensures ContentArea and header exist before we add dashboard to them
-            .add_systems(PostStartup, (setup_dashboard, setup_seat_selector_ui).chain())
+            // PostStartup ensures header exists before we add seat selector to it
+            .add_systems(PostStartup, setup_seat_selector_ui)
             .add_systems(
                 Update,
                 (
@@ -54,6 +54,11 @@ impl Plugin for DashboardPlugin {
                     handle_context_selection,
                     handle_take_seat,
                     handle_dashboard_keyboard,
+                    // Filler systems - populate layout-spawned column markers
+                    fill_kernel_list_column,
+                    fill_context_list_column,
+                    fill_seats_list_column,
+                    fill_dashboard_footer,
                     // List rebuild systems
                     rebuild_kernel_list,
                     rebuild_context_list,
@@ -143,190 +148,25 @@ pub struct SeatListItem;
 pub struct TakeSeatButton;
 
 // ============================================================================
-// Setup
+// Layout Column Markers (spawned by layout builders, filled by filler systems)
 // ============================================================================
 
-fn setup_dashboard(
-    mut commands: Commands,
-    theme: Res<Theme>,
-    mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
-    content_area: Query<Entity, With<crate::ui::state::ContentArea>>,
-) {
-    // Get the ContentArea entity to parent the dashboard under
-    let Ok(content_entity) = content_area.single() else {
-        warn!("ContentArea not found - dashboard cannot be attached");
-        return;
-    };
+/// Marker for KernelList column container (spawned by layout, filled by filler)
+#[derive(Component)]
+pub struct KernelListColumn;
 
-    // Pre-create chasing border materials for each column
-    // Sharp cyan border with rainbow cycling chase - parameters from theme
-    let column_border_material = chasing_materials.add(
-        ChasingBorderMaterial::from_theme(theme.accent, Color::WHITE)
-            .with_thickness(1.0)
-            .with_glow(theme.effect_chase_glow_radius, theme.effect_chase_glow_intensity)
-            .with_chase_speed(theme.effect_chase_speed)
-            .with_chase_width(theme.effect_chase_width)
-            .with_color_cycle(theme.effect_chase_color_cycle),
-    );
+/// Marker for ContextList column container (spawned by layout, filled by filler)
+#[derive(Component)]
+pub struct ContextListColumn;
 
-    // Root container - flex child in ContentArea
-    // Visibility controlled by AppScreen state transitions (Display::Flex by default)
-    let dashboard = commands
-        .spawn((
-            DashboardRoot,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                display: Display::Flex, // Visible by default (Dashboard is initial state)
-                ..default()
-            },
-            BackgroundColor(theme.bg),
-            Visibility::Inherited, // Visible by default, state transitions toggle this
-        ))
-        .with_children(|root| {
-            // Main content - 3 columns
-            root.spawn((Node {
-                width: Val::Percent(100.0),
-                flex_grow: 1.0,
-                flex_direction: FlexDirection::Row,
-                padding: UiRect::all(Val::Px(20.0)),
-                column_gap: Val::Px(20.0),
-                ..default()
-            },))
-                .with_children(|content| {
-                    // Column 1: Kernels
-                    spawn_dashboard_column_with_border(content, &theme, "KERNELS", KernelList, column_border_material.clone());
+/// Marker for SeatsList column container (spawned by layout, filled by filler)
+#[derive(Component)]
+pub struct SeatsListColumn;
 
-                    // Column 2: Contexts
-                    spawn_dashboard_column_with_border(content, &theme, "CONTEXTS", ContextList, column_border_material.clone());
+/// Marker for dashboard footer container (spawned by layout, filled by filler)
+#[derive(Component)]
+pub struct DashboardFooter;
 
-                    // Column 3: Your Seats
-                    spawn_dashboard_column_with_border(content, &theme, "YOUR SEATS", SeatsList, column_border_material.clone());
-                });
-
-            // Footer with "Take Seat" input
-            root.spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    padding: UiRect::all(Val::Px(20.0)),
-                    border: UiRect::top(Val::Px(1.0)),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                },
-                BorderColor::all(theme.border),
-            ))
-            .with_children(|footer| {
-                footer.spawn((
-                    MsdfUiText::new("Take a seat:")
-                        .with_font_size(14.0)
-                        .with_color(theme.fg_dim),
-                    UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(100.0),
-                        min_height: Val::Px(20.0),
-                        ..default()
-                    },
-                ));
-
-                // Take Seat button
-                footer
-                    .spawn((
-                        TakeSeatButton,
-                        Button,
-                        Node {
-                            padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
-                            ..default()
-                        },
-                        BackgroundColor(theme.accent),
-                    ))
-                    .with_children(|btn| {
-                        btn.spawn((
-                            MsdfUiText::new("Take Seat 席")
-                                .with_font_size(14.0)
-                                .with_color(theme.bg),
-                            UiTextPositionCache::default(),
-                            Node {
-                                min_width: Val::Px(100.0),
-                                min_height: Val::Px(20.0),
-                                ..default()
-                            },
-                        ));
-                    });
-            });
-        })
-        .id();
-
-    // Attach dashboard to ContentArea
-    commands.entity(content_entity).add_child(dashboard);
-}
-
-/// Spawn a dashboard column with chasing neon border effect
-fn spawn_dashboard_column_with_border<M: Component>(
-    parent: &mut ChildSpawnerCommands,
-    theme: &Theme,
-    title: &str,
-    marker: M,
-    border_material: Handle<ChasingBorderMaterial>,
-) {
-    // Outer container with chasing border material
-    parent
-        .spawn((
-            ChasingBorder,
-            Node {
-                flex_grow: 1.0,
-                flex_direction: FlexDirection::Column,
-                // Small padding to create space between border and content
-                padding: UiRect::all(Val::Px(4.0)),
-                ..default()
-            },
-            // The material renders the animated border
-            MaterialNode(border_material),
-        ))
-        .with_children(|outer| {
-            // Inner content area with background
-            outer
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Column,
-                        padding: UiRect::all(Val::Px(12.0)),
-                        ..default()
-                    },
-                    BackgroundColor(theme.panel_bg),
-                ))
-                .with_children(|col| {
-                    // Column header
-                    col.spawn((
-                        MsdfUiText::new(title)
-                            .with_font_size(12.0)
-                            .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
-                        Node {
-                            min_width: Val::Px(100.0),
-                            min_height: Val::Px(16.0),
-                            margin: UiRect::bottom(Val::Px(12.0)),
-                            ..default()
-                        },
-                    ));
-
-                    // Content area (scrollable)
-                    col.spawn((
-                        marker,
-                        Node {
-                            flex_grow: 1.0,
-                            flex_direction: FlexDirection::Column,
-                            overflow: Overflow::scroll_y(),
-                            row_gap: Val::Px(4.0),
-                            ..default()
-                        },
-                    ));
-                });
-        });
-}
 
 // ============================================================================
 // Systems
@@ -737,5 +577,162 @@ fn rebuild_seats_list(
                     ));
                 });
         }
+    });
+}
+
+// ============================================================================
+// Layout Filler Systems
+// These populate layout-spawned column markers with chasing borders and content
+// ============================================================================
+
+/// Fill newly spawned KernelListColumn with chasing border and inner container
+fn fill_kernel_list_column(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    material_cache: Res<crate::ui::materials::MaterialCache>,
+    new_columns: Query<Entity, Added<KernelListColumn>>,
+) {
+    for column_entity in new_columns.iter() {
+        spawn_column_content(&mut commands, column_entity, &theme, &material_cache, "KERNELS", KernelList);
+    }
+}
+
+/// Fill newly spawned ContextListColumn with chasing border and inner container
+fn fill_context_list_column(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    material_cache: Res<crate::ui::materials::MaterialCache>,
+    new_columns: Query<Entity, Added<ContextListColumn>>,
+) {
+    for column_entity in new_columns.iter() {
+        spawn_column_content(&mut commands, column_entity, &theme, &material_cache, "CONTEXTS", ContextList);
+    }
+}
+
+/// Fill newly spawned SeatsListColumn with chasing border and inner container
+fn fill_seats_list_column(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    material_cache: Res<crate::ui::materials::MaterialCache>,
+    new_columns: Query<Entity, Added<SeatsListColumn>>,
+) {
+    for column_entity in new_columns.iter() {
+        spawn_column_content(&mut commands, column_entity, &theme, &material_cache, "YOUR SEATS", SeatsList);
+    }
+}
+
+/// Fill newly spawned DashboardFooter with Take Seat button
+fn fill_dashboard_footer(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    new_footers: Query<Entity, Added<DashboardFooter>>,
+) {
+    for footer_entity in new_footers.iter() {
+        // Apply border color to footer (already has structure from layout builder)
+        commands.entity(footer_entity).insert(BorderColor::all(theme.border));
+
+        // Add footer content as children
+        commands.entity(footer_entity).with_children(|footer| {
+            footer.spawn((
+                MsdfUiText::new("Take a seat:")
+                    .with_font_size(14.0)
+                    .with_color(theme.fg_dim),
+                UiTextPositionCache::default(),
+                Node {
+                    min_width: Val::Px(100.0),
+                    min_height: Val::Px(20.0),
+                    ..default()
+                },
+            ));
+
+            // Take Seat button
+            footer
+                .spawn((
+                    TakeSeatButton,
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(theme.accent),
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        MsdfUiText::new("Take Seat 席")
+                            .with_font_size(14.0)
+                            .with_color(theme.bg),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(100.0),
+                            min_height: Val::Px(20.0),
+                            ..default()
+                        },
+                    ));
+                });
+        });
+    }
+}
+
+/// Helper: Spawn chasing border and inner content area for a dashboard column
+fn spawn_column_content<M: Component>(
+    commands: &mut Commands,
+    column_entity: Entity,
+    theme: &Theme,
+    material_cache: &crate::ui::materials::MaterialCache,
+    title: &str,
+    marker: M,
+) {
+    // Add chasing border material and styling to the column
+    commands.entity(column_entity).insert((
+        ChasingBorder,
+        MaterialNode(material_cache.chasing_border.clone()),
+        Node {
+            flex_grow: 1.0,
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(Val::Px(4.0)),
+            ..default()
+        },
+    ));
+
+    // Spawn inner content as child
+    commands.entity(column_entity).with_children(|outer| {
+        outer
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(12.0)),
+                    ..default()
+                },
+                BackgroundColor(theme.panel_bg),
+            ))
+            .with_children(|col| {
+                // Column header
+                col.spawn((
+                    MsdfUiText::new(title)
+                        .with_font_size(12.0)
+                        .with_color(theme.fg_dim),
+                    UiTextPositionCache::default(),
+                    Node {
+                        min_width: Val::Px(100.0),
+                        min_height: Val::Px(16.0),
+                        margin: UiRect::bottom(Val::Px(12.0)),
+                        ..default()
+                    },
+                ));
+
+                // Scrollable content area with the marker
+                col.spawn((
+                    marker,
+                    Node {
+                        flex_grow: 1.0,
+                        flex_direction: FlexDirection::Column,
+                        overflow: Overflow::scroll_y(),
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    },
+                ));
+            });
     });
 }

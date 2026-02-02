@@ -21,7 +21,7 @@
 use bevy::prelude::*;
 
 use super::layout::{
-    LayoutNode, LayoutPreset, LoadedLayouts, PanelRegistry, PanelSpawnContext,
+    LayoutDirection, LayoutNode, LayoutPreset, LoadedLayouts, PanelRegistry, PanelSpawnContext,
 };
 use super::theme::Theme;
 
@@ -142,7 +142,15 @@ fn spawn_node(
             direction,
             children,
             flex,
+            padding,
+            gap,
         } => {
+            // Determine gap direction based on flex direction
+            let (row_gap, column_gap) = match direction {
+                LayoutDirection::Column => (Val::Px(*gap), Val::Px(0.0)),
+                LayoutDirection::Row => (Val::Px(0.0), Val::Px(*gap)),
+            };
+
             // Spawn container entity
             let container = commands
                 .spawn((
@@ -164,6 +172,9 @@ fn spawn_node(
                         } else {
                             Val::Auto
                         },
+                        padding: UiRect::all(Val::Px(*padding)),
+                        row_gap,
+                        column_gap,
                         ..default()
                     },
                 ))
@@ -194,11 +205,12 @@ fn spawn_node(
                 };
 
                 if let Some(entity) = registry.spawn(panel_id, commands, &ctx) {
-                    // Mark spawned panel as layout-managed
+                    // Mark spawned panel as layout-managed and add as child
                     commands.entity(entity).insert(LayoutManaged {
                         layout_name: layout_name.to_string(),
                         node_path: path,
                     });
+                    commands.entity(parent).add_child(entity);
                 } else {
                     // No builder - spawn placeholder
                     spawn_panel_placeholder(commands, parent, layout_name, &path, id, *flex);

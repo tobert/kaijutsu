@@ -99,12 +99,14 @@ fn main() {
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
         // Startup
+        // MaterialCache must run early so panel builders can access materials
         .add_systems(Startup, (
             setup_camera,
+            ui::materials::setup_material_cache,
             setup_ui,
             setup_input_layer,
             ui::debug::setup_debug_overlay,
-        ))
+        ).chain())
         // Update
         .add_systems(Update, (
             handle_connection_events,
@@ -252,6 +254,23 @@ fn setup_ui(
             ))
             .with_children(|content| {
                 // ───────────────────────────────────────────────────────────
+                // DASHBOARD VIEW (visible by default)
+                // Children (KernelList, ContextList, etc) spawned by layout system
+                // ───────────────────────────────────────────────────────────
+                content.spawn((
+                    dashboard::DashboardRoot,
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        display: Display::Flex, // Visible by default (Dashboard is initial state)
+                        ..default()
+                    },
+                    BackgroundColor(theme.bg),
+                    Visibility::Inherited, // Visible by default
+                ));
+
+                // ───────────────────────────────────────────────────────────
                 // CONVERSATION VIEW (hidden when in Dashboard state)
                 // Children (DagView, InputShadow) spawned by layout system
                 // ───────────────────────────────────────────────────────────
@@ -266,9 +285,6 @@ fn setup_ui(
                     },
                     Visibility::Hidden, // Hidden by default (glyphon needs this too)
                 ));
-
-                // Dashboard view is spawned by DashboardPlugin in setup_dashboard
-                // Dashboard children also spawned by layout system
             });
 
             // ═══════════════════════════════════════════════════════════════

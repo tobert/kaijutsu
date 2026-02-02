@@ -4,23 +4,30 @@
 //
 // Structure:
 // ┌────────────────────────────────────────────────────────┐
-// │                    Dashboard                          │
-// │  ┌──────────┬───────────┬────────────────────────┐   │
-// │  │ KERNELS  │ CONTEXTS  │      YOUR SEATS        │   │
-// │  │          │           │                        │   │
-// │  │ [lobby]  │ [default] │  • amy@local           │   │
-// │  │ [test]   │ [coding]  │  • claude@prod         │   │
-// │  │          │           │                        │   │
-// │  └──────────┴───────────┴────────────────────────┘   │
-// │                                                       │
-// │                    [Take Seat]                        │
+// │                    Dashboard                           │
+// │  ┌──────────┬───────────┬────────────────────────┐    │
+// │  │ KERNELS  │ CONTEXTS  │      YOUR SEATS        │    │
+// │  │          │           │                        │    │
+// │  │ [lobby]  │ [default] │  • amy@local           │    │
+// │  │ [test]   │ [coding]  │  • claude@prod         │    │
+// │  │          │           │                        │    │
+// │  └──────────┴───────────┴────────────────────────┘    │
+// │  ┌────────────────────────────────────────────────┐   │
+// │  │ Take a seat: [Take Seat 席]                    │   │
+// │  └────────────────────────────────────────────────┘   │
 // └────────────────────────────────────────────────────────┘
+//
+// Panel builders:
+// - KernelList, ContextList, SeatsList: Column markers filled by filler systems
+// - DashboardFooter: Footer with Take Seat button
+//
+// SeatSelector is in header chrome, not part of this layout.
 (
     name: "dashboard",
     root: Container(
         direction: Column,
         children: [
-            // Three-column selection area
+            // Main content - three-column row with padding and gaps
             Container(
                 direction: Row,
                 children: [
@@ -29,9 +36,11 @@
                     Panel(id: "SeatsList", flex: 1.0),
                 ],
                 flex: 1.0,
+                padding: 20.0,
+                gap: 20.0,
             ),
-            // Seat selector (dropdown + button)
-            Panel(id: "SeatSelector", flex: 0.0),
+            // Footer with Take Seat button
+            Panel(id: "DashboardFooter", flex: 0.0),
         ],
         flex: 1.0,
     ),
