@@ -496,6 +496,9 @@ impl BlockDocument {
     ) -> Result<BlockId> {
         let id = self.new_block_id();
 
+        // Default to placing after the tool call if not specified
+        let after = after.or(Some(tool_call_id));
+
         self.insert_block_with_id(
             id.clone(),
             Some(tool_call_id), // Parent is the tool call
@@ -1034,28 +1037,29 @@ impl BlockDocument {
         let mut doc = Self::new(&snapshot.document_id, &agent_id);
 
         let mut last_id: Option<BlockId> = None;
-        for block_snap in snapshot.blocks {
+        for block_snap in &snapshot.blocks {
             // Track max seq for our agent_id to avoid ID collisions
             if block_snap.id.agent_id == agent_id {
                 doc.next_seq = doc.next_seq.max(block_snap.id.seq + 1);
             }
 
-            let _ = doc.insert_block_with_id(
+            if doc.insert_block_with_id(
                 block_snap.id.clone(),
                 block_snap.parent_id.as_ref(),
                 last_id.as_ref(),
-                block_snap.role,
-                block_snap.kind,
-                block_snap.content,
-                block_snap.author,
-                block_snap.tool_name,
-                block_snap.tool_input,
-                block_snap.tool_call_id,
+                block_snap.role.clone(),
+                block_snap.kind.clone(),
+                block_snap.content.clone(),
+                block_snap.author.clone(),
+                block_snap.tool_name.clone(),
+                block_snap.tool_input.clone(),
+                block_snap.tool_call_id.clone(),
                 block_snap.exit_code,
                 block_snap.is_error,
-                block_snap.display_hint,
-            );
-            last_id = Some(block_snap.id);
+                block_snap.display_hint.clone(),
+            ).is_ok() {
+                last_id = Some(block_snap.id.clone());
+            }
         }
 
         doc.version = snapshot.version;

@@ -852,49 +852,12 @@ mod tests {
         )
         .unwrap();
 
-        // Debug: check what we're saving
-        let snapshot = doc.snapshot();
-        eprintln!("DEBUG: conv.id = {}", conv.id);
-        eprintln!("DEBUG: doc.document_id = {}", doc.document_id());
-        eprintln!("DEBUG: snapshot.document_id = {}", snapshot.document_id);
-        eprintln!("DEBUG: snapshot.blocks.len() = {}", snapshot.blocks.len());
-        for b in &snapshot.blocks {
-            eprintln!("DEBUG: block.id.document_id = {}", b.id.document_id);
-        }
-
         db.save(&conv, Some(&doc)).unwrap();
-
-        // Debug: check if blocks were saved
-        let count: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM blocks",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        eprintln!("DEBUG: blocks table count = {}", count);
-
-        let cell_ids: Vec<String> = {
-            let mut stmt = db.conn.prepare("SELECT DISTINCT cell_id FROM blocks").unwrap();
-            stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect()
-        };
-        eprintln!("DEBUG: distinct cell_ids in blocks = {:?}", cell_ids);
-
-        let conv_cell_id: Option<String> = db.conn.query_row(
-            "SELECT cell_id FROM conversations WHERE id = ?1",
-            params![&id],
-            |row| row.get(0),
-        ).ok();
-        eprintln!("DEBUG: conversation cell_id = {:?}", conv_cell_id);
-
-        // Load blocks directly to debug
-        let direct_blocks = db.load_blocks(&id).unwrap();
-        eprintln!("DEBUG: direct load_blocks count = {}", direct_blocks.len());
 
         // Load and verify
         let (_, loaded_doc) = db.load(&id).unwrap().unwrap();
-        eprintln!("DEBUG: loaded_doc is_some = {}", loaded_doc.is_some());
         let loaded_doc = loaded_doc.expect("document should exist");
         let blocks = loaded_doc.blocks_ordered();
-        eprintln!("DEBUG: loaded_doc.blocks_ordered().len() = {}", blocks.len());
         assert_eq!(blocks.len(), 2);
 
         let result = &blocks[1];
