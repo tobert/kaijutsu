@@ -2,11 +2,10 @@
 
 use bevy::prelude::*;
 use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::mouse::MouseButton;
-use bevy::ui::ComputedNode;
 
 use super::components::*;
-use crate::cell::{CellEditor, CurrentMode, MainCell};
+use crate::cell::{CellEditor, CurrentMode, MainCell, ViewingConversation};
+use crate::connection::bridge::{ConnectionCommands, ConnectionCommand, ConnectionEvent};
 
 // ============================================================================
 // VERSION SYNC
@@ -88,85 +87,8 @@ pub fn handle_timeline_keys(
 }
 
 // ============================================================================
-// MOUSE SCRUBBING
+// BLOCK VISIBILITY
 // ============================================================================
-
-/// Handle mouse interaction with the timeline scrubber.
-pub fn handle_timeline_mouse(
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
-    mut timeline: ResMut<TimelineState>,
-    track_query: Query<(&ComputedNode, &GlobalTransform), With<TimelineTrack>>,
-    window_query: Query<&Window>,
-) {
-    // Get cursor position
-    let Ok(window) = window_query.single() else {
-        return;
-    };
-    let Some(cursor_pos) = window.cursor_position() else {
-        return;
-    };
-
-    // Get track bounds
-    let Ok((computed_node, transform)) = track_query.single() else {
-        return;
-    };
-
-    let track_pos = transform.translation().truncate();
-    let track_size = computed_node.size();
-
-    // Check if cursor is within track bounds
-    let track_left = track_pos.x - track_size.x / 2.0;
-    let track_right = track_pos.x + track_size.x / 2.0;
-    let track_top = track_pos.y - track_size.y / 2.0;
-    let track_bottom = track_pos.y + track_size.y / 2.0;
-
-    let in_track = cursor_pos.x >= track_left
-        && cursor_pos.x <= track_right
-        && cursor_pos.y >= track_top
-        && cursor_pos.y <= track_bottom;
-
-    // Handle click/drag
-    if mouse_buttons.just_pressed(MouseButton::Left) && in_track {
-        let relative_x = (cursor_pos.x - track_left) / track_size.x;
-        timeline.begin_scrub(relative_x);
-    } else if mouse_buttons.pressed(MouseButton::Left) && timeline.scrubbing {
-        let relative_x = (cursor_pos.x - track_left) / track_size.x;
-        timeline.update_scrub(relative_x);
-    } else if mouse_buttons.just_released(MouseButton::Left) && timeline.scrubbing {
-        timeline.end_scrub();
-    }
-}
-
-// ============================================================================
-// UI UPDATES
-// ============================================================================
-
-/// Update the playhead position based on timeline state.
-pub fn update_playhead_position(
-    timeline: Res<TimelineState>,
-    mut playhead_query: Query<&mut Node, With<TimelinePlayhead>>,
-    track_query: Query<&ComputedNode, (With<TimelineTrack>, Without<TimelinePlayhead>)>,
-) {
-    let Ok(track_computed) = track_query.single() else {
-        return;
-    };
-    let track_width = track_computed.size().x;
-
-    for mut node in playhead_query.iter_mut() {
-        // Position playhead as percentage of track width
-        node.left = Val::Px(timeline.position * track_width);
-    }
-}
-
-/// Update the fill bar width based on timeline position.
-pub fn update_fill_width(
-    timeline: Res<TimelineState>,
-    mut fill_query: Query<&mut Node, With<TimelineFill>>,
-) {
-    for mut node in fill_query.iter_mut() {
-        node.width = Val::Percent(timeline.position * 100.0);
-    }
-}
 
 /// Update block visibility based on timeline position.
 ///
@@ -202,38 +124,6 @@ pub fn update_block_visibility(
 }
 
 // ============================================================================
-// BUTTON HANDLERS
-// ============================================================================
-
-/// Handle Fork button clicks.
-pub fn handle_fork_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<ForkButton>)>,
-    timeline: Res<TimelineState>,
-    mut fork_writer: MessageWriter<ForkRequest>,
-) {
-    for interaction in interactions.iter() {
-        if *interaction == Interaction::Pressed {
-            fork_writer.write(ForkRequest {
-                from_version: timeline.viewing_version,
-                name: None,
-            });
-        }
-    }
-}
-
-/// Handle Jump to Now button clicks.
-pub fn handle_jump_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<JumpToNowButton>)>,
-    mut timeline: ResMut<TimelineState>,
-) {
-    for interaction in interactions.iter() {
-        if *interaction == Interaction::Pressed {
-            timeline.jump_to_live();
-        }
-    }
-}
-
-// ============================================================================
 // FORK/CHERRY-PICK PROCESSING
 // ============================================================================
 
@@ -243,8 +133,8 @@ pub fn handle_jump_button(
 /// The actual forking happens server-side.
 pub fn process_fork_requests(
     mut fork_reader: MessageReader<ForkRequest>,
-    mut result_writer: MessageWriter<ForkResult>,
-    // TODO: Add RPC client connection
+    cmds: Res<ConnectionCommands>,
+    conversation_query: Query<&ViewingConversation, With<MainCell>>,
 ) {
     for request in fork_reader.read() {
         info!(
@@ -252,21 +142,48 @@ pub fn process_fork_requests(
             request.from_version, request.name
         );
 
-        // TODO: Send to server via RPC
-        // For now, emit a placeholder result
-        result_writer.write(ForkResult {
-            success: false,
-            context_id: None,
-            error: Some("Fork not yet implemented in RPC".to_string()),
+        // Get the current document ID from the conversation
+        let document_id = if let Ok(viewing) = conversation_query.single() {
+            viewing.conversation_id.clone()
+        } else {
+            warn!("No active conversation for fork");
+            continue;
+        };
+
+        // Generate context name if not provided
+        let context_name = request.name.clone().unwrap_or_else(|| {
+            format!("fork-v{}", request.from_version)
         });
+
+        // Send to server via connection bridge
+        cmds.send(ConnectionCommand::ForkDocument {
+            document_id,
+            version: request.from_version,
+            context_name,
+        });
+    }
+}
+
+/// Handle fork completion events from the connection bridge.
+pub fn handle_fork_complete(
+    mut events: MessageReader<ConnectionEvent>,
+    mut result_writer: MessageWriter<ForkResult>,
+) {
+    for event in events.read() {
+        if let ConnectionEvent::ForkComplete { success, context_name, error, .. } = event {
+            result_writer.write(ForkResult {
+                success: *success,
+                context_id: context_name.clone(),
+                error: error.clone(),
+            });
+        }
     }
 }
 
 /// Process cherry-pick requests.
 pub fn process_cherry_pick_requests(
     mut pick_reader: MessageReader<CherryPickRequest>,
-    mut result_writer: MessageWriter<CherryPickResult>,
-    // TODO: Add RPC client connection
+    cmds: Res<ConnectionCommands>,
 ) {
     for request in pick_reader.read() {
         info!(
@@ -274,12 +191,27 @@ pub fn process_cherry_pick_requests(
             request.block_id, request.target_context
         );
 
-        // TODO: Send to server via RPC
-        result_writer.write(CherryPickResult {
-            success: false,
-            new_block_id: None,
-            error: Some("Cherry-pick not yet implemented in RPC".to_string()),
+        // Send to server via connection bridge
+        cmds.send(ConnectionCommand::CherryPickBlock {
+            block_id: request.block_id.clone(),
+            target_context: request.target_context.clone(),
         });
+    }
+}
+
+/// Handle cherry-pick completion events from the connection bridge.
+pub fn handle_cherry_pick_complete(
+    mut events: MessageReader<ConnectionEvent>,
+    mut result_writer: MessageWriter<CherryPickResult>,
+) {
+    for event in events.read() {
+        if let ConnectionEvent::CherryPickComplete { success, new_block_id, error } = event {
+            result_writer.write(CherryPickResult {
+                success: *success,
+                new_block_id: new_block_id.clone(),
+                error: error.clone(),
+            });
+        }
     }
 }
 

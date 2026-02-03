@@ -180,43 +180,6 @@ pub struct CherryPickResult {
 }
 
 // ============================================================================
-// UI MARKERS
-// ============================================================================
-
-/// Marker for the timeline scrubber container.
-#[derive(Component)]
-pub struct TimelineScrubber;
-
-/// Marker for the timeline track (the draggable area).
-#[derive(Component)]
-pub struct TimelineTrack;
-
-/// Marker for the timeline position indicator (the "playhead").
-#[derive(Component)]
-pub struct TimelinePlayhead;
-
-/// Marker for the "filled" portion of the timeline (before playhead).
-#[derive(Component)]
-pub struct TimelineFill;
-
-/// Marker for the "Fork from here" button.
-#[derive(Component)]
-pub struct ForkButton;
-
-/// Marker for the "Jump to Now" button.
-#[derive(Component)]
-pub struct JumpToNowButton;
-
-/// Marker for a timeline tick mark (visual reference point).
-#[derive(Component)]
-pub struct TimelineTick {
-    /// Position along the timeline (0.0 to 1.0).
-    pub position: f32,
-    /// The version this tick represents.
-    pub version: u64,
-}
-
-// ============================================================================
 // BLOCK VISUAL STATE
 // ============================================================================
 
