@@ -1,50 +1,31 @@
 //! Conversation model for Kaijutsu.
 //!
-//! A conversation is a `BlockDocument` containing message blocks from multiple participants.
-//! Conversations can mount multiple resource kernels for access to files, repos, etc.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Conversation
-//!   ├── BlockDocument (messages as blocks)
-//!   │     └── Blocks with author attribution
-//!   ├── Participants (users and models)
-//!   └── Mounts (access to resource kernels)
-//! ```
+//! A conversation is metadata about a collaborative session with participants and mounts.
 //!
 //! # Example
 //!
 //! ```ignore
-//! let mut conv = Conversation::new("my-chat", "alice");
+//! let mut conv = Conversation::new("my-chat");
 //! conv.add_participant(Participant::user("user:amy", "Amy"));
 //! conv.add_participant(Participant::model("model:claude", "Claude", "anthropic", "claude-3-opus"));
-//!
-//! // Add a message as a user
-//! conv.add_text_message("user:amy", "Help me with this code");
-//!
-//! // Add a response as a model
-//! conv.add_thinking_message("model:claude", "Let me analyze this...");
-//! conv.add_text_message("model:claude", "I can help with that!");
 //! ```
 
-use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, Role};
 use serde::{Deserialize, Serialize};
 
-/// A conversation with participants and resource access.
+/// A conversation with participants and resource access (metadata only).
 ///
 /// Conversations are the primary collaboration primitive in Kaijutsu.
 /// They contain:
-/// - A `BlockDocument` holding all messages as CRDT-tracked blocks
 /// - A list of participants (users and models) who can contribute
 /// - Mounts providing access to resource kernels (worktrees, repos, etc.)
+///
+/// The actual message content is stored in a `BlockDocument` owned by the
+/// sync layer (DocumentSyncState on the client).
 pub struct Conversation {
     /// Unique identifier for this conversation.
     pub id: String,
     /// Human-readable name.
     pub name: String,
-    /// The message blocks (source of truth for content).
-    pub doc: BlockDocument,
     /// Participants in this conversation.
     pub participants: Vec<Participant>,
     /// Mounted resource kernels.
@@ -60,7 +41,6 @@ impl std::fmt::Debug for Conversation {
         f.debug_struct("Conversation")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("message_count", &self.doc.block_count())
             .field("participants", &self.participants.len())
             .field("mounts", &self.mounts.len())
             .field("created_at", &self.created_at)
@@ -70,10 +50,9 @@ impl std::fmt::Debug for Conversation {
 }
 
 impl Conversation {
-    /// Create a new conversation.
-    pub fn new(name: impl Into<String>, agent_id: impl Into<String>) -> Self {
+    /// Create a new conversation (metadata only).
+    pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
-        let agent_id = agent_id.into();
         let id = uuid::Uuid::new_v4().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -81,9 +60,8 @@ impl Conversation {
             .unwrap_or(0);
 
         Self {
-            id: id.clone(),
+            id,
             name,
-            doc: BlockDocument::new(&id, &agent_id),
             participants: Vec::new(),
             mounts: Vec::new(),
             created_at: now,
@@ -91,20 +69,18 @@ impl Conversation {
         }
     }
 
-    /// Create a conversation with a specific ID.
-    pub fn with_id(id: impl Into<String>, name: impl Into<String>, agent_id: impl Into<String>) -> Self {
+    /// Create a conversation with a specific ID (metadata only).
+    pub fn with_id(id: impl Into<String>, name: impl Into<String>) -> Self {
         let id = id.into();
         let name = name.into();
-        let agent_id = agent_id.into();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
         Self {
-            id: id.clone(),
+            id,
             name,
-            doc: BlockDocument::new(&id, &agent_id),
             participants: Vec::new(),
             mounts: Vec::new(),
             created_at: now,
@@ -165,106 +141,11 @@ impl Conversation {
     }
 
     // =========================================================================
-    // Messages
-    // =========================================================================
-
-    /// Add a text message to the conversation.
-    ///
-    /// The author must be a participant in the conversation.
-    pub fn add_text_message(&mut self, author: &str, text: impl Into<String>) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let role = if author.starts_with("user:") { Role::User } else { Role::Model };
-        let block_id = self.doc
-            .insert_block(None, last_id.as_ref(), role, BlockKind::Text, text, author)
-            .ok()?;
-        self.touch();
-        Some(block_id)
-    }
-
-    /// Add a thinking/reasoning block to the conversation.
-    pub fn add_thinking_message(&mut self, author: &str, text: impl Into<String>) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self.doc
-            .insert_block(None, last_id.as_ref(), Role::Model, BlockKind::Thinking, text, author)
-            .ok()?;
-        self.touch();
-        Some(block_id)
-    }
-
-    /// Add a tool call block to the conversation.
-    pub fn add_tool_call(
-        &mut self,
-        author: &str,
-        name: impl Into<String>,
-        input: serde_json::Value,
-    ) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self.doc
-            .insert_tool_call(None, last_id.as_ref(), name, input, author)
-            .ok()?;
-        self.touch();
-        Some(block_id)
-    }
-
-    /// Add a tool result block to the conversation.
-    ///
-    /// The tool_call_id should be the BlockId of the tool call this is a result for.
-    pub fn add_tool_result(
-        &mut self,
-        tool_call_id: &BlockId,
-        content: impl Into<String>,
-        is_error: bool,
-        exit_code: Option<i32>,
-        author: &str,
-    ) -> Option<BlockId> {
-        let last_id = self.doc.blocks_ordered().last().map(|b| b.id.clone());
-        let block_id = self.doc
-            .insert_tool_result_block(tool_call_id, last_id.as_ref(), content, is_error, exit_code, author)
-            .ok()?;
-        self.touch();
-        Some(block_id)
-    }
-
-    /// Append text to an existing block.
-    pub fn append_to_message(&mut self, block_id: &BlockId, text: &str) -> bool {
-        if self.doc.append_text(block_id, text).is_ok() {
-            self.touch();
-            true
-        } else {
-            false
-        }
-    }
-
-    // =========================================================================
-    // Accessors
-    // =========================================================================
-
-    /// Get the number of messages (blocks) in the conversation.
-    pub fn message_count(&self) -> usize {
-        self.doc.block_count()
-    }
-
-    /// Check if the conversation is empty.
-    pub fn is_empty(&self) -> bool {
-        self.doc.is_empty()
-    }
-
-    /// Get all messages in order.
-    pub fn messages(&self) -> Vec<kaijutsu_crdt::BlockSnapshot> {
-        self.doc.blocks_ordered()
-    }
-
-    /// Get the full text content of the conversation.
-    pub fn full_text(&self) -> String {
-        self.doc.full_text()
-    }
-
-    // =========================================================================
     // Internal
     // =========================================================================
 
     /// Update the updated_at timestamp.
-    fn touch(&mut self) {
+    pub fn touch(&mut self) {
         self.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -399,15 +280,14 @@ mod tests {
 
     #[test]
     fn test_conversation_creation() {
-        let conv = Conversation::new("Test Chat", "alice");
+        let conv = Conversation::new("Test Chat");
         assert_eq!(conv.name, "Test Chat");
-        assert!(conv.is_empty());
         assert!(conv.participants.is_empty());
     }
 
     #[test]
     fn test_participants() {
-        let mut conv = Conversation::new("Test", "alice");
+        let mut conv = Conversation::new("Test");
 
         let user = Participant::user("user:amy", "Amy");
         let model = Participant::model("model:claude", "Claude", "anthropic", "claude-3-opus");
@@ -429,33 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn test_messages() {
-        let mut conv = Conversation::new("Test", "alice");
-        conv.add_participant(Participant::user("user:amy", "Amy"));
-        conv.add_participant(Participant::model("model:claude", "Claude", "anthropic", "claude-3-opus"));
-
-        // Add messages
-        let user_msg = conv.add_text_message("user:amy", "Hello!");
-        assert!(user_msg.is_some());
-
-        let thinking = conv.add_thinking_message("model:claude", "Let me think...");
-        assert!(thinking.is_some());
-
-        let response = conv.add_text_message("model:claude", "Hi there!");
-        assert!(response.is_some());
-
-        assert_eq!(conv.message_count(), 3);
-
-        // Check authors
-        let messages = conv.messages();
-        assert_eq!(messages[0].author, "user:amy");
-        assert_eq!(messages[1].author, "model:claude");
-        assert_eq!(messages[2].author, "model:claude");
-    }
-
-    #[test]
     fn test_mounts() {
-        let mut conv = Conversation::new("Test", "alice");
+        let mut conv = Conversation::new("Test");
 
         conv.add_mount(Mount::read_only("kernel-123", "/project"));
         conv.add_mount(Mount::read_write("kernel-456", "/notes"));

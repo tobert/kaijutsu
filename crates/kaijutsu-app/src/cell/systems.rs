@@ -10,7 +10,7 @@ use super::components::{
     InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
-use crate::conversation::{ConversationRegistry, CurrentConversation};
+use crate::conversation::CurrentConversation;
 use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
 use crate::ui::format::format_for_display;
 use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
@@ -835,14 +835,11 @@ fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
 ///
 /// Note: We don't add messages locally - the server adds them and broadcasts
 /// back to us. This avoids duplicate messages.
-///
-/// IMPORTANT: Uses the conversation's document cell_id (not the registry ID)
-/// so that BlockInserted events from the server match our document's cell_id.
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
     mode: Res<CurrentMode>,
     current_conv: Res<CurrentConversation>,
-    registry: Res<ConversationRegistry>,
+    sync_state: Res<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
     cmds: Option<Res<crate::connection::ConnectionCommands>>,
 ) {
@@ -852,14 +849,13 @@ pub fn handle_prompt_submitted(
         return;
     };
 
-    // Get the conversation's document cell_id (not the registry ID)
-    // This is critical: the server sends BlockInserted events with the document's
-    // cell_id, and handle_block_events validates against editor.doc.cell_id()
-    let Some(conv) = registry.get(conv_id) else {
-        warn!("Conversation {} not in registry", conv_id);
+    // Get the document cell_id from sync state
+    // This ensures we use the same ID the server uses for BlockInserted events
+    let Some(ref doc) = sync_state.doc else {
+        warn!("No document in sync state");
         return;
     };
-    let doc_cell_id = conv.doc.document_id().to_string();
+    let doc_cell_id = doc.document_id().to_string();
 
     for event in submit_events.read() {
         if let Some(ref cmds) = cmds {
@@ -1461,23 +1457,23 @@ pub fn spawn_main_cell(
     info!("Spawned main kernel cell with id {:?}", cell_id.0);
 }
 
-/// Sync the MainCell's content with the current conversation.
+/// Sync the MainCell's content with DocumentSyncState.
 ///
 /// This system:
 /// 1. Checks if there's a current conversation
-/// 2. Checks if the conversation's version has changed
-/// 3. If changed, rebuilds the MainCell's BlockDocument from conversation blocks
+/// 2. Checks if the sync state's version has changed
+/// 3. If changed, rebuilds the MainCell's BlockDocument from sync state
 ///
-/// This provides a simple "copy on change" approach. More sophisticated CRDT
-/// sync can be added later for multi-user editing.
+/// DocumentSyncState owns the authoritative BlockDocument. This system
+/// copies that document to the MainCell's CellEditor for rendering.
 pub fn sync_main_cell_to_conversation(
     current_conv: Res<CurrentConversation>,
-    registry: Res<ConversationRegistry>,
+    sync_state: Res<super::components::DocumentSyncState>,
     main_entity: Res<MainCellEntity>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
 ) {
-    // Need both a current conversation and a main cell
+    // Need both a current conversation and sync state document
     let Some(conv_id) = current_conv.id() else {
         debug!("sync_main_cell: no current conversation");
         return;
@@ -1486,10 +1482,16 @@ pub fn sync_main_cell_to_conversation(
         debug!("sync_main_cell: no main cell entity");
         return;
     };
-    let Some(conv) = registry.get(conv_id) else {
-        debug!("sync_main_cell: conversation {} not in registry", conv_id);
+    let Some(ref source_doc) = sync_state.doc else {
+        debug!("sync_main_cell: no document in sync state");
         return;
     };
+
+    // Verify document ID matches
+    if source_doc.document_id() != conv_id {
+        debug!("sync_main_cell: document ID mismatch ({} vs {})", source_doc.document_id(), conv_id);
+        return;
+    }
 
     // Get the main cell's editor and viewing component
     let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
@@ -1497,26 +1499,22 @@ pub fn sync_main_cell_to_conversation(
         return;
     };
 
-    // Check if we need to sync
-    let conv_version = conv.doc.version();
+    // Check if we need to sync (version changed)
+    let sync_version = sync_state.version();
     let needs_sync = match viewing_opt {
         Some(ref viewing) => {
-            // Check if conversation changed or version advanced
-            viewing.conversation_id != conv_id || viewing.last_sync_version != conv_version
+            viewing.conversation_id != conv_id || viewing.last_sync_version != sync_version
         }
-        None => true, // No viewing component yet, need to initialize
+        None => true,
     };
 
     if !needs_sync {
         return;
     }
 
-    // Rebuild the editor's BlockDocument from the conversation
-    // This is a simple approach - replace the entire document
+    // Copy from authoritative source
     let agent_id = editor.doc.agent_id().to_string();
-    let snapshot = conv.doc.snapshot();
-
-    // Create new document from snapshot
+    let snapshot = source_doc.snapshot();
     let new_doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, &agent_id);
     editor.doc = new_doc;
 
@@ -1530,19 +1528,19 @@ pub fn sync_main_cell_to_conversation(
     match viewing_opt {
         Some(mut viewing) => {
             viewing.conversation_id = conv_id.to_string();
-            viewing.last_sync_version = conv_version;
+            viewing.last_sync_version = sync_version;
         }
         None => {
             commands.entity(entity).insert(ViewingConversation {
                 conversation_id: conv_id.to_string(),
-                last_sync_version: conv_version,
+                last_sync_version: sync_version,
             });
         }
     }
 
     info!(
         "Synced MainCell to conversation {} (version {})",
-        conv_id, conv_version
+        conv_id, sync_version
     );
 }
 
@@ -1567,86 +1565,43 @@ use crate::connection::ConnectionEvent;
 /// read history, we don't interrupt them.
 pub fn handle_block_events(
     mut events: MessageReader<ConnectionEvent>,
-    mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
     layout_gen: Res<super::components::LayoutGeneration>,
     current_conv: Res<CurrentConversation>,
-    mut registry: ResMut<ConversationRegistry>,
 ) {
-    let Ok(mut editor) = main_cells.single_mut() else {
-        return;
-    };
-
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
 
+    // Get agent ID for creating documents
+    let agent_id = format!("user:{}", whoami::username());
+
     for event in events.read() {
         match event {
-            // Initial state from server - apply to conversation registry
-            // sync_main_cell_to_conversation will then copy to MainCell
+            // Initial state from server - single path through DocumentSyncState
             ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
-                // Update the conversation in the registry (authoritative source)
-                // NOTE: This system must run after DashboardEventHandling (see cell/plugin.rs)
-                // so that SeatTaken has already created the conversation.
-                if let Some(conv_id) = current_conv.id() {
-                    if let Some(conv) = registry.get_mut(conv_id) {
-                        let agent_id = conv.doc.agent_id().to_string();
-                        match kaijutsu_crdt::BlockDocument::from_oplog(
-                            cell_id.clone(),
-                            &agent_id,
-                            ops,
-                        ) {
-                            Ok(new_doc) => {
-                                info!(
-                                    "Applied initial state to conversation {}: {} blocks",
-                                    conv_id,
-                                    new_doc.block_count()
-                                );
-                                conv.doc = new_doc;
-                            }
-                            Err(e) => {
-                                warn!("Failed to apply initial state to conversation: {}", e);
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "BlockCellInitialState: conversation {} not found in registry",
-                            conv_id
-                        );
-                    }
-                } else {
+                if current_conv.id().is_none() {
                     warn!(
                         "BlockCellInitialState arrived but no current conversation set. \
                          This indicates a system ordering bug - handle_block_events should \
                          run after DashboardEventHandling."
                     );
+                    continue;
                 }
-                // Also update sync state frontier for incremental ops
-                match sync_state.apply_initial_state(&mut editor.doc, cell_id, ops) {
+
+                match sync_state.apply_initial_state(cell_id, &agent_id, ops) {
                     Ok(result) => {
-                        trace!("Initial state sync result: {:?}", result);
+                        info!("Initial state sync result: {:?}", result);
                     }
                     Err(e) => {
-                        trace!("Initial state sync error: {}", e);
+                        error!("Initial state sync error: {}", e);
                     }
                 }
             }
 
-            // Block insertion - apply to conversation and sync state
+            // Block insertion - single path through DocumentSyncState
             ConnectionEvent::BlockInserted { cell_id, block, ops } => {
-                // Update conversation registry (deserialize ops for CRDT merge)
-                if let Some(conv_id) = current_conv.id() {
-                    if let Some(conv) = registry.get_mut(conv_id) {
-                        if let Ok(serialized_ops) = serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
-                            if let Err(e) = conv.doc.merge_ops_owned(serialized_ops) {
-                                warn!("Failed to merge block insert ops to conversation: {}", e);
-                            }
-                        }
-                    }
-                }
-                // Update sync state
-                match sync_state.apply_block_inserted(&mut editor.doc, cell_id, block, ops) {
+                match sync_state.apply_block_inserted(cell_id, &agent_id, block, ops) {
                     Ok(result) => {
                         trace!("Block insert sync result for {:?}: {:?}", block.id, result);
                     }
@@ -1656,24 +1611,13 @@ pub fn handle_block_events(
                 }
             }
 
-            // Text streaming ops - apply to conversation and sync state
+            // Text streaming ops - single path through DocumentSyncState
             ConnectionEvent::BlockTextOps {
                 cell_id,
                 block_id,
                 ops,
             } => {
-                // Update conversation registry (deserialize ops for CRDT merge)
-                if let Some(conv_id) = current_conv.id() {
-                    if let Some(conv) = registry.get_mut(conv_id) {
-                        if let Ok(serialized_ops) = serde_json::from_slice::<kaijutsu_crdt::SerializedOpsOwned>(ops) {
-                            if let Err(e) = conv.doc.merge_ops_owned(serialized_ops) {
-                                warn!("Failed to merge text ops to conversation: {}", e);
-                            }
-                        }
-                    }
-                }
-                // Update sync state
-                match sync_state.apply_text_ops(&mut editor.doc, cell_id, ops) {
+                match sync_state.apply_text_ops(cell_id, &agent_id, ops) {
                     Ok(result) => {
                         trace!("Text ops sync result for {:?}: {:?}", block_id, result);
                     }
@@ -1683,18 +1627,16 @@ pub fn handle_block_events(
                 }
             }
 
-            // Non-CRDT events stay in the system (no sync state changes)
+            // Non-CRDT events - operate on sync_state.doc
             ConnectionEvent::BlockStatusChanged {
                 cell_id,
                 block_id,
                 status,
             } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.document_id() {
-                    continue;
-                }
+                let Some(ref mut doc) = sync_state.doc else { continue; };
+                if cell_id != doc.document_id() { continue; }
 
-                if let Err(e) = editor.doc.set_status(block_id, *status) {
+                if let Err(e) = doc.set_status(block_id, *status) {
                     warn!("Failed to update block status: {}", e);
                 }
             }
@@ -1702,12 +1644,10 @@ pub fn handle_block_events(
                 cell_id,
                 block_id,
             } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.document_id() {
-                    continue;
-                }
+                let Some(ref mut doc) = sync_state.doc else { continue; };
+                if cell_id != doc.document_id() { continue; }
 
-                if let Err(e) = editor.doc.delete_block(block_id) {
+                if let Err(e) = doc.delete_block(block_id) {
                     warn!("Failed to delete block: {}", e);
                 }
             }
@@ -1716,12 +1656,10 @@ pub fn handle_block_events(
                 block_id,
                 collapsed,
             } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.document_id() {
-                    continue;
-                }
+                let Some(ref mut doc) = sync_state.doc else { continue; };
+                if cell_id != doc.document_id() { continue; }
 
-                if let Err(e) = editor.doc.set_collapsed(block_id, *collapsed) {
+                if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
                     warn!("Failed to update block collapsed state: {}", e);
                 }
             }
@@ -1730,12 +1668,10 @@ pub fn handle_block_events(
                 block_id,
                 after_id,
             } => {
-                // Validate cell ID matches our document
-                if cell_id != editor.doc.document_id() {
-                    continue;
-                }
+                let Some(ref mut doc) = sync_state.doc else { continue; };
+                if cell_id != doc.document_id() { continue; }
 
-                if let Err(e) = editor.doc.move_block(block_id, after_id.as_ref()) {
+                if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
                     warn!("Failed to move block: {}", e);
                 }
             }
@@ -2141,8 +2077,6 @@ pub fn layout_block_cells(
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     _shadow_height: Res<InputShadowHeight>, // Used only in apply_block_cell_positions now
-    registry: Res<ConversationRegistry>,
-    current: Res<CurrentConversation>,
     font_system: Res<SharedFontSystem>,
     mut metrics_cache: ResMut<FontMetricsCache>,
     windows: Query<&Window>,
@@ -2216,7 +2150,6 @@ pub fn layout_block_cells(
     }
 
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
-    let _ = (&current, &registry); // suppress unused warnings
 
     for entity in &container.block_cells {
         let Ok((block_cell, mut block_layout, mut buffer)) = block_cells.get_mut(*entity) else {

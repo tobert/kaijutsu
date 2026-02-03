@@ -19,7 +19,6 @@ pub mod seat_selector;
 
 use bevy::prelude::*;
 use kaijutsu_client::{Context, KernelInfo, SeatInfo};
-use tracing::trace;
 
 use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
 use crate::shaders::nine_slice::ChasingBorder;
@@ -207,31 +206,16 @@ fn handle_dashboard_events(
             ConnectionEvent::SeatTaken { seat } => {
                 state.current_seat = Some(seat.clone());
 
-                // NOTE: We no longer reset sync_state here.
-                // BlockCellInitialState event (sent after SeatTaken) sets up the document
-                // from full oplog and establishes the frontier for incremental sync.
-
                 // Derive document_id from kernel and context
-                // This ensures the client uses the same document_id the server uses for BlockInserted events
                 let document_id = format!("{}@{}", seat.id.kernel, seat.id.context);
 
-                // Idempotency: Only create conversation if it doesn't already exist.
-                // Duplicate SeatTaken events (e.g., from dialog input leak) must NOT
-                // reset CRDT state, or incremental ops will fail with DataMissing.
+                // Create conversation metadata if it doesn't exist (idempotent)
                 if registry.get(&document_id).is_none() {
-                    let agent_id = format!("user:{}", whoami::username());
-
-                    // Create conversation using the server-provided document_id
-                    // (with_id uses the ID for BlockDocument::new which sets document_id)
-                    let conv = kaijutsu_kernel::Conversation::with_id(
-                        &document_id,  // becomes both conversation ID and doc document_id
-                        &document_id,  // name (display)
-                        &agent_id,
-                    );
+                    // Conversation is metadata-only now (no BlockDocument)
+                    // BlockCellInitialState event will set up DocumentSyncState with the document
+                    let conv = kaijutsu_kernel::Conversation::with_id(&document_id, &document_id);
                     registry.add(conv);
-                    info!("Created conversation for document {}", document_id);
-                } else {
-                    trace!("SeatTaken for existing conversation {}, skipping creation", document_id);
+                    info!("Created conversation metadata for {}", document_id);
                 }
 
                 current_conv.0 = Some(document_id.clone());

@@ -510,29 +510,116 @@ pub struct BlockEditCursor {
     pub offset: usize,
 }
 
-/// Resource tracking CRDT sync state for frontier-based incremental updates.
+/// Resource tracking CRDT sync state and owning the authoritative BlockDocument.
 ///
-/// This is a thin wrapper around [`SyncManager`](super::sync::SyncManager) that
-/// integrates with Bevy ECS. The actual sync logic is in SyncManager, which can
-/// be unit tested without Bevy dependencies.
+/// This is the **single source of truth** for conversation document state.
+/// It integrates SyncManager's frontier-tracking with document ownership,
+/// eliminating the dual-path sync issues between ConversationRegistry and sync state.
 ///
 /// **Sync protocol:**
-/// - `frontier = None` or `cell_id` changed → full sync (from_oplog)
-/// - `frontier = Some(_)` and matching cell_id → incremental merge (merge_ops_owned)
+/// - `doc = None` or `document_id` changed → full sync (from_oplog)
+/// - `doc = Some(_)` and matching document_id → incremental merge (merge_ops_owned)
+///
+/// The sync manager handles frontier tracking internally. Systems should use
+/// the convenience methods on this resource rather than accessing the manager directly.
 #[derive(Resource, Default)]
-pub struct DocumentSyncState(pub super::sync::SyncManager);
-
-impl std::ops::Deref for DocumentSyncState {
-    type Target = super::sync::SyncManager;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub struct DocumentSyncState {
+    /// The authoritative document (None until first sync).
+    pub doc: Option<BlockDocument>,
+    /// Sync manager for frontier tracking.
+    manager: super::sync::SyncManager,
 }
 
-impl std::ops::DerefMut for DocumentSyncState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+#[allow(dead_code)]
+impl DocumentSyncState {
+    /// Create a new DocumentSyncState with no document.
+    pub fn new() -> Self {
+        Self {
+            doc: None,
+            manager: super::sync::SyncManager::new(),
+        }
+    }
+
+    /// Get the version counter (bumped on every successful sync).
+    pub fn version(&self) -> u64 {
+        self.manager.version()
+    }
+
+    /// Check if we need a full sync for the given document.
+    pub fn needs_full_sync(&self, document_id: &str) -> bool {
+        self.doc.is_none() || self.manager.needs_full_sync(document_id)
+    }
+
+    /// Get the current document_id (for testing/debugging).
+    pub fn document_id(&self) -> Option<&str> {
+        self.manager.document_id()
+    }
+
+    /// Apply initial state from server (BlockCellInitialState event).
+    ///
+    /// Always performs a full sync from the provided oplog.
+    /// Creates the BlockDocument if it doesn't exist.
+    pub fn apply_initial_state(
+        &mut self,
+        document_id: &str,
+        agent_id: &str,
+        oplog_bytes: &[u8],
+    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+        // Create document if needed, or get existing
+        let doc = self.doc.get_or_insert_with(|| {
+            BlockDocument::new(document_id, agent_id)
+        });
+        self.manager.apply_initial_state(doc, document_id, oplog_bytes)
+    }
+
+    /// Apply a block insertion event (BlockInserted).
+    ///
+    /// Decision logic:
+    /// - If block already exists → skip (idempotent)
+    /// - If needs_full_sync → rebuild from oplog
+    /// - Otherwise → incremental merge
+    pub fn apply_block_inserted(
+        &mut self,
+        document_id: &str,
+        agent_id: &str,
+        block: &BlockSnapshot,
+        ops: &[u8],
+    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+        let doc = self.doc.get_or_insert_with(|| {
+            BlockDocument::new(document_id, agent_id)
+        });
+        self.manager.apply_block_inserted(doc, document_id, block, ops)
+    }
+
+    /// Apply text ops event (BlockTextOps).
+    ///
+    /// Always attempts incremental merge (text streaming).
+    /// On failure, resets frontier to trigger full sync on next block event.
+    pub fn apply_text_ops(
+        &mut self,
+        document_id: &str,
+        agent_id: &str,
+        ops: &[u8],
+    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+        let doc = self.doc.get_or_insert_with(|| {
+            BlockDocument::new(document_id, agent_id)
+        });
+        self.manager.apply_text_ops(doc, document_id, ops)
+    }
+
+    /// Reset sync state, forcing full sync on next event.
+    ///
+    /// This clears the document and resets the sync manager.
+    /// Use when switching conversations or recovering from errors.
+    pub fn reset(&mut self) {
+        self.doc = None;
+        self.manager.reset();
+    }
+
+    /// Get a reference to the underlying sync manager (for testing/debugging).
+    #[allow(dead_code)]
+    pub fn manager(&self) -> &super::sync::SyncManager {
+        &self.manager
     }
 }
 

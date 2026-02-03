@@ -232,11 +232,19 @@ impl ConversationDb {
     // Conversation CRUD
     // =========================================================================
 
-    /// Save a conversation (insert or replace).
-    pub fn save(&self, conv: &Conversation) -> SqliteResult<()> {
-        let snapshot = conv.doc.snapshot();
-        let cell_id = snapshot.document_id.clone();
-        let version = snapshot.version;
+    /// Save a conversation with its document (insert or replace).
+    ///
+    /// The document is optional - if None, only metadata is saved and existing
+    /// blocks are preserved.
+    pub fn save(&self, conv: &Conversation, doc: Option<&BlockDocument>) -> SqliteResult<()> {
+        // Get cell_id and version from document, or use conversation id as fallback
+        let (cell_id, version) = match doc {
+            Some(d) => {
+                let snapshot = d.snapshot();
+                (snapshot.document_id.clone(), snapshot.version)
+            }
+            None => (conv.id.clone(), 0),
+        };
 
         // Use a transaction for atomicity
         let tx = self.conn.unchecked_transaction()?;
@@ -255,13 +263,16 @@ impl ConversationDb {
             ],
         )?;
 
-        // Delete existing blocks for this cell_id (cascade handles extension tables)
-        tx.execute("DELETE FROM blocks WHERE cell_id = ?1", params![cell_id])?;
+        // Save blocks only if document is provided
+        if let Some(d) = doc {
+            // Delete existing blocks for this cell_id (cascade handles extension tables)
+            tx.execute("DELETE FROM blocks WHERE cell_id = ?1", params![cell_id])?;
 
-        // Insert each block with order index
-        let blocks = snapshot.blocks;
-        for (order_idx, block) in blocks.iter().enumerate() {
-            self.save_block(&tx, block, order_idx)?;
+            // Insert each block with order index
+            let snapshot = d.snapshot();
+            for (order_idx, block) in snapshot.blocks.iter().enumerate() {
+                self.save_block(&tx, block, order_idx)?;
+            }
         }
 
         // Delete existing participants and mounts (we'll reinsert)
@@ -396,8 +407,10 @@ impl ConversationDb {
         Ok(())
     }
 
-    /// Load a conversation by ID.
-    pub fn load(&self, id: &str) -> SqliteResult<Option<Conversation>> {
+    /// Load a conversation and its document by ID.
+    ///
+    /// Returns the conversation metadata and optionally the document (if blocks exist).
+    pub fn load(&self, id: &str) -> SqliteResult<Option<(Conversation, Option<BlockDocument>)>> {
         // Load conversation metadata
         let mut stmt = self.conn.prepare(
             "SELECT id, name, cell_id, version, created_at, updated_at
@@ -416,14 +429,18 @@ impl ConversationDb {
         let created_at: i64 = row.get(4)?;
         let updated_at: i64 = row.get(5)?;
 
-        // Load blocks and reconstruct document
+        // Load blocks and reconstruct document if any exist
         let blocks = self.load_blocks(&cell_id)?;
-        let snapshot = DocumentSnapshot {
-            document_id: cell_id,
-            blocks,
-            version: version as u64,
+        let doc = if blocks.is_empty() {
+            None
+        } else {
+            let snapshot = DocumentSnapshot {
+                document_id: cell_id,
+                blocks,
+                version: version as u64,
+            };
+            Some(BlockDocument::from_snapshot(snapshot, "server"))
         };
-        let doc = BlockDocument::from_snapshot(snapshot, "server");
 
         // Load participants
         let participants = self.load_participants(&conv_id)?;
@@ -431,15 +448,16 @@ impl ConversationDb {
         // Load mounts
         let mounts = self.load_mounts(&conv_id)?;
 
-        Ok(Some(Conversation {
+        let conv = Conversation {
             id: conv_id,
             name,
-            doc,
             participants,
             mounts,
             created_at: created_at as u64,
             updated_at: updated_at as u64,
-        }))
+        };
+
+        Ok(Some((conv, doc)))
     }
 
     /// Load all blocks for a cell_id, ordered by order_idx.
@@ -604,7 +622,7 @@ impl ConversationDb {
     }
 
     /// Load all conversations (ordered by updated_at descending).
-    pub fn load_all(&self) -> SqliteResult<Vec<Conversation>> {
+    pub fn load_all(&self) -> SqliteResult<Vec<(Conversation, Option<BlockDocument>)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM conversations ORDER BY updated_at DESC")?;
@@ -616,8 +634,8 @@ impl ConversationDb {
 
         let mut conversations = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(conv) = self.load(&id)? {
-                conversations.push(conv);
+            if let Some(result) = self.load(&id)? {
+                conversations.push(result);
             }
         }
 
@@ -666,12 +684,20 @@ impl ConversationDb {
 mod tests {
     use super::*;
 
+    /// Helper: create a document with some messages.
+    fn create_test_doc(doc_id: &str) -> BlockDocument {
+        let mut doc = BlockDocument::new(doc_id, "test-agent");
+        doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!", "user:amy")
+            .unwrap();
+        doc
+    }
+
     #[test]
     fn test_save_and_load() {
         let db = ConversationDb::in_memory().unwrap();
 
-        // Create a conversation
-        let mut conv = Conversation::new("Test Chat", "alice");
+        // Create a conversation with participants
+        let mut conv = Conversation::new("Test Chat");
         conv.add_participant(Participant::user("user:amy", "Amy"));
         conv.add_participant(Participant::model(
             "model:claude",
@@ -679,25 +705,30 @@ mod tests {
             "anthropic",
             "claude-3-opus",
         ));
-        conv.add_text_message("user:amy", "Hello!");
 
         let id = conv.id.clone();
 
+        // Create a document with a message
+        let doc = create_test_doc(&id);
+
         // Save
-        db.save(&conv).unwrap();
+        db.save(&conv, Some(&doc)).unwrap();
 
         // Load
-        let loaded = db.load(&id).unwrap().unwrap();
-        assert_eq!(loaded.name, "Test Chat");
-        assert_eq!(loaded.message_count(), 1);
-        assert_eq!(loaded.participants.len(), 2);
+        let (loaded_conv, loaded_doc) = db.load(&id).unwrap().unwrap();
+        assert_eq!(loaded_conv.name, "Test Chat");
+        assert_eq!(loaded_conv.participants.len(), 2);
+
+        // Verify document was loaded
+        let loaded_doc = loaded_doc.expect("document should exist");
+        assert_eq!(loaded_doc.block_count(), 1);
 
         // Verify participant details
-        let amy = loaded.get_participant("user:amy").unwrap();
+        let amy = loaded_conv.get_participant("user:amy").unwrap();
         assert_eq!(amy.display_name, "Amy");
         assert!(amy.is_user());
 
-        let claude = loaded.get_participant("model:claude").unwrap();
+        let claude = loaded_conv.get_participant("model:claude").unwrap();
         assert_eq!(claude.display_name, "Claude");
         assert!(claude.is_model());
     }
@@ -706,10 +737,10 @@ mod tests {
     fn test_load_all() {
         let db = ConversationDb::in_memory().unwrap();
 
-        // Create multiple conversations
+        // Create multiple conversations (metadata only)
         for i in 0..3 {
-            let conv = Conversation::new(format!("Chat {}", i), "alice");
-            db.save(&conv).unwrap();
+            let conv = Conversation::new(format!("Chat {}", i));
+            db.save(&conv, None).unwrap();
         }
 
         let all = db.load_all().unwrap();
@@ -720,9 +751,9 @@ mod tests {
     fn test_delete() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let conv = Conversation::new("To Delete", "alice");
+        let conv = Conversation::new("To Delete");
         let id = conv.id.clone();
-        db.save(&conv).unwrap();
+        db.save(&conv, None).unwrap();
 
         assert!(db.exists(&id).unwrap());
         db.delete(&id).unwrap();
@@ -733,39 +764,41 @@ mod tests {
     fn test_update() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("Original", "alice");
+        let mut conv = Conversation::new("Original");
         let id = conv.id.clone();
-        db.save(&conv).unwrap();
+        db.save(&conv, None).unwrap();
 
-        // Update the conversation
+        // Update the conversation name
         conv.name = "Updated".to_string();
-        conv.add_text_message("alice", "New message");
-        db.save(&conv).unwrap();
 
-        let loaded = db.load(&id).unwrap().unwrap();
-        assert_eq!(loaded.name, "Updated");
-        assert_eq!(loaded.message_count(), 1);
+        // Create a document with a message
+        let doc = create_test_doc(&id);
+        db.save(&conv, Some(&doc)).unwrap();
+
+        let (loaded_conv, loaded_doc) = db.load(&id).unwrap().unwrap();
+        assert_eq!(loaded_conv.name, "Updated");
+        assert_eq!(loaded_doc.unwrap().block_count(), 1);
     }
 
     #[test]
     fn test_mounts() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("With Mounts", "alice");
+        let mut conv = Conversation::new("With Mounts");
         conv.add_mount(Mount::read_only("kernel-1", "/project"));
         conv.add_mount(Mount::read_write("kernel-2", "/scratch"));
 
         let id = conv.id.clone();
-        db.save(&conv).unwrap();
+        db.save(&conv, None).unwrap();
 
-        let loaded = db.load(&id).unwrap().unwrap();
-        assert_eq!(loaded.mounts.len(), 2);
+        let (loaded_conv, _) = db.load(&id).unwrap().unwrap();
+        assert_eq!(loaded_conv.mounts.len(), 2);
 
-        let project = loaded.get_mount("/project").unwrap();
+        let project = loaded_conv.get_mount("/project").unwrap();
         assert_eq!(project.kernel_id, "kernel-1");
         assert_eq!(project.access, AccessLevel::Read);
 
-        let scratch = loaded.get_mount("/scratch").unwrap();
+        let scratch = loaded_conv.get_mount("/scratch").unwrap();
         assert_eq!(scratch.access, AccessLevel::ReadWrite);
     }
 
@@ -773,28 +806,24 @@ mod tests {
     fn test_tool_call_persistence() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("Tool Test", "alice");
-        conv.add_participant(Participant::model(
-            "model:claude",
-            "Claude",
-            "anthropic",
-            "claude-3-opus",
-        ));
-
-        // Add a tool call
-        let tool_input = serde_json::json!({"path": "/etc/hosts", "recursive": true});
-        let call_id = conv.add_tool_call("model:claude", "read_file", tool_input.clone());
-        assert!(call_id.is_some());
-
+        let conv = Conversation::new("Tool Test");
         let id = conv.id.clone();
-        db.save(&conv).unwrap();
+
+        // Create document with a tool call
+        let mut doc = BlockDocument::new(&id, "test-agent");
+        let tool_input = serde_json::json!({"path": "/etc/hosts", "recursive": true});
+        doc.insert_tool_call(None, None, "read_file", tool_input.clone(), "model:claude")
+            .unwrap();
+
+        db.save(&conv, Some(&doc)).unwrap();
 
         // Load and verify
-        let loaded = db.load(&id).unwrap().unwrap();
-        let messages = loaded.messages();
-        assert_eq!(messages.len(), 1);
+        let (_, loaded_doc) = db.load(&id).unwrap().unwrap();
+        let loaded_doc = loaded_doc.expect("document should exist");
+        let blocks = loaded_doc.blocks_ordered();
+        assert_eq!(blocks.len(), 1);
 
-        let block = &messages[0];
+        let block = &blocks[0];
         assert_eq!(block.kind, BlockKind::ToolCall);
         assert_eq!(block.tool_name, Some("read_file".to_string()));
         assert_eq!(block.tool_input, Some(tool_input));
@@ -804,37 +833,71 @@ mod tests {
     fn test_tool_result_persistence() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("Tool Result Test", "alice");
-        conv.add_participant(Participant::model(
-            "model:claude",
-            "Claude",
-            "anthropic",
-            "claude-3-opus",
-        ));
+        let conv = Conversation::new("Tool Result Test");
+        let id = conv.id.clone();
 
-        // Add a tool call and result
+        // Create document with tool call and result
+        let mut doc = BlockDocument::new(&id, "test-agent");
         let tool_input = serde_json::json!({"command": "ls -la"});
-        let call_id = conv
-            .add_tool_call("model:claude", "bash", tool_input)
+        let call_id = doc
+            .insert_tool_call(None, None, "bash", tool_input, "model:claude")
             .unwrap();
-        let result_id = conv.add_tool_result(
+        doc.insert_tool_result_block(
             &call_id,
+            None,
             "total 4\ndrwxr-xr-x 2 user user 4096 Jan 1 00:00 .",
             false,
             Some(0),
             "system",
-        );
-        assert!(result_id.is_some());
+        )
+        .unwrap();
 
-        let id = conv.id.clone();
-        db.save(&conv).unwrap();
+        // Debug: check what we're saving
+        let snapshot = doc.snapshot();
+        eprintln!("DEBUG: conv.id = {}", conv.id);
+        eprintln!("DEBUG: doc.document_id = {}", doc.document_id());
+        eprintln!("DEBUG: snapshot.document_id = {}", snapshot.document_id);
+        eprintln!("DEBUG: snapshot.blocks.len() = {}", snapshot.blocks.len());
+        for b in &snapshot.blocks {
+            eprintln!("DEBUG: block.id.document_id = {}", b.id.document_id);
+        }
+
+        db.save(&conv, Some(&doc)).unwrap();
+
+        // Debug: check if blocks were saved
+        let count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM blocks",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        eprintln!("DEBUG: blocks table count = {}", count);
+
+        let cell_ids: Vec<String> = {
+            let mut stmt = db.conn.prepare("SELECT DISTINCT cell_id FROM blocks").unwrap();
+            stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+        };
+        eprintln!("DEBUG: distinct cell_ids in blocks = {:?}", cell_ids);
+
+        let conv_cell_id: Option<String> = db.conn.query_row(
+            "SELECT cell_id FROM conversations WHERE id = ?1",
+            params![&id],
+            |row| row.get(0),
+        ).ok();
+        eprintln!("DEBUG: conversation cell_id = {:?}", conv_cell_id);
+
+        // Load blocks directly to debug
+        let direct_blocks = db.load_blocks(&id).unwrap();
+        eprintln!("DEBUG: direct load_blocks count = {}", direct_blocks.len());
 
         // Load and verify
-        let loaded = db.load(&id).unwrap().unwrap();
-        let messages = loaded.messages();
-        assert_eq!(messages.len(), 2);
+        let (_, loaded_doc) = db.load(&id).unwrap().unwrap();
+        eprintln!("DEBUG: loaded_doc is_some = {}", loaded_doc.is_some());
+        let loaded_doc = loaded_doc.expect("document should exist");
+        let blocks = loaded_doc.blocks_ordered();
+        eprintln!("DEBUG: loaded_doc.blocks_ordered().len() = {}", blocks.len());
+        assert_eq!(blocks.len(), 2);
 
-        let result = &messages[1];
+        let result = &blocks[1];
         assert_eq!(result.kind, BlockKind::ToolResult);
         assert_eq!(result.tool_call_id, Some(call_id));
         assert_eq!(result.exit_code, Some(0));
@@ -845,35 +908,33 @@ mod tests {
     fn test_tool_result_with_error() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("Error Test", "alice");
-        conv.add_participant(Participant::model(
-            "model:claude",
-            "Claude",
-            "anthropic",
-            "claude-3-opus",
-        ));
+        let conv = Conversation::new("Error Test");
+        let id = conv.id.clone();
 
-        // Add a tool call and error result
+        // Create document with tool call and error result
+        let mut doc = BlockDocument::new(&id, "test-agent");
         let tool_input = serde_json::json!({"command": "cat /nonexistent"});
-        let call_id = conv
-            .add_tool_call("model:claude", "bash", tool_input)
+        let call_id = doc
+            .insert_tool_call(None, None, "bash", tool_input, "model:claude")
             .unwrap();
-        conv.add_tool_result(
+        doc.insert_tool_result_block(
             &call_id,
+            None,
             "cat: /nonexistent: No such file or directory",
             true,
             Some(1),
             "system",
-        );
+        )
+        .unwrap();
 
-        let id = conv.id.clone();
-        db.save(&conv).unwrap();
+        db.save(&conv, Some(&doc)).unwrap();
 
         // Load and verify
-        let loaded = db.load(&id).unwrap().unwrap();
-        let messages = loaded.messages();
+        let (_, loaded_doc) = db.load(&id).unwrap().unwrap();
+        let loaded_doc = loaded_doc.expect("document should exist");
+        let blocks = loaded_doc.blocks_ordered();
 
-        let result = &messages[1];
+        let result = &blocks[1];
         assert_eq!(result.kind, BlockKind::ToolResult);
         assert!(result.is_error);
         assert_eq!(result.exit_code, Some(1));
@@ -883,20 +944,29 @@ mod tests {
     fn test_multiple_blocks_ordering() {
         let db = ConversationDb::in_memory().unwrap();
 
-        let mut conv = Conversation::new("Ordering Test", "alice");
-        conv.add_text_message("user:amy", "First");
-        conv.add_text_message("model:claude", "Second");
-        conv.add_text_message("user:amy", "Third");
-
+        let conv = Conversation::new("Ordering Test");
         let id = conv.id.clone();
-        db.save(&conv).unwrap();
+
+        // Create document with multiple blocks
+        let mut doc = BlockDocument::new(&id, "test-agent");
+        doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "user:amy")
+            .unwrap();
+        let last = doc.blocks_ordered().last().map(|b| b.id.clone());
+        doc.insert_block(None, last.as_ref(), Role::Model, BlockKind::Text, "Second", "model:claude")
+            .unwrap();
+        let last = doc.blocks_ordered().last().map(|b| b.id.clone());
+        doc.insert_block(None, last.as_ref(), Role::User, BlockKind::Text, "Third", "user:amy")
+            .unwrap();
+
+        db.save(&conv, Some(&doc)).unwrap();
 
         // Load and verify order
-        let loaded = db.load(&id).unwrap().unwrap();
-        let messages = loaded.messages();
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].content, "First");
-        assert_eq!(messages[1].content, "Second");
-        assert_eq!(messages[2].content, "Third");
+        let (_, loaded_doc) = db.load(&id).unwrap().unwrap();
+        let loaded_doc = loaded_doc.expect("document should exist");
+        let blocks = loaded_doc.blocks_ordered();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].content, "First");
+        assert_eq!(blocks[1].content, "Second");
+        assert_eq!(blocks[2].content, "Third");
     }
 }

@@ -34,9 +34,11 @@ pub struct ConversationStore {
 
 impl ConversationStore {
     /// Save a conversation to the database.
-    pub fn save(&self, conv: &Conversation) {
+    ///
+    /// The document is optional - if None, only metadata is saved.
+    pub fn save(&self, conv: &Conversation, doc: Option<&kaijutsu_crdt::BlockDocument>) {
         if let Ok(db) = self.db.lock()
-            && let Err(e) = db.save(conv) {
+            && let Err(e) = db.save(conv, doc) {
                 error!("Failed to save conversation {}: {}", conv.id, e);
             }
     }
@@ -104,9 +106,9 @@ fn load_or_create_conversations(
     if let Some(ref store) = store
         && let Ok(db) = store.db.lock() {
             match db.load_all() {
-                Ok(conversations) if !conversations.is_empty() => {
-                    info!("Loaded {} conversations from database", conversations.len());
-                    for conv in conversations {
+                Ok(loaded) if !loaded.is_empty() => {
+                    info!("Loaded {} conversations from database", loaded.len());
+                    for (conv, _doc) in loaded {
                         let id = conv.id.clone();
                         registry.add(conv);
                         // Set the first (most recent) as current
@@ -125,15 +127,15 @@ fn load_or_create_conversations(
             }
         }
 
-    // Create a default conversation
-    let mut conv = Conversation::new("Main", &agent_id);
+    // Create a default conversation (metadata only)
+    let mut conv = Conversation::new("Main");
     conv.add_participant(kaijutsu_kernel::Participant::user(&agent_id, &display_name));
 
     let conv_id = conv.id.clone();
 
-    // Save to database
+    // Save to database (no document yet)
     if let Some(ref store) = store {
-        store.save(&conv);
+        store.save(&conv, None);
     }
 
     registry.add(conv);

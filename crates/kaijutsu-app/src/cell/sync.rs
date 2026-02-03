@@ -81,6 +81,8 @@ pub struct SyncManager {
     frontier: Option<Vec<LV>>,
     /// Document ID we're synced to. Change triggers full sync.
     document_id: Option<String>,
+    /// Version counter for change detection (bumped on every successful sync).
+    version: u64,
 }
 
 #[allow(dead_code)]
@@ -90,12 +92,13 @@ impl SyncManager {
         Self {
             frontier: None,
             document_id: None,
+            version: 0,
         }
     }
 
     /// Create a SyncManager with existing state (for testing/migration).
     pub fn with_state(document_id: Option<String>, frontier: Option<Vec<LV>>) -> Self {
-        Self { frontier, document_id }
+        Self { frontier, document_id, version: 0 }
     }
 
     /// Check if we need a full sync for the given document.
@@ -115,6 +118,11 @@ impl SyncManager {
     /// Get the current document_id (for testing/debugging).
     pub fn document_id(&self) -> Option<&str> {
         self.document_id.as_deref()
+    }
+
+    /// Get the version counter (bumped on every successful sync).
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Reset sync state, forcing full sync on next event.
@@ -154,6 +162,7 @@ impl SyncManager {
                 // Update sync state with frontier
                 self.frontier = Some(new_doc.frontier());
                 self.document_id = Some(document_id.to_string());
+                self.version = self.version.wrapping_add(1);
 
                 // Replace the document
                 *doc = new_doc;
@@ -295,6 +304,7 @@ impl SyncManager {
                 // Update sync state with new frontier
                 self.frontier = Some(new_doc.frontier());
                 self.document_id = Some(document_id.to_string());
+                self.version = self.version.wrapping_add(1);
 
                 // Replace the document
                 *doc = new_doc;
@@ -341,6 +351,7 @@ impl SyncManager {
             Ok(()) => {
                 // Update frontier after merge
                 self.frontier = Some(doc.frontier());
+                self.version = self.version.wrapping_add(1);
                 trace!(
                     "Incremental merge for block {:?}, new frontier={:?}",
                     block_id,
