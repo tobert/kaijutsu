@@ -27,3 +27,4 @@ pub use components::{
     FocusedBlockCell, InputKind, MainCell,
 };
 pub use plugin::CellPlugin;
+// CellPhase is pub in plugin.rs but not re-exported - use cell::plugin::CellPhase if needed

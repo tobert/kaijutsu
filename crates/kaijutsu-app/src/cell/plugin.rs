@@ -2,6 +2,35 @@
 
 use bevy::prelude::*;
 
+// ============================================================================
+// SYSTEM SETS - Execution Phases
+// ============================================================================
+
+/// SystemSets for organizing cell systems into execution phases.
+///
+/// These replace the fragile 40+ `.after()` chains with proper set-based ordering.
+/// Systems within a set can still use internal `.after()` for fine-grained ordering.
+///
+/// Execution order:
+/// 1. **Input** - Mode switching, key handling, click-to-focus
+/// 2. **Sync** - Server events (BlockInserted, etc.), document sync
+/// 3. **Spawn** - Entity spawning + ApplyDeferred command flush
+/// 4. **Buffer** - Text buffer init/sync, highlighting
+/// 5. **Layout** - Measure heights, scroll, position entities
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CellPhase {
+    /// Mode switching, key handling, click-to-focus
+    Input,
+    /// Server events, document sync
+    Sync,
+    /// Entity spawning + ApplyDeferred
+    Spawn,
+    /// Text buffer init/sync
+    Buffer,
+    /// Measure, scroll, position
+    Layout,
+}
+
 use super::components::{
     BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
     BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
@@ -12,7 +41,7 @@ use super::components::{
 use super::frame_assembly;
 use super::systems;
 use crate::dashboard::DashboardEventHandling;
-use crate::ui::state::{InputDock, InputPosition, InputPresence, InputShadowHeight};
+use crate::ui::state::InputPresence;
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -46,6 +75,18 @@ impl Plugin for CellPlugin {
             .register_type::<BubbleSpawnContext>()
             .register_type::<BubbleConfig>();
 
+        // Configure SystemSet execution order
+        app.configure_sets(
+            Update,
+            (
+                CellPhase::Input,
+                CellPhase::Sync.after(CellPhase::Input),
+                CellPhase::Spawn.after(CellPhase::Sync),
+                CellPhase::Buffer.after(CellPhase::Spawn),
+                CellPhase::Layout.after(CellPhase::Buffer),
+            ),
+        );
+
         app.init_resource::<FocusedCell>()
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
@@ -57,226 +98,160 @@ impl Plugin for CellPlugin {
             .init_resource::<systems::ConsumedModeKeys>()
             .init_resource::<systems::MainCellEntity>()
             .init_resource::<systems::ExpandedBlockEntity>()
-            // Input area state resources
+            // Input presence resource (still used by mode switching and frame visibility)
             .init_resource::<InputPresence>()
-            .init_resource::<InputDock>()
-            .init_resource::<InputPosition>()
-            .init_resource::<InputShadowHeight>()
             // Bubble system resources
             .init_resource::<BubbleRegistry>()
-            .init_resource::<BubbleConfig>()
-            // Input and mode handling (mode_switch must run before cell_input)
-            // Block edit mode intercepts `i` when a BlockCell is focused
-            .add_systems(
-                Update,
-                (
-                    // Clear consumed keys at start of frame before any input handling
-                    systems::clear_consumed_keys,
-                    // Block edit mode must run BEFORE mode_switch to intercept `i`
-                    // when a BlockCell is focused
-                    systems::handle_block_edit_mode
-                        .after(systems::clear_consumed_keys)
-                        .before(systems::handle_mode_switch),
-                    systems::handle_mode_switch
-                        .after(systems::clear_consumed_keys),
-                    // Block cell input runs before compose block to handle editing blocks
-                    systems::handle_block_cell_input
-                        .after(systems::handle_block_edit_mode),
-                    systems::click_to_focus,
-                ),
-            )
-            // Main cell management
-            .add_systems(
-                Update,
-                (
-                    systems::spawn_main_cell,
-                    systems::handle_prompt_submitted,
-                    systems::sync_main_cell_to_conversation
-                        .after(systems::handle_prompt_submitted),
-                    // Block navigation (j/k) runs before scroll_input
-                    systems::navigate_blocks
-                        .after(systems::sync_main_cell_to_conversation),
-                    // Expand block with `f` key
-                    systems::handle_expand_block
-                        .after(systems::navigate_blocks),
-                    // Pop ViewStack with Esc (before mode switch handles Esc)
-                    systems::handle_view_pop
-                        .before(systems::handle_mode_switch),
-                    // scroll_input sets target, but smooth_scroll must run AFTER layout
-                    // (layout updates content_height, smooth_scroll depends on it)
-                    systems::handle_scroll_input
-                        .after(systems::navigate_blocks),
-                ),
-            )
-            // Layout and rendering for cells
-            // NOTE: MainCell no longer uses legacy rendering - BlockCell system handles it
-            .add_systems(
-                Update,
-                (
-                    systems::init_cell_buffers,
-                    systems::compute_cell_heights,
-                    systems::sync_cell_buffers
-                        .after(systems::init_cell_buffers)
-                        .after(systems::sync_main_cell_to_conversation),
-                    systems::highlight_focused_cell,
-                ),
-            )
-            // Block event handling (server → client sync)
-            // Receives block events from the server and updates the Conversation registry.
-            // Must run:
-            // - AFTER DashboardEventHandling so SeatTaken creates conversation first
-            // - BEFORE sync_main_cell_to_conversation so sync sees updated version
-            .add_systems(
-                Update,
-                systems::handle_block_events
-                    .after(DashboardEventHandling)
-                    .before(systems::sync_main_cell_to_conversation),
-            )
-            // Block cell systems (per-block UI rendering for conversation)
-            // Each block gets its own entity with independent GlyphonTextBuffer
-            //
-            // Critical ordering for smooth scroll:
-            //   1. layout_block_cells → computes heights, updates content_height
-            //   2. smooth_scroll → updates offset using new content_height
-            //   3. apply_block_cell_positions → positions blocks using new offset
-            // Block cell systems with explicit command flush between spawn and init.
-            // spawn_block_cells uses deferred commands, so we need ApplyDeferred
-            // before init_block_cell_buffers can see the new entities.
-            .add_systems(
-                Update,
-                (
-                    systems::spawn_block_cells
-                        .after(systems::handle_block_events)
-                        .after(systems::sync_main_cell_to_conversation),
-                    systems::sync_role_headers
-                        .after(systems::spawn_block_cells),
-                    ApplyDeferred
-                        .after(systems::sync_role_headers),
-                    systems::init_block_cell_buffers
-                        .after(ApplyDeferred),
-                    systems::init_role_header_buffers
-                        .after(ApplyDeferred),
-                    systems::sync_block_cell_buffers
-                        .after(systems::init_block_cell_buffers)
-                        .after(systems::init_role_header_buffers)
-                        .after(systems::handle_cell_input),
-                    // Highlight focused block (overrides color set by sync_block_cell_buffers)
-                    systems::highlight_focused_block
-                        .after(systems::sync_block_cell_buffers),
-                    systems::layout_block_cells
-                        .after(systems::highlight_focused_block),
-                    systems::smooth_scroll
-                        .after(systems::layout_block_cells),
-                    systems::apply_block_cell_positions
-                        .after(systems::smooth_scroll),
-                ),
-            )
-            // NOTE: Turn header systems removed in DAG migration.
-            // Role transitions are now computed inline in layout_block_cells.
-            // See systems.rs for details on the new role-based layout.
-            // Collapse/expand for thinking blocks
-            .add_systems(
-                Update,
+            .init_resource::<BubbleConfig>();
+
+        // ====================================================================
+        // CellPhase::Input - Mode switching, key handling, click-to-focus
+        // ====================================================================
+        app.add_systems(
+            Update,
+            (
+                // Clear consumed keys at start of frame before any input handling
+                systems::clear_consumed_keys,
+                // Block edit mode must run BEFORE mode_switch to intercept `i`
+                // when a BlockCell is focused
+                systems::handle_block_edit_mode
+                    .after(systems::clear_consumed_keys)
+                    .before(systems::handle_mode_switch),
+                systems::handle_mode_switch.after(systems::clear_consumed_keys),
+                // Block cell input runs after block edit mode
+                systems::handle_block_cell_input.after(systems::handle_block_edit_mode),
+                // Compose block input runs after mode switch
+                systems::handle_compose_block_input.after(systems::handle_mode_switch),
+                // Click to focus
+                systems::click_to_focus,
+                // Collapse/expand for thinking blocks (Tab in Normal mode)
                 systems::handle_collapse_toggle,
+                // Pop ViewStack with Esc (before mode switch handles Esc)
+                systems::handle_view_pop.before(systems::handle_mode_switch),
+                // Mobile bubble input systems
+                systems::handle_bubble_spawn
+                    .after(systems::clear_consumed_keys)
+                    .before(systems::handle_mode_switch),
+                systems::handle_bubble_navigation
+                    .after(systems::handle_bubble_spawn)
+                    .before(systems::handle_mode_switch),
+                systems::handle_bubble_input
+                    .after(systems::handle_mode_switch)
+                    .before(systems::handle_cell_input),
+                systems::handle_bubble_submit.after(systems::handle_bubble_input),
             )
-            // Expanded block view (Phase 4)
-            .add_systems(
-                Update,
-                (
-                    systems::spawn_expanded_block_view,
-                    systems::sync_expanded_block_content
-                        .after(systems::spawn_expanded_block_view),
-                ),
+                .in_set(CellPhase::Input),
+        );
+
+        // ====================================================================
+        // CellPhase::Sync - Server events, document sync
+        // ====================================================================
+        app.add_systems(
+            Update,
+            (
+                // Block event handling (server → client sync)
+                // Must run AFTER DashboardEventHandling so SeatTaken creates conversation first
+                systems::handle_block_events.after(DashboardEventHandling),
+                // Handle prompt submission
+                systems::handle_prompt_submitted,
+                // Sync main cell to conversation (after both block events and prompt submission)
+                systems::sync_main_cell_to_conversation
+                    .after(systems::handle_block_events)
+                    .after(systems::handle_prompt_submitted),
+                // Block navigation (j/k) after sync
+                systems::navigate_blocks.after(systems::sync_main_cell_to_conversation),
+                // Expand block with `f` key
+                systems::handle_expand_block.after(systems::navigate_blocks),
+                // Scroll input after navigation
+                systems::handle_scroll_input.after(systems::navigate_blocks),
             )
-            // Compose block systems (inline input at bottom of conversation)
-            .add_systems(
-                Update,
-                (
-                    systems::init_compose_block_buffer,
-                    systems::handle_compose_block_input
-                        .after(systems::handle_mode_switch),
-                    systems::sync_compose_block_buffer
-                        .after(systems::handle_compose_block_input),
-                    // Position compose block after Bevy's UI layout runs
-                    systems::position_compose_block
-                        .after(bevy::ui::UiSystems::Prepare)
-                        .after(systems::sync_compose_block_buffer),
-                ),
+                .in_set(CellPhase::Sync),
+        );
+
+        // ====================================================================
+        // CellPhase::Spawn - Entity spawning + ApplyDeferred
+        // ====================================================================
+        app.add_systems(
+            Update,
+            (
+                // Main cell spawning
+                systems::spawn_main_cell,
+                // Block cell spawning (after sync)
+                systems::spawn_block_cells,
+                // Role header sync (after block cells)
+                systems::sync_role_headers.after(systems::spawn_block_cells),
+                // Expanded block view spawning
+                systems::spawn_expanded_block_view,
+                // Cursor spawning
+                systems::spawn_cursor,
+                // ApplyDeferred to flush spawn commands
+                ApplyDeferred.after(systems::sync_role_headers),
             )
-            // Mobile input bubble systems
-            // These enable floating CRDT-backed input bubbles that can be stashed/recalled
-            .add_systems(
-                Update,
-                (
-                    // Spawn: Space in Normal mode creates/recalls bubble
-                    systems::handle_bubble_spawn
-                        .after(systems::clear_consumed_keys)
-                        .before(systems::handle_mode_switch),
-                    // Navigation: Tab cycles stashed, Esc stashes active
-                    systems::handle_bubble_navigation
-                        .after(systems::handle_bubble_spawn)
-                        .before(systems::handle_mode_switch),
-                    // Input: Route keyboard to active bubble
-                    systems::handle_bubble_input
-                        .after(systems::handle_mode_switch)
-                        .before(systems::handle_cell_input),
-                    // Submit: Enter sends content
-                    systems::handle_bubble_submit
-                        .after(systems::handle_bubble_input),
-                ),
+                .in_set(CellPhase::Spawn),
+        );
+
+        // ====================================================================
+        // CellPhase::Buffer - Text buffer init/sync, highlighting
+        // ====================================================================
+        app.add_systems(
+            Update,
+            (
+                // Cell buffer init and sync
+                systems::init_cell_buffers,
+                systems::sync_cell_buffers.after(systems::init_cell_buffers),
+                systems::compute_cell_heights,
+                // Block cell buffer init and sync
+                systems::init_block_cell_buffers,
+                systems::init_role_header_buffers,
+                systems::sync_block_cell_buffers
+                    .after(systems::init_block_cell_buffers)
+                    .after(systems::init_role_header_buffers),
+                // Compose block buffer init and sync
+                systems::init_compose_block_buffer,
+                systems::sync_compose_block_buffer.after(systems::init_compose_block_buffer),
+                // Expanded block content sync
+                systems::sync_expanded_block_content,
+                // Bubble buffer init and sync
+                systems::init_bubble_buffers,
+                systems::sync_bubble_buffers.after(systems::init_bubble_buffers),
+                // Highlighting (after buffer sync)
+                systems::highlight_focused_cell.after(systems::sync_cell_buffers),
+                systems::highlight_focused_block.after(systems::sync_block_cell_buffers),
             )
-            // Bubble rendering systems
-            .add_systems(
-                Update,
-                (
-                    systems::init_bubble_buffers,
-                    systems::sync_bubble_buffers
-                        .after(systems::init_bubble_buffers)
-                        .after(systems::handle_bubble_input),
-                    systems::layout_bubble_position
-                        .after(systems::sync_bubble_buffers),
-                    systems::update_bubble_cursor
-                        .after(systems::layout_bubble_position)
-                        .after(systems::update_cursor),
-                    systems::sync_bubble_visibility
-                        .after(systems::layout_bubble_position),
-                ),
+                .in_set(CellPhase::Buffer),
+        );
+
+        // ====================================================================
+        // CellPhase::Layout - Measure heights, scroll, position entities
+        // ====================================================================
+        app.add_systems(
+            Update,
+            (
+                // Block cell layout (computes heights, updates content_height)
+                systems::layout_block_cells,
+                // Smooth scroll (uses content_height from layout)
+                systems::smooth_scroll.after(systems::layout_block_cells),
+                // Apply positions (uses scroll offset)
+                systems::apply_block_cell_positions.after(systems::smooth_scroll),
+                // Compose block positioning (after Bevy's UI layout)
+                systems::position_compose_block.after(bevy::ui::UiSystems::Prepare),
+                // Cursor positioning
+                systems::update_cursor,
+                systems::update_block_edit_cursor.after(systems::update_cursor),
+                // Bubble layout and cursor
+                systems::layout_bubble_position,
+                systems::update_bubble_cursor
+                    .after(systems::layout_bubble_position)
+                    .after(systems::update_cursor),
+                systems::sync_bubble_visibility.after(systems::layout_bubble_position),
+                // 9-slice frame layout
+                frame_assembly::spawn_nine_slice_frames,
+                frame_assembly::layout_nine_slice_frames,
+                frame_assembly::update_nine_slice_state,
+                frame_assembly::sync_frame_visibility,
+                frame_assembly::cleanup_nine_slice_frames,
             )
-            // 9-slice frame system
-            .add_systems(
-                Update,
-                (
-                    frame_assembly::spawn_nine_slice_frames,
-                    frame_assembly::layout_nine_slice_frames,
-                    frame_assembly::update_nine_slice_state,
-                    frame_assembly::sync_frame_visibility,
-                    frame_assembly::cleanup_nine_slice_frames,
-                ),
-            )
-            // Cursor
-            // update_cursor handles cursor for ComposeBlock and focused cells
-            // update_block_edit_cursor handles cursor when editing a BlockCell
-            .add_systems(
-                Update,
-                (
-                    systems::spawn_cursor,
-                    systems::update_cursor,
-                    // Block edit cursor overrides normal cursor when editing a block
-                    systems::update_block_edit_cursor
-                        .after(systems::update_cursor),
-                ),
-            )
-            // Input area positioning and visibility (legacy - being replaced by ComposeBlock)
-            .add_systems(
-                Update,
-                (
-                    systems::sync_presence_with_screen,
-                    systems::compute_input_position.after(systems::sync_presence_with_screen),
-                    systems::sync_input_layer_visibility.after(systems::compute_input_position),
-                    systems::sync_backdrop_visibility.after(systems::compute_input_position),
-                    systems::apply_input_position.after(systems::compute_input_position),
-                    systems::sync_input_shadow_height.after(systems::sync_presence_with_screen),
-                ),
-            );
+                .in_set(CellPhase::Layout),
+        );
     }
 }

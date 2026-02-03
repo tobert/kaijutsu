@@ -13,7 +13,7 @@ use super::components::{
 use crate::conversation::CurrentConversation;
 use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
 use crate::ui::format::format_for_display;
-use crate::ui::state::{AppScreen, InputPosition, InputShadowHeight};
+use crate::ui::state::{AppScreen, InputPresence, InputPresenceKind};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -2076,7 +2076,7 @@ pub fn layout_block_cells(
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    _shadow_height: Res<InputShadowHeight>, // Used only in apply_block_cell_positions now
+    // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
     font_system: Res<SharedFontSystem>,
     mut metrics_cache: ResMut<FontMetricsCache>,
     windows: Query<&Window>,
@@ -2218,7 +2218,7 @@ pub fn apply_block_cell_positions(
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    shadow_height: Res<InputShadowHeight>,
+    // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
     windows: Query<&Window>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
@@ -2253,9 +2253,9 @@ pub fn apply_block_cell_positions(
         .map(|w| (w.resolution.width(), w.resolution.height()))
         .unwrap_or((1280.0, 800.0));
 
-    // Visible area (use shadow_height, 0 when minimized)
+    // Visible area (ComposeBlock is inline, no legacy shadow height)
     let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - shadow_height.0 - STATUS_BAR_HEIGHT;
+    let visible_bottom = window_height - STATUS_BAR_HEIGHT;
     let visible_height = (visible_bottom - visible_top).max(100.0); // Ensure positive
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
@@ -2328,194 +2328,9 @@ pub fn apply_block_cell_positions(
 // TODO: Implement inline role header rendering in BlockCell format_single_block
 // or as a separate UI element spawned alongside BlockCells.
 
-// ============================================================================
-// INPUT AREA POSITION SYSTEMS
-// ============================================================================
-
-use crate::ui::state::{
-    InputBackdrop, InputDock, InputFrame, InputLayer, InputPresence,
-    InputPresenceKind, InputShadow,
-};
-
-/// Compute the input position based on presence, dock, and window size.
-///
-/// This is the single source of truth for input area positioning.
-/// Runs whenever presence, dock, or window changes.
-pub fn compute_input_position(
-    presence: Res<InputPresence>,
-    dock: Res<InputDock>,
-    theme: Res<Theme>,
-    window: Query<&Window>,
-    mut pos: ResMut<InputPosition>,
-) {
-    // Only recompute when relevant resources change
-    if !presence.is_changed() && !dock.is_changed() && !theme.is_changed() {
-        // Window size changes need to be checked
-        // (Query change detection handles this implicitly)
-    }
-
-    let Ok(win) = window.single() else {
-        return;
-    };
-
-    let win_width = win.width();
-    let win_height = win.height();
-
-    match presence.0 {
-        InputPresenceKind::Overlay => {
-            // Centered, 60% width (from theme), content-height
-            let width = win_width * theme.input_overlay_width_pct;
-            pos.x = (win_width - width) * 0.5;
-            pos.y = win_height * 0.3; // Upper-center
-            pos.width = width;
-            pos.height = theme.input_docked_height * 1.2; // Slightly taller in overlay
-            pos.show_backdrop = true;
-            pos.show_frame = true;
-        }
-        InputPresenceKind::Docked => {
-            // InputDockKind::Bottom - full-width at bottom
-            let _ = dock; // Acknowledge dock for future variants
-            pos.x = 0.0;
-            pos.y = win_height - theme.input_docked_height;
-            pos.width = win_width;
-            pos.height = theme.input_docked_height;
-            pos.show_backdrop = false;
-            pos.show_frame = true;
-        }
-        InputPresenceKind::Minimized => {
-            // Full-width thin line at bottom
-            pos.x = 0.0;
-            pos.y = win_height - theme.input_minimized_height;
-            pos.width = win_width;
-            pos.height = theme.input_minimized_height;
-            pos.show_backdrop = false;
-            pos.show_frame = false;
-        }
-        InputPresenceKind::Hidden => {
-            pos.height = 0.0;
-            pos.show_backdrop = false;
-            pos.show_frame = false;
-        }
-    }
-}
-
-/// Sync InputLayer visibility based on InputPresence.
-///
-/// The InputLayer is visible when presence is Docked or Overlay.
-/// It's hidden when Minimized (only shadow line shows) or Hidden (dashboard).
-pub fn sync_input_layer_visibility(
-    presence: Res<InputPresence>,
-    mut layer_query: Query<&mut Visibility, With<InputLayer>>,
-) {
-    if !presence.is_changed() {
-        return;
-    }
-
-    let target = if presence.is_visible() {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
-
-    for mut vis in layer_query.iter_mut() {
-        *vis = target;
-    }
-}
-
-/// Sync InputBackdrop visibility based on InputPresence.
-///
-/// The backdrop is only visible in Overlay mode.
-pub fn sync_backdrop_visibility(
-    presence: Res<InputPresence>,
-    mut backdrop_query: Query<&mut Visibility, With<InputBackdrop>>,
-) {
-    if !presence.is_changed() {
-        return;
-    }
-
-    let target = if presence.shows_backdrop() {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
-
-    for mut vis in backdrop_query.iter_mut() {
-        *vis = target;
-    }
-}
-
-/// Apply computed InputPosition to the InputFrame node.
-///
-/// Updates the InputFrame's position and size based on InputPosition.
-pub fn apply_input_position(
-    pos: Res<InputPosition>,
-    mut frame_query: Query<(&mut Node, &mut Visibility), With<InputFrame>>,
-) {
-    if !pos.is_changed() {
-        return;
-    }
-
-    for (mut node, mut vis) in frame_query.iter_mut() {
-        // Update position and size
-        node.left = Val::Px(pos.x);
-        node.top = Val::Px(pos.y);
-        node.width = Val::Px(pos.width);
-        node.height = Val::Px(pos.height);
-
-        // Frame visibility based on show_frame flag
-        *vis = if pos.show_frame {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-    }
-}
-
-/// Sync InputShadow height based on presence.
-///
-/// When docked, the shadow reserves full docked height.
-/// When minimized/hidden, it's just the line height.
-pub fn sync_input_shadow_height(
-    presence: Res<InputPresence>,
-    theme: Res<Theme>,
-    mut shadow_query: Query<&mut Node, With<InputShadow>>,
-    mut shadow_height: ResMut<InputShadowHeight>,
-) {
-    if !presence.is_changed() && !theme.is_changed() {
-        return;
-    }
-
-    let new_height = match presence.0 {
-        InputPresenceKind::Docked => theme.input_docked_height,
-        InputPresenceKind::Overlay => 0.0,   // Overlay floats, no space reserved
-        InputPresenceKind::Minimized => 0.0, // Hidden completely
-        InputPresenceKind::Hidden => 0.0,
-    };
-
-    shadow_height.0 = new_height;
-
-    for mut node in shadow_query.iter_mut() {
-        node.min_height = Val::Px(new_height);
-        node.height = Val::Px(new_height);
-    }
-}
-
-/// Sync InputPresence with AppScreen state.
-///
-/// InputPresence is kept Hidden - the legacy input layer is no longer used.
-/// ComposeBlock handles input inline within the conversation flow.
-pub fn sync_presence_with_screen(
-    screen: Res<State<AppScreen>>,
-    mut presence: ResMut<InputPresence>,
-) {
-    if !screen.is_changed() {
-        return;
-    }
-
-    // Keep presence Hidden always - ComposeBlock handles input inline
-    // The legacy InputLayer and floating prompt have been removed
-    presence.0 = InputPresenceKind::Hidden;
-}
+// NOTE: Legacy input area position systems have been removed.
+// The InputLayer, InputFrame, and floating prompt are replaced by ComposeBlock.
+// InputPresence is still used by frame_assembly::sync_frame_visibility but kept Hidden.
 
 // ============================================================================
 // BLOCK CELL EDITING SYSTEMS (Unified Edit Model)

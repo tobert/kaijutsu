@@ -40,6 +40,7 @@ impl ConversationRegistry {
     }
 
     /// Get a mutable conversation by ID.
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Conversation> {
         self.conversations.get_mut(id)
     }
