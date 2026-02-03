@@ -34,8 +34,8 @@ pub enum CellPhase {
 use super::components::{
     BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
     BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
-    ConversationContainer, ConversationFocus, ConversationScrollState, CurrentMode,
-    DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell,
+    ConversationContainer, ConversationScrollState, CurrentMode,
+    DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
     PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
@@ -64,7 +64,7 @@ impl Plugin for CellPlugin {
             .register_type::<ViewingConversation>()
             .register_type::<CellPosition>()
             .register_type::<CellState>()
-            .register_type::<FocusedCell>()
+            .register_type::<FocusTarget>()
             .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
@@ -87,17 +87,14 @@ impl Plugin for CellPlugin {
             ),
         );
 
-        app.init_resource::<FocusedCell>()
+        app.init_resource::<FocusTarget>()
             .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
-            .init_resource::<ConversationFocus>()
             .init_resource::<LayoutGeneration>()
             .init_resource::<DocumentSyncState>()
-            .init_resource::<systems::CursorEntity>()
+            .init_resource::<systems::EditorEntities>()
             .init_resource::<systems::ConsumedModeKeys>()
-            .init_resource::<systems::MainCellEntity>()
-            .init_resource::<systems::ExpandedBlockEntity>()
             // Input presence resource (still used by mode switching and frame visibility)
             .init_resource::<InputPresence>()
             // Bubble system resources

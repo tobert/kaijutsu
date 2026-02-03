@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use super::{Cell, CurrentMode, EditorMode, FocusedCell};
+use super::{Cell, CurrentMode, EditorMode, FocusTarget};
 use crate::shaders::nine_slice::{
     CornerMarker, CornerMaterial, CornerPosition, EdgeMarker, EdgeMaterial, EdgePosition,
 };
@@ -159,7 +159,7 @@ pub fn layout_nine_slice_frames(
 
 /// Updates frame colors/params based on focus and mode state.
 pub fn update_nine_slice_state(
-    focused: Res<FocusedCell>,
+    focus: Res<FocusTarget>,
     mode: Res<CurrentMode>,
     cells: Query<(Entity, &NineSliceFrame, &Cell)>,
     theme: Res<Theme>,
@@ -168,12 +168,12 @@ pub fn update_nine_slice_state(
     corner_entities: Query<&MaterialNode<CornerMaterial>>,
     edge_entities: Query<&MaterialNode<EdgeMaterial>>,
 ) {
-    if !focused.is_changed() && !mode.is_changed() {
+    if !focus.is_changed() && !mode.is_changed() {
         return;
     }
 
     for (entity, frame, _cell) in cells.iter() {
-        let is_focused = focused.0 == Some(entity);
+        let is_focused = focus.entity == Some(entity);
 
         let frame_color = if !is_focused {
             theme.frame_unfocused

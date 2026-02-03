@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusedCell,
+    ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusTarget,
     InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
@@ -207,7 +207,7 @@ pub fn handle_mode_switch(
 /// This system handles input for CellEditor-based entities like BlockCells in edit mode.
 pub fn handle_cell_input(
     mut key_events: MessageReader<KeyboardInput>,
-    focused: Res<FocusedCell>,
+    focus: Res<FocusTarget>,
     mode: Res<CurrentMode>,
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     consumed: Res<ConsumedModeKeys>,
@@ -219,7 +219,7 @@ pub fn handle_cell_input(
         return;
     }
 
-    let Some(focused_entity) = focused.0 else {
+    let Some(focused_entity) = focus.entity else {
         return;
     };
 
@@ -491,7 +491,7 @@ pub fn compute_cell_heights(
 
 /// Visual indication for focused cell.
 pub fn highlight_focused_cell(
-    focused: Res<FocusedCell>,
+    focus: Res<FocusTarget>,
     mut cells: Query<(Entity, &mut MsdfTextAreaConfig), With<Cell>>,
     theme: Option<Res<crate::ui::theme::Theme>>,
 ) {
@@ -501,7 +501,7 @@ pub fn highlight_focused_cell(
     };
 
     for (entity, mut config) in cells.iter_mut() {
-        let color = if Some(entity) == focused.0 {
+        let color = if Some(entity) == focus.entity {
             theme.accent // Brighter for focused
         } else {
             theme.fg_dim
@@ -515,7 +515,7 @@ pub fn highlight_focused_cell(
 /// FUTURE: This system will evolve to support threaded conversations:
 /// - Clicking a BlockCell could focus it for reply (input follows focus)
 /// - Input area might "attach" to the focused block or move on-screen
-/// - Consider: FocusedCell vs ActiveThread vs ReplyTarget as separate concepts
+/// - Consider: FocusTarget.entity vs ActiveThread vs ReplyTarget as separate concepts
 ///
 /// For now: Any cell with MsdfTextAreaConfig can receive focus.
 /// The cursor renders at the focused cell's position.
@@ -523,7 +523,7 @@ pub fn click_to_focus(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
     cells: Query<(Entity, &MsdfTextAreaConfig), With<Cell>>,
-    mut focused: ResMut<FocusedCell>,
+    mut focus: ResMut<FocusTarget>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
         return;
@@ -542,13 +542,13 @@ pub fn click_to_focus(
             && cursor_pos.y >= bounds.top as f32
             && cursor_pos.y <= bounds.bottom as f32
         {
-            focused.0 = Some(entity);
+            focus.entity = Some(entity);
             return;
         }
     }
 
-    // Clicked outside any cell - clear focus
-    focused.0 = None;
+    // Clicked outside any cell - clear entity focus
+    focus.entity = None;
 }
 
 /// Toggle collapse state of focused cell or thinking blocks (Tab in Normal mode).
@@ -559,7 +559,7 @@ pub fn click_to_focus(
 pub fn handle_collapse_toggle(
     mut key_events: MessageReader<KeyboardInput>,
     mode: Res<CurrentMode>,
-    focused: Res<FocusedCell>,
+    focus: Res<FocusTarget>,
     mut cells: Query<(&mut CellEditor, &mut CellState)>,
 ) {
     // Only in Normal mode
@@ -567,7 +567,7 @@ pub fn handle_collapse_toggle(
         return;
     }
 
-    let Some(focused_entity) = focused.0 else {
+    let Some(focused_entity) = focus.entity else {
         return;
     };
 
@@ -634,9 +634,21 @@ use crate::shaders::{CursorBeamMaterial, CursorMode};
 #[derive(Component)]
 pub struct CursorMarker;
 
-/// Resource tracking the cursor entity.
+/// Consolidated resource tracking editor-related singleton entities.
+///
+/// Replaces the previous separate resources:
+/// - `CursorEntity` → `entities.cursor`
+/// - `MainCellEntity` → `entities.main_cell`
+/// - `ExpandedBlockEntity` → `entities.expanded_view`
 #[derive(Resource, Default)]
-pub struct CursorEntity(pub Option<Entity>);
+pub struct EditorEntities {
+    /// The cursor UI entity (shader-based).
+    pub cursor: Option<Entity>,
+    /// The main conversation cell entity.
+    pub main_cell: Option<Entity>,
+    /// The expanded block overlay view entity.
+    pub expanded_view: Option<Entity>,
+}
 
 // Font metrics are now read from TextMetrics resource instead of hardcoded constants.
 // This ensures cursor positioning matches actual text rendering.
@@ -646,12 +658,12 @@ const MONOSPACE_WIDTH_RATIO: f32 = 0.6;
 /// Spawn the cursor entity if it doesn't exist.
 pub fn spawn_cursor(
     mut commands: Commands,
-    mut cursor_entity: ResMut<CursorEntity>,
+    mut entities: ResMut<EditorEntities>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
     text_metrics: Res<TextMetrics>,
 ) {
-    if cursor_entity.0.is_some() {
+    if entities.cursor.is_some() {
         return;
     }
 
@@ -685,22 +697,22 @@ pub fn spawn_cursor(
         ))
         .id();
 
-    cursor_entity.0 = Some(entity);
+    entities.cursor = Some(entity);
     info!("Spawned cursor entity");
 }
 
 /// Update cursor position and visibility based on focused cell and mode.
 pub fn update_cursor(
-    focused: Res<FocusedCell>,
+    focus: Res<FocusTarget>,
     mode: Res<CurrentMode>,
-    cursor_entity: Res<CursorEntity>,
+    entities: Res<EditorEntities>,
     mut cells: Query<(&mut CellEditor, &MsdfTextAreaConfig)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
     text_metrics: Res<TextMetrics>,
 ) {
-    let Some(cursor_ent) = cursor_entity.0 else {
+    let Some(cursor_ent) = entities.cursor else {
         return;
     };
 
@@ -709,7 +721,7 @@ pub fn update_cursor(
     };
 
     // Hide cursor if no cell is focused
-    let Some(focused_entity) = focused.0 else {
+    let Some(focused_entity) = focus.entity else {
         *visibility = Visibility::Hidden;
         return;
     };
@@ -984,7 +996,7 @@ pub fn handle_scroll_input(
 // BLOCK FOCUS NAVIGATION (Phase 2)
 // ============================================================================
 
-use super::components::{ConversationFocus, FocusedBlockCell};
+use super::components::FocusedBlockCell;
 
 /// Navigate between blocks with j/k in Normal mode.
 ///
@@ -1003,11 +1015,11 @@ pub fn navigate_blocks(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<CurrentMode>,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
     block_cells: Query<(Entity, &BlockCell, &BlockCellLayout)>,
-    mut focus: ResMut<ConversationFocus>,
+    mut focus: ResMut<FocusTarget>,
     mut scroll_state: ResMut<ConversationScrollState>,
     focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
@@ -1016,7 +1028,7 @@ pub fn navigate_blocks(
         return;
     }
 
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -1079,7 +1091,7 @@ pub fn navigate_blocks(
     let new_block = &blocks[new_idx];
 
     // Update focus resource
-    focus.focus(new_block.id.clone());
+    focus.focus_block(new_block.id.clone());
 
     // Remove old FocusedBlockCell markers
     for entity in focused_markers.iter() {
@@ -1145,7 +1157,7 @@ fn scroll_to_block_visible(
 /// that has the FocusedBlockCell marker.
 pub fn highlight_focused_block(
     mut focused_configs: Query<(&BlockCell, &mut MsdfTextAreaConfig), With<FocusedBlockCell>>,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     theme: Res<Theme>,
 ) {
@@ -1157,7 +1169,7 @@ pub fn highlight_focused_block(
     // For now, we indicate focus by slightly brightening the text color
     // Future: could add a background highlight or border via a separate UI element
 
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -1201,7 +1213,7 @@ pub fn highlight_focused_block(
 pub fn handle_expand_block(
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<CurrentMode>,
-    focus: Res<ConversationFocus>,
+    focus: Res<FocusTarget>,
     mut view_stack: ResMut<crate::ui::state::ViewStack>,
 ) {
     // Only in Normal mode with a focused block
@@ -1249,17 +1261,12 @@ pub fn handle_view_pop(
 
 use crate::ui::state::{ExpandedBlockView, ViewStack};
 
-/// Tracks the expanded block view entity.
-#[derive(Resource, Default)]
-pub struct ExpandedBlockEntity(pub Option<Entity>);
-
 /// Spawn the ExpandedBlockView when ViewStack enters ExpandedBlock state.
 pub fn spawn_expanded_block_view(
     mut commands: Commands,
     view_stack: Res<ViewStack>,
-    mut expanded_entity: ResMut<ExpandedBlockEntity>,
+    mut entities: ResMut<EditorEntities>,
     existing_views: Query<Entity, With<ExpandedBlockView>>,
-    main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     font_system: Res<SharedFontSystem>,
     text_metrics: Res<TextMetrics>,
@@ -1268,14 +1275,14 @@ pub fn spawn_expanded_block_view(
     // Check if we need to spawn or despawn
     let should_show = view_stack.has_expanded_block();
 
-    if should_show && expanded_entity.0.is_none() {
+    if should_show && entities.expanded_view.is_none() {
         // Spawn the expanded block view
         let Some(block_id) = view_stack.expanded_block_id() else {
             return;
         };
 
         // Get the block content from MainCell
-        let Some(main_ent) = main_entity.0 else {
+        let Some(main_ent) = entities.main_cell else {
             return;
         };
         let Ok(editor) = main_cells.get(main_ent) else {
@@ -1325,14 +1332,14 @@ pub fn spawn_expanded_block_view(
             ))
             .id();
 
-        expanded_entity.0 = Some(entity);
+        entities.expanded_view = Some(entity);
         info!("Spawned ExpandedBlockView for {:?}", block_id);
-    } else if !should_show && expanded_entity.0.is_some() {
+    } else if !should_show && entities.expanded_view.is_some() {
         // Despawn when leaving ExpandedBlock view
         for entity in existing_views.iter() {
             commands.entity(entity).despawn();
         }
-        expanded_entity.0 = None;
+        entities.expanded_view = None;
         info!("Despawned ExpandedBlockView");
     }
 }
@@ -1348,7 +1355,7 @@ pub struct ExpandedBlockInfo {
 /// Update the ExpandedBlockView content when the block changes.
 pub fn sync_expanded_block_content(
     view_stack: Res<ViewStack>,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut expanded_views: Query<
         (&ExpandedBlockInfo, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig),
@@ -1362,7 +1369,7 @@ pub fn sync_expanded_block_content(
         return;
     }
 
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
     let Ok(editor) = main_cells.get(main_ent) else {
@@ -1407,21 +1414,17 @@ pub fn sync_expanded_block_content(
 // MAIN CELL SYSTEMS
 // ============================================================================
 
-/// Resource tracking the main kernel/shell cell entity.
-#[derive(Resource, Default)]
-pub struct MainCellEntity(pub Option<Entity>);
-
 /// Spawn the main kernel cell on startup.
 ///
 /// This is the primary workspace cell that displays kernel output, shell interactions,
 /// and agent conversations. It fills the space between the header and prompt.
 pub fn spawn_main_cell(
     mut commands: Commands,
-    mut main_entity: ResMut<MainCellEntity>,
+    mut entities: ResMut<EditorEntities>,
     conversation_container: Query<Entity, Added<super::components::ConversationContainer>>,
 ) {
     // Only spawn once when we see the ConversationContainer
-    if main_entity.0.is_some() {
+    if entities.main_cell.is_some() {
         return;
     }
 
@@ -1453,7 +1456,7 @@ pub fn spawn_main_cell(
         ))
         .id();
 
-    main_entity.0 = Some(entity);
+    entities.main_cell = Some(entity);
     info!("Spawned main kernel cell with id {:?}", cell_id.0);
 }
 
@@ -1469,7 +1472,7 @@ pub fn spawn_main_cell(
 pub fn sync_main_cell_to_conversation(
     current_conv: Res<CurrentConversation>,
     sync_state: Res<super::components::DocumentSyncState>,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
 ) {
@@ -1478,7 +1481,7 @@ pub fn sync_main_cell_to_conversation(
         debug!("sync_main_cell: no current conversation");
         return;
     };
-    let Some(entity) = main_entity.0 else {
+    let Some(entity) = entities.main_cell else {
         debug!("sync_main_cell: no main cell entity");
         return;
     };
@@ -1751,12 +1754,12 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
 /// - Maintains order in BlockCellContainer
 pub fn spawn_block_cells(
     mut commands: Commands,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
     _block_cells: Query<(Entity, &BlockCell)>,
 ) {
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -1830,12 +1833,12 @@ pub fn spawn_block_cells(
 /// MsdfText + MsdfTextAreaConfig for consistent rendering.
 pub fn sync_role_headers(
     mut commands: Commands,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
     theme: Res<Theme>,
 ) {
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -1949,7 +1952,7 @@ pub fn init_block_cell_buffers(
 /// mutates editor.doc directly which doesn't trigger Bevy change detection.
 /// Instead, we rely on block_cell.last_render_version for dirty tracking.
 pub fn sync_block_cell_buffers(
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
@@ -1957,7 +1960,7 @@ pub fn sync_block_cell_buffers(
     theme: Res<Theme>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -2069,7 +2072,7 @@ pub fn sync_block_cell_buffers(
 /// and window size. It skips expensive recomputation when neither content nor
 /// window has changed. This makes scrolling feel instant regardless of block count.
 pub fn layout_block_cells(
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer)>,
@@ -2084,7 +2087,7 @@ pub fn layout_block_cells(
     mut last_layout_gen: Local<u64>,
     mut last_window_size: Local<(f32, f32)>,
 ) {
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -2212,7 +2215,7 @@ pub fn layout_block_cells(
 /// Combined with layout_block_cells optimization, this means scrolling only runs
 /// this lightweight position update, not the expensive layout computation.
 pub fn apply_block_cell_positions(
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCellLayout, &mut MsdfTextAreaConfig), With<BlockCell>>,
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
@@ -2224,7 +2227,7 @@ pub fn apply_block_cell_positions(
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
 ) {
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
 
@@ -2361,8 +2364,8 @@ pub fn handle_block_edit_mode(
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
     screen: Res<State<AppScreen>>,
-    focus: Res<ConversationFocus>,
-    main_entity: Res<MainCellEntity>,
+    focus: Res<FocusTarget>,
+    entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     _containers: Query<&BlockCellContainer>,
     focused_block_cells: Query<Entity, With<FocusedBlockCell>>,
@@ -2381,7 +2384,7 @@ pub fn handle_block_edit_mode(
             if let Some(ref block_id) = focus.block_id {
                 // Check if this block exists and is editable
                 // For now, only User and Text blocks are editable
-                if let Some(main_ent) = main_entity.0 {
+                if let Some(main_ent) = entities.main_cell {
                     if let Ok(editor) = main_cells.get(main_ent) {
                         let blocks = editor.blocks();
                         if let Some(block) = blocks.iter().find(|b| &b.id == block_id) {
@@ -2443,7 +2446,7 @@ pub fn handle_block_cell_input(
     mut key_events: MessageReader<KeyboardInput>,
     mode: Res<CurrentMode>,
     consumed: Res<ConsumedModeKeys>,
-    main_entity: Res<MainCellEntity>,
+    entities: Res<EditorEntities>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
 ) {
@@ -2458,7 +2461,7 @@ pub fn handle_block_cell_input(
     };
 
     // Get the main cell editor for CRDT operations
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
     let Ok(mut editor) = main_cells.get_mut(main_ent) else {
@@ -2601,10 +2604,9 @@ pub fn handle_block_cell_input(
 /// position, not in the PromptCell.
 pub fn update_block_edit_cursor(
     editing_cells: Query<(&BlockCell, &BlockEditCursor, &BlockCellLayout, &MsdfTextAreaConfig), With<EditingBlockCell>>,
-    cursor_entity: Res<CursorEntity>,
+    entities: Res<EditorEntities>,
     mode: Res<CurrentMode>,
     mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
-    main_entity: Res<MainCellEntity>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     text_metrics: Res<TextMetrics>,
 ) {
@@ -2613,7 +2615,7 @@ pub fn update_block_edit_cursor(
         return;
     };
 
-    let Some(cursor_ent) = cursor_entity.0 else {
+    let Some(cursor_ent) = entities.cursor else {
         return;
     };
 
@@ -2622,7 +2624,7 @@ pub fn update_block_edit_cursor(
     };
 
     // Get block content for cursor position calculation
-    let Some(main_ent) = main_entity.0 else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
     let Ok(editor) = main_cells.get(main_ent) else {
@@ -2873,7 +2875,7 @@ pub fn handle_bubble_spawn(
     screen: Res<State<AppScreen>>,
     mut registry: ResMut<BubbleRegistry>,
     config: Res<BubbleConfig>,
-    focus: Res<ConversationFocus>,
+    focus: Res<FocusTarget>,
     current_conv: Res<CurrentConversation>,
     mut bubble_query: Query<&mut InputBubble>,
 ) {
@@ -3320,7 +3322,7 @@ pub fn layout_bubble_position(
 pub fn update_bubble_cursor(
     registry: Res<BubbleRegistry>,
     mode: Res<CurrentMode>,
-    cursor_entity: Res<CursorEntity>,
+    entities: Res<EditorEntities>,
     bubbles: Query<(&InputBubble, &MsdfTextAreaConfig), With<BubbleState>>,
     mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
     text_metrics: Res<TextMetrics>,
@@ -3334,7 +3336,7 @@ pub fn update_bubble_cursor(
         return;
     };
 
-    let Some(cursor_ent) = cursor_entity.0 else {
+    let Some(cursor_ent) = entities.cursor else {
         return;
     };
 

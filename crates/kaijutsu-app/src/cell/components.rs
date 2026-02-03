@@ -443,41 +443,54 @@ impl EditorMode {
 #[reflect(Resource)]
 pub struct CurrentMode(pub EditorMode);
 
-/// Resource tracking which cell has keyboard focus.
+// ============================================================================
+// UNIFIED FOCUS RESOURCE
+// ============================================================================
+
+/// Unified focus tracking for keyboard focus and block navigation.
+///
+/// Consolidates the previous `FocusedCell` and `ConversationFocus` into a single
+/// resource, eliminating confusion about which resource to check for focus state.
+///
+/// - `entity`: Which entity has keyboard focus (for cursor rendering, input routing)
+/// - `block_id`: Which block is focused for j/k navigation and reply workflows
+/// - `editing`: Whether the focused target is actively being edited
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
-pub struct FocusedCell(pub Option<Entity>);
-
-// ============================================================================
-// BLOCK FOCUS NAVIGATION (Phase 2)
-// ============================================================================
-
-/// Which block is focused for navigation/reply.
-///
-/// This enables j/k navigation between blocks (not just scroll) and
-/// supports future "reply to this block" workflows.
-#[derive(Resource, Default)]
-pub struct ConversationFocus {
-    /// The currently focused block (if any).
+pub struct FocusTarget {
+    /// Entity with keyboard focus (for cursor rendering).
+    pub entity: Option<Entity>,
+    /// Block ID for navigation (j/k, reply workflows).
+    #[reflect(ignore)]
     pub block_id: Option<BlockId>,
+    /// Whether actively editing the focused target.
+    pub editing: bool,
 }
 
-impl ConversationFocus {
+impl FocusTarget {
     /// Check if a specific block is focused.
     #[allow(dead_code)]
-    pub fn is_focused(&self, block_id: &BlockId) -> bool {
+    pub fn is_block_focused(&self, block_id: &BlockId) -> bool {
         self.block_id.as_ref() == Some(block_id)
     }
 
-    /// Clear the focus.
+    /// Clear all focus state.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        self.entity = None;
         self.block_id = None;
+        self.editing = false;
     }
 
-    /// Set focus to a block.
-    pub fn focus(&mut self, block_id: BlockId) {
+    /// Set focus to a block (for j/k navigation).
+    pub fn focus_block(&mut self, block_id: BlockId) {
         self.block_id = Some(block_id);
+    }
+
+    /// Set focus to an entity (for cursor/input).
+    #[allow(dead_code)]
+    pub fn focus_entity(&mut self, entity: Entity) {
+        self.entity = Some(entity);
     }
 }
 
