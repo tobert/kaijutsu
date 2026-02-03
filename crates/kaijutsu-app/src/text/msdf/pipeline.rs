@@ -328,6 +328,9 @@ pub struct ExtractedMsdfRenderConfig {
     pub format: TextureFormat,
     /// Whether this config is valid for rendering.
     pub initialized: bool,
+    /// Window scale factor (logical to physical pixel multiplier).
+    /// Used to convert layout bounds and positions to physical pixels.
+    pub scale_factor: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Font rendering parameters (from Theme)
@@ -432,6 +435,20 @@ pub struct MsdfTextTaaResources {
     /// Bind group for blit pass (uniforms, history_write, dummy, sampler).
     /// Uses TAA shader with taa_enabled=0 for passthrough.
     pub blit_bind_group: Option<BindGroup>,
+}
+
+/// A batch of vertices with common scissor bounds for clipped rendering.
+///
+/// Text areas with the same bounds are grouped into batches. Each batch
+/// gets its own scissor rect to clip text to its designated area.
+#[derive(Debug, Clone)]
+pub struct TextBatch {
+    /// Scissor rect [x, y, width, height] in physical pixels.
+    pub scissor: [u32; 4],
+    /// Starting vertex index in the vertex buffer.
+    pub vertex_start: u32,
+    /// Number of vertices in this batch.
+    pub vertex_count: u32,
 }
 
 impl MsdfTextTaaResources {
@@ -570,6 +587,9 @@ pub struct MsdfTextResources {
     pub vertex_buffer: Option<Buffer>,
     pub bind_group: Option<BindGroup>,
     pub vertex_count: u32,
+    /// Batches of vertices grouped by scissor bounds.
+    /// Each batch has a scissor rect in physical pixels.
+    pub batches: Vec<TextBatch>,
     /// Depth texture for per-glyph depth testing.
     pub depth_texture: Option<Texture>,
     pub depth_texture_view: Option<TextureView>,
@@ -839,7 +859,47 @@ impl ViewNode for MsdfTextRenderNode {
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_vertex_buffer(0, *vertex_buffer.slice(..));
-        render_pass.draw(0..resources.vertex_count, 0..1);
+
+        // Get viewport dimensions for scissor rect clamping
+        let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
+        let (vp_w, vp_h) = render_config
+            .map(|c| (c.resolution[0] as u32, c.resolution[1] as u32))
+            .unwrap_or((1920, 1080)); // Fallback if config not available
+
+        // Draw each batch with its scissor rect
+        if resources.batches.is_empty() {
+            // Fallback: no batches but have vertices - draw everything without scissor
+            // This can happen if bounds data is stale during resize
+            render_pass.set_scissor_rect(0, 0, vp_w, vp_h);
+            render_pass.draw(0..resources.vertex_count, 0..1);
+        } else {
+            for batch in &resources.batches {
+                if batch.vertex_count == 0 {
+                    continue;
+                }
+
+                // Set scissor rect (clamp to viewport dimensions)
+                let [x, y, w, h] = batch.scissor;
+                let clamped_w = w.min(vp_w.saturating_sub(x));
+                let clamped_h = h.min(vp_h.saturating_sub(y));
+
+                // Skip batches with zero-size scissor (would clip everything)
+                // This can happen if bounds are stale or inverted
+                if clamped_w == 0 || clamped_h == 0 {
+                    // Fall back to full viewport for this batch
+                    render_pass.set_scissor_rect(0, 0, vp_w, vp_h);
+                } else {
+                    render_pass.set_scissor_rect(
+                        x.min(vp_w),
+                        y.min(vp_h),
+                        clamped_w,
+                        clamped_h,
+                    );
+                }
+
+                render_pass.draw(batch.vertex_start..batch.vertex_start + batch.vertex_count, 0..1);
+            }
+        }
 
         Ok(())
     }
@@ -1088,6 +1148,7 @@ pub fn extract_msdf_render_config(
         resolution: config.resolution,
         format: config.format,
         initialized: config.initialized,
+        scale_factor: config.scale_factor,
         // Font rendering parameters from Theme
         stem_darkening: theme.font_stem_darkening,
         hint_amount: theme.font_hint_amount,
@@ -1315,8 +1376,16 @@ pub fn prepare_msdf_texts(
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-    // Build vertex buffer
+    // Build vertex buffer with batching by scissor bounds
     let mut vertices: Vec<MsdfVertex> = Vec::new();
+    let mut batches: Vec<TextBatch> = Vec::new();
+
+    // Scale factor for logical→physical pixel conversion
+    let scale = render_config.scale_factor;
+
+    // Track current batch state
+    let mut current_batch_scissor: Option<[u32; 4]> = None;
+    let mut batch_vertex_start: u32 = 0;
 
     // MSDF textures are generated at 32 px/em (use module constant)
 
@@ -1329,6 +1398,31 @@ pub fn prepare_msdf_texts(
     let mut glyph_index: u32 = 0;
 
     for text in &extracted.texts {
+        // Convert logical bounds to physical pixel scissor rect
+        let scissor = [
+            (text.bounds.left.max(0) as f32 * scale) as u32,
+            (text.bounds.top.max(0) as f32 * scale) as u32,
+            ((text.bounds.right - text.bounds.left).max(0) as f32 * scale) as u32,
+            ((text.bounds.bottom - text.bounds.top).max(0) as f32 * scale) as u32,
+        ];
+
+        // Start new batch if bounds changed
+        if current_batch_scissor != Some(scissor) {
+            // Finalize previous batch if any
+            if let Some(prev_scissor) = current_batch_scissor {
+                let vertex_count = vertices.len() as u32 - batch_vertex_start;
+                if vertex_count > 0 {
+                    batches.push(TextBatch {
+                        scissor: prev_scissor,
+                        vertex_start: batch_vertex_start,
+                        vertex_count,
+                    });
+                }
+            }
+            current_batch_scissor = Some(scissor);
+            batch_vertex_start = vertices.len() as u32;
+        }
+
         #[cfg(debug_assertions)]
         let mut first_glyph_in_text = true;
 
@@ -1436,7 +1530,20 @@ pub fn prepare_msdf_texts(
         }
     }
 
+    // Finalize the last batch
+    if let Some(scissor) = current_batch_scissor {
+        let vertex_count = vertices.len() as u32 - batch_vertex_start;
+        if vertex_count > 0 {
+            batches.push(TextBatch {
+                scissor,
+                vertex_start: batch_vertex_start,
+                vertex_count,
+            });
+        }
+    }
+
     resources.vertex_count = vertices.len() as u32;
+    resources.batches = batches;
 
     if vertices.is_empty() {
         return;
@@ -1741,6 +1848,7 @@ pub fn init_msdf_resources(
         vertex_buffer: None,
         bind_group: None,
         vertex_count: 0,
+        batches: Vec::new(),
         depth_texture: None,
         depth_texture_view: None,
         depth_texture_size: (0, 0),

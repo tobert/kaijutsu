@@ -131,6 +131,9 @@ pub struct MsdfRenderConfig {
     /// Whether this config has been initialized.
     /// Systems will skip rendering if this is false.
     pub initialized: bool,
+    /// Window scale factor (logical to physical pixel multiplier).
+    /// Used to convert layout positions (logical) to render positions (physical).
+    pub scale_factor: f32,
 }
 
 impl Default for MsdfRenderConfig {
@@ -142,6 +145,7 @@ impl Default for MsdfRenderConfig {
             // actual swap chain format, which is the authoritative source.
             format: bevy::render::render_resource::TextureFormat::bevy_default(),
             initialized: false,
+            scale_factor: 1.0,
         }
     }
 }
@@ -158,12 +162,19 @@ impl MsdfRenderConfig {
             resolution: [width as f32, height as f32],
             format: bevy::render::render_resource::TextureFormat::bevy_default(),
             initialized: true,
+            scale_factor: 1.0,
         }
     }
 
     /// Create config with explicit format (for matching window swap chain).
     pub fn with_format(mut self, format: bevy::render::render_resource::TextureFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Create config with explicit scale factor (for HiDPI displays).
+    pub fn with_scale_factor(mut self, scale_factor: f32) -> Self {
+        self.scale_factor = scale_factor;
         self
     }
 

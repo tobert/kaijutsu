@@ -36,6 +36,10 @@ const ROLE_HEADER_SPACING: f32 = 4.0;
 /// Height of the status bar at bottom of window.
 const STATUS_BAR_HEIGHT: f32 = 32.0;
 
+/// Minimum height reserved for compose block (min_height + margins).
+/// ComposeBlock: 60px min + 8px top margin + 16px bottom margin = 84px
+const COMPOSE_BLOCK_MIN_HEIGHT: f32 = 84.0;
+
 // ============================================================================
 // BLOCK COLOR MAPPING
 // ============================================================================
@@ -2256,9 +2260,10 @@ pub fn apply_block_cell_positions(
         .map(|w| (w.resolution.width(), w.resolution.height()))
         .unwrap_or((1280.0, 800.0));
 
-    // Visible area (ComposeBlock is inline, no legacy shadow height)
+    // Visible area for conversation content
+    // Reserve space for: header (workspace_margin_top), compose block, and status bar
     let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - STATUS_BAR_HEIGHT;
+    let visible_bottom = window_height - STATUS_BAR_HEIGHT - COMPOSE_BLOCK_MIN_HEIGHT;
     let visible_height = (visible_bottom - visible_top).max(100.0); // Ensure positive
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);

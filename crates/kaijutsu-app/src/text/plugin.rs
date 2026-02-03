@@ -151,7 +151,7 @@ impl Plugin for TextRenderPlugin {
 
 /// Sync MSDF render config from the primary window.
 ///
-/// In windowed mode, this updates resolution and marks the config as initialized.
+/// In windowed mode, this updates resolution, scale_factor, and marks the config as initialized.
 /// In headless mode (no window), this system does nothing - tests must set the config directly.
 fn sync_render_config_from_window(
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -175,6 +175,11 @@ fn sync_render_config_from_window(
     if (text_metrics.scale_factor - scale).abs() > 0.01 {
         text_metrics.scale_factor = scale;
         info!("TextMetrics scale_factor updated: {:.2}", scale);
+    }
+
+    // Update scale_factor in MsdfRenderConfig for render world coordinate conversion
+    if (config.scale_factor - scale).abs() > 0.001 {
+        config.scale_factor = scale;
     }
 }
 

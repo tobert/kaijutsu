@@ -401,8 +401,8 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
                     min_height: Val::Px(60.0),
                     padding: UiRect::all(Val::Px(12.0)),
                     margin: UiRect::new(
-                        Val::Px(40.0),  // left margin matches conversation blocks
-                        Val::Px(40.0),  // right margin
+                        Val::Px(20.0),  // left margin matches workspace_margin_left
+                        Val::Px(20.0),  // right margin matches workspace_margin_right
                         Val::Px(8.0),   // top margin
                         Val::Px(16.0),  // bottom margin
                     ),
