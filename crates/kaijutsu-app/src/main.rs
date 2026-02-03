@@ -109,7 +109,8 @@ fn main() {
             setup_camera,
             ui::materials::setup_material_cache,
             setup_ui,
-            setup_input_layer,
+            // NOTE: Legacy InputLayer disabled - ComposeBlock is the new inline input
+            // setup_input_layer,
             ui::debug::setup_debug_overlay,
         ).chain())
         // Update
@@ -354,6 +355,9 @@ fn setup_ui(
 /// - Input frame content (the 9-slice frame and text are positioned here)
 ///
 /// This is spawned at ZIndex(100) so it floats above all conversation content.
+///
+/// NOTE: Legacy system - disabled in favor of ComposeBlock (inline input).
+#[allow(dead_code)]
 fn setup_input_layer(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,

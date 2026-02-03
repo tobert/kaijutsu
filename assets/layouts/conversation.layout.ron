@@ -3,8 +3,8 @@
 // The main view for chat/shell interaction with the kernel.
 //
 // NOTE: This layout only includes panels that have been migrated to the
-// layout system. Other UI elements (ConstellationMini, InputFrame, PromptCell)
-// are still spawned by their respective systems.
+// layout system. Other UI elements (ConstellationMini) are still spawned
+// by their respective systems.
 //
 // Structure:
 // ┌────────────────────────────────────────────────────────┐

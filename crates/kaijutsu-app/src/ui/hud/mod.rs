@@ -141,15 +141,16 @@ impl HudPosition {
     /// Get CSS-like position values
     pub fn to_node_position(&self) -> (Val, Val, Val, Val) {
         // Returns (top, right, bottom, left)
+        // Margins sized to clear header, status bar, and avoid content overlap
         match self {
-            Self::TopRight => (Val::Px(60.0), Val::Px(16.0), Val::Auto, Val::Auto),
-            Self::TopLeft => (Val::Px(60.0), Val::Auto, Val::Auto, Val::Px(16.0)),
-            Self::BottomRight => (Val::Auto, Val::Px(16.0), Val::Px(60.0), Val::Auto),
-            Self::BottomLeft => (Val::Auto, Val::Auto, Val::Px(60.0), Val::Px(16.0)),
+            Self::TopRight => (Val::Px(80.0), Val::Px(16.0), Val::Auto, Val::Auto),
+            Self::TopLeft => (Val::Px(80.0), Val::Auto, Val::Auto, Val::Px(16.0)),
+            Self::BottomRight => (Val::Auto, Val::Px(16.0), Val::Px(70.0), Val::Auto),
+            Self::BottomLeft => (Val::Auto, Val::Auto, Val::Px(70.0), Val::Px(16.0)),
             Self::Left => (Val::Percent(30.0), Val::Auto, Val::Auto, Val::Px(16.0)),
             Self::Right => (Val::Percent(30.0), Val::Px(16.0), Val::Auto, Val::Auto),
-            Self::Top => (Val::Px(60.0), Val::Auto, Val::Auto, Val::Percent(30.0)),
-            Self::Bottom => (Val::Auto, Val::Auto, Val::Px(60.0), Val::Percent(30.0)),
+            Self::Top => (Val::Px(80.0), Val::Auto, Val::Auto, Val::Percent(30.0)),
+            Self::Bottom => (Val::Auto, Val::Auto, Val::Px(70.0), Val::Percent(30.0)),
         }
     }
 }

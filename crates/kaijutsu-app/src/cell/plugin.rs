@@ -6,8 +6,8 @@ use super::components::{
     BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
     BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
     ConversationContainer, ConversationFocus, ConversationScrollState, CurrentMode,
-    DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell, PromptCell,
-    PromptContainer, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
+    DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell,
+    PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -27,8 +27,6 @@ impl Plugin for CellPlugin {
             .register_type::<CurrentMode>()
             .register_type::<ConversationScrollState>()
             .register_type::<ConversationContainer>()
-            .register_type::<PromptContainer>()
-            .register_type::<PromptCell>()
             .register_type::<MainCell>()
             .register_type::<PromptSubmitted>()
             // Additional types for debugging
@@ -57,7 +55,6 @@ impl Plugin for CellPlugin {
             .init_resource::<DocumentSyncState>()
             .init_resource::<systems::CursorEntity>()
             .init_resource::<systems::ConsumedModeKeys>()
-            .init_resource::<systems::PromptCellEntity>()
             .init_resource::<systems::MainCellEntity>()
             .init_resource::<systems::ExpandedBlockEntity>()
             // Input area state resources
@@ -82,25 +79,17 @@ impl Plugin for CellPlugin {
                         .before(systems::handle_mode_switch),
                     systems::handle_mode_switch
                         .after(systems::clear_consumed_keys),
-                    // Auto-focus prompt when entering INSERT mode (after mode switch, before input)
-                    systems::auto_focus_prompt.after(systems::handle_mode_switch),
-                    // Block cell input runs before prompt submit to handle editing blocks
+                    // Block cell input runs before compose block to handle editing blocks
                     systems::handle_block_cell_input
-                        .after(systems::handle_block_edit_mode)
-                        .before(systems::handle_prompt_submit),
-                    // Prompt submit must run before cell_input to intercept Enter in prompt
-                    systems::handle_prompt_submit.after(systems::auto_focus_prompt),
-                    systems::handle_cell_input.after(systems::handle_prompt_submit),
+                        .after(systems::handle_block_edit_mode),
                     systems::click_to_focus,
-                    systems::debug_spawn_cell,
                 ),
             )
-            // Main cell and prompt cell management
+            // Main cell management
             .add_systems(
                 Update,
                 (
                     systems::spawn_main_cell,
-                    systems::spawn_prompt_cell,
                     systems::handle_prompt_submitted,
                     systems::sync_main_cell_to_conversation
                         .after(systems::handle_prompt_submitted),
@@ -119,18 +108,15 @@ impl Plugin for CellPlugin {
                         .after(systems::navigate_blocks),
                 ),
             )
-            // Layout and rendering for PromptCell
+            // Layout and rendering for cells
             // NOTE: MainCell no longer uses legacy rendering - BlockCell system handles it
-            // These systems now only affect PromptCell (the input area at bottom)
             .add_systems(
                 Update,
                 (
                     systems::init_cell_buffers,
                     systems::compute_cell_heights,
-                    systems::layout_prompt_cell_position,
                     systems::sync_cell_buffers
                         .after(systems::init_cell_buffers)
-                        .after(systems::handle_cell_input)
                         .after(systems::sync_main_cell_to_conversation),
                     systems::highlight_focused_cell,
                 ),
@@ -208,8 +194,7 @@ impl Plugin for CellPlugin {
                 (
                     systems::init_compose_block_buffer,
                     systems::handle_compose_block_input
-                        .after(systems::handle_mode_switch)
-                        .before(systems::handle_prompt_submit),
+                        .after(systems::handle_mode_switch),
                     systems::sync_compose_block_buffer
                         .after(systems::handle_compose_block_input),
                     // Position compose block after Bevy's UI layout runs
@@ -237,8 +222,7 @@ impl Plugin for CellPlugin {
                         .before(systems::handle_cell_input),
                     // Submit: Enter sends content
                     systems::handle_bubble_submit
-                        .after(systems::handle_bubble_input)
-                        .before(systems::handle_prompt_submit),
+                        .after(systems::handle_bubble_input),
                 ),
             )
             // Bubble rendering systems
@@ -270,19 +254,19 @@ impl Plugin for CellPlugin {
                 ),
             )
             // Cursor
+            // update_cursor handles cursor for ComposeBlock and focused cells
             // update_block_edit_cursor handles cursor when editing a BlockCell
-            // update_cursor handles cursor in PromptCell
             .add_systems(
                 Update,
                 (
                     systems::spawn_cursor,
                     systems::update_cursor,
-                    // Block edit cursor overrides prompt cursor when editing a block
+                    // Block edit cursor overrides normal cursor when editing a block
                     systems::update_block_edit_cursor
                         .after(systems::update_cursor),
                 ),
             )
-            // Input area positioning and visibility
+            // Input area positioning and visibility (legacy - being replaced by ComposeBlock)
             .add_systems(
                 Update,
                 (
@@ -292,8 +276,6 @@ impl Plugin for CellPlugin {
                     systems::sync_backdrop_visibility.after(systems::compute_input_position),
                     systems::apply_input_position.after(systems::compute_input_position),
                     systems::sync_input_shadow_height.after(systems::sync_presence_with_screen),
-                    // PromptCell visibility syncs with presence to hide glyphon text on Dashboard
-                    systems::sync_prompt_visibility.after(systems::sync_presence_with_screen),
                 ),
             );
     }

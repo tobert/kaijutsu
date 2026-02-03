@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
     ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusedCell,
-    InputKind, MainCell, PromptCell, PromptContainer, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::{ConversationRegistry, CurrentConversation};
@@ -76,26 +76,6 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
     }
 }
 
-/// Spawn a new cell entity with all required components.
-pub fn spawn_cell(
-    commands: &mut Commands,
-    cell: Cell,
-    position: CellPosition,
-    initial_text: &str,
-) -> Entity {
-    commands
-        .spawn((
-            cell,
-            CellEditor::default().with_text(initial_text),
-            CellState::new(),
-            position,
-            // Text rendering components
-            MsdfText,
-            MsdfTextAreaConfig::default(),
-        ))
-        .id()
-}
-
 /// Keys consumed by mode switching this frame (cleared each frame).
 #[derive(Resource, Default)]
 pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
@@ -124,7 +104,7 @@ pub fn handle_mode_switch(
     mut consumed: ResMut<ConsumedModeKeys>,
     mut presence: ResMut<InputPresence>,
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
-    prompt_cells: Query<&CellEditor, With<PromptCell>>,
+    compose_blocks: Query<&ComposeBlock>,
     screen: Res<State<AppScreen>>,
 ) {
     // Note: consumed.0.clear() happens in clear_consumed_keys system
@@ -167,29 +147,26 @@ pub fn handle_mode_switch(
                 match event.key_code {
                     KeyCode::KeyI => {
                         mode.0 = EditorMode::Input(InputKind::Chat);
-                        presence.0 = InputPresenceKind::Docked;
-                        info!("Mode: CHAT, Presence: DOCKED");
+                        // InputPresence no longer used with ComposeBlock
+                        info!("Mode: CHAT");
                     }
                     KeyCode::Space => {
-                        // Space summons the overlay input
+                        // Space enters chat mode
                         mode.0 = EditorMode::Input(InputKind::Chat);
-                        presence.0 = InputPresenceKind::Overlay;
                         consumed.0.insert(KeyCode::Space);
-                        info!("Mode: CHAT, Presence: OVERLAY");
+                        info!("Mode: CHAT (via Space)");
                     }
                     KeyCode::Backquote => {
                         // Backtick enters shell mode (kaish REPL)
                         mode.0 = EditorMode::Input(InputKind::Shell);
-                        presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::Backquote);
-                        info!("Mode: SHELL, Presence: DOCKED");
+                        info!("Mode: SHELL");
                     }
                     KeyCode::Semicolon if event.text.as_deref() == Some(":") => {
                         // Colon also enters Shell - kaish handles : commands natively
                         mode.0 = EditorMode::Input(InputKind::Shell);
-                        presence.0 = InputPresenceKind::Docked;
                         consumed.0.insert(KeyCode::Semicolon);
-                        info!("Mode: SHELL (command), Presence: DOCKED");
+                        info!("Mode: SHELL (command)");
                     }
                     KeyCode::KeyV => {
                         mode.0 = EditorMode::Visual;
@@ -205,20 +182,18 @@ pub fn handle_mode_switch(
                     mode.0 = EditorMode::Normal;
                     consumed.0.insert(KeyCode::Escape);
 
-                    // Set presence based on prompt content
-                    // If prompt is empty, minimize. If has content, stay docked.
-                    let prompt_empty = prompt_cells
+                    // Check if ComposeBlock has draft content
+                    let compose_empty = compose_blocks
                         .iter()
                         .next()
-                        .map(|editor| editor.text().trim().is_empty())
+                        .map(|compose| compose.is_empty())
                         .unwrap_or(true);
 
-                    if prompt_empty {
-                        presence.0 = InputPresenceKind::Minimized;
-                        info!("Mode: NORMAL, Presence: MINIMIZED");
+                    if compose_empty {
+                        presence.0 = InputPresenceKind::Hidden;
+                        info!("Mode: NORMAL");
                     } else {
-                        presence.0 = InputPresenceKind::Docked;
-                        info!("Mode: NORMAL, Presence: DOCKED (draft preserved)");
+                        info!("Mode: NORMAL (draft preserved in ComposeBlock)");
                     }
                 }
             }
@@ -226,7 +201,10 @@ pub fn handle_mode_switch(
     }
 }
 
-/// Handle keyboard input for the focused cell.
+/// Handle keyboard input for the focused cell (CellEditor-based cells only).
+///
+/// Note: ComposeBlock has its own input handling in handle_compose_block_input.
+/// This system handles input for CellEditor-based entities like BlockCells in edit mode.
 pub fn handle_cell_input(
     mut key_events: MessageReader<KeyboardInput>,
     focused: Res<FocusedCell>,
@@ -234,7 +212,6 @@ pub fn handle_cell_input(
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     consumed: Res<ConsumedModeKeys>,
     mut editors: Query<&mut CellEditor>,
-    prompt_cells: Query<Entity, With<PromptCell>>,
 ) {
     // Skip when a modal dialog is open to prevent input leakage
     if modal_open.is_some_and(|m| m.0) {
@@ -249,9 +226,6 @@ pub fn handle_cell_input(
     let Ok(mut editor) = editors.get_mut(focused_entity) else {
         return;
     };
-
-    // Check if focused cell is the prompt cell (for Enter handling)
-    let is_prompt = prompt_cells.contains(focused_entity);
 
     // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
     // This prevents the mode-switch key from being inserted as text
@@ -307,11 +281,7 @@ pub fn handle_cell_input(
                 continue;
             }
             KeyCode::Enter => {
-                // For PromptCell, let handle_prompt_submit deal with Enter
-                // (Enter submits, Shift+Enter adds newline)
-                if is_prompt {
-                    continue;
-                }
+                // Enter inserts newline in CellEditor-based editing
                 editor.insert("\n");
                 continue;
             }
@@ -519,45 +489,6 @@ pub fn compute_cell_heights(
     }
 }
 
-/// Layout the prompt cell at the bottom of the window.
-/// Uses full window width minus margins for a wide input area.
-pub fn layout_prompt_cell_position(
-    mut cells: Query<(&CellState, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), With<PromptCell>>,
-    pos: Res<InputPosition>,
-    layout: Res<WorkspaceLayout>,
-    font_system: Res<SharedFontSystem>,
-    mut metrics_cache: ResMut<FontMetricsCache>,
-) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    // Use InputPosition for positioning (computed from presence/dock/window)
-    // Add padding inside the frame for the text
-    let padding = 20.0;
-    let text_left = pos.x + padding;
-    let text_top = pos.y + padding * 0.5;
-    let text_width = pos.width - (padding * 2.0);
-
-    for (state, mut buffer, mut config) in cells.iter_mut() {
-        let height = state.computed_height.max(layout.prompt_min_height);
-
-        // Shape the text and generate glyphs - this is the critical step!
-        // Without this call, buffer.glyphs() returns empty and no text renders.
-        buffer.visual_line_count(&mut font_system, text_width, Some(&mut metrics_cache));
-
-        config.left = text_left;
-        config.top = text_top;
-        config.scale = 1.0;
-        config.bounds = crate::text::TextBounds {
-            left: text_left as i32,
-            top: text_top as i32,
-            right: (text_left + text_width) as i32,
-            bottom: (text_top + height) as i32,
-        };
-    }
-}
-
 /// Visual indication for focused cell.
 pub fn highlight_focused_cell(
     focused: Res<FocusedCell>,
@@ -618,32 +549,6 @@ pub fn click_to_focus(
 
     // Clicked outside any cell - clear focus
     focused.0 = None;
-}
-
-/// Debug: spawn a test cell on F2.
-pub fn debug_spawn_cell(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    cells: Query<&CellPosition, With<Cell>>,
-) {
-    if keys.just_pressed(KeyCode::F2) {
-        // Find next available row (start at 0 if no cells exist)
-        let next_row = cells
-            .iter()
-            .map(|p| p.row)
-            .max()
-            .map(|max| max + 1)
-            .unwrap_or(0);
-
-        spawn_cell(
-            &mut commands,
-            Cell::new(),
-            CellPosition::new(next_row),
-            "// New cell\nfn main() {\n    println!(\"Hello!\");\n}\n",
-        );
-
-        info!("Spawned debug cell at row {}", next_row);
-    }
 }
 
 /// Toggle collapse state of focused cell or thinking blocks (Tab in Normal mode).
@@ -914,135 +819,8 @@ fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
 }
 
 // ============================================================================
-// PROMPT CELL SYSTEMS
+// PROMPT SUBMISSION (from ComposeBlock)
 // ============================================================================
-
-/// Resource tracking the prompt cell entity.
-#[derive(Resource, Default)]
-pub struct PromptCellEntity(pub Option<Entity>);
-
-/// Spawn the prompt cell when the PromptContainer appears.
-pub fn spawn_prompt_cell(
-    mut commands: Commands,
-    mut prompt_entity: ResMut<PromptCellEntity>,
-    mut focused: ResMut<FocusedCell>,
-    prompt_container: Query<Entity, Added<PromptContainer>>,
-    layout: Res<WorkspaceLayout>,
-) {
-    // Only spawn once when we see the PromptContainer
-    if prompt_entity.0.is_some() {
-        return;
-    }
-
-    // Check if prompt container exists
-    if prompt_container.is_empty() {
-        return;
-    }
-
-    // Create a prompt cell
-    // Note: Not parented to container - uses absolute positioning for glyphon
-    let cell = Cell::new();
-    let cell_id = cell.id.clone();
-
-    let entity = commands
-        .spawn((
-            cell,
-            CellEditor::default().with_text(""),
-            CellState {
-                computed_height: layout.min_cell_height,
-                collapsed: false,
-            },
-            // Row value is unused - PromptCell marker + Without<PromptCell> filters handle exclusion
-            CellPosition::new(0),
-            MsdfText,
-            MsdfTextAreaConfig::default(),
-            PromptCell,
-            // Start hidden - sync_prompt_visibility controls based on InputPresence
-            // This prevents stray glyphon text when on Dashboard
-            Visibility::Hidden,
-        ))
-        .id();
-
-    prompt_entity.0 = Some(entity);
-    focused.0 = Some(entity); // Auto-focus the prompt on startup
-    info!("Spawned prompt cell with id {:?}", cell_id.0);
-}
-
-/// Handle prompt submission (Enter key in INSERT mode while focused on PromptCell).
-///
-/// After submission:
-/// - Editor is cleared
-/// - Mode returns to Normal
-/// - Presence set to Minimized (just the chasing line)
-pub fn handle_prompt_submit(
-    mut key_events: MessageReader<KeyboardInput>,
-    focused: Res<FocusedCell>,
-    mode: Res<CurrentMode>,
-    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut editors: Query<&mut CellEditor>,
-    prompt_cells: Query<Entity, With<PromptCell>>,
-    mut submit_events: MessageWriter<PromptSubmitted>,
-) {
-    // Skip when a modal dialog is open to prevent input leakage
-    if modal_open.is_some_and(|m| m.0) {
-        // Consume the keyboard events even though we're not processing them,
-        // to prevent other systems from seeing stale events after the modal closes
-        for _ in key_events.read() {}
-        return;
-    }
-
-    // Only handle in Input modes (Chat or Shell)
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    let Some(focused_entity) = focused.0 else {
-        return;
-    };
-
-    // Check if focused cell is the prompt cell
-    if !prompt_cells.contains(focused_entity) {
-        return;
-    }
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Enter submits (unless Shift is held for newline)
-        if event.key_code == KeyCode::Enter {
-            let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-
-            if shift_held {
-                // Shift+Enter = newline (handled by normal input)
-                continue;
-            }
-
-            // Submit the prompt
-            let Ok(mut editor) = editors.get_mut(focused_entity) else {
-                continue;
-            };
-
-            let text = editor.text().trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-
-            // Send the submit message
-            submit_events.write(PromptSubmitted { text: text.clone() });
-            info!("Prompt submitted: {:?}", text);
-
-            // Clear the editor (CRDT-tracked)
-            editor.clear();
-
-            // Stay in current mode after submit (REPL-style)
-            // User can press Escape to return to Normal mode
-            info!("Prompt submitted, staying in {:?} mode", mode.0);
-        }
-    }
-}
 
 /// Send submitted prompts to the server.
 ///
@@ -1123,33 +901,6 @@ pub fn handle_prompt_submitted(
 }
 
 /// Auto-focus the prompt cell when entering Input mode.
-///
-/// In conversation UI, input modes normally mean typing in the prompt.
-/// However, if a BlockCell is being edited (has EditingBlockCell marker),
-/// we skip this to let the block keep focus.
-pub fn auto_focus_prompt(
-    mode: Res<CurrentMode>,
-    mut focused: ResMut<FocusedCell>,
-    prompt_entity: Res<PromptCellEntity>,
-    editing_blocks: Query<Entity, With<EditingBlockCell>>,
-) {
-    // Only when entering Input mode
-    if !mode.is_changed() || !mode.0.accepts_input() {
-        return;
-    }
-
-    // Don't steal focus if we're editing a BlockCell
-    if !editing_blocks.is_empty() {
-        return;
-    }
-
-    // Focus the prompt when entering Input mode (no block being edited)
-    if let Some(entity) = prompt_entity.0 {
-        focused.0 = Some(entity);
-        info!("Focused prompt cell for {} mode", mode.0.name());
-    }
-}
-
 /// Smooth scroll interpolation system.
 ///
 /// Runs every frame to smoothly interpolate scroll position toward target.
@@ -2816,34 +2567,10 @@ pub fn sync_input_shadow_height(
     }
 }
 
-/// Sync PromptCell visibility with InputPresence.
-///
-/// PromptCell is a root entity (not parented to InputLayer) so it needs
-/// its own visibility management for glyphon text extraction. Without this,
-/// the glyphon text renders even when the input area is hidden.
-pub fn sync_prompt_visibility(
-    presence: Res<InputPresence>,
-    prompt_entity: Res<PromptCellEntity>,
-    mut query: Query<&mut Visibility>,
-) {
-    if !presence.is_changed() {
-        return;
-    }
-
-    let Some(entity) = prompt_entity.0 else { return };
-    let Ok(mut vis) = query.get_mut(entity) else { return };
-
-    *vis = if presence.is_visible() {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
-}
-
 /// Sync InputPresence with AppScreen state.
 ///
-/// When transitioning to Dashboard, hide the input.
-/// When transitioning to Conversation, show docked (unless already in a valid state).
+/// InputPresence is kept Hidden - the legacy input layer is no longer used.
+/// ComposeBlock handles input inline within the conversation flow.
 pub fn sync_presence_with_screen(
     screen: Res<State<AppScreen>>,
     mut presence: ResMut<InputPresence>,
@@ -2852,28 +2579,17 @@ pub fn sync_presence_with_screen(
         return;
     }
 
-    match screen.get() {
-        AppScreen::Dashboard => {
-            // Hide input when on dashboard
-            presence.0 = InputPresenceKind::Hidden;
-            info!("AppScreen::Dashboard -> Presence: HIDDEN");
-        }
-        AppScreen::Conversation => {
-            // Show minimized when entering conversation (user can expand with i/Space)
-            // Only change if currently hidden - don't override if already docked/overlay
-            if matches!(presence.0, InputPresenceKind::Hidden) {
-                presence.0 = InputPresenceKind::Minimized;
-                info!("AppScreen::Conversation -> Presence: MINIMIZED");
-            }
-        }
-    }
+    // Keep presence Hidden always - ComposeBlock handles input inline
+    // The legacy InputLayer and floating prompt have been removed
+    presence.0 = InputPresenceKind::Hidden;
 }
 
 // ============================================================================
-// BLOCK CELL EDITING SYSTEMS (Phase 1: Unified Edit Model)
+// BLOCK CELL EDITING SYSTEMS (Unified Edit Model)
 // ============================================================================
 //
-// These systems enable editing any BlockCell, not just the PromptCell.
+// These systems enable editing any BlockCell. ComposeBlock handles new input
+// while existing blocks can be edited inline.
 // The core insight: "mode emerges from focus + edit state, not a global switch"
 //
 // Flow:
@@ -2889,8 +2605,8 @@ pub fn sync_presence_with_screen(
 /// - `Escape` in edit mode → Exit edit mode, return to Normal
 ///
 /// This system modifies mode_switch behavior:
-/// - When a BlockCell is focused, `i` edits that block instead of the prompt
-/// - When no BlockCell is focused, `i` still goes to the prompt (existing behavior)
+/// - When a BlockCell is focused, `i` edits that block instead of ComposeBlock
+/// - When no BlockCell is focused, `i` still routes to ComposeBlock for new input
 pub fn handle_block_edit_mode(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,

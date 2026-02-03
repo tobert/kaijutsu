@@ -197,20 +197,6 @@ impl CellEditor {
     // TEXT MUTATION
     // =========================================================================
 
-    /// Clear all content.
-    pub fn clear(&mut self) {
-        let block_ids: Vec<_> = self
-            .doc
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.id.clone())
-            .collect();
-        for id in block_ids {
-            let _ = self.doc.delete_block(&id);
-        }
-        self.cursor = BlockCursor::default();
-    }
-
     /// Insert text at cursor position.
     pub fn insert(&mut self, text: &str) {
         // Ensure we have a block to insert into
@@ -379,14 +365,6 @@ pub struct CellState {
     pub computed_height: f32,
 }
 
-impl CellState {
-    pub fn new() -> Self {
-        Self {
-            collapsed: false,
-            computed_height: 100.0,
-        }
-    }
-}
 
 /// Input routing kind for text entry modes.
 ///
@@ -611,24 +589,6 @@ impl WorkspaceLayout {
 #[derive(Component, Reflect)]
 #[reflect(Component)]
 pub struct ConversationContainer;
-
-/// Marker for the fixed prompt input area at the bottom.
-///
-/// FUTURE: The prompt might become mobile - attaching to focused BlockCells
-/// for threaded reply workflows instead of being fixed at bottom.
-#[derive(Component, Reflect)]
-#[reflect(Component)]
-pub struct PromptContainer;
-
-/// Marker for the prompt input cell (the editable text input at bottom).
-/// This cell captures input in INSERT mode and submits on Enter.
-///
-/// FUTURE: Input capabilities might move to BlockCells directly, or
-/// PromptCell could "attach" to a focused block for reply-to workflows.
-/// Current implementation uses legacy GlyphonText + TextAreaConfig rendering.
-#[derive(Component, Reflect)]
-#[reflect(Component)]
-pub struct PromptCell;
 
 /// Marker for the compose block - an inline editable block at the end of conversation.
 ///

@@ -23,6 +23,8 @@ mod plugin;
 mod registry;
 mod systems;
 
+#[allow(unused_imports)]
 pub use components::*;
 pub use plugin::AgentsPlugin;
+#[allow(unused_imports)]
 pub use registry::*;
