@@ -30,6 +30,12 @@ rusqlite.workspace = true
 # Enum string conversion
 strum = { version = "0.26", features = ["derive"] }
 
+# File watching
+notify = "7"
+
+# Config parsing (for validation)
+ron = "0.9"
+
 # Scripting
 rhai.workspace = true
 

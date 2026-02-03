@@ -307,7 +307,8 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  attachKernel @2 (id :Text) -> (kernel :Kernel);
+  # Attach to an existing kernel. seatId defaults to hostname if not provided.
+  attachKernel @2 (id :Text, seatId :Text) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
 
   # Seat management (cross-kernel)
@@ -467,6 +468,27 @@ interface Kernel {
   # Get document version history for timeline scrubber
   # Returns list of significant versions (block additions, major edits)
   getDocumentHistory @68 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
+
+  # ============================================================================
+  # Configuration (Phase 2: Config as CRDT)
+  # ============================================================================
+  # Config files (theme.rhai, seats/*.rhai) are managed as CRDT documents.
+  # These methods provide safety valves for when CRDT gets into a bad state.
+
+  # List loaded config documents
+  listConfigs @69 () -> (configs :List(Text));
+
+  # Reload a config file from disk, discarding CRDT changes (safety valve)
+  reloadConfig @70 (path :Text) -> (success :Bool, error :Text);
+
+  # Reset a config file to embedded default
+  resetConfig @71 (path :Text) -> (success :Bool, error :Text);
+
+  # Get config content (from CRDT)
+  getConfig @72 (path :Text) -> (content :Text, error :Text);
+
+  # Ensure seat config exists for the current connection
+  ensureSeatConfig @73 (seatId :Text) -> (success :Bool, error :Text);
 }
 
 # Capability for interacting with a seat

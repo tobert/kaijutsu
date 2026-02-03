@@ -31,9 +31,12 @@ use kaijutsu_kernel::{
     McpServerPool, McpServerConfig, McpToolEngine,
     // FlowBus
     BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
+    SharedConfigFlowBus, shared_config_flow_bus,
     block_store::BlockStore,
     // Agents
     AgentCapability, AgentConfig, AgentInfo, AgentStatus, AgentActivityEvent,
+    // Config
+    ConfigCrdtBackend, ConfigWatcherHandle,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -312,6 +315,72 @@ fn ensure_main_document(
     Ok(main_document_id)
 }
 
+/// Get the config directory path.
+/// Returns: ~/.config/kaijutsu/
+fn config_dir() -> std::path::PathBuf {
+    kaish_kernel::xdg_config_home()
+        .join("kaijutsu")
+}
+
+/// Get the default seat ID (hostname).
+fn get_default_seat_id() -> String {
+    // Try hostname crate first
+    if let Ok(name) = hostname::get() {
+        if let Some(name_str) = name.to_str() {
+            if !name_str.is_empty() {
+                return name_str.to_string();
+            }
+        }
+    }
+
+    // Fallback to reading /etc/hostname
+    if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
+        let hostname = hostname.trim();
+        if !hostname.is_empty() {
+            return hostname.to_string();
+        }
+    }
+
+    // Ultimate fallback
+    "default".to_string()
+}
+
+/// Create and initialize the config CRDT backend.
+///
+/// This loads config files into CRDT documents and starts the file watcher.
+/// Returns the backend and optional watcher handle.
+async fn create_config_backend(
+    documents: SharedBlockStore,
+    config_flows: SharedConfigFlowBus,
+) -> (Arc<ConfigCrdtBackend>, Option<ConfigWatcherHandle>) {
+    let config_path = config_dir();
+
+    let backend = Arc::new(ConfigCrdtBackend::with_flows(
+        documents,
+        config_path,
+        config_flows,
+    ));
+
+    // Load base theme config
+    if let Err(e) = backend.ensure_config("theme.rhai").await {
+        log::warn!("Failed to load theme.rhai: {}", e);
+    }
+
+    // Start the file watcher
+    let watcher = match backend.start_watcher() {
+        Ok(handle) => {
+            log::info!("Config file watcher started");
+            Some(handle)
+        }
+        Err(e) => {
+            log::warn!("Failed to start config watcher: {}", e);
+            None
+        }
+    };
+
+    (backend, watcher)
+}
+
 pub struct KernelState {
     pub id: String,
     pub name: String,
@@ -329,6 +398,10 @@ pub struct KernelState {
     pub contexts: HashMap<String, ContextState>,
     /// Thread-safe context manager for shell access
     pub context_manager: Arc<ContextManager>,
+    /// Config CRDT backend (manages theme.rhai, seats/*.rhai)
+    pub config_backend: Arc<ConfigCrdtBackend>,
+    /// Config watcher handle (stops when kernel is dropped)
+    pub config_watcher: Option<ConfigWatcherHandle>,
 }
 
 #[derive(Clone, Copy)]
@@ -400,7 +473,22 @@ impl world::Server for WorldImpl {
         params: world::AttachKernelParams,
         mut results: world::AttachKernelResults,
     ) -> Promise<(), capnp::Error> {
-        let id = pry!(pry!(pry!(params.get()).get_id()).to_str()).to_owned();
+        let params_reader = pry!(params.get());
+        let id = pry!(pry!(params_reader.get_id()).to_str()).to_owned();
+
+        // Get seat_id, defaulting to hostname if not provided or empty
+        let seat_id = match params_reader.get_seat_id() {
+            Ok(s) => {
+                let s = pry!(s.to_str());
+                if s.is_empty() {
+                    get_default_seat_id()
+                } else {
+                    s.to_owned()
+                }
+            }
+            Err(_) => get_default_seat_id(),
+        };
+
         let state = self.state.clone();
 
         Promise::from_future(async move {
@@ -413,6 +501,7 @@ impl world::Server for WorldImpl {
             if needs_create {
                 // Create shared FlowBus first - shared between Kernel and BlockStore
                 let block_flows = shared_block_flow_bus(1024);
+                let config_flows = shared_config_flow_bus(256);
 
                 // Create the kaijutsu kernel with shared FlowBus
                 let kernel = Kernel::with_flows(&id, block_flows.clone()).await;
@@ -428,6 +517,15 @@ impl world::Server for WorldImpl {
 
                 // Ensure main document exists (convention ID)
                 let main_document_id = ensure_main_document(&documents, &id)?;
+
+                // Create config backend and ensure seat config exists
+                let (config_backend, config_watcher) =
+                    create_config_backend(documents.clone(), config_flows).await;
+
+                // Ensure seat-specific config exists
+                if let Err(e) = config_backend.ensure_seat_config(&seat_id).await {
+                    log::warn!("Failed to ensure seat config for '{}': {}", seat_id, e);
+                }
 
                 // Get identity for context manager
                 let nick = {
@@ -464,6 +562,8 @@ impl world::Server for WorldImpl {
                         main_document_id,
                         contexts,
                         context_manager,
+                        config_backend,
+                        config_watcher,
                     },
                 );
             }
@@ -496,6 +596,7 @@ impl world::Server for WorldImpl {
 
             // Create shared FlowBus first - shared between Kernel and BlockStore
             let block_flows = shared_block_flow_bus(1024);
+            let config_flows = shared_config_flow_bus(256);
 
             // Create the kaijutsu kernel with shared FlowBus
             let kernel = Kernel::with_flows(&name, block_flows.clone()).await;
@@ -511,6 +612,10 @@ impl world::Server for WorldImpl {
 
             // Ensure main document exists (convention ID)
             let main_document_id = ensure_main_document(&documents, &id)?;
+
+            // Create config backend
+            let (config_backend, config_watcher) =
+                create_config_backend(documents.clone(), config_flows).await;
 
             // Get identity for context manager
             let nick = {
@@ -548,6 +653,8 @@ impl world::Server for WorldImpl {
                         main_document_id,
                         contexts,
                         context_manager,
+                        config_backend,
+                        config_watcher,
                     },
                 );
             }
@@ -3134,6 +3241,159 @@ impl kernel::Server for KernelImpl {
             snapshot_count, current_version
         );
         Promise::ok(())
+    }
+
+    // =========================================================================
+    // Config Methods (Phase 2: Config as CRDT)
+    // =========================================================================
+
+    fn list_configs(
+        self: Rc<Self>,
+        _params: kernel::ListConfigsParams,
+        mut results: kernel::ListConfigsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state_ref = self.state.borrow();
+        let kernel_state = match state_ref.kernels.get(&self.kernel_id) {
+            Some(ks) => ks,
+            None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+
+        let configs = kernel_state.config_backend.list_configs();
+        let mut builder = results.get().init_configs(configs.len() as u32);
+        for (i, config) in configs.iter().enumerate() {
+            builder.set(i as u32, config);
+        }
+
+        Promise::ok(())
+    }
+
+    fn reload_config(
+        self: Rc<Self>,
+        params: kernel::ReloadConfigParams,
+        mut results: kernel::ReloadConfigResults,
+    ) -> Promise<(), capnp::Error> {
+        let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let config_backend = {
+                let state_ref = state.borrow();
+                let kernel_state = match state_ref.kernels.get(&kernel_id) {
+                    Some(ks) => ks,
+                    None => return Err(capnp::Error::failed("Kernel not found".into())),
+                };
+                kernel_state.config_backend.clone()
+            };
+
+            match config_backend.reload_from_disk(&path).await {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&format!("{}", e));
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn reset_config(
+        self: Rc<Self>,
+        params: kernel::ResetConfigParams,
+        mut results: kernel::ResetConfigResults,
+    ) -> Promise<(), capnp::Error> {
+        let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let config_backend = {
+                let state_ref = state.borrow();
+                let kernel_state = match state_ref.kernels.get(&kernel_id) {
+                    Some(ks) => ks,
+                    None => return Err(capnp::Error::failed("Kernel not found".into())),
+                };
+                kernel_state.config_backend.clone()
+            };
+
+            match config_backend.reset_to_default(&path).await {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&format!("{}", e));
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn get_config(
+        self: Rc<Self>,
+        params: kernel::GetConfigParams,
+        mut results: kernel::GetConfigResults,
+    ) -> Promise<(), capnp::Error> {
+        let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
+
+        let state_ref = self.state.borrow();
+        let kernel_state = match state_ref.kernels.get(&self.kernel_id) {
+            Some(ks) => ks,
+            None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+
+        match kernel_state.config_backend.get_content(&path) {
+            Ok(content) => {
+                results.get().set_content(&content);
+                results.get().set_error("");
+            }
+            Err(e) => {
+                results.get().set_content("");
+                results.get().set_error(&format!("{}", e));
+            }
+        }
+
+        Promise::ok(())
+    }
+
+    fn ensure_seat_config(
+        self: Rc<Self>,
+        params: kernel::EnsureSeatConfigParams,
+        mut results: kernel::EnsureSeatConfigResults,
+    ) -> Promise<(), capnp::Error> {
+        let seat_id = pry!(pry!(pry!(params.get()).get_seat_id()).to_str()).to_owned();
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let config_backend = {
+                let state_ref = state.borrow();
+                let kernel_state = match state_ref.kernels.get(&kernel_id) {
+                    Some(ks) => ks,
+                    None => return Err(capnp::Error::failed("Kernel not found".into())),
+                };
+                kernel_state.config_backend.clone()
+            };
+
+            match config_backend.ensure_seat_config(&seat_id).await {
+                Ok(_) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&format!("{}", e));
+                }
+            }
+
+            Ok(())
+        })
     }
 }
 

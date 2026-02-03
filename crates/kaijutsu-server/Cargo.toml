@@ -37,6 +37,9 @@ tracing = "0.1"
 # File watching for external tool changes (cargo, clippy, etc.)
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 
+# Hostname detection for default seat ID
+hostname = "0.3"
+
 # No separate russh-keys needed - russh 0.56 includes keys module
 
 [build-dependencies]

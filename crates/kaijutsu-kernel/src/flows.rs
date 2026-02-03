@@ -713,6 +713,124 @@ impl HasSubject for ElicitationFlow {
 }
 
 // ============================================================================
+// Config Flow Events
+// ============================================================================
+
+/// Source of a config file load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ConfigSource {
+    /// Loaded from disk file.
+    #[default]
+    Disk,
+    /// Loaded from CRDT (possibly edited by agent/user).
+    Crdt,
+    /// Using embedded default (fallback).
+    Default,
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disk => write!(f, "disk"),
+            Self::Crdt => write!(f, "crdt"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+/// Config-related flow events.
+///
+/// These events are emitted when config files are loaded, changed, or reloaded.
+/// The config system supports both file-backed and CRDT-backed config documents.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ConfigFlow {
+    /// A config file was loaded (at startup or on demand).
+    Loaded {
+        /// Relative path within config directory (e.g., "theme.rhai").
+        path: String,
+        /// Where the config was loaded from.
+        source: ConfigSource,
+        /// Content of the loaded config.
+        content: String,
+    },
+
+    /// Config content changed (either from CRDT edit or file watcher).
+    Changed {
+        /// Relative path within config directory.
+        path: String,
+        /// Serialized CRDT operations (for sync).
+        ops: Vec<u8>,
+        /// Origin of this operation (Local or Remote).
+        source: OpSource,
+    },
+
+    /// User requested a config reload from disk (safety valve).
+    ReloadRequested {
+        /// Relative path within config directory (or "all" for all configs).
+        path: String,
+    },
+
+    /// Config was reset to embedded default.
+    Reset {
+        /// Relative path within config directory.
+        path: String,
+    },
+
+    /// Config validation failed (on flush to disk or apply).
+    ValidationFailed {
+        /// Relative path within config directory.
+        path: String,
+        /// Error message describing the validation failure.
+        error: String,
+        /// Content that failed validation.
+        content: String,
+    },
+}
+
+impl ConfigFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Loaded { .. } => "config.loaded",
+            Self::Changed { .. } => "config.changed",
+            Self::ReloadRequested { .. } => "config.reload_requested",
+            Self::Reset { .. } => "config.reset",
+            Self::ValidationFailed { .. } => "config.validation_failed",
+        }
+    }
+
+    /// Get the path for this event.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Loaded { path, .. }
+            | Self::Changed { path, .. }
+            | Self::ReloadRequested { path, .. }
+            | Self::Reset { path, .. }
+            | Self::ValidationFailed { path, .. } => path,
+        }
+    }
+
+    /// Get the source of this event (for Changed events).
+    pub fn op_source(&self) -> Option<OpSource> {
+        match self {
+            Self::Changed { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
+
+    /// Check if this event originated locally.
+    pub fn is_local(&self) -> bool {
+        self.op_source() == Some(OpSource::Local)
+    }
+}
+
+impl HasSubject for ConfigFlow {
+    fn subject(&self) -> &str {
+        ConfigFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Logging Flow Events
 // ============================================================================
 
@@ -776,6 +894,9 @@ pub type SharedElicitationFlowBus = Arc<FlowBus<ElicitationFlow>>;
 /// Thread-safe handle to a LoggingFlow bus.
 pub type SharedLoggingFlowBus = Arc<FlowBus<LoggingFlow>>;
 
+/// Thread-safe handle to a ConfigFlow bus.
+pub type SharedConfigFlowBus = Arc<FlowBus<ConfigFlow>>;
+
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
     Arc::new(FlowBus::new(capacity))
@@ -798,6 +919,11 @@ pub fn shared_elicitation_flow_bus(capacity: usize) -> SharedElicitationFlowBus 
 
 /// Create a new shared logging flow bus.
 pub fn shared_logging_flow_bus(capacity: usize) -> SharedLoggingFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared config flow bus.
+pub fn shared_config_flow_bus(capacity: usize) -> SharedConfigFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 

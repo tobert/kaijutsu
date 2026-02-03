@@ -40,6 +40,9 @@ pub enum DocumentKind {
     Text,
     /// Git-backed document (repo:branch → 1 doc, file → 1 block)
     Git,
+    /// Configuration file (theme.rhai, seats/*.rhai)
+    #[strum(serialize = "config")]
+    Config,
 }
 
 impl DocumentKind {
@@ -49,6 +52,7 @@ impl DocumentKind {
             DocumentKind::Code => "code",
             DocumentKind::Text => "text",
             DocumentKind::Git => "git",
+            DocumentKind::Config => "config",
         }
     }
 

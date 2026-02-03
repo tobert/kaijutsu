@@ -417,3 +417,86 @@ pub fn color_to_linear_vec4(color: Color) -> Vec4 {
     let linear = color.to_linear();
     Vec4::new(linear.red, linear.green, linear.blue, linear.alpha)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Config Status (Phase 2: Config as CRDT)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Source of a loaded config file.
+#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigLoadSource {
+    /// Loaded from disk file (~/.config/kaijutsu/).
+    #[default]
+    Disk,
+    /// Loaded from CRDT document (synced from server).
+    Crdt,
+    /// Using embedded default (fallback).
+    Default,
+}
+
+impl std::fmt::Display for ConfigLoadSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disk => write!(f, "disk"),
+            Self::Crdt => write!(f, "crdt"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+/// Status of a single config file.
+#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
+#[derive(Debug, Clone, Default)]
+pub struct ConfigFileStatus {
+    /// Where the config was loaded from.
+    pub source: ConfigLoadSource,
+    /// Error message if there was a problem loading/parsing.
+    pub error: Option<String>,
+    /// Version counter (increments on changes).
+    pub version: u64,
+    /// Whether the config has pending CRDT changes not yet applied.
+    pub pending_changes: bool,
+}
+
+#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
+impl ConfigFileStatus {
+    /// Create a successful status.
+    pub fn success(source: ConfigLoadSource, version: u64) -> Self {
+        Self {
+            source,
+            error: None,
+            version,
+            pending_changes: false,
+        }
+    }
+
+    /// Create an error status.
+    pub fn with_error(source: ConfigLoadSource, error: impl Into<String>) -> Self {
+        Self {
+            source,
+            error: Some(error.into()),
+            version: 0,
+            pending_changes: false,
+        }
+    }
+}
+
+/// Resource tracking the status of all config files.
+///
+/// Used for:
+/// - Showing config status in UI (loaded, errors, pending changes)
+/// - Triggering theme reloads when config changes
+/// - Debugging config issues
+#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
+#[derive(Resource, Default)]
+pub struct ConfigStatus {
+    /// Status of the base theme (theme.rhai).
+    pub theme: ConfigFileStatus,
+    /// Status of the current seat config (seats/{seat_id}.rhai).
+    pub seat: ConfigFileStatus,
+    /// Current seat ID (hostname by default).
+    pub seat_id: String,
+    /// Whether live reload is enabled (Phase 3+).
+    pub live_reload_enabled: bool,
+}

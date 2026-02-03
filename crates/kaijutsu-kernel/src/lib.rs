@@ -14,6 +14,7 @@
 pub mod agents;
 pub mod block_store;
 pub mod block_tools;
+pub mod config_backend;
 pub mod control;
 pub mod conversation;
 pub mod conversation_db;
@@ -62,6 +63,11 @@ pub use mcp_pool::{
     // Resource types
     CachedResource, McpResourceInfo, ResourceCache,
 };
+pub use config_backend::{
+    ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
+    ConfigWatcherHandle, ValidationResult,
+    DEFAULT_THEME, EXAMPLE_SEAT,
+};
 
 // Re-export rmcp types needed for resource handling
 pub use rmcp::model::ResourceContents as McpResourceContents;
@@ -77,4 +83,6 @@ pub use flows::{
     SharedElicitationFlowBus, shared_elicitation_flow_bus,
     // Logging flow types
     LoggingFlow, SharedLoggingFlowBus, shared_logging_flow_bus,
+    // Config flow types
+    ConfigFlow, ConfigSource, SharedConfigFlowBus, shared_config_flow_bus,
 };
