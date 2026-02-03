@@ -103,17 +103,6 @@ impl View {
         }
     }
 
-    /// Get the RON layout preset name for this view.
-    ///
-    /// Maps view variants to layout file names in assets/layouts/.
-    pub fn layout_name(&self) -> &'static str {
-        match self {
-            View::Dashboard => "dashboard",
-            View::Conversation { .. } => "conversation",
-            View::ExpandedBlock { .. } => "expanded_block",
-        }
-    }
-
     /// Get the root container type for this view.
     ///
     /// Used by the layout reconciler to find the correct parent entity.
@@ -271,14 +260,13 @@ fn hide_dashboard(
 /// Show the conversation view when entering Conversation state
 fn show_conversation(
     mut query: Query<(&mut Node, &mut Visibility), With<ConversationRoot>>,
-    mut presence: ResMut<InputPresence>,
 ) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
-    // Restore input area when entering conversation
-    presence.0 = InputPresenceKind::Docked;
+    // NOTE: InputPresence stays Hidden - ComposeBlock is the inline input now
+    // Legacy floating input layer has been removed
 }
 
 /// Hide the conversation view when leaving Conversation state
@@ -348,11 +336,11 @@ pub enum InputPresenceKind {
     /// Floating centered overlay with backdrop
     Overlay,
     /// Pinned to dock position (bottom, bottom-right, etc.)
-    #[default]
     Docked,
     /// Collapsed to thin chasing line at bottom
     Minimized,
-    /// Completely hidden (Dashboard state)
+    /// Completely hidden (Dashboard state, or when using ComposeBlock)
+    #[default]
     Hidden,
 }
 

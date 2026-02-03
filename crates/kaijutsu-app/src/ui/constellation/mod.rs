@@ -152,13 +152,6 @@ pub struct Constellation {
 }
 
 impl Constellation {
-    /// Get the currently focused node
-    pub fn focused_node(&self) -> Option<&ContextNode> {
-        self.focus_id
-            .as_ref()
-            .and_then(|id| self.nodes.iter().find(|n| &n.context_id == id))
-    }
-
     /// Get a mutable reference to the focused node
     pub fn focused_node_mut(&mut self) -> Option<&mut ContextNode> {
         let focus_id = self.focus_id.clone();
@@ -166,13 +159,8 @@ impl Constellation {
     }
 
     /// Get node by context ID
-    pub fn node_by_id(&self, id: &str) -> Option<&ContextNode> {
+    fn node_by_id(&self, id: &str) -> Option<&ContextNode> {
         self.nodes.iter().find(|n| n.context_id == id)
-    }
-
-    /// Get mutable node by context ID
-    pub fn node_by_id_mut(&mut self, id: &str) -> Option<&mut ContextNode> {
-        self.nodes.iter_mut().find(|n| n.context_id == id)
     }
 
     /// Add a new context node
@@ -199,21 +187,6 @@ impl Constellation {
         // If no focus, set this as focus
         if self.focus_id.is_none() {
             self.focus_id = Some(context_id);
-        }
-    }
-
-    /// Remove a context node
-    pub fn remove_node(&mut self, context_id: &str) {
-        self.nodes.retain(|n| n.context_id != context_id);
-
-        // Update focus if we removed the focused node
-        if self.focus_id.as_deref() == Some(context_id) {
-            self.focus_id = self.nodes.first().map(|n| n.context_id.clone());
-        }
-
-        // Update alternate if we removed it
-        if self.alternate_id.as_deref() == Some(context_id) {
-            self.alternate_id = None;
         }
     }
 

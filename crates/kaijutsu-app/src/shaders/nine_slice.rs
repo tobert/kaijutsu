@@ -52,13 +52,6 @@ impl Default for CornerMaterial {
     }
 }
 
-impl CornerMaterial {
-    /// Create a corner with specific dimensions
-    pub fn with_dimensions(mut self, width: f32, height: f32, corner_size: f32) -> Self {
-        self.dimensions = Vec4::new(width, height, corner_size, 1.0);
-        self
-    }
-}
 
 impl UiMaterial for CornerMaterial {
     fn fragment_shader() -> ShaderRef {

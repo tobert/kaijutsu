@@ -105,11 +105,13 @@ pub struct HudPlacement {
 #[derive(Debug, Clone, Deserialize, Asset, TypePath)]
 pub struct LayoutPreset {
     /// Preset name (for display/reference)
+    #[allow(dead_code)] // RON field
     pub name: String,
     /// Root layout node
     pub root: LayoutNode,
     /// HUD placements (overlay widgets)
     #[serde(default)]
+    #[allow(dead_code)] // RON field, used in tests
     pub huds: Vec<HudPlacement>,
 }
 
@@ -122,20 +124,16 @@ pub struct LayoutPreset {
 pub struct PanelTypeId(u32);
 
 /// Context passed to panel builder functions.
-pub struct PanelSpawnContext<'a> {
-    /// Parent entity to spawn under
-    pub parent: Entity,
+pub struct PanelSpawnContext {
     /// Flex grow factor from layout
     pub flex: f32,
-    /// Current theme
-    pub theme: &'a crate::ui::theme::Theme,
 }
 
 /// Function type for panel spawning.
 ///
 /// Panel builders receive a Commands reference and context,
 /// return the root entity of the spawned panel.
-pub type PanelBuilder = Box<dyn Fn(&mut Commands, &PanelSpawnContext) -> Entity + Send + Sync>;
+pub type PanelBuilder = Box<dyn Fn(&mut Commands, PanelSpawnContext) -> Entity + Send + Sync>;
 
 /// Registry mapping panel names to spawn capabilities.
 ///
@@ -173,7 +171,7 @@ impl PanelRegistry {
     pub fn register_with_builder(
         &mut self,
         name: impl Into<String>,
-        builder: impl Fn(&mut Commands, &PanelSpawnContext) -> Entity + Send + Sync + 'static,
+        builder: impl Fn(&mut Commands, PanelSpawnContext) -> Entity + Send + Sync + 'static,
     ) -> PanelTypeId {
         let id = self.register(name);
         self.builders.insert(id, Box::new(builder));
@@ -183,11 +181,6 @@ impl PanelRegistry {
     /// Get panel type ID by name.
     pub fn get(&self, name: &str) -> Option<PanelTypeId> {
         self.name_to_id.get(name).copied()
-    }
-
-    /// Get panel name by ID.
-    pub fn name(&self, id: PanelTypeId) -> Option<&str> {
-        self.id_to_name.get(&id).map(|s| s.as_str())
     }
 
     /// Check if a panel has a builder registered.
@@ -202,7 +195,7 @@ impl PanelRegistry {
         &self,
         id: PanelTypeId,
         commands: &mut Commands,
-        ctx: &PanelSpawnContext,
+        ctx: PanelSpawnContext,
     ) -> Option<Entity> {
         self.builders.get(&id).map(|builder| builder(commands, ctx))
     }
@@ -226,17 +219,6 @@ pub struct LoadedLayouts {
     pub active: Option<String>,
 }
 
-impl LoadedLayouts {
-    /// Get a layout handle by name.
-    pub fn get(&self, name: &str) -> Option<&Handle<LayoutPreset>> {
-        self.presets.get(name)
-    }
-
-    /// Get list of available layout names.
-    pub fn available_layouts(&self) -> Vec<&str> {
-        self.presets.keys().map(|s| s.as_str()).collect()
-    }
-}
 
 // ============================================================================
 // LAYOUT SWITCHING
@@ -256,6 +238,7 @@ pub struct SwitchLayoutRequest {
 #[derive(Message)]
 pub struct LayoutSwitched {
     /// Name of the layout that was applied
+    #[allow(dead_code)] // Written for future readers
     pub layout_name: String,
 }
 
@@ -389,11 +372,11 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     });
 
     // InputShadow - reserves space at bottom for docked input (legacy)
+    // No longer spawns PromptContainer - ComposeBlock handles input inline
     registry.register_with_builder("InputShadow", |commands, ctx| {
         commands
             .spawn((
                 super::state::InputShadow,
-                crate::cell::PromptContainer,
                 Node {
                     width: Val::Percent(100.0),
                     flex_grow: ctx.flex,
@@ -439,10 +422,9 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     // TODO: Move constellation spawning to a builder
     registry.register("ConstellationMini");
 
-    // InputFrame and PromptCell - spawned by the frame_assembly system
-    // These are handled by the existing input layer system, not the layout system
+    // InputFrame - legacy, kept for layout compatibility
+    // PromptCell removed - ComposeBlock handles input inline
     registry.register("InputFrame");
-    registry.register("PromptCell");
 
     // =========================================================================
     // DASHBOARD VIEW PANELS
@@ -625,8 +607,6 @@ mod tests {
         assert_eq!(registry.get("TestPanel"), Some(id1));
         assert_eq!(registry.get("AnotherPanel"), Some(id2));
         assert_eq!(registry.get("NonExistent"), None);
-
-        assert_eq!(registry.name(id1), Some("TestPanel"));
     }
 
     #[test]

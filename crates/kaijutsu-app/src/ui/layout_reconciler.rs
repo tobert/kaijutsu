@@ -198,13 +198,9 @@ fn spawn_node(
         }
         LayoutNode::Panel { id, flex } => {
             if let Some(panel_id) = registry.get(id) {
-                let ctx = PanelSpawnContext {
-                    parent,
-                    flex: *flex,
-                    theme,
-                };
+                let ctx = PanelSpawnContext { flex: *flex };
 
-                if let Some(entity) = registry.spawn(panel_id, commands, &ctx) {
+                if let Some(entity) = registry.spawn(panel_id, commands, ctx) {
                     // Mark spawned panel as layout-managed and add as child
                     commands.entity(entity).insert(LayoutManaged {
                         layout_name: layout_name.to_string(),
