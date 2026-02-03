@@ -3,7 +3,8 @@
 use bevy::prelude::*;
 
 use super::components::{
-    BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
+    BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
+    BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
     ConversationContainer, ConversationFocus, ConversationScrollState, CurrentMode,
     DocumentSyncState, EditorMode, FocusedCell, LayoutGeneration, MainCell, PromptCell,
     PromptContainer, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
@@ -40,7 +41,12 @@ impl Plugin for CellPlugin {
             .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
-            .register_type::<RoleHeaderLayout>();
+            .register_type::<RoleHeaderLayout>()
+            // Bubble types
+            .register_type::<BubbleState>()
+            .register_type::<BubblePosition>()
+            .register_type::<BubbleSpawnContext>()
+            .register_type::<BubbleConfig>();
 
         app.init_resource::<FocusedCell>()
             .init_resource::<CurrentMode>()
@@ -59,6 +65,9 @@ impl Plugin for CellPlugin {
             .init_resource::<InputDock>()
             .init_resource::<InputPosition>()
             .init_resource::<InputShadowHeight>()
+            // Bubble system resources
+            .init_resource::<BubbleRegistry>()
+            .init_resource::<BubbleConfig>()
             // Input and mode handling (mode_switch must run before cell_input)
             // Block edit mode intercepts `i` when a BlockCell is focused
             .add_systems(
@@ -203,6 +212,50 @@ impl Plugin for CellPlugin {
                         .before(systems::handle_prompt_submit),
                     systems::sync_compose_block_buffer
                         .after(systems::handle_compose_block_input),
+                    // Position compose block after Bevy's UI layout runs
+                    systems::position_compose_block
+                        .after(bevy::ui::UiSystems::Prepare)
+                        .after(systems::sync_compose_block_buffer),
+                ),
+            )
+            // Mobile input bubble systems
+            // These enable floating CRDT-backed input bubbles that can be stashed/recalled
+            .add_systems(
+                Update,
+                (
+                    // Spawn: Space in Normal mode creates/recalls bubble
+                    systems::handle_bubble_spawn
+                        .after(systems::clear_consumed_keys)
+                        .before(systems::handle_mode_switch),
+                    // Navigation: Tab cycles stashed, Esc stashes active
+                    systems::handle_bubble_navigation
+                        .after(systems::handle_bubble_spawn)
+                        .before(systems::handle_mode_switch),
+                    // Input: Route keyboard to active bubble
+                    systems::handle_bubble_input
+                        .after(systems::handle_mode_switch)
+                        .before(systems::handle_cell_input),
+                    // Submit: Enter sends content
+                    systems::handle_bubble_submit
+                        .after(systems::handle_bubble_input)
+                        .before(systems::handle_prompt_submit),
+                ),
+            )
+            // Bubble rendering systems
+            .add_systems(
+                Update,
+                (
+                    systems::init_bubble_buffers,
+                    systems::sync_bubble_buffers
+                        .after(systems::init_bubble_buffers)
+                        .after(systems::handle_bubble_input),
+                    systems::layout_bubble_position
+                        .after(systems::sync_bubble_buffers),
+                    systems::update_bubble_cursor
+                        .after(systems::layout_bubble_position)
+                        .after(systems::update_cursor),
+                    systems::sync_bubble_visibility
+                        .after(systems::layout_bubble_position),
                 ),
             )
             // 9-slice frame system

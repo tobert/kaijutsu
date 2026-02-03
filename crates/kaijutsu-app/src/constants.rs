@@ -30,6 +30,7 @@ pub struct ZLayer;
 
 impl ZLayer {
     /// Base chrome layer (header, status bar)
+    #[allow(dead_code)]
     pub const CHROME: i32 = 0;
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
@@ -41,9 +42,12 @@ impl ZLayer {
     pub const HUD: i32 = 50;
     /// Modal overlays (input layer, command palette)
     pub const MODAL: i32 = 100;
+    /// Floating input bubbles (above modal but below dropdown)
+    pub const BUBBLE_LAYER: i32 = 150;
     /// Dropdown menus (above modals)
     pub const DROPDOWN: i32 = 200;
     /// Toast notifications
+    #[allow(dead_code)]
     pub const TOAST: i32 = 250;
 }
 

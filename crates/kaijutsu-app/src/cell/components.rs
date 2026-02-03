@@ -980,3 +980,443 @@ pub struct RoleHeaderLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
 }
+
+// ============================================================================
+// MOBILE INPUT BUBBLE SYSTEM
+// ============================================================================
+//
+// ARCHITECTURE: CRDT-backed floating input bubbles that can be stashed,
+// recalled, and positioned spatially. Multiple bubbles can exist simultaneously
+// with different draft content.
+//
+// Key concepts:
+// - Each bubble owns a BlockDocument (CRDT source of truth)
+// - Bubbles can be Active (receiving input) or Stashed (minimized)
+// - Screen-relative positioning via BubblePosition
+// - Spawn context remembers focused block at creation for reply workflows
+
+/// Unique identifier for an input bubble.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect)]
+pub struct BubbleId(pub String);
+
+impl BubbleId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+impl Default for BubbleId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Mobile input bubble with CRDT-backed content.
+///
+/// Each bubble owns its own BlockDocument, enabling:
+/// - Multiple independent drafts
+/// - CRDT-based text editing
+/// - Server sync when ready
+///
+/// Note: Not reflectable due to BlockDocument lacking Default.
+#[derive(Component)]
+pub struct InputBubble {
+    /// Unique identifier for this bubble.
+    pub id: BubbleId,
+    /// The CRDT document holding bubble content (source of truth).
+    pub doc: BlockDocument,
+    /// Cursor position within the document.
+    pub cursor: BlockCursor,
+    /// Timestamp when bubble was created (for stash ordering).
+    #[allow(dead_code)]
+    pub created_at: u64,
+}
+
+impl InputBubble {
+    /// Create a new input bubble with a fresh BlockDocument.
+    pub fn new() -> Self {
+        let id = BubbleId::new();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let doc = BlockDocument::new(&id.0, &agent_id);
+        Self {
+            id,
+            doc,
+            cursor: BlockCursor::default(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Get the full text content from the bubble's document.
+    pub fn text(&self) -> String {
+        self.doc.full_text()
+    }
+
+    /// Insert text at cursor position.
+    pub fn insert(&mut self, text: &str) {
+        // Ensure we have a block to insert into
+        if self.cursor.block_id.is_none() {
+            if let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, "", "user") {
+                self.cursor.block_id = Some(block_id);
+                self.cursor.offset = 0;
+            } else {
+                return;
+            }
+        }
+
+        if let Some(ref block_id) = self.cursor.block_id
+            && self.doc.edit_text(block_id, self.cursor.offset, text, 0).is_ok()
+        {
+            self.cursor.offset += text.len();
+        }
+    }
+
+    /// Delete character before cursor (backspace).
+    pub fn backspace(&mut self) {
+        if self.cursor.offset == 0 {
+            return;
+        }
+
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            let mut new_offset = self.cursor.offset.saturating_sub(1);
+            while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                new_offset -= 1;
+            }
+            let delete_len = self.cursor.offset - new_offset;
+
+            if self.doc.edit_text(block_id, new_offset, "", delete_len).is_ok() {
+                self.cursor.offset = new_offset;
+            }
+        }
+    }
+
+    /// Delete character at cursor (delete key).
+    pub fn delete(&mut self) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            if self.cursor.offset >= text.len() {
+                return;
+            }
+
+            let mut end = self.cursor.offset + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+            let delete_len = end - self.cursor.offset;
+
+            let _ = self.doc.edit_text(block_id, self.cursor.offset, "", delete_len);
+        }
+    }
+
+    /// Move cursor left.
+    pub fn move_left(&mut self) {
+        if self.cursor.offset > 0
+            && let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            let mut new_offset = self.cursor.offset - 1;
+            while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                new_offset -= 1;
+            }
+            self.cursor.offset = new_offset;
+        }
+    }
+
+    /// Move cursor right.
+    pub fn move_right(&mut self) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            if self.cursor.offset < text.len() {
+                let mut new_offset = self.cursor.offset + 1;
+                while new_offset < text.len() && !text.is_char_boundary(new_offset) {
+                    new_offset += 1;
+                }
+                self.cursor.offset = new_offset;
+            }
+        }
+    }
+
+    /// Move cursor to start of line.
+    pub fn move_home(&mut self) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            let before_cursor = &text[..self.cursor.offset];
+            self.cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        }
+    }
+
+    /// Move cursor to end of line.
+    pub fn move_end(&mut self) {
+        if let Some(ref block_id) = self.cursor.block_id
+            && let Some(block) = self.doc.get_block_snapshot(block_id)
+        {
+            let text = block.content.clone();
+            let after_cursor = &text[self.cursor.offset..];
+            self.cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
+        }
+    }
+
+    /// Check if the bubble has any content.
+    pub fn is_empty(&self) -> bool {
+        self.text().trim().is_empty()
+    }
+
+    /// Take the text content (clears the document).
+    #[allow(dead_code)]
+    pub fn take(&mut self) -> String {
+        let text = self.text();
+        // Delete all blocks
+        let block_ids: Vec<_> = self.doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        for id in block_ids {
+            let _ = self.doc.delete_block(&id);
+        }
+        self.cursor = BlockCursor::default();
+        text
+    }
+}
+
+impl Default for InputBubble {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Context captured when a bubble is spawned.
+///
+/// Remembers the focused block at creation time so the bubble's content
+/// can be submitted as a reply to that block (or at conversation end).
+#[derive(Component, Clone, Debug, Default, Reflect)]
+#[reflect(Component)]
+pub struct BubbleSpawnContext {
+    /// The block that was focused when this bubble was created.
+    /// Future: Used for "reply to this block" workflows.
+    #[reflect(ignore)]
+    #[allow(dead_code)]
+    pub focused_block_id: Option<BlockId>,
+    /// The conversation this bubble belongs to.
+    #[allow(dead_code)]
+    pub conversation_id: String,
+}
+
+/// Visual state of a bubble.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+#[reflect(Component)]
+pub enum BubbleState {
+    /// Bubble is active and receiving input.
+    #[default]
+    Active,
+    /// Bubble is stashed (minimized to pill indicator).
+    Stashed,
+}
+
+/// Screen-relative position for a bubble.
+///
+/// Bubbles float over the conversation and can be positioned anywhere.
+/// Coordinates are percentages of screen dimensions.
+#[derive(Component, Clone, Debug, Reflect)]
+#[reflect(Component)]
+pub struct BubblePosition {
+    /// X position as percentage of screen width (0.0=left, 1.0=right).
+    pub x_percent: f32,
+    /// Y position as percentage of screen height (0.0=top, 1.0=bottom).
+    pub y_percent: f32,
+}
+
+impl Default for BubblePosition {
+    fn default() -> Self {
+        // Default: centered horizontally, lower third of screen
+        Self {
+            x_percent: 0.5,
+            y_percent: 0.7,
+        }
+    }
+}
+
+impl BubblePosition {
+    /// Create a centered position.
+    #[allow(dead_code)]
+    pub fn centered() -> Self {
+        Self {
+            x_percent: 0.5,
+            y_percent: 0.5,
+        }
+    }
+
+    /// Create a position at the bottom center.
+    pub fn bottom_center() -> Self {
+        Self {
+            x_percent: 0.5,
+            y_percent: 0.8,
+        }
+    }
+}
+
+/// Registry tracking all input bubbles.
+///
+/// Manages the lifecycle of bubbles: which is active, which are stashed,
+/// and entity lookups by BubbleId.
+#[derive(Resource, Default)]
+pub struct BubbleRegistry {
+    /// Map from BubbleId to Entity.
+    bubbles: std::collections::HashMap<BubbleId, Entity>,
+    /// The currently active bubble (receiving input).
+    active: Option<BubbleId>,
+    /// Stashed bubbles in most-recent-first order.
+    stashed: Vec<BubbleId>,
+}
+
+impl BubbleRegistry {
+    /// Register a new bubble entity.
+    pub fn register(&mut self, id: BubbleId, entity: Entity) {
+        self.bubbles.insert(id, entity);
+    }
+
+    /// Unregister a bubble.
+    pub fn unregister(&mut self, id: &BubbleId) {
+        self.bubbles.remove(id);
+        if self.active.as_ref() == Some(id) {
+            self.active = None;
+        }
+        self.stashed.retain(|sid| sid != id);
+    }
+
+    /// Set a bubble as active.
+    pub fn set_active(&mut self, id: BubbleId) {
+        // Move from stashed to active
+        self.stashed.retain(|sid| sid != &id);
+        self.active = Some(id);
+    }
+
+    /// Get the active bubble ID.
+    pub fn active(&self) -> Option<&BubbleId> {
+        self.active.as_ref()
+    }
+
+    /// Get the active bubble entity.
+    pub fn active_entity(&self) -> Option<Entity> {
+        self.active.as_ref().and_then(|id| self.bubbles.get(id).copied())
+    }
+
+    /// Stash the currently active bubble.
+    ///
+    /// Moves the active bubble to the front of the stash list.
+    pub fn stash_active(&mut self) {
+        if let Some(id) = self.active.take() {
+            // Add to front of stash (most recent first)
+            self.stashed.insert(0, id);
+        }
+    }
+
+    /// Recall the most recently stashed bubble.
+    ///
+    /// Makes it active and removes from stash.
+    pub fn recall(&mut self) -> Option<BubbleId> {
+        if self.stashed.is_empty() {
+            return None;
+        }
+        let id = self.stashed.remove(0);
+        self.active = Some(id.clone());
+        Some(id)
+    }
+
+    /// Cycle through stashed bubbles.
+    ///
+    /// Moves the current active to back of stash, recalls next.
+    pub fn cycle(&mut self) -> Option<BubbleId> {
+        if self.stashed.is_empty() {
+            return None;
+        }
+
+        // If there's an active bubble, move it to end of stash
+        if let Some(active_id) = self.active.take() {
+            self.stashed.push(active_id);
+        }
+
+        // Recall the first stashed
+        self.recall()
+    }
+
+    /// Get all stashed bubble IDs.
+    pub fn stashed(&self) -> &[BubbleId] {
+        &self.stashed
+    }
+
+    /// Get entity for a bubble ID.
+    pub fn get_entity(&self, id: &BubbleId) -> Option<Entity> {
+        self.bubbles.get(id).copied()
+    }
+
+    /// Check if there are any bubbles (active or stashed).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.active.is_none() && self.stashed.is_empty()
+    }
+
+    /// Count total bubbles.
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        (if self.active.is_some() { 1 } else { 0 }) + self.stashed.len()
+    }
+}
+
+/// Configuration for the bubble system.
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
+pub struct BubbleConfig {
+    /// Maximum number of stashed bubbles (older ones get discarded).
+    pub max_stashed: usize,
+    /// Default bubble width (pixels).
+    pub default_width: f32,
+    /// Default bubble height (pixels).
+    pub default_height: f32,
+    /// Stashed pill width (pixels).
+    pub pill_width: f32,
+    /// Stashed pill height (pixels).
+    pub pill_height: f32,
+}
+
+impl Default for BubbleConfig {
+    fn default() -> Self {
+        Self {
+            max_stashed: 5,
+            default_width: 600.0,
+            default_height: 120.0,
+            pill_width: 80.0,
+            pill_height: 24.0,
+        }
+    }
+}
+
+/// Marker for the bubble layer (world-level floating container).
+///
+/// Contains all bubble entities. Floats above the conversation
+/// with high Z-index.
+#[derive(Component, Reflect)]
+#[reflect(Component)]
+pub struct BubbleLayer;
+
+/// Marker for a stashed bubble pill indicator.
+///
+/// Future: Used for rendering stashed bubble pills in corner of screen.
+#[derive(Component, Reflect)]
+#[reflect(Component)]
+#[allow(dead_code)]
+pub struct StashedPill {
+    /// The bubble ID this pill represents.
+    #[reflect(ignore)]
+    pub bubble_id: BubbleId,
+    /// Index in the stash list (for positioning).
+    pub stash_index: usize,
+}
