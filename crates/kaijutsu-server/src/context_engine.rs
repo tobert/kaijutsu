@@ -144,6 +144,32 @@ impl ContextManager {
         self.inner.read().contexts.get(name).cloned()
     }
 
+    /// Attach a document to a context.
+    ///
+    /// If the context doesn't exist, it will be created first.
+    pub fn attach_document(&self, context_name: &str, document_id: &str, attached_by: &str) {
+        use crate::rpc::ContextDocument;
+
+        let mut inner = self.inner.write();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_millis() as u64;
+
+        let doc = ContextDocument {
+            id: document_id.to_string(),
+            attached_by: attached_by.to_string(),
+            attached_at: now,
+        };
+
+        // Ensure context exists
+        inner.contexts
+            .entry(context_name.to_string())
+            .or_insert_with(|| ContextState::new(context_name.to_string()))
+            .documents.push(doc);
+    }
+
     /// Sync state from RPC layer (called when contexts change externally).
     pub fn sync_contexts(&self, contexts: HashMap<String, ContextState>) {
         let mut inner = self.inner.write();
@@ -275,6 +301,20 @@ impl ExecutionEngine for ContextEngine {
 
     fn description(&self) -> &str {
         "Manage conversation contexts (new, switch, list, current, leave)"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "_positional": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subcommand and arguments: new|switch|list|current|leave [name]"
+                }
+            },
+            "required": []
+        }))
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {

@@ -623,6 +623,99 @@ impl KernelHandle {
         request.send().promise.await?;
         Ok(())
     }
+
+    /// Subscribe to MCP elicitation requests
+    ///
+    /// The callback will receive elicitation requests from MCP servers that
+    /// require user input. The callback must return a response for each request.
+    ///
+    /// Elicitation is a server-initiated pattern where MCP servers can request
+    /// confirmation or input from the user for operations that require consent.
+    pub async fn subscribe_mcp_elicitations(
+        &self,
+        callback: crate::kaijutsu_capnp::elicitation_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_mcp_elicitations_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Timeline / Fork operations
+    // =========================================================================
+
+    /// Fork a document at a specific version, creating a new context.
+    ///
+    /// Returns the newly created context.
+    pub async fn fork_from_version(
+        &self,
+        document_id: &str,
+        version: u64,
+        context_name: &str,
+    ) -> Result<Context, RpcError> {
+        let mut request = self.kernel.fork_from_version_request();
+        {
+            let mut params = request.get();
+            params.set_document_id(document_id);
+            params.set_version(version);
+            params.set_context_name(context_name);
+        }
+        let response = request.send().promise.await?;
+        let ctx = response.get()?.get_context()?;
+        parse_context(&ctx)
+    }
+
+    /// Cherry-pick a block from one context into another.
+    ///
+    /// Returns the new block ID in the target context.
+    pub async fn cherry_pick_block(
+        &self,
+        block_id: &kaijutsu_crdt::BlockId,
+        target_context: &str,
+    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+        let mut request = self.kernel.cherry_pick_block_request();
+        {
+            let mut params = request.get();
+            let mut source = params.reborrow().init_source_block_id();
+            source.set_document_id(&block_id.document_id);
+            source.set_agent_id(&block_id.agent_id);
+            source.set_seq(block_id.seq);
+            params.set_target_context(target_context);
+        }
+        let response = request.send().promise.await?;
+        let new_block = response.get()?.get_new_block_id()?;
+        parse_block_id(&new_block)
+    }
+
+    /// Get document history (version snapshots).
+    ///
+    /// Returns a list of version snapshots for timeline navigation.
+    pub async fn get_document_history(
+        &self,
+        document_id: &str,
+        limit: u32,
+    ) -> Result<Vec<VersionSnapshot>, RpcError> {
+        let mut request = self.kernel.get_document_history_request();
+        {
+            let mut params = request.get();
+            params.set_document_id(document_id);
+            params.set_limit(limit);
+        }
+        let response = request.send().promise.await?;
+        let snapshots = response.get()?.get_snapshots()?;
+
+        let mut result = Vec::with_capacity(snapshots.len() as usize);
+        for snap in snapshots.iter() {
+            result.push(VersionSnapshot {
+                version: snap.get_version(),
+                timestamp: snap.get_timestamp(),
+                block_count: snap.get_block_count(),
+                change_kind: snap.get_change_kind()?.to_string()?,
+            });
+        }
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -916,6 +1009,23 @@ pub struct HistoryEntry {
     pub id: u64,
     pub code: String,
     pub timestamp: u64,
+}
+
+// ============================================================================
+// Timeline Types
+// ============================================================================
+
+/// A version snapshot in document history.
+#[derive(Debug, Clone)]
+pub struct VersionSnapshot {
+    /// Version number
+    pub version: u64,
+    /// Unix timestamp (ms) when this version was created
+    pub timestamp: u64,
+    /// Number of blocks at this version
+    pub block_count: u32,
+    /// What changed ("block_added", "block_edited", etc.)
+    pub change_kind: String,
 }
 
 // ============================================================================

@@ -199,6 +199,14 @@ pub trait ExecutionEngine: Send + Sync {
     async fn interrupt(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Get the JSON Schema for tool input parameters.
+    ///
+    /// Returns the schema used to validate tool input. This enables
+    /// models to understand the expected parameters for each tool.
+    fn schema(&self) -> Option<serde_json::Value> {
+        None // Default: no schema
+    }
 }
 
 /// Registry of tools and execution engines.

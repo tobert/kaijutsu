@@ -1142,15 +1142,21 @@ impl kernel::Server for KernelImpl {
         drop(state);
 
         Promise::from_future(async move {
-            let tools = kernel.list_tools().await;
+            let registry = kernel.tools().read().await;
+            let tools = registry.list();
             let mut builder = results.get().init_schemas(tools.len() as u32);
             for (i, tool) in tools.iter().enumerate() {
                 let mut s = builder.reborrow().get(i as u32);
                 s.set_name(&tool.name);
                 s.set_description(&tool.description);
                 s.set_category(&tool.category);
-                // TODO: Add input_schema when we add schema() method to ExecutionEngine
-                s.set_input_schema("{}");
+                // Get schema from the engine if available
+                let schema = registry
+                    .get_engine(&tool.name)
+                    .and_then(|e| e.schema())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                s.set_input_schema(&schema);
             }
             Ok(())
         })
@@ -2773,6 +2779,119 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    fn subscribe_mcp_elicitations(
+        self: Rc<Self>,
+        params: kernel::SubscribeMcpElicitationsParams,
+        _results: kernel::SubscribeMcpElicitationsResults,
+    ) -> Promise<(), capnp::Error> {
+        let callback = pry!(pry!(params.get()).get_callback());
+
+        let state = self.state.borrow();
+        let mcp_pool = state.mcp_pool.clone();
+        let kernel_id = self.kernel_id.clone();
+        drop(state);
+
+        // Get the elicitation flow bus from the MCP pool
+        let elicitation_flows = mcp_pool.elicitation_flows().clone();
+
+        // Spawn a bridge task that handles elicitation request/response cycle
+        // Use spawn_local because Cap'n Proto callbacks are not Send
+        tokio::task::spawn_local(async move {
+            let mut sub = elicitation_flows.subscribe("elicitation.*");
+            log::debug!("Started ElicitationFlow subscription for kernel {}", kernel_id);
+
+            while let Some(msg) = sub.recv().await {
+                match msg.payload {
+                    kaijutsu_kernel::ElicitationFlow::Request {
+                        ref request_id,
+                        ref server,
+                        ref message,
+                        ref schema,
+                    } => {
+                        // Forward the request to the client callback and await response
+                        let mut req = callback.on_request_request();
+                        {
+                            let mut request_builder = req.get().init_request();
+                            request_builder.set_request_id(request_id);
+                            request_builder.set_server(server);
+                            request_builder.set_message(message);
+                            if let Some(s) = schema {
+                                request_builder.set_schema(&s.to_string());
+                                request_builder.set_has_schema(true);
+                            } else {
+                                request_builder.set_has_schema(false);
+                            }
+                        }
+
+                        // Await the client's response
+                        let response = match req.send().promise.await {
+                            Ok(result) => {
+                                match result.get() {
+                                    Ok(reader) => {
+                                        let response_reader = match reader.get_response() {
+                                            Ok(r) => r,
+                                            Err(_) => {
+                                                // Parse error, decline
+                                                kaijutsu_kernel::ElicitationResponse {
+                                                    action: kaijutsu_kernel::ElicitationAction::Decline,
+                                                    content: None,
+                                                }
+                                            }
+                                        };
+
+                                        // Parse the action string
+                                        let action_str = response_reader.get_action()
+                                            .unwrap_or(Ok("decline"))
+                                            .unwrap_or("decline");
+                                        let action = action_str.parse()
+                                            .unwrap_or(kaijutsu_kernel::ElicitationAction::Decline);
+
+                                        // Parse the content if present
+                                        let content = if response_reader.get_has_content() {
+                                            response_reader.get_content()
+                                                .ok()
+                                                .and_then(|s| s.to_str().ok())
+                                                .and_then(|s| serde_json::from_str(s).ok())
+                                        } else {
+                                            None
+                                        };
+
+                                        kaijutsu_kernel::ElicitationResponse { action, content }
+                                    }
+                                    Err(_) => {
+                                        // Capnp error, decline
+                                        kaijutsu_kernel::ElicitationResponse {
+                                            action: kaijutsu_kernel::ElicitationAction::Decline,
+                                            content: None,
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Network/callback error, decline
+                                log::warn!(
+                                    "Elicitation callback failed for kernel {}: {}",
+                                    kernel_id, e
+                                );
+                                kaijutsu_kernel::ElicitationResponse {
+                                    action: kaijutsu_kernel::ElicitationAction::Decline,
+                                    content: None,
+                                }
+                            }
+                        };
+
+                        // Route the response back to the MCP server
+                        mcp_pool.respond_to_elicitation(request_id, response);
+                    }
+                }
+            }
+
+            log::debug!("ElicitationFlow bridge task for kernel {} ended", kernel_id);
+        });
+
+        Promise::ok(())
+    }
+
     // ========================================================================
     // Agent Attachment (Phase 2: Collaborative Canvas)
     // ========================================================================
@@ -3112,8 +3231,22 @@ impl kernel::Server for KernelImpl {
             ));
         }
 
-        // Create a new context via join_context (creates if doesn't exist)
+        // Release the doc_entry ref before forking
+        drop(doc_entry);
+
+        // Generate new document ID for the fork
+        let new_doc_id = format!("{}@{}", kernel_id, context_name);
+
+        // Fork the document
+        if let Err(e) = kernel_state.documents.fork_document(&document_id, new_doc_id.clone()) {
+            return Promise::err(capnp::Error::failed(format!("Fork failed: {}", e)));
+        }
+
+        // Create a new context and attach the forked document
         let _seat_info = kernel_state.context_manager.join_context(&context_name);
+
+        // Attach the forked document to the new context
+        kernel_state.context_manager.attach_document(&context_name, &new_doc_id, "server");
 
         // Get the newly created context
         let context = kernel_state.context_manager.get_context(&context_name);
@@ -3126,11 +3259,22 @@ impl kernel::Server for KernelImpl {
         let mut ctx_builder = results.get().init_context();
         ctx_builder.set_name(&context.name);
 
-        // Initialize lists for documents and seats
-        ctx_builder.reborrow().init_documents(context.documents.len() as u32);
+        // Initialize and populate documents list
+        let mut docs_builder = ctx_builder.reborrow().init_documents(context.documents.len() as u32);
+        for (i, doc) in context.documents.iter().enumerate() {
+            let mut doc_builder = docs_builder.reborrow().get(i as u32);
+            doc_builder.set_id(&doc.id);
+            doc_builder.set_attached_by(&doc.attached_by);
+            doc_builder.set_attached_at(doc.attached_at);
+        }
+
+        // Initialize seats list
         ctx_builder.init_seats(context.seats.len() as u32);
 
-        log::info!("Fork created: {} from version {}", context_name, version);
+        log::info!(
+            "Fork created: {} from document {} at version {}, new document {}",
+            context_name, document_id, version, new_doc_id
+        );
         Promise::ok(())
     }
 
@@ -3141,16 +3285,16 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let source_block_id = pry!(params_reader.get_source_block_id());
-        let doc_id = pry!(pry!(source_block_id.get_document_id()).to_str()).to_owned();
-        let agent_id = pry!(pry!(source_block_id.get_agent_id()).to_str()).to_owned();
-        let seq = source_block_id.get_seq();
-        let _target_context = pry!(pry!(params_reader.get_target_context()).to_str()).to_owned();
+        let source_doc_id = pry!(pry!(source_block_id.get_document_id()).to_str()).to_owned();
+        let source_agent_id = pry!(pry!(source_block_id.get_agent_id()).to_str()).to_owned();
+        let source_seq = source_block_id.get_seq();
+        let target_context = pry!(pry!(params_reader.get_target_context()).to_str()).to_owned();
 
         let kernel_id = self.kernel_id.clone();
 
         log::info!(
             "Cherry-pick request: block={}/{}/{} to context={}",
-            doc_id, agent_id, seq, _target_context
+            source_doc_id, source_agent_id, source_seq, target_context
         );
 
         // Get kernel state synchronously
@@ -3161,31 +3305,66 @@ impl kernel::Server for KernelImpl {
         };
 
         // Get the source document (DashMap access is sync)
-        let doc_entry = kernel_state.documents.get(&doc_id);
+        let doc_entry = kernel_state.documents.get(&source_doc_id);
         let doc_entry = match doc_entry {
             Some(entry) => entry,
             None => return Promise::err(capnp::Error::failed("Source document not found".into())),
         };
 
-        // Find the block
-        let block_id = kaijutsu_crdt::BlockId::new(&doc_id, &agent_id, seq);
-        let _block_snapshot = match doc_entry.doc.get_block_snapshot(&block_id) {
+        // Find the block to cherry-pick
+        let block_id = kaijutsu_crdt::BlockId::new(&source_doc_id, &source_agent_id, source_seq);
+        let block_snapshot = match doc_entry.doc.get_block_snapshot(&block_id) {
             Some(snapshot) => snapshot,
             None => return Promise::err(capnp::Error::failed("Block not found".into())),
         };
 
-        // For now, return an error - full implementation requires:
-        // 1. Getting or creating the target document
-        // 2. Creating a new block with copied content
-        // 3. Preserving lineage metadata (parent_id references)
-        log::warn!("Cherry-pick not fully implemented yet");
+        // Release source doc ref
+        drop(doc_entry);
 
-        // Return the same block ID for now (placeholder)
-        let mut new_block = results.get().init_new_block_id();
-        new_block.set_document_id(&doc_id);
-        new_block.set_agent_id(&agent_id);
-        new_block.set_seq(seq);
+        // Generate target document ID from context
+        let target_doc_id = format!("{}@{}", kernel_id, target_context);
 
+        // Check if target document exists, create if not
+        if !kernel_state.documents.contains(&target_doc_id) {
+            if let Err(e) = kernel_state.documents.create_document(
+                target_doc_id.clone(),
+                kaijutsu_kernel::DocumentKind::Conversation,
+                None,
+            ) {
+                return Promise::err(capnp::Error::failed(format!("Failed to create target document: {}", e)));
+            }
+        }
+
+        // Get the last block ID in target document for ordering
+        let after_id = kernel_state.documents.last_block_id(&target_doc_id);
+
+        // Insert the block into target document
+        // Note: We don't preserve parent_id as it references the source document
+        let new_block_result = kernel_state.documents.insert_block(
+            &target_doc_id,
+            None, // No parent in target (cherry-picked blocks are roots)
+            after_id.as_ref(),
+            block_snapshot.role,
+            block_snapshot.kind,
+            block_snapshot.content,
+        );
+
+        let new_block_id = match new_block_result {
+            Ok(id) => id,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("Failed to insert block: {}", e))),
+        };
+
+        // Build result
+        let mut new_block_builder = results.get().init_new_block_id();
+        new_block_builder.set_document_id(&new_block_id.document_id);
+        new_block_builder.set_agent_id(&new_block_id.agent_id);
+        new_block_builder.set_seq(new_block_id.seq);
+
+        log::info!(
+            "Cherry-pick complete: {} -> {}",
+            block_id.to_key(),
+            new_block_id.to_key()
+        );
         Promise::ok(())
     }
 
@@ -3477,12 +3656,21 @@ use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
 
 /// Build tool definitions from equipped tools in the kernel.
 async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
-    let equipped = kernel.list_equipped().await;
+    let registry = kernel.tools().read().await;
+    let equipped = registry.list_equipped();
 
     equipped
         .into_iter()
         .map(|info| {
-            let input_schema = get_tool_schema(&info.name);
+            // Get schema from the engine if available, fall back to minimal schema
+            let input_schema = registry
+                .get_engine(&info.name)
+                .and_then(|e| e.schema())
+                .unwrap_or_else(|| serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }));
             ToolDefinition {
                 name: info.name.clone(),
                 description: info.description.clone(),
@@ -3490,193 +3678,6 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
             }
         })
         .collect()
-}
-
-/// Get JSON schema for a tool.
-/// Schemas must be valid JSON Schema with `type: "object"` and `required` array.
-fn get_tool_schema(tool_name: &str) -> serde_json::Value {
-    match tool_name {
-        "block_create" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "role": {
-                    "type": "string",
-                    "enum": ["user", "model"],
-                    "description": "Role of the block creator"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["text", "thinking", "tool_call", "tool_result"],
-                    "description": "Type of block"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Initial content of the block"
-                },
-                "parent_id": {
-                    "type": "string",
-                    "description": "Parent block ID (optional)"
-                }
-            },
-            "required": ["role", "kind", "content"]
-        }),
-        "block_append" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID to append to (format: cell_id:agent_id:seq)"
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Text to append"
-                }
-            },
-            "required": ["block_id", "text"]
-        }),
-        "block_edit" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID to edit (format: cell_id:agent_id:seq)"
-                },
-                "operations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": { "type": "string", "enum": ["replace", "insert", "delete"], "description": "Operation type" },
-                            "line": { "type": "integer", "description": "Line number (1-indexed)" },
-                            "text": { "type": "string", "description": "Text for replace/insert" }
-                        },
-                        "required": ["op", "line"]
-                    },
-                    "description": "Edit operations to apply atomically"
-                }
-            },
-            "required": ["block_id", "operations"]
-        }),
-        "block_read" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID to read (format: cell_id:agent_id:seq)"
-                },
-                "line_numbers": {
-                    "type": "boolean",
-                    "description": "Include line numbers in output (default: false)"
-                }
-            },
-            "required": ["block_id"]
-        }),
-        "block_search" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID to search within"
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search for"
-                }
-            },
-            "required": ["block_id", "pattern"]
-        }),
-        "block_list" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "role": {
-                    "type": "string",
-                    "enum": ["user", "model"],
-                    "description": "Filter by role"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["text", "thinking", "tool_call", "tool_result"],
-                    "description": "Filter by kind"
-                }
-            },
-            "required": []
-        }),
-        "block_status" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID"
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["pending", "streaming", "done", "error"],
-                    "description": "New status"
-                }
-            },
-            "required": ["block_id", "status"]
-        }),
-        "block_splice" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "Block ID to splice"
-                },
-                "pos": {
-                    "type": "integer",
-                    "description": "Character position (0-indexed)"
-                },
-                "delete": {
-                    "type": "integer",
-                    "description": "Number of characters to delete (default: 0)"
-                },
-                "insert": {
-                    "type": "string",
-                    "description": "Text to insert (default: empty)"
-                }
-            },
-            "required": ["block_id", "pos"]
-        }),
-        "kernel_search" => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Regex pattern to search across all blocks"
-                },
-                "cell_id": {
-                    "type": "string",
-                    "description": "Limit search to this cell"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["text", "thinking", "tool_call", "tool_result"],
-                    "description": "Filter by block kind"
-                },
-                "role": {
-                    "type": "string",
-                    "enum": ["user", "model", "system", "tool"],
-                    "description": "Filter by block role"
-                },
-                "context_lines": {
-                    "type": "integer",
-                    "description": "Lines of context around matches (default: 0)"
-                },
-                "max_matches": {
-                    "type": "integer",
-                    "description": "Maximum matches to return (default: 100)"
-                }
-            },
-            "required": ["query"]
-        }),
-        // Default schema for unknown tools - minimal valid schema
-        _ => serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        }),
-    }
 }
 
 /// Process LLM streaming in a background task with agentic loop.

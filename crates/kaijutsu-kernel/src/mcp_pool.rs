@@ -1631,17 +1631,33 @@ impl McpServerPool {
 
     /// Send a response to a pending elicitation request.
     ///
+    /// Iterates through all connected servers to find the one that owns
+    /// the request_id, then sends the response to complete the elicitation.
+    ///
     /// Returns true if the response was sent successfully, false if the
-    /// request was not found (may have timed out).
-    pub fn respond_to_elicitation(&self, request_id: &str, _response: ElicitationResponse) -> bool {
-        // This method needs access to the handler's pending_elicitations map.
-        // Since handlers are per-server, we need a different approach.
-        // For now, this is a placeholder - the actual implementation would need
-        // to track which server owns which elicitation request.
-        warn!(
-            request_id = %request_id,
-            "respond_to_elicitation called but not fully implemented yet"
-        );
+    /// request was not found (may have timed out or server disconnected).
+    pub fn respond_to_elicitation(&self, request_id: &str, response: ElicitationResponse) -> bool {
+        let servers = self.servers.read();
+
+        for (_name, server_arc) in servers.iter() {
+            // Try to acquire the lock without blocking
+            if let Ok(server) = server_arc.try_lock() {
+                let handler = server.service.service();
+                // Check if this handler owns the request
+                if let Some((_, pending)) = handler.pending_elicitations().remove(request_id) {
+                    // Found it! Send the response
+                    let sent = pending.response_tx.send(response).is_ok();
+                    if sent {
+                        info!(request_id = %request_id, "Elicitation response sent successfully");
+                    } else {
+                        warn!(request_id = %request_id, "Elicitation response channel closed");
+                    }
+                    return sent;
+                }
+            }
+        }
+
+        warn!(request_id = %request_id, "Elicitation request not found in any server handler");
         false
     }
 
@@ -1679,6 +1695,8 @@ pub struct McpToolEngine {
     qualified_name: String,
     /// Tool description.
     description: String,
+    /// JSON Schema for tool input parameters.
+    input_schema: JsonValue,
 }
 
 impl McpToolEngine {
@@ -1690,11 +1708,13 @@ impl McpToolEngine {
     /// * `server_name` - Name of the MCP server
     /// * `tool_name` - Name of the tool on that server
     /// * `description` - Tool description for help text
+    /// * `input_schema` - JSON Schema for tool input parameters
     pub fn new(
         pool: Arc<McpServerPool>,
         server_name: impl Into<String>,
         tool_name: impl Into<String>,
         description: impl Into<String>,
+        input_schema: JsonValue,
     ) -> Self {
         let server_name = server_name.into();
         let tool_name = tool_name.into();
@@ -1705,6 +1725,7 @@ impl McpToolEngine {
             tool_name,
             qualified_name,
             description: description.into(),
+            input_schema,
         }
     }
 
@@ -1725,6 +1746,7 @@ impl McpToolEngine {
                     server_name,
                     &tool.name,
                     tool.description.clone().unwrap_or_default(),
+                    tool.input_schema.clone(),
                 )) as Arc<dyn ExecutionEngine>;
                 (qualified_name, engine)
             })
@@ -1748,6 +1770,10 @@ impl ExecutionEngine for McpToolEngine {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(self.input_schema.clone())
     }
 
     async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {

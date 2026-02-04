@@ -314,6 +314,10 @@ impl ExecutionEngine for BlockCreateEngine {
         "Create a new block with role, kind, and optional content"
     }
 
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
+    }
+
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockCreateParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -393,6 +397,10 @@ impl ExecutionEngine for BlockAppendEngine {
 
     fn description(&self) -> &str {
         "Append text to a block (optimized for streaming)"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
@@ -579,6 +587,10 @@ impl ExecutionEngine for BlockEditEngine {
         "Line-based block editing with atomic operations and CAS validation"
     }
 
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
+    }
+
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockEditParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -670,6 +682,10 @@ impl ExecutionEngine for BlockSpliceEngine {
 
     fn description(&self) -> &str {
         "Character-based editing (for programmatic tools)"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
@@ -787,6 +803,10 @@ impl ExecutionEngine for BlockReadEngine {
 
     fn description(&self) -> &str {
         "Read block content with optional line numbers and range"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
@@ -930,6 +950,10 @@ impl ExecutionEngine for BlockSearchEngine {
         "Search within a block using regex or literal patterns"
     }
 
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
+    }
+
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -1069,6 +1093,10 @@ impl ExecutionEngine for BlockListEngine {
         "List blocks with optional filters"
     }
 
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
+    }
+
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockListParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -1149,6 +1177,10 @@ impl ExecutionEngine for BlockStatusEngine {
 
     fn description(&self) -> &str {
         "Set block status (pending, running, done, error, cancelled)"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
@@ -1351,6 +1383,10 @@ impl ExecutionEngine for KernelSearchEngine {
 
     fn description(&self) -> &str {
         "Search across all blocks using regex, with filters and context"
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(Self::schema())
     }
 
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
