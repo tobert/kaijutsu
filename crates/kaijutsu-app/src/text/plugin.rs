@@ -165,6 +165,9 @@ fn sync_render_config_from_window(
     let new_width = window.physical_width() as f32;
     let new_height = window.physical_height() as f32;
 
+    // Track previous resolution BEFORE updating for resize detection in extract phase
+    config.prev_resolution = config.resolution;
+
     if config.resolution[0] != new_width || config.resolution[1] != new_height {
         config.resolution = [new_width, new_height];
         config.initialized = true;

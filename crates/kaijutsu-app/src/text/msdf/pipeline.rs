@@ -331,6 +331,9 @@ pub struct ExtractedMsdfRenderConfig {
     /// Window scale factor (logical to physical pixel multiplier).
     /// Used to convert layout bounds and positions to physical pixels.
     pub scale_factor: f32,
+    /// True when resolution changed this frame - bounds may be stale.
+    /// During resize, we skip batched scissor clipping to avoid zero-size rects.
+    pub resize_in_progress: bool,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Font rendering parameters (from Theme)
@@ -545,10 +548,13 @@ impl MsdfTextTaaResources {
     }
 
     /// Recreate textures if resolution changed.
+    /// Preserves the pipeline ID since it doesn't depend on resolution.
     pub fn resize_if_needed(&mut self, device: &RenderDevice, width: u32, height: u32) {
         if self.resolution != (width, height) && width > 0 && height > 0 {
             let format = self.format;
+            let pipeline = self.pipeline.take(); // Preserve pipeline
             *self = Self::new(device, width, height, format);
+            self.pipeline = pipeline; // Restore pipeline
         }
     }
 
@@ -790,6 +796,18 @@ impl ViewNode for MsdfTextRenderNode {
             return Ok(());
         };
 
+        // Skip rendering during resize - detect by comparing config resolution
+        // against our depth texture size. Due to pipelining, config may have new
+        // resolution before our resources are recreated.
+        let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
+        if let Some(config) = render_config {
+            let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
+            if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+                // Resolution mismatch - skip this frame to avoid scissor errors
+                return Ok(());
+            }
+        }
+
         if resources.vertex_count == 0 {
             return Ok(());
         }
@@ -860,11 +878,12 @@ impl ViewNode for MsdfTextRenderNode {
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_vertex_buffer(0, *vertex_buffer.slice(..));
 
-        // Get viewport dimensions for scissor rect clamping
+        // Get viewport dimensions for scissor rect clamping.
+        // Note: resize_in_progress case is handled by early return at start of run().
         let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
         let (vp_w, vp_h) = render_config
             .map(|c| (c.resolution[0] as u32, c.resolution[1] as u32))
-            .unwrap_or((1920, 1080)); // Fallback if config not available
+            .unwrap_or((1920, 1080));
 
         // Draw each batch with its scissor rect
         if resources.batches.is_empty() {
@@ -926,6 +945,17 @@ impl ViewNode for MsdfTextTaaNode {
         view_target: &ViewTarget,
         world: &World,
     ) -> Result<(), NodeRunError> {
+        // Skip during resize - detect by comparing config against resources
+        let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
+        if let Some(config) = render_config {
+            if let Some(resources) = world.get_resource::<MsdfTextResources>() {
+                let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
+                if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if TAA is enabled
         let Some(taa_state) = world.get_resource::<MsdfTextTaaState>() else {
             return Ok(());
@@ -1143,12 +1173,16 @@ pub fn extract_msdf_render_config(
     let default_theme = crate::ui::theme::Theme::default();
     let theme = theme.as_ref().map(|t| t.as_ref()).unwrap_or(&default_theme);
 
+    // Detect if resolution changed this frame - bounds may be stale
+    let resize_in_progress = config.resolution != config.prev_resolution;
+
     let glow_srgba = theme.font_glow_color.to_srgba();
     commands.insert_resource(ExtractedMsdfRenderConfig {
         resolution: config.resolution,
         format: config.format,
         initialized: config.initialized,
         scale_factor: config.scale_factor,
+        resize_in_progress,
         // Font rendering parameters from Theme
         stem_darkening: theme.font_stem_darkening,
         hint_amount: theme.font_hint_amount,
@@ -1542,6 +1576,14 @@ pub fn prepare_msdf_texts(
         }
     }
 
+    // During resize, scissor bounds may be stale (computed with old resolution).
+    // Clear batches to use the full-viewport fallback in the render node.
+    // Text still renders correctly, just without per-area clipping for 1 frame.
+    // Next frame, bounds are recalculated and normal clipping resumes.
+    if render_config.resize_in_progress {
+        batches.clear();
+    }
+
     resources.vertex_count = vertices.len() as u32;
     resources.batches = batches;
 
@@ -1561,7 +1603,8 @@ pub fn prepare_msdf_texts(
         queue.write_buffer(buffer, 0, vertex_data);
     }
 
-    // Create or update depth texture if resolution changed
+    // Create or update depth texture if resolution changed.
+    // Always recreate - render node will skip if sizes don't match ViewTarget yet.
     let width = resolution[0] as u32;
     let height = resolution[1] as u32;
     if resources.depth_texture_size != (width, height) && width > 0 && height > 0 {
@@ -1591,7 +1634,11 @@ pub fn prepare_msdf_texts(
     // Create intermediate texture for TAA if needed (separate from depth texture)
     // This must be checked every frame because TAA can be toggled and resources
     // may be initialized after the depth texture already exists.
-    if taa_state.enabled && resources.intermediate_texture_view.is_none() && width > 0 && height > 0 {
+    if taa_state.enabled
+        && resources.intermediate_texture_view.is_none()
+        && width > 0
+        && height > 0
+    {
         let intermediate_texture = device.create_texture(&TextureDescriptor {
             label: Some("msdf_intermediate_texture"),
             size: Extent3d {

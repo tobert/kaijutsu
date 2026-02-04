@@ -134,6 +134,9 @@ pub struct MsdfRenderConfig {
     /// Window scale factor (logical to physical pixel multiplier).
     /// Used to convert layout positions (logical) to render positions (physical).
     pub scale_factor: f32,
+    /// Previous frame's resolution for detecting resize events.
+    /// When resolution != prev_resolution, bounds may be stale.
+    pub prev_resolution: [f32; 2],
 }
 
 impl Default for MsdfRenderConfig {
@@ -146,6 +149,7 @@ impl Default for MsdfRenderConfig {
             format: bevy::render::render_resource::TextureFormat::bevy_default(),
             initialized: false,
             scale_factor: 1.0,
+            prev_resolution: [0.0, 0.0],
         }
     }
 }
@@ -158,11 +162,13 @@ impl MsdfRenderConfig {
     /// In windowed mode, init_msdf_resources will query the actual swap chain format.
     /// Use `with_format()` to override if needed.
     pub fn new(width: u32, height: u32) -> Self {
+        let resolution = [width as f32, height as f32];
         Self {
-            resolution: [width as f32, height as f32],
+            resolution,
             format: bevy::render::render_resource::TextureFormat::bevy_default(),
             initialized: true,
             scale_factor: 1.0,
+            prev_resolution: resolution, // Same as current on creation
         }
     }
 
