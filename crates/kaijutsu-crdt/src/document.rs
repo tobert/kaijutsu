@@ -1,7 +1,7 @@
-//! Block document with unified CRDT using facet.
+//! Block document with unified CRDT using diamond-types-extended.
 //!
-//! Uses the facet library (github.com/tobert/facet) which provides a unified
-//! Document API with Map, Set, Register, and Text CRDTs.
+//! Uses the diamond-types-extended library (github.com/tobert/diamond-types-extended)
+//! which provides a unified Document API with Map, Set, Register, and Text CRDTs.
 //!
 //! # DAG Model
 //!
@@ -10,11 +10,11 @@
 //! - Multiple children (parallel tool calls, multiple response blocks)
 //! - Role and status for conversation flow tracking
 
-use facet::{Document, AgentId, SerializedOps, SerializedOpsOwned, LV};
+use diamond_types_extended::{Document, AgentId, SerializedOps, SerializedOpsOwned, LV};
 
 use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 
-/// Block document backed by facet Document.
+/// Block document backed by diamond-types-extended Document.
 ///
 /// # Document Structure
 ///
@@ -42,7 +42,7 @@ use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 ///
 /// # Convergence
 ///
-/// All operations go through the facet Document, ensuring:
+/// All operations go through the diamond-types-extended Document, ensuring:
 /// - Maps use LWW (Last-Write-Wins) semantics
 /// - Sets use OR-Set (add-wins) semantics
 /// - Text uses sequence CRDT for character-level merging
@@ -933,6 +933,134 @@ impl BlockDocument {
     }
 
     // =========================================================================
+    // Fork Support
+    // =========================================================================
+
+    /// Fork the document, creating a copy with a new document ID.
+    ///
+    /// All blocks and their content are copied to the new document.
+    /// The new document gets a fresh agent ID for future edits.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_doc_id` - Document ID for the forked document
+    /// * `new_agent_id` - Agent ID for local operations on the fork
+    ///
+    /// # Returns
+    ///
+    /// A new BlockDocument with all blocks copied from this document.
+    pub fn fork(&self, new_doc_id: &str, new_agent_id: &str) -> Self {
+        // Create new document with fresh CRDT state
+        let mut forked = BlockDocument::new(new_doc_id, new_agent_id);
+
+        // Copy all blocks in order
+        let blocks = self.blocks_ordered();
+        let mut id_mapping: std::collections::HashMap<BlockId, BlockId> = std::collections::HashMap::new();
+        let mut last_id: Option<BlockId> = None;
+
+        for block in blocks {
+            // Generate new block ID in the forked document
+            let new_id = forked.new_block_id();
+
+            // Map old ID to new ID for parent_id translation
+            id_mapping.insert(block.id.clone(), new_id.clone());
+
+            // Translate parent_id if it exists
+            let new_parent_id = block.parent_id.as_ref()
+                .and_then(|old_pid| id_mapping.get(old_pid).cloned());
+
+            // Translate tool_call_id if it exists
+            let new_tool_call_id = block.tool_call_id.as_ref()
+                .and_then(|old_tcid| id_mapping.get(old_tcid).cloned());
+
+            // Insert the block with translated IDs, maintaining order by inserting after last block
+            let _ = forked.insert_block_with_id(
+                new_id.clone(),
+                new_parent_id.as_ref(),
+                last_id.as_ref(), // Insert after last block to maintain order
+                block.role,
+                block.kind,
+                block.content,
+                block.author,
+                block.tool_name,
+                block.tool_input,
+                new_tool_call_id,
+                block.exit_code,
+                block.is_error,
+                block.display_hint,
+            );
+
+            last_id = Some(new_id);
+        }
+
+        forked
+    }
+
+    /// Fork the document at a specific version, excluding blocks created after that version.
+    ///
+    /// This creates a new document containing only blocks that existed at the given version.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_doc_id` - Document ID for the forked document
+    /// * `new_agent_id` - Agent ID for local operations on the fork
+    /// * `at_version` - Only include blocks with created_at <= this version
+    ///
+    /// # Returns
+    ///
+    /// A new BlockDocument with blocks up to the specified version.
+    pub fn fork_at_version(&self, new_doc_id: &str, new_agent_id: &str, at_version: u64) -> Self {
+        // Create new document with fresh CRDT state
+        let mut forked = BlockDocument::new(new_doc_id, new_agent_id);
+
+        // Get all blocks ordered, filter by version
+        let blocks: Vec<_> = self.blocks_ordered()
+            .into_iter()
+            .filter(|b| b.created_at <= at_version)
+            .collect();
+
+        let mut id_mapping: std::collections::HashMap<BlockId, BlockId> = std::collections::HashMap::new();
+        let mut last_id: Option<BlockId> = None;
+
+        for block in blocks {
+            // Generate new block ID in the forked document
+            let new_id = forked.new_block_id();
+
+            // Map old ID to new ID for parent_id translation
+            id_mapping.insert(block.id.clone(), new_id.clone());
+
+            // Translate parent_id if it exists and was included
+            let new_parent_id = block.parent_id.as_ref()
+                .and_then(|old_pid| id_mapping.get(old_pid).cloned());
+
+            // Translate tool_call_id if it exists and was included
+            let new_tool_call_id = block.tool_call_id.as_ref()
+                .and_then(|old_tcid| id_mapping.get(old_tcid).cloned());
+
+            // Insert the block with translated IDs, maintaining order by inserting after last block
+            let _ = forked.insert_block_with_id(
+                new_id.clone(),
+                new_parent_id.as_ref(),
+                last_id.as_ref(), // Insert after last block to maintain order
+                block.role,
+                block.kind,
+                block.content,
+                block.author,
+                block.tool_name,
+                block.tool_input,
+                new_tool_call_id,
+                block.exit_code,
+                block.is_error,
+                block.display_hint,
+            );
+
+            last_id = Some(new_id);
+        }
+
+        forked
+    }
+
+    // =========================================================================
     // Oplog-Based Sync (for initial state transfer)
     // =========================================================================
 
@@ -1387,7 +1515,7 @@ mod tests {
     /// the "blocks" Set creation, allowing the client to merge successfully.
     #[test]
     fn test_sync_succeeds_with_full_oplog() {
-        use facet::Document;
+        use diamond_types_extended::Document;
 
         // === Server side ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
@@ -1431,7 +1559,7 @@ mod tests {
     /// incremental ops should merge correctly.
     #[test]
     fn test_incremental_sync_after_full_sync() {
-        use facet::Document;
+        use diamond_types_extended::Document;
 
         // === Initial full sync ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
@@ -1516,7 +1644,7 @@ mod tests {
     /// Test text streaming sync (append operations).
     #[test]
     fn test_text_streaming_sync() {
-        use facet::Document;
+        use diamond_types_extended::Document;
 
         // === Initial setup ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
@@ -1553,5 +1681,119 @@ mod tests {
 
         // For client verification, we'd need to wrap the doc in BlockDocument
         // For now, just verify the merge succeeded without errors
+    }
+
+    /// Test document fork creates a deep copy with new IDs.
+    #[test]
+    fn test_fork_document() {
+        let mut original = BlockDocument::new("original-doc", "alice");
+
+        // Insert some blocks
+        let user_msg = original.insert_block(
+            None,
+            None,
+            Role::User,
+            BlockKind::Text,
+            "Hello Claude!",
+            "user:amy",
+        ).unwrap();
+
+        let _model_response = original.insert_block(
+            Some(&user_msg),
+            Some(&user_msg),
+            Role::Model,
+            BlockKind::Text,
+            "Hi Amy!",
+            "model:claude",
+        ).unwrap();
+
+        // Fork the document
+        let forked = original.fork("forked-doc", "bob");
+
+        // Verify forked document has same number of blocks
+        assert_eq!(forked.block_count(), 2);
+
+        // Verify forked document has different ID
+        assert_eq!(forked.document_id(), "forked-doc");
+        assert_eq!(forked.agent_id(), "bob");
+
+        // Verify block content is preserved
+        let forked_blocks = forked.blocks_ordered();
+        assert_eq!(forked_blocks[0].content, "Hello Claude!");
+        assert_eq!(forked_blocks[0].role, Role::User);
+        assert_eq!(forked_blocks[1].content, "Hi Amy!");
+        assert_eq!(forked_blocks[1].role, Role::Model);
+
+        // Verify blocks have new document ID
+        assert_eq!(forked_blocks[0].id.document_id, "forked-doc");
+        assert_eq!(forked_blocks[1].id.document_id, "forked-doc");
+
+        // Verify parent-child relationship is preserved
+        assert!(forked_blocks[0].parent_id.is_none());
+        assert!(forked_blocks[1].parent_id.is_some());
+        assert_eq!(forked_blocks[1].parent_id.as_ref().unwrap().document_id, "forked-doc");
+
+        // Verify original document is unchanged
+        assert_eq!(original.block_count(), 2);
+        assert_eq!(original.document_id(), "original-doc");
+        let original_blocks = original.blocks_ordered();
+        assert_eq!(original_blocks[0].id.document_id, "original-doc");
+
+        // Verify editing forked document doesn't affect original
+        let forked_first_block = &forked_blocks[0].id;
+        let mut forked_mut = forked;
+        forked_mut.append_text(forked_first_block, " How are you?").unwrap();
+
+        let forked_content = forked_mut.get_block_snapshot(forked_first_block).unwrap().content;
+        assert_eq!(forked_content, "Hello Claude! How are you?");
+
+        let original_content = original.get_block_snapshot(&user_msg).unwrap().content;
+        assert_eq!(original_content, "Hello Claude!");
+    }
+
+    /// Test fork with tool call blocks preserves tool_call_id references.
+    #[test]
+    fn test_fork_with_tool_blocks() {
+        let mut original = BlockDocument::new("original-doc", "server");
+
+        // Insert a tool call
+        let tool_call_id = original.insert_tool_call(
+            None,
+            None,
+            "read_file",
+            serde_json::json!({"path": "/etc/hosts"}),
+            "model:claude",
+        ).unwrap();
+
+        // Insert tool result
+        let _tool_result_id = original.insert_tool_result_block(
+            &tool_call_id,
+            Some(&tool_call_id),
+            "127.0.0.1 localhost",
+            false,
+            Some(0),
+            "system",
+        ).unwrap();
+
+        // Fork the document
+        let forked = original.fork("forked-doc", "client");
+
+        // Verify blocks exist
+        assert_eq!(forked.block_count(), 2);
+
+        let forked_blocks = forked.blocks_ordered();
+
+        // Verify tool call
+        assert_eq!(forked_blocks[0].kind, BlockKind::ToolCall);
+        assert_eq!(forked_blocks[0].tool_name, Some("read_file".to_string()));
+
+        // Verify tool result
+        assert_eq!(forked_blocks[1].kind, BlockKind::ToolResult);
+        assert_eq!(forked_blocks[1].content, "127.0.0.1 localhost");
+
+        // Verify tool_call_id reference is properly translated
+        let tool_call_id_ref = forked_blocks[1].tool_call_id.as_ref().expect("should have tool_call_id");
+        assert_eq!(tool_call_id_ref.document_id, "forked-doc");
+        assert_eq!(tool_call_id_ref, &forked_blocks[0].id);
     }
 }

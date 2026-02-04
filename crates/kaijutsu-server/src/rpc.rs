@@ -2828,35 +2828,34 @@ impl kernel::Server for KernelImpl {
                             Ok(result) => {
                                 match result.get() {
                                     Ok(reader) => {
-                                        let response_reader = match reader.get_response() {
-                                            Ok(r) => r,
-                                            Err(_) => {
-                                                // Parse error, decline
-                                                kaijutsu_kernel::ElicitationResponse {
-                                                    action: kaijutsu_kernel::ElicitationAction::Decline,
-                                                    content: None,
-                                                }
-                                            }
-                                        };
-
-                                        // Parse the action string
-                                        let action_str = response_reader.get_action()
-                                            .unwrap_or(Ok("decline"))
-                                            .unwrap_or("decline");
-                                        let action = action_str.parse()
-                                            .unwrap_or(kaijutsu_kernel::ElicitationAction::Decline);
-
-                                        // Parse the content if present
-                                        let content = if response_reader.get_has_content() {
-                                            response_reader.get_content()
+                                        // Parse response, defaulting to decline on any error
+                                        if let Ok(response_reader) = reader.get_response() {
+                                            // Parse the action string
+                                            let action_str = response_reader.get_action()
                                                 .ok()
-                                                .and_then(|s| s.to_str().ok())
-                                                .and_then(|s| serde_json::from_str(s).ok())
-                                        } else {
-                                            None
-                                        };
+                                                .and_then(|r| r.to_str().ok())
+                                                .unwrap_or("decline");
+                                            let action = action_str.parse()
+                                                .unwrap_or(kaijutsu_kernel::ElicitationAction::Decline);
 
-                                        kaijutsu_kernel::ElicitationResponse { action, content }
+                                            // Parse the content if present
+                                            let content = if response_reader.get_has_content() {
+                                                response_reader.get_content()
+                                                    .ok()
+                                                    .and_then(|s| s.to_str().ok())
+                                                    .and_then(|s| serde_json::from_str(s).ok())
+                                            } else {
+                                                None
+                                            };
+
+                                            kaijutsu_kernel::ElicitationResponse { action, content }
+                                        } else {
+                                            // Parse error, decline
+                                            kaijutsu_kernel::ElicitationResponse {
+                                                action: kaijutsu_kernel::ElicitationAction::Decline,
+                                                content: None,
+                                            }
+                                        }
                                     }
                                     Err(_) => {
                                         // Capnp error, decline
@@ -3237,8 +3236,8 @@ impl kernel::Server for KernelImpl {
         // Generate new document ID for the fork
         let new_doc_id = format!("{}@{}", kernel_id, context_name);
 
-        // Fork the document
-        if let Err(e) = kernel_state.documents.fork_document(&document_id, new_doc_id.clone()) {
+        // Fork the document at the specified version
+        if let Err(e) = kernel_state.documents.fork_document_at_version(&document_id, new_doc_id.clone(), version) {
             return Promise::err(capnp::Error::failed(format!("Fork failed: {}", e)));
         }
 

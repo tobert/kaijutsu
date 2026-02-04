@@ -3111,6 +3111,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "diamond-types-extended"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "crc",
+ "humansize",
+ "jumprope",
+ "lazy_static",
+ "libc",
+ "lz4_flex",
+ "num_enum",
+ "rle",
+ "serde",
+ "smallvec 2.0.0-alpha.12",
+ "smartstring",
+ "str_indices",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3523,25 +3542,6 @@ dependencies = [
  "rayon-core",
  "smallvec 1.15.1",
  "zune-inflate",
-]
-
-[[package]]
-name = "facet"
-version = "0.1.0"
-dependencies = [
- "bumpalo",
- "crc",
- "humansize",
- "jumprope",
- "lazy_static",
- "libc",
- "lz4_flex",
- "num_enum",
- "rle",
- "serde",
- "smallvec 2.0.0-alpha.12",
- "smartstring",
- "str_indices",
 ]
 
 [[package]]
@@ -5005,7 +5005,7 @@ dependencies = [
 name = "kaijutsu-crdt"
 version = "0.1.0"
 dependencies = [
- "facet",
+ "diamond-types-extended",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -5022,8 +5022,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dashmap",
+ "diamond-types-extended",
  "dunce",
- "facet",
  "kaijutsu-crdt",
  "notify 7.0.0",
  "parking_lot",

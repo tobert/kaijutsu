@@ -337,6 +337,153 @@ impl BlockStore {
         self.documents.is_empty()
     }
 
+    /// Fork a document, creating a copy with a new document ID.
+    ///
+    /// All blocks and their content are copied to the new document.
+    /// The new document gets a fresh CRDT oplog.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_id` - ID of the document to fork
+    /// * `new_id` - ID for the forked document
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) on success, Err if source not found or target exists.
+    pub fn fork_document(
+        &self,
+        source_id: &str,
+        new_id: DocumentId,
+    ) -> Result<(), String> {
+        if self.documents.contains_key(&new_id) {
+            return Err(format!("Document {} already exists", new_id));
+        }
+
+        let source_entry = self.get(source_id)
+            .ok_or_else(|| format!("Source document {} not found", source_id))?;
+
+        let agent_id = self.agent_id();
+        let forked_doc = source_entry.doc.fork(&new_id, &agent_id);
+        let kind = source_entry.kind;
+        let language = source_entry.language.clone();
+        drop(source_entry); // Release the read lock
+
+        // Persist metadata if we have a DB
+        if let Some(db) = &self.db {
+            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let meta = DocumentMeta {
+                id: new_id.clone(),
+                kind,
+                language: language.clone(),
+                position_col: None,
+                position_row: None,
+                parent_document: Some(source_id.to_string()),
+                created_at: 0, // DB default handles timestamp
+            };
+            db_guard
+                .create_document(&meta)
+                .map_err(|e| format!("DB error: {}", e))?;
+        }
+
+        let version = forked_doc.version();
+        let entry = DocumentEntry {
+            doc: forked_doc,
+            kind,
+            language,
+            version: AtomicU64::new(version),
+            last_agent: RwLock::new(agent_id.clone()),
+        };
+        self.documents.insert(new_id.clone(), entry);
+
+        // Broadcast event
+        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
+            document_id: new_id,
+            kind,
+            agent_id,
+        });
+
+        Ok(())
+    }
+
+    /// Fork a document at a specific version, creating a copy with only blocks up to that version.
+    ///
+    /// This creates a new document containing only blocks that existed at the given version,
+    /// useful for timeline branching and "what if" explorations.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_id` - ID of the document to fork
+    /// * `new_id` - ID for the forked document
+    /// * `at_version` - Only include blocks with created_at <= this version
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) on success, Err if source not found, target exists, or version invalid.
+    pub fn fork_document_at_version(
+        &self,
+        source_id: &str,
+        new_id: DocumentId,
+        at_version: u64,
+    ) -> Result<(), String> {
+        if self.documents.contains_key(&new_id) {
+            return Err(format!("Document {} already exists", new_id));
+        }
+
+        let source_entry = self.get(source_id)
+            .ok_or_else(|| format!("Source document {} not found", source_id))?;
+
+        // Validate version
+        let current_version = source_entry.version();
+        if at_version > current_version {
+            return Err(format!(
+                "Requested version {} is in the future (current: {})",
+                at_version, current_version
+            ));
+        }
+
+        let agent_id = self.agent_id();
+        let forked_doc = source_entry.doc.fork_at_version(&new_id, &agent_id, at_version);
+        let kind = source_entry.kind;
+        let language = source_entry.language.clone();
+        drop(source_entry); // Release the read lock
+
+        // Persist metadata if we have a DB
+        if let Some(db) = &self.db {
+            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let meta = DocumentMeta {
+                id: new_id.clone(),
+                kind,
+                language: language.clone(),
+                position_col: None,
+                position_row: None,
+                parent_document: Some(source_id.to_string()),
+                created_at: 0, // DB default handles timestamp
+            };
+            db_guard
+                .create_document(&meta)
+                .map_err(|e| format!("DB error: {}", e))?;
+        }
+
+        let version = forked_doc.version();
+        let entry = DocumentEntry {
+            doc: forked_doc,
+            kind,
+            language,
+            version: AtomicU64::new(version),
+            last_agent: RwLock::new(agent_id.clone()),
+        };
+        self.documents.insert(new_id.clone(), entry);
+
+        // Broadcast event
+        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
+            document_id: new_id,
+            kind,
+            agent_id,
+        });
+
+        Ok(())
+    }
+
     /// Get the number of documents.
     pub fn len(&self) -> usize {
         self.documents.len()

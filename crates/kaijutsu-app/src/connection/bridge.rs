@@ -81,6 +81,19 @@ pub enum ConnectionCommand {
         tool: String,
         args: serde_json::Value,
     },
+
+    // Timeline / Fork operations
+    /// Fork a document at current version, creating a new context
+    ForkDocument {
+        document_id: String,
+        version: u64,
+        context_name: String,
+    },
+    /// Cherry-pick a block from one context to another
+    CherryPickBlock {
+        block_id: kaijutsu_crdt::BlockId,
+        target_context: String,
+    },
 }
 
 /// Events sent from the connection thread to Bevy
@@ -194,6 +207,28 @@ pub enum ConnectionEvent {
         server: String,
         /// Resources if available (may be None, requiring a list call)
         resources: Option<Vec<kaijutsu_client::McpResource>>,
+    },
+
+    // Timeline / Fork events
+    /// Fork operation completed
+    ForkComplete {
+        /// Whether the fork succeeded
+        success: bool,
+        /// New context name if successful
+        context_name: Option<String>,
+        /// New document ID if successful
+        document_id: Option<String>,
+        /// Error message if failed
+        error: Option<String>,
+    },
+    /// Cherry-pick operation completed
+    CherryPickComplete {
+        /// Whether the cherry-pick succeeded
+        success: bool,
+        /// New block ID in target context
+        new_block_id: Option<kaijutsu_crdt::BlockId>,
+        /// Error message if failed
+        error: Option<String>,
     },
 }
 
@@ -897,6 +932,99 @@ async fn connection_loop(
                         server,
                         tool,
                         result: Err("Not attached to a kernel".into()),
+                    });
+                }
+            }
+
+            // Timeline / Fork operations
+            ConnectionCommand::ForkDocument { document_id, version, context_name } => {
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.fork_from_version(&document_id, version, &context_name)).await {
+                        Ok(Ok(context)) => {
+                            // Generate the new document ID (matches server logic)
+                            let new_doc_id = format!("{}@{}", document_id.split('@').next().unwrap_or(&document_id), context_name);
+                            let _ = evt_tx.send(ConnectionEvent::ForkComplete {
+                                success: true,
+                                context_name: Some(context.name),
+                                document_id: Some(new_doc_id),
+                                error: None,
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during fork: {}", err_str);
+                                rpc_client = None;
+                                current_kernel = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::ForkComplete {
+                                    success: false,
+                                    context_name: None,
+                                    document_id: None,
+                                    error: Some(err_str),
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Fork RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::ForkComplete {
+                                success: false,
+                                context_name: None,
+                                document_id: None,
+                                error: Some("Fork operation timed out".into()),
+                            });
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::ForkComplete {
+                        success: false,
+                        context_name: None,
+                        document_id: None,
+                        error: Some("Not attached to a kernel".into()),
+                    });
+                }
+            }
+
+            ConnectionCommand::CherryPickBlock { block_id, target_context } => {
+                if let Some(kernel) = &current_kernel {
+                    match timeout(RPC_TIMEOUT, kernel.cherry_pick_block(&block_id, &target_context)).await {
+                        Ok(Ok(new_block_id)) => {
+                            let _ = evt_tx.send(ConnectionEvent::CherryPickComplete {
+                                success: true,
+                                new_block_id: Some(new_block_id),
+                                error: None,
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if is_connection_error(&err_str) {
+                                log::warn!("Connection lost during cherry-pick: {}", err_str);
+                                rpc_client = None;
+                                current_kernel = None;
+                                let _ = evt_tx.send(ConnectionEvent::Disconnected);
+                            } else {
+                                let _ = evt_tx.send(ConnectionEvent::CherryPickComplete {
+                                    success: false,
+                                    new_block_id: None,
+                                    error: Some(err_str),
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Cherry-pick RPC timed out");
+                            let _ = evt_tx.send(ConnectionEvent::CherryPickComplete {
+                                success: false,
+                                new_block_id: None,
+                                error: Some("Cherry-pick operation timed out".into()),
+                            });
+                        }
+                    }
+                } else {
+                    let _ = evt_tx.send(ConnectionEvent::CherryPickComplete {
+                        success: false,
+                        new_block_id: None,
+                        error: Some("Not attached to a kernel".into()),
                     });
                 }
             }

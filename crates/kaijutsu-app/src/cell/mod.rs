@@ -24,7 +24,7 @@ mod systems;
 // Re-export public API
 pub use components::{
     Cell, CellEditor, ComposeBlock, ConversationContainer, CurrentMode, EditorMode, FocusTarget,
-    FocusedBlockCell, InputKind, MainCell,
+    FocusedBlockCell, InputKind, MainCell, ViewingConversation,
 };
 pub use plugin::CellPlugin;
 // CellPhase is pub in plugin.rs but not re-exported - use cell::plugin::CellPhase if needed

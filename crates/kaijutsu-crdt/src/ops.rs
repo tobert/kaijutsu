@@ -1,10 +1,10 @@
 //! CRDT operation serialization helpers.
 //!
-//! With the unified facet library, operations are handled internally via `SerializedOps`.
+//! With the unified diamond_types_extended library, operations are handled internally via `SerializedOps`.
 //! This module re-exports the relevant types for convenience.
 
-// Re-export key types from facet for sync operations
-pub use facet::{SerializedOps, SerializedOpsOwned, LV};
+// Re-export key types from diamond_types_extended for sync operations
+pub use diamond_types_extended::{SerializedOps, SerializedOpsOwned, LV};
 
 /// Frontier type alias for clarity.
 /// A frontier represents a version vector - the set of latest operations seen.
@@ -12,7 +12,7 @@ pub type Frontier = Vec<LV>;
 
 #[cfg(test)]
 mod tests {
-    use facet::Document;
+    use diamond_types_extended::Document;
 
     #[test]
     fn test_ops_sync() {
