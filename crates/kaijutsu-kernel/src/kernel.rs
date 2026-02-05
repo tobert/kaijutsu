@@ -20,6 +20,7 @@ use crate::agents::{
 use crate::control::ConsentMode;
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::{LlmProvider, LlmRegistry, LlmResult};
+use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 use crate::vfs::{
@@ -40,6 +41,8 @@ pub struct Kernel {
     state: RwLock<KernelState>,
     /// Tool registry (behind RwLock for interior mutability).
     tools: RwLock<ToolRegistry>,
+    /// Tool configuration (filter for which tools are available).
+    tool_config: RwLock<ToolConfig>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
     /// Agent registry (behind RwLock for interior mutability).
@@ -80,6 +83,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
+            tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -97,6 +101,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::with_id(id, &name)),
             tools: RwLock::new(ToolRegistry::new()),
+            tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -117,6 +122,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             tools: RwLock::new(ToolRegistry::new()),
+            tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -503,6 +509,9 @@ impl Kernel {
         // Copy mount info (but not backends - they'd need Clone impl)
         // This is a limitation - real fork would need backend cloning
 
+        // Copy tool config - forked kernels inherit parent's tool filtering
+        let tool_config = self.tool_config.read().await.clone();
+
         // Note: LLM providers are not copied - forked kernels start fresh
         // This matches tool behavior and avoids credential sharing concerns
 
@@ -515,6 +524,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
+            tool_config: RwLock::new(tool_config),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -530,6 +540,10 @@ impl Kernel {
         // Share the VFS
         let vfs = Arc::clone(&self.vfs);
 
+        // Copy tool config - threaded kernels inherit parent's tool filtering
+        // (they can modify independently)
+        let tool_config = self.tool_config.read().await.clone();
+
         // Note: LLM providers are not shared - threaded kernels get fresh registry
         // This avoids credential sharing and allows per-thread provider config
 
@@ -543,11 +557,31 @@ impl Kernel {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
+            tool_config: RwLock::new(tool_config),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
         }
+    }
+
+    // ========================================================================
+    // Tool Configuration
+    // ========================================================================
+
+    /// Get the tool configuration.
+    pub async fn tool_config(&self) -> ToolConfig {
+        self.tool_config.read().await.clone()
+    }
+
+    /// Set the tool filter for this kernel.
+    pub async fn set_tool_filter(&self, filter: ToolFilter) {
+        *self.tool_config.write().await = ToolConfig::new(filter);
+    }
+
+    /// Check if a tool is allowed by the current configuration.
+    pub async fn tool_allowed(&self, tool_name: &str) -> bool {
+        self.tool_config.read().await.allows(tool_name)
     }
 }
 

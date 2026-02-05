@@ -935,18 +935,194 @@ impl kernel::Server for KernelImpl {
 
     fn fork(
         self: Rc<Self>,
-        _params: kernel::ForkParams,
-        _results: kernel::ForkResults,
+        params: kernel::ForkParams,
+        mut results: kernel::ForkResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("fork not yet implemented".into()))
+        let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
+        let parent_kernel_id = self.kernel_id.clone();
+        let state = self.state.clone();
+
+        Promise::from_future(async move {
+            // Get parent kernel
+            let parent_kernel = {
+                let state_ref = state.borrow();
+                let parent = state_ref.kernels.get(&parent_kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("parent kernel not found".into()))?;
+                parent.kernel.clone()
+            };
+
+            // Create forked kernel (deep copy, isolated VFS)
+            let forked_kernel = parent_kernel.fork(&name).await;
+
+            // Generate new kernel ID
+            let id = {
+                let state_ref = state.borrow();
+                state_ref.next_kernel_id()
+            };
+
+            // Create shared FlowBus for the new kernel
+            let block_flows = shared_block_flow_bus(1024);
+            let config_flows = shared_config_flow_bus(256);
+
+            // Create block store with database persistence
+            let documents = create_block_store_with_db(&id, block_flows);
+
+            // Ensure main document exists
+            let main_document_id = ensure_main_document(&documents, &id)?;
+
+            // Create config backend
+            let (config_backend, config_watcher) =
+                create_config_backend(documents.clone(), config_flows).await;
+
+            // Get identity for context manager
+            let nick = {
+                let state_ref = state.borrow();
+                state_ref.identity.username.clone()
+            };
+
+            // Create context manager for forked kernel
+            let context_manager = Arc::new(ContextManager::new(
+                nick,
+                id.clone(),
+                uuid::Uuid::new_v4().to_string(),
+            ));
+
+            // Register block tools on forked kernel
+            let kernel_arc = Arc::new(forked_kernel);
+            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Create default context
+            let mut contexts = HashMap::new();
+            contexts.insert("default".to_string(), ContextState::new("default".to_string()));
+
+            // Get parent's consent mode
+            let consent_mode = {
+                let state_ref = state.borrow();
+                state_ref.kernels.get(&parent_kernel_id)
+                    .map(|k| k.consent_mode)
+                    .unwrap_or(ConsentMode::Collaborative)
+            };
+
+            // Register the forked kernel
+            {
+                let mut state_ref = state.borrow_mut();
+                state_ref.kernels.insert(
+                    id.clone(),
+                    KernelState {
+                        id: id.clone(),
+                        name,
+                        consent_mode,
+                        command_history: Vec::new(),
+                        kaish: None,
+                        kernel: kernel_arc,
+                        documents,
+                        main_document_id,
+                        contexts,
+                        context_manager,
+                        config_backend,
+                        config_watcher,
+                    },
+                );
+            }
+
+            log::info!("Forked kernel {} from {}", id, parent_kernel_id);
+
+            let kernel_impl = KernelImpl::new(state.clone(), id);
+            results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
+            Ok(())
+        })
     }
 
     fn thread(
         self: Rc<Self>,
-        _params: kernel::ThreadParams,
-        _results: kernel::ThreadResults,
+        params: kernel::ThreadParams,
+        mut results: kernel::ThreadResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("thread not yet implemented".into()))
+        let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
+        let parent_kernel_id = self.kernel_id.clone();
+        let state = self.state.clone();
+
+        Promise::from_future(async move {
+            // Get parent kernel and documents (thread shares VFS + documents)
+            let (parent_kernel, parent_documents, parent_config_backend) = {
+                let state_ref = state.borrow();
+                let parent = state_ref.kernels.get(&parent_kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("parent kernel not found".into()))?;
+                (parent.kernel.clone(), parent.documents.clone(), parent.config_backend.clone())
+            };
+
+            // Create threaded kernel (light copy, shared VFS + FlowBus)
+            let threaded_kernel = parent_kernel.thread(&name).await;
+
+            // Generate new kernel ID
+            let id = {
+                let state_ref = state.borrow();
+                state_ref.next_kernel_id()
+            };
+
+            // Thread shares the parent's documents (same block store)
+            let documents = parent_documents;
+
+            // Create main document for this thread (separate conversation)
+            let main_document_id = ensure_main_document(&documents, &id)?;
+
+            // Get identity for context manager
+            let nick = {
+                let state_ref = state.borrow();
+                state_ref.identity.username.clone()
+            };
+
+            // Create context manager for threaded kernel
+            let context_manager = Arc::new(ContextManager::new(
+                nick,
+                id.clone(),
+                uuid::Uuid::new_v4().to_string(),
+            ));
+
+            // Register block tools on threaded kernel
+            let kernel_arc = Arc::new(threaded_kernel);
+            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Create default context
+            let mut contexts = HashMap::new();
+            contexts.insert("default".to_string(), ContextState::new("default".to_string()));
+
+            // Get parent's consent mode
+            let consent_mode = {
+                let state_ref = state.borrow();
+                state_ref.kernels.get(&parent_kernel_id)
+                    .map(|k| k.consent_mode)
+                    .unwrap_or(ConsentMode::Collaborative)
+            };
+
+            // Register the threaded kernel (shares config backend with parent)
+            {
+                let mut state_ref = state.borrow_mut();
+                state_ref.kernels.insert(
+                    id.clone(),
+                    KernelState {
+                        id: id.clone(),
+                        name,
+                        consent_mode,
+                        command_history: Vec::new(),
+                        kaish: None,
+                        kernel: kernel_arc,
+                        documents,
+                        main_document_id,
+                        contexts,
+                        context_manager,
+                        config_backend: parent_config_backend,
+                        config_watcher: None, // Thread doesn't own the watcher
+                    },
+                );
+            }
+
+            log::info!("Threaded kernel {} from {}", id, parent_kernel_id);
+
+            let kernel_impl = KernelImpl::new(state.clone(), id);
+            results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
+            Ok(())
+        })
     }
 
     fn detach(
@@ -3659,10 +3835,14 @@ use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
 /// Build tool definitions from equipped tools in the kernel.
 async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
     let registry = kernel.tools().read().await;
+    let tool_config = kernel.tool_config().await;
+
+    // Get equipped tools that also pass the kernel's tool filter
     let equipped = registry.list_equipped();
 
     equipped
         .into_iter()
+        .filter(|info| tool_config.allows(&info.name))
         .map(|info| {
             // Get schema from the engine if available, fall back to minimal schema
             let input_schema = registry
