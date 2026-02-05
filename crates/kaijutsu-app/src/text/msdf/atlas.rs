@@ -33,11 +33,9 @@ pub struct AtlasRegion {
     /// Size of the glyph in the atlas.
     pub width: u32,
     pub height: u32,
-    /// Anchor point for positioning (offset from glyph origin).
-    /// Will be used for proper glyph positioning once spacing is fixed.
-    #[allow(dead_code)]
+    /// Anchor point: offset from bitmap origin to glyph origin in em units.
+    /// Used by the pipeline to align glyph quads with cosmic-text pen positions.
     pub anchor_x: f32,
-    #[allow(dead_code)]
     pub anchor_y: f32,
 }
 
@@ -90,7 +88,8 @@ pub struct MsdfAtlas {
 #[allow(dead_code)]
 impl MsdfAtlas {
     /// Default MSDF range (distance field extent in pixels).
-    pub const DEFAULT_RANGE: f32 = 8.0;
+    /// Must match MsdfGenerator::new() msdf_range for correct shader AA math.
+    pub const DEFAULT_RANGE: f32 = 4.0;
     /// Default pixels per em for MSDF generation.
     pub const DEFAULT_PX_PER_EM: f64 = 32.0;
 
@@ -115,7 +114,7 @@ impl MsdfAtlas {
 
         // Padding must be >= MSDF range to prevent atlas bleeding when sampling
         // with bilinear filtering near glyph edges
-        let padding = (Self::DEFAULT_RANGE as i32) + 2; // 8 + 2 = 10 pixels
+        let padding = (Self::DEFAULT_RANGE as i32) + 2; // 4 + 2 = 6 pixels
         let packer_config = PackerConfig {
             width: width as i32,
             height: height as i32,
