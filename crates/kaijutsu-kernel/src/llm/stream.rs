@@ -326,6 +326,15 @@ impl StreamRequest {
 ///
 /// This is a wrapper around rig's `StreamingCompletionResponse` that handles
 /// provider-specific differences and emits a unified event stream.
+///
+/// ## State Machine
+///
+/// The adapter tracks the current block type (Text or Thinking) and ensures
+/// proper End events are emitted:
+/// - When switching from one block type to another (e.g., Thinking → Text)
+/// - When the stream finishes (before Done/Error)
+///
+/// This is critical for CRDT systems that need well-formed block boundaries.
 pub struct RigStreamAdapter {
     model: String,
     provider_kind: ProviderKind,
@@ -341,6 +350,8 @@ pub struct RigStreamAdapter {
     /// Accumulated usage stats.
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Pending event to emit on next call (for two-event sequences like End+Start).
+    pending_event: Option<StreamEvent>,
 }
 
 /// Provider kind for internal dispatch.
@@ -399,14 +410,46 @@ impl RigStreamAdapter {
             finished: false,
             input_tokens: None,
             output_tokens: None,
+            pending_event: None,
         })
     }
 
 }
 
+impl RigStreamAdapter {
+    /// Close the current block and return an End event, queueing the next event.
+    fn close_current_block(&mut self, next_event: StreamEvent) -> StreamEvent {
+        let end_event = match self.current_block.take() {
+            Some(StreamingBlockType::Text) => StreamEvent::TextEnd,
+            Some(StreamingBlockType::Thinking) => StreamEvent::ThinkingEnd,
+            None => {
+                // No block to close, just return the next event directly
+                return next_event;
+            }
+        };
+        // Queue the next event and return the end event
+        self.pending_event = Some(next_event);
+        end_event
+    }
+
+    /// Create the Done event with current token counts.
+    fn make_done_event(&self) -> StreamEvent {
+        StreamEvent::Done {
+            stop_reason: Some("end_turn".into()),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        }
+    }
+}
+
 impl LlmStream for RigStreamAdapter {
     async fn next_event(&mut self) -> Option<StreamEvent> {
         use rig::streaming::StreamedAssistantContent;
+
+        // First, drain any pending event from a previous transition
+        if let Some(event) = self.pending_event.take() {
+            return Some(event);
+        }
 
         if self.finished {
             return None;
@@ -423,68 +466,112 @@ impl LlmStream for RigStreamAdapter {
                             match content {
                                 StreamedAssistantContent::Text(text) => {
                                     if !text.text.is_empty() {
+                                        // Check for block transition: was Thinking, now Text
+                                        if self.current_block == Some(StreamingBlockType::Thinking) {
+                                            self.text_started = true;
+                                            self.current_block = Some(StreamingBlockType::Text);
+                                            // Queue: TextStart, then TextDelta
+                                            self.pending_event = Some(StreamEvent::TextDelta(text.text));
+                                            return Some(self.close_current_block(StreamEvent::TextStart));
+                                        }
+
+                                        // Normal case: starting or continuing text
                                         if !self.text_started {
                                             self.text_started = true;
                                             self.current_block = Some(StreamingBlockType::Text);
+                                            // Queue the delta, emit start first
+                                            self.pending_event = Some(StreamEvent::TextDelta(text.text));
+                                            return Some(StreamEvent::TextStart);
                                         }
                                         return Some(StreamEvent::TextDelta(text.text));
                                     }
                                 }
                                 StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                                    return Some(StreamEvent::ToolUse {
+                                    let tool_event = StreamEvent::ToolUse {
                                         id: tool_call.id.clone(),
                                         name: tool_call.function.name.clone(),
                                         input: tool_call.function.arguments.clone(),
-                                    });
+                                    };
+                                    // Close any open block before tool use
+                                    if self.current_block.is_some() {
+                                        return Some(self.close_current_block(tool_event));
+                                    }
+                                    return Some(tool_event);
                                 }
                                 StreamedAssistantContent::ToolCallDelta { .. } => {
                                     // Tool call deltas are partial updates, we handle complete tool calls
                                 }
                                 StreamedAssistantContent::Reasoning(reasoning) => {
                                     if !reasoning.reasoning.is_empty() {
-                                        if !self.thinking_started {
-                                            self.thinking_started = true;
-                                            self.current_block = Some(StreamingBlockType::Thinking);
-                                        }
                                         let text = reasoning.reasoning.join("");
                                         if !text.is_empty() {
+                                            // Check for block transition: was Text, now Thinking
+                                            if self.current_block == Some(StreamingBlockType::Text) {
+                                                self.thinking_started = true;
+                                                self.current_block = Some(StreamingBlockType::Thinking);
+                                                self.pending_event = Some(StreamEvent::ThinkingDelta(text));
+                                                return Some(self.close_current_block(StreamEvent::ThinkingStart));
+                                            }
+
+                                            if !self.thinking_started {
+                                                self.thinking_started = true;
+                                                self.current_block = Some(StreamingBlockType::Thinking);
+                                                self.pending_event = Some(StreamEvent::ThinkingDelta(text));
+                                                return Some(StreamEvent::ThinkingStart);
+                                            }
                                             return Some(StreamEvent::ThinkingDelta(text));
                                         }
                                     }
                                 }
                                 StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
                                     if !reasoning.is_empty() {
+                                        // Check for block transition: was Text, now Thinking
+                                        if self.current_block == Some(StreamingBlockType::Text) {
+                                            self.thinking_started = true;
+                                            self.current_block = Some(StreamingBlockType::Thinking);
+                                            self.pending_event = Some(StreamEvent::ThinkingDelta(reasoning));
+                                            return Some(self.close_current_block(StreamEvent::ThinkingStart));
+                                        }
+
                                         if !self.thinking_started {
                                             self.thinking_started = true;
                                             self.current_block = Some(StreamingBlockType::Thinking);
+                                            self.pending_event = Some(StreamEvent::ThinkingDelta(reasoning));
+                                            return Some(StreamEvent::ThinkingStart);
                                         }
                                         return Some(StreamEvent::ThinkingDelta(reasoning));
                                     }
                                 }
                                 StreamedAssistantContent::Final(_) => {
-                                    // Final response - stream is ending
+                                    // Final response - close any open block, then Done
                                     self.finished = true;
-                                    return Some(StreamEvent::Done {
-                                        stop_reason: Some("end_turn".into()),
-                                        input_tokens: self.input_tokens,
-                                        output_tokens: self.output_tokens,
-                                    });
+                                    let done = self.make_done_event();
+                                    if self.current_block.is_some() {
+                                        return Some(self.close_current_block(done));
+                                    }
+                                    return Some(done);
                                 }
                             }
                             // No event to emit for this chunk, continue
                             continue;
                         }
                         Some(Err(e)) => {
+                            // Close any open block before error
                             self.finished = true;
-                            return Some(StreamEvent::Error(e.to_string()));
+                            let error = StreamEvent::Error(e.to_string());
+                            if self.current_block.is_some() {
+                                return Some(self.close_current_block(error));
+                            }
+                            return Some(error);
                         }
                         None => {
+                            // Stream ended - close any open block, then Done
                             self.finished = true;
-                            return Some(StreamEvent::Done {
-                                stop_reason: Some("end_turn".into()),
-                                input_tokens: self.input_tokens,
-                                output_tokens: self.output_tokens,
-                            });
+                            let done = self.make_done_event();
+                            if self.current_block.is_some() {
+                                return Some(self.close_current_block(done));
+                            }
+                            return Some(done);
                         }
                     }
                 }};
