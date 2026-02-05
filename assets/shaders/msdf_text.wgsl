@@ -329,11 +329,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let sd = min(msdf_sd, sample.a);
 
     // Discard pixels clearly outside this glyph's territory.
-    // The glyph edge is at sd=0.5. We use 0.45 as threshold to allow:
-    // - Antialiasing transition (0.45 to 0.50)
-    // - Glow effect which extends beyond the edge
-    // Depth testing ensures the first glyph wins in contested overlap regions.
-    if sd < 0.45 {
+    // The glyph edge is at sd=0.5. Threshold 0.48 allows a thin AA transition
+    // while minimizing territory claiming — where earlier glyphs' SDF fields
+    // "nibble" the left edges of later glyphs via depth-test priority.
+    // Glow extends inward from the edge, so this threshold doesn't affect it.
+    if sd < 0.48 {
         discard;
     }
 
