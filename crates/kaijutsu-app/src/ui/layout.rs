@@ -25,7 +25,7 @@ use bevy::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use super::hud::HudPosition;
+use super::widget::Edge;
 
 // ============================================================================
 // LAYOUT TYPES
@@ -88,12 +88,12 @@ impl From<LayoutDirection> for FlexDirection {
     }
 }
 
-/// HUD placement in a layout.
+/// Widget placement in a layout preset.
 #[derive(Debug, Clone, Deserialize, Reflect)]
-pub struct HudPlacement {
-    /// Screen position
-    pub position: HudPosition,
-    /// Widget name (must match HudContent enum variant)
+pub struct WidgetPlacement {
+    /// Dock edge for the widget
+    pub edge: Edge,
+    /// Widget name
     pub widget: String,
 }
 
@@ -109,10 +109,10 @@ pub struct LayoutPreset {
     pub name: String,
     /// Root layout node
     pub root: LayoutNode,
-    /// HUD placements (overlay widgets)
+    /// Widget placements (docked widgets)
     #[serde(default)]
     #[allow(dead_code)] // RON field, used in tests
-    pub huds: Vec<HudPlacement>,
+    pub widgets: Vec<WidgetPlacement>,
 }
 
 // ============================================================================
@@ -422,9 +422,6 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     // TODO: Move constellation spawning to a builder
     registry.register("ConstellationMini");
 
-    // InputFrame - legacy, kept for layout compatibility
-    // PromptCell removed - ComposeBlock handles input inline
-    registry.register("InputFrame");
 
     // =========================================================================
     // DASHBOARD VIEW PANELS
@@ -658,15 +655,15 @@ mod tests {
                     ],
                     flex: 1.0,
                 ),
-                huds: [
-                    (position: TopRight, widget: "status"),
+                widgets: [
+                    (edge: South, widget: "mode"),
                 ],
             )
         "#;
 
         let preset: LayoutPreset = ron::from_str(ron).unwrap();
         assert_eq!(preset.name, "test");
-        assert_eq!(preset.huds.len(), 1);
-        assert_eq!(preset.huds[0].widget, "status");
+        assert_eq!(preset.widgets.len(), 1);
+        assert_eq!(preset.widgets[0].widget, "mode");
     }
 }

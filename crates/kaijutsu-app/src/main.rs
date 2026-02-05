@@ -9,8 +9,8 @@
 //! - `AppScreen::Dashboard` - Kernel/Context/Seat selection
 //! - `AppScreen::Conversation` - Active conversation view
 //!
-//! Chrome (header, status bar) is always visible. Content area switches
-//! between views using `Display::None` for efficient layout.
+//! Chrome is handled by the widget system (North/South docks).
+//! Content area switches between views using `Display::None`.
 
 // Bevy ECS idioms that trigger these lints
 #![allow(clippy::too_many_arguments)]
@@ -93,8 +93,8 @@ fn main() {
         .add_plugins(commands::CommandsPlugin)
         // Constellation - context navigation as visual node graph
         .add_plugins(ui::constellation::ConstellationPlugin)
-        // HUD system - configurable overlay panels
-        .add_plugins(ui::hud::HudPlugin)
+        // Widget system - unified docked/floating UI primitives
+        .add_plugins(ui::widget::WidgetPlugin)
         // Layout system - RON-driven view layouts
         .add_plugins(ui::layout::LayoutPlugin)
         // Timeline navigation - temporal scrubbing through history
@@ -115,11 +115,9 @@ fn main() {
         ).chain())
         // Update
         .add_systems(Update, (
-            handle_connection_events,
             ui::debug::handle_debug_toggle,
             ui::debug::handle_screenshot,
             ui::debug::handle_quit,
-            ui::mode_indicator::update_mode_indicator,
         ))
         .run();
 }
@@ -139,34 +137,29 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
 ///
 /// ## Architecture
 ///
+/// Chrome is handled by the widget system (North/South docks at ZLayer::HUD).
+/// This function spawns the content area structure only.
+///
 /// ```text
-/// Z-LAYER 0: CHROME (always visible)
 /// ┌─────────────────────────────────────────────────────┐
-/// │ 会術 Kaijutsu    [status]           [Seat Selector] │  ← Header
+/// │ [title widget]              [connection widget]     │ ← North dock (widgets)
 /// ├─────────────────────────────────────────────────────┤
-/// │ Z-LAYER 10: CONTENT AREA (state-driven)             │
 /// │                                                     │
 /// │   ┌─ AppScreen::Dashboard ────────────────────────┐ │
 /// │   │ KERNELS │ CONTEXTS │ YOUR SEATS               │ │
-/// │   │ [lobby] │ [default]│                          │ │
 /// │   └───────────────────────────────────────────────┘ │
 /// │                                                     │
 /// │   ┌─ AppScreen::Conversation ─────────────────────┐ │
 /// │   │ (scrollable conversation messages)            │ │
-/// │   │ ───────────────────────────────────────────── │ │
-/// │   │ [Prompt input area]                           │ │
 /// │   └───────────────────────────────────────────────┘ │
 /// │                                                     │
 /// ├─────────────────────────────────────────────────────┤
-/// │ [NORMAL]               Enter: submit │ Esc: normal │  ← Status bar
+/// │ [mode widget]                      [hints widget]   │ ← South dock (widgets)
 /// └─────────────────────────────────────────────────────┘
-///
-/// Z-LAYER 100: MODALS (seat dropdown, command palette)
 /// ```
 fn setup_ui(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,
-    mut text_glow_materials: ResMut<Assets<shaders::TextGlowMaterial>>,
 ) {
     // Root container - fills window, flex column layout
     commands
@@ -175,75 +168,35 @@ fn setup_ui(
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
+                // Padding for widget docks (North=48px, South=32px)
+                padding: UiRect {
+                    top: Val::Px(48.0),
+                    bottom: Val::Px(32.0),
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                },
                 ..default()
             },
-            // Transparent - let camera clear color show through
         ))
         .with_children(|root| {
             // ═══════════════════════════════════════════════════════════════
-            // CHROME: HEADER (always visible, Z-LAYER 0)
+            // HEADER CONTAINER (minimal - just for seat selector attachment)
+            // Actual header content is in North dock widgets
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
                 HeaderContainer,
                 Node {
                     width: Val::Percent(100.0),
+                    height: Val::Px(0.0), // Zero height - just an attachment point
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(6.0),
+                    right: Val::Px(16.0),
                     flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)), // Tighter vertical
-                    border: UiRect::bottom(Val::Px(1.0)),
+                    justify_content: JustifyContent::FlexEnd,
                     ..default()
                 },
-                BorderColor::all(theme.border),
-            ))
-            .with_children(|header| {
-                // Left: Title with icy sheen plane underneath (absolute positioned)
-                header
-                    .spawn(Node {
-                        min_width: Val::Px(180.0),
-                        min_height: Val::Px(36.0),
-                        ..default()
-                    })
-                    .with_children(|title_container| {
-                        // Title text (normal flow)
-                        title_container.spawn((
-                            text::MsdfUiText::new("会術 Kaijutsu")
-                                .with_font_size(24.0)
-                                .with_color(theme.accent),
-                            text::UiTextPositionCache::default(),
-                            Node::default(),
-                        ));
-
-                        // Icy sheen plane - absolute positioned below text
-                        title_container.spawn((
-                            MaterialNode(text_glow_materials.add(
-                                shaders::TextGlowMaterial::icy_sheen(theme.accent),
-                            )),
-                            Node {
-                                position_type: PositionType::Absolute,
-                                bottom: Val::Px(0.0),
-                                left: Val::Px(0.0),
-                                width: Val::Percent(100.0),
-                                height: Val::Px(6.0),
-                                ..default()
-                            },
-                        ));
-                    });
-
-                // Right: Connection status (uses glyphon)
-                header.spawn((
-                    StatusText,
-                    text::MsdfUiText::new("Connecting...")
-                        .with_font_size(14.0)
-                        .with_color(theme.fg_dim),
-                    text::UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(250.0),
-                        min_height: Val::Px(20.0),
-                        ..default()
-                    },
-                ));
-            });
+                ZIndex(constants::ZLayer::HUD + 1), // Above North dock
+            ));
 
             // ═══════════════════════════════════════════════════════════════
             // CONTENT AREA (state-driven, Z-LAYER 10)
@@ -292,165 +245,12 @@ fn setup_ui(
                     Visibility::Hidden, // Hidden by default (glyphon needs this too)
                 ));
             });
-
-            // ═══════════════════════════════════════════════════════════════
-            // CHROME: STATUS BAR (always visible, Z-LAYER 0)
-            // Contains mode indicator integrated as flex child
-            // ═══════════════════════════════════════════════════════════════
-            root.spawn((
-                ui::state::StatusBar,
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(theme.panel_bg),
-            ))
-            .with_children(|status_bar| {
-                // Left: Mode indicator (spawned as flex child, not absolute)
-                status_bar.spawn((
-                    ui::mode_indicator::ModeIndicator,
-                    text::MsdfUiText::new("NORMAL")
-                        .with_font_size(14.0)
-                        .with_color(theme.fg_dim),
-                    text::UiTextPositionCache::default(),
-                    Node {
-                        padding: UiRect::all(Val::Px(8.0)),
-                        min_width: Val::Px(80.0),
-                        min_height: Val::Px(20.0),
-                        ..default()
-                    },
-                    BackgroundColor(theme.panel_bg),
-                ));
-
-                // Spacer
-                status_bar.spawn(Node {
-                    flex_grow: 1.0,
-                    ..default()
-                });
-
-                // Right: Key hints
-                status_bar.spawn((
-                    text::MsdfUiText::new("Enter: submit │ Shift+Enter: newline │ Esc: normal mode")
-                        .with_font_size(11.0)
-                        .with_color(theme.fg_dim),
-                    text::UiTextPositionCache::default(),
-                    Node {
-                        min_width: Val::Px(450.0),
-                        min_height: Val::Px(16.0),
-                        ..default()
-                    },
-                ));
-            });
         });
 }
 
-/// Spawn the InputLayer - world-level floating container for the input area.
+/// Marker for the header container (used by dashboard to attach seat selector).
 ///
-/// The InputLayer floats over the InputShadow and contains:
-/// - Backdrop (dim overlay, visible when presence=Overlay)
-/// - Input frame content (the 9-slice frame and text are positioned here)
-///
-/// This is spawned at ZIndex(100) so it floats above all conversation content.
-///
-/// NOTE: Legacy system - disabled in favor of ComposeBlock (inline input).
-#[allow(dead_code)]
-fn setup_input_layer(
-    mut commands: Commands,
-    theme: Res<ui::theme::Theme>,
-) {
-    // Spawn the InputLayer at world level (not parented to any UI tree)
-    commands.spawn((
-        ui::state::InputLayer,
-        Node {
-            position_type: PositionType::Absolute,
-            // Position will be updated by compute_input_position system
-            left: Val::Px(0.0),
-            top: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            // No layout - children use absolute positioning
-            ..default()
-        },
-        ZIndex(constants::ZLayer::MODAL),
-        // Start hidden - visibility controlled by InputPresence
-        Visibility::Hidden,
-    ))
-    .with_children(|layer| {
-        // Backdrop - dim overlay behind centered input (only visible in Overlay mode)
-        layer.spawn((
-            ui::state::InputBackdrop,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                top: Val::Px(0.0),
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                ..default()
-            },
-            BackgroundColor(theme.input_backdrop_color),
-            Visibility::Hidden, // Toggled by sync_backdrop_visibility
-        ));
-
-        // InputFrame container - the 9-slice frame pieces are spawned as children
-        // by the frame_assembly system when it sees an InputFrame marker
-        layer.spawn((
-            ui::state::InputFrame,
-            Node {
-                position_type: PositionType::Absolute,
-                // Position/size updated by apply_input_position system
-                ..default()
-            },
-            // No background - frame pieces render the border
-        ));
-    });
-}
-
-
-/// Marker for status text
-#[derive(Component)]
-struct StatusText;
-
-/// Marker for the header container (used by dashboard to attach seat selector)
+/// The actual header content (title, connection status) is now in widget system.
+/// This component exists only as an attachment point for the seat selector dropdown.
 #[derive(Component)]
 pub struct HeaderContainer;
-
-/// Convert connection events to UI updates
-fn handle_connection_events(
-    mut conn_events: MessageReader<connection::ConnectionEvent>,
-    mut status_text: Query<&mut text::MsdfUiText, With<StatusText>>,
-    theme: Res<ui::theme::Theme>,
-) {
-    use connection::ConnectionEvent;
-
-    for event in conn_events.read() {
-        for mut ui_text in status_text.iter_mut() {
-            match event {
-                ConnectionEvent::Connected => {
-                    ui_text.text = "✓ Connected to server".into();
-                    ui_text.color = text::bevy_to_rgba8(theme.row_result);
-                }
-                ConnectionEvent::Disconnected => {
-                    ui_text.text = "⚡ Disconnected (reconnecting...)".into();
-                    ui_text.color = text::bevy_to_rgba8(theme.row_tool);
-                }
-                ConnectionEvent::ConnectionFailed(err) => {
-                    ui_text.text = format!("✗ {}", err);
-                    ui_text.color = text::bevy_to_rgba8(theme.accent2);
-                }
-                ConnectionEvent::Reconnecting { attempt, .. } => {
-                    ui_text.text = format!("⟳ Reconnecting (attempt {})...", attempt);
-                    ui_text.color = text::bevy_to_rgba8(theme.fg_dim);
-                }
-                ConnectionEvent::AttachedKernel(info) => {
-                    ui_text.text = format!("✓ Attached to kernel: {}", info.name);
-                    ui_text.color = text::bevy_to_rgba8(theme.row_result);
-                }
-                _ => {}
-            }
-        }
-    }
-}

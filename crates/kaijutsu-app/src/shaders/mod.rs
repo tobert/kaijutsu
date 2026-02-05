@@ -443,7 +443,7 @@ impl UiMaterial for CursorBeamMaterial {
 /// // Glow backing
 /// commands.spawn((
 ///     Node { width: Val::Px(200.0), height: Val::Px(30.0), ..default() },
-///     MaterialNode(materials.add(TextGlowMaterial::icy_sheen(theme.accent))),
+///     MaterialNode(materials.add(TextGlowMaterial::default())),
 ///     ZIndex(-1),
 /// ));
 /// // Text on top (ZIndex 0, default)
@@ -490,24 +490,6 @@ impl Default for TextGlowMaterial {
             // Geometry defaults (will be populated by sync system if TextGlowTarget present)
             text_bounds: Vec4::new(0.0, 0.0, 100.0, 20.0), // Placeholder bounds
             text_metrics: Vec4::new(11.2, 20.0, 14.0, 11.2), // baseline, line_height, font_size, ascent
-        }
-    }
-}
-
-impl TextGlowMaterial {
-    /// Create an icy sheen effect (cool reflective plane)
-    /// Uses params.w > 0.5 to signal "icy mode" to shader
-    pub fn icy_sheen(color: Color) -> Self {
-        let c = color.to_linear();
-        Self {
-            color: Vec4::new(
-                c.red * 0.7 + 0.3,
-                c.green * 0.7 + 0.3,
-                c.blue * 0.8 + 0.2,
-                0.25,
-            ),
-            params: Vec4::new(0.8, 0.6, 2.0, 1.0), // mode=1 (icy)
-            ..Default::default()
         }
     }
 }

@@ -146,6 +146,44 @@ Key components:
 
 Edits go through CRDT operations on the MainCell's BlockDocument, ensuring all changes are properly tracked and synced.
 
+### Widget System (Phase 1)
+
+Widgets are the unified UI primitive for all non-content chrome. Located in `ui/widget/mod.rs`.
+
+**Core types:**
+- `Widget` - component with name, content, state, size hints
+- `WidgetState` - `Docked{edge, order}`, `Floating{x, y}`, or `Hidden`
+- `WidgetContent` - `Mode`, `Text{template}`, `Agents`, `Tokens`, etc.
+- `Edge` - `North`, `South`, `East`, `West`
+- `DockContainer` - flex container for widgets at each edge
+
+**Current widgets (Phase 2):**
+- `title` - app title (North dock, left)
+- `connection` - reactive connection status (North dock, right)
+- `mode` - reactive mode indicator (South dock, left)
+- `hints` - context-sensitive key hints (South dock, right)
+
+**Architecture:**
+```
+┌────────────────────────────────────────────────────────────────┐
+│ [widget] [widget]                        [widget] [widget]     │ ← North
+├────────┬──────────────────────────────────────────────┬────────┤
+│[widget]│              FOCAL CONTEXT                   │[widget]│ ← E/W
+├────────┴──────────────────────────────────────────────┴────────┤
+│ [mode]                                               [hints]   │ ← South
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Completed phases:**
+- Phase 1: Widget foundation (core types, mode widget)
+- Phase 2: Dock layout system (N/S docks, title/connection widgets)
+- Phase 4: Chrome removal (deleted mode_indicator.rs, legacy header/status bar)
+
+**Future phases:**
+- Phase 3: Canvas owns widgets (multi-canvas support)
+- Phase 5: Floating widgets with drag-to-dock
+- Phase 6: Rich content types (AgentList, TokenMeter, MiniConstellation)
+
 ## Key Patterns
 
 ### RPC (Cap'n Proto)

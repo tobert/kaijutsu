@@ -34,10 +34,6 @@ pub struct ContentArea;
 #[derive(Component)]
 pub struct ConversationRoot;
 
-/// Marker for the status bar (chrome, always visible)
-#[derive(Component)]
-pub struct StatusBar;
-
 // ============================================================================
 // VIEW STACK (Phase 4)
 // ============================================================================
@@ -343,31 +339,11 @@ pub enum InputPresenceKind {
 pub struct InputPresence(pub InputPresenceKind);
 
 // ============================================================================
-// INPUT AREA MARKERS (Legacy - kept for entity spawning compatibility)
+// INPUT AREA MARKERS
 // ============================================================================
 
-/// Marker for the InputShadow - legacy flex child.
+/// Marker for the InputShadow - flex child that reserves space for input.
 ///
-/// NOTE: No longer reserves space - ComposeBlock is inline now.
-/// Kept for layout.rs spawning compatibility.
+/// Used by layout.rs for conversation view structure.
 #[derive(Component)]
 pub struct InputShadow;
-
-/// Marker for the InputLayer - legacy world-level floating container.
-///
-/// NOTE: Hidden - ComposeBlock handles input inline now.
-/// Kept for main.rs spawning compatibility.
-#[derive(Component)]
-pub struct InputLayer;
-
-/// Marker for the backdrop within InputLayer.
-///
-/// NOTE: Legacy - always hidden now.
-#[derive(Component)]
-pub struct InputBackdrop;
-
-/// Marker for the frame container within InputLayer.
-///
-/// NOTE: Legacy - the 9-slice frame is no longer used for input.
-#[derive(Component)]
-pub struct InputFrame;
