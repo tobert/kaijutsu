@@ -19,6 +19,7 @@ pub mod control;
 pub mod conversation;
 pub mod conversation_db;
 pub mod db;
+pub mod drift;
 pub mod flows;
 pub mod kernel;
 pub mod llm;
@@ -77,6 +78,13 @@ pub use config_backend::{
     ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
     ConfigWatcherHandle, ValidationResult,
     DEFAULT_THEME, DEFAULT_LLM_CONFIG, EXAMPLE_SEAT,
+};
+
+pub use drift::{
+    ContextHandle, DriftEngine, DriftError, DriftRouter,
+    SharedDriftRouter, StagedDrift, shared_drift_router,
+    // Distillation helpers
+    DISTILLATION_SYSTEM_PROMPT, build_distillation_prompt,
 };
 
 // Re-export rmcp types needed for resource handling

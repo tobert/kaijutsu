@@ -18,6 +18,7 @@ use crate::agents::{
     AgentStatus,
 };
 use crate::control::ConsentMode;
+use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::{LlmRegistry, LlmResult, RigProvider};
 use crate::llm::config::{ToolConfig, ToolFilter};
@@ -51,6 +52,8 @@ pub struct Kernel {
     consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
     block_flows: SharedBlockFlowBus,
+    /// DriftRouter for cross-context communication.
+    drift: SharedDriftRouter,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -61,6 +64,7 @@ impl std::fmt::Debug for Kernel {
             .field("tools", &"<locked>")
             .field("llm", &"<locked>")
             .field("consent_mode", &"<locked>")
+            .field("drift", &"<shared>")
             .finish()
     }
 }
@@ -88,6 +92,7 @@ impl Kernel {
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
+            drift: shared_drift_router(),
         }
     }
 
@@ -106,6 +111,7 @@ impl Kernel {
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
+            drift: shared_drift_router(),
         }
     }
 
@@ -127,12 +133,18 @@ impl Kernel {
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
+            drift: shared_drift_router(),
         }
     }
 
     /// Get the block flows bus.
     pub fn block_flows(&self) -> &SharedBlockFlowBus {
         &self.block_flows
+    }
+
+    /// Get the drift router.
+    pub fn drift(&self) -> &SharedDriftRouter {
+        &self.drift
     }
 
     // ========================================================================
@@ -505,6 +517,9 @@ impl Kernel {
 
         // Note: Agents are not copied - forked kernels start fresh
 
+        // Share DriftRouter - forked kernels participate in drift with parent
+        let drift = Arc::clone(&self.drift);
+
         Self {
             vfs,
             state: RwLock::new(state),
@@ -514,6 +529,7 @@ impl Kernel {
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
+            drift,
         }
     }
 
@@ -538,6 +554,9 @@ impl Kernel {
         // Share the FlowBus - threaded kernels share event streams
         let block_flows = Arc::clone(&self.block_flows);
 
+        // Share DriftRouter - threaded kernels participate in drift with parent
+        let drift = Arc::clone(&self.drift);
+
         Self {
             vfs,
             state: RwLock::new(state),
@@ -547,6 +566,7 @@ impl Kernel {
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
+            drift,
         }
     }
 

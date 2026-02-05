@@ -183,7 +183,7 @@ pub struct ServerState {
     /// Shared MCP server pool
     pub mcp_pool: Arc<McpServerPool>,
     /// Cross-context drift router (context registry + staging queue)
-    pub drift_router: crate::drift::DriftRouter,
+    pub drift_router: kaijutsu_kernel::DriftRouter,
 }
 
 impl ServerState {
@@ -199,7 +199,7 @@ impl ServerState {
             my_seats: HashMap::new(),
             current_seat: None,
             mcp_pool: Arc::new(McpServerPool::new()),
-            drift_router: crate::drift::DriftRouter::new(),
+            drift_router: kaijutsu_kernel::DriftRouter::new(),
         }
     }
 
@@ -638,7 +638,8 @@ impl world::Server for WorldImpl {
                 let mut state_ref = state.borrow_mut();
 
                 // Register in drift router for cross-context communication
-                state_ref.drift_router.register(&id, &name, None);
+                // context_name = kernel_id, document_id = main_document_id
+                state_ref.drift_router.register(&id, &main_document_id, None);
 
                 state_ref.kernels.insert(
                     id.clone(),
@@ -1034,11 +1035,11 @@ impl kernel::Server for KernelImpl {
 
                 // Register in drift router with parent lineage
                 let parent_short = state_ref.drift_router
-                    .short_id_for_kernel(&parent_kernel_id)
+                    .short_id_for_context(&parent_kernel_id)
                     .map(|s| s.to_string());
                 state_ref.drift_router.register(
                     &id,
-                    &name,
+                    &main_document_id,
                     parent_short.as_deref(),
                 );
 
@@ -1140,11 +1141,11 @@ impl kernel::Server for KernelImpl {
 
                 // Register in drift router with parent lineage
                 let parent_short = state_ref.drift_router
-                    .short_id_for_kernel(&parent_kernel_id)
+                    .short_id_for_context(&parent_kernel_id)
                     .map(|s| s.to_string());
                 state_ref.drift_router.register(
                     &id,
-                    &name,
+                    &main_document_id,
                     parent_short.as_deref(),
                 );
 
@@ -3838,11 +3839,11 @@ impl kernel::Server for KernelImpl {
         let state = self.state.borrow();
         let kernel_id = &self.kernel_id;
 
-        let short_id = state.drift_router.short_id_for_kernel(kernel_id)
+        let short_id = state.drift_router.short_id_for_context(kernel_id)
             .unwrap_or("");
-        let name = state.drift_router.short_id_for_kernel(kernel_id)
+        let name = state.drift_router.short_id_for_context(kernel_id)
             .and_then(|sid| state.drift_router.get(sid))
-            .map(|h| h.name.as_str())
+            .map(|h| h.context_name.as_str())
             .unwrap_or("");
 
         results.get().set_short_id(short_id);
@@ -3865,7 +3866,7 @@ impl kernel::Server for KernelImpl {
             // Update drift router metadata
             {
                 let mut state_ref = state.borrow_mut();
-                let short_id = state_ref.drift_router.short_id_for_kernel(&kernel_id)
+                let short_id = state_ref.drift_router.short_id_for_context(&kernel_id)
                     .map(|s| s.to_string());
                 if let Some(ref sid) = short_id {
                     let _ = state_ref.drift_router.configure_llm(sid, &provider_name, &model);
@@ -3920,7 +3921,7 @@ impl kernel::Server for KernelImpl {
         // Extract what we need from state before going async
         let (source_ctx, source_model, kernel_arc, documents, main_doc_id) = {
             let state_ref = state.borrow();
-            let source_ctx = match state_ref.drift_router.short_id_for_kernel(&kernel_id) {
+            let source_ctx = match state_ref.drift_router.short_id_for_context(&kernel_id) {
                 Some(sid) => sid.to_string(),
                 None => {
                     return Promise::err(capnp::Error::failed(
@@ -3974,7 +3975,7 @@ impl kernel::Server for KernelImpl {
             let blocks = documents.block_snapshots(&main_doc_id)
                 .map_err(|e| capnp::Error::failed(format!("failed to read blocks: {}", e)))?;
 
-            let user_prompt = crate::drift::build_distillation_prompt(&blocks, None);
+            let user_prompt = kaijutsu_kernel::build_distillation_prompt(&blocks, None);
 
             // Determine model to use
             let model = source_model.as_deref().unwrap_or_else(|| {
@@ -3987,7 +3988,7 @@ impl kernel::Server for KernelImpl {
             let summary = provider
                 .prompt_with_system(
                     model,
-                    Some(crate::drift::DISTILLATION_SYSTEM_PROMPT),
+                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
                     &user_prompt,
                 )
                 .await
@@ -4023,7 +4024,7 @@ impl kernel::Server for KernelImpl {
         let mut state = self.state.borrow_mut();
 
         // Scope flush to items involving the calling kernel's context
-        let caller_ctx = state.drift_router.short_id_for_kernel(&self.kernel_id)
+        let caller_ctx = state.drift_router.short_id_for_context(&self.kernel_id)
             .map(|s| s.to_string());
         let staged = state.drift_router.drain(caller_ctx.as_deref());
         let count = staged.len() as u32;
@@ -4031,7 +4032,7 @@ impl kernel::Server for KernelImpl {
         for drift in &staged {
             // Look up target kernel's documents
             let target_kernel_id = match state.drift_router.get(&drift.target_ctx) {
-                Some(h) => h.kernel_id.clone(),
+                Some(h) => h.context_name.clone(),
                 None => {
                     log::warn!("Drift flush: target context {} not found, skipping", drift.target_ctx);
                     continue;
@@ -4048,7 +4049,7 @@ impl kernel::Server for KernelImpl {
 
             // Build drift block snapshot
             let author = format!("drift:{}", drift.source_ctx);
-            let snapshot = crate::drift::DriftRouter::build_drift_block(drift, &author);
+            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(drift, &author);
 
             // Get last block in target document for ordering
             let after = documents.last_block_id(&main_doc_id);
@@ -4129,14 +4130,14 @@ impl kernel::Server for KernelImpl {
 
                 let source_handle = state_ref.drift_router.get(&source_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
-                let source_kernel_id = source_handle.kernel_id.clone();
+                let source_kernel_id = source_handle.context_name.clone();
                 let source_model = source_handle.model.clone();
                 let source_ks = state_ref.kernels.get(&source_kernel_id)
                     .ok_or_else(|| capnp::Error::failed(format!("kernel {} not found", source_kernel_id)))?;
                 let source_docs = source_ks.documents.clone();
                 let source_main_doc = source_ks.main_document_id.clone();
 
-                let target_ctx_id = state_ref.drift_router.short_id_for_kernel(&kernel_id)
+                let target_ctx_id = state_ref.drift_router.short_id_for_context(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("current kernel not registered".into()))?
                     .to_string();
                 let target_ks = state_ref.kernels.get(&kernel_id)
@@ -4161,7 +4162,7 @@ impl kernel::Server for KernelImpl {
             let blocks = source_docs.block_snapshots(&source_main_doc)
                 .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
 
-            let user_prompt = crate::drift::build_distillation_prompt(
+            let user_prompt = kaijutsu_kernel::build_distillation_prompt(
                 &blocks,
                 directed_prompt.as_deref(),
             );
@@ -4176,14 +4177,14 @@ impl kernel::Server for KernelImpl {
             let summary = provider
                 .prompt_with_system(
                     model,
-                    Some(crate::drift::DISTILLATION_SYSTEM_PROMPT),
+                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
                     &user_prompt,
                 )
                 .await
                 .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
 
             // Build drift block and inject directly into target (caller's) document
-            let staged = crate::drift::StagedDrift {
+            let staged = kaijutsu_kernel::StagedDrift {
                 id: 0,
                 source_ctx: source_ctx_id.clone(),
                 target_ctx: target_ctx_id.clone(),
@@ -4197,7 +4198,7 @@ impl kernel::Server for KernelImpl {
             };
 
             let author = format!("drift:{}", source_ctx_id);
-            let snapshot = crate::drift::DriftRouter::build_drift_block(&staged, &author);
+            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&staged, &author);
             let after = target_docs.last_block_id(&target_main_doc);
 
             let block_id = target_docs.insert_from_snapshot(&target_main_doc, snapshot, after.as_ref())
@@ -4238,7 +4239,7 @@ impl kernel::Server for KernelImpl {
                         format!("context {} has no parent — cannot merge", source_ctx_id)
                     ))?;
 
-                let source_kernel_id = source_handle.kernel_id.clone();
+                let source_kernel_id = source_handle.context_name.clone();
                 let source_model = source_handle.model.clone();
                 let source_ks = state_ref.kernels.get(&source_kernel_id)
                     .ok_or_else(|| capnp::Error::failed(format!("kernel {} not found", source_kernel_id)))?;
@@ -4248,7 +4249,7 @@ impl kernel::Server for KernelImpl {
 
                 let parent_handle = state_ref.drift_router.get(&parent_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("parent context {} not found", parent_ctx_id)))?;
-                let parent_kernel_id = parent_handle.kernel_id.clone();
+                let parent_kernel_id = parent_handle.context_name.clone();
                 let parent_ks = state_ref.kernels.get(&parent_kernel_id)
                     .ok_or_else(|| capnp::Error::failed(format!("parent kernel {} not found", parent_kernel_id)))?;
                 let parent_docs = parent_ks.documents.clone();
@@ -4270,7 +4271,7 @@ impl kernel::Server for KernelImpl {
             let blocks = source_docs.block_snapshots(&source_main_doc)
                 .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
 
-            let user_prompt = crate::drift::build_distillation_prompt(&blocks, None);
+            let user_prompt = kaijutsu_kernel::build_distillation_prompt(&blocks, None);
 
             let model = source_model.as_deref().unwrap_or_else(|| {
                 provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
@@ -4282,14 +4283,14 @@ impl kernel::Server for KernelImpl {
             let summary = provider
                 .prompt_with_system(
                     model,
-                    Some(crate::drift::DISTILLATION_SYSTEM_PROMPT),
+                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
                     &user_prompt,
                 )
                 .await
                 .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
 
             // Build drift block and inject into parent document
-            let staged = crate::drift::StagedDrift {
+            let staged = kaijutsu_kernel::StagedDrift {
                 id: 0,
                 source_ctx: source_ctx_id.clone(),
                 target_ctx: parent_ctx_id.clone(),
@@ -4303,7 +4304,7 @@ impl kernel::Server for KernelImpl {
             };
 
             let author = format!("drift:{}", source_ctx_id);
-            let snapshot = crate::drift::DriftRouter::build_drift_block(&staged, &author);
+            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&staged, &author);
             let after = parent_docs.last_block_id(&parent_main_doc);
 
             let block_id = parent_docs.insert_from_snapshot(&parent_main_doc, snapshot, after.as_ref())
@@ -4333,8 +4334,8 @@ impl kernel::Server for KernelImpl {
         for (i, ctx) in contexts.iter().enumerate() {
             let mut entry = list.reborrow().get(i as u32);
             entry.set_short_id(&ctx.short_id);
-            entry.set_name(&ctx.name);
-            entry.set_kernel_id(&ctx.kernel_id);
+            entry.set_name(&ctx.context_name);
+            entry.set_kernel_id(&ctx.context_name);
             entry.set_provider(ctx.provider.as_deref().unwrap_or(""));
             entry.set_model(ctx.model.as_deref().unwrap_or(""));
             if let Some(ref parent) = ctx.parent_short_id {
