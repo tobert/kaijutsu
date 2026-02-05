@@ -65,10 +65,10 @@ RigStreamAdapter converts rig SSE streams to kaijutsu StreamEvents with proper b
 **Location:** `rpc.rs:936-1108`
 
 **Implementation:**
-- `fork(name)` — Creates isolated kernel copy with fresh LlmRegistry, new VFS, new FlowBus
-- `thread(name)` — Creates lightweight kernel sharing VFS and FlowBus with parent
+- `fork(name)` — Creates isolated kernel copy with cloned LlmRegistry, new VFS, new FlowBus
+- `thread(name)` — Creates lightweight kernel sharing VFS and FlowBus, cloned LlmRegistry
 
-Both return a new `Kernel` capability that can have different providers registered.
+Both inherit the parent's runtime LLM config (including `setDefaultProvider`/`setDefaultModel` changes) and can modify independently.
 
 ### 2.2 Example Flow (Now Supported!)
 

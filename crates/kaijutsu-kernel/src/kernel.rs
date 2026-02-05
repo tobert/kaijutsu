@@ -497,20 +497,20 @@ impl Kernel {
         // Copy tool config - forked kernels inherit parent's tool filtering
         let tool_config = self.tool_config.read().await.clone();
 
-        // Note: LLM providers are not copied - forked kernels start fresh
-        // This matches tool behavior and avoids credential sharing concerns
+        // Copy LLM registry - forked kernels inherit runtime provider/model config
+        // (provider Arc<RigProvider>s are shared, settings are independent)
+        let llm_registry = self.llm.read().await.clone_state();
 
         // Note: FlowBus is independent - forked kernels have their own event streams
 
         // Note: Agents are not copied - forked kernels start fresh
-        // This matches tool/LLM behavior
 
         Self {
             vfs,
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             tool_config: RwLock::new(tool_config),
-            llm: RwLock::new(LlmRegistry::new()),
+            llm: RwLock::new(llm_registry),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
@@ -529,11 +529,11 @@ impl Kernel {
         // (they can modify independently)
         let tool_config = self.tool_config.read().await.clone();
 
-        // Note: LLM providers are not shared - threaded kernels get fresh registry
-        // This avoids credential sharing and allows per-thread provider config
+        // Copy LLM registry - threaded kernels inherit runtime provider/model config
+        // (provider Arc<RigProvider>s are shared, settings are independent)
+        let llm_registry = self.llm.read().await.clone_state();
 
         // Note: Agents are not shared - threaded kernels get fresh registry
-        // This matches LLM provider behavior
 
         // Share the FlowBus - threaded kernels share event streams
         let block_flows = Arc::clone(&self.block_flows);
@@ -543,7 +543,7 @@ impl Kernel {
             state: RwLock::new(state),
             tools: RwLock::new(ToolRegistry::new()),
             tool_config: RwLock::new(tool_config),
-            llm: RwLock::new(LlmRegistry::new()),
+            llm: RwLock::new(llm_registry),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
@@ -764,5 +764,53 @@ mod tests {
         // Should fail gracefully without provider
         let result = kernel.prompt("Hello").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fork_inherits_llm_config() {
+        let parent = Kernel::new("parent").await;
+
+        // Set up parent's LLM registry
+        let provider = Arc::new(RigProvider::Anthropic(
+            rig::providers::anthropic::Client::new("fake-key").unwrap(),
+        ));
+        parent.register_llm("anthropic", provider).await;
+        parent.set_default_llm("anthropic").await;
+        parent.llm().write().await.set_default_model("claude-sonnet-4-5-20250929");
+
+        // Fork
+        let child = parent.fork("child").await;
+
+        // Child inherits provider, default provider name, and default model
+        let child_reg = child.llm().read().await;
+        assert!(child_reg.get("anthropic").is_some());
+        assert_eq!(child_reg.default_provider_name(), Some("anthropic"));
+        assert_eq!(child_reg.default_model(), Some("claude-sonnet-4-5-20250929"));
+        drop(child_reg);
+
+        // Child can change model independently
+        child.llm().write().await.set_default_model("claude-haiku-4-5-20251001");
+        assert_eq!(child.llm().read().await.default_model(), Some("claude-haiku-4-5-20251001"));
+
+        // Parent is unaffected
+        assert_eq!(parent.llm().read().await.default_model(), Some("claude-sonnet-4-5-20250929"));
+    }
+
+    #[tokio::test]
+    async fn test_thread_inherits_llm_config() {
+        let parent = Kernel::new("parent").await;
+
+        let provider = Arc::new(RigProvider::Anthropic(
+            rig::providers::anthropic::Client::new("fake-key").unwrap(),
+        ));
+        parent.register_llm("anthropic", provider).await;
+        parent.set_default_llm("anthropic").await;
+
+        let child = parent.thread("worker").await;
+
+        // Thread inherits LLM config
+        let child_reg = child.llm().read().await;
+        assert!(child_reg.get("anthropic").is_some());
+        assert_eq!(child_reg.default_provider_name(), Some("anthropic"));
     }
 }

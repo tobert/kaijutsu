@@ -1013,8 +1013,8 @@ impl kernel::Server for KernelImpl {
             let kernel_arc = Arc::new(forked_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
-            // Initialize LLM registry from llm.rhai config
-            initialize_kernel_llm(&kernel_arc, &config_backend).await;
+            // LLM registry is inherited from parent via Kernel::fork()
+            // (includes runtime setDefaultProvider/setDefaultModel changes)
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -1119,8 +1119,8 @@ impl kernel::Server for KernelImpl {
             let kernel_arc = Arc::new(threaded_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
-            // Initialize LLM registry from parent's config
-            initialize_kernel_llm(&kernel_arc, &parent_config_backend).await;
+            // LLM registry is inherited from parent via Kernel::thread()
+            // (includes runtime setDefaultProvider/setDefaultModel changes)
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -4638,21 +4638,17 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
     available
         .into_iter()
         .filter(|info| tool_config.allows(&info.name))
-        .map(|info| {
-            // Get schema from the engine if available, fall back to minimal schema
+        .filter_map(|info| {
+            // Only include tools that provide a schema — models can't use tools
+            // without knowing the expected parameters
             let input_schema = registry
                 .get_engine(&info.name)
-                .and_then(|e| e.schema())
-                .unwrap_or_else(|| serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }));
-            ToolDefinition {
+                .and_then(|e| e.schema())?;
+            Some(ToolDefinition {
                 name: info.name.clone(),
                 description: info.description.clone(),
                 input_schema,
-            }
+            })
         })
         .collect()
 }
@@ -4816,57 +4812,65 @@ async fn process_llm_stream(
             break;
         }
 
-        // Execute tools and collect results
-        log::info!("Executing {} tool calls", tool_calls.len());
-        let mut tool_results: Vec<ContentBlock> = vec![];
-        let mut assistant_tool_uses: Vec<ContentBlock> = vec![];
+        // Execute tools concurrently — CRDT handles concurrent block inserts
+        log::info!("Executing {} tool calls concurrently", tool_calls.len());
 
-        for (tool_use_id, tool_name, input) in tool_calls {
-            // Build tool uses for assistant message
-            assistant_tool_uses.push(ContentBlock::ToolUse {
-                id: tool_use_id.clone(),
-                name: tool_name.clone(),
+        // Build assistant tool uses (for conversation history)
+        let assistant_tool_uses: Vec<ContentBlock> = tool_calls.iter()
+            .map(|(id, name, input)| ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
                 input: input.clone(),
-            });
+            })
+            .collect();
 
-            // Execute the tool
-            let params = input.to_string();
-            log::info!("Executing tool: {} with params: {}", tool_name, params);
+        // Execute all tools concurrently
+        let futures: Vec<_> = tool_calls.into_iter()
+            .map(|(tool_use_id, tool_name, input)| {
+                let kernel = kernel.clone();
+                let documents = documents.clone();
+                let cell_id = cell_id.clone();
+                let tool_call_block_id = tool_call_blocks.get(&tool_use_id).cloned();
+                async move {
+                    let params = input.to_string();
+                    log::info!("Executing tool: {} with params: {}", tool_name, params);
 
-            let result = kernel.execute_with(&tool_name, &params).await;
+                    let result = kernel.execute_with(&tool_name, &params).await;
 
-            let (result_content, is_error) = match result {
-                Ok(r) if r.success => {
-                    log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
-                    (r.stdout, false)
-                }
-                Ok(r) => {
-                    log::warn!("Tool {} failed: {}", tool_name, r.stderr);
-                    (format!("Error: {}", r.stderr), true)
-                }
-                Err(e) => {
-                    log::error!("Tool {} execution error: {}", tool_name, e);
-                    (format!("Execution error: {}", e), true)
-                }
-            };
+                    let (result_content, is_error) = match result {
+                        Ok(r) if r.success => {
+                            log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
+                            (r.stdout, false)
+                        }
+                        Ok(r) => {
+                            log::warn!("Tool {} failed: {}", tool_name, r.stderr);
+                            (format!("Error: {}", r.stderr), true)
+                        }
+                        Err(e) => {
+                            log::error!("Tool {} execution error: {}", tool_name, e);
+                            (format!("Execution error: {}", e), true)
+                        }
+                    };
 
-            // Insert tool result block after the tool call (FlowBus handles broadcasting)
-            if let Some(tool_call_block_id) = tool_call_blocks.get(&tool_use_id) {
-                match documents.insert_tool_result(&cell_id, tool_call_block_id, Some(tool_call_block_id), &result_content, is_error, None) {
-                    Ok(block_id) => {
-                        last_block_id = block_id;
+                    // Insert tool result block (CRDT DAG — each result parents its own tool_call)
+                    if let Some(ref tcb_id) = tool_call_block_id {
+                        if let Err(e) = documents.insert_tool_result(
+                            &cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None,
+                        ) {
+                            log::error!("Failed to insert tool result block: {}", e);
+                        }
                     }
-                    Err(e) => log::error!("Failed to insert tool result block: {}", e),
-                }
-            }
 
-            // Collect result for conversation
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id,
-                content: result_content,
-                is_error,
-            });
-        }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: result_content,
+                        is_error,
+                    }
+                }
+            })
+            .collect();
+
+        let tool_results = futures::future::join_all(futures).await;
 
         // Add assistant message with tool uses to conversation
         messages.push(LlmMessage::with_tool_uses(
