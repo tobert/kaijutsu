@@ -72,8 +72,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Scripting
 rhai = "1.21"
 
-# LLM providers (fork with ToolUse in request content blocks)
-anthropic-api = { git = "https://github.com/tobert/anthropic-api", branch = "add-tooluse-to-request-content-block" }
+# LLM providers - unified via rig-core
+rig-core = "0.30"
 
 # MCP (Model Context Protocol) - using local source
 rmcp = { path = "../rmcp/crates/rmcp", features = ["client", "transport-child-process"] }

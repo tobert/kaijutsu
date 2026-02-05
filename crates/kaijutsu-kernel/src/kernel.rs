@@ -19,7 +19,7 @@ use crate::agents::{
 };
 use crate::control::ConsentMode;
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmRegistry, LlmResult};
+use crate::llm::{LlmProvider, LlmRegistry, LlmResult};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 use crate::vfs::{
@@ -372,18 +372,6 @@ impl Kernel {
         self.llm.read().await.prompt(prompt).await
     }
 
-    /// Send a completion request to the default LLM provider.
-    pub async fn complete(&self, request: CompletionRequest) -> LlmResult<CompletionResponse> {
-        let provider = self
-            .llm
-            .read()
-            .await
-            .default_provider()
-            .ok_or_else(|| crate::llm::LlmError::Unavailable("no default LLM provider".into()))?;
-
-        provider.complete(request).await
-    }
-
     /// Send a prompt to a specific LLM provider.
     pub async fn prompt_with(&self, provider_name: &str, model: &str, prompt: &str) -> LlmResult<String> {
         let provider = self
@@ -638,7 +626,7 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider, LlmResult, Message, ResponseBlock, Usage};
+    use crate::llm::{LlmProvider, LlmResult};
     use crate::tools::NoopEngine;
 
     /// Mock LLM provider for testing.
@@ -666,17 +654,8 @@ mod tests {
             true
         }
 
-        async fn complete(&self, _request: CompletionRequest) -> LlmResult<CompletionResponse> {
-            Ok(CompletionResponse {
-                content: self.response.clone(),
-                blocks: vec![ResponseBlock::Text { text: self.response.clone() }],
-                model: "mock-model".to_string(),
-                stop_reason: Some("end_turn".to_string()),
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 20,
-                },
-            })
+        async fn prompt(&self, _model: &str, _prompt: &str) -> LlmResult<String> {
+            Ok(self.response.clone())
         }
     }
 
@@ -788,12 +767,6 @@ mod tests {
         // Test prompt
         let response = kernel.prompt("Hello").await.unwrap();
         assert_eq!(response, "Hello from mock!");
-
-        // Test complete
-        let request = CompletionRequest::new("mock-model", vec![Message::user("Hi")]);
-        let response = kernel.complete(request).await.unwrap();
-        assert_eq!(response.content, "Hello from mock!");
-        assert_eq!(response.usage.total(), 30);
     }
 
     #[tokio::test]

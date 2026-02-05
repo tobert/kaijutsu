@@ -51,8 +51,17 @@ pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
 pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use llm::{
-    AnthropicProvider, CompletionRequest, CompletionResponse, LlmError, LlmProvider, LlmRegistry,
-    LlmResult, Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
+    // Core types
+    LlmError, LlmProvider, LlmRegistry, LlmResult, RigProvider,
+    Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
+    // Tool definitions
+    ToolDefinition as LlmToolDefinition,
+    // Streaming
+    StreamEvent, StreamRequest, RigStreamAdapter, LlmStream,
+    // Configuration
+    ProviderConfig, ToolConfig, ToolFilter, ContextSegment,
+    // Default model
+    DEFAULT_MODEL,
 };
 pub use vfs::{
     backends::{LocalBackend, MemoryBackend},

@@ -39,8 +39,11 @@ ron = "0.9"
 # Scripting
 rhai.workspace = true
 
-# LLM providers
-anthropic-api.workspace = true
+# LLM providers - unified via rig-core
+rig-core.workspace = true
+
+# Async streams
+futures = "0.3"
 
 # MCP (Model Context Protocol)
 rmcp.workspace = true

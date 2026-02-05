@@ -23,7 +23,7 @@ use crate::embedded_kaish::EmbeddedKaish;
 use kaijutsu_kernel::{
     DocumentDb, DocumentKind, Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps,
-    AnthropicProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
+    RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
@@ -213,8 +213,8 @@ pub struct ServerState {
     pub kernels: HashMap<String, KernelState>,
     next_kernel_id: AtomicU64,
     next_exec_id: AtomicU64,
-    /// LLM provider (initialized from ANTHROPIC_API_KEY)
-    pub llm_provider: Option<Arc<AnthropicProvider>>,
+    /// LLM provider (initialized from ANTHROPIC_API_KEY for now)
+    pub llm_provider: Option<Arc<RigProvider>>,
     /// User's active seats across all kernels
     pub my_seats: HashMap<String, SeatInfo>,  // key is SeatId::key()
     /// Currently active seat for this connection (if any)
@@ -226,12 +226,15 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(username: String) -> Self {
         // Initialize LLM provider from environment if API key is available
-        let llm_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            log::info!("ANTHROPIC_API_KEY found, initializing LLM provider");
-            Some(Arc::new(AnthropicProvider::from_env()))
-        } else {
-            log::warn!("ANTHROPIC_API_KEY not set, LLM features disabled");
-            None
+        let llm_provider = match RigProvider::anthropic_from_env() {
+            Ok(provider) => {
+                log::info!("ANTHROPIC_API_KEY found, initializing LLM provider");
+                Some(Arc::new(provider))
+            }
+            Err(e) => {
+                log::warn!("LLM provider unavailable: {}", e);
+                None
+            }
         };
 
         Self {
@@ -1534,10 +1537,10 @@ impl kernel::Server for KernelImpl {
             log::info!("User message block inserted, spawning LLM stream task");
 
             // Determine model name
-            let default_model = provider.default_model();
-            let model_name = model.as_deref().unwrap_or(default_model).to_string();
+            use kaijutsu_kernel::DEFAULT_MODEL;
+            let model_name = model.as_deref().unwrap_or(DEFAULT_MODEL).to_string();
             log::info!("Using model: {} (requested: {:?}, default: {})",
-                model_name, model, default_model);
+                model_name, model, DEFAULT_MODEL);
 
             // Spawn LLM streaming in background task with agentic loop
             // Pass user block_id so streaming blocks are inserted AFTER it
@@ -3686,7 +3689,7 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
 /// `after_block_id` is the starting point for block ordering - all streaming blocks
 /// will be inserted after this block (typically the user's message).
 async fn process_llm_stream(
-    provider: Arc<AnthropicProvider>,
+    provider: Arc<RigProvider>,
     documents: SharedBlockStore,
     cell_id: String,
     content: String,
