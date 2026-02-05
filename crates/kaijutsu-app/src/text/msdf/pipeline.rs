@@ -835,12 +835,12 @@ impl ViewNode for MsdfTextRenderNode {
         let taa_enabled = taa_state.map(|s| s.enabled).unwrap_or(false);
 
         // Choose render target: intermediate texture for TAA, ViewTarget otherwise
+        // During warmup, intermediate texture may not exist yet - fall back gracefully
         let (render_target, load_op) = if taa_enabled {
             if let Some(intermediate_view) = &resources.intermediate_texture_view {
                 // Clear intermediate to transparent black
                 (intermediate_view as &TextureView, LoadOp::Clear(Default::default()))
             } else {
-                warn!("⚠️ TAA enabled but no intermediate texture - falling back to ViewTarget");
                 (view_target.out_texture(), LoadOp::Load)
             }
         } else {
@@ -966,32 +966,27 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(());
         }
 
-        // Get required resources
+        // Get required resources - early returns are expected during warmup
         let Some(taa_resources) = world.get_resource::<MsdfTextTaaResources>() else {
-            warn!("⚠️ TAA node: no MsdfTextTaaResources");
             return Ok(());
         };
 
         let Some(msdf_resources) = world.get_resource::<MsdfTextResources>() else {
-            warn!("⚠️ TAA node: no MsdfTextResources");
             return Ok(());
         };
 
         // Need intermediate texture for TAA to work
         let Some(intermediate_view) = &msdf_resources.intermediate_texture_view else {
-            warn!("⚠️ TAA node: no intermediate texture view");
             return Ok(());
         };
 
         // Need the bind group
         let Some(bind_group) = &taa_resources.bind_group else {
-            warn!("⚠️ TAA node: no bind group (frames_accumulated={})", taa_resources.frames_accumulated);
             return Ok(());
         };
 
         // Get cached pipeline
         let Some(pipeline_id) = taa_resources.pipeline else {
-            warn!("⚠️ TAA node: no pipeline ID");
             return Ok(());
         };
 
@@ -1002,7 +997,6 @@ impl ViewNode for MsdfTextTaaNode {
 
         // Need the blit bind group for second pass
         let Some(blit_bind_group) = &taa_resources.blit_bind_group else {
-            warn!("⚠️ TAA node: no blit bind group");
             return Ok(());
         };
 
@@ -1281,7 +1275,7 @@ pub fn init_msdf_taa_resources(
 
     taa_resources.pipeline = Some(pipeline_id);
     commands.insert_resource(taa_resources);
-    info!("📺 Initialized TAA resources: {}x{} format={:?}", width, height, format);
+    trace!("TAA resources initialized: {}x{} format={:?}", width, height, format);
 }
 
 /// Prepare MSDF text resources for rendering.
