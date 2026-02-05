@@ -245,12 +245,13 @@ impl MsdfAtlas {
         self.width = new_width;
         self.height = new_height;
 
-        // Recreate packer with new dimensions
+        // Recreate packer with new dimensions — use same padding as new()
+        let padding = (Self::DEFAULT_RANGE as i32) + 2;
         let packer_config = PackerConfig {
             width: new_width as i32,
             height: new_height as i32,
-            border_padding: 1,
-            rectangle_padding: 1,
+            border_padding: padding,
+            rectangle_padding: padding,
         };
         self.packer = Packer::new(packer_config);
 
