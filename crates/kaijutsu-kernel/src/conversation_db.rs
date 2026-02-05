@@ -208,6 +208,9 @@ fn row_to_block(
         exit_code,
         is_error,
         display_hint: None, // TODO: persist display hints to DB if needed
+        source_context: None, // TODO: persist drift metadata to DB if needed
+        source_model: None,
+        drift_kind: None,
     }
 }
 

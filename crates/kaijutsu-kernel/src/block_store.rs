@@ -650,6 +650,47 @@ impl BlockStore {
         Ok(block_id)
     }
 
+    /// Insert a block from a snapshot (used by drift flush and cross-context injection).
+    ///
+    /// The snapshot's ID is used as-is if the agent_id matches this store's agent,
+    /// otherwise a new ID is assigned. Emits FlowBus events for real-time sync.
+    pub fn insert_from_snapshot(
+        &self,
+        document_id: &str,
+        snapshot: BlockSnapshot,
+        after: Option<&BlockId>,
+    ) -> Result<BlockId, String> {
+        let after_id = after.cloned();
+        let (block_id, final_snapshot, ops) = {
+            let mut entry = self.get_mut(document_id)
+                .ok_or_else(|| format!("Document {} not found", document_id))?;
+            let agent_id = self.agent_id();
+
+            let frontier_before = entry.doc.frontier();
+
+            let block_id = entry.doc.insert_from_snapshot(snapshot, after)
+                .map_err(|e| e.to_string())?;
+            let final_snapshot = entry.doc.get_block_snapshot(&block_id)
+                .ok_or_else(|| "Block not found after insert".to_string())?;
+
+            let ops = entry.doc.ops_since(&frontier_before);
+            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
+            entry.touch(&agent_id);
+            (block_id, final_snapshot, ops_bytes)
+        };
+        self.auto_save(document_id);
+
+        self.emit(BlockFlow::Inserted {
+            document_id: document_id.to_string(),
+            block: final_snapshot,
+            after_id,
+            ops,
+            source: OpSource::Local,
+        });
+
+        Ok(block_id)
+    }
+
     /// Set the status of a block.
     pub fn set_status(
         &self,

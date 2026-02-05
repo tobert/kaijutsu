@@ -6,6 +6,7 @@ pub mod auth_db;
 pub mod composite_backend;
 pub mod constants;
 pub mod context_engine;
+pub mod drift;
 pub mod embedded_kaish;
 pub mod git_backend;
 pub mod kaish;
@@ -19,6 +20,7 @@ pub mod kaijutsu_capnp {
 }
 
 pub use auth_db::{AuthDb, User, SshKey};
+pub use drift::{DriftRouter, ContextHandle, StagedDrift, DriftError};
 pub use composite_backend::CompositeBackend;
 pub use context_engine::{ContextEngine, ContextManager};
 pub use embedded_kaish::EmbeddedKaish;

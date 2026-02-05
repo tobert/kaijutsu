@@ -405,13 +405,22 @@ impl RigProvider {
 
     /// Simple prompt helper - sends a single user message.
     pub async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
+        self.prompt_with_system(model, None, prompt).await
+    }
+
+    /// Prompt with an optional system preamble.
+    pub async fn prompt_with_system(
+        &self,
+        model: &str,
+        system: Option<&str>,
+        prompt: &str,
+    ) -> LlmResult<String> {
         use rig::completion::{AssistantContent, CompletionModel};
         use rig::message::Message as RigMessage;
 
-        // Create a simple completion request with just the user prompt
         let message = RigMessage::user(prompt);
         let request = rig_completion::CompletionRequest {
-            preamble: None,
+            preamble: system.map(|s| s.to_string()),
             chat_history: rig::OneOrMany::one(message),
             tools: vec![],
             temperature: None,

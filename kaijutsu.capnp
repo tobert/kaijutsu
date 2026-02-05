@@ -489,6 +489,65 @@ interface Kernel {
 
   # Ensure seat config exists for the current connection
   ensureSeatConfig @73 (seatId :Text) -> (success :Bool, error :Text);
+
+  # ============================================================================
+  # Multi-Context Drifting (Phase 4: Cross-Context Communication)
+  # ============================================================================
+  # Drift enables content transfer between kernel contexts with provenance tracking.
+
+  # Get this kernel's context short ID and name
+  getContextId @74 () -> (shortId :Text, name :Text);
+
+  # Configure LLM provider/model on an existing kernel
+  configureLlm @75 (provider :Text, model :Text) -> (success :Bool, error :Text);
+
+  # Push content to another context's staging queue
+  driftPush @76 (targetCtx :Text, content :Text, summarize :Bool) -> (stagedId :UInt64);
+
+  # Flush all staged drifts (inject into target kernels)
+  driftFlush @77 () -> (count :UInt32);
+
+  # List staged drifts pending flush
+  driftQueue @78 () -> (staged :List(StagedDriftInfo));
+
+  # Cancel a staged drift by ID
+  driftCancel @79 (stagedId :UInt64) -> (success :Bool);
+
+  # Pull summarized content from another context
+  driftPull @80 (sourceCtx :Text, prompt :Text) -> (blockId :BlockId);
+
+  # Merge a forked context back into its parent
+  driftMerge @81 (sourceCtx :Text) -> (blockId :BlockId);
+
+  # List all registered contexts across all kernels
+  listAllContexts @82 () -> (contexts :List(ContextHandleInfo));
+}
+
+# ============================================================================
+# Drift Types (Multi-Context Communication)
+# ============================================================================
+
+# Information about a staged drift (pending content transfer)
+struct StagedDriftInfo {
+  id @0 :UInt64;
+  sourceCtx @1 :Text;
+  targetCtx @2 :Text;
+  content @3 :Text;
+  sourceModel @4 :Text;
+  driftKind @5 :Text;
+  createdAt @6 :UInt64;
+}
+
+# Information about a registered context
+struct ContextHandleInfo {
+  shortId @0 :Text;
+  name @1 :Text;
+  kernelId @2 :Text;
+  provider @3 :Text;
+  model @4 :Text;
+  parentId @5 :Text;
+  hasParentId @6 :Bool;
+  createdAt @7 :UInt64;
 }
 
 # Capability for interacting with a seat
@@ -541,6 +600,7 @@ enum BlockKind {
   toolResult @3;
   shellCommand @4;
   shellOutput @5;
+  drift @6;
 }
 
 # Flat block snapshot - all fields present, some unused depending on kind
@@ -577,6 +637,14 @@ struct BlockSnapshot {
   # Display hint for richer output formatting (JSON-serialized)
   displayHint @17 :Text;      # JSON DisplayHint for tables/trees
   hasDisplayHint @18 :Bool;   # True if displayHint is set
+
+  # Drift-specific fields (cross-context transfer)
+  sourceContext @19 :Text;    # Short ID of originating context
+  hasSourceContext @20 :Bool; # True if sourceContext is set
+  sourceModel @21 :Text;     # Model that produced this content
+  hasSourceModel @22 :Bool;  # True if sourceModel is set
+  driftKind @23 :Text;       # How this block arrived (push/pull/merge/distill)
+  hasDriftKind @24 :Bool;    # True if driftKind is set
 }
 
 # Operations on block documents

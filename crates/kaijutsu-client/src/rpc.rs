@@ -4,6 +4,7 @@
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
+use kaijutsu_crdt::DriftKind;
 use russh::client::Msg;
 use russh::ChannelStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -716,6 +717,155 @@ impl KernelHandle {
         }
         Ok(result)
     }
+
+    // ========================================================================
+    // Drift: Cross-Context Communication
+    // ========================================================================
+
+    /// Get this kernel's context short ID and name.
+    pub async fn get_context_id(&self) -> Result<(String, String), RpcError> {
+        let request = self.kernel.get_context_id_request();
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        let short_id = reader.get_short_id()?.to_string()?;
+        let name = reader.get_name()?.to_string()?;
+        Ok((short_id, name))
+    }
+
+    /// Configure the LLM provider and model for this kernel.
+    pub async fn configure_llm(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<bool, RpcError> {
+        let mut request = self.kernel.configure_llm_request();
+        {
+            let mut params = request.get();
+            params.set_provider(provider);
+            params.set_model(model);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(true)
+        } else {
+            let error = reader.get_error()?.to_string()?;
+            Err(RpcError::ServerError(error))
+        }
+    }
+
+    /// Stage a drift push to another context.
+    pub async fn drift_push(
+        &self,
+        target_ctx: &str,
+        content: &str,
+        summarize: bool,
+    ) -> Result<u64, RpcError> {
+        let mut request = self.kernel.drift_push_request();
+        {
+            let mut params = request.get();
+            params.set_target_ctx(target_ctx);
+            params.set_content(content);
+            params.set_summarize(summarize);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_staged_id())
+    }
+
+    /// Flush all staged drifts.
+    pub async fn drift_flush(&self) -> Result<u32, RpcError> {
+        let request = self.kernel.drift_flush_request();
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_count())
+    }
+
+    /// View the drift staging queue.
+    pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, RpcError> {
+        let request = self.kernel.drift_queue_request();
+        let response = request.send().promise.await?;
+        let staged = response.get()?.get_staged()?;
+
+        let mut result = Vec::with_capacity(staged.len() as usize);
+        for entry in staged.iter() {
+            result.push(StagedDriftInfo {
+                id: entry.get_id(),
+                source_ctx: entry.get_source_ctx()?.to_string()?,
+                target_ctx: entry.get_target_ctx()?.to_string()?,
+                content: entry.get_content()?.to_string()?,
+                source_model: entry.get_source_model()?.to_string()?,
+                drift_kind: entry.get_drift_kind()?.to_string()?,
+                created_at: entry.get_created_at(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Cancel a staged drift.
+    pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, RpcError> {
+        let mut request = self.kernel.drift_cancel_request();
+        request.get().set_staged_id(staged_id);
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_success())
+    }
+
+    /// Pull summarized content from another context into this one.
+    ///
+    /// Reads the source context's conversation, distills it via LLM,
+    /// and injects the summary as a Drift block in this kernel's document.
+    pub async fn drift_pull(
+        &self,
+        source_ctx: &str,
+        prompt: Option<&str>,
+    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+        let mut request = self.kernel.drift_pull_request();
+        request.get().set_source_ctx(source_ctx);
+        if let Some(p) = prompt {
+            request.get().set_prompt(p);
+        }
+        let response = request.send().promise.await?;
+        let block_id_reader = response.get()?.get_block_id()?;
+        parse_block_id(&block_id_reader)
+    }
+
+    /// Merge a forked context back into its parent.
+    ///
+    /// Distills the source context's conversation and injects the summary
+    /// into the parent context as a Drift block with DriftKind::Merge.
+    pub async fn drift_merge(
+        &self,
+        source_ctx: &str,
+    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+        let mut request = self.kernel.drift_merge_request();
+        request.get().set_source_ctx(source_ctx);
+        let response = request.send().promise.await?;
+        let block_id_reader = response.get()?.get_block_id()?;
+        parse_block_id(&block_id_reader)
+    }
+
+    /// List all registered contexts.
+    pub async fn list_all_contexts(&self) -> Result<Vec<ContextInfo>, RpcError> {
+        let request = self.kernel.list_all_contexts_request();
+        let response = request.send().promise.await?;
+        let contexts = response.get()?.get_contexts()?;
+
+        let mut result = Vec::with_capacity(contexts.len() as usize);
+        for ctx in contexts.iter() {
+            result.push(ContextInfo {
+                short_id: ctx.get_short_id()?.to_string()?,
+                name: ctx.get_name()?.to_string()?,
+                kernel_id: ctx.get_kernel_id()?.to_string()?,
+                provider: ctx.get_provider()?.to_string()?,
+                model: ctx.get_model()?.to_string()?,
+                parent_id: if ctx.get_has_parent_id() {
+                    Some(ctx.get_parent_id()?.to_string()?)
+                } else {
+                    None
+                },
+                created_at: ctx.get_created_at(),
+            });
+        }
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -906,6 +1056,7 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
         crate::kaijutsu_capnp::BlockKind::ShellCommand => BlockKind::ShellCommand,
         crate::kaijutsu_capnp::BlockKind::ShellOutput => BlockKind::ShellOutput,
+        crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
     };
 
     // Parse content
@@ -975,6 +1126,23 @@ fn parse_block_snapshot(
         exit_code,
         is_error,
         display_hint,
+        source_context: if reader.get_has_source_context() {
+            reader.get_source_context().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+        } else { None },
+        source_model: if reader.get_has_source_model() {
+            reader.get_source_model().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+        } else { None },
+        drift_kind: if reader.get_has_drift_kind() {
+            reader.get_drift_kind().ok()
+                .and_then(|s| s.to_str().ok())
+                .and_then(|s| DriftKind::from_str(s))
+        } else { None },
     })
 }
 
@@ -1026,6 +1194,34 @@ pub struct VersionSnapshot {
     pub block_count: u32,
     /// What changed ("block_added", "block_edited", etc.)
     pub change_kind: String,
+}
+
+// ============================================================================
+// Drift Types
+// ============================================================================
+
+/// Info about a staged drift operation.
+#[derive(Debug, Clone)]
+pub struct StagedDriftInfo {
+    pub id: u64,
+    pub source_ctx: String,
+    pub target_ctx: String,
+    pub content: String,
+    pub source_model: String,
+    pub drift_kind: String,
+    pub created_at: u64,
+}
+
+/// Info about a registered drift context.
+#[derive(Debug, Clone)]
+pub struct ContextInfo {
+    pub short_id: String,
+    pub name: String,
+    pub kernel_id: String,
+    pub provider: String,
+    pub model: String,
+    pub parent_id: Option<String>,
+    pub created_at: u64,
 }
 
 // ============================================================================

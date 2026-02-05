@@ -520,6 +520,23 @@ impl KaijutsuMcp {
             content.clone()
         };
 
+        let mut metadata = serde_json::json!({
+            "tool_name": snapshot.tool_name,
+            "tool_call_id": snapshot.tool_call_id.map(|id| id.to_key()),
+            "is_error": snapshot.is_error,
+        });
+
+        // Include drift provenance when present
+        if let Some(ref ctx) = snapshot.source_context {
+            metadata["source_context"] = serde_json::json!(ctx);
+        }
+        if let Some(ref model) = snapshot.source_model {
+            metadata["source_model"] = serde_json::json!(model);
+        }
+        if let Some(ref dk) = snapshot.drift_kind {
+            metadata["drift_kind"] = serde_json::json!(dk.to_string());
+        }
+
         serde_json::json!({
             "content": formatted_content,
             "role": snapshot.role.as_str(),
@@ -527,11 +544,7 @@ impl KaijutsuMcp {
             "status": snapshot.status.as_str(),
             "version": entry.version(),
             "line_count": total_lines,
-            "metadata": {
-                "tool_name": snapshot.tool_name,
-                "tool_call_id": snapshot.tool_call_id.map(|id| id.to_key()),
-                "is_error": snapshot.is_error,
-            }
+            "metadata": metadata,
         }).to_string()
     }
 
@@ -702,14 +715,27 @@ impl KaijutsuMcp {
                         snapshot.content.clone()
                     };
 
-                    blocks.push(BlockSummary {
+                    let mut block_sum = BlockSummary {
                         block_id: snapshot.id.to_key(),
                         parent_id: snapshot.parent_id.map(|id| id.to_key()),
                         role: snapshot.role.as_str().to_string(),
                         kind: snapshot.kind.as_str().to_string(),
                         status: snapshot.status.as_str().to_string(),
                         summary,
-                    });
+                    };
+
+                    // Prepend drift source to summary for drift blocks
+                    if snapshot.kind == kaijutsu_crdt::BlockKind::Drift {
+                        if let Some(ref ctx) = snapshot.source_context {
+                            let model = snapshot.source_model.as_deref().unwrap_or("?");
+                            block_sum.summary = format!(
+                                "[drift from {} via {}] {}",
+                                ctx, model, block_sum.summary
+                            );
+                        }
+                    }
+
+                    blocks.push(block_sum);
                 }
             }
         }
@@ -1039,6 +1065,104 @@ impl KaijutsuMcp {
 
         output
     }
+
+    // ========================================================================
+    // Drift Tools (Cross-Context Communication)
+    // ========================================================================
+
+    #[tool(description = "List all registered drift contexts. Shows short IDs, names, providers, and lineage. Requires remote connection.")]
+    fn drift_ls(&self) -> String {
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: drift_ls requires a remote connection to kaijutsu-server".to_string(),
+        };
+
+        // Use tokio current thread to reconnect and call RPC
+        let host = remote.host.clone();
+        let port = remote.port;
+        let kernel_id = remote.kernel_id.clone();
+
+        // Since we can't do async in a sync tool handler, return connection info
+        // The actual RPC call would need the async push_to_server pattern
+        serde_json::json!({
+            "note": "drift_ls requires async RPC — use kaish 'drift ls' or direct RPC for now",
+            "server": format!("{}:{}", host, port),
+            "kernel": kernel_id,
+        }).to_string()
+    }
+
+    #[tool(description = "Stage a drift push to transfer content to another context. Requires remote connection.")]
+    fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
+        let _remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: drift_push requires a remote connection to kaijutsu-server".to_string(),
+        };
+
+        serde_json::json!({
+            "note": "drift_push requires async RPC — use kaish 'drift push' or direct RPC for now",
+            "target_ctx": req.target_ctx,
+            "content_length": req.content.len(),
+            "summarize": req.summarize,
+        }).to_string()
+    }
+
+    #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush. Requires remote connection.")]
+    fn drift_queue(&self) -> String {
+        match self.remote() {
+            Some(_) => serde_json::json!({
+                "note": "drift_queue requires async RPC — use kaish 'drift queue' or direct RPC for now",
+            }).to_string(),
+            None => "Error: drift_queue requires a remote connection to kaijutsu-server".to_string(),
+        }
+    }
+
+    #[tool(description = "Cancel a staged drift by its ID. Requires remote connection.")]
+    fn drift_cancel(&self, Parameters(req): Parameters<DriftCancelRequest>) -> String {
+        match self.remote() {
+            Some(_) => serde_json::json!({
+                "note": "drift_cancel requires async RPC — use kaish 'drift cancel' or direct RPC for now",
+                "staged_id": req.staged_id,
+            }).to_string(),
+            None => "Error: drift_cancel requires a remote connection to kaijutsu-server".to_string(),
+        }
+    }
+
+    #[tool(description = "Flush all staged drifts, injecting content into target contexts. Requires remote connection.")]
+    fn drift_flush(&self) -> String {
+        match self.remote() {
+            Some(_) => serde_json::json!({
+                "note": "drift_flush requires async RPC — use kaish 'drift flush' or direct RPC for now",
+            }).to_string(),
+            None => "Error: drift_flush requires a remote connection to kaijutsu-server".to_string(),
+        }
+    }
+
+    #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.")]
+    fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
+        match self.remote() {
+            Some(_) => serde_json::json!({
+                "note": "drift_pull requires async RPC — use kaish 'drift pull' or direct RPC for now",
+                "source_ctx": req.source_ctx,
+                "prompt": req.prompt,
+            }).to_string(),
+            None => "Error: drift_pull requires a remote connection to kaijutsu-server".to_string(),
+        }
+    }
+
+    #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.")]
+    fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
+        match self.remote() {
+            Some(_) => serde_json::json!({
+                "note": "drift_merge requires async RPC — use kaish 'drift merge' or direct RPC for now",
+                "source_ctx": req.source_ctx,
+            }).to_string(),
+            None => "Error: drift_merge requires a remote connection to kaijutsu-server".to_string(),
+        }
+    }
+
+    // ========================================================================
+    // Undo
+    // ========================================================================
 
     #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.")]
     fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {

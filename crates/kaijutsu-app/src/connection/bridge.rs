@@ -1347,6 +1347,7 @@ fn parse_block_snapshot(
         kaijutsu_client::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
         kaijutsu_client::kaijutsu_capnp::BlockKind::ShellCommand => kaijutsu_crdt::BlockKind::ShellCommand,
         kaijutsu_client::kaijutsu_capnp::BlockKind::ShellOutput => kaijutsu_crdt::BlockKind::ShellOutput,
+        kaijutsu_client::kaijutsu_capnp::BlockKind::Drift => kaijutsu_crdt::BlockKind::Drift,
     };
 
     let tool_call_id = if reader.get_has_tool_call_id() {
@@ -1393,6 +1394,18 @@ fn parse_block_snapshot(
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
         display_hint,
+        source_context: if reader.get_has_source_context() {
+            reader.get_source_context().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned())
+        } else { None },
+        source_model: if reader.get_has_source_model() {
+            reader.get_source_model().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned())
+        } else { None },
+        drift_kind: if reader.get_has_drift_kind() {
+            reader.get_drift_kind().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<kaijutsu_crdt::DriftKind>().ok())
+        } else { None },
     })
 }
 

@@ -77,6 +77,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
         }
         BlockKind::ShellCommand => theme.block_shell_cmd,
         BlockKind::ShellOutput => theme.block_shell_output,
+        BlockKind::Drift => theme.fg_dim, // Drift blocks use dim system color
     }
 }
 
@@ -416,6 +417,12 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                 // Use display hint for richer formatting (tables, trees)
                 let formatted = format_for_display(&block.content, block.display_hint.as_deref());
                 output.push_str(&formatted.text);
+            }
+            BlockKind::Drift => {
+                let ctx = block.source_context.as_deref().unwrap_or("?");
+                let model = block.source_model.as_deref().unwrap_or("unknown");
+                output.push_str(&format!("🌊 Drift from {} ({})\n", ctx, model));
+                output.push_str(&block.content);
             }
         }
     }
@@ -1755,6 +1762,11 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             // Use display hint for richer formatting (tables, trees)
             let formatted = format_for_display(&block.content, block.display_hint.as_deref());
             formatted.text
+        }
+        BlockKind::Drift => {
+            let ctx = block.source_context.as_deref().unwrap_or("?");
+            let model = block.source_model.as_deref().unwrap_or("unknown");
+            format!("🌊 Drift from {} ({})\n{}", ctx, model, block.content)
         }
     }
 }

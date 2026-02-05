@@ -187,6 +187,10 @@ pub enum BlockKind {
     #[serde(rename = "shell_output")]
     #[strum(serialize = "shell_output", serialize = "shelloutput")]
     ShellOutput,
+    /// Drifted content from another context (cross-context transfer).
+    #[serde(rename = "drift")]
+    #[strum(serialize = "drift")]
+    Drift,
 }
 
 impl BlockKind {
@@ -207,6 +211,7 @@ impl BlockKind {
             BlockKind::ToolResult => "tool_result",
             BlockKind::ShellCommand => "shell_command",
             BlockKind::ShellOutput => "shell_output",
+            BlockKind::Drift => "drift",
         }
     }
 
@@ -226,9 +231,54 @@ impl BlockKind {
     pub fn is_shell(&self) -> bool {
         matches!(self, BlockKind::ShellCommand | BlockKind::ShellOutput)
     }
+
+    /// Check if this is a drift block (cross-context transfer).
+    pub fn is_drift(&self) -> bool {
+        matches!(self, BlockKind::Drift)
+    }
 }
 
 impl std::fmt::Display for BlockKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// How a drift block arrived from another context.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(ascii_case_insensitive)]
+pub enum DriftKind {
+    /// User manually pushed content to another context.
+    #[default]
+    Push,
+    /// User pulled/requested content from another context.
+    Pull,
+    /// Context merge (fork coming home).
+    Merge,
+    /// LLM-summarized before transfer.
+    Distill,
+}
+
+impl DriftKind {
+    /// Parse from string (case-insensitive).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        <Self as FromStr>::from_str(s).ok()
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DriftKind::Push => "push",
+            DriftKind::Pull => "pull",
+            DriftKind::Merge => "merge",
+            DriftKind::Distill => "distill",
+        }
+    }
+}
+
+impl std::fmt::Display for DriftKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -286,6 +336,18 @@ pub struct BlockSnapshot {
     /// Used for shell output blocks to enable per-viewer rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_hint: Option<String>,
+
+    // Drift-specific fields (for Drift blocks)
+
+    /// Short ID of the originating context (for Drift blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_context: Option<String>,
+    /// Model that produced this content (for Drift blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_model: Option<String>,
+    /// How this block arrived from another context (for Drift blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_kind: Option<DriftKind>,
 }
 
 impl BlockSnapshot {
@@ -313,6 +375,9 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -339,6 +404,9 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -367,6 +435,9 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -395,6 +466,9 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -421,6 +495,9 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -449,6 +526,9 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
         }
     }
 
@@ -478,6 +558,41 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             display_hint,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        }
+    }
+
+    /// Create a new drift block snapshot (cross-context transfer).
+    pub fn drift(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        content: impl Into<String>,
+        author: impl Into<String>,
+        source_context: impl Into<String>,
+        source_model: Option<String>,
+        drift_kind: DriftKind,
+    ) -> Self {
+        Self {
+            id,
+            parent_id,
+            role: Role::System,
+            status: Status::Done,
+            kind: BlockKind::Drift,
+            content: content.into(),
+            collapsed: false,
+            author: author.into(),
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            display_hint: None,
+            source_context: Some(source_context.into()),
+            source_model,
+            drift_kind: Some(drift_kind),
         }
     }
 
@@ -624,5 +739,60 @@ mod tests {
         assert_eq!(snap.parent_id, Some(tool_call_id));
         assert!(!snap.is_error);
         assert_eq!(snap.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_block_kind_drift() {
+        assert_eq!(BlockKind::from_str("drift"), Some(BlockKind::Drift));
+        assert!(BlockKind::Drift.is_drift());
+        assert!(!BlockKind::Text.is_drift());
+        assert!(BlockKind::Drift.has_text_crdt());
+        assert!(!BlockKind::Drift.is_tool());
+        assert!(!BlockKind::Drift.is_shell());
+    }
+
+    #[test]
+    fn test_drift_kind_parsing() {
+        assert_eq!(DriftKind::from_str("push"), Some(DriftKind::Push));
+        assert_eq!(DriftKind::from_str("pull"), Some(DriftKind::Pull));
+        assert_eq!(DriftKind::from_str("merge"), Some(DriftKind::Merge));
+        assert_eq!(DriftKind::from_str("distill"), Some(DriftKind::Distill));
+        assert_eq!(DriftKind::from_str("PUSH"), Some(DriftKind::Push));
+        assert_eq!(DriftKind::from_str("invalid"), None);
+        assert_eq!(DriftKind::Push.as_str(), "push");
+        assert_eq!(DriftKind::Distill.as_str(), "distill");
+    }
+
+    #[test]
+    fn test_block_snapshot_drift() {
+        let id = BlockId::new("doc-1", "drift", 1);
+        let snap = BlockSnapshot::drift(
+            id.clone(),
+            None,
+            "CAS has a race condition in the merge path",
+            "drift:a1b2c3",
+            "a1b2c3",
+            Some("claude-opus-4-6".to_string()),
+            DriftKind::Push,
+        );
+
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.kind, BlockKind::Drift);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.source_context, Some("a1b2c3".to_string()));
+        assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
+        assert_eq!(snap.drift_kind, Some(DriftKind::Push));
+        assert_eq!(snap.content, "CAS has a race condition in the merge path");
+        assert!(snap.tool_name.is_none());
+    }
+
+    #[test]
+    fn test_drift_kind_serde_roundtrip() {
+        let dk = DriftKind::Distill;
+        let json = serde_json::to_string(&dk).unwrap();
+        assert_eq!(json, "\"distill\"");
+        let parsed: DriftKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, DriftKind::Distill);
     }
 }

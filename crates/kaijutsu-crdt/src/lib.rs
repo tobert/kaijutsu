@@ -32,7 +32,7 @@ mod document;
 mod error;
 mod ops;
 
-pub use block::{BlockId, BlockKind, BlockSnapshot, Role, Status};
+pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
 pub use dag::ConversationDAG;
 pub use document::{BlockDocument, DocumentSnapshot};
 pub use error::CrdtError;

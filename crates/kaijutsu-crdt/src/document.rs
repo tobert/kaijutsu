@@ -249,6 +249,17 @@ impl BlockDocument {
         let display_hint = block_map.get("display_hint")
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
+        // Drift-specific fields
+        let source_context = block_map.get("source_context")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        let source_model = block_map.get("source_model")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        let drift_kind = block_map.get("drift_kind")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| crate::block::DriftKind::from_str(&s));
+
         Some(BlockSnapshot {
             id: id.clone(),
             parent_id,
@@ -265,6 +276,9 @@ impl BlockDocument {
             exit_code,
             is_error,
             display_hint,
+            source_context,
+            source_model,
+            drift_kind,
         })
     }
 
@@ -448,6 +462,9 @@ impl BlockDocument {
             None, // exit_code
             false, // is_error
             None, // display_hint
+            None, // source_context
+            None, // source_model
+            None, // drift_kind
         )?;
 
         Ok(id)
@@ -479,6 +496,9 @@ impl BlockDocument {
             None,
             false,
             None, // display_hint
+            None, // source_context
+            None, // source_model
+            None, // drift_kind
         )?;
 
         Ok(id)
@@ -513,6 +533,9 @@ impl BlockDocument {
             exit_code,
             is_error,
             None, // display_hint
+            None, // source_context
+            None, // source_model
+            None, // drift_kind
         )?;
 
         Ok(id)
@@ -536,13 +559,20 @@ impl BlockDocument {
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
-        // Update next_seq if needed to avoid collisions
-        if snapshot.id.agent_id == self.agent_id_str {
-            self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
-        }
+        // Generate a local ID if the snapshot has a placeholder (empty document_id).
+        // This happens for drift blocks built by DriftRouter::build_drift_block().
+        let block_id = if snapshot.id.document_id.is_empty() {
+            self.new_block_id()
+        } else {
+            // Update next_seq if needed to avoid collisions with remote IDs
+            if snapshot.id.agent_id == self.agent_id_str {
+                self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
+            }
+            snapshot.id.clone()
+        };
 
         self.insert_block_with_id(
-            snapshot.id.clone(),
+            block_id.clone(),
             snapshot.parent_id.as_ref(),
             after,
             snapshot.role,
@@ -555,9 +585,12 @@ impl BlockDocument {
             snapshot.exit_code,
             snapshot.is_error,
             snapshot.display_hint,
+            snapshot.source_context,
+            snapshot.source_model,
+            snapshot.drift_kind,
         )?;
 
-        Ok(snapshot.id)
+        Ok(block_id)
     }
 
     /// Internal block insertion with all fields.
@@ -577,6 +610,9 @@ impl BlockDocument {
         exit_code: Option<i32>,
         is_error: bool,
         display_hint: Option<String>,
+        source_context: Option<String>,
+        source_model: Option<String>,
+        drift_kind: Option<crate::block::DriftKind>,
     ) -> Result<()> {
         let block_key = id.to_key();
 
@@ -668,6 +704,17 @@ impl BlockDocument {
 
                 if let Some(ref hint) = display_hint {
                     block_map.set("display_hint", hint.as_str());
+                }
+
+                // Drift-specific fields
+                if let Some(ref ctx) = source_context {
+                    block_map.set("source_context", ctx.as_str());
+                }
+                if let Some(ref model) = source_model {
+                    block_map.set("source_model", model.as_str());
+                }
+                if let Some(ref dk) = drift_kind {
+                    block_map.set("drift_kind", dk.as_str());
                 }
 
                 (text_id, tool_input_id)
@@ -988,6 +1035,9 @@ impl BlockDocument {
                 block.exit_code,
                 block.is_error,
                 block.display_hint,
+                block.source_context,
+                block.source_model,
+                block.drift_kind,
             );
 
             last_id = Some(new_id);
@@ -1052,6 +1102,9 @@ impl BlockDocument {
                 block.exit_code,
                 block.is_error,
                 block.display_hint,
+                block.source_context,
+                block.source_model,
+                block.drift_kind,
             );
 
             last_id = Some(new_id);
@@ -1185,6 +1238,9 @@ impl BlockDocument {
                 block_snap.exit_code,
                 block_snap.is_error,
                 block_snap.display_hint.clone(),
+                block_snap.source_context.clone(),
+                block_snap.source_model.clone(),
+                block_snap.drift_kind.clone(),
             ).is_ok() {
                 last_id = Some(block_snap.id.clone());
             }
@@ -1795,5 +1851,80 @@ mod tests {
         let tool_call_id_ref = forked_blocks[1].tool_call_id.as_ref().expect("should have tool_call_id");
         assert_eq!(tool_call_id_ref.document_id, "forked-doc");
         assert_eq!(tool_call_id_ref, &forked_blocks[0].id);
+    }
+
+    /// Test drift block insertion, CRDT round-trip, and metadata preservation.
+    #[test]
+    fn test_drift_block_roundtrip() {
+        use crate::block::DriftKind;
+
+        let mut doc = BlockDocument::new("doc-1", "server");
+
+        // Create a drift block using insert_from_snapshot
+        let drift_snap = BlockSnapshot::drift(
+            BlockId::new("doc-1", "drift", 0),
+            None,
+            "CAS has a race condition in the merge path",
+            "drift:a1b2c3",
+            "a1b2c3",
+            Some("claude-opus-4-6".to_string()),
+            DriftKind::Push,
+        );
+
+        let id = doc.insert_from_snapshot(drift_snap, None).unwrap();
+
+        // Read it back from the CRDT
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.kind, BlockKind::Drift);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.source_context, Some("a1b2c3".to_string()));
+        assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
+        assert_eq!(snap.drift_kind, Some(DriftKind::Push));
+        assert_eq!(snap.content, "CAS has a race condition in the merge path");
+        assert_eq!(snap.author, "drift:a1b2c3");
+
+        // Verify it shows up in blocks_ordered
+        let blocks = doc.blocks_ordered();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Drift);
+    }
+
+    /// Test that drift blocks survive fork (metadata preserved with new IDs).
+    #[test]
+    fn test_fork_preserves_drift_metadata() {
+        use crate::block::DriftKind;
+
+        let mut original = BlockDocument::new("original", "server");
+
+        // Add a regular block first
+        let user_msg = original.insert_block(
+            None, None,
+            Role::User, BlockKind::Text,
+            "Hello!", "user:amy",
+        ).unwrap();
+
+        // Add a drift block
+        let drift_snap = BlockSnapshot::drift(
+            BlockId::new("original", "drift", 0),
+            Some(user_msg.clone()),
+            "Summary from gemini context",
+            "drift:d4e5f6",
+            "d4e5f6",
+            Some("gemini-2.0-flash".to_string()),
+            DriftKind::Distill,
+        );
+        original.insert_from_snapshot(drift_snap, Some(&user_msg)).unwrap();
+
+        // Fork it
+        let forked = original.fork("forked", "client");
+        assert_eq!(forked.block_count(), 2);
+
+        let blocks = forked.blocks_ordered();
+        let drift_block = &blocks[1];
+        assert_eq!(drift_block.kind, BlockKind::Drift);
+        assert_eq!(drift_block.source_context, Some("d4e5f6".to_string()));
+        assert_eq!(drift_block.source_model, Some("gemini-2.0-flash".to_string()));
+        assert_eq!(drift_block.drift_kind, Some(DriftKind::Distill));
+        assert_eq!(drift_block.content, "Summary from gemini context");
     }
 }

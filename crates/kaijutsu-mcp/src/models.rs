@@ -251,6 +251,52 @@ fn default_undo_steps() -> u32 {
 }
 
 // ============================================================================
+// Drift Types
+// ============================================================================
+
+/// Push content to another context's staging queue.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriftPushRequest {
+    /// Short ID of the target context
+    #[schemars(description = "Short ID of the target context (e.g., 'a1b2c3')")]
+    pub target_ctx: String,
+    /// Content to transfer
+    #[schemars(description = "Content to push to the target context")]
+    pub content: String,
+    /// Whether to LLM-summarize before transfer
+    #[schemars(description = "Summarize via LLM before transfer (default: false)")]
+    #[serde(default)]
+    pub summarize: bool,
+}
+
+/// Cancel a staged drift by ID.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriftCancelRequest {
+    /// Staged drift ID to cancel
+    #[schemars(description = "ID of the staged drift to cancel")]
+    pub staged_id: u64,
+}
+
+/// Pull summarized content from another context.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriftPullRequest {
+    /// Short ID of the source context to pull from
+    #[schemars(description = "Short ID of the source context (e.g., 'a1b2c3')")]
+    pub source_ctx: String,
+    /// Optional directed prompt to focus the summary
+    #[schemars(description = "Optional prompt to focus the summary (e.g., 'what decisions were made about auth?')")]
+    pub prompt: Option<String>,
+}
+
+/// Merge a forked context back into its parent.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DriftMergeRequest {
+    /// Short ID of the source context (the fork) to merge
+    #[schemars(description = "Short ID of the forked context to merge back into its parent")]
+    pub source_ctx: String,
+}
+
+// ============================================================================
 // Response Types
 // ============================================================================
 
