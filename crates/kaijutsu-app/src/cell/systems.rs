@@ -1575,7 +1575,7 @@ pub fn handle_block_events(
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
     layout_gen: Res<super::components::LayoutGeneration>,
-    current_conv: Res<CurrentConversation>,
+    mut current_conv: ResMut<CurrentConversation>,
 ) {
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
@@ -1594,6 +1594,17 @@ pub fn handle_block_events(
                          run after DashboardEventHandling."
                     );
                     continue;
+                }
+
+                // Use server's cell_id as canonical document ID to avoid format mismatches
+                // between client-generated "kernel@context" and server's stored document_id
+                if current_conv.id() != Some(cell_id) {
+                    info!(
+                        "Updating current_conv to server's document_id: {} (was {:?})",
+                        cell_id,
+                        current_conv.id()
+                    );
+                    current_conv.0 = Some(cell_id.clone());
                 }
 
                 match sync_state.apply_initial_state(cell_id, &agent_id, ops) {
