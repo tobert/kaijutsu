@@ -2713,9 +2713,10 @@ pub fn init_compose_block_buffer(
         // Initialize with placeholder text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, "Type here...", attrs, cosmic_text::Shaping::Advanced);
+        // Shape the text so glyphs are populated for MSDF rendering
+        buffer.visual_line_count(&mut font_system, 800.0, None);
 
         commands.entity(entity).insert(buffer);
-        info!("Initialized ComposeBlock buffer");
     }
 }
 
@@ -2813,14 +2814,20 @@ pub fn sync_compose_block_buffer(
             &compose.text
         };
 
-        buffer.set_text(&mut font_system, display_text, attrs, cosmic_text::Shaping::Advanced);
-
-        // Use user block color for compose block
-        config.default_color = if compose.is_empty() {
+        // Set glyph color from theme before shaping (color bakes into glyphs)
+        let color = if compose.is_empty() {
             theme.fg_dim // Placeholder is dimmed
         } else {
             theme.block_user // User input color
         };
+        buffer.set_color(color);
+        config.default_color = color;
+
+        buffer.set_text(&mut font_system, display_text, attrs, cosmic_text::Shaping::Advanced);
+
+        // Shape the text so glyphs are populated for MSDF rendering
+        let wrap_width = config.bounds.width().max(100) as f32;
+        buffer.visual_line_count(&mut font_system, wrap_width, None);
     }
 }
 
