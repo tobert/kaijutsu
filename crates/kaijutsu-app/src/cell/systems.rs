@@ -339,6 +339,7 @@ pub fn init_cell_buffers(
         // Create a new buffer with DPI-aware metrics
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+        buffer.set_snap_x(true); // monospace: snap to pixel grid
 
         // Initialize with current editor text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -1308,6 +1309,7 @@ pub fn spawn_expanded_block_view(
         let mut fs = font_system.0.lock().unwrap();
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
+        buffer.set_snap_x(true); // monospace: snap to pixel grid
 
         let color = block_color(block, &theme);
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -1932,6 +1934,7 @@ pub fn init_role_header_buffers(
         // Use UI metrics for headers (slightly smaller than content)
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+        buffer.set_snap_x(true); // monospace: snap to pixel grid
 
         // Set header text based on role
         let text = match header.role {
@@ -2705,6 +2708,7 @@ pub fn init_compose_block_buffer(
     for entity in compose_blocks.iter() {
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+        buffer.set_snap_x(true); // monospace: snap to pixel grid
 
         // Initialize with placeholder text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));

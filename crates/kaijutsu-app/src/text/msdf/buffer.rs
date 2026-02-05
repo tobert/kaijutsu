@@ -57,6 +57,10 @@ pub struct MsdfTextBuffer {
     text_hash: u64,
     /// Default text color.
     default_color: [u8; 4],
+    /// Snap glyph x-positions to pixel boundaries.
+    /// Enables uniform character cell widths for monospace fonts where
+    /// fractional positioning causes visible spacing inconsistency.
+    snap_x: bool,
 }
 
 #[allow(dead_code)]
@@ -71,6 +75,7 @@ impl MsdfTextBuffer {
             cached_wrap_width: 0.0,
             text_hash: 0,
             default_color: [220, 220, 240, 255],
+            snap_x: false,
         }
     }
 
@@ -86,6 +91,7 @@ impl MsdfTextBuffer {
             cached_wrap_width: width,
             text_hash: 0,
             default_color: [220, 220, 240, 255],
+            snap_x: false,
         }
     }
 
@@ -100,6 +106,19 @@ impl MsdfTextBuffer {
         self.buffer.set_text(font_system, text, &attrs, shaping, None);
         self.dirty = true;
         self.text_hash = Self::hash_str(text);
+    }
+
+    /// Enable horizontal pixel snapping for monospace fonts.
+    ///
+    /// When enabled, glyph x-positions are rounded to pixel boundaries so that
+    /// every character cell starts at an integer pixel offset. This prevents
+    /// visible spacing inconsistency where different glyphs land at different
+    /// sub-pixel offsets and appear slightly wider or narrower than neighbors.
+    pub fn set_snap_x(&mut self, snap: bool) {
+        if self.snap_x != snap {
+            self.snap_x = snap;
+            self.dirty = true;
+        }
     }
 
     /// Set the default text color.
@@ -201,10 +220,13 @@ impl MsdfTextBuffer {
                     line_y_snapped + glyph.y
                 };
 
+                // Snap x to pixel boundary for monospace fonts so every
+                // character cell starts at an integer offset
+                let x = if self.snap_x { glyph.x.round() } else { glyph.x };
+
                 self.glyphs.push(PositionedGlyph {
                     key,
-                    // cosmic-text's x is the pen position for this glyph
-                    x: glyph.x,
+                    x,
                     // Pixel-aligned baseline + grid-fitted vertical offset
                     y: y_adjusted,
                     font_size,
