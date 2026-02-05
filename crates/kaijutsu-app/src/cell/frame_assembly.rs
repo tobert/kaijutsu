@@ -229,12 +229,9 @@ pub fn update_nine_slice_state(
 // VISIBILITY SYNC SYSTEM
 // ============================================================================
 
-use crate::ui::state::{InputPresence, InputPresenceKind};
-
-/// Syncs frame visibility with AppScreen state and InputPresence.
+/// Syncs frame visibility with AppScreen state.
 pub fn sync_frame_visibility(
     screen: Res<State<AppScreen>>,
-    presence: Res<InputPresence>,
     new_frames: Query<&NineSliceFrame, Added<NineSliceFrame>>,
     all_frames: Query<&NineSliceFrame>,
     mut corners: Query<&mut Visibility, With<CornerMarker>>,
@@ -242,14 +239,11 @@ pub fn sync_frame_visibility(
 ) {
     let target_visibility = match screen.get() {
         AppScreen::Dashboard => Visibility::Hidden,
-        AppScreen::Conversation => match presence.0 {
-            InputPresenceKind::Docked | InputPresenceKind::Overlay => Visibility::Inherited,
-            InputPresenceKind::Minimized | InputPresenceKind::Hidden => Visibility::Hidden,
-        },
+        AppScreen::Conversation => Visibility::Hidden,
     };
 
     let frames_to_update: Box<dyn Iterator<Item = &NineSliceFrame>> =
-        if screen.is_changed() || presence.is_changed() {
+        if screen.is_changed() {
             Box::new(all_frames.iter())
         } else if !new_frames.is_empty() {
             Box::new(new_frames.iter())

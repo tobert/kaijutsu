@@ -168,10 +168,10 @@ fn setup_ui(
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                // Padding for widget docks (North=48px, South=32px)
+                // Padding for widget docks
                 padding: UiRect {
-                    top: Val::Px(48.0),
-                    bottom: Val::Px(32.0),
+                    top: Val::Px(constants::NORTH_DOCK_CLEARANCE),
+                    bottom: Val::Px(constants::SOUTH_DOCK_CLEARANCE),
                     left: Val::Px(0.0),
                     right: Val::Px(0.0),
                 },
@@ -231,7 +231,7 @@ fn setup_ui(
 
                 // ───────────────────────────────────────────────────────────
                 // CONVERSATION VIEW (hidden when in Dashboard state)
-                // Children (DagView, InputShadow) spawned by layout system
+                // Children (DagView, ComposeBlock) spawned by layout system
                 // ───────────────────────────────────────────────────────────
                 content.spawn((
                     ui::state::ConversationRoot,

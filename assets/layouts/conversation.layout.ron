@@ -13,9 +13,6 @@
 // │  │                  DagView                       │   │
 // │  │              (scrollable blocks)               │   │
 // │  └────────────────────────────────────────────────┘   │
-// │  ┌────────────────────────────────────────────────┐   │
-// │  │ InputShadow (reserves flex space)              │   │
-// │  └────────────────────────────────────────────────┘   │
 // └────────────────────────────────────────────────────────┘
 (
     name: "conversation",
@@ -30,10 +27,4 @@
         ],
         flex: 1.0,
     ),
-    huds: [
-        (position: TopRight, widget: "session_info"),
-        (position: TopLeft, widget: "connection_status"),
-        (position: BottomRight, widget: "keybinds"),
-        (position: BottomLeft, widget: "build_status"),
-    ],
 )

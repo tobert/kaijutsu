@@ -383,21 +383,6 @@ pub fn on_view_change(
     }
 }
 
-/// System that fills panel placeholders with actual content.
-///
-/// This runs after the reconciler and allows other systems to "claim"
-/// placeholders by spawning content as children.
-///
-/// Currently a no-op - placeholder filling will be done by panel-specific
-/// systems that check for LayoutPanelPlaceholder markers.
-#[allow(dead_code)]
-pub fn fill_panel_placeholders(
-    _commands: Commands,
-    _placeholders: Query<(Entity, &LayoutPanelPlaceholder), Added<LayoutPanelPlaceholder>>,
-) {
-    // Panel-specific systems will handle this
-}
-
 // ============================================================================
 // TESTS
 // ============================================================================

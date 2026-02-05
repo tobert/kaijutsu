@@ -10,6 +10,11 @@ pub const DEFAULT_KERNEL_ID: &str = "lobby";
 pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 
+/// Space reserved for the North dock (header bar).
+pub const NORTH_DOCK_CLEARANCE: f32 = 48.0;
+/// Space reserved for the South dock (status bar).
+pub const SOUTH_DOCK_CLEARANCE: f32 = 32.0;
+
 // ============================================================================
 // Z-INDEX LAYERS
 // ============================================================================
@@ -17,21 +22,20 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 /// Z-Index layers for UI element stacking.
 ///
 /// The UI is organized into layers from back to front:
-/// - **Chrome** (0): Header, status bar - always visible base layer
 /// - **Content** (10): Main content area (dashboard, conversation)
 /// - **Constellation** (15): Context node graph overlay (Map/Orbital modes)
-/// - **HUD** (50): Heads-up display panels
+/// - **Cursor** (20): Cursor overlay in focused document
+/// - **HUD** (50): Dock containers (North/South) and HUD panels
 /// - **Modal** (100): Input layer, dropdowns, command palette
-/// - **Toast** (150): Notifications, transient messages
+/// - **Bubble** (150): Floating input bubbles
+/// - **Dropdown** (200): Dropdown menus above modals
+/// - **Toast** (250): Notifications, transient messages
 ///
 /// Use these constants instead of magic numbers for maintainability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZLayer;
 
 impl ZLayer {
-    /// Base chrome layer (header, status bar)
-    #[allow(dead_code)]
-    pub const CHROME: i32 = 0;
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
     /// Constellation overlay (context nodes, connections)

@@ -98,18 +98,6 @@ impl WidgetSize {
             ..default()
         }
     }
-
-    /// Create size hints with min and max dimensions.
-    #[allow(dead_code)]
-    pub fn bounded(min_w: f32, min_h: f32, max_w: f32, max_h: f32) -> Self {
-        Self {
-            min_width: Some(min_w),
-            min_height: Some(min_h),
-            max_width: Some(max_w),
-            max_height: Some(max_h),
-            ..default()
-        }
-    }
 }
 
 /// What a widget displays.
@@ -125,21 +113,6 @@ pub enum WidgetContent {
     Mode,
     /// Connection status - reactive to ConnectionState
     Connection,
-    /// Agent list with status dots (future)
-    #[allow(dead_code)]
-    Agents,
-    /// Token count with bar visualization (future)
-    #[allow(dead_code)]
-    Tokens,
-    /// Build status from /tmp/kj.status (future)
-    #[allow(dead_code)]
-    Build,
-    /// Context-sensitive key hints (future)
-    #[allow(dead_code)]
-    Keys,
-    /// Clock display (future)
-    #[allow(dead_code)]
-    Clock,
 }
 
 impl Default for WidgetContent {
@@ -193,7 +166,7 @@ impl Widget {
 }
 
 /// Marker for widget text content (the MsdfUiText child).
-#[derive(Component)]
+#[derive(Component, Debug, Clone)]
 pub struct WidgetText {
     /// Parent widget's name for lookup
     pub widget_name: String,
@@ -211,7 +184,7 @@ pub struct DockContainer {
 }
 
 /// Marker for spacer elements within docks.
-#[derive(Component)]
+#[derive(Component, Debug, Clone, Copy)]
 pub struct DockSpacer;
 
 // ============================================================================
@@ -222,7 +195,8 @@ pub struct DockSpacer;
 ///
 /// Defines which widgets to spawn and their initial configuration.
 /// Phase 2: Hardcoded. Future: Load from ~/.config/kaijutsu/widgets.toml
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
 pub struct WidgetConfig {
     /// Whether config has been loaded
     pub loaded: bool,
@@ -255,6 +229,7 @@ impl Plugin for WidgetPlugin {
             .register_type::<WidgetContent>()
             .register_type::<Widget>()
             .register_type::<DockContainer>()
+            .register_type::<WidgetConfig>()
             .add_systems(Startup, setup_dock_containers)
             .add_systems(
                 Update,
@@ -310,9 +285,10 @@ fn setup_dock_containers(mut commands: Commands, theme: Res<Theme>) {
             justify_content: JustifyContent::SpaceBetween,
             align_items: AlignItems::Center,
             padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
+            border: UiRect::top(Val::Px(1.0)),
             ..default()
         },
-        BackgroundColor(theme.panel_bg),
+        BorderColor::all(theme.border),
         ZIndex(crate::constants::ZLayer::HUD),
     ));
 
@@ -490,7 +466,7 @@ fn spawn_widget(
                 .with_color(color),
             UiTextPositionCache::default(),
             Node {
-                min_width: Val::Px(min_width - 16.0),
+                min_width: Val::Px(if has_padding { min_width - 16.0 } else { min_width }),
                 min_height: Val::Px(min_height),
                 ..default()
             },
@@ -504,7 +480,6 @@ fn spawn_widget(
 fn update_mode_widget(
     mode: Res<CurrentMode>,
     theme: Res<Theme>,
-    widgets: Query<&Widget>,
     mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
 ) {
     if !mode.is_changed() {
@@ -513,15 +488,6 @@ fn update_mode_widget(
 
     for (widget_text, mut msdf_text) in widget_texts.iter_mut() {
         if widget_text.widget_name != "mode" {
-            continue;
-        }
-
-        // Verify it's a mode widget
-        let is_mode_widget = widgets
-            .iter()
-            .any(|w| w.name == "mode" && matches!(w.content, WidgetContent::Mode));
-
-        if !is_mode_widget {
             continue;
         }
 
@@ -541,7 +507,6 @@ fn update_mode_widget(
 fn update_connection_widget(
     conn_state: Res<ConnectionState>,
     theme: Res<Theme>,
-    widgets: Query<&Widget>,
     mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
 ) {
     if !conn_state.is_changed() {
@@ -550,15 +515,6 @@ fn update_connection_widget(
 
     for (widget_text, mut msdf_text) in widget_texts.iter_mut() {
         if widget_text.widget_name != "connection" {
-            continue;
-        }
-
-        // Verify it's a connection widget
-        let is_conn_widget = widgets
-            .iter()
-            .any(|w| w.name == "connection" && matches!(w.content, WidgetContent::Connection));
-
-        if !is_conn_widget {
             continue;
         }
 

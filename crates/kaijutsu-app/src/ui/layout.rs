@@ -25,8 +25,6 @@ use bevy::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use super::widget::Edge;
-
 // ============================================================================
 // LAYOUT TYPES
 // ============================================================================
@@ -88,20 +86,9 @@ impl From<LayoutDirection> for FlexDirection {
     }
 }
 
-/// Widget placement in a layout preset.
-#[derive(Debug, Clone, Deserialize, Reflect)]
-pub struct WidgetPlacement {
-    /// Dock edge for the widget
-    pub edge: Edge,
-    /// Widget name
-    pub widget: String,
-}
-
 /// Complete layout preset, loadable from RON.
 ///
-/// A preset defines a complete view layout including:
-/// - Panel arrangement (the tree)
-/// - HUD overlay positions
+/// A preset defines a complete view layout as a tree of containers and panels.
 #[derive(Debug, Clone, Deserialize, Asset, TypePath)]
 pub struct LayoutPreset {
     /// Preset name (for display/reference)
@@ -109,10 +96,6 @@ pub struct LayoutPreset {
     pub name: String,
     /// Root layout node
     pub root: LayoutNode,
-    /// Widget placements (docked widgets)
-    #[serde(default)]
-    #[allow(dead_code)] // RON field, used in tests
-    pub widgets: Vec<WidgetPlacement>,
 }
 
 // ============================================================================
@@ -365,23 +348,6 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
                     flex_direction: FlexDirection::Column,
                     overflow: Overflow::clip(),
                     padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
-                    ..default()
-                },
-            ))
-            .id()
-    });
-
-    // InputShadow - reserves space at bottom for docked input (legacy)
-    // No longer spawns PromptContainer - ComposeBlock handles input inline
-    registry.register_with_builder("InputShadow", |commands, ctx| {
-        commands
-            .spawn((
-                super::state::InputShadow,
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_grow: ctx.flex,
-                    // Height controlled by sync_input_shadow_height system
-                    min_height: Val::Px(0.0),
                     ..default()
                 },
             ))
@@ -655,15 +621,10 @@ mod tests {
                     ],
                     flex: 1.0,
                 ),
-                widgets: [
-                    (edge: South, widget: "mode"),
-                ],
             )
         "#;
 
         let preset: LayoutPreset = ron::from_str(ron).unwrap();
         assert_eq!(preset.name, "test");
-        assert_eq!(preset.widgets.len(), 1);
-        assert_eq!(preset.widgets[0].widget, "mode");
     }
 }

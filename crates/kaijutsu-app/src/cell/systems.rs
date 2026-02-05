@@ -13,7 +13,7 @@ use super::components::{
 use crate::conversation::CurrentConversation;
 use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
 use crate::ui::format::format_for_display;
-use crate::ui::state::{AppScreen, InputPresence, InputPresenceKind};
+use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -106,7 +106,6 @@ pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
-    mut presence: ResMut<InputPresence>,
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     compose_blocks: Query<&ComposeBlock>,
     screen: Res<State<AppScreen>>,
@@ -194,7 +193,6 @@ pub fn handle_mode_switch(
                         .unwrap_or(true);
 
                     if compose_empty {
-                        presence.0 = InputPresenceKind::Hidden;
                         info!("Mode: NORMAL");
                     } else {
                         info!("Mode: NORMAL (draft preserved in ComposeBlock)");
@@ -2349,7 +2347,6 @@ pub fn apply_block_cell_positions(
 
 // NOTE: Legacy input area position systems have been removed.
 // The InputLayer, InputFrame, and floating prompt are replaced by ComposeBlock.
-// InputPresence is still used by frame_assembly::sync_frame_visibility but kept Hidden.
 
 // ============================================================================
 // BLOCK CELL EDITING SYSTEMS (Unified Edit Model)

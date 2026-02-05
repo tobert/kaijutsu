@@ -515,28 +515,6 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.constellation_orbital_speed = v;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // HUD configuration
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(c) = get_color_with_alpha(&scope, "hud_panel_bg") {
-        theme.hud_panel_bg = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "hud_panel_glow") {
-        theme.hud_panel_glow = c;
-    }
-    if let Some(v) = get_float(&scope, "hud_panel_glow_intensity") {
-        theme.hud_panel_glow_intensity = v;
-    }
-    if let Some(v) = get_float(&scope, "hud_orbital_curve_radius") {
-        theme.hud_orbital_curve_radius = v;
-    }
-    if let Some(c) = get_color(&scope, "hud_text_color") {
-        theme.hud_text_color = c;
-    }
-    if let Some(v) = get_float(&scope, "hud_font_size") {
-        theme.hud_font_size = v;
-    }
-
     Ok(theme)
 }
 

@@ -256,22 +256,6 @@ pub struct Theme {
     /// Animation speed for orbital mode (radians/sec)
     pub constellation_orbital_speed: f32,
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // HUD Configuration
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Panel background color for HUD widgets
-    pub hud_panel_bg: Color,
-    /// Panel border/glow color
-    pub hud_panel_glow: Color,
-    /// Panel glow intensity (0.0-1.0)
-    pub hud_panel_glow_intensity: f32,
-    /// Orbital HUD curve radius (for curved edge style)
-    pub hud_orbital_curve_radius: f32,
-    /// Text color for HUD content
-    pub hud_text_color: Color,
-    /// Font size for HUD text
-    pub hud_font_size: f32,
 }
 
 impl Default for Theme {
@@ -395,13 +379,6 @@ impl Default for Theme {
             constellation_particle_budget: 500,
             constellation_orbital_speed: 0.1,
 
-            // HUD defaults - glowing panel aesthetic
-            hud_panel_bg: Color::srgba(0.05, 0.07, 0.09, 0.85),
-            hud_panel_glow: Color::srgba(0.49, 0.85, 0.82, 0.5),  // Cyan glow
-            hud_panel_glow_intensity: 0.4,
-            hud_orbital_curve_radius: 20.0,
-            hud_text_color: Color::srgb(0.7, 0.72, 0.78),
-            hud_font_size: 11.0,
         }
     }
 }

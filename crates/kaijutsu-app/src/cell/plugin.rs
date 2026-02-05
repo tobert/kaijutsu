@@ -41,7 +41,6 @@ use super::components::{
 use super::frame_assembly;
 use super::systems;
 use crate::dashboard::DashboardEventHandling;
-use crate::ui::state::InputPresence;
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -95,8 +94,6 @@ impl Plugin for CellPlugin {
             .init_resource::<DocumentSyncState>()
             .init_resource::<systems::EditorEntities>()
             .init_resource::<systems::ConsumedModeKeys>()
-            // Input presence resource (still used by mode switching and frame visibility)
-            .init_resource::<InputPresence>()
             // Bubble system resources
             .init_resource::<BubbleRegistry>()
             .init_resource::<BubbleConfig>();

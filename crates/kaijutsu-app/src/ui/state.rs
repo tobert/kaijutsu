@@ -8,8 +8,6 @@
 //!
 //! Input is handled by ComposeBlock - an inline editable block at the end of
 //! the conversation. The legacy floating InputLayer has been removed.
-//!
-//! `InputPresence` is kept for frame visibility sync but always set to Hidden.
 
 use bevy::prelude::*;
 
@@ -193,9 +191,7 @@ pub struct AppScreenPlugin;
 impl Plugin for AppScreenPlugin {
     fn build(&self, app: &mut App) {
         // Register types for BRP reflection
-        app.register_type::<AppScreen>()
-            .register_type::<InputPresenceKind>()
-            .register_type::<InputPresence>();
+        app.register_type::<AppScreen>();
 
         // Initialize ViewStack resource
         app.init_resource::<ViewStack>();
@@ -220,15 +216,12 @@ impl Plugin for AppScreenPlugin {
 /// Show the dashboard view when entering Dashboard state
 fn show_dashboard(
     mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
-    mut presence: ResMut<InputPresence>,
     mut mode: ResMut<crate::cell::CurrentMode>,
 ) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
-    // Hide input area when on dashboard
-    presence.0 = InputPresenceKind::Hidden;
     // Reset mode to Normal (Chat/Shell make no sense on Dashboard)
     mode.0 = crate::cell::EditorMode::Normal;
 }
@@ -251,8 +244,6 @@ fn show_conversation(
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
-    // NOTE: InputPresence stays Hidden - ComposeBlock is the inline input now
-    // Legacy floating input layer has been removed
 }
 
 /// Hide the conversation view when leaving Conversation state
@@ -306,44 +297,3 @@ fn sync_expanded_block_visibility(
     }
 }
 
-// ============================================================================
-// INPUT AREA STATE MANAGEMENT
-// ============================================================================
-
-/// Input area presence state - determines visibility and positioning mode.
-///
-/// Design principle: Overlay is the base case, Docked and Minimized are special cases.
-/// - **Overlay**: Floating centered with backdrop (Space to summon)
-/// - **Docked**: Pinned to dock position, no backdrop (i to enter insert)
-/// - **Minimized**: Only chasing line visible (reading mode)
-/// - **Hidden**: Dashboard state, input completely hidden
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Reflect)]
-pub enum InputPresenceKind {
-    /// Floating centered overlay with backdrop
-    Overlay,
-    /// Pinned to dock position (bottom, bottom-right, etc.)
-    Docked,
-    /// Collapsed to thin chasing line at bottom
-    Minimized,
-    /// Completely hidden (Dashboard state, or when using ComposeBlock)
-    #[default]
-    Hidden,
-}
-
-/// Resource tracking current input presence state.
-///
-/// NOTE: Always Hidden now - ComposeBlock handles input inline.
-/// Kept for frame_assembly::sync_frame_visibility compatibility.
-#[derive(Resource, Default, Reflect)]
-#[reflect(Resource)]
-pub struct InputPresence(pub InputPresenceKind);
-
-// ============================================================================
-// INPUT AREA MARKERS
-// ============================================================================
-
-/// Marker for the InputShadow - flex child that reserves space for input.
-///
-/// Used by layout.rs for conversation view structure.
-#[derive(Component)]
-pub struct InputShadow;
