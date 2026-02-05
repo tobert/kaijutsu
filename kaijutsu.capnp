@@ -521,6 +521,29 @@ interface Kernel {
 
   # List all registered contexts across all kernels
   listAllContexts @82 () -> (contexts :List(ContextHandleInfo));
+
+  # ============================================================================
+  # LLM Configuration (Phase 5: Per-Kernel Multi-Provider LLM)
+  # ============================================================================
+
+  # Get current LLM configuration for this kernel
+  getLlmConfig @83 () -> (config :LlmConfigInfo);
+
+  # Set default LLM provider
+  setDefaultProvider @84 (provider :Text) -> (success :Bool, error :Text);
+
+  # Set default model for a provider
+  setDefaultModel @85 (provider :Text, model :Text) -> (success :Bool, error :Text);
+
+  # ============================================================================
+  # Tool Filter Configuration (Phase 5: Unified Tool Filtering)
+  # ============================================================================
+
+  # Get current tool filter configuration
+  getToolFilter @86 () -> (filter :ToolFilterConfig);
+
+  # Set tool filter configuration
+  setToolFilter @87 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
 }
 
 # ============================================================================
@@ -548,6 +571,37 @@ struct ContextHandleInfo {
   parentId @5 :Text;
   hasParentId @6 :Bool;
   createdAt @7 :UInt64;
+}
+
+# ============================================================================
+# LLM Configuration Types
+# ============================================================================
+
+# Information about a single LLM provider
+struct LlmProviderInfo {
+  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
+  defaultModel @1 :Text;     # Default model for this provider
+  available @2 :Bool;         # Whether the provider is available (has API key)
+}
+
+# Current LLM configuration for a kernel
+struct LlmConfigInfo {
+  defaultProvider @0 :Text;   # Name of the default provider
+  defaultModel @1 :Text;     # Name of the default model
+  providers @2 :List(LlmProviderInfo);
+}
+
+# ============================================================================
+# Tool Filter Configuration Types
+# ============================================================================
+
+# Tool filter mode — controls which tools are available
+struct ToolFilterConfig {
+  union {
+    all @0 :Void;                 # All tools available
+    allowList @1 :List(Text);     # Only these tools available
+    denyList @2 :List(Text);      # All except these tools available
+  }
 }
 
 # Capability for interacting with a seat

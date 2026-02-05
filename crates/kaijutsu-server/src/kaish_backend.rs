@@ -552,7 +552,7 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolInfo>> {
-        let tools = self.kernel.list_equipped().await;
+        let tools = self.kernel.list_with_engines().await;
         let infos: Vec<ToolInfo> = tools
             .iter()
             .map(|t| Self::convert_tool_info(t))

@@ -19,7 +19,7 @@ use crate::agents::{
 };
 use crate::control::ConsentMode;
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::{LlmProvider, LlmRegistry, LlmResult};
+use crate::llm::{LlmRegistry, LlmResult, RigProvider};
 use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
@@ -257,21 +257,6 @@ impl Kernel {
         self.tools.write().await.register_with_engine(info, engine);
     }
 
-    /// Equip a tool (must have an engine already registered).
-    pub async fn equip(&self, name: &str) -> bool {
-        self.tools.write().await.equip(name)
-    }
-
-    /// Equip a tool with an execution engine.
-    pub async fn equip_with_engine(&self, name: &str, engine: Arc<dyn ExecutionEngine>) -> bool {
-        self.tools.write().await.equip_with_engine(name, engine)
-    }
-
-    /// Unequip a tool.
-    pub async fn unequip(&self, name: &str) -> bool {
-        self.tools.write().await.unequip(name)
-    }
-
     /// Get the tools registry (for RPC access).
     pub fn tools(&self) -> &RwLock<ToolRegistry> {
         &self.tools
@@ -282,12 +267,12 @@ impl Kernel {
         self.tools.read().await.list().into_iter().cloned().collect()
     }
 
-    /// List equipped tools.
-    pub async fn list_equipped(&self) -> Vec<ToolInfo> {
+    /// List tools that have registered engines.
+    pub async fn list_with_engines(&self) -> Vec<ToolInfo> {
         self.tools
             .read()
             .await
-            .list_equipped()
+            .list_with_engines()
             .into_iter()
             .cloned()
             .collect()
@@ -298,7 +283,7 @@ impl Kernel {
         self.tools.read().await.get(name).cloned()
     }
 
-    /// Get an equipped engine by name.
+    /// Get an engine by name (returns it if registered).
     pub async fn get_engine(&self, name: &str) -> Option<Arc<dyn ExecutionEngine>> {
         self.tools.read().await.get_engine(name)
     }
@@ -352,8 +337,8 @@ impl Kernel {
     // ========================================================================
 
     /// Register an LLM provider.
-    pub async fn register_llm(&self, provider: Arc<dyn LlmProvider>) {
-        self.llm.write().await.register(provider);
+    pub async fn register_llm(&self, name: impl Into<String>, provider: Arc<RigProvider>) {
+        self.llm.write().await.register(name, provider);
     }
 
     /// Set the default LLM provider.
@@ -660,38 +645,7 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{LlmProvider, LlmResult};
     use crate::tools::NoopEngine;
-
-    /// Mock LLM provider for testing.
-    struct MockLlmProvider {
-        response: String,
-    }
-
-    impl MockLlmProvider {
-        fn new(response: impl Into<String>) -> Self {
-            Self { response: response.into() }
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for MockLlmProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
-        fn available_models(&self) -> Vec<&str> {
-            vec!["mock-model"]
-        }
-
-        async fn is_available(&self) -> bool {
-            true
-        }
-
-        async fn prompt(&self, _model: &str, _prompt: &str) -> LlmResult<String> {
-            Ok(self.response.clone())
-        }
-    }
 
     #[tokio::test]
     async fn test_kernel_creation() {
@@ -738,8 +692,10 @@ mod tests {
     async fn test_tools() {
         let kernel = Kernel::new("test").await;
 
-        kernel.register_tool(ToolInfo::new("noop", "Noop engine", "test")).await;
-        kernel.equip_with_engine("noop", Arc::new(NoopEngine)).await;
+        kernel.register_tool_with_engine(
+            ToolInfo::new("noop", "Noop engine", "test"),
+            Arc::new(NoopEngine),
+        ).await;
         kernel.set_default_engine("noop").await;
 
         let result = kernel.execute("hello").await.unwrap();
@@ -789,18 +745,16 @@ mod tests {
     async fn test_llm_provider() {
         let kernel = Kernel::new("test").await;
 
-        // Register mock provider
-        let provider = Arc::new(MockLlmProvider::new("Hello from mock!"));
-        kernel.register_llm(provider).await;
-        kernel.set_default_llm("mock").await;
+        // Register a provider (uses fake key, won't actually call API)
+        let provider = Arc::new(RigProvider::Anthropic(
+            rig::providers::anthropic::Client::new("fake-key").unwrap(),
+        ));
+        kernel.register_llm("anthropic", provider).await;
+        kernel.set_default_llm("anthropic").await;
 
         // Check provider is listed
         let providers = kernel.list_llm_providers().await;
-        assert_eq!(providers, vec!["mock"]);
-
-        // Test prompt
-        let response = kernel.prompt("Hello").await.unwrap();
-        assert_eq!(response, "Hello from mock!");
+        assert_eq!(providers, vec!["anthropic"]);
     }
 
     #[tokio::test]

@@ -8,17 +8,17 @@
 2. Context forking to switch models (Claude ↔ Gemini ↔ Ollama)
 3. Configurable tool→model wiring (currently: all equipped tools → all models)
 
-## Current Tool Wiring
+## Tool Wiring
 
 ```
-ToolRegistry.list_equipped()  →  build_tool_definitions()  →  StreamRequest.with_tools()
-                                      ↓
-                              Equipped tools filtered by kernel's ToolConfig
-                              (equipped flag + tool filter)
+ToolRegistry.list_with_engines()  →  build_tool_definitions()  →  StreamRequest.with_tools()
+                                          ↓
+                                  Tools filtered by kernel's ToolConfig
+                                  (ToolFilter: All / AllowList / DenyList)
 ```
 
 **Key files:**
-- `rpc.rs:3836-3860` — `build_tool_definitions()` collects equipped + filtered tools
+- `rpc.rs` — `build_tool_definitions()` collects engine-backed + filtered tools
 - `kernel.rs` — `tool_config: RwLock<ToolConfig>` for per-kernel filtering
 
 ## Phase 1: Core rig Integration ✅ COMPLETE
@@ -142,14 +142,14 @@ let providers = #{
 
 ### 3.4 Update `build_tool_definitions()` ✅
 
-Now filters tools through both `equipped` status AND kernel's `tool_config`:
+Now filters tools through kernel's `tool_config` — tools with registered engines are available:
 
 ```rust
 async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
     let registry = kernel.tools().read().await;
     let tool_config = kernel.tool_config().await;
 
-    registry.list_equipped()
+    registry.list_with_engines()
         .into_iter()
         .filter(|info| tool_config.allows(&info.name))
         .map(|info| /* ... */)
@@ -229,9 +229,47 @@ rig-core has full thinking support:
 2. Tool filtering works per-kernel via ToolConfig
 3. `cargo check --workspace` — passes
 
-## Future Work
+## Phase 5: Rhai-Driven LLM Init + RPC Config + Unified Tool Filtering ✅ COMPLETE
 
-- [ ] Load llm.rhai at server startup to initialize providers
-- [ ] RPC to set default provider/model on a kernel
-- [ ] RPC to modify tool filter at runtime
-- [ ] Remove global `equipped` flag from ToolInfo (replace with ToolConfig only)
+All four "Future Work" items are now implemented.
+
+### 5.1 Load llm.rhai at Startup ✅
+
+- **Removed `LlmProvider` trait** — `RigProvider` is the only implementation
+- **`LlmRegistry` now stores `Arc<RigProvider>`** (concrete type)
+- **Created `llm/rhai_config.rs`** — evaluates `llm.rhai` script, returns `LlmConfig`
+- **Created `initialize_llm_registry()`** — builds `LlmRegistry` from Rhai config
+- **Removed `ServerState.llm_provider`** — each kernel loads its own LLM config
+- **Added `enabled` field to `ProviderConfig`** — skip disabled providers
+
+### 5.2 RPC: Provider/Model Configuration ✅
+
+Cap'n Proto methods @83-@85:
+- `getLlmConfig()` → returns `LlmConfigInfo` (default provider, model, provider list)
+- `setDefaultProvider(name)` → switch kernel's default LLM provider
+- `setDefaultModel(provider, model)` → switch kernel's default model
+
+Client types: `LlmProviderInfo`, `LlmConfigInfo` in `kaijutsu-client/src/rpc.rs`.
+
+### 5.3 RPC: Tool Filter Management ✅
+
+Cap'n Proto methods @86-@87:
+- `getToolFilter()` → returns `ToolFilterConfig` (union: all / allowList / denyList)
+- `setToolFilter(filter)` → replace kernel's tool filter
+
+Client type: `ClientToolFilter` in `kaijutsu-client/src/rpc.rs`.
+
+### 5.4 Remove `equipped` Flag ✅
+
+- **Removed `equipped: bool` from `ToolInfo`** — tools with engines are available
+- **Removed `equip()`/`unequip()`/`list_equipped()`** from `ToolRegistry` and `Kernel`
+- **Added `list_with_engines()`** — tools with registered engines (replaces `list_equipped`)
+- **Reimplemented equip/unequip RPC** as `ToolConfig` operations (backward compatible)
+- **`executeTool` checks `tool_allowed()`** before execution
+- **`listEquipment`** populates `equipped` field from `tool_config.allows()`
+
+### Verification ✅
+
+- `cargo check --workspace` — passes
+- `cargo test -p kaijutsu-kernel` — 203 tests pass
+- `cargo test --workspace` (excluding flaky GPU tests) — 338 tests pass, 0 failures

@@ -55,6 +55,9 @@ use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
 /// Embedded default theme content.
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.rhai");
 
+/// Embedded default LLM configuration.
+pub const DEFAULT_LLM_CONFIG: &str = include_str!("../../../assets/defaults/llm.rhai");
+
 /// Embedded example seat config.
 pub const EXAMPLE_SEAT: &str = include_str!("../../../assets/defaults/seats/example.rhai");
 
@@ -318,6 +321,7 @@ impl ConfigCrdtBackend {
     fn get_default_content(&self, path: &str) -> Option<String> {
         match path {
             "theme.rhai" => Some(DEFAULT_THEME.to_string()),
+            "llm.rhai" => Some(DEFAULT_LLM_CONFIG.to_string()),
             p if p.starts_with("seats/") && p.ends_with(".rhai") => {
                 // Generate seat-specific default from template
                 Some(EXAMPLE_SEAT.to_string())

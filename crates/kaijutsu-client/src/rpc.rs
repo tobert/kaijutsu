@@ -866,6 +866,130 @@ impl KernelHandle {
         }
         Ok(result)
     }
+
+    // ========================================================================
+    // LLM Configuration
+    // ========================================================================
+
+    /// Get current LLM configuration
+    pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, RpcError> {
+        let request = self.kernel.get_llm_config_request();
+        let response = request.send().promise.await?;
+        let config = response.get()?.get_config()?;
+
+        let providers_reader = config.get_providers()?;
+        let mut providers = Vec::with_capacity(providers_reader.len() as usize);
+        for p in providers_reader.iter() {
+            providers.push(LlmProviderInfo {
+                name: p.get_name()?.to_string()?,
+                default_model: p.get_default_model()?.to_string()?,
+                available: p.get_available(),
+            });
+        }
+
+        Ok(LlmConfigInfo {
+            default_provider: config.get_default_provider()?.to_string()?,
+            default_model: config.get_default_model()?.to_string()?,
+            providers,
+        })
+    }
+
+    /// Set the default LLM provider
+    pub async fn set_default_provider(&self, provider: &str) -> Result<bool, RpcError> {
+        let mut request = self.kernel.set_default_provider_request();
+        request.get().set_provider(provider);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_success() {
+            let error = result.get_error()?.to_str()?;
+            if !error.is_empty() {
+                return Err(RpcError::ServerError(error.to_string()));
+            }
+        }
+        Ok(result.get_success())
+    }
+
+    /// Set the default model for a provider
+    pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, RpcError> {
+        let mut request = self.kernel.set_default_model_request();
+        request.get().set_provider(provider);
+        request.get().set_model(model);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_success() {
+            let error = result.get_error()?.to_str()?;
+            if !error.is_empty() {
+                return Err(RpcError::ServerError(error.to_string()));
+            }
+        }
+        Ok(result.get_success())
+    }
+
+    // ========================================================================
+    // Tool Filter Configuration
+    // ========================================================================
+
+    /// Get current tool filter configuration
+    pub async fn get_tool_filter(&self) -> Result<ClientToolFilter, RpcError> {
+        let request = self.kernel.get_tool_filter_request();
+        let response = request.send().promise.await?;
+        let filter = response.get()?.get_filter()?;
+
+        use crate::kaijutsu_capnp::tool_filter_config;
+        match filter.which()? {
+            tool_filter_config::All(()) => Ok(ClientToolFilter::All),
+            tool_filter_config::AllowList(list) => {
+                let list = list?;
+                let mut tools = Vec::with_capacity(list.len() as usize);
+                for i in 0..list.len() {
+                    tools.push(list.get(i)?.to_str()?.to_string());
+                }
+                Ok(ClientToolFilter::AllowList(tools))
+            }
+            tool_filter_config::DenyList(list) => {
+                let list = list?;
+                let mut tools = Vec::with_capacity(list.len() as usize);
+                for i in 0..list.len() {
+                    tools.push(list.get(i)?.to_str()?.to_string());
+                }
+                Ok(ClientToolFilter::DenyList(tools))
+            }
+        }
+    }
+
+    /// Set tool filter configuration
+    pub async fn set_tool_filter(&self, filter: &ClientToolFilter) -> Result<bool, RpcError> {
+        let mut request = self.kernel.set_tool_filter_request();
+        {
+            let mut filter_builder = request.get().init_filter();
+            match filter {
+                ClientToolFilter::All => {
+                    filter_builder.set_all(());
+                }
+                ClientToolFilter::AllowList(tools) => {
+                    let mut list = filter_builder.init_allow_list(tools.len() as u32);
+                    for (i, tool) in tools.iter().enumerate() {
+                        list.set(i as u32, tool);
+                    }
+                }
+                ClientToolFilter::DenyList(tools) => {
+                    let mut list = filter_builder.init_deny_list(tools.len() as u32);
+                    for (i, tool) in tools.iter().enumerate() {
+                        list.set(i as u32, tool);
+                    }
+                }
+            }
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_success() {
+            let error = result.get_error()?.to_str()?;
+            if !error.is_empty() {
+                return Err(RpcError::ServerError(error.to_string()));
+            }
+        }
+        Ok(result.get_success())
+    }
 }
 
 // ============================================================================
@@ -1222,6 +1346,37 @@ pub struct ContextInfo {
     pub model: String,
     pub parent_id: Option<String>,
     pub created_at: u64,
+}
+
+// ============================================================================
+// LLM Configuration Types
+// ============================================================================
+
+/// Information about a single LLM provider
+#[derive(Debug, Clone)]
+pub struct LlmProviderInfo {
+    pub name: String,
+    pub default_model: String,
+    pub available: bool,
+}
+
+/// Current LLM configuration for a kernel
+#[derive(Debug, Clone)]
+pub struct LlmConfigInfo {
+    pub default_provider: String,
+    pub default_model: String,
+    pub providers: Vec<LlmProviderInfo>,
+}
+
+/// Tool filter configuration
+#[derive(Debug, Clone)]
+pub enum ClientToolFilter {
+    /// All tools available
+    All,
+    /// Only these tools available
+    AllowList(Vec<String>),
+    /// All except these tools available
+    DenyList(Vec<String>),
 }
 
 // ============================================================================

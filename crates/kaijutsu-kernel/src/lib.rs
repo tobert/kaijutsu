@@ -52,7 +52,7 @@ pub use state::KernelState;
 pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use llm::{
     // Core types
-    LlmError, LlmProvider, LlmRegistry, LlmResult, RigProvider,
+    LlmError, LlmRegistry, LlmResult, RigProvider,
     Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
     // Tool definitions
     ToolDefinition as LlmToolDefinition,
@@ -60,6 +60,7 @@ pub use llm::{
     StreamEvent, StreamRequest, RigStreamAdapter, LlmStream,
     // Configuration
     ProviderConfig, ToolConfig, ToolFilter, ContextSegment,
+    LlmConfig, ModelAlias, initialize_llm_registry, load_llm_config,
     // Default model
     DEFAULT_MODEL,
 };
@@ -75,7 +76,7 @@ pub use mcp_pool::{
 pub use config_backend::{
     ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
     ConfigWatcherHandle, ValidationResult,
-    DEFAULT_THEME, EXAMPLE_SEAT,
+    DEFAULT_THEME, DEFAULT_LLM_CONFIG, EXAMPLE_SEAT,
 };
 
 // Re-export rmcp types needed for resource handling

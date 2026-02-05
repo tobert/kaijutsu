@@ -33,17 +33,19 @@
 //! CRDT block operations.
 
 pub mod config;
+pub mod rhai_config;
 pub mod stream;
 
 // Re-export key types
 pub use config::{ContextSegment, ProviderConfig, ToolConfig, ToolFilter};
+pub use rhai_config::{LlmConfig, ModelAlias, initialize_llm_registry, load_llm_config};
 pub use stream::{LlmStream, RigStreamAdapter, StreamEvent, StreamRequest, StreamingBlockType};
 
-use async_trait::async_trait;
 use rig::client::{CompletionClient, Nothing};
 use rig::completion::{self as rig_completion};
 use rig::providers::{anthropic, gemini, ollama, openai};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default model to use when none specified.
@@ -477,29 +479,9 @@ impl RigProvider {
     }
 }
 
-/// Trait for LLM providers (kept for compatibility).
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    /// Get the provider name (e.g., "anthropic", "gemini").
-    fn name(&self) -> &str;
-
+impl RigProvider {
     /// List available models for this provider.
-    fn available_models(&self) -> Vec<&str>;
-
-    /// Check if the provider is ready (has credentials, connection, etc.).
-    async fn is_available(&self) -> bool;
-
-    /// Simple prompt helper - sends a single user message.
-    async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String>;
-}
-
-#[async_trait]
-impl LlmProvider for RigProvider {
-    fn name(&self) -> &str {
-        self.name()
-    }
-
-    fn available_models(&self) -> Vec<&str> {
+    pub fn available_models(&self) -> Vec<&str> {
         match self {
             Self::Anthropic(_) => vec![
                 anthropic::completion::CLAUDE_4_OPUS,
@@ -512,23 +494,15 @@ impl LlmProvider for RigProvider {
             Self::Ollama(_) => vec!["qwen2.5-coder:7b", "llama3.2", "codellama"],
         }
     }
-
-    async fn is_available(&self) -> bool {
-        // Could do a lightweight API check here
-        true
-    }
-
-    async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
-        self.prompt(model, prompt).await
-    }
 }
 
 /// Registry of LLM providers.
 #[derive(Default)]
 pub struct LlmRegistry {
-    providers: std::collections::HashMap<String, Arc<dyn LlmProvider>>,
+    providers: HashMap<String, Arc<RigProvider>>,
     default_provider: Option<String>,
     default_model: Option<String>,
+    model_aliases: HashMap<String, rhai_config::ModelAlias>,
 }
 
 impl std::fmt::Debug for LlmRegistry {
@@ -537,6 +511,7 @@ impl std::fmt::Debug for LlmRegistry {
             .field("providers", &self.providers.keys().collect::<Vec<_>>())
             .field("default_provider", &self.default_provider)
             .field("default_model", &self.default_model)
+            .field("model_aliases", &self.model_aliases.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -547,14 +522,13 @@ impl LlmRegistry {
         Self::default()
     }
 
-    /// Register a provider.
-    pub fn register(&mut self, provider: Arc<dyn LlmProvider>) {
-        let name = provider.name().to_string();
-        self.providers.insert(name, provider);
+    /// Register a provider by name.
+    pub fn register(&mut self, name: impl Into<String>, provider: Arc<RigProvider>) {
+        self.providers.insert(name.into(), provider);
     }
 
     /// Get a provider by name.
-    pub fn get(&self, name: &str) -> Option<Arc<dyn LlmProvider>> {
+    pub fn get(&self, name: &str) -> Option<Arc<RigProvider>> {
         self.providers.get(name).cloned()
     }
 
@@ -568,13 +542,18 @@ impl LlmRegistry {
         }
     }
 
+    /// Get the default provider name.
+    pub fn default_provider_name(&self) -> Option<&str> {
+        self.default_provider.as_deref()
+    }
+
     /// Set the default model.
     pub fn set_default_model(&mut self, model: impl Into<String>) {
         self.default_model = Some(model.into());
     }
 
     /// Get the default provider.
-    pub fn default_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+    pub fn default_provider(&self) -> Option<Arc<RigProvider>> {
         self.default_provider
             .as_ref()
             .and_then(|name| self.get(name))
@@ -583,6 +562,35 @@ impl LlmRegistry {
     /// Get the default model.
     pub fn default_model(&self) -> Option<&str> {
         self.default_model.as_deref()
+    }
+
+    /// Set model aliases.
+    pub fn set_model_aliases(&mut self, aliases: HashMap<String, rhai_config::ModelAlias>) {
+        self.model_aliases = aliases;
+    }
+
+    /// Resolve a model name through aliases.
+    ///
+    /// If the name matches an alias, returns the (provider, model) tuple.
+    /// Otherwise returns None, meaning the name should be used as-is.
+    pub fn resolve_alias(&self, name: &str) -> Option<(&str, &str)> {
+        self.model_aliases
+            .get(name)
+            .map(|a| (a.provider.as_str(), a.model.as_str()))
+    }
+
+    /// Resolve a model name, returning the provider and model to use.
+    ///
+    /// Checks aliases first. If no alias matches, uses the default provider
+    /// with the given model name.
+    pub fn resolve_model(&self, model_name: &str) -> Option<(Arc<RigProvider>, String)> {
+        if let Some((provider_name, model)) = self.resolve_alias(model_name) {
+            self.get(provider_name)
+                .map(|p| (p, model.to_string()))
+        } else {
+            self.default_provider()
+                .map(|p| (p, model_name.to_string()))
+        }
     }
 
     /// List all registered providers.
@@ -666,10 +674,45 @@ mod tests {
 
     #[test]
     fn test_provider_names() {
-        // Just verify the names are correct
         assert_eq!(
             RigProvider::Anthropic(anthropic::Client::new("fake").unwrap()).name(),
             "anthropic"
         );
+    }
+
+    #[test]
+    fn test_registry_concrete_type() {
+        let mut registry = LlmRegistry::new();
+        let provider = Arc::new(RigProvider::Anthropic(
+            anthropic::Client::new("fake").unwrap(),
+        ));
+        registry.register("anthropic", provider);
+        registry.set_default("anthropic");
+
+        assert!(registry.default_provider().is_some());
+        assert_eq!(registry.list(), vec!["anthropic"]);
+    }
+
+    #[test]
+    fn test_model_alias_resolution() {
+        let mut registry = LlmRegistry::new();
+        let provider = Arc::new(RigProvider::Anthropic(
+            anthropic::Client::new("fake").unwrap(),
+        ));
+        registry.register("anthropic", provider);
+        registry.set_default("anthropic");
+
+        let mut aliases = HashMap::new();
+        aliases.insert("fast".to_string(), rhai_config::ModelAlias {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+        });
+        registry.set_model_aliases(aliases);
+
+        assert!(registry.resolve_alias("fast").is_some());
+        let (prov, model) = registry.resolve_alias("fast").unwrap();
+        assert_eq!(prov, "anthropic");
+        assert_eq!(model, "claude-haiku-4-5-20251001");
+        assert!(registry.resolve_alias("nonexistent").is_none());
     }
 }

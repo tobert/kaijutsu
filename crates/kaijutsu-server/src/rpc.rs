@@ -21,7 +21,7 @@ use crate::context_engine::{ContextEngine, ContextManager};
 use crate::embedded_kaish::EmbeddedKaish;
 
 use kaijutsu_kernel::{
-    DocumentDb, DocumentKind, Kernel, LlmProvider,
+    DocumentDb, DocumentKind, Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps,
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
@@ -37,6 +37,8 @@ use kaijutsu_kernel::{
     AgentCapability, AgentConfig, AgentInfo, AgentStatus, AgentActivityEvent,
     // Config
     ConfigCrdtBackend, ConfigWatcherHandle,
+    // Tool filtering
+    ToolFilter,
 };
 use kaijutsu_crdt::{BlockKind, Role};
 use serde_json;
@@ -46,100 +48,61 @@ use serde_json;
 // ============================================================================
 
 /// Register block tools with a kernel.
+/// Tools with engines are automatically available via the ToolFilter system.
 async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
     context_manager: Arc<ContextManager>,
 ) {
-    // context - Context management (new, switch, list)
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("context", "Manage conversation contexts (new, switch, list)", "kernel"),
-            Arc::new(ContextEngine::new(context_manager)),
-        )
-        .await;
-    kernel.equip("context").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("context", "Manage conversation contexts (new, switch, list)", "kernel"),
+        Arc::new(ContextEngine::new(context_manager)),
+    ).await;
 
-    // block_create - Create a new block
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
-            Arc::new(BlockCreateEngine::new(documents.clone(), "server")),
-        )
-        .await;
-    kernel.equip("block_create").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
+        Arc::new(BlockCreateEngine::new(documents.clone(), "server")),
+    ).await;
 
-    // block_append - Append text to a block (streaming-optimized)
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_append", "Append text to a block", "block"),
-            Arc::new(BlockAppendEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_append").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_append", "Append text to a block", "block"),
+        Arc::new(BlockAppendEngine::new(documents.clone())),
+    ).await;
 
-    // block_edit - Line-based editing with atomic operations and CAS
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
-            Arc::new(BlockEditEngine::new(documents.clone(), "server")),
-        )
-        .await;
-    kernel.equip("block_edit").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
+        Arc::new(BlockEditEngine::new(documents.clone(), "server")),
+    ).await;
 
-    // block_splice - Character-based editing for programmatic tools
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_splice", "Character-based splice editing", "block"),
-            Arc::new(BlockSpliceEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_splice").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_splice", "Character-based splice editing", "block"),
+        Arc::new(BlockSpliceEngine::new(documents.clone())),
+    ).await;
 
-    // block_read - Read block content with line numbers and ranges
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_read", "Read block content with optional line numbers", "block"),
-            Arc::new(BlockReadEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_read").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_read", "Read block content with optional line numbers", "block"),
+        Arc::new(BlockReadEngine::new(documents.clone())),
+    ).await;
 
-    // block_search - Search within a block using regex
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_search", "Search within a block using regex", "block"),
-            Arc::new(BlockSearchEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_search").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_search", "Search within a block using regex", "block"),
+        Arc::new(BlockSearchEngine::new(documents.clone())),
+    ).await;
 
-    // block_list - List blocks with filters
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_list", "List blocks with optional filters", "block"),
-            Arc::new(BlockListEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_list").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_list", "List blocks with optional filters", "block"),
+        Arc::new(BlockListEngine::new(documents.clone())),
+    ).await;
 
-    // block_status - Set block status
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_status", "Set block status", "block"),
-            Arc::new(BlockStatusEngine::new(documents.clone())),
-        )
-        .await;
-    kernel.equip("block_status").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("block_status", "Set block status", "block"),
+        Arc::new(BlockStatusEngine::new(documents.clone())),
+    ).await;
 
-    // kernel_search - Cross-block grep
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
-            Arc::new(KernelSearchEngine::new(documents)),
-        )
-        .await;
-    kernel.equip("kernel_search").await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
+        Arc::new(KernelSearchEngine::new(documents)),
+    ).await;
 }
 
 // ============================================================================
@@ -213,8 +176,6 @@ pub struct ServerState {
     pub kernels: HashMap<String, KernelState>,
     next_kernel_id: AtomicU64,
     next_exec_id: AtomicU64,
-    /// LLM provider (initialized from ANTHROPIC_API_KEY for now)
-    pub llm_provider: Option<Arc<RigProvider>>,
     /// User's active seats across all kernels
     pub my_seats: HashMap<String, SeatInfo>,  // key is SeatId::key()
     /// Currently active seat for this connection (if any)
@@ -227,18 +188,6 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(username: String) -> Self {
-        // Initialize LLM provider from environment if API key is available
-        let llm_provider = match RigProvider::anthropic_from_env() {
-            Ok(provider) => {
-                log::info!("ANTHROPIC_API_KEY found, initializing LLM provider");
-                Some(Arc::new(provider))
-            }
-            Err(e) => {
-                log::warn!("LLM provider unavailable: {}", e);
-                None
-            }
-        };
-
         Self {
             identity: Identity {
                 username: username.clone(),
@@ -247,7 +196,6 @@ impl ServerState {
             kernels: HashMap::new(),
             next_kernel_id: AtomicU64::new(1),
             next_exec_id: AtomicU64::new(1),
-            llm_provider,
             my_seats: HashMap::new(),
             current_seat: None,
             mcp_pool: Arc::new(McpServerPool::new()),
@@ -385,6 +333,42 @@ async fn create_config_backend(
     };
 
     (backend, watcher)
+}
+
+/// Initialize a kernel's LLM registry from its config backend.
+///
+/// Loads `llm.rhai` from the config CRDT, parses it, and populates
+/// the kernel's `LlmRegistry` with providers and aliases.
+async fn initialize_kernel_llm(
+    kernel: &Arc<Kernel>,
+    config_backend: &Arc<ConfigCrdtBackend>,
+) {
+    // Ensure llm.rhai is loaded
+    if let Err(e) = config_backend.ensure_config("llm.rhai").await {
+        log::warn!("Failed to load llm.rhai: {}", e);
+        return;
+    }
+
+    // Get the content
+    let script = match config_backend.get_content("llm.rhai") {
+        Ok(content) => content,
+        Err(e) => {
+            log::warn!("Failed to read llm.rhai content: {}", e);
+            return;
+        }
+    };
+
+    // Parse and build registry
+    match kaijutsu_kernel::load_llm_config(&script) {
+        Ok(config) => {
+            let registry = kaijutsu_kernel::initialize_llm_registry(&config);
+            *kernel.llm().write().await = registry;
+            log::info!("Initialized kernel LLM registry from llm.rhai");
+        }
+        Err(e) => {
+            log::warn!("Failed to parse llm.rhai: {}", e);
+        }
+    }
 }
 
 pub struct KernelState {
@@ -550,6 +534,9 @@ impl world::Server for WorldImpl {
                 let kernel_arc = Arc::new(kernel);
                 register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
+                // Initialize LLM registry from llm.rhai config
+                initialize_kernel_llm(&kernel_arc, &config_backend).await;
+
                 // Create default context
                 let mut contexts = HashMap::new();
                 contexts.insert("default".to_string(), ContextState::new("default".to_string()));
@@ -639,6 +626,9 @@ impl world::Server for WorldImpl {
             // Register block tools (including context engine)
             let kernel_arc = Arc::new(kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Initialize LLM registry from llm.rhai config
+            initialize_kernel_llm(&kernel_arc, &config_backend).await;
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -878,13 +868,15 @@ impl kernel::Server for KernelImpl {
         drop(state);
 
         Promise::from_future(async move {
-            let tools = kernel.list_tools().await;
+            let tool_config = kernel.tool_config().await;
+            let tools = kernel.list_with_engines().await;
             let mut builder = results.get().init_tools(tools.len() as u32);
             for (i, tool) in tools.iter().enumerate() {
                 let mut t = builder.reborrow().get(i as u32);
                 t.set_name(&tool.name);
                 t.set_description(&tool.description);
-                t.set_equipped(tool.equipped);
+                // "equipped" now means "allowed by tool filter"
+                t.set_equipped(tool_config.allows(&tool.name));
             }
             Ok(())
         })
@@ -904,17 +896,23 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        // Equip now means "ensure tool is allowed by ToolFilter"
         Promise::from_future(async move {
-            // Tools must be pre-registered with engines
-            // equip() just sets the equipped flag
-            if kernel.equip(&tool_name).await {
-                Ok(())
-            } else {
-                Err(capnp::Error::failed(format!(
-                    "Unknown tool or no engine registered: {}",
-                    tool_name
-                )))
+            let config = kernel.tool_config().await;
+            match config.filter {
+                ToolFilter::DenyList(mut denied) => {
+                    denied.remove(&tool_name);
+                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
+                }
+                ToolFilter::AllowList(mut allowed) => {
+                    allowed.insert(tool_name);
+                    kernel.set_tool_filter(ToolFilter::AllowList(allowed)).await;
+                }
+                ToolFilter::All => {
+                    // Already allowed
+                }
             }
+            Ok(())
         })
     }
 
@@ -932,8 +930,25 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        // Unequip now means "ensure tool is denied by ToolFilter"
         Promise::from_future(async move {
-            kernel.unequip(&tool_name).await;
+            let config = kernel.tool_config().await;
+            match config.filter {
+                ToolFilter::All => {
+                    // Switch to deny list with just this tool
+                    let mut denied = std::collections::HashSet::new();
+                    denied.insert(tool_name);
+                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
+                }
+                ToolFilter::DenyList(mut denied) => {
+                    denied.insert(tool_name);
+                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
+                }
+                ToolFilter::AllowList(mut allowed) => {
+                    allowed.remove(&tool_name);
+                    kernel.set_tool_filter(ToolFilter::AllowList(allowed)).await;
+                }
+            }
             Ok(())
         })
     }
@@ -997,6 +1012,9 @@ impl kernel::Server for KernelImpl {
             // Register block tools on forked kernel
             let kernel_arc = Arc::new(forked_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Initialize LLM registry from llm.rhai config
+            initialize_kernel_llm(&kernel_arc, &config_backend).await;
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -1100,6 +1118,9 @@ impl kernel::Server for KernelImpl {
             // Register block tools on threaded kernel
             let kernel_arc = Arc::new(threaded_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Initialize LLM registry from parent's config
+            initialize_kernel_llm(&kernel_arc, &parent_config_backend).await;
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -1310,6 +1331,13 @@ impl kernel::Server for KernelImpl {
             let mut result = results.get().init_result();
             result.set_request_id(&request_id);
 
+            // Check if tool is allowed by kernel's tool filter
+            if !kernel.tool_allowed(&tool_name).await {
+                result.set_success(false);
+                result.set_error(&format!("Tool filtered out by kernel config: {}", tool_name));
+                return Ok(());
+            }
+
             // Get the engine for this tool
             let engine = kernel.tools().read().await.get_engine(&tool_name);
             match engine {
@@ -1330,7 +1358,7 @@ impl kernel::Server for KernelImpl {
                 }
                 None => {
                     result.set_success(false);
-                    result.set_error(&format!("Tool not equipped: {}", tool_name));
+                    result.set_error(&format!("No engine registered for tool: {}", tool_name));
                 }
             }
             Ok(())
@@ -1691,24 +1719,45 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
-            // Get LLM provider and kernel references
-            let (provider, documents, kernel_arc) = {
+            // Get LLM provider and kernel references from the kernel's own registry
+            let (documents, kernel_arc) = {
                 let state_ref = state.borrow();
-                let provider = match &state_ref.llm_provider {
-                    Some(p) => p.clone(),
-                    None => {
-                        log::error!("LLM provider not configured");
-                        return Err(capnp::Error::failed("LLM provider not configured (missing ANTHROPIC_API_KEY)".into()));
-                    }
-                };
                 let kernel_state = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| {
                         log::error!("kernel {} not found", kernel_id);
                         capnp::Error::failed("kernel not found".into())
                     })?;
-                log::debug!("Got provider and kernel state");
+                log::debug!("Got kernel state");
 
-                (provider, kernel_state.documents.clone(), kernel_state.kernel.clone())
+                (kernel_state.documents.clone(), kernel_state.kernel.clone())
+            };
+
+            // Resolve provider from kernel's LLM registry
+            let (provider, model_name) = {
+                let registry = kernel_arc.llm().read().await;
+                let requested_model = model.as_deref();
+
+                // Try alias resolution first, then default
+                if let Some(name) = requested_model {
+                    if let Some((p, m)) = registry.resolve_model(name) {
+                        (p, m)
+                    } else {
+                        let p = registry.default_provider().ok_or_else(|| {
+                            log::error!("No LLM provider configured");
+                            capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
+                        })?;
+                        (p, name.to_string())
+                    }
+                } else {
+                    let p = registry.default_provider().ok_or_else(|| {
+                        log::error!("No LLM provider configured");
+                        capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
+                    })?;
+                    let m = registry.default_model()
+                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                        .to_string();
+                    (p, m)
+                }
             };
 
             // Build tool definitions from equipped tools (async)
@@ -1737,15 +1786,9 @@ impl kernel::Server for KernelImpl {
                     capnp::Error::failed(format!("failed to insert user block: {}", e))
                 })?;
             log::debug!("Inserted user block: {:?}", user_block_id);
-            // User block broadcast happens via FlowBus (insert_block emits BlockFlow::Inserted)
 
             log::info!("User message block inserted, spawning LLM stream task");
-
-            // Determine model name
-            use kaijutsu_kernel::DEFAULT_MODEL;
-            let model_name = model.as_deref().unwrap_or(DEFAULT_MODEL).to_string();
-            log::info!("Using model: {} (requested: {:?}, default: {})",
-                model_name, model, DEFAULT_MODEL);
+            log::info!("Using model: {} (requested: {:?})", model_name, model);
 
             // Spawn LLM streaming in background task with agentic loop
             // Pass user block_id so streaming blocks are inserted AFTER it
@@ -1966,6 +2009,7 @@ impl kernel::Server for KernelImpl {
                 .map_err(|e| capnp::Error::failed(format!("Failed to register MCP server: {}", e)))?;
 
             // Register MCP tools with the kernel if we have one
+            // Tools with engines are automatically available via ToolFilter
             if let Some(kernel) = kernel_arc {
                 let tools = McpToolEngine::from_server_tools(mcp_pool.clone(), &name, &info.tools);
                 for (qualified_name, engine) in tools {
@@ -1974,7 +2018,6 @@ impl kernel::Server for KernelImpl {
                         ToolInfo::new(&qualified_name, &desc, "mcp"),
                         engine,
                     ).await;
-                    kernel.equip(&qualified_name).await;
                 }
             }
 
@@ -2008,12 +2051,13 @@ impl kernel::Server for KernelImpl {
             .map(|k| k.kernel.clone());
 
         Promise::from_future(async move {
-            // Get tools before unregistering so we can unequip them
+            // Remove engines for MCP tools before unregistering the server
             if let Some(kernel) = kernel_arc {
                 if let Ok(info) = mcp_pool.get_server_info(&name).await {
+                    let mut registry = kernel.tools().write().await;
                     for tool in &info.tools {
                         let qualified_name = format!("{}:{}", name, tool.name);
-                        kernel.unequip(&qualified_name).await;
+                        registry.remove_engine(&qualified_name);
                     }
                 }
             }
@@ -3812,38 +3856,52 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ConfigureLlmResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
-        let provider = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
+        let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
         let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
         let kernel_id = self.kernel_id.clone();
+        let state = self.state.clone();
 
-        let mut state = self.state.borrow_mut();
-
-        // Update drift router metadata
-        let short_id = state.drift_router.short_id_for_kernel(&kernel_id)
-            .map(|s| s.to_string());
-
-        if let Some(ref sid) = short_id {
-            let _ = state.drift_router.configure_llm(sid, &provider, &model);
-        }
-
-        // Create new provider from config
-        let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider)
-            .with_default_model(&model);
-        match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
-            Ok(new_provider) => {
-                state.llm_provider = Some(Arc::new(new_provider));
-                results.get().set_success(true);
-                results.get().set_error("");
-                log::info!("LLM configured: provider={}, model={}", provider, model);
+        Promise::from_future(async move {
+            // Update drift router metadata
+            {
+                let mut state_ref = state.borrow_mut();
+                let short_id = state_ref.drift_router.short_id_for_kernel(&kernel_id)
+                    .map(|s| s.to_string());
+                if let Some(ref sid) = short_id {
+                    let _ = state_ref.drift_router.configure_llm(sid, &provider_name, &model);
+                }
             }
-            Err(e) => {
-                results.get().set_success(false);
-                results.get().set_error(&format!("{}", e));
-                log::warn!("Failed to configure LLM: {}", e);
-            }
-        }
 
-        Promise::ok(())
+            // Get kernel
+            let kernel_arc = {
+                let state_ref = state.borrow();
+                state_ref.kernels.get(&kernel_id)
+                    .map(|k| k.kernel.clone())
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?
+            };
+
+            // Create new provider from config and register with kernel
+            let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
+                .with_default_model(&model);
+            match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
+                Ok(new_provider) => {
+                    let mut registry = kernel_arc.llm().write().await;
+                    registry.register(&provider_name, Arc::new(new_provider));
+                    registry.set_default(&provider_name);
+                    registry.set_default_model(&model);
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                    log::info!("LLM configured: provider={}, model={}", provider_name, model);
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&format!("{}", e));
+                    log::warn!("Failed to configure LLM: {}", e);
+                }
+            }
+
+            Ok(())
+        })
     }
 
     fn drift_push(
@@ -3860,7 +3918,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
 
         // Extract what we need from state before going async
-        let (source_ctx, source_model, provider, documents, main_doc_id) = {
+        let (source_ctx, source_model, kernel_arc, documents, main_doc_id) = {
             let state_ref = state.borrow();
             let source_ctx = match state_ref.drift_router.short_id_for_kernel(&kernel_id) {
                 Some(sid) => sid.to_string(),
@@ -3872,14 +3930,13 @@ impl kernel::Server for KernelImpl {
             };
             let source_model = state_ref.drift_router.get(&source_ctx)
                 .and_then(|h| h.model.clone());
-            let provider = state_ref.llm_provider.clone();
-            let (documents, main_doc_id) = match state_ref.kernels.get(&kernel_id) {
-                Some(ks) => (ks.documents.clone(), ks.main_document_id.clone()),
+            let (kernel_arc, documents, main_doc_id) = match state_ref.kernels.get(&kernel_id) {
+                Some(ks) => (ks.kernel.clone(), ks.documents.clone(), ks.main_document_id.clone()),
                 None => {
                     return Promise::err(capnp::Error::failed("kernel not found".into()));
                 }
             };
-            (source_ctx, source_model, provider, documents, main_doc_id)
+            (source_ctx, source_model, kernel_arc, documents, main_doc_id)
         };
 
         if !summarize {
@@ -3905,9 +3962,13 @@ impl kernel::Server for KernelImpl {
 
         // Summarize path — async LLM call
         Promise::from_future(async move {
-            let provider = provider.ok_or_else(|| {
-                capnp::Error::failed("LLM provider not configured — cannot summarize".into())
-            })?;
+            // Get LLM provider from kernel's registry
+            let provider = {
+                let registry = kernel_arc.llm().read().await;
+                registry.default_provider().ok_or_else(|| {
+                    capnp::Error::failed("LLM provider not configured — cannot summarize (check llm.rhai)".into())
+                })?
+            };
 
             // Build distillation prompt from source context's blocks
             let blocks = documents.block_snapshots(&main_doc_id)
@@ -4062,13 +4123,9 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
-            let (provider, source_docs, source_main_doc, source_model,
+            let (kernel_arc, source_docs, source_main_doc, source_model,
                  target_docs, target_main_doc, target_ctx_id) = {
                 let state_ref = state.borrow();
-
-                let provider = state_ref.llm_provider.clone().ok_or_else(|| {
-                    capnp::Error::failed("LLM provider not configured — cannot pull".into())
-                })?;
 
                 let source_handle = state_ref.drift_router.get(&source_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
@@ -4084,11 +4141,20 @@ impl kernel::Server for KernelImpl {
                     .to_string();
                 let target_ks = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                let kernel_arc = target_ks.kernel.clone();
                 let target_docs = target_ks.documents.clone();
                 let target_main_doc = target_ks.main_document_id.clone();
 
-                (provider, source_docs, source_main_doc, source_model,
+                (kernel_arc, source_docs, source_main_doc, source_model,
                  target_docs, target_main_doc, target_ctx_id)
+            };
+
+            // Get LLM provider from kernel's registry
+            let provider = {
+                let registry = kernel_arc.llm().read().await;
+                registry.default_provider().ok_or_else(|| {
+                    capnp::Error::failed("LLM provider not configured — cannot pull (check llm.rhai)".into())
+                })?
             };
 
             // Read source context's blocks
@@ -4160,13 +4226,9 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
-            let (provider, source_docs, source_main_doc, source_model,
+            let (kernel_arc, source_docs, source_main_doc, source_model,
                  parent_ctx_id, parent_docs, parent_main_doc) = {
                 let state_ref = state.borrow();
-
-                let provider = state_ref.llm_provider.clone().ok_or_else(|| {
-                    capnp::Error::failed("LLM provider not configured — cannot merge".into())
-                })?;
 
                 let source_handle = state_ref.drift_router.get(&source_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
@@ -4180,6 +4242,7 @@ impl kernel::Server for KernelImpl {
                 let source_model = source_handle.model.clone();
                 let source_ks = state_ref.kernels.get(&source_kernel_id)
                     .ok_or_else(|| capnp::Error::failed(format!("kernel {} not found", source_kernel_id)))?;
+                let kernel_arc = source_ks.kernel.clone();
                 let source_docs = source_ks.documents.clone();
                 let source_main_doc = source_ks.main_document_id.clone();
 
@@ -4191,8 +4254,16 @@ impl kernel::Server for KernelImpl {
                 let parent_docs = parent_ks.documents.clone();
                 let parent_main_doc = parent_ks.main_document_id.clone();
 
-                (provider, source_docs, source_main_doc, source_model,
+                (kernel_arc, source_docs, source_main_doc, source_model,
                  parent_ctx_id, parent_docs, parent_main_doc)
+            };
+
+            // Get LLM provider from kernel's registry
+            let provider = {
+                let registry = kernel_arc.llm().read().await;
+                registry.default_provider().ok_or_else(|| {
+                    capnp::Error::failed("LLM provider not configured — cannot merge (check llm.rhai)".into())
+                })?
             };
 
             // Read source context's blocks
@@ -4278,6 +4349,204 @@ impl kernel::Server for KernelImpl {
 
         Promise::ok(())
     }
+
+    // ========================================================================
+    // LLM Configuration (Phase 5)
+    // ========================================================================
+
+    fn get_llm_config(
+        self: Rc<Self>,
+        _params: kernel::GetLlmConfigParams,
+        mut results: kernel::GetLlmConfigResults,
+    ) -> Promise<(), capnp::Error> {
+        let kernel_arc = {
+            let state = self.state.borrow();
+            match state.kernels.get(&self.kernel_id) {
+                Some(ks) => ks.kernel.clone(),
+                None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+            }
+        };
+
+        Promise::from_future(async move {
+            let registry = kernel_arc.llm().read().await;
+
+            let mut config = results.get().init_config();
+            config.set_default_provider(
+                registry.default_provider_name().unwrap_or("")
+            );
+            config.set_default_model(
+                registry.default_model().unwrap_or("")
+            );
+
+            let provider_names = registry.list();
+            let mut providers = config.init_providers(provider_names.len() as u32);
+            for (i, name) in provider_names.iter().enumerate() {
+                let mut entry = providers.reborrow().get(i as u32);
+                entry.set_name(name);
+                // Get the provider's default model if available
+                if let Some(p) = registry.get(name) {
+                    let models = p.available_models();
+                    entry.set_default_model(models.first().copied().unwrap_or(""));
+                    entry.set_available(true);
+                } else {
+                    entry.set_default_model("");
+                    entry.set_available(false);
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn set_default_provider(
+        self: Rc<Self>,
+        params: kernel::SetDefaultProviderParams,
+        mut results: kernel::SetDefaultProviderResults,
+    ) -> Promise<(), capnp::Error> {
+        let provider_name = pry!(pry!(pry!(params.get()).get_provider()).to_str()).to_owned();
+        let kernel_arc = {
+            let state = self.state.borrow();
+            match state.kernels.get(&self.kernel_id) {
+                Some(ks) => ks.kernel.clone(),
+                None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+            }
+        };
+
+        Promise::from_future(async move {
+            let mut registry = kernel_arc.llm().write().await;
+            if registry.set_default(&provider_name) {
+                results.get().set_success(true);
+                results.get().set_error("");
+                log::info!("Default LLM provider set to: {}", provider_name);
+            } else {
+                results.get().set_success(false);
+                results.get().set_error(&format!("provider '{}' not found", provider_name));
+            }
+            Ok(())
+        })
+    }
+
+    fn set_default_model(
+        self: Rc<Self>,
+        params: kernel::SetDefaultModelParams,
+        mut results: kernel::SetDefaultModelResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
+        let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
+        let kernel_arc = {
+            let state = self.state.borrow();
+            match state.kernels.get(&self.kernel_id) {
+                Some(ks) => ks.kernel.clone(),
+                None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+            }
+        };
+
+        Promise::from_future(async move {
+            let mut registry = kernel_arc.llm().write().await;
+            // Verify the provider exists
+            if registry.get(&provider_name).is_none() {
+                results.get().set_success(false);
+                results.get().set_error(&format!("provider '{}' not found", provider_name));
+                return Ok(());
+            }
+            registry.set_default_model(&model);
+            results.get().set_success(true);
+            results.get().set_error("");
+            log::info!("Default model set to: {} (provider: {})", model, provider_name);
+            Ok(())
+        })
+    }
+
+    // ========================================================================
+    // Tool Filter Configuration (Phase 5)
+    // ========================================================================
+
+    fn get_tool_filter(
+        self: Rc<Self>,
+        _params: kernel::GetToolFilterParams,
+        mut results: kernel::GetToolFilterResults,
+    ) -> Promise<(), capnp::Error> {
+        let kernel_arc = {
+            let state = self.state.borrow();
+            match state.kernels.get(&self.kernel_id) {
+                Some(ks) => ks.kernel.clone(),
+                None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+            }
+        };
+
+        Promise::from_future(async move {
+            let tool_config = kernel_arc.tool_config().await;
+            let mut filter = results.get().init_filter();
+
+            match &tool_config.filter {
+                ToolFilter::All => {
+                    filter.set_all(());
+                }
+                ToolFilter::AllowList(tools) => {
+                    let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+                    let mut list = filter.init_allow_list(tools_vec.len() as u32);
+                    for (i, tool) in tools_vec.iter().enumerate() {
+                        list.set(i as u32, tool);
+                    }
+                }
+                ToolFilter::DenyList(tools) => {
+                    let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+                    let mut list = filter.init_deny_list(tools_vec.len() as u32);
+                    for (i, tool) in tools_vec.iter().enumerate() {
+                        list.set(i as u32, tool);
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn set_tool_filter(
+        self: Rc<Self>,
+        params: kernel::SetToolFilterParams,
+        mut results: kernel::SetToolFilterResults,
+    ) -> Promise<(), capnp::Error> {
+        let filter_reader = pry!(pry!(params.get()).get_filter());
+        let filter = match pry!(filter_reader.which()) {
+            tool_filter_config::All(()) => ToolFilter::All,
+            tool_filter_config::AllowList(list) => {
+                let list = pry!(list);
+                let mut tools = std::collections::HashSet::new();
+                for i in 0..list.len() {
+                    let name = pry!(pry!(list.get(i)).to_str());
+                    tools.insert(name.to_string());
+                }
+                ToolFilter::AllowList(tools)
+            }
+            tool_filter_config::DenyList(list) => {
+                let list = pry!(list);
+                let mut tools = std::collections::HashSet::new();
+                for i in 0..list.len() {
+                    let name = pry!(pry!(list.get(i)).to_str());
+                    tools.insert(name.to_string());
+                }
+                ToolFilter::DenyList(tools)
+            }
+        };
+
+        let kernel_arc = {
+            let state = self.state.borrow();
+            match state.kernels.get(&self.kernel_id) {
+                Some(ks) => ks.kernel.clone(),
+                None => return Promise::err(capnp::Error::failed("kernel not found".into())),
+            }
+        };
+
+        Promise::from_future(async move {
+            kernel_arc.set_tool_filter(filter).await;
+            results.get().set_success(true);
+            results.get().set_error("");
+            log::info!("Tool filter updated for kernel");
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================
@@ -4358,15 +4627,15 @@ fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
 
 use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
 
-/// Build tool definitions from equipped tools in the kernel.
+/// Build tool definitions from tools with engines, filtered by the kernel's ToolConfig.
 async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
     let registry = kernel.tools().read().await;
     let tool_config = kernel.tool_config().await;
 
-    // Get equipped tools that also pass the kernel's tool filter
-    let equipped = registry.list_equipped();
+    // Get tools with engines, filtered by the kernel's tool filter
+    let available = registry.list_with_engines();
 
-    equipped
+    available
         .into_iter()
         .filter(|info| tool_config.allows(&info.name))
         .map(|info| {

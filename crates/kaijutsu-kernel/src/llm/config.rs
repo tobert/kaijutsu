@@ -12,6 +12,10 @@ pub struct ProviderConfig {
     /// Provider type identifier (e.g., "anthropic", "gemini", "ollama").
     pub provider_type: String,
 
+    /// Whether this provider is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// API key (for cloud providers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -33,11 +37,16 @@ pub struct ProviderConfig {
     pub default_tools: ToolFilter,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl ProviderConfig {
     /// Create a new provider config.
     pub fn new(provider_type: impl Into<String>) -> Self {
         Self {
             provider_type: provider_type.into(),
+            enabled: true,
             api_key: None,
             api_key_env: None,
             base_url: None,
