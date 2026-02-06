@@ -343,6 +343,11 @@ impl RpcActor {
     }
 
     /// Process commands until the channel closes.
+    ///
+    /// TODO: Commands run sequentially — a slow RPC (e.g. drift_pull with LLM)
+    /// blocks all queued commands behind it. If this becomes a UX issue, refactor
+    /// to spawn_local a child task per command (KernelHandle's inner capnp Client
+    /// is Clone, so concurrent calls should be safe).
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<RpcCommand>) {
         while let Some(cmd) = rx.recv().await {
             self.handle_command(cmd).await;
