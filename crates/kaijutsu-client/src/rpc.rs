@@ -508,6 +508,31 @@ impl KernelHandle {
     // MCP Tool operations
     // =========================================================================
 
+    /// Execute a tool via the kernel's tool registry.
+    ///
+    /// This is the general-purpose tool execution path (executeTool @16).
+    /// Tools include git, drift, and any registered execution engines.
+    pub async fn execute_tool(
+        &self,
+        tool: &str,
+        params: &str,
+    ) -> Result<ToolResult, RpcError> {
+        let mut request = self.kernel.execute_tool_request();
+        {
+            let mut call = request.get().init_call();
+            call.set_tool(tool);
+            call.set_params(params);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?.get_result()?;
+
+        Ok(ToolResult {
+            request_id: result.get_request_id()?.to_string()?,
+            success: result.get_success(),
+            output: result.get_output()?.to_string()?,
+        })
+    }
+
     /// Call an MCP tool
     ///
     /// Invokes a tool on a registered MCP server and returns the result.
@@ -1391,6 +1416,14 @@ pub struct DocumentState {
     pub version: u64,
     /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
     pub ops: Vec<u8>,
+}
+
+/// Result from a kernel tool execution (executeTool @16).
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub request_id: String,
+    pub success: bool,
+    pub output: String,
 }
 
 /// Result from an MCP tool call

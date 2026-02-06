@@ -47,7 +47,7 @@ use rmcp::{
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
-use kaijutsu_client::{SshConfig, connect_ssh};
+use kaijutsu_client::{ActorHandle, SshConfig, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{ConversationDAG, LV};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
@@ -106,11 +106,10 @@ pub enum Backend {
     Remote(RemoteState),
 }
 
-/// Remote backend state - cached from initial connection.
+/// Remote backend state — persistent actor connection to kaijutsu-server.
 ///
-/// Note: Cap'n Proto RPC types are !Send, which conflicts with rmcp's
-/// Send+Sync requirement. We store connection info and reconnect when
-/// pushing ops to the server.
+/// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
+/// types in a `spawn_local` task with auto-reconnect.
 #[derive(Clone)]
 pub struct RemoteState {
     /// The document ID from our seat
@@ -119,9 +118,8 @@ pub struct RemoteState {
     pub kernel_id: String,
     /// Local cache of synced state (with FlowBus for local event tracking)
     pub store: SharedBlockStore,
-    /// Connection info for reconnecting
-    pub host: String,
-    pub port: u16,
+    /// Send+Sync actor handle for RPC operations
+    pub actor: ActorHandle,
     /// Server's frontier at last sync (used to calculate ops to push)
     /// Protected by Arc<Mutex<>> for thread-safe updates
     pub last_sync_frontier: Arc<Mutex<Vec<LV>>>,
@@ -191,13 +189,13 @@ impl KaijutsuMcp {
     ///
     /// Uses ssh-agent for authentication. Must be called within a `LocalSet`.
     ///
-    /// Syncs initial state from the server into a local cache. The connection
-    /// is closed after sync due to rmcp's Send+Sync requirements conflicting
-    /// with Cap'n Proto's !Send types. Push operations reconnect as needed.
+    /// Syncs initial state from the server into a local cache, then spawns
+    /// an `ActorHandle` for persistent RPC access (drift, tool execution, etc.).
     pub async fn connect(
         host: &str,
         port: u16,
         kernel_id: &str,
+        context_name: &str,
     ) -> Result<Self, anyhow::Error> {
         let config = SshConfig {
             host: host.to_string(),
@@ -208,9 +206,9 @@ impl KaijutsuMcp {
 
         tracing::debug!(?config, "Connecting via SSH");
 
-        let client = connect_ssh(config).await?;
+        let client = connect_ssh(config.clone()).await?;
         let kernel = client.attach_kernel(kernel_id).await?;
-        let seat_handle = kernel.join_context("default", "mcp-server").await?;
+        let seat_handle = kernel.join_context(context_name, "mcp-server").await?;
         let seat_info = seat_handle.get_state().await?;
 
         // Derive document_id from kernel and context
@@ -218,6 +216,7 @@ impl KaijutsuMcp {
 
         tracing::info!(
             kernel = %kernel_id,
+            context = %context_name,
             document_id = %document_id,
             "Connected to server"
         );
@@ -264,18 +263,23 @@ impl KaijutsuMcp {
             "Initial sync complete, recorded frontier"
         );
 
-        // Detach cleanly - we'll reconnect for push operations
-        // Note: Real-time subscription requires a different architecture
-        // that can maintain a persistent connection outside the MCP handler
-        kernel.detach().await?;
+        // Spawn actor with the existing connection (no double-connect)
+        let actor = spawn_actor(
+            config,
+            kernel_id.to_string(),
+            context_name.to_string(),
+            "mcp-server".to_string(),
+            Some((client, kernel)),
+        );
+
+        tracing::info!("RPC actor spawned, persistent connection ready");
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
                 document_id,
                 kernel_id: kernel_id.to_string(),
                 store,
-                host: host.to_string(),
-                port,
+                actor,
                 last_sync_frontier: Arc::new(Mutex::new(frontier)),
             }),
             tool_router: Self::tool_router(),
@@ -300,7 +304,7 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Push local changes to the server (async, requires LocalSet context).
+    /// Push local changes to the server via the actor.
     ///
     /// Returns the number of ops pushed and the new ack version.
     pub async fn push_to_server(&self) -> Result<(usize, u64), anyhow::Error> {
@@ -320,7 +324,6 @@ impl KaijutsuMcp {
             .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         if ops_bytes.len() <= 2 {
-            // Empty ops (just "[]" or "{}")
             tracing::debug!("No ops to push");
             return Ok((0, 0));
         }
@@ -331,40 +334,28 @@ impl KaijutsuMcp {
             "Pushing ops to server"
         );
 
-        // Reconnect to server
-        let config = SshConfig {
-            host: remote.host.clone(),
-            port: remote.port,
-            username: whoami::username(),
-            ..SshConfig::default()
-        };
-
-        let client = connect_ssh(config).await?;
-        let kernel = client.attach_kernel(&remote.kernel_id).await?;
-
-        // Push ops
-        let ack_version = kernel.push_ops(&remote.document_id, &ops_bytes).await?;
+        // Push via persistent actor (no reconnect dance)
+        let ack_version = remote.actor.push_ops(&remote.document_id, &ops_bytes).await
+            .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
         // Update last sync frontier to current local frontier
         let new_frontier = remote.store.frontier(&remote.document_id)
             .unwrap_or_default();
-
         *remote.last_sync_frontier.lock()
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))? = new_frontier;
 
-        // Detach
-        kernel.detach().await?;
+        tracing::info!(doc = %remote.document_id, ack_version, "Pushed ops");
 
-        tracing::info!(
-            doc = %remote.document_id,
-            ack_version,
-            "Pushed ops successfully"
-        );
-
-        // Estimate ops count (rough, based on serialized size)
         let ops_count = ops_bytes.len() / 50; // Rough estimate
-
         Ok((ops_count.max(1), ack_version))
+    }
+
+    /// Get the actor handle for direct RPC operations.
+    fn actor(&self) -> Option<&ActorHandle> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::Remote(remote) => Some(&remote.actor),
+        }
     }
 }
 
@@ -1070,93 +1061,143 @@ impl KaijutsuMcp {
     // Drift Tools (Cross-Context Communication)
     // ========================================================================
 
-    #[tool(description = "List all registered drift contexts. Shows short IDs, names, providers, and lineage. Requires remote connection.")]
-    fn drift_ls(&self) -> String {
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => return "Error: drift_ls requires a remote connection to kaijutsu-server".to_string(),
+    #[tool(description = "List all registered drift contexts. Shows short IDs, names, providers, models, and lineage.")]
+    async fn drift_ls(&self) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_ls requires --connect to kaijutsu-server".to_string(),
         };
 
-        // Use tokio current thread to reconnect and call RPC
-        let host = remote.host.clone();
-        let port = remote.port;
-        let kernel_id = remote.kernel_id.clone();
-
-        // Since we can't do async in a sync tool handler, return connection info
-        // The actual RPC call would need the async push_to_server pattern
-        serde_json::json!({
-            "note": "drift_ls requires async RPC — use kaish 'drift ls' or direct RPC for now",
-            "server": format!("{}:{}", host, port),
-            "kernel": kernel_id,
-        }).to_string()
-    }
-
-    #[tool(description = "Stage a drift push to transfer content to another context. Requires remote connection.")]
-    fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
-        let _remote = match self.remote() {
-            Some(r) => r,
-            None => return "Error: drift_push requires a remote connection to kaijutsu-server".to_string(),
-        };
-
-        serde_json::json!({
-            "note": "drift_push requires async RPC — use kaish 'drift push' or direct RPC for now",
-            "target_ctx": req.target_ctx,
-            "content_length": req.content.len(),
-            "summarize": req.summarize,
-        }).to_string()
-    }
-
-    #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush. Requires remote connection.")]
-    fn drift_queue(&self) -> String {
-        match self.remote() {
-            Some(_) => serde_json::json!({
-                "note": "drift_queue requires async RPC — use kaish 'drift queue' or direct RPC for now",
-            }).to_string(),
-            None => "Error: drift_queue requires a remote connection to kaijutsu-server".to_string(),
+        match actor.list_all_contexts().await {
+            Ok(contexts) => {
+                let mut lines = vec![format!("{:<8} {:<20} {:<12} {:<20} {}", "ID", "NAME", "PROVIDER", "MODEL", "PARENT")];
+                lines.push("─".repeat(72));
+                for ctx in &contexts {
+                    lines.push(format!(
+                        "{:<8} {:<20} {:<12} {:<20} {}",
+                        ctx.short_id,
+                        ctx.name,
+                        ctx.provider,
+                        ctx.model,
+                        ctx.parent_id.as_deref().unwrap_or("—"),
+                    ));
+                }
+                lines.push(format!("\n{} context(s)", contexts.len()));
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Cancel a staged drift by its ID. Requires remote connection.")]
-    fn drift_cancel(&self, Parameters(req): Parameters<DriftCancelRequest>) -> String {
-        match self.remote() {
-            Some(_) => serde_json::json!({
-                "note": "drift_cancel requires async RPC — use kaish 'drift cancel' or direct RPC for now",
-                "staged_id": req.staged_id,
+    #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush.")]
+    async fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_push requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_push(&req.target_ctx, &req.content, req.summarize).await {
+            Ok(staged_id) => serde_json::json!({
+                "success": true,
+                "staged_id": staged_id,
+                "target_ctx": req.target_ctx,
+                "content_length": req.content.len(),
+                "summarize": req.summarize,
             }).to_string(),
-            None => "Error: drift_cancel requires a remote connection to kaijutsu-server".to_string(),
+            Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Flush all staged drifts, injecting content into target contexts. Requires remote connection.")]
-    fn drift_flush(&self) -> String {
-        match self.remote() {
-            Some(_) => serde_json::json!({
-                "note": "drift_flush requires async RPC — use kaish 'drift flush' or direct RPC for now",
-            }).to_string(),
-            None => "Error: drift_flush requires a remote connection to kaijutsu-server".to_string(),
+    #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush.")]
+    async fn drift_queue(&self) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_queue requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_queue().await {
+            Ok(queue) if queue.is_empty() => "Staging queue is empty.".to_string(),
+            Ok(queue) => {
+                let mut lines = vec![format!("{:<6} {:<8} {:<8} {:<10} {}", "ID", "FROM", "TO", "KIND", "CONTENT")];
+                lines.push("─".repeat(60));
+                for entry in &queue {
+                    let preview: String = entry.content.chars().take(40).collect();
+                    lines.push(format!(
+                        "{:<6} {:<8} {:<8} {:<10} {}{}",
+                        entry.id,
+                        entry.source_ctx,
+                        entry.target_ctx,
+                        entry.drift_kind,
+                        preview,
+                        if entry.content.len() > 40 { "…" } else { "" },
+                    ));
+                }
+                lines.push(format!("\n{} staged drift(s)", queue.len()));
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Cancel a staged drift by its ID.")]
+    async fn drift_cancel(&self, Parameters(req): Parameters<DriftCancelRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_cancel requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_cancel(req.staged_id).await {
+            Ok(true) => format!("Cancelled staged drift {}", req.staged_id),
+            Ok(false) => format!("Staged drift {} not found", req.staged_id),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Flush all staged drifts, injecting content into target contexts.")]
+    async fn drift_flush(&self) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_flush requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_flush().await {
+            Ok(0) => "Nothing to flush — staging queue was empty.".to_string(),
+            Ok(count) => format!("Flushed {count} drift(s) successfully."),
+            Err(e) => format!("Error: {e}"),
         }
     }
 
     #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.")]
-    fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
-        match self.remote() {
-            Some(_) => serde_json::json!({
-                "note": "drift_pull requires async RPC — use kaish 'drift pull' or direct RPC for now",
+    async fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_pull requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_pull(&req.source_ctx, req.prompt.as_deref()).await {
+            Ok(block_id) => serde_json::json!({
+                "success": true,
+                "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
                 "source_ctx": req.source_ctx,
-                "prompt": req.prompt,
             }).to_string(),
-            None => "Error: drift_pull requires a remote connection to kaijutsu-server".to_string(),
+            Err(e) => format!("Error: {e}"),
         }
     }
 
     #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.")]
-    fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
-        match self.remote() {
-            Some(_) => serde_json::json!({
-                "note": "drift_merge requires async RPC — use kaish 'drift merge' or direct RPC for now",
+    async fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: drift_merge requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.drift_merge(&req.source_ctx).await {
+            Ok(block_id) => serde_json::json!({
+                "success": true,
+                "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
                 "source_ctx": req.source_ctx,
             }).to_string(),
-            None => "Error: drift_merge requires a remote connection to kaijutsu-server".to_string(),
+            Err(e) => format!("Error: {e}"),
         }
     }
 

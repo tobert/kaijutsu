@@ -40,6 +40,10 @@ struct Args {
     /// Kernel ID to attach to
     #[arg(long, default_value = "lobby")]
     kernel: String,
+
+    /// Context name to join within the kernel
+    #[arg(long, default_value = "default")]
+    context_name: String,
 }
 
 #[tokio::main]
@@ -66,7 +70,7 @@ async fn main() -> Result<()> {
                 kernel = %args.kernel,
                 "Connecting via SSH"
             );
-            KaijutsuMcp::connect(&args.host, args.port, &args.kernel).await?
+            KaijutsuMcp::connect(&args.host, args.port, &args.kernel, &args.context_name).await?
         } else {
             tracing::info!("Starting with in-memory store");
             KaijutsuMcp::new()

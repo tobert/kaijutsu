@@ -3,6 +3,7 @@
 //! Provides typed Cap'n Proto RPC client for connecting to kaijutsu servers.
 //! Can connect via SSH (to remote servers) or Unix socket (for testing).
 
+pub mod actor;
 pub mod constants;
 pub mod rpc;
 pub mod ssh;
@@ -12,11 +13,12 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
+pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
     Completion, CompletionKind, ConsentMode, Context, ContextDocument, DocumentState,
     HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo, McpResource,
     McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, SeatHandle,
-    SeatId, SeatInfo, SeatStatus,
+    SeatId, SeatInfo, SeatStatus, ToolResult,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 
