@@ -17,7 +17,7 @@ use kaijutsu_crdt::{BlockId, BlockSnapshot, DriftKind};
 use crate::block_store::SharedBlockStore;
 use crate::drift::{build_commit_prompt, COMMIT_SYSTEM_PROMPT};
 use crate::git_ops::GitRepo;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{EngineArgs, ExecResult, ExecutionEngine};
 use crate::vfs::VfsOps;
 
 /// Git execution engine — context-aware git with optional LLM commit summaries.
@@ -527,15 +527,7 @@ impl ExecutionEngine for GitEngine {
             }
         };
 
-        let args: Vec<String> = parsed
-            .get("_positional")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let args = EngineArgs::from_json(&parsed).to_argv();
 
         match self.execute_inner(args).await {
             Ok(result) => Ok(result),

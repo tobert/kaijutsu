@@ -47,4 +47,8 @@ capnpc.workspace = true
 
 [dev-dependencies]
 kaijutsu-client = { path = "../kaijutsu-client" }
+kaijutsu-kernel = { path = "../kaijutsu-kernel" }
 futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+git2 = "0.19"

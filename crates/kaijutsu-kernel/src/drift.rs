@@ -34,7 +34,7 @@ use tokio::sync::RwLock;
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{EngineArgs, ExecResult, ExecutionEngine};
 
 /// Short ID length — first 6 hex chars of a UUID.
 const SHORT_ID_LEN: usize = 6;
@@ -1088,15 +1088,7 @@ impl ExecutionEngine for DriftEngine {
             }
         };
 
-        let args: Vec<String> = parsed
-            .get("_positional")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let args = EngineArgs::from_json(&parsed).to_argv();
 
         match self.execute_inner(args).await {
             Ok(result) => Ok(result),

@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 // ============================================================================
@@ -168,6 +168,130 @@ impl ExecResult {
         self
     }
 }
+
+// ============================================================================
+// EngineArgs — structured args bridging LLMs and kaish
+// ============================================================================
+
+/// Structured arguments for execution engines.
+///
+/// Bridges two calling conventions:
+/// - **LLMs** put everything in `_positional` as raw argv strings
+/// - **kaish** splits into `positional` + `named` keys + boolean `flags`
+///
+/// Use [`to_argv()`](EngineArgs::to_argv) to reconstruct a flat argv for engines
+/// that parse Unix-style args. The ordering is:
+///
+/// 1. `positional[0]` (subcommand)
+/// 2. Named args as `-k value` / `--key value`
+/// 3. Boolean flags as `-f` / `--flag`
+/// 4. `positional[1..]` (remaining positional args)
+///
+/// This works because git/drift handlers use scan-based flag detection (`.any()`,
+/// `.find()`, `extract_m_flag`) rather than strict positional indexing.
+#[derive(Debug, Clone, Default)]
+pub struct EngineArgs {
+    /// Positional arguments (subcommand + trailing args).
+    pub positional: Vec<String>,
+    /// Named arguments (`-m "msg"`, `--output file`). Deterministic ordering.
+    pub named: BTreeMap<String, String>,
+    /// Boolean flags (`--cached`, `-s`). Deterministic ordering.
+    pub flags: BTreeSet<String>,
+}
+
+impl EngineArgs {
+    /// Parse from the JSON object that `tool_args_to_json()` produces.
+    ///
+    /// Extracts:
+    /// - `_positional` array → `positional` (String, Number, Bool all coerced)
+    /// - String-valued root keys (except `_positional`) → `named`
+    /// - `true`-valued root keys → `flags`
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let mut args = Self::default();
+
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => return args,
+        };
+
+        // Extract positional args, coercing all scalar types to String
+        if let Some(arr) = obj.get("_positional").and_then(|v| v.as_array()) {
+            args.positional = arr
+                .iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect();
+        }
+
+        // Extract named args and flags from remaining keys
+        for (key, value) in obj {
+            if key == "_positional" {
+                continue;
+            }
+            match value {
+                serde_json::Value::String(s) => {
+                    args.named.insert(key.clone(), s.clone());
+                }
+                serde_json::Value::Bool(true) => {
+                    args.flags.insert(key.clone());
+                }
+                // Number-valued named args (rare but handle gracefully)
+                serde_json::Value::Number(n) => {
+                    args.named.insert(key.clone(), n.to_string());
+                }
+                _ => {} // Skip arrays, objects, null, false
+            }
+        }
+
+        args
+    }
+
+    /// Reconstruct a flat argv vector suitable for Unix-style argument parsing.
+    ///
+    /// Ordering: `subcommand` + `named pairs` + `flags` + `trailing positionals`.
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = Vec::new();
+
+        // Subcommand (positional[0])
+        if let Some(first) = self.positional.first() {
+            argv.push(first.clone());
+        }
+
+        // Named args: single-char → `-k value`, multi-char → `--key value`
+        for (key, value) in &self.named {
+            if key.len() == 1 {
+                argv.push(format!("-{}", key));
+            } else {
+                argv.push(format!("--{}", key));
+            }
+            argv.push(value.clone());
+        }
+
+        // Flags: single-char → `-f`, multi-char → `--flag`
+        for flag in &self.flags {
+            if flag.len() == 1 {
+                argv.push(format!("-{}", flag));
+            } else {
+                argv.push(format!("--{}", flag));
+            }
+        }
+
+        // Remaining positional args
+        if self.positional.len() > 1 {
+            argv.extend_from_slice(&self.positional[1..]);
+        }
+
+        argv
+    }
+}
+
+// ============================================================================
+// ExecutionEngine trait
+// ============================================================================
 
 /// Trait for execution engines.
 ///
@@ -471,5 +595,90 @@ mod tests {
         assert!(json.contains("\"directory\""));
         let parsed: DisplayHint = serde_json::from_str(&json).unwrap();
         assert_eq!(hint, parsed);
+    }
+
+    // ========================================================================
+    // EngineArgs tests
+    // ========================================================================
+
+    #[test]
+    fn engine_args_llm_passthrough() {
+        // LLMs put everything in _positional — to_argv() returns them as-is
+        let json = serde_json::json!({"_positional": ["commit", "-m", "hello world"]});
+        let args = EngineArgs::from_json(&json);
+
+        assert_eq!(args.positional, vec!["commit", "-m", "hello world"]);
+        assert!(args.named.is_empty());
+        assert!(args.flags.is_empty());
+        assert_eq!(args.to_argv(), vec!["commit", "-m", "hello world"]);
+    }
+
+    #[test]
+    fn engine_args_kaish_commit_m_flag() {
+        // kaish: `git commit -m "msg"` → positional: ["commit","msg"], flags: {"m"}
+        let json = serde_json::json!({
+            "_positional": ["commit", "msg"],
+            "m": true
+        });
+        let args = EngineArgs::from_json(&json);
+        let argv = args.to_argv();
+
+        // Should reconstruct: ["commit", "-m", "msg"]
+        assert_eq!(argv[0], "commit");
+        assert!(argv.contains(&"-m".to_string()));
+        assert!(argv.contains(&"msg".to_string()));
+    }
+
+    #[test]
+    fn engine_args_kaish_diff_cached() {
+        // kaish: `git diff --cached` → positional: ["diff"], flags: {"cached"}
+        let json = serde_json::json!({
+            "_positional": ["diff"],
+            "cached": true
+        });
+        let argv = EngineArgs::from_json(&json).to_argv();
+        assert_eq!(argv, vec!["diff", "--cached"]);
+    }
+
+    #[test]
+    fn engine_args_kaish_log_numeric_flag() {
+        // kaish: `git log -5` → positional: ["log"], flags: {"5"}
+        let json = serde_json::json!({
+            "_positional": ["log"],
+            "5": true
+        });
+        let argv = EngineArgs::from_json(&json).to_argv();
+        assert_eq!(argv, vec!["log", "-5"]);
+    }
+
+    #[test]
+    fn engine_args_numeric_positional() {
+        // drift cancel 1 → positional might include a JSON number
+        let json = serde_json::json!({"_positional": ["cancel", 1]});
+        let args = EngineArgs::from_json(&json);
+        assert_eq!(args.positional, vec!["cancel", "1"]);
+        assert_eq!(args.to_argv(), vec!["cancel", "1"]);
+    }
+
+    #[test]
+    fn engine_args_empty_json() {
+        let json = serde_json::json!({});
+        let args = EngineArgs::from_json(&json);
+        assert!(args.positional.is_empty());
+        assert!(args.to_argv().is_empty());
+    }
+
+    #[test]
+    fn engine_args_named_string_values() {
+        let json = serde_json::json!({
+            "_positional": ["push"],
+            "target": "abc123"
+        });
+        let args = EngineArgs::from_json(&json);
+        assert_eq!(args.named.get("target"), Some(&"abc123".to_string()));
+        let argv = args.to_argv();
+        assert_eq!(argv[0], "push");
+        assert!(argv.contains(&"--target".to_string()));
+        assert!(argv.contains(&"abc123".to_string()));
     }
 }

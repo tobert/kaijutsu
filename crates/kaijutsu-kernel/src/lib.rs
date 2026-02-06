@@ -52,7 +52,7 @@ pub use db::{DocumentDb, DocumentKind, DocumentMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
-pub use tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
+pub use tools::{EngineArgs, ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 pub use llm::{
     // Core types
     LlmError, LlmRegistry, LlmResult, RigProvider,

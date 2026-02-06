@@ -234,6 +234,20 @@ cat /v/jobs/1/stdout   # View build output
 cat /v/jobs/1/stderr   # View errors/warnings
 ```
 
+#### kaish Tool Dispatch
+
+New kaijutsu engines should read structured args via `EngineArgs` (in `tools.rs`)
+rather than raw `_positional` parsing. kaish provides rich `Value` types (String,
+Int, Float, Bool, Json, Blob) through its `ToolArgs` struct — but it also splits
+flags and named args separately from positional args.
+
+`EngineArgs::from_json()` + `to_argv()` bridges both calling conventions:
+- **LLMs** put everything in `_positional` as raw argv strings → passthrough
+- **kaish** splits into `positional` + `named` + `flags` → reconstructs flat argv
+
+Known limitation: short flags with values (`-C /path`) are split by kaish's parser
+into a boolean flag + separate positional. Use `set_pwd()` or named args instead.
+
 ## Crate Structure
 
 ```
