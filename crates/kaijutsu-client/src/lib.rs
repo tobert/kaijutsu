@@ -7,6 +7,7 @@ pub mod actor;
 pub mod constants;
 pub mod rpc;
 pub mod ssh;
+pub mod subscriptions;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {
@@ -15,12 +16,14 @@ pub mod kaijutsu_capnp {
 
 pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
-    Completion, CompletionKind, ConsentMode, Context, ContextDocument, DocumentState,
-    HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo, McpResource,
-    McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, SeatHandle,
-    SeatId, SeatInfo, SeatStatus, ToolResult,
+    ClientToolFilter, Completion, CompletionKind, ConsentMode, Context, ContextDocument,
+    ContextInfo, DocumentState, HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo,
+    LlmConfigInfo, LlmProviderInfo, McpResource, McpResourceContents, McpToolResult, MountSpec,
+    RpcClient, RpcError, SeatHandle, SeatId, SeatInfo, SeatStatus, StagedDriftInfo, ToolResult,
+    VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
+pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};
 
 /// Connect to a server via SSH and return an RPC client
 ///

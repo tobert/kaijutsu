@@ -17,6 +17,7 @@ use crate::kaijutsu_capnp::world;
 ///
 /// IMPORTANT: Must be created and used within a `tokio::task::LocalSet` context
 /// because capnp-rpc's RpcSystem is not Send.
+#[derive(Clone)]
 pub struct RpcClient {
     world: world::Client,
 }
@@ -1156,7 +1157,7 @@ fn parse_kernel_info(
 }
 
 /// Helper to parse block ID from Cap'n Proto
-fn parse_block_id(
+pub(crate) fn parse_block_id(
     reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
 ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
     Ok(kaijutsu_crdt::BlockId {
@@ -1167,7 +1168,7 @@ fn parse_block_id(
 }
 
 /// Helper to parse a flat BlockSnapshot from Cap'n Proto
-fn parse_block_snapshot(
+pub(crate) fn parse_block_snapshot(
     reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
 ) -> Result<kaijutsu_crdt::BlockSnapshot, RpcError> {
     use kaijutsu_crdt::{BlockKind, BlockSnapshot, Role, Status};
