@@ -42,6 +42,9 @@ rhai.workspace = true
 # LLM providers - unified via rig-core
 rig-core.workspace = true
 
+# Git operations (libgit2)
+git2 = "0.19"
+
 # Async streams
 futures = "0.3"
 
@@ -54,3 +57,4 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+git2 = "0.19"

@@ -5017,6 +5017,7 @@ dependencies = [
  "diamond-types-extended",
  "dunce",
  "futures",
+ "git2",
  "kaijutsu-crdt",
  "notify 7.0.0",
  "parking_lot",

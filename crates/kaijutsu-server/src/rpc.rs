@@ -26,7 +26,7 @@ use kaijutsu_kernel::{
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, DriftEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, DriftEngine, GitEngine,
     // MCP
     McpServerPool, McpServerConfig, McpToolEngine,
     // FlowBus
@@ -107,6 +107,15 @@ async fn register_block_tools(
     kernel.register_tool_with_engine(
         ToolInfo::new("drift", "Cross-context drift: push, pull, merge between contexts", "drift"),
         Arc::new(DriftEngine::new(
+            kernel,
+            documents.clone(),
+            "default",
+        )),
+    ).await;
+
+    kernel.register_tool_with_engine(
+        ToolInfo::new("git", "Context-aware git with LLM commit summaries", "vcs"),
+        Arc::new(GitEngine::new(
             kernel,
             documents,
             "default",

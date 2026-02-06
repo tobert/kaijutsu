@@ -258,6 +258,8 @@ pub enum DriftKind {
     Merge,
     /// LLM-summarized before transfer.
     Distill,
+    /// Git commit recorded as conversation provenance.
+    Commit,
 }
 
 impl DriftKind {
@@ -274,6 +276,7 @@ impl DriftKind {
             DriftKind::Pull => "pull",
             DriftKind::Merge => "merge",
             DriftKind::Distill => "distill",
+            DriftKind::Commit => "commit",
         }
     }
 }

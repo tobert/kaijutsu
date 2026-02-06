@@ -21,6 +21,8 @@ pub mod conversation_db;
 pub mod db;
 pub mod drift;
 pub mod flows;
+pub mod git_engine;
+pub mod git_ops;
 pub mod kernel;
 pub mod llm;
 pub mod mcp_pool;
@@ -85,7 +87,10 @@ pub use drift::{
     SharedDriftRouter, StagedDrift, shared_drift_router,
     // Distillation helpers
     DISTILLATION_SYSTEM_PROMPT, build_distillation_prompt,
+    // Commit helpers
+    COMMIT_SYSTEM_PROMPT, build_commit_prompt,
 };
+pub use git_engine::GitEngine;
 
 // Re-export rmcp types needed for resource handling
 pub use rmcp::model::ResourceContents as McpResourceContents;

@@ -64,6 +64,8 @@ pub struct ContextHandle {
     pub context_name: String,
     /// Primary document ID in the shared BlockStore.
     pub document_id: String,
+    /// Working directory in VFS (e.g., "/mnt/kaijutsu").
+    pub pwd: Option<String>,
     /// Provider name if configured (e.g., "anthropic", "gemini").
     pub provider: Option<String>,
     /// Model name if configured (e.g., "claude-opus-4-6", "gemini-2.0-flash").
@@ -160,6 +162,7 @@ impl DriftRouter {
             short_id: short_id.clone(),
             context_name: context_name.to_string(),
             document_id: document_id.to_string(),
+            pwd: None,
             provider: None,
             model: None,
             parent_short_id: parent_short_id.map(|s| s.to_string()),
@@ -204,6 +207,25 @@ impl DriftRouter {
             .ok_or_else(|| DriftError::UnknownContext(short_id.to_string()))?;
         handle.provider = Some(provider.to_string());
         handle.model = Some(model.to_string());
+        Ok(())
+    }
+
+    /// Set the working directory for a context.
+    pub fn set_pwd(
+        &mut self,
+        context_name: &str,
+        pwd: Option<String>,
+    ) -> Result<(), DriftError> {
+        let short_id = self
+            .context_to_short
+            .get(context_name)
+            .ok_or_else(|| DriftError::UnknownContext(context_name.to_string()))?
+            .clone();
+        let handle = self
+            .contexts
+            .get_mut(&short_id)
+            .ok_or_else(|| DriftError::UnknownContext(short_id))?;
+        handle.pwd = pwd;
         Ok(())
     }
 
@@ -386,10 +408,91 @@ pub fn build_distillation_prompt(
 }
 
 // ============================================================================
+// Commit message helpers
+// ============================================================================
+
+/// System prompt for LLM-generated commit messages.
+pub const COMMIT_SYSTEM_PROMPT: &str = "\
+Generate a concise git commit message from the diff and conversation context below. \
+Use conventional commit format (type(scope): description). \
+Focus on the 'why' over the 'what'. Keep the subject line under 72 chars. \
+Add a body paragraph only if the change is non-obvious.";
+
+/// Build a commit prompt from a diff and recent conversation blocks.
+///
+/// Formats the diff (truncated at 8000 bytes) and last ~10 conversation blocks
+/// as context for LLM commit message generation.
+pub fn build_commit_prompt(diff: &str, context_blocks: &[BlockSnapshot]) -> String {
+    let mut prompt = String::new();
+
+    // Diff section (truncated for token budget)
+    prompt.push_str("## Git Diff\n\n```diff\n");
+    if diff.len() > 8000 {
+        let mut end = 8000;
+        while end > 0 && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        prompt.push_str(&diff[..end]);
+        prompt.push_str(&format!(
+            "\n... [truncated, {} bytes total]\n",
+            diff.len()
+        ));
+    } else {
+        prompt.push_str(diff);
+    }
+    prompt.push_str("```\n\n");
+
+    // Conversation context section (last ~10 blocks)
+    prompt.push_str("## Conversation Context\n\n");
+    let recent = if context_blocks.len() > 10 {
+        &context_blocks[context_blocks.len() - 10..]
+    } else {
+        context_blocks
+    };
+
+    for block in recent {
+        let role_label = match block.role {
+            Role::User => "User",
+            Role::Model => "Assistant",
+            Role::System => "System",
+            Role::Tool => "Tool",
+        };
+
+        if block.content.is_empty() {
+            continue;
+        }
+
+        // Truncate long blocks at 2000 bytes
+        let content = if block.content.len() > 2000 {
+            let mut end = 2000;
+            while end > 0 && !block.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}... [truncated, {} bytes total]",
+                &block.content[..end],
+                block.content.len()
+            )
+        } else {
+            block.content.clone()
+        };
+
+        prompt.push_str(&format!("**{}**: {}\n\n", role_label, content));
+    }
+
+    prompt
+}
+
+// ============================================================================
 // DriftEngine — ExecutionEngine for the `drift` kaish command
 // ============================================================================
 
 /// Execution engine for the `drift` shell command.
+///
+/// **Context binding limitation:** Currently instantiated once per kernel with a
+/// fixed `context_name` (typically `"default"`). Multi-context scenarios require
+/// either per-context engine instances or a mechanism to pass the active context
+/// through `ExecutionEngine::execute()`. See also `GitEngine`.
 ///
 /// Provides commands for cross-context drift within a kernel:
 /// - `drift ls` — list contexts in this kernel
