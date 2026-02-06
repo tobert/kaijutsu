@@ -29,6 +29,31 @@ The transferred content arrives as a `BlockKind::Drift` block in the target docu
 a first-class citizen in the conversation DAG, tagged with its origin context and
 how it arrived.
 
+## Getting Oriented
+
+If you're an agent landing in a kernel cold, here's the mental model:
+
+**Session vs. Context.** A *session* is your viewport — the SSH connection, the Bevy
+window, the MCP channel. A *context* is a conversation with its own document and KV
+cache. One session can move between many contexts, fork new ones, and edit across them.
+
+**Default landing.** Every kernel starts with a `main` context. When you connect, that's
+where you are unless told otherwise. Use `drift ls` to see what other contexts exist.
+
+**Context ≈ model context window.** A context tracks everything — every message, tool
+call, and result — in a CRDT document. When it's time to call an LLM, the context
+generates a payload from that document, filtering and formatting for inference. The
+document is the durable state; the context window is the ephemeral view.
+
+**All clients auto-connect.** When the RPC layer attaches a kernel, the caller's context
+is registered in the `DriftRouter` automatically. You don't need to opt in — you're
+already visible to other contexts and can drift to/from them immediately.
+
+**Forking = new conversation + new KV cache.** `fork` creates a deep copy: new document
+ID, new context name, independent exploration. The fork remembers its parent (via
+`parent_short_id`), which enables `drift merge` to bring findings home. `thread` is
+lighter — shared VFS, new document, same kernel.
+
 ## Why Drift Instead of Shared Documents?
 
 Contexts intentionally have **separate documents**. This isolation is the feature:
@@ -42,69 +67,45 @@ Shared documents would mean every participant sees every message. Drift means ea
 context gets a **curated summary** of what the other learned. This is closer to how
 human teams work: you don't sit in every meeting, you get a briefing.
 
-## Architecture
+## What Drift Blocks Look Like
 
-### Components
+When a drift arrives, it's a `BlockSnapshot` with `kind: Drift` and these fields:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         Kernel                               │
-│                                                              │
-│  SharedDriftRouter = Arc<RwLock<DriftRouter>>                │
-│  ├── contexts: HashMap<short_id, ContextHandle>              │
-│  ├── staging: Vec<StagedDrift>  (push → stage → flush)       │
-│  └── context_to_short: HashMap<name, short_id>               │
-│                                                              │
-│  DriftEngine (ExecutionEngine for `drift` command)           │
-│  ├── drift ls       — list contexts                          │
-│  ├── drift push     — stage content for target               │
-│  ├── drift pull     — read + distill from source             │
-│  ├── drift merge    — summarize fork into parent             │
-│  ├── drift flush    — deliver staged drifts                  │
-│  ├── drift queue    — inspect staging queue                  │
-│  └── drift cancel   — remove from queue                      │
-│                                                              │
-│  SharedBlockStore (all contexts' documents live here)        │
-└─────────────────────────────────────────────────────────────┘
-```
+| Field | Type | Example |
+|-------|------|---------|
+| `source_context` | `Option<String>` | `"a1b2c3"` (short ID of sender) |
+| `source_model` | `Option<String>` | `"claude-opus-4-6"` |
+| `drift_kind` | `Option<DriftKind>` | `Push`, `Pull`, `Distill`, `Merge`, `Commit` |
+| `content` | `String` | The actual briefing text |
+| `author` | `String` | Nick of sender (e.g., `"amy"`, `"claude"`) |
+| `created_at` | `u64` | Unix epoch seconds |
 
-### ContextHandle
+The block's role is `System`. It's a first-class DAG citizen — it has a `BlockId`, a
+parent in the conversation tree, and participates in CRDT ordering like any other block.
 
-Each registered context maps a short hex ID (6 chars from UUID) to:
+In the UI, drift blocks will be collapsible and visually attributed, like a message
+from a named colleague dropping into your conversation with context about where it
+came from and how it was produced.
 
-| Field | Purpose |
-|-------|---------|
-| `short_id` | Unique address (e.g., `"a1b2c3"`) |
-| `context_name` | Human name (e.g., `"main"`, `"debug-auth"`) |
-| `document_id` | Primary document in the shared BlockStore |
-| `pwd` | Working directory in VFS (for git operations) |
-| `provider` | LLM provider name (e.g., `"anthropic"`) |
-| `model` | Model name (e.g., `"claude-opus-4-6"`) |
-| `parent_short_id` | Parent context (set on fork/thread, enables merge) |
+## When to Drift
 
-### DriftKind
+Drift is the cybernetics of multi-context work: it's the feedback loop that keeps
+parallel investigations from diverging into wasted effort.
 
-How content arrived — stored on the drift block for provenance:
+**Current maturity:** human-directed, agent-hinted. You (an agent or human) decide
+when to drift. The maturity path is:
 
-| Kind | Meaning |
-|------|---------|
-| `Push` | Direct content transfer ("here's what I found") |
-| `Pull` | Source was read and LLM-distilled into caller's context |
-| `Distill` | Like Push, but LLM-summarized before staging |
-| `Merge` | Fork summarized back into parent (like git merge for conversations) |
-| `Commit` | Conversation → git commit message (utility, not cross-context) |
+1. **Human-directed** — user says "drift this to context B" *(now)*
+2. **Agent-hinted** — agent suggests "this finding is relevant to context B" *(soon)*
+3. **Agent-autonomous** — agent auto-drifts on significant findings *(future)*
 
-### Staging Model
+**When should you drift?** When your findings would save another context significant
+rework. Found the root cause of a bug? Drift it. Discovered the right API pattern?
+Drift it. Made a design decision that affects shared code? Drift it.
 
-Drift uses a two-phase staging pattern:
-
-1. **Stage** — `drift push` or `drift push --summarize` adds to the queue
-2. **Flush** — `drift flush` delivers all staged drifts by injecting `BlockKind::Drift`
-   blocks into target documents
-
-This lets you review what's queued before delivery (`drift queue`) and cancel
-mistakes (`drift cancel <id>`). Pull and merge bypass staging — they're immediate
-because the caller explicitly requested the content.
+This aligns with how human minds juggle parallel investigation threads — you don't
+keep every thread loaded, you context-switch with a mental summary. Drift is that
+summary, made explicit and durable.
 
 ## Usage
 
@@ -135,6 +136,18 @@ drift pull a1b2c3 "what was decided about caching?"
 # Merge a forked context back to its parent
 drift merge a1b2c3
 ```
+
+**How delivery works:** The sender *stages* content, then *flushes* it. On flush, the
+content is injected as a `BlockKind::Drift` block into the target's document. There's
+no notification system yet — the block simply appears in the target document like any
+other message. Recipients see it when they next read their document.
+
+**Push vs. Pull:**
+- **Push** = "I have something for you" — source initiates, stages content for target
+- **Pull** = "I want something from you" — destination initiates, reads + distills from source
+
+Agents will typically `push` + `flush` in sequence, since there's rarely a reason
+to batch review when operating programmatically.
 
 ### From RPC (Cap'n Proto)
 
@@ -170,6 +183,34 @@ let block_id = actor.drift_pull("a1b2c3", Some("what about auth?")).await?;
 let contexts = actor.list_all_contexts().await?;
 ```
 
+## DriftKind
+
+How content arrived — stored on the drift block for provenance:
+
+| Kind | Meaning |
+|------|---------|
+| `Push` | Direct content transfer ("here's what I found") |
+| `Pull` | Source was read and LLM-distilled into caller's context |
+| `Distill` | Like Push, but LLM-summarized before staging |
+| `Merge` | Fork summarized back into parent (like git merge for conversations) |
+| `Commit` | Conversation → git commit message (utility, not cross-context) |
+
+## Staging Model
+
+Drift uses a two-phase staging pattern:
+
+1. **Stage** — `drift push` or `drift push --summarize` adds to the queue
+2. **Flush** — `drift flush` delivers all staged drifts by injecting `BlockKind::Drift`
+   blocks into target documents
+
+This lets you review what's queued before delivery (`drift queue`) and cancel
+mistakes (`drift cancel <id>`). Pull and merge bypass staging — they're immediate
+because the caller explicitly requested the content.
+
+Agents will typically push and flush in immediate sequence. The staging model is
+most useful for humans who want to review before sending, or for batching multiple
+drifts to different contexts into a single delivery.
+
 ## LLM Distillation
 
 Drift includes built-in LLM-powered summarization for cross-context transfer:
@@ -190,6 +231,50 @@ The distillation process:
 This means **different contexts can use different models** and drift still works —
 Claude distills for Claude, Gemini distills for Gemini, and the summaries bridge
 the gap.
+
+Future: distillation prompts will be scriptable via Rhai, so teams can customize
+the summarization style per-context or per-drift-kind.
+
+## Architecture
+
+### Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         Kernel                               │
+│                                                              │
+│  SharedDriftRouter = Arc<RwLock<DriftRouter>>                │
+│  ├── contexts: HashMap<short_id, ContextHandle>              │
+│  ├── staging: Vec<StagedDrift>  (push → stage → flush)       │
+│  └── context_to_short: HashMap<name, short_id>               │
+│                                                              │
+│  DriftEngine (ExecutionEngine for `drift` command)           │
+│  ├── drift ls       — list contexts                          │
+│  ├── drift push     — stage content for target               │
+│  ├── drift pull     — read + distill from source             │
+│  ├── drift merge    — summarize fork into parent             │
+│  ├── drift flush    — deliver staged drifts                  │
+│  ├── drift queue    — inspect staging queue                  │
+│  └── drift cancel   — remove from queue                      │
+│                                                              │
+│  SharedBlockStore (all contexts' documents live here)        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### ContextHandle
+
+Each registered context maps a short hex ID (6 chars from UUID) to:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `short_id` | `String` | Unique address (e.g., `"a1b2c3"`) |
+| `context_name` | `String` | Human name (e.g., `"main"`, `"debug-auth"`) |
+| `document_id` | `String` | Primary document in the shared BlockStore |
+| `pwd` | `Option<String>` | Working directory in VFS (for git operations) |
+| `provider` | `Option<String>` | LLM provider name (e.g., `"anthropic"`) |
+| `model` | `Option<String>` | Model name (e.g., `"claude-opus-4-6"`) |
+| `parent_short_id` | `Option<String>` | Parent context (set on fork/thread, enables merge) |
+| `created_at` | `u64` | Creation timestamp (Unix epoch seconds) |
 
 ## Fork/Thread and Drift
 
@@ -220,6 +305,19 @@ Parent (main)          Fork (debug-auth)
        merge summary]       │
 ```
 
+## Error Handling
+
+Drift errors are loud and educational — they tell you what went wrong and what
+your options are:
+
+| Operation | Error condition | What happens |
+|-----------|----------------|--------------|
+| `drift push <ctx>` | Target context doesn't exist | Error with list of available contexts |
+| `drift merge <ctx>` | Context has no `parent_short_id` | Error explaining that merge requires fork lineage |
+| `drift flush` | Nothing staged | No-op (zero blocks delivered, not an error) |
+| `drift pull <ctx>` | Source document is empty | Error or empty summary (no content to distill) |
+| `drift cancel <id>` | ID doesn't exist in staging | Error with current queue contents |
+
 ## Implementation Status
 
 | Feature | Status |
@@ -233,29 +331,14 @@ Parent (main)          Fork (debug-auth)
 | LLM distillation (summarize for transfer) | ✅ Implemented |
 | BlockKind::Drift (first-class CRDT block type) | ✅ Implemented |
 | Fork lineage tracking (parent_short_id) | ✅ Implemented |
-| Multi-context DriftEngine instances | 🚧 Known limitation (see below) |
 | UI rendering of drift blocks | 🚧 Renders as text, no provenance chrome |
 | MCP exposure of drift operations | 📋 Planned (kaijutsu-mcp) |
 | Automated drift (agent-initiated) | 📋 Planned |
 
-### Known Limitation: DriftEngine Context Binding
+## Future
 
-The `DriftEngine` is currently instantiated once per kernel with a fixed
-`context_name` (typically `"default"`). This means the kaish `drift` command
-always operates as that context.
-
-**Workaround:** The RPC layer handles multi-context correctly because it looks up
-the caller's context dynamically from `kernel_id`. The limitation only affects
-the kaish command path.
-
-**Fix:** Either create per-context DriftEngine instances (registered with
-context-qualified names) or add a context parameter to `ExecutionEngine::execute()`.
-
-## Future: Multi-Context Drifting at Scale
-
-The current implementation handles the happy path well. For full multi-context
-drifting (5-10 concurrent agents, each in their own context, freely drifting
-findings between each other), we'll need:
+For full multi-context drifting (5-10 concurrent agents, each in their own context,
+freely drifting findings between each other), we'll need:
 
 1. **kaijutsu-mcp** — MCP server exposing drift operations to external agents
    (Claude Code, opencode, Gemini CLI) so they can participate as contexts
