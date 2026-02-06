@@ -252,6 +252,7 @@ pub struct MountSpec {
 }
 
 /// Handle to an attached kernel
+#[derive(Clone)]
 pub struct KernelHandle {
     kernel: crate::kaijutsu_capnp::kernel::Client,
 }

@@ -1,24 +1,31 @@
-//! Actor-based RPC client for persistent connections.
+//! Actor-based RPC client with concurrent dispatch and backpressure.
 //!
 //! Provides a `Send+Sync` [`ActorHandle`] that wraps Cap'n Proto's `!Send`
-//! types. The actor runs in a `spawn_local` task, processing commands
-//! sequentially from an mpsc channel while maintaining a persistent SSH
+//! types. The actor runs in a `spawn_local` task, dispatching commands
+//! concurrently via child tasks while maintaining a persistent SSH
 //! connection with auto-reconnect.
 //!
 //! ```text
-//!   ActorHandle (Send+Sync)     mpsc      RpcActor (spawn_local, !Send)
-//!   ┌─────────────────────┐  ────────▶  ┌──────────────────────────────┐
-//!   │ .drift_push()       │             │ RpcClient + KernelHandle     │
-//!   │ .execute_tool()     │  ◀────────  │ auto-reconnect               │
-//!   │ .push_ops()         │   oneshot   │ persistent SSH connection    │
-//!   └─────────────────────┘             └──────────────────────────────┘
+//!   ActorHandle (Send+Sync)    bounded(32)   RpcActor (spawn_local, !Send)
+//!   ┌─────────────────────┐  ────────────▶  ┌──────────────────────────────┐
+//!   │ .drift_push()       │                 │ ensure_connected() [serial]  │
+//!   │ .execute_tool()     │  ◀────────────  │ dispatch_command [concurrent]│
+//!   │ .push_ops()         │    oneshot      │ auto-reconnect on error      │
+//!   └─────────────────────┘                 └──────────────────────────────┘
 //! ```
+//!
+//! Backpressure: The bounded channel (capacity 32) naturally throttles callers
+//! when the actor is saturated — `.send().await` blocks until commands complete
+//! and slots free up. The system recovers as in-flight RPCs finish.
 
 use kaijutsu_crdt::BlockId;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::rpc::{ContextInfo, DocumentState, StagedDriftInfo, ToolResult};
 use crate::{connect_ssh, KernelHandle, RpcClient, SshConfig};
+
+/// Channel capacity — when 32 commands are in-flight, callers block on send.
+const CHANNEL_CAPACITY: usize = 32;
 
 // ============================================================================
 // Error Type
@@ -97,17 +104,40 @@ enum RpcCommand {
     },
 }
 
+impl RpcCommand {
+    /// Send an error reply without matching all variant fields.
+    fn reply_err(self, err: ActorError) {
+        match self {
+            Self::DriftPush { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DriftFlush { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DriftQueue { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DriftPull { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListAllContexts { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetDocumentState { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
+        }
+    }
+}
+
 // ============================================================================
 // ActorHandle (Send + Sync public API)
 // ============================================================================
 
 /// Send+Sync handle to an RPC actor running in a LocalSet.
 ///
-/// Each method sends a command via mpsc and awaits the oneshot reply.
+/// Each method sends a command via a bounded mpsc channel and awaits the
+/// oneshot reply. When the channel is full (32 in-flight commands), callers
+/// naturally block on `.send().await` until slots free up — providing
+/// backpressure without explicit semaphores.
+///
 /// The handle can be cloned and shared across threads.
 #[derive(Clone)]
 pub struct ActorHandle {
-    tx: mpsc::UnboundedSender<RpcCommand>,
+    tx: mpsc::Sender<RpcCommand>,
 }
 
 impl ActorHandle {
@@ -126,14 +156,14 @@ impl ActorHandle {
             content: content.to_string(),
             summarize,
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 
     /// Flush all staged drifts.
     pub async fn drift_flush(&self) -> Result<u32, ActorError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftFlush { reply })
+        self.tx.send(RpcCommand::DriftFlush { reply }).await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
@@ -141,7 +171,7 @@ impl ActorHandle {
     /// View the drift staging queue.
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, ActorError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftQueue { reply })
+        self.tx.send(RpcCommand::DriftQueue { reply }).await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
@@ -149,7 +179,7 @@ impl ActorHandle {
     /// Cancel a staged drift.
     pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, ActorError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftCancel { staged_id, reply })
+        self.tx.send(RpcCommand::DriftCancel { staged_id, reply }).await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
@@ -165,7 +195,7 @@ impl ActorHandle {
             source_ctx: source_ctx.to_string(),
             prompt: prompt.map(String::from),
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 
@@ -175,7 +205,7 @@ impl ActorHandle {
         self.tx.send(RpcCommand::DriftMerge {
             source_ctx: source_ctx.to_string(),
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 
@@ -184,7 +214,7 @@ impl ActorHandle {
     /// List all registered drift contexts.
     pub async fn list_all_contexts(&self) -> Result<Vec<ContextInfo>, ActorError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::ListAllContexts { reply })
+        self.tx.send(RpcCommand::ListAllContexts { reply }).await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
@@ -192,7 +222,7 @@ impl ActorHandle {
     /// Get this kernel's context short ID and name.
     pub async fn get_context_id(&self) -> Result<(String, String), ActorError> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::GetContextId { reply })
+        self.tx.send(RpcCommand::GetContextId { reply }).await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
@@ -210,7 +240,7 @@ impl ActorHandle {
             document_id: document_id.to_string(),
             ops: ops.to_vec(),
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 
@@ -223,7 +253,7 @@ impl ActorHandle {
         self.tx.send(RpcCommand::GetDocumentState {
             document_id: document_id.to_string(),
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 
@@ -240,7 +270,7 @@ impl ActorHandle {
             tool: tool.to_string(),
             params: params.to_string(),
             reply,
-        }).map_err(|_| ActorError::Shutdown)?;
+        }).await.map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
     }
 }
@@ -266,24 +296,22 @@ struct ConnectionState {
     kernel: KernelHandle,
 }
 
-/// Ensure connected, call an async RPC method, disconnect on error.
+/// Call an RPC method on a cloned KernelHandle, signaling errors to the actor.
 ///
-/// Uses a macro instead of a generic closure to avoid the classic Rust
-/// "async closure captures don't outlive the future" lifetime issue.
-/// The macro expands in-place so the borrow checker sees the real code flow.
+/// On success, sends `Ok(val)` to the reply channel. On failure, logs a warning,
+/// signals the actor to disconnect via `err_tx`, and sends `Err(ActorError::Rpc)`
+/// to the reply channel.
 macro_rules! rpc_call {
-    ($self:ident, $reply:ident, $k:ident, $call:expr) => {{
-        // Phase 1: connect + call (borrows self via ensure_connected → kernel ref)
-        let rpc_result = match $self.ensure_connected().await {
-            Ok($k) => $call.await.map_err(|e| e.to_string()),
-            Err(e) => { let _ = $reply.send(Err(e)); return; }
+    ($kernel:ident, $reply:ident, $err_tx:ident, $k:ident, $call:expr) => {{
+        let rpc_result = {
+            let $k = &$kernel;
+            $call.await.map_err(|e| e.to_string())
         };
-        // Phase 2: handle result (kernel ref dropped, self is free)
         let result = match rpc_result {
             Ok(val) => Ok(val),
             Err(msg) => {
                 log::warn!("RPC error, will reconnect on next call: {msg}");
-                $self.disconnect();
+                let _ = $err_tx.send(());
                 Err(ActorError::Rpc(msg))
             }
         };
@@ -342,61 +370,100 @@ impl RpcActor {
         self.connection = None;
     }
 
-    /// Process commands until the channel closes.
+    /// Process commands concurrently until the channel closes.
     ///
-    /// TODO: Commands run sequentially — a slow RPC (e.g. drift_pull with LLM)
-    /// blocks all queued commands behind it. If this becomes a UX issue, refactor
-    /// to spawn_local a child task per command (KernelHandle's inner capnp Client
-    /// is Clone, so concurrent calls should be safe).
-    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<RpcCommand>) {
-        while let Some(cmd) = rx.recv().await {
-            self.handle_command(cmd).await;
+    /// Connection management (ensure_connected) is serial — one at a time.
+    /// RPC calls are dispatched concurrently via spawn_local child tasks.
+    /// The err_tx channel lets child tasks signal connection failures back
+    /// to the main loop, which disconnects so the next command reconnects.
+    async fn run(mut self, mut rx: mpsc::Receiver<RpcCommand>) {
+        let (err_tx, mut err_rx) = mpsc::unbounded_channel::<()>();
+
+        // TODO: If the server is down and commands queue up, we'll busy-retry
+        // ensure_connected() for each one. Consider a circuit breaker / backoff
+        // state that short-circuits commands for a cooldown period after N
+        // consecutive connection failures.
+        loop {
+            tokio::select! {
+                // Prioritize error signals so we disconnect before spawning
+                // new tasks on a dead connection.
+                biased;
+
+                // Any child task signaled an RPC error → disconnect
+                _ = err_rx.recv() => {
+                    log::warn!("Child task reported RPC error, disconnecting");
+                    self.disconnect();
+                }
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { break };
+
+                    // Serial: ensure connection, clone handle for the task
+                    let kernel = match self.ensure_connected().await {
+                        Ok(k) => k.clone(),
+                        Err(e) => { cmd.reply_err(e); continue; }
+                    };
+
+                    // Concurrent: spawn the actual RPC call as a child task
+                    let err_tx = err_tx.clone();
+                    tokio::task::spawn_local(async move {
+                        dispatch_command(cmd, kernel, err_tx).await;
+                    });
+                }
+            }
         }
         log::debug!("Actor shutting down: channel closed");
     }
+}
 
-    async fn handle_command(&mut self, cmd: RpcCommand) {
-        match cmd {
-            // ── Drift ────────────────────────────────────────────────
-            RpcCommand::DriftPush { target_ctx, content, summarize, reply } => {
-                rpc_call!(self, reply, k, k.drift_push(&target_ctx, &content, summarize));
-            }
-            RpcCommand::DriftFlush { reply } => {
-                rpc_call!(self, reply, k, k.drift_flush());
-            }
-            RpcCommand::DriftQueue { reply } => {
-                rpc_call!(self, reply, k, k.drift_queue());
-            }
-            RpcCommand::DriftCancel { staged_id, reply } => {
-                rpc_call!(self, reply, k, k.drift_cancel(staged_id));
-            }
-            RpcCommand::DriftPull { source_ctx, prompt, reply } => {
-                rpc_call!(self, reply, k, k.drift_pull(&source_ctx, prompt.as_deref()));
-            }
-            RpcCommand::DriftMerge { source_ctx, reply } => {
-                rpc_call!(self, reply, k, k.drift_merge(&source_ctx));
-            }
+/// Dispatch a single RPC command on a cloned KernelHandle.
+///
+/// Runs in a spawn_local child task. On RPC error, signals the actor
+/// via err_tx so it disconnects and reconnects on the next command.
+async fn dispatch_command(
+    cmd: RpcCommand,
+    kernel: KernelHandle,
+    err_tx: mpsc::UnboundedSender<()>,
+) {
+    match cmd {
+        // ── Drift ────────────────────────────────────────────────
+        RpcCommand::DriftPush { target_ctx, content, summarize, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_push(&target_ctx, &content, summarize));
+        }
+        RpcCommand::DriftFlush { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_flush());
+        }
+        RpcCommand::DriftQueue { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_queue());
+        }
+        RpcCommand::DriftCancel { staged_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_cancel(staged_id));
+        }
+        RpcCommand::DriftPull { source_ctx, prompt, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_pull(&source_ctx, prompt.as_deref()));
+        }
+        RpcCommand::DriftMerge { source_ctx, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.drift_merge(&source_ctx));
+        }
 
-            // ── Context ──────────────────────────────────────────────
-            RpcCommand::ListAllContexts { reply } => {
-                rpc_call!(self, reply, k, k.list_all_contexts());
-            }
-            RpcCommand::GetContextId { reply } => {
-                rpc_call!(self, reply, k, k.get_context_id());
-            }
+        // ── Context ──────────────────────────────────────────────
+        RpcCommand::ListAllContexts { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.list_all_contexts());
+        }
+        RpcCommand::GetContextId { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_context_id());
+        }
 
-            // ── CRDT Sync ────────────────────────────────────────────
-            RpcCommand::PushOps { document_id, ops, reply } => {
-                rpc_call!(self, reply, k, k.push_ops(&document_id, &ops));
-            }
-            RpcCommand::GetDocumentState { document_id, reply } => {
-                rpc_call!(self, reply, k, k.get_document_state(&document_id));
-            }
+        // ── CRDT Sync ────────────────────────────────────────────
+        RpcCommand::PushOps { document_id, ops, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.push_ops(&document_id, &ops));
+        }
+        RpcCommand::GetDocumentState { document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_document_state(&document_id));
+        }
 
-            // ── Tool Execution ───────────────────────────────────────
-            RpcCommand::ExecuteTool { tool, params, reply } => {
-                rpc_call!(self, reply, k, k.execute_tool(&tool, &params));
-            }
+        // ── Tool Execution ───────────────────────────────────────
+        RpcCommand::ExecuteTool { tool, params, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.execute_tool(&tool, &params));
         }
     }
 }
@@ -408,6 +475,13 @@ impl RpcActor {
 /// Spawn an RPC actor in the current `LocalSet` context.
 ///
 /// Returns a `Send+Sync` [`ActorHandle`] that can be shared across threads.
+///
+/// # Backpressure
+///
+/// The actor uses a bounded channel (capacity 32). When all slots are occupied
+/// by in-flight commands, callers naturally block on `.send().await` until
+/// commands complete. This provides automatic backpressure without explicit
+/// semaphores — the system slows down under load and recovers as RPCs finish.
 ///
 /// # Safety
 ///
@@ -429,7 +503,7 @@ pub fn spawn_actor(
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,
 ) -> ActorHandle {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let actor = RpcActor::new(config, kernel_id, context_name, instance, existing);
     tokio::task::spawn_local(actor.run(rx));
     ActorHandle { tx }
