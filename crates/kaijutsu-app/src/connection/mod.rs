@@ -1,10 +1,14 @@
-//! Connection module - Bevy integration for kaijutsu-client
+//! Connection module — Bevy integration for kaijutsu-client via ActorHandle.
 //!
-//! Uses kaijutsu-client for SSH + RPC, provides Bevy bridge via channels.
+//! The bootstrap thread owns a tokio runtime + LocalSet for Cap'n Proto's !Send
+//! types. ActorPlugin polls broadcast channels each frame and provides resources
+//! and messages for consumer systems.
 
-pub mod bridge;
+pub mod actor_plugin;
+pub mod bootstrap;
 
-pub use bridge::{
-    ConnectionBridgePlugin, ConnectionCommand, ConnectionCommands, ConnectionEvent,
+pub use actor_plugin::{
+    ActorPlugin, ConnectionStatusMessage, RpcActor, RpcConnectionState, RpcResultChannel,
+    RpcResultMessage, ServerEventMessage,
 };
-
+pub use bootstrap::{BootstrapChannel, BootstrapCommand};

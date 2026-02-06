@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use crate::connection::{ConnectionCommand, ConnectionCommands};
+use crate::connection::{BootstrapChannel, BootstrapCommand, RpcResultChannel, RpcResultMessage};
 use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -218,23 +218,37 @@ pub fn handle_seat_selector_click(
     }
 }
 
-/// Handle clicking on the Dashboard button
+/// Handle clicking on the Dashboard button.
+///
+/// Respawns the actor in lobby context (effectively "leaving" the current seat).
 pub fn handle_dashboard_click(
     interaction: Query<&Interaction, (Changed<Interaction>, With<DashboardButton>)>,
     state: Res<DashboardState>,
     mut next_screen: ResMut<NextState<crate::ui::state::AppScreen>>,
     mut dropdown: Query<&mut Node, With<SeatDropdown>>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
+    channel: Res<RpcResultChannel>,
 ) {
     for interaction in interaction.iter() {
         if *interaction == Interaction::Pressed {
-            // Leave current seat and transition to Dashboard screen
             if state.current_seat.is_some() {
-                conn.send(ConnectionCommand::LeaveSeat);
+                // Respawn actor in lobby (leaves current context)
+                let kernel_id = conn_state.current_kernel
+                    .as_ref()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+                let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                    config: conn_state.ssh_config.clone(),
+                    kernel_id,
+                    context_name: "lobby".into(),
+                    instance: "bevy-client".into(),
+                });
+                // Signal context left for dashboard state
+                let _ = channel.tx.send(RpcResultMessage::ContextLeft);
             }
             next_screen.set(crate::ui::state::AppScreen::Dashboard);
 
-            // Hide dropdown
             for mut node in dropdown.iter_mut() {
                 node.display = Display::None;
             }
@@ -242,26 +256,28 @@ pub fn handle_dashboard_click(
     }
 }
 
-/// Handle clicking on a seat option in the dropdown
+/// Handle clicking on a seat option in the dropdown.
+///
+/// Respawns the actor with the target seat's kernel + context.
 pub fn handle_seat_option_click(
     interaction: Query<(&Interaction, &SeatOption), Changed<Interaction>>,
     state: Res<DashboardState>,
     mut dropdown: Query<&mut Node, With<SeatDropdown>>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     for (interaction, option) in interaction.iter() {
         if *interaction == Interaction::Pressed
             && let Some(seat_info) = state.my_seats.get(option.index)
         {
-            // Switch to this seat
-            conn.send(ConnectionCommand::TakeSeat {
-                nick: seat_info.id.nick.clone(),
+            // Respawn actor targeting the seat's kernel + context
+            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                config: conn_state.ssh_config.clone(),
+                kernel_id: seat_info.id.kernel.clone(),
+                context_name: seat_info.id.context.clone(),
                 instance: seat_info.id.instance.clone(),
-                kernel: seat_info.id.kernel.clone(),
-                context: seat_info.id.context.clone(),
             });
 
-            // Hide dropdown
             for mut node in dropdown.iter_mut() {
                 node.display = Display::None;
             }

@@ -28,7 +28,7 @@
 use bevy::prelude::*;
 
 use crate::cell::{CurrentMode, EditorMode, InputKind};
-use crate::connection::bridge::ConnectionState;
+use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -111,7 +111,7 @@ pub enum WidgetContent {
     Title,
     /// Mode indicator - reactive to CurrentMode
     Mode,
-    /// Connection status - reactive to ConnectionState
+    /// Connection status - reactive to RpcConnectionState
     Connection,
 }
 
@@ -503,9 +503,9 @@ fn update_mode_widget(
     }
 }
 
-/// Update connection widget when ConnectionState changes.
+/// Update connection widget when RpcConnectionState changes.
 fn update_connection_widget(
-    conn_state: Res<ConnectionState>,
+    conn_state: Res<RpcConnectionState>,
     theme: Res<Theme>,
     mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
 ) {

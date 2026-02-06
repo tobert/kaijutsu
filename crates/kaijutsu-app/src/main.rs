@@ -82,7 +82,7 @@ fn main() {
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
-        .add_plugins(connection::ConnectionBridgePlugin)
+        .add_plugins(connection::ActorPlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
         // App screen state management (Dashboard vs Conversation)

@@ -312,21 +312,21 @@ impl ConstellationMode {
 // SYSTEMS
 // ============================================================================
 
-/// Track seat events to add/remove constellation nodes
+/// Track seat events to add/remove constellation nodes.
 fn track_seat_events(
     mut constellation: ResMut<Constellation>,
-    mut events: MessageReader<crate::connection::ConnectionEvent>,
+    mut events: MessageReader<crate::connection::RpcResultMessage>,
 ) {
-    use crate::connection::ConnectionEvent;
+    use crate::connection::RpcResultMessage;
 
     for event in events.read() {
         match event {
-            ConnectionEvent::SeatTaken { seat } => {
+            RpcResultMessage::ContextJoined { seat, .. } => {
                 info!("Constellation: Adding node for context '{}' (kernel: {})", seat.id.context, seat.id.kernel);
                 constellation.add_node(seat.clone());
             }
-            ConnectionEvent::SeatLeft => {
-                // We don't remove nodes on SeatLeft - contexts persist
+            RpcResultMessage::ContextLeft => {
+                // We don't remove nodes on ContextLeft - contexts persist
                 // They just become "idle" in the constellation
                 if let Some(node) = constellation.focused_node_mut() {
                     node.activity = ActivityState::Idle;
@@ -479,9 +479,8 @@ fn handle_node_click(
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
 
-            // TODO: Trigger context switch via RPC
-            // For now, just update the focus - actual context loading would
-            // need to send an event to the connection bridge
+            // TODO: Trigger context switch via BootstrapCommand::SpawnActor
+            // For now, just update the focus in the constellation
         }
     }
 }

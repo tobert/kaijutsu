@@ -863,7 +863,8 @@ pub fn handle_prompt_submitted(
     current_conv: Res<CurrentConversation>,
     sync_state: Res<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    cmds: Option<Res<crate::connection::ConnectionCommands>>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    channel: Res<crate::connection::RpcResultChannel>,
 ) {
     // Get the current conversation ID
     let Some(conv_id) = current_conv.id() else {
@@ -880,33 +881,45 @@ pub fn handle_prompt_submitted(
     let doc_cell_id = doc.document_id().to_string();
 
     for event in submit_events.read() {
-        if let Some(ref cmds) = cmds {
+        if let Some(ref actor) = actor {
+            let handle = actor.handle.clone();
+            let text = event.text.clone();
+            let cell_id = doc_cell_id.clone();
+            let conv = conv_id.to_string();
+
+            let tx = channel.sender();
             match mode.0 {
                 EditorMode::Input(InputKind::Shell) => {
-                    // Shell mode: execute as kaish command
-                    cmds.send(crate::connection::ConnectionCommand::ShellExecute {
-                        command: event.text.clone(),
-                        cell_id: doc_cell_id.clone(),
-                    });
-                    info!(
-                        "Sent shell command to server (conv={}, cell_id={})",
-                        conv_id, doc_cell_id
-                    );
+                    // Shell mode: fire-and-forget, results via ServerEvent broadcast
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.shell_execute(&text, &cell_id).await {
+                                log::error!("shell_execute failed: {e}");
+                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                    operation: "shell_execute".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        })
+                        .detach();
+                    info!("Sent shell command to server (conv={}, cell_id={})", conv, doc_cell_id);
                 }
                 EditorMode::Input(InputKind::Chat) => {
-                    // Chat mode: send to LLM
-                    cmds.send(crate::connection::ConnectionCommand::Prompt {
-                        content: event.text.clone(),
-                        model: None, // Use server default
-                        cell_id: doc_cell_id.clone(),
-                    });
-                    info!(
-                        "Sent prompt to server (conv={}, cell_id={})",
-                        conv_id, doc_cell_id
-                    );
+                    // Chat mode: fire-and-forget, results via ServerEvent broadcast
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.prompt(&text, None, &cell_id).await {
+                                log::error!("prompt failed: {e}");
+                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                    operation: "prompt".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        })
+                        .detach();
+                    info!("Sent prompt to server (conv={}, cell_id={})", conv, doc_cell_id);
                 }
                 _ => {
-                    // Other modes shouldn't submit prompts, but handle gracefully
                     warn!("Unexpected prompt submission in {:?} mode", mode.0);
                 }
             }
@@ -1562,15 +1575,16 @@ pub fn sync_main_cell_to_conversation(
 // BLOCK EVENT HANDLING (Server → Client Block Sync)
 // ============================================================================
 
-use crate::connection::ConnectionEvent;
+use crate::connection::{RpcResultMessage, ServerEventMessage};
 
 /// Handle block events from the server and update the MainCell's BlockDocument.
 ///
-/// This system processes streamed block events (inserted, edited, deleted, etc.)
-/// from the server and applies them to the local document for live updates.
+/// This system processes:
+/// - `ServerEventMessage` — streamed block events (inserted, edited, deleted, etc.)
+/// - `RpcResultMessage::ContextJoined` — initial document state after joining a context
 ///
 /// **Frontier-based sync protocol:**
-/// - First BlockInserted (or cell_id change) → full sync via `from_oplog()`
+/// - Initial state (ContextJoined) → full sync via `from_oplog()`
 /// - Subsequent BlockInserted → incremental merge via `merge_ops_owned()`
 /// - BlockTextOps → always incremental merge
 ///
@@ -1578,43 +1592,36 @@ use crate::connection::ConnectionEvent;
 /// new content arrives, we stay at the bottom. If they've scrolled up to
 /// read history, we don't interrupt them.
 pub fn handle_block_events(
-    mut events: MessageReader<ConnectionEvent>,
+    mut server_events: MessageReader<ServerEventMessage>,
+    mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut current_conv: ResMut<CurrentConversation>,
 ) {
+    use kaijutsu_client::ServerEvent;
+
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
 
     // Get agent ID for creating documents
     let agent_id = format!("user:{}", whoami::username());
 
-    for event in events.read() {
-        match event {
-            // Initial state from server - single path through DocumentSyncState
-            ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
-                if current_conv.id().is_none() {
-                    warn!(
-                        "BlockCellInitialState arrived but no current conversation set. \
-                         This indicates a system ordering bug - handle_block_events should \
-                         run after DashboardEventHandling."
-                    );
-                    continue;
-                }
-
-                // Use server's cell_id as canonical document ID to avoid format mismatches
-                // between client-generated "kernel@context" and server's stored document_id
-                if current_conv.id() != Some(cell_id) {
+    // Handle initial document state from ContextJoined
+    for result in result_events.read() {
+        if let RpcResultMessage::ContextJoined { document_id, initial_state, .. } = result {
+            if let Some(state) = initial_state {
+                // Use server's document_id as canonical
+                if current_conv.id() != Some(document_id) {
                     info!(
                         "Updating current_conv to server's document_id: {} (was {:?})",
-                        cell_id,
+                        document_id,
                         current_conv.id()
                     );
-                    current_conv.0 = Some(cell_id.clone());
+                    current_conv.0 = Some(document_id.clone());
                 }
 
-                match sync_state.apply_initial_state(cell_id, &agent_id, ops) {
+                match sync_state.apply_initial_state(&state.document_id, &agent_id, &state.ops) {
                     Ok(result) => {
                         info!("Initial state sync result: {:?}", result);
                     }
@@ -1623,10 +1630,14 @@ pub fn handle_block_events(
                     }
                 }
             }
+        }
+    }
 
-            // Block insertion - single path through DocumentSyncState
-            ConnectionEvent::BlockInserted { cell_id, block, ops } => {
-                match sync_state.apply_block_inserted(cell_id, &agent_id, block, ops) {
+    // Handle streamed block events
+    for ServerEventMessage(event) in server_events.read() {
+        match event {
+            ServerEvent::BlockInserted { document_id, block, ops } => {
+                match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
                     Ok(result) => {
                         trace!("Block insert sync result for {:?}: {:?}", block.id, result);
                     }
@@ -1636,13 +1647,12 @@ pub fn handle_block_events(
                 }
             }
 
-            // Text streaming ops - single path through DocumentSyncState
-            ConnectionEvent::BlockTextOps {
-                cell_id,
+            ServerEvent::BlockTextOps {
+                document_id,
                 block_id,
                 ops,
             } => {
-                match sync_state.apply_text_ops(cell_id, &agent_id, ops) {
+                match sync_state.apply_text_ops(document_id, &agent_id, ops) {
                     Ok(result) => {
                         trace!("Text ops sync result for {:?}: {:?}", block_id, result);
                     }
@@ -1652,64 +1662,60 @@ pub fn handle_block_events(
                 }
             }
 
-            // Non-CRDT events - operate on sync_state.doc
-            ConnectionEvent::BlockStatusChanged {
-                cell_id,
+            ServerEvent::BlockStatusChanged {
+                document_id,
                 block_id,
                 status,
             } => {
                 let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
+                if document_id != doc.document_id() { continue; }
 
                 if let Err(e) = doc.set_status(block_id, *status) {
                     warn!("Failed to update block status: {}", e);
                 }
             }
-            ConnectionEvent::BlockDeleted {
-                cell_id,
+            ServerEvent::BlockDeleted {
+                document_id,
                 block_id,
             } => {
                 let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
+                if document_id != doc.document_id() { continue; }
 
                 if let Err(e) = doc.delete_block(block_id) {
                     warn!("Failed to delete block: {}", e);
                 }
             }
-            ConnectionEvent::BlockCollapsedChanged {
-                cell_id,
+            ServerEvent::BlockCollapsedChanged {
+                document_id,
                 block_id,
                 collapsed,
             } => {
                 let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
+                if document_id != doc.document_id() { continue; }
 
                 if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
                     warn!("Failed to update block collapsed state: {}", e);
                 }
             }
-            ConnectionEvent::BlockMoved {
-                cell_id,
+            ServerEvent::BlockMoved {
+                document_id,
                 block_id,
                 after_id,
             } => {
                 let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
+                if document_id != doc.document_id() { continue; }
 
                 if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
                     warn!("Failed to move block: {}", e);
                 }
             }
-            // Ignore other connection events - they're handled elsewhere
-            _ => {}
+            // Resource events are not block-related — ignore here
+            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => {}
         }
     }
 
     // Terminal-like auto-scroll: if we were at the bottom before processing
     // events and content changed, enable follow mode to smoothly track new content.
-    // If user had scrolled up, we don't interrupt them.
-    // IMPORTANT: Don't re-enable following if user explicitly scrolled this frame.
-    // Use LayoutGeneration to detect content changes (bumped by sync_block_cell_buffers).
     if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;

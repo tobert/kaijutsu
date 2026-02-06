@@ -7,7 +7,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use uuid::Uuid;
 
-use crate::connection::{ConnectionCommand, ConnectionCommands};
+use crate::connection::{BootstrapChannel, BootstrapCommand};
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -340,7 +340,8 @@ fn handle_dialog_input(
     mut text_query: Query<&mut MsdfUiText, With<InputTextDisplay>>,
     dialog_query: Query<Entity, With<CreateContextDialog>>,
     theme: Res<Theme>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     let Ok(mut input) = input_query.single_mut() else {
         return;
@@ -362,7 +363,7 @@ fn handle_dialog_input(
             // Enter - submit
             (Key::Enter, _) => {
                 if !input.text.is_empty() {
-                    submit_create_context(&input.text, &conn);
+                    submit_create_context(&input.text, &bootstrap, &conn_state);
                     // Close dialog and release modal state
                     modal_state.0 = false;
                     if let Ok(dialog_entity) = dialog_query.single() {
@@ -408,7 +409,8 @@ fn handle_dialog_buttons(
     cancel_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextCancel>)>,
     input_query: Query<&ContextNameInput>,
     dialog_query: Query<Entity, With<CreateContextDialog>>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     let Ok(dialog_entity) = dialog_query.single() else {
         return;
@@ -419,7 +421,7 @@ fn handle_dialog_buttons(
         if *interaction == Interaction::Pressed {
             if let Ok(input) = input_query.single() {
                 if !input.text.is_empty() {
-                    submit_create_context(&input.text, &conn);
+                    submit_create_context(&input.text, &bootstrap, &conn_state);
                     modal_state.0 = false;
                     commands.entity(dialog_entity).despawn();
                 }
@@ -453,13 +455,25 @@ fn handle_dialog_escape(
     }
 }
 
-/// Submit the create context request
-fn submit_create_context(name: &str, conn: &ConnectionCommands) {
+/// Submit the create context request by respawning the actor with the new context.
+fn submit_create_context(
+    name: &str,
+    bootstrap: &BootstrapChannel,
+    conn_state: &crate::connection::RpcConnectionState,
+) {
     let instance = Uuid::new_v4().to_string();
     info!("Creating context: {} (instance: {})", name, instance);
 
-    conn.send(ConnectionCommand::JoinContext {
-        context: name.to_string(),
+    let kernel_id = conn_state
+        .current_kernel
+        .as_ref()
+        .map(|k| k.id.clone())
+        .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+
+    let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+        config: conn_state.ssh_config.clone(),
+        kernel_id,
+        context_name: name.to_string(),
         instance,
     });
 }

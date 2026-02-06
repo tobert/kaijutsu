@@ -20,7 +20,10 @@ pub mod seat_selector;
 use bevy::prelude::*;
 use kaijutsu_client::{Context, KernelInfo, SeatInfo};
 
-use crate::connection::{ConnectionCommand, ConnectionCommands, ConnectionEvent};
+use crate::connection::{
+    BootstrapChannel, BootstrapCommand, ConnectionStatusMessage, RpcActor, RpcResultChannel,
+    RpcResultMessage,
+};
 use crate::shaders::nine_slice::ChasingBorder;
 use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::state::AppScreen;
@@ -171,78 +174,79 @@ pub struct DashboardFooter;
 // Systems
 // ============================================================================
 
-/// Handle connection events that affect the dashboard
+/// Handle connection lifecycle and RPC result events that affect the dashboard.
+///
+/// Reads:
+/// - `ConnectionStatusMessage` — connection lifecycle (Connected, Disconnected)
+/// - `RpcResultMessage` — results from async RPC calls (kernel lists, seat taken, etc.)
+///
+/// On Connected, fires async list requests via ActorHandle + RpcResultChannel.
 fn handle_dashboard_events(
-    mut events: MessageReader<ConnectionEvent>,
+    mut status_events: MessageReader<ConnectionStatusMessage>,
+    mut result_events: MessageReader<RpcResultMessage>,
     mut state: ResMut<DashboardState>,
     mut next_screen: ResMut<NextState<AppScreen>>,
-    conn: Res<ConnectionCommands>,
+    actor: Option<Res<RpcActor>>,
+    channel: Res<RpcResultChannel>,
     mut registry: ResMut<crate::conversation::ConversationRegistry>,
     mut current_conv: ResMut<crate::conversation::CurrentConversation>,
 ) {
-    for event in events.read() {
-        match event {
-            ConnectionEvent::KernelList(kernels) => {
-                state.kernels = kernels.clone();
-                // Select first kernel if none selected
-                if state.selected_kernel.is_none() && !state.kernels.is_empty() {
-                    state.selected_kernel = Some(0);
-                    // Request contexts for the selected kernel
-                    conn.send(ConnectionCommand::ListContexts);
+    // Handle connection lifecycle
+    for ConnectionStatusMessage(status) in status_events.read() {
+        match status {
+            kaijutsu_client::ConnectionStatus::Connected => {
+                // Actor just (re)connected — fire list requests
+                if let Some(ref actor) = actor {
+                    fire_dashboard_list_requests(&actor.handle, actor.generation, &channel);
                 }
             }
-            ConnectionEvent::ContextsList(contexts) => {
+            kaijutsu_client::ConnectionStatus::Disconnected => {
+                state.kernels.clear();
+                state.contexts.clear();
+                state.my_seats.clear();
+                state.current_seat = None;
+                next_screen.set(AppScreen::Dashboard);
+            }
+            _ => {}
+        }
+    }
+
+    // Handle RPC results — discard stale list results from previous actors
+    let current_gen = actor.as_ref().map(|a| a.generation).unwrap_or(0);
+    for result in result_events.read() {
+        match result {
+            RpcResultMessage::KernelList { kernels, generation } if *generation == current_gen => {
+                state.kernels = kernels.clone();
+                if state.selected_kernel.is_none() && !state.kernels.is_empty() {
+                    state.selected_kernel = Some(0);
+                }
+            }
+            RpcResultMessage::ContextList { contexts, generation } if *generation == current_gen => {
                 state.contexts = contexts.clone();
-                // Auto-select first context if available
                 if !state.contexts.is_empty() {
                     state.selected_context = Some(0);
                 } else {
                     state.selected_context = None;
                 }
             }
-            ConnectionEvent::MySeatsList(seats) => {
+            RpcResultMessage::MySeatsList { seats, generation } if *generation == current_gen => {
                 state.my_seats = seats.clone();
             }
-            ConnectionEvent::SeatTaken { seat } => {
+            RpcResultMessage::ContextJoined { seat, document_id, .. } => {
                 state.current_seat = Some(seat.clone());
 
-                // Derive document_id from kernel and context
-                let document_id = format!("{}@{}", seat.id.kernel, seat.id.context);
-
                 // Create conversation metadata if it doesn't exist (idempotent)
-                if registry.get(&document_id).is_none() {
-                    // Conversation is metadata-only now (no BlockDocument)
-                    // BlockCellInitialState event will set up DocumentSyncState with the document
-                    let conv = kaijutsu_kernel::Conversation::with_id(&document_id, &document_id);
+                if registry.get(document_id).is_none() {
+                    let conv = kaijutsu_kernel::Conversation::with_id(document_id, document_id);
                     registry.add(conv);
                     info!("Created conversation metadata for {}", document_id);
                 }
 
                 current_conv.0 = Some(document_id.clone());
-
-                // Transition to Conversation screen
                 next_screen.set(AppScreen::Conversation);
             }
-            ConnectionEvent::SeatLeft => {
+            RpcResultMessage::ContextLeft => {
                 state.current_seat = None;
-                // Transition to Dashboard screen
-                next_screen.set(AppScreen::Dashboard);
-            }
-            ConnectionEvent::Connected => {
-                // Stay on Dashboard - kernel list will be requested after attach
-            }
-            ConnectionEvent::AttachedKernel(_) => {
-                // Now that we're attached, request kernel list and contexts
-                conn.send(ConnectionCommand::ListKernels);
-                conn.send(ConnectionCommand::ListMySeats);
-                conn.send(ConnectionCommand::ListContexts);
-            }
-            ConnectionEvent::Disconnected => {
-                state.kernels.clear();
-                state.contexts.clear();
-                state.my_seats.clear();
-                state.current_seat = None;
-                // Return to Dashboard on disconnect
                 next_screen.set(AppScreen::Dashboard);
             }
             _ => {}
@@ -250,11 +254,96 @@ fn handle_dashboard_events(
     }
 }
 
-/// Handle kernel selection (clicking on kernel list item)
+/// Fire async list/info requests on the actor and route results through RpcResultChannel.
+///
+/// Called when the actor reports Connected. Fetches lists for dashboard display,
+/// kernel info for state tracking, and (if not lobby) document state for joining.
+/// `generation` is stamped on results so the dashboard can discard stale responses.
+fn fire_dashboard_list_requests(
+    handle: &kaijutsu_client::ActorHandle,
+    generation: u64,
+    channel: &RpcResultChannel,
+) {
+    // List kernels
+    let h = handle.clone();
+    let tx = channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match h.list_kernels().await {
+                Ok(kernels) => { let _ = tx.send(RpcResultMessage::KernelList { kernels, generation }); }
+                Err(e) => log::warn!("list_kernels failed: {e}"),
+            }
+        })
+        .detach();
+
+    // List contexts
+    let h = handle.clone();
+    let tx = channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match h.list_contexts().await {
+                Ok(contexts) => { let _ = tx.send(RpcResultMessage::ContextList { contexts, generation }); }
+                Err(e) => log::warn!("list_contexts failed: {e}"),
+            }
+        })
+        .detach();
+
+    // Get kernel info + context ID to determine if we auto-joined a non-lobby context
+    let h = handle.clone();
+    let tx = channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            // Get kernel info for state tracking
+            match h.get_info().await {
+                Ok(info) => { let _ = tx.send(RpcResultMessage::KernelAttached(Ok(info.clone()))); }
+                Err(e) => log::warn!("get_info failed: {e}"),
+            }
+
+            // Get context ID — if not "lobby", fetch document state for the seat
+            match h.get_context_id().await {
+                Ok((kernel_id, context_name)) => {
+                    if context_name != "lobby" {
+                        let document_id = format!("{}@{}", kernel_id, context_name);
+                        let initial_state = match h.get_document_state(&document_id).await {
+                            Ok(state) => Some(state),
+                            Err(e) => {
+                                log::warn!("get_document_state failed: {e}");
+                                None
+                            }
+                        };
+                        let seat = kaijutsu_client::SeatInfo {
+                            id: kaijutsu_client::SeatId {
+                                nick: String::new(), // Will be filled by identity
+                                instance: "bevy-client".into(),
+                                kernel: kernel_id,
+                                context: context_name,
+                            },
+                            owner: String::new(),
+                            status: kaijutsu_client::SeatStatus::Active,
+                            last_activity: 0,
+                            cursor_block: None,
+                        };
+                        let _ = tx.send(RpcResultMessage::ContextJoined {
+                            seat,
+                            document_id,
+                            initial_state,
+                        });
+                    }
+                }
+                Err(e) => log::warn!("get_context_id failed: {e}"),
+            }
+        })
+        .detach();
+}
+
+/// Handle kernel selection (clicking on kernel list item).
+///
+/// Selecting a different kernel respawns the actor with the new kernel_id.
 fn handle_kernel_selection(
     interaction: Query<(&Interaction, &KernelListItem), Changed<Interaction>>,
     mut state: ResMut<DashboardState>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     for (interaction, item) in interaction.iter() {
         if *interaction == Interaction::Pressed {
@@ -262,12 +351,14 @@ fn handle_kernel_selection(
             state.contexts.clear();
             state.selected_context = None;
 
-            // Attach to kernel and request contexts
+            // Respawn actor with selected kernel
             if let Some(kernel) = state.kernels.get(item.index) {
-                conn.send(ConnectionCommand::AttachKernel {
-                    id: kernel.id.clone(),
+                let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                    config: conn_state.ssh_config.clone(),
+                    kernel_id: kernel.id.clone(),
+                    context_name: "lobby".into(),
+                    instance: "bevy-client".into(),
                 });
-                conn.send(ConnectionCommand::ListContexts);
             }
         }
     }
@@ -285,29 +376,30 @@ fn handle_context_selection(
     }
 }
 
-/// Handle "Take Seat" button click
+/// Handle "Take Seat" button click.
+///
+/// Respawns the actor with the selected kernel + context so it auto-joins.
 fn handle_take_seat(
     interaction: Query<&Interaction, (Changed<Interaction>, With<TakeSeatButton>)>,
     state: Res<DashboardState>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     for interaction in interaction.iter() {
-        if *interaction == Interaction::Pressed {
-            // Get selected kernel and context
-            if let (Some(_kernel), Some(context)) =
+        if *interaction == Interaction::Pressed
+            && let (Some(kernel), Some(context)) =
                 (state.selected_kernel(), state.selected_context())
-            {
-                // Default instance name based on "default" for now
-                // (hostname crate would require an additional dependency)
-                let instance = std::env::var("USER")
-                    .or_else(|_| std::env::var("USERNAME"))
-                    .unwrap_or_else(|_| "default".to_string());
+        {
+            let instance = std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "default".to_string());
 
-                conn.send(ConnectionCommand::JoinContext {
-                    context: context.name.clone(),
-                    instance,
-                });
-            }
+            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                config: conn_state.ssh_config.clone(),
+                kernel_id: kernel.id.clone(),
+                context_name: context.name.clone(),
+                instance,
+            });
         }
     }
 }
@@ -318,7 +410,8 @@ fn handle_dashboard_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<AppScreen>>,
     mut state: ResMut<DashboardState>,
-    conn: Res<ConnectionCommands>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     // Only handle keys when on Dashboard
     if *screen.get() != AppScreen::Dashboard {
@@ -334,8 +427,8 @@ fn handle_dashboard_keyboard(
             state.selected_context = Some(0);
         }
 
-        // Take seat with selected context
-        if let (Some(_kernel), Some(context)) =
+        // Respawn actor with selected kernel + context
+        if let (Some(kernel), Some(context)) =
             (state.selected_kernel(), state.selected_context())
         {
             let instance = std::env::var("USER")
@@ -343,8 +436,10 @@ fn handle_dashboard_keyboard(
                 .unwrap_or_else(|_| "default".to_string());
 
             info!("Enter pressed - taking seat in context: {}", context.name);
-            conn.send(ConnectionCommand::JoinContext {
-                context: context.name.clone(),
+            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                config: conn_state.ssh_config.clone(),
+                kernel_id: kernel.id.clone(),
+                context_name: context.name.clone(),
                 instance,
             });
         }
