@@ -1,6 +1,6 @@
 # Kaijutsu Kernel Model
 
-*Last updated: 2026-01-24*
+*Last updated: 2026-02-06*
 
 > **This is the authoritative design document for Kaijutsu's kernel model.**
 
@@ -9,20 +9,25 @@
 | Component | Status |
 |-----------|--------|
 | Kernel concept | ✅ Implemented (`kaijutsu-kernel/src/kernel.rs`) |
-| Cap'n Proto schema | ✅ Complete (25 Kernel methods, 5 World methods) |
+| Cap'n Proto schema | ✅ Complete (88 Kernel methods, 6 World methods) |
 | Server (kaijutsu-server) | ✅ Functional |
-| Client (kaijutsu-app) | 🚧 Partial |
+| Client (kaijutsu-client) | ✅ RPC client + ActorHandle (Send+Sync concurrent dispatch) |
+| Client (kaijutsu-app) | 🚧 Bevy UI (block rendering, editing, navigation) |
 | kaish integration | ✅ EmbeddedKaish (in-process) + KaishProcess (subprocess) |
 | KaijutsuBackend | ✅ Maps kaish file I/O to CRDT blocks |
 | MCP integration | ✅ McpServerPool with dynamic registration via RPC |
 | Consent modes | ✅ Implemented (`control.rs`) |
 | Checkpoint system | ✅ Implemented in kernel (not yet exposed via RPC) |
-| Fork/Thread (kernel) | ✅ Implemented (`kernel.rs:367-409`) |
-| Fork/Thread (RPC) | 📋 Stub (returns unimplemented error) |
+| Fork/Thread (kernel) | ✅ Implemented (`kernel.rs:497-571`) |
+| Fork/Thread (RPC) | ✅ Implemented (`rpc.rs:988-1218`) |
 | Block tools | ✅ Extensive (9 tools, 104KB implementation) |
 | Seat/Context | ✅ Implemented (4-tuple SeatId model) |
-| LLM integration | ✅ Implemented (Anthropic provider, streaming) |
-| FlowBus | ✅ Pub/sub for CRDT block events |
+| LLM integration | ✅ Per-kernel LLM via `llm.rhai` config (Anthropic, OpenAI, Gemini) |
+| FlowBus | ✅ Pub/sub for block, resource, config, progress, elicitation events |
+| Drift | ✅ Cross-context communication with LLM distillation |
+| Agents | ✅ AgentRegistry with capabilities, status, activity events |
+| Git integration | ✅ GitEngine with CRDT-backed worktrees and file watching |
+| Tool filtering | ✅ ToolConfig (All/AllowList/DenyList) per kernel |
 | complete() | 📋 Stub (returns empty completions) |
 | archive() | 📋 Planned (not yet in schema) |
 
@@ -37,14 +42,17 @@
 │  kaijutsu.capnp::World                                          │
 │  └── listKernels, attachKernel, createKernel, listMySeats       │
 │                                                                 │
-│  kaijutsu.capnp::Kernel                                         │
+│  kaijutsu.capnp::Kernel (88 methods)                             │
 │  ├── VFS: mount, unmount, listMounts, vfs()                     │
 │  ├── State: checkpoints, history, variables                     │
 │  ├── Tools: block_*, kernel_search, executeTool                 │
 │  ├── MCP: registerMcp, unregisterMcp, listMcpServers, callMcp   │
-│  ├── LLM: prompt() with streaming                               │
+│  ├── LLM: prompt() with streaming, per-kernel config            │
+│  ├── Drift: push, flush, pull, merge, queue, cancel             │
+│  ├── Agents: attach, detach, list, capabilities, events         │
+│  ├── Git: registerRepo, branches, flush, attribution            │
 │  ├── Seats: joinContext, leaveSeat, listContexts                │
-│  ├── Lifecycle: fork, thread (stubs), detach                    │
+│  ├── Lifecycle: fork, thread, detach                            │
 │  │                                                              │
 │  │  execute() / shellExecute() ──────────────────────┐          │
 │  │                                                   │          │
@@ -71,9 +79,11 @@
 |-----------|-------|-------|
 | VFS (MountTable) | **kaijutsu-kernel** | LocalBackend, MemoryBackend |
 | State (history, checkpoints) | **kaijutsu-kernel** | KernelState |
-| Tools (block tools, etc.) | **kaijutsu-kernel** | ToolRegistry |
+| Tools (block tools, etc.) | **kaijutsu-kernel** | ToolRegistry + ExecutionEngine trait |
+| Drift (cross-context) | **kaijutsu-kernel** | DriftRouter (shared via Arc across fork/thread) |
 | MCP connections | **kaijutsu-kernel** | McpServerPool (shared across kernels) |
-| LLM integration | **kaijutsu-kernel** | LlmRegistry |
+| LLM integration | **kaijutsu-kernel** | LlmRegistry (per-kernel via `llm.rhai`) |
+| Agents | **kaijutsu-kernel** | AgentRegistry (capabilities, status, events) |
 | Shell execution | **kaijutsu-server** | EmbeddedKaish or KaishProcess |
 | Block I/O for kaish | **kaijutsu-server** | KaijutsuBackend (maps files to CRDT blocks) |
 
@@ -212,7 +222,7 @@ kaish attach kernel://project-kaijutsu
 When attached:
 - User gets UI view into the kernel
 - AI gets context payload from the kernel
-- Both can see each other's presence (if lease permits)
+- Both can see each other's presence via seats
 
 ### Fork / Thread
 
@@ -239,7 +249,7 @@ kaish thread --name=parallel-work
 **Thread details:**
 - The "linked" relationship means the child kernel holds references to the parent's VFS mounts, not copies
 - Changes to files in `/mnt/project/` are visible to both parent and child immediately
-- Each kernel still has its own `state/` (history, lease, checkpoints) — only VFS is shared
+- Each kernel still has its own `state/` (history, checkpoints) — only VFS is shared
 - If the parent kernel is archived/killed, threads become orphaned and must either:
   - Adopt the VFS mounts as their own (copy-on-orphan)
   - Be killed along with the parent (cascade delete, configurable)
@@ -327,7 +337,7 @@ kaish mount /mnt/research kernel://research-session
 # Now can read:
 ls /mnt/research/root/          # Their VFS
 cat /mnt/research/checkpoints/  # Their summaries
-cat /mnt/research/state/lease   # Who's active there
+cat /mnt/research/state/seats   # Who's active there
 ```
 
 Every kernel exposes itself as a mountable filesystem. This enables:
@@ -397,7 +407,7 @@ When attached bidirectionally:
 ## Block Tools
 
 The kernel exposes a rich set of CRDT-native block tools for content manipulation.
-These are automatically equipped and available via `executeTool()`.
+Tools are registered as `ExecutionEngine` implementations and available via `executeTool()`.
 
 | Tool | Purpose |
 |------|---------|
@@ -410,8 +420,42 @@ These are automatically equipped and available via `executeTool()`.
 | `block_list` | List blocks with filters (kind, status, parent) |
 | `block_status` | Set block status (pending/running/done/error) |
 | `kernel_search` | Cross-block grep across kernel |
+| `drift` | Cross-context communication (push, pull, merge) |
+| `git` | Context-aware git with VFS-resolved paths |
+| `context` | Context management (create, list, switch) |
 
-See [block-tools.md](block-tools.md) for the full interface specification.
+See [block-tools.md](block-tools.md) for the block interface specification.
+
+## Drift: Cross-Context Communication
+
+Drift is how contexts within a kernel share knowledge without sharing conversation
+history. Each context has its own document, and drift transfers distilled content
+between them as first-class `BlockKind::Drift` blocks.
+
+```
+Context A (main)           Context B (debug-fork)
+    │                           │
+    │  fork ───────────────────►│
+    │                           │  ... Claude explores bug ...
+    │                           │
+    │◄── drift push "found it" ─│
+    │  [Drift block injected]   │
+    │                           │
+    │◄── drift merge ───────────│  (LLM distills fork into parent)
+    │  [Merge summary block]    │
+```
+
+**Key concepts:**
+- `DriftRouter` — context registry + staging queue, shared via `Arc<RwLock>` across fork/thread
+- `DriftEngine` — `ExecutionEngine` for the `drift` kaish command
+- `DriftKind` — Push, Pull, Distill, Merge, Commit (provenance tracking)
+- LLM distillation — optional summarization before transfer (uses context's configured model)
+
+**Why drift instead of shared documents?** Isolation is the feature. Each context has
+its own conversation flow. Drift provides *selective, curated* transfer — closer to
+how human teams work (briefings, not sitting in every meeting).
+
+See [drift.md](drift.md) for the full design document.
 
 ## Seat & Context Model
 
@@ -448,52 +492,54 @@ interface World {
 }
 
 interface Kernel {
-  # Info
-  getInfo @0 () -> (info :KernelInfo);
+  # 88 methods (@0-@87) — key categories shown below.
+  # Full schema lives in kaijutsu.capnp.
 
   # kaish execution
   execute @1 (code :Text) -> (execId :UInt64);
-  interrupt @2 (execId :UInt64);
-  complete @3 (...) -> (completions :List(Completion));  # stub
-  subscribeOutput @4 (callback :KernelOutput);           # stub
-  getCommandHistory @5 (limit :UInt32) -> (...);
-
-  # Equipment (tools)
-  listEquipment @6 () -> (tools :List(ToolInfo));
-  equip @7 (tool :Text);
-  unequip @8 (tool :Text);
-
-  # Lifecycle
-  fork @9 (name :Text) -> (kernel :Kernel);    # stub
-  thread @10 (name :Text) -> (kernel :Kernel); # stub
-  detach @11 ();
-
-  # VFS
-  vfs @12 () -> (vfs :Vfs);
-  listMounts @13 () -> (mounts :List(MountInfo));
-  mount @14 (path :Text, source :Text, writable :Bool);
-  unmount @15 (path :Text) -> (success :Bool);
+  shellExecute @25 (code :Text, cellId :Text) -> (blockId :BlockId);
 
   # Tools
   executeTool @16 (call :ToolCall) -> (result :ToolResult);
   getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
-  # Block CRDT
-  applyBlockOp @18 (cellId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  # Lifecycle
+  fork @9 (name :Text) -> (kernel :Kernel);
+  thread @10 (name :Text) -> (kernel :Kernel);
+  detach @11 ();
+
+  # Block CRDT sync
+  pushOps @34 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
+  getDocumentState @35 (documentId :Text) -> (state :DocumentState);
   subscribeBlocks @19 (callback :BlockEvents);
-  getBlockCellState @20 (cellId :Text) -> (state :BlockCellState);
 
-  # LLM
+  # Drift (cross-context communication)
+  driftPush @76 (targetCtx :Text, content :Text, summarize :Bool);
+  driftFlush @77 () -> (count :UInt32);
+  driftPull @78 (sourceCtx :Text, prompt :Text) -> (blockId :BlockId);
+  driftMerge @79 (sourceCtx :Text) -> (blockId :BlockId);
+  driftQueue @80 () -> (staged :List(StagedDrift));
+  driftCancel @81 (stagedId :UInt64) -> (success :Bool);
+  listAllContexts @82 () -> (contexts :List(ContextInfo));
+
+  # LLM (per-kernel config)
   prompt @21 (request :LlmRequest) -> (promptId :Text);
+  getLlmConfig @83 () -> (config :LlmConfigInfo);
+  setDefaultProvider @84 (provider :Text);
+  setDefaultModel @85 (provider :Text, model :Text);
 
-  # Context/Seats
-  listContexts @22 () -> (contexts :List(Context));
-  joinContext @23 (contextName :Text, instance :Text) -> (seat :SeatInfo);
-  leaveSeat @24 ();
+  # MCP
+  registerMcp @38 (...) -> (info :McpServerInfo);
+  callMcpTool @41 (server :Text, tool :Text, arguments :Text);
+
+  # Tool filtering
+  getToolFilter @86 () -> (filter :ToolFilter);
+  setToolFilter @87 (filter :ToolFilter);
 }
 ```
 
-**Note:** `fork`, `thread`, and `complete` are stubs awaiting implementation.
+**Note:** Only a representative subset shown. `complete()` remains a stub.
+See `kaijutsu.capnp` for the full schema.
 
 ## Storage & Persistence
 
@@ -542,19 +588,30 @@ Think of a kernel like a development environment that:
 
 ### Open Questions
 
-1. **Cross-kernel transactions:** Can a checkpoint span multiple kernels?
+1. **Cross-kernel drift:** The server has its own `DriftRouter` for cross-kernel communication — how does it compose with per-kernel routers?
 2. **Kernel discovery:** How do you find kernels? Tags? Search? Hierarchy?
 3. **Garbage collection:** When is it safe to delete archived history?
-4. **Multi-model:** Can a kernel have multiple AI models attached with different roles?
+4. **Drift policies:** When should contexts auto-push findings? On checkpoint? On significant tool results?
+5. **kaijutsu-mcp:** How do external agents (Claude Code, opencode, Gemini CLI) participate as drift contexts?
 
 ## References
 
-- [design-notes.md](./design-notes.md) — Design explorations and background
+- [drift.md](./drift.md) — Cross-context communication design
 - [block-tools.md](./block-tools.md) — Block CRDT interface specification
+- [design-notes.md](./design-notes.md) — Design explorations and background
 
 ---
 
 ## Changelog
+
+**2026-02-06**
+- Added Drift section documenting cross-context communication
+- Updated Implementation Status (88 RPC methods, fork/thread implemented, agents, git, tool filtering)
+- Updated Cap'n Proto schema to show drift, LLM config, tool filter, agents
+- Fixed stale references: removed "lease" (use seats), removed "equip/unequip" (use ToolConfig)
+- Updated ownership table with drift, agents, per-kernel LLM
+- Added drift.md and context/git/drift to block tools table
+- Updated Open Questions for drift era
 
 **2026-01-24**
 - Added MCP integration (McpServerPool, McpToolEngine, RPC methods)

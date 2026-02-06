@@ -6,10 +6,10 @@
 //! A kernel:
 //! - Owns `/` in its VFS (virtual filesystem)
 //! - Can mount worktrees, repos, other kernels at paths like `/mnt/project`
-//! - Has a lease (who holds "the pen" for mutations)
 //! - Has a consent mode (collaborative vs autonomous)
 //! - Can checkpoint (distill history into summaries)
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
+//! - Has a DriftRouter for cross-context communication (shared across fork/thread)
 
 pub mod agents;
 pub mod block_store;

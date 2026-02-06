@@ -60,23 +60,31 @@ Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Server                                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
-│  │   Kernels   │  │    kaish    │  │  Cap'n Proto│                 │
-│  │  (state +   │  │ interpreter │  │   Handlers  │                 │
-│  │    VFS)     │  │             │  │             │                 │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                 │
-│         └────────────────┴────────────────┘                         │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ Kernel (per-session)                                         │   │
+│  │  ├── VFS (MountTable)     ├── DriftRouter ←── shared via    │   │
+│  │  ├── ToolRegistry         │   (contexts,      Arc across    │   │
+│  │  ├── LlmRegistry         │    staging,        fork/thread)  │   │
+│  │  ├── AgentRegistry       │    distillation)                 │   │
+│  │  ├── FlowBus (pub/sub)   └── McpServerPool                 │   │
+│  │  └── KernelState                                            │   │
+│  ├──────────────────────────────────────────────────────────────┤   │
+│  │ EmbeddedKaish → KaijutsuBackend → BlockStore (CRDT)         │   │
+│  └──────────────────────────────────────────────────────────────┘   │
 │                          │                                          │
-│                   SSH + Cap'n Proto                                 │
+│                   SSH + Cap'n Proto (88 methods)                    │
 └──────────────────────────┼──────────────────────────────────────────┘
                            │
-┌──────────────────────────┼──────────────────────────────────────────┐
-│                    Kaijutsu Client (Bevy)                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │  Dashboard / │  │    Block     │  │    RPC       │              │
-│  │ Conversation │  │   Rendering  │  │   Client     │              │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-└─────────────────────────────────────────────────────────────────────┘
+          ┌────────────────┼────────────────┐
+          │                │                │
+┌─────────┴──────┐ ┌──────┴───────┐ ┌──────┴───────┐
+│ kaijutsu-app   │ │ kaijutsu-mcp │ │ External     │
+│ (Bevy client)  │ │ (planned)    │ │ (Claude Code,│
+│                │ │              │ │  opencode,   │
+│ ActorHandle    │ │ MCP server   │ │  Gemini CLI) │
+│ (Send+Sync)    │ │ exposing     │ │              │
+│                │ │ drift + tools│ │              │
+└────────────────┘ └──────────────┘ └──────────────┘
 ```
 
 ## Documentation
@@ -84,6 +92,7 @@ Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to
 | Doc | Purpose |
 |-----|---------|
 | [docs/kernel-model.md](docs/kernel-model.md) | **Authoritative kernel model — start here** |
+| [docs/drift.md](docs/drift.md) | **Cross-context communication (drift) design** |
 | [docs/block-tools.md](docs/block-tools.md) | CRDT block interface design |
 | [docs/diamond-types-fork.md](docs/diamond-types-fork.md) | Why we forked diamond-types |
 | [docs/design-notes.md](docs/design-notes.md) | Collected design explorations |
@@ -113,6 +122,33 @@ Context isn't stored, it's *generated*. When a context payload is needed (for Cl
 |----|-------|-----|----------|
 | `fork` | Deep copy | Snapshot | Isolated exploration |
 | `thread` | New, linked | Shared refs | Parallel work on same codebase |
+
+### Drift (Cross-Context Communication)
+
+Drift is how contexts within a kernel share knowledge without sharing conversation history.
+Each context has its own document; drift transfers distilled content between them as
+`BlockKind::Drift` blocks.
+
+**Why drift?** Multiple agents (Claude, Gemini, local models, humans) can work in parallel
+contexts on the same kernel. When one context finds something useful, it drifts the finding
+to another — optionally distilled by an LLM into a concise briefing.
+
+| Command | Effect |
+|---------|--------|
+| `drift ls` | List contexts in this kernel |
+| `drift push <ctx> "content"` | Stage content for target context |
+| `drift push <ctx> --summarize` | LLM-summarize before staging |
+| `drift pull <ctx> [prompt]` | Read + distill from source context |
+| `drift merge <ctx>` | Summarize fork back into parent |
+| `drift flush` | Deliver staged drifts |
+| `drift queue` / `drift cancel` | Manage staging queue |
+
+**DriftKind** tracks provenance: Push, Pull, Distill, Merge, Commit.
+
+**Architecture:** `SharedDriftRouter = Arc<RwLock<DriftRouter>>` is shared across
+fork/thread, so parent and child contexts can immediately see and drift to each other.
+
+See [docs/drift.md](docs/drift.md) for the full design.
 
 ### Context View (Not Chat)
 
@@ -260,6 +296,7 @@ kaijutsu/
 │   └── kaijutsu-app/        # Bevy GUI, kaish syntax validation
 └── docs/
     ├── kernel-model.md      # ✅ Start here
+    ├── drift.md             # Cross-context communication
     ├── block-tools.md       # CRDT interface
     ├── diamond-types-fork.md
     └── design-notes.md
