@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use kaish_kernel::interpreter::{DisplayHint as KaishDisplayHint, EntryType as KaishEntryType, ExecResult};
+use kaish_kernel::interpreter::{EntryType as KaishEntryType, ExecResult, OutputData};
 use kaish_kernel::vfs::Filesystem;
 use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
@@ -371,37 +371,83 @@ fn generate_blob_id() -> String {
 /// Convert a kaish EntryType to kaijutsu EntryType.
 pub fn convert_entry_type(et: &KaishEntryType) -> EntryType {
     match et {
-        KaishEntryType::File => EntryType::File,
+        KaishEntryType::Text | KaishEntryType::File => EntryType::File,
         KaishEntryType::Directory => EntryType::Directory,
         KaishEntryType::Executable => EntryType::Executable,
         KaishEntryType::Symlink => EntryType::Symlink,
     }
 }
 
-/// Convert a kaish DisplayHint to kaijutsu DisplayHint.
-pub fn convert_display_hint(kaish_hint: &KaishDisplayHint) -> DisplayHint {
-    match kaish_hint {
-        KaishDisplayHint::None => DisplayHint::None,
+/// Convert kaish `OutputData` to kaijutsu `DisplayHint`.
+///
+/// The mapping:
+/// - `None` → `DisplayHint::None`
+/// - Simple text → `DisplayHint::None` (text is already in stdout)
+/// - Tabular (headers + cells) → `DisplayHint::Table`
+/// - Nested children → `DisplayHint::Tree`
+/// - Flat list → `DisplayHint::Table` (single-column)
+pub fn convert_output_data(output: Option<&OutputData>) -> DisplayHint {
+    let output = match output {
+        Some(o) => o,
+        None => return DisplayHint::None,
+    };
 
-        KaishDisplayHint::Formatted { user, model } => DisplayHint::Formatted {
-            user: user.clone(),
-            model: model.clone(),
-        },
+    // Simple text — no structured hint needed
+    if output.is_simple_text() {
+        return DisplayHint::None;
+    }
 
-        KaishDisplayHint::Table { headers, rows, entry_types } => DisplayHint::Table {
-            headers: headers.clone(),
-            rows: rows.clone(),
-            entry_types: entry_types.as_ref().map(|ets| {
-                ets.iter().map(convert_entry_type).collect()
-            }),
-        },
+    // Tabular data
+    if output.is_tabular() || output.headers.is_some() {
+        let rows: Vec<Vec<String>> = output
+            .root
+            .iter()
+            .map(|node| {
+                let mut row = vec![node.name.clone()];
+                row.extend(node.cells.iter().cloned());
+                row
+            })
+            .collect();
+        let entry_types: Vec<EntryType> = output
+            .root
+            .iter()
+            .map(|node| convert_entry_type(&node.entry_type))
+            .collect();
+        return DisplayHint::Table {
+            headers: output.headers.clone(),
+            rows,
+            entry_types: Some(entry_types),
+        };
+    }
 
-        KaishDisplayHint::Tree { root, structure, traditional, compact } => DisplayHint::Tree {
-            root: root.clone(),
-            structure: structure.clone(),
-            traditional: traditional.clone(),
-            compact: compact.clone(),
-        },
+    // Nested tree
+    if !output.is_flat() {
+        let canonical = output.to_canonical_string();
+        let json_structure = serde_json::to_value(output).unwrap_or_default();
+        let root_name = output
+            .root
+            .first()
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        return DisplayHint::Tree {
+            root: root_name,
+            structure: json_structure,
+            traditional: canonical.clone(),
+            compact: canonical,
+        };
+    }
+
+    // Flat list without cells — single-column table
+    let rows: Vec<Vec<String>> = output.root.iter().map(|n| vec![n.name.clone()]).collect();
+    let entry_types: Vec<EntryType> = output
+        .root
+        .iter()
+        .map(|node| convert_entry_type(&node.entry_type))
+        .collect();
+    DisplayHint::Table {
+        headers: None,
+        rows,
+        entry_types: Some(entry_types),
     }
 }
 

@@ -2294,8 +2294,8 @@ impl kernel::Server for KernelImpl {
                             result.code, result.out.len(), result.err.len());
                         log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
 
-                        // Convert kaish DisplayHint to kaijutsu format and serialize
-                        let display_hint = crate::embedded_kaish::convert_display_hint(&result.hint);
+                        // Convert kaish OutputData to kaijutsu DisplayHint and serialize
+                        let display_hint = crate::embedded_kaish::convert_output_data(result.output.as_ref());
                         let hint_json = crate::embedded_kaish::serialize_display_hint(&display_hint);
 
                         // Combine out and err (kaish uses out/err/code fields)
@@ -2444,7 +2444,7 @@ impl kernel::Server for KernelImpl {
                 }
 
                 // Serialize display hint
-                let hint = crate::embedded_kaish::convert_display_hint(&exec_result.hint);
+                let hint = crate::embedded_kaish::convert_output_data(exec_result.output.as_ref());
                 if let Some(hint_json) = crate::embedded_kaish::serialize_display_hint(&hint) {
                     result_builder.set_hint(&hint_json);
                 }

@@ -1,19 +1,15 @@
-//! End-to-end integration tests for kaish→engine dispatch path.
-//!
-//! These tests exercise the full path from structured tool arguments (as kaish's
-//! `tool_args_to_json` produces) through `EngineArgs` reconstruction to engine
-//! execution and CRDT block injection.
-//!
-//! The dispatch chain tested:
-//! ```text
-//! kaish tool_args_to_json() → JSON → EngineArgs::from_json() → to_argv() → engine
-//! ```
+//! End-to-end integration tests for kaish→engine dispatch paths.
 //!
 //! # Tiers
 //!
-//! - **Tier 1:** Drift engine dispatch — smoke tests through EngineArgs
-//! - **Tier 2:** Multi-context drift — push/queue/flush lifecycle with block verification
-//! - **Tier 3:** Git engine via EngineArgs — flag reconstruction with real git repos
+//! - **Tier 0:** EngineArgs unit tests — JSON→argv reconstruction in isolation
+//! - **Tier 1:** Drift e2e through EmbeddedKaish — smoke tests exercising full dispatch:
+//!   `kaish.execute("drift ls")` → parser → execute_command (not a builtin) →
+//!   backend fallback → KaijutsuBackend.call_tool("drift", ...) → tool_args_to_json →
+//!   DriftEngine.execute(json) → result
+//! - **Tier 2:** Drift e2e through EmbeddedKaish — lifecycle with CRDT block verification
+//! - **Tier 3:** Git direct-engine via EngineArgs — kaish's git builtin shadows the
+//!   backend path, so GitEngine is unreachable through EmbeddedKaish
 
 use std::sync::Arc;
 
@@ -23,15 +19,20 @@ use kaijutsu_kernel::drift::DriftEngine;
 use kaijutsu_kernel::git_engine::GitEngine;
 use kaijutsu_kernel::tools::{EngineArgs, ExecutionEngine, ToolInfo};
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
+use kaijutsu_server::EmbeddedKaish;
 
 // ============================================================================
 // Shared test setup
 // ============================================================================
 
-/// Create a kernel with drift engine registered and a "default" context.
-async fn setup_drift() -> (Arc<DriftEngine>, Arc<Kernel>, SharedBlockStore) {
-    let kernel = Arc::new(Kernel::new("e2e-test").await);
-    let documents = shared_block_store("e2e-test");
+/// Create an EmbeddedKaish with drift engine for true e2e testing.
+///
+/// Returns an EmbeddedKaish that exercises the full dispatch chain:
+/// kaish parser → execute_command → backend fallback →
+/// KaijutsuBackend.call_tool() → DriftEngine.
+async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
+    let kernel = Arc::new(Kernel::new("e2e-drift").await);
+    let documents = shared_block_store("e2e-drift");
 
     documents
         .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
@@ -52,7 +53,10 @@ async fn setup_drift() -> (Arc<DriftEngine>, Arc<Kernel>, SharedBlockStore) {
         router.register("default", "doc-default", None);
     }
 
-    (engine, kernel, documents)
+    let kaish = EmbeddedKaish::new("e2e-drift", documents.clone(), kernel.clone())
+        .expect("EmbeddedKaish::new failed");
+
+    (kaish, kernel, documents)
 }
 
 /// Create a kernel with git engine and a real git repo in a tempdir.
@@ -128,23 +132,8 @@ fn kaish_json(positional: &[&str], flags: &[&str]) -> String {
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap()
 }
 
-/// Build JSON with numeric positional args (like kaish sends for `drift cancel 1`).
-fn kaish_json_with_num(positional_strs: &[&str], positional_nums: &[i64]) -> String {
-    let mut pos: Vec<serde_json::Value> = positional_strs
-        .iter()
-        .map(|s| serde_json::Value::String(s.to_string()))
-        .collect();
-    for n in positional_nums {
-        pos.push(serde_json::json!(*n));
-    }
-
-    let mut obj = serde_json::Map::new();
-    obj.insert("_positional".to_string(), serde_json::Value::Array(pos));
-    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap()
-}
-
 // ============================================================================
-// EngineArgs unit tests (kaish-style JSON → argv reconstruction)
+// Tier 0: EngineArgs unit tests (kaish-style JSON → argv reconstruction)
 // ============================================================================
 
 #[test]
@@ -204,65 +193,65 @@ fn engine_args_numeric_positional_coerced() {
 }
 
 // ============================================================================
-// Tier 1: Drift engine dispatch — smoke tests
+// Tier 1: Drift e2e through EmbeddedKaish — smoke tests
 // ============================================================================
 
 #[tokio::test]
 async fn drift_help_returns_usage() {
-    let (engine, _kernel, _docs) = setup_drift().await;
-    let result = engine.execute(&kaish_json(&["help"], &[])).await.unwrap();
+    let (kaish, _kernel, _docs) = setup_drift_e2e().await;
+    let result = kaish.execute("drift help").await.unwrap();
 
-    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.ok(), "err: {}", result.err);
     assert!(
-        result.stdout.contains("USAGE:"),
+        result.out.contains("USAGE:"),
         "expected USAGE in output, got: {}",
-        result.stdout
+        result.out
     );
 }
 
 #[tokio::test]
 async fn drift_ls_shows_default_context() {
-    let (engine, _kernel, _docs) = setup_drift().await;
-    let result = engine.execute(&kaish_json(&["ls"], &[])).await.unwrap();
+    let (kaish, _kernel, _docs) = setup_drift_e2e().await;
+    let result = kaish.execute("drift ls").await.unwrap();
 
-    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.ok(), "err: {}", result.err);
     assert!(
-        result.stdout.contains("default"),
+        result.out.contains("default"),
         "expected 'default' context, got: {}",
-        result.stdout
+        result.out
     );
     assert!(
-        result.stdout.contains("doc-default"),
+        result.out.contains("doc-default"),
         "expected 'doc-default' document, got: {}",
-        result.stdout
+        result.out
     );
     assert!(
-        result.stdout.contains("* "),
+        result.out.contains("* "),
         "expected '* ' marker for current context, got: {}",
-        result.stdout
+        result.out
     );
 }
 
 #[tokio::test]
 async fn drift_unknown_subcommand_fails() {
-    let (engine, _kernel, _docs) = setup_drift().await;
-    let result = engine.execute(&kaish_json(&["bogus"], &[])).await.unwrap();
+    let (kaish, _kernel, _docs) = setup_drift_e2e().await;
+    let result = kaish.execute("drift bogus").await.unwrap();
 
-    assert!(!result.success);
+    assert!(!result.ok());
     assert!(
-        result.stderr.contains("Unknown subcommand"),
-        "expected 'Unknown subcommand' in stderr, got: {}",
-        result.stderr
+        result.err.contains("Unknown subcommand"),
+        "expected 'Unknown subcommand' in err, got: {}",
+        result.err
     );
 }
 
 // ============================================================================
-// Tier 2: Multi-context drift lifecycle
+// Tier 2: Drift e2e through EmbeddedKaish — lifecycle with CRDT verification
 // ============================================================================
 
 #[tokio::test]
 async fn drift_push_queue_flush_lifecycle() {
-    let (engine, kernel, documents) = setup_drift().await;
+    let (kaish, kernel, documents) = setup_drift_e2e().await;
 
     // Register a second context as drift target
     let target_short = {
@@ -274,21 +263,26 @@ async fn drift_push_queue_flush_lifecycle() {
         .create_document("doc-target".to_string(), DocumentKind::Conversation, None)
         .unwrap();
 
-    // Stage a drift push
-    let push_json = kaish_json(&["push", &target_short, "hello from e2e test"], &[]);
-    let push_result = engine.execute(&push_json).await.unwrap();
-    assert!(push_result.success, "push failed: {}", push_result.stderr);
-    assert!(push_result.stdout.contains("Staged"));
+    // Stage a drift push — tests kaish string parsing → arg splitting → backend dispatch.
+    // The target_short is a hex ID that may start with a digit, so it must be quoted.
+    let push_result = kaish
+        .execute(&format!(
+            r#"drift push "{target_short}" "hello from e2e test""#
+        ))
+        .await
+        .unwrap();
+    assert!(push_result.ok(), "push failed: {}", push_result.err);
+    assert!(push_result.out.contains("Staged"));
 
     // Verify queue shows the staged drift
-    let queue_result = engine.execute(&kaish_json(&["queue"], &[])).await.unwrap();
-    assert!(queue_result.success);
-    assert!(queue_result.stdout.contains("hello from e2e test"));
+    let queue_result = kaish.execute("drift queue").await.unwrap();
+    assert!(queue_result.ok());
+    assert!(queue_result.out.contains("hello from e2e test"));
 
     // Flush and verify injection
-    let flush_result = engine.execute(&kaish_json(&["flush"], &[])).await.unwrap();
-    assert!(flush_result.success, "flush failed: {}", flush_result.stderr);
-    assert!(flush_result.stdout.contains("Flushed 1 drifts"));
+    let flush_result = kaish.execute("drift flush").await.unwrap();
+    assert!(flush_result.ok(), "flush failed: {}", flush_result.err);
+    assert!(flush_result.out.contains("Flushed 1 drifts"));
 
     // Verify block was injected into target document
     let blocks = documents.block_snapshots("doc-target").unwrap();
@@ -299,33 +293,37 @@ async fn drift_push_queue_flush_lifecycle() {
 
 #[tokio::test]
 async fn drift_cancel_with_numeric_arg() {
-    let (engine, kernel, _documents) = setup_drift().await;
+    let (kaish, kernel, _documents) = setup_drift_e2e().await;
 
     let target_short = {
         let mut router = kernel.drift().write().await;
         router.register("target2", "doc-target2", None)
     };
 
-    // Stage a drift
-    let push_json = kaish_json(&["push", &target_short, "to be cancelled"], &[]);
-    let push_result = engine.execute(&push_json).await.unwrap();
-    assert!(push_result.success, "push failed: {}", push_result.stderr);
+    // Stage a drift — kaish parses the quoted string as a single argument.
+    // Hex short IDs that may start with a digit must be quoted for kaish's lexer.
+    let push_result = kaish
+        .execute(&format!(
+            r#"drift push "{target_short}" "to be cancelled""#
+        ))
+        .await
+        .unwrap();
+    assert!(push_result.ok(), "push failed: {}", push_result.err);
 
-    // Cancel using numeric ID — this is the key test for EngineArgs numeric coercion
-    // kaish sends: {"_positional": ["cancel", 1]} (number, not string)
-    let cancel_json = kaish_json_with_num(&["cancel"], &[1]);
-    let cancel_result = engine.execute(&cancel_json).await.unwrap();
-    assert!(cancel_result.success, "cancel failed: {}", cancel_result.stderr);
-    assert!(cancel_result.stdout.contains("Cancelled"));
+    // Cancel using numeric ID — kaish parser sends this as a number,
+    // which exercises EngineArgs numeric coercion through the full chain
+    let cancel_result = kaish.execute("drift cancel 1").await.unwrap();
+    assert!(cancel_result.ok(), "cancel failed: {}", cancel_result.err);
+    assert!(cancel_result.out.contains("Cancelled"));
 
     // Queue should be empty
-    let queue_result = engine.execute(&kaish_json(&["queue"], &[])).await.unwrap();
-    assert!(queue_result.success);
-    assert!(queue_result.stdout.contains("No staged drifts"));
+    let queue_result = kaish.execute("drift queue").await.unwrap();
+    assert!(queue_result.ok());
+    assert!(queue_result.out.contains("No staged drifts"));
 }
 
 // ============================================================================
-// Tier 3: Git engine via EngineArgs — flag reconstruction
+// Tier 3: Git direct-engine via EngineArgs (kaish builtin shadows backend path)
 // ============================================================================
 
 #[tokio::test]
