@@ -34,7 +34,6 @@ use tokio::sync::RwLock;
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
-use crate::llm::LlmRegistry;
 use crate::tools::{ExecResult, ExecutionEngine};
 
 /// Short ID length — first 6 hex chars of a UUID.
@@ -403,35 +402,40 @@ pub fn build_distillation_prompt(
 /// - `drift merge <ctx>` — summarize forked context into parent
 /// - `drift help` — usage info
 pub struct DriftEngine {
-    /// Shared DriftRouter (same instance across all contexts in this kernel).
-    router: SharedDriftRouter,
+    /// Weak reference to the kernel (avoids Kernel→ToolRegistry→DriftEngine→Kernel cycle).
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
     /// Shared BlockStore (all contexts' documents).
     documents: SharedBlockStore,
-    /// LLM registry for distillation.
-    llm: Arc<RwLock<LlmRegistry>>,
     /// Which context this engine operates as (the "caller").
     context_name: String,
 }
 
 impl DriftEngine {
     /// Create a new drift engine.
+    ///
+    /// Takes an `Arc<Kernel>` but stores it as `Weak` to avoid a reference cycle
+    /// (Kernel owns ToolRegistry which owns DriftEngine).
     pub fn new(
-        router: SharedDriftRouter,
+        kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        llm: Arc<RwLock<LlmRegistry>>,
         context_name: impl Into<String>,
     ) -> Self {
         Self {
-            router,
+            kernel: Arc::downgrade(kernel),
             documents,
-            llm,
             context_name: context_name.into(),
         }
     }
 
+    /// Upgrade the weak kernel reference, or return an error.
+    fn kernel(&self) -> Result<Arc<crate::kernel::Kernel>, String> {
+        self.kernel.upgrade().ok_or_else(|| "kernel has been dropped".to_string())
+    }
+
     /// Get the caller's short ID from the router.
     async fn caller_short_id(&self) -> Result<String, String> {
-        let router = self.router.read().await;
+        let kernel = self.kernel()?;
+        let router = kernel.drift().read().await;
         router
             .short_id_for_context(&self.context_name)
             .map(|s| s.to_string())
@@ -466,7 +470,8 @@ impl DriftEngine {
     }
 
     async fn cmd_ls(&self) -> Result<ExecResult, String> {
-        let router = self.router.read().await;
+        let kernel = self.kernel()?;
+        let router = kernel.drift().read().await;
         let contexts = router.list_contexts();
         let caller_short = router
             .short_id_for_context(&self.context_name)
@@ -507,6 +512,7 @@ impl DriftEngine {
             return Err("Usage: drift push <target-ctx> \"content\" [--summarize]".to_string());
         }
 
+        let kernel = self.kernel()?;
         let target_ctx = &args[0];
         let summarize = args.iter().any(|a| a == "--summarize" || a == "-s");
 
@@ -521,7 +527,7 @@ impl DriftEngine {
 
         if summarize {
             // LLM-summarize path
-            let router = self.router.read().await;
+            let router = kernel.drift().read().await;
             let source_handle = router
                 .get(&caller_short)
                 .ok_or_else(|| format!("caller context {} not found", caller_short))?;
@@ -536,7 +542,7 @@ impl DriftEngine {
 
             let user_prompt = build_distillation_prompt(&blocks, None);
 
-            let registry = self.llm.read().await;
+            let registry = kernel.llm().read().await;
             let provider = registry
                 .default_provider()
                 .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
@@ -554,7 +560,7 @@ impl DriftEngine {
                 .await
                 .map_err(|e| format!("distillation failed: {}", e))?;
 
-            let mut router = self.router.write().await;
+            let mut router = kernel.drift().write().await;
             let staged_id = router
                 .stage(
                     &caller_short,
@@ -578,7 +584,7 @@ impl DriftEngine {
                 );
             }
 
-            let mut router = self.router.write().await;
+            let mut router = kernel.drift().write().await;
             let source_model = router
                 .get(&caller_short)
                 .and_then(|h| h.model.clone());
@@ -600,7 +606,8 @@ impl DriftEngine {
     }
 
     async fn cmd_queue(&self) -> Result<ExecResult, String> {
-        let router = self.router.read().await;
+        let kernel = self.kernel()?;
+        let router = kernel.drift().read().await;
         let queue = router.queue();
 
         if queue.is_empty() {
@@ -635,7 +642,8 @@ impl DriftEngine {
             .parse()
             .map_err(|_| format!("Invalid staged ID: {}", args[0]))?;
 
-        let mut router = self.router.write().await;
+        let kernel = self.kernel()?;
+        let mut router = kernel.drift().write().await;
         if router.cancel(staged_id) {
             Ok(ExecResult::success(format!(
                 "Cancelled staged drift #{}",
@@ -647,10 +655,11 @@ impl DriftEngine {
     }
 
     async fn cmd_flush(&self) -> Result<ExecResult, String> {
+        let kernel = self.kernel()?;
         let caller_short = self.caller_short_id().await?;
 
         let staged = {
-            let mut router = self.router.write().await;
+            let mut router = kernel.drift().write().await;
             router.drain(Some(&caller_short))
         };
 
@@ -660,7 +669,7 @@ impl DriftEngine {
         for drift in &staged {
             // Look up target document from the router
             let target_doc_id = {
-                let router = self.router.read().await;
+                let router = kernel.drift().read().await;
                 match router.get(&drift.target_ctx) {
                     Some(h) => h.document_id.clone(),
                     None => {
@@ -712,6 +721,7 @@ impl DriftEngine {
             return Err("Usage: drift pull <source-ctx> [focus prompt]".to_string());
         }
 
+        let kernel = self.kernel()?;
         let source_ctx = &args[0];
         let directed_prompt = if args.len() > 1 {
             Some(args[1..].join(" "))
@@ -723,7 +733,7 @@ impl DriftEngine {
 
         // Read source context info
         let (source_doc_id, source_model) = {
-            let router = self.router.read().await;
+            let router = kernel.drift().read().await;
             let source_handle = router
                 .get(source_ctx)
                 .ok_or_else(|| format!("unknown source context: {}", source_ctx))?;
@@ -743,7 +753,7 @@ impl DriftEngine {
             build_distillation_prompt(&blocks, directed_prompt.as_deref());
 
         // Get LLM
-        let registry = self.llm.read().await;
+        let registry = kernel.llm().read().await;
         let provider = registry
             .default_provider()
             .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
@@ -771,7 +781,7 @@ impl DriftEngine {
 
         // Inject drift block directly into caller's document
         let caller_doc_id = {
-            let router = self.router.read().await;
+            let router = kernel.drift().read().await;
             router
                 .get(&caller_short)
                 .ok_or_else(|| format!("caller context {} not found", caller_short))?
@@ -811,11 +821,12 @@ impl DriftEngine {
             return Err("Usage: drift merge <source-ctx>".to_string());
         }
 
+        let kernel = self.kernel()?;
         let source_ctx = &args[0];
 
         // Read source context + parent info
         let (source_doc_id, source_model, parent_ctx_id) = {
-            let router = self.router.read().await;
+            let router = kernel.drift().read().await;
             let source_handle = router
                 .get(source_ctx)
                 .ok_or_else(|| format!("unknown source context: {}", source_ctx))?;
@@ -837,7 +848,7 @@ impl DriftEngine {
 
         // Get parent's document ID
         let parent_doc_id = {
-            let router = self.router.read().await;
+            let router = kernel.drift().read().await;
             router
                 .get(&parent_ctx_id)
                 .ok_or_else(|| format!("parent context {} not found", parent_ctx_id))?
@@ -854,7 +865,7 @@ impl DriftEngine {
         let user_prompt = build_distillation_prompt(&blocks, None);
 
         // Get LLM
-        let registry = self.llm.read().await;
+        let registry = kernel.llm().read().await;
         let provider = registry
             .default_provider()
             .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
@@ -1307,17 +1318,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_drift_engine_ls() {
-        let router = shared_drift_router();
+        let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         {
-            let mut r = router.write().await;
+            let mut r = kernel.drift().write().await;
             r.register("main", "doc-main", None);
             r.register("debug", "doc-debug", None);
         }
 
         let documents = crate::block_store::shared_block_store("test");
-        let llm = Arc::new(RwLock::new(LlmRegistry::new()));
-
-        let engine = DriftEngine::new(router, documents, llm, "main");
+        let engine = DriftEngine::new(&kernel, documents, "main");
         let result = engine
             .execute(r#"{"_positional": ["ls"]}"#)
             .await
@@ -1330,11 +1339,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_drift_engine_push_queue_flush() {
-        let router = shared_drift_router();
+        let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         let src_short;
         let tgt_short;
         {
-            let mut r = router.write().await;
+            let mut r = kernel.drift().write().await;
             src_short = r.register("source", "doc-src", None);
             tgt_short = r.register("target", "doc-tgt", None);
         }
@@ -1345,8 +1354,7 @@ mod tests {
             .create_document("doc-tgt".to_string(), crate::db::DocumentKind::Conversation, None)
             .unwrap();
 
-        let llm = Arc::new(RwLock::new(LlmRegistry::new()));
-        let engine = DriftEngine::new(router.clone(), documents.clone(), llm, "source");
+        let engine = DriftEngine::new(&kernel, documents.clone(), "source");
 
         // Push content
         let push_result = engine

@@ -26,7 +26,7 @@ use kaijutsu_kernel::{
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, DriftEngine,
     // MCP
     McpServerPool, McpServerConfig, McpToolEngine,
     // FlowBus
@@ -101,7 +101,16 @@ async fn register_block_tools(
 
     kernel.register_tool_with_engine(
         ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
-        Arc::new(KernelSearchEngine::new(documents)),
+        Arc::new(KernelSearchEngine::new(documents.clone())),
+    ).await;
+
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift", "Cross-context drift: push, pull, merge between contexts", "drift"),
+        Arc::new(DriftEngine::new(
+            kernel,
+            documents,
+            "default",
+        )),
     ).await;
 }
 
@@ -530,9 +539,15 @@ impl world::Server for WorldImpl {
                     uuid::Uuid::new_v4().to_string(), // instance ID
                 ));
 
-                // Register block tools (including context engine)
+                // Register block tools (including context engine + drift)
                 let kernel_arc = Arc::new(kernel);
                 register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+                // Register "default" context in kernel's own DriftRouter
+                {
+                    let mut drift = kernel_arc.drift().write().await;
+                    drift.register("default", &main_document_id, None);
+                }
 
                 // Initialize LLM registry from llm.rhai config
                 initialize_kernel_llm(&kernel_arc, &config_backend).await;
@@ -623,9 +638,15 @@ impl world::Server for WorldImpl {
                 uuid::Uuid::new_v4().to_string(), // instance ID
             ));
 
-            // Register block tools (including context engine)
+            // Register block tools (including context engine + drift)
             let kernel_arc = Arc::new(kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
+
+            // Register "default" context in kernel's own DriftRouter
+            {
+                let mut drift = kernel_arc.drift().write().await;
+                drift.register("default", &main_document_id, None);
+            }
 
             // Initialize LLM registry from llm.rhai config
             initialize_kernel_llm(&kernel_arc, &config_backend).await;
@@ -637,8 +658,7 @@ impl world::Server for WorldImpl {
             {
                 let mut state_ref = state.borrow_mut();
 
-                // Register in drift router for cross-context communication
-                // context_name = kernel_id, document_id = main_document_id
+                // Register in server-level drift router for cross-kernel communication
                 state_ref.drift_router.register(&id, &main_document_id, None);
 
                 state_ref.kernels.insert(
@@ -1010,12 +1030,18 @@ impl kernel::Server for KernelImpl {
                 uuid::Uuid::new_v4().to_string(),
             ));
 
-            // Register block tools on forked kernel
+            // Register block tools on forked kernel (including drift)
             let kernel_arc = Arc::new(forked_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
             // LLM registry is inherited from parent via Kernel::fork()
             // (includes runtime setDefaultProvider/setDefaultModel changes)
+
+            // Register "default" context in kernel's own DriftRouter
+            {
+                let mut drift = kernel_arc.drift().write().await;
+                drift.register("default", &main_document_id, None);
+            }
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -1033,7 +1059,7 @@ impl kernel::Server for KernelImpl {
             {
                 let mut state_ref = state.borrow_mut();
 
-                // Register in drift router with parent lineage
+                // Register in server-level drift router with parent lineage
                 let parent_short = state_ref.drift_router
                     .short_id_for_context(&parent_kernel_id)
                     .map(|s| s.to_string());
@@ -1116,12 +1142,18 @@ impl kernel::Server for KernelImpl {
                 uuid::Uuid::new_v4().to_string(),
             ));
 
-            // Register block tools on threaded kernel
+            // Register block tools on threaded kernel (including drift)
             let kernel_arc = Arc::new(threaded_kernel);
             register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
             // LLM registry is inherited from parent via Kernel::thread()
             // (includes runtime setDefaultProvider/setDefaultModel changes)
+
+            // Register "default" context in kernel's own DriftRouter
+            {
+                let mut drift = kernel_arc.drift().write().await;
+                drift.register("default", &main_document_id, None);
+            }
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -1139,7 +1171,7 @@ impl kernel::Server for KernelImpl {
             {
                 let mut state_ref = state.borrow_mut();
 
-                // Register in drift router with parent lineage
+                // Register in server-level drift router with parent lineage
                 let parent_short = state_ref.drift_router
                     .short_id_for_context(&parent_kernel_id)
                     .map(|s| s.to_string());
