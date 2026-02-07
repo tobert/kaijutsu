@@ -38,8 +38,9 @@ struct Uniforms {
     vert_scale: f32,
     // SDF threshold for text rendering (0.45-0.55). Default 0.5.
     text_bias: f32,
-    // Padding for alignment
-    _padding: f32,
+    // Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    // Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    gamma_correction: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -216,6 +217,11 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
     // Optionally darken horizontal strokes slightly for better visual weight
     // This compensates for the sharper AA making them appear lighter
     alpha = pow(alpha, 1.0 + 0.2 * vgrad * uniforms.hint_amount);
+
+    // Gamma-correct alpha: compensates for perceptual non-linearity.
+    // Values < 1.0 widen the AA transition (thicker light-on-dark text).
+    // Values > 1.0 narrow it (thicker dark-on-light text).
+    alpha = pow(alpha, uniforms.gamma_correction);
 
     return alpha;
 }

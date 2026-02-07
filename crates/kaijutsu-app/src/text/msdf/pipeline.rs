@@ -204,8 +204,9 @@ pub struct MsdfUniforms {
     /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
     /// Default 0.5 is the edge of the signed distance field.
     pub text_bias: f32,
-    /// Padding for 16-byte alignment (3 u32s + 3 f32s = 24 bytes → pad to 32).
-    pub _padding: f32,
+    /// Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    /// Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    pub gamma_correction: f32,
 }
 
 impl Default for MsdfUniforms {
@@ -230,7 +231,7 @@ impl Default for MsdfUniforms {
             horz_scale: 1.1, // Wider AA for vertical strokes
             vert_scale: 0.6, // Sharper AA for horizontal strokes
             text_bias: 0.5,  // Standard SDF threshold
-            _padding: 0.0,
+            gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
         }
     }
 }
@@ -357,6 +358,8 @@ pub struct ExtractedMsdfRenderConfig {
     pub vert_scale: f32,
     /// SDF threshold for text rendering.
     pub text_bias: f32,
+    /// Gamma correction for alpha.
+    pub gamma_correction: f32,
     /// Glow intensity (0.0-1.0).
     pub glow_intensity: f32,
     /// Glow spread in pixels.
@@ -1184,6 +1187,7 @@ pub fn extract_msdf_render_config(
         horz_scale: theme.font_horz_scale,
         vert_scale: theme.font_vert_scale,
         text_bias: theme.font_text_bias,
+        gamma_correction: theme.font_gamma_correction,
         glow_intensity: theme.font_glow_intensity,
         glow_spread: theme.font_glow_spread,
         glow_color: [glow_srgba.red, glow_srgba.green, glow_srgba.blue, glow_srgba.alpha],
@@ -1399,7 +1403,7 @@ pub fn prepare_msdf_texts(
         horz_scale: render_config.horz_scale,
         vert_scale: render_config.vert_scale,
         text_bias: render_config.text_bias,
-        _padding: 0.0,
+        gamma_correction: render_config.gamma_correction,
     };
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));

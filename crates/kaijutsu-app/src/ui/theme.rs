@@ -226,6 +226,9 @@ pub struct Theme {
     pub font_vert_scale: f32,
     /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
     pub font_text_bias: f32,
+    /// Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    /// Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    pub font_gamma_correction: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Font Effects (MSDF text)
@@ -375,6 +378,7 @@ impl Default for Theme {
             font_horz_scale: 1.1,       // Wider AA for vertical strokes
             font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
             font_text_bias: 0.5,        // Standard SDF threshold
+            font_gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
 
             // Font effects defaults
             font_glow_intensity: 0.0,   // Glow off by default
