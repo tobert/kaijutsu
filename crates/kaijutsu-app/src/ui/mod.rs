@@ -1,5 +1,6 @@
 pub mod constellation;
 pub mod debug;
+pub mod drift;
 pub mod format;
 pub mod layout;
 pub mod layout_reconciler;

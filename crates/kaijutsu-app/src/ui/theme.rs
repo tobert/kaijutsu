@@ -107,6 +107,16 @@ pub struct Theme {
     /// Focused block highlight color (border/background accent)
     #[allow(dead_code)]
     pub block_focus: Color,
+    /// Drift push block text color (cyan — conversational)
+    pub block_drift_push: Color,
+    /// Drift pull/distill block text color (blue — substantive)
+    pub block_drift_pull: Color,
+    /// Drift merge block text color (purple — structural)
+    pub block_drift_merge: Color,
+    /// Drift commit block text color (green — like git)
+    pub block_drift_commit: Color,
+    /// Drift border/chrome color (dim)
+    pub block_drift_border: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Semantic colors
@@ -285,6 +295,11 @@ impl Default for Theme {
             block_shell_cmd: Color::srgb(0.49, 0.85, 0.82),    // Cyan (ansi.cyan)
             block_shell_output: Color::srgb(0.70, 0.72, 0.78), // Light gray
             block_focus: Color::srgba(0.48, 0.64, 0.97, 0.3),      // Soft blue highlight (#7aa2f7)
+            block_drift_push: Color::srgb(0.49, 0.85, 0.82),         // Cyan — conversational
+            block_drift_pull: Color::srgb(0.58, 0.74, 1.00),         // Blue — substantive
+            block_drift_merge: Color::srgb(0.73, 0.47, 0.91),        // Purple — structural
+            block_drift_commit: Color::srgb(0.62, 0.81, 0.42),       // Green — like git
+            block_drift_border: Color::srgb(0.30, 0.32, 0.38),       // Dim border chars
 
             // Semantic
             error: Color::srgb(0.97, 0.38, 0.45),     // Red

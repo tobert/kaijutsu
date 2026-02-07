@@ -6,8 +6,8 @@ use bevy::prelude::*;
 
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusTarget,
-    InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    ComposeBlock, ConversationScrollState, CurrentMode, DriftKind, EditingBlockCell, EditorMode,
+    FocusTarget, InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::CurrentConversation;
@@ -77,7 +77,13 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
         }
         BlockKind::ShellCommand => theme.block_shell_cmd,
         BlockKind::ShellOutput => theme.block_shell_output,
-        BlockKind::Drift => theme.fg_dim, // Drift blocks use dim system color
+        BlockKind::Drift => match block.drift_kind {
+            Some(DriftKind::Push) => theme.block_drift_push,
+            Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
+            Some(DriftKind::Merge) => theme.block_drift_merge,
+            Some(DriftKind::Commit) => theme.block_drift_commit,
+            None => theme.fg_dim,
+        },
     }
 }
 
@@ -420,15 +426,109 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                 output.push_str(&formatted.text);
             }
             BlockKind::Drift => {
-                let ctx = block.source_context.as_deref().unwrap_or("?");
-                let model = block.source_model.as_deref().unwrap_or("unknown");
-                output.push_str(&format!("🌊 Drift from {} ({})\n", ctx, model));
-                output.push_str(&block.content);
+                output.push_str(&format_drift_block(block, None));
             }
         }
     }
 
     output
+}
+
+/// Strip provider prefix from model name for compact display.
+///
+/// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`
+/// `"claude-opus-4-6"` → `"claude-opus-4-6"`
+fn truncate_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Draw a box-drawing frame around content.
+///
+/// ```text
+/// ┌─ header ──────────────────┐
+/// │ content line 1             │
+/// │ content line 2             │
+/// └────────────────────────────┘
+/// ```
+fn draw_box(header: &str, content: &str, width: usize) -> String {
+    let inner = width.saturating_sub(4); // account for "│ " and " │"
+    let header_pad = inner.saturating_sub(header.chars().count() + 2);
+    let mut out = String::new();
+
+    // Top border
+    out.push_str("┌─ ");
+    out.push_str(header);
+    out.push(' ');
+    for _ in 0..header_pad {
+        out.push('─');
+    }
+    out.push_str("┐\n");
+
+    // Content lines
+    for line in content.lines() {
+        out.push_str("│ ");
+        let line_chars: usize = line.chars().count();
+        out.push_str(line);
+        let pad = inner.saturating_sub(line_chars);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        out.push_str(" │\n");
+    }
+    // Handle empty content
+    if content.is_empty() {
+        out.push_str("│ ");
+        for _ in 0..inner {
+            out.push(' ');
+        }
+        out.push_str(" │\n");
+    }
+
+    // Bottom border
+    out.push('└');
+    for _ in 0..inner + 2 {
+        out.push('─');
+    }
+    out.push_str("┘\n");
+
+    out
+}
+
+/// Format a drift block with variant-specific visual treatment.
+///
+/// `local_ctx`: if provided, determines push direction arrow (→ outgoing, ← incoming).
+fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
+    let ctx = block.source_context.as_deref().unwrap_or("?");
+    let model = block.source_model.as_deref().map(truncate_model).unwrap_or("unknown");
+    let ctx_label = format!("@{}", ctx);
+    let width = 72;
+
+    // Determine direction arrow: → if we sent it, ← if we received it
+    let arrow = match local_ctx {
+        Some(local) if ctx == local => "→",
+        _ => "←",
+    };
+
+    match block.drift_kind {
+        Some(DriftKind::Push) => {
+            let preview = block.content.lines().next().unwrap_or("");
+            format!("{} {} ({})  {}\n", arrow, ctx_label, model, preview)
+        }
+        Some(DriftKind::Pull) | Some(DriftKind::Distill) => {
+            let header = format!("pulled from {} ({})", ctx_label, model);
+            draw_box(&header, &block.content, width)
+        }
+        Some(DriftKind::Merge) => {
+            let header = format!("⇄ merged from {} ({})", ctx_label, model);
+            draw_box(&header, &block.content, width)
+        }
+        Some(DriftKind::Commit) => {
+            format!("📝 {}  {}\n", ctx_label, block.content.lines().next().unwrap_or(""))
+        }
+        None => {
+            format!("🌊 {} ({})  {}\n", ctx_label, model, block.content.lines().next().unwrap_or(""))
+        }
+    }
 }
 
 /// Update MsdfTextBuffer from CellEditor when dirty.
@@ -1731,7 +1831,8 @@ use super::components::{BlockCell, BlockCellContainer, BlockCellLayout};
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
-pub fn format_single_block(block: &BlockSnapshot) -> String {
+/// `local_ctx`: optional local context ID for drift push direction.
+pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
@@ -1771,11 +1872,7 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             let formatted = format_for_display(&block.content, block.display_hint.as_deref());
             formatted.text
         }
-        BlockKind::Drift => {
-            let ctx = block.source_context.as_deref().unwrap_or("?");
-            let model = block.source_model.as_deref().unwrap_or("unknown");
-            format!("🌊 Drift from {} ({})\n{}", ctx, model, block.content)
-        }
+        BlockKind::Drift => format_drift_block(block, local_ctx),
     }
 }
 
@@ -1992,6 +2089,7 @@ pub fn sync_block_cell_buffers(
     mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
+    drift_state: Res<crate::ui::drift::DriftState>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -2060,7 +2158,8 @@ pub fn sync_block_cell_buffers(
         // Format and update the buffer
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
-        let text = format_single_block(block);
+        let local_ctx = drift_state.local_context_id.as_deref();
+        let text = format_single_block(block, local_ctx);
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
 

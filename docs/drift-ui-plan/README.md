@@ -101,7 +101,7 @@ These stay server-side, accessed via kaish commands or MCP:
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| Phase 1 — ActorHandle | 🔲 Not started | |
-| Phase 2 — Bridge replacement | 🔲 Not started | |
-| Phase 3 — Drift UI | 🔲 Not started | |
+| Phase 1 — ActorHandle | ✅ Complete | 36 methods, broadcast subscriptions, auto-reconnect |
+| Phase 2 — Bridge replacement | ✅ Complete | ActorPlugin (~340 lines) replaces ConnectionBridge (1,302 lines) |
+| Phase 3 — Drift UI | 🔄 In progress | Enhanced rendering, DriftState, context widget, constellation lines |
 | Phase 4 — Multi-context | 🔲 Not started | |

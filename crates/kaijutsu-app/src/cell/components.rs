@@ -7,7 +7,7 @@ use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
 // NOTE: BlockContentSnapshot was replaced with flat BlockSnapshot in the DAG migration
-pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, Role};
+pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DriftKind, Role};
 
 /// Unique identifier for a cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect)]

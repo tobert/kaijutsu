@@ -30,6 +30,7 @@ use bevy::prelude::*;
 use crate::cell::{CurrentMode, EditorMode, InputKind};
 use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -113,6 +114,8 @@ pub enum WidgetContent {
     Mode,
     /// Connection status - reactive to RpcConnectionState
     Connection,
+    /// Drift context list - reactive to DriftState
+    Contexts,
 }
 
 impl Default for WidgetContent {
@@ -237,6 +240,7 @@ impl Plugin for WidgetPlugin {
                     spawn_initial_widgets,
                     update_mode_widget,
                     update_connection_widget,
+                    update_contexts_widget,
                 )
                     .chain(),
             );
@@ -397,9 +401,30 @@ fn spawn_initial_widgets(
     );
     commands.entity(south).add_child(mode_widget);
 
-    // Spacer
-    let south_spacer = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
-    commands.entity(south).add_child(south_spacer);
+    // Spacer (left)
+    let south_spacer_l = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
+    commands.entity(south).add_child(south_spacer_l);
+
+    // Context list widget (center)
+    let contexts_widget = spawn_widget(
+        &mut commands,
+        &mut config,
+        &theme,
+        Widget::new("contexts", WidgetContent::Contexts)
+            .with_state(WidgetState::Docked {
+                edge: Edge::South,
+                order: 50,
+            })
+            .with_size(WidgetSize::min(200.0, 16.0)),
+        "",
+        11.0,
+        theme.fg_dim,
+    );
+    commands.entity(south).add_child(contexts_widget);
+
+    // Spacer (right)
+    let south_spacer_r = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
+    commands.entity(south).add_child(south_spacer_r);
 
     // Key hints widget (right side)
     let hints_widget = spawn_widget(
@@ -533,6 +558,73 @@ fn update_connection_widget(
             )
         } else {
             ("⚡ Disconnected".to_string(), theme.error)
+        };
+
+        msdf_text.text = text;
+        msdf_text.color = bevy_to_rgba8(color);
+    }
+}
+
+/// Update contexts widget when DriftState changes.
+///
+/// Shows context short IDs with local context highlighted, plus staged count.
+/// When a notification is active, temporarily shows the notification instead.
+///
+/// Normal: `@abc @def @ghi  ·2 staged`
+/// Notification: `← @abc: "Found the auth bug in..."`
+fn update_contexts_widget(
+    drift_state: Res<DriftState>,
+    theme: Res<Theme>,
+    mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
+) {
+    if !drift_state.is_changed() {
+        return;
+    }
+
+    for (widget_text, mut msdf_text) in widget_texts.iter_mut() {
+        if widget_text.widget_name != "contexts" {
+            continue;
+        }
+
+        // If there's an active notification, show it instead of the context list
+        if let Some(ref notif) = drift_state.notification {
+            let text = format!("← @{}: \"{}\"", notif.source_ctx, notif.preview);
+            msdf_text.text = text;
+            msdf_text.color = bevy_to_rgba8(theme.accent);
+            continue;
+        }
+
+        if drift_state.contexts.is_empty() {
+            msdf_text.text = String::new();
+            continue;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let max_display = 5;
+
+        for (i, ctx) in drift_state.contexts.iter().enumerate() {
+            if i >= max_display {
+                let remaining = drift_state.contexts.len() - max_display;
+                parts.push(format!("+{} more", remaining));
+                break;
+            }
+            parts.push(format!("@{}", ctx.short_id));
+        }
+
+        let mut text = parts.join(" ");
+
+        // Append staged count if any
+        let staged = drift_state.staged_count();
+        if staged > 0 {
+            text.push_str(&format!("  ·{} staged", staged));
+        }
+
+        // Use accent for the local context, fg_dim for rest
+        // (MsdfUiText is single-color, so we use accent if we're in the list, else dim)
+        let color = if drift_state.local_context_id.is_some() {
+            theme.accent
+        } else {
+            theme.fg_dim
         };
 
         msdf_text.text = text;

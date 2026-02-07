@@ -124,6 +124,14 @@ pub enum RpcResultMessage {
     ContextList { contexts: Vec<kaijutsu_client::Context>, generation: u64 },
     /// Seats list received (for dashboard).
     MySeatsList { seats: Vec<kaijutsu_client::SeatInfo>, generation: u64 },
+    /// Drift contexts list received (from periodic polling).
+    DriftContextsReceived {
+        contexts: Vec<kaijutsu_client::ContextInfo>,
+    },
+    /// Drift staged queue received (from periodic polling).
+    DriftQueueReceived {
+        staged: Vec<kaijutsu_client::StagedDriftInfo>,
+    },
     /// Generic RPC error (for toast/notification).
     RpcError {
         operation: String,

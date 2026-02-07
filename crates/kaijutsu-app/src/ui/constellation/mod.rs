@@ -45,6 +45,7 @@ impl Plugin for ConstellationPlugin {
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()
             .register_type::<ConstellationConnection>()
+            .register_type::<DriftConnectionKind>()
             .register_type::<ConstellationZoom>()
             .add_systems(
                 Update,
@@ -653,10 +654,21 @@ pub struct ConstellationNode {
     pub context_id: String,
 }
 
+/// What kind of connection this line represents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum DriftConnectionKind {
+    /// Parent-child ancestry from fork/thread
+    #[default]
+    Ancestry,
+    /// Active staged drift between contexts
+    StagedDrift,
+}
+
 /// Marker for a constellation connection line entity
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
 pub struct ConstellationConnection {
     pub from: String,
     pub to: String,
+    pub kind: DriftConnectionKind,
 }

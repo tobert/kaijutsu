@@ -12,9 +12,11 @@ use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
     mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
-    ConstellationMode, ConstellationNode, ConstellationZoom, OrbitalAnimation,
+    ConstellationMode, ConstellationNode, ConstellationZoom, DriftConnectionKind,
+    OrbitalAnimation,
 };
 use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
+use crate::ui::drift::DriftState;
 use crate::ui::theme::{color_to_vec4, Theme};
 
 /// System set for constellation rendering
@@ -437,10 +439,17 @@ fn despawn_removed_nodes(
     }
 }
 
-/// Spawn connection lines between constellation nodes
+/// Spawn drift-aware connection lines between constellation nodes.
+///
+/// Three connection types:
+/// - **Ancestry**: parent→child lines from fork/thread (thin, dim, slow flow)
+/// - **Staged drift**: pulsing accent-color lines for pending drift operations
+///
+/// Replaces the old circular-ring adjacency connections.
 fn spawn_connection_lines(
     mut commands: Commands,
     constellation: Res<Constellation>,
+    drift_state: Res<DriftState>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
     container: Query<Entity, With<ConstellationContainer>>,
@@ -450,81 +459,105 @@ fn spawn_connection_lines(
         return;
     };
 
-    // Only spawn connections when we have 2+ nodes
     if constellation.nodes.len() < 2 {
         return;
     }
 
-    // Build list of existing connections
-    let existing: Vec<(String, String)> = existing_connections
+    // Build set of existing connections (from, to, kind)
+    let existing: Vec<(String, String, DriftConnectionKind)> = existing_connections
         .iter()
-        .map(|c| (c.from.clone(), c.to.clone()))
+        .map(|c| (c.from.clone(), c.to.clone(), c.kind))
         .collect();
 
-    // Generate connections for adjacent nodes (circular layout)
-    let node_count = constellation.nodes.len();
-    for i in 0..node_count {
-        let next_i = (i + 1) % node_count;
-        let from_id = &constellation.nodes[i].context_id;
-        let to_id = &constellation.nodes[next_i].context_id;
+    // Collect connections to spawn: (from_id, to_id, kind)
+    let mut wanted: Vec<(String, String, DriftConnectionKind)> = Vec::new();
 
-        // Skip if connection already exists
-        if existing.iter().any(|(f, t)| f == from_id && t == to_id) {
+    // 1. Ancestry lines from DriftState.contexts (parent_id → child)
+    for ctx in &drift_state.contexts {
+        if let Some(ref parent_id) = ctx.parent_id {
+            // Find the parent context's short_id to match constellation nodes
+            // The parent_id from ContextInfo is a short_id
+            wanted.push((parent_id.clone(), ctx.short_id.clone(), DriftConnectionKind::Ancestry));
+        }
+    }
+
+    // 2. Staged drift lines (source → target)
+    for staged in &drift_state.staged {
+        wanted.push((
+            staged.source_ctx.clone(),
+            staged.target_ctx.clone(),
+            DriftConnectionKind::StagedDrift,
+        ));
+    }
+
+    // Spawn missing connections
+    let padding = theme.constellation_node_size;
+    let container_center =
+        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
+
+    for (from_id, to_id, kind) in &wanted {
+        // Skip if already exists
+        if existing.iter().any(|(f, t, k)| f == from_id && t == to_id && k == kind) {
             continue;
         }
 
-        let from_node = &constellation.nodes[i];
-        let to_node = &constellation.nodes[next_i];
+        // Both nodes must exist in the constellation
+        let Some(from_node) = constellation.node_by_id(from_id) else { continue };
+        let Some(to_node) = constellation.node_by_id(to_id) else { continue };
 
-        // Calculate bounding box for the connection line
+        // Material params vary by connection kind
+        let (color, intensity, flow_speed) = match kind {
+            DriftConnectionKind::Ancestry => (
+                theme.constellation_connection_color,
+                0.2,  // dim
+                0.1,  // slow flow
+            ),
+            DriftConnectionKind::StagedDrift => (
+                Color::srgba(0.49, 0.85, 0.82, 0.8), // bright cyan
+                0.6,  // medium bright
+                0.5,  // moderate flow
+            ),
+        };
+
+        // Calculate bounding box
         let min_x = from_node.position.x.min(to_node.position.x);
         let max_x = from_node.position.x.max(to_node.position.x);
         let min_y = from_node.position.y.min(to_node.position.y);
         let max_y = from_node.position.y.max(to_node.position.y);
 
-        // Add padding so the line isn't clipped
-        let padding = theme.constellation_node_size;
         let width = (max_x - min_x).max(padding);
         let height = (max_y - min_y).max(padding);
 
-        // Container center offset
-        let container_center =
-            theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
-
-        // Calculate endpoints relative to the connection's bounding box (0-1 UV space)
         let rel_from_x = (from_node.position.x - min_x + padding / 2.0) / (width + padding);
         let rel_from_y = (from_node.position.y - min_y + padding / 2.0) / (height + padding);
         let rel_to_x = (to_node.position.x - min_x + padding / 2.0) / (width + padding);
         let rel_to_y = (to_node.position.y - min_y + padding / 2.0) / (height + padding);
 
-        // Calculate activity level based on both nodes
         let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
 
-        // Calculate aspect ratio for shader
         let mat_width = width + padding;
         let mat_height = height + padding;
         let aspect = mat_width / mat_height.max(1.0);
 
-        // Create connection material with aspect ratio correction
         let material = connection_materials.add(ConnectionLineMaterial {
-            color: color_to_vec4(theme.constellation_connection_color),
+            color: color_to_vec4(color),
             params: Vec4::new(
-                0.08,                              // glow_width
-                theme.constellation_connection_glow, // intensity
-                0.5,                               // flow_speed
-                0.0,                               // unused
+                0.08,        // glow_width
+                intensity,   // intensity (kind-specific)
+                flow_speed,  // flow_speed (kind-specific)
+                0.0,         // unused
             ),
             time: Vec4::new(0.0, activity, 0.0, 0.0),
             endpoints: Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y),
-            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0), // width, height, aspect, falloff
+            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0),
         });
 
-        // Spawn connection line entity
         let connection_entity = commands
             .spawn((
                 ConstellationConnection {
                     from: from_id.clone(),
                     to: to_id.clone(),
+                    kind: *kind,
                 },
                 Node {
                     position_type: PositionType::Absolute,
@@ -535,7 +568,6 @@ fn spawn_connection_lines(
                     ..default()
                 },
                 MaterialNode(material),
-                // Render behind nodes
                 ZIndex(-1),
             ))
             .id();
@@ -543,8 +575,8 @@ fn spawn_connection_lines(
         commands.entity(container_entity).add_child(connection_entity);
 
         info!(
-            "Spawned connection line: {} -> {}",
-            from_id, to_id
+            "Spawned {:?} connection: {} -> {}",
+            kind, from_id, to_id
         );
     }
 }
@@ -617,22 +649,32 @@ fn update_connection_visuals(
     }
 }
 
-/// Despawn connection lines for removed connections
+/// Despawn connection lines whose nodes no longer exist or whose drift state is stale.
 fn despawn_removed_connections(
     mut commands: Commands,
     constellation: Res<Constellation>,
+    drift_state: Res<DriftState>,
     connections: Query<(Entity, &ConstellationConnection)>,
 ) {
     for (entity, marker) in connections.iter() {
         let from_exists = constellation.node_by_id(&marker.from).is_some();
         let to_exists = constellation.node_by_id(&marker.to).is_some();
 
+        // Despawn if either node is gone
         if !from_exists || !to_exists {
             commands.entity(entity).despawn();
-            info!(
-                "Despawned connection line: {} -> {}",
-                marker.from, marker.to
-            );
+            continue;
+        }
+
+        // For staged drift lines, despawn if the staged item is gone (flushed/cancelled)
+        if marker.kind == DriftConnectionKind::StagedDrift {
+            let still_staged = drift_state.staged.iter().any(|s| {
+                s.source_ctx == marker.from && s.target_ctx == marker.to
+            });
+            if !still_staged {
+                commands.entity(entity).despawn();
+                info!("Despawned flushed drift line: {} -> {}", marker.from, marker.to);
+            }
         }
     }
 }

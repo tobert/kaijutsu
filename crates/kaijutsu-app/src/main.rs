@@ -95,6 +95,8 @@ fn main() {
         .add_plugins(ui::constellation::ConstellationPlugin)
         // Widget system - unified docked/floating UI primitives
         .add_plugins(ui::widget::WidgetPlugin)
+        // Drift state - context list + staged queue polling
+        .add_plugins(ui::drift::DriftPlugin)
         // Layout system - RON-driven view layouts
         .add_plugins(ui::layout::LayoutPlugin)
         // Timeline navigation - temporal scrubbing through history
