@@ -188,12 +188,29 @@ impl Plugin for ActorPlugin {
 fn poll_bootstrap_results(
     mut commands: Commands,
     channel: Res<BootstrapChannel>,
+    result_channel: Res<RpcResultChannel>,
 ) {
     let Ok(mut rx) = channel.rx.lock() else { return };
     while let Ok(result) = rx.try_recv() {
         match result {
             bootstrap::BootstrapResult::ActorReady { handle, generation } => {
                 log::info!("Actor ready (generation {})", generation);
+
+                // Eagerly connect: fire whoami to trigger ensure_connected,
+                // which does SSH → attach_kernel → join_context → Connected.
+                let h = handle.clone();
+                let tx = result_channel.sender();
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        match h.whoami().await {
+                            Ok(identity) => {
+                                let _ = tx.send(RpcResultMessage::IdentityReceived(identity));
+                            }
+                            Err(e) => log::warn!("Initial whoami failed: {e}"),
+                        }
+                    })
+                    .detach();
+
                 commands.insert_resource(RpcActor { handle, generation });
             }
             bootstrap::BootstrapResult::Error(e) => {

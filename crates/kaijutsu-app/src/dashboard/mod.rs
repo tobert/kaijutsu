@@ -288,49 +288,14 @@ fn fire_dashboard_list_requests(
         })
         .detach();
 
-    // Get kernel info + context ID to determine if we auto-joined a non-lobby context
+    // Get kernel info for state tracking (separate task to isolate failures)
     let h = handle.clone();
     let tx = channel.sender();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            // Get kernel info for state tracking
             match h.get_info().await {
-                Ok(info) => { let _ = tx.send(RpcResultMessage::KernelAttached(Ok(info.clone()))); }
+                Ok(info) => { let _ = tx.send(RpcResultMessage::KernelAttached(Ok(info))); }
                 Err(e) => log::warn!("get_info failed: {e}"),
-            }
-
-            // Get context ID — if not "lobby", fetch document state for the seat
-            match h.get_context_id().await {
-                Ok((kernel_id, context_name)) => {
-                    if context_name != "lobby" {
-                        let document_id = format!("{}@{}", kernel_id, context_name);
-                        let initial_state = match h.get_document_state(&document_id).await {
-                            Ok(state) => Some(state),
-                            Err(e) => {
-                                log::warn!("get_document_state failed: {e}");
-                                None
-                            }
-                        };
-                        let seat = kaijutsu_client::SeatInfo {
-                            id: kaijutsu_client::SeatId {
-                                nick: String::new(), // Will be filled by identity
-                                instance: "bevy-client".into(),
-                                kernel: kernel_id,
-                                context: context_name,
-                            },
-                            owner: String::new(),
-                            status: kaijutsu_client::SeatStatus::Active,
-                            last_activity: 0,
-                            cursor_block: None,
-                        };
-                        let _ = tx.send(RpcResultMessage::ContextJoined {
-                            seat,
-                            document_id,
-                            initial_state,
-                        });
-                    }
-                }
-                Err(e) => log::warn!("get_context_id failed: {e}"),
             }
         })
         .detach();
