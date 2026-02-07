@@ -26,7 +26,11 @@ use kaijutsu_kernel::{
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, DriftEngine, GitEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, GitEngine,
+    // Drift engines (split)
+    DriftLsEngine, DriftPushEngine, DriftPullEngine, DriftFlushEngine, DriftMergeEngine,
+    // File tools
+    FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
     // MCP
     McpServerPool, McpServerConfig, McpToolEngine,
     // FlowBus
@@ -104,15 +108,56 @@ async fn register_block_tools(
         Arc::new(KernelSearchEngine::new(documents.clone())),
     ).await;
 
+    // ── Drift tools (split into individual engines) ──
     kernel.register_tool_with_engine(
-        ToolInfo::new("drift", "Cross-context drift: push, pull, merge between contexts", "drift"),
-        Arc::new(DriftEngine::new(
-            kernel,
-            documents.clone(),
-            "default",
-        )),
+        ToolInfo::new("drift_ls", "List all contexts in this kernel's drift router", "drift"),
+        Arc::new(DriftLsEngine::new(kernel, "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_push", "Stage content for transfer to another context", "drift"),
+        Arc::new(DriftPushEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_pull", "Read and LLM-summarize another context's conversation", "drift"),
+        Arc::new(DriftPullEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_flush", "Deliver all staged drifts to target documents", "drift"),
+        Arc::new(DriftFlushEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_merge", "Summarize a forked context back into its parent", "drift"),
+        Arc::new(DriftMergeEngine::new(kernel, documents.clone(), "default")),
     ).await;
 
+    // ── File tools (CRDT-backed) ──
+    let file_cache = Arc::new(FileDocumentCache::new(documents.clone(), kernel.vfs().clone()));
+    kernel.register_tool_with_engine(
+        ToolInfo::new("read", "Read file content with optional line numbers", "file"),
+        Arc::new(ReadEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
+        Arc::new(EditEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("write", "Write or create a file with the given content", "file"),
+        Arc::new(WriteEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
+        Arc::new(GlobEngine::new(kernel.vfs().clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("grep", "Search file content with regex", "file"),
+        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("whoami", "Show current context identity", "drift"),
+        Arc::new(WhoamiEngine::new(kernel.drift().clone(), "default")),
+    ).await;
+
+    // ── VCS ──
     kernel.register_tool_with_engine(
         ToolInfo::new("git", "Context-aware git with LLM commit summaries", "vcs"),
         Arc::new(GitEngine::new(

@@ -28,6 +28,7 @@ kaijutsu-client = { path = "crates/kaijutsu-client" }
 # Kaish (execution engine + client)
 kaish-kernel = { git = "https://github.com/tobert/kaish", branch = "main" }
 kaish-client = { git = "https://github.com/tobert/kaish", branch = "main" }
+kaish-glob = { git = "https://github.com/tobert/kaish", branch = "main" }
 
 # Cap'n Proto
 capnp = "0.25"
