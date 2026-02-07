@@ -213,7 +213,7 @@ impl Default for MsdfUniforms {
     fn default() -> Self {
         Self {
             resolution: [1280.0, 720.0],
-            msdf_range: 8.0,
+            msdf_range: 4.0, // Must match MsdfAtlas::DEFAULT_RANGE
             time: 0.0,
             rainbow: 0,
             glow_intensity: 0.0,

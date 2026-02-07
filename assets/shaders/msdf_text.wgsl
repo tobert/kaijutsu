@@ -327,22 +327,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // === SAMPLE MSDF FOR TERRITORY CLAIM ===
-    // Sample the signed distance to determine if this pixel is "owned" by this glyph.
-    // Depth testing ensures the first glyph to render claims overlapping regions.
-    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let msdf_sd = median(sample.r, sample.g, sample.b);
-    let sd = min(msdf_sd, sample.a);
-
-    // Discard pixels clearly outside this glyph's territory.
-    // The glyph edge is at sd=0.5. Threshold 0.48 allows a thin AA transition
-    // while minimizing territory claiming — where earlier glyphs' SDF fields
-    // "nibble" the left edges of later glyphs via depth-test priority.
-    // Glow extends inward from the edge, so this threshold doesn't affect it.
-    if sd < 0.48 {
-        discard;
-    }
-
     var output = vec4<f32>(0.0);
 
     // === GLOW LAYER ===
@@ -371,6 +355,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Blend text using premultiplied alpha
     output = blend_over_premultiplied(output, text_color, text_alpha * in.color.a);
+
+    // === LATE DISCARD ===
+    // Discard pixels with no visible ink to prevent them writing to the depth buffer.
+    // Previous approach discarded based on raw SDF distance (sd < 0.48), but this caused
+    // transparent padding pixels to pass the threshold and write to depth, occluding the
+    // visible edges of adjacent glyphs (the "smeared letters" bug). By discarding based
+    // on final alpha instead, only pixels with actual ink claim depth buffer territory.
+    if output.a < 0.01 {
+        discard;
+    }
 
     // Output is already in premultiplied form (rgb * alpha) which matches our blend state
     return output;
