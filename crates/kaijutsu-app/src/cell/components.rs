@@ -636,6 +636,152 @@ impl DocumentSyncState {
     }
 }
 
+// ============================================================================
+// DOCUMENT CACHE — Multi-Context Document Management
+// ============================================================================
+
+/// A cached document for a single context, including its CRDT doc and sync state.
+#[allow(dead_code)]
+pub struct CachedDocument {
+    /// The CRDT document — authoritative content for this context.
+    pub doc: BlockDocument,
+    /// Sync manager for frontier tracking (one per document).
+    pub sync: super::sync::SyncManager,
+    /// Context name (e.g. the kernel_id or user-supplied name).
+    pub context_name: String,
+    /// Generation counter at last sync (for staleness detection).
+    pub synced_at_generation: u64,
+    /// When this document was last accessed (for LRU eviction).
+    pub last_accessed: std::time::Instant,
+    /// Saved scroll offset (restored on switch-back).
+    pub scroll_offset: f32,
+    /// Seat info from server (for constellation display).
+    pub seat_info: Option<kaijutsu_client::SeatInfo>,
+}
+
+/// Multi-context document cache.
+///
+/// Holds `BlockDocument` + `SyncManager` per joined context, enabling:
+/// - Instant context switching (cache hit → snapshot swap)
+/// - Background sync for inactive contexts (events route by document_id)
+/// - LRU eviction when too many contexts are cached
+///
+/// `DocumentSyncState` becomes a thin proxy to the active cache entry
+/// for backward compatibility with existing systems.
+#[derive(Resource)]
+#[allow(dead_code)]
+pub struct DocumentCache {
+    /// Map from document_id → cached document state.
+    documents: std::collections::HashMap<String, CachedDocument>,
+    /// Currently active (rendered) document_id.
+    active_id: Option<String>,
+    /// Most-recently-used document IDs (front = most recent).
+    mru: Vec<String>,
+    /// Maximum number of cached documents before LRU eviction.
+    max_cached: usize,
+}
+
+impl Default for DocumentCache {
+    fn default() -> Self {
+        Self {
+            documents: std::collections::HashMap::new(),
+            active_id: None,
+            mru: Vec::new(),
+            max_cached: 8,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl DocumentCache {
+    /// Get the active document ID.
+    pub fn active_id(&self) -> Option<&str> {
+        self.active_id.as_deref()
+    }
+
+    /// Get a reference to a cached document by document_id.
+    pub fn get(&self, document_id: &str) -> Option<&CachedDocument> {
+        self.documents.get(document_id)
+    }
+
+    /// Get a mutable reference to a cached document by document_id.
+    pub fn get_mut(&mut self, document_id: &str) -> Option<&mut CachedDocument> {
+        self.documents.get_mut(document_id)
+    }
+
+    /// Check if a document is cached.
+    pub fn contains(&self, document_id: &str) -> bool {
+        self.documents.contains_key(document_id)
+    }
+
+    /// Insert a new cached document. Evicts LRU entry if at capacity.
+    pub fn insert(&mut self, document_id: String, cached: CachedDocument) {
+        // Evict LRU if at capacity (never evict the active document)
+        if self.documents.len() >= self.max_cached {
+            self.evict_lru();
+        }
+
+        self.documents.insert(document_id.clone(), cached);
+        self.touch_mru(&document_id);
+    }
+
+    /// Set the active document. Returns the previous active_id if changed.
+    pub fn set_active(&mut self, document_id: &str) -> Option<String> {
+        let previous = self.active_id.take();
+        self.active_id = Some(document_id.to_string());
+        self.touch_mru(document_id);
+
+        // Update last_accessed timestamp
+        if let Some(doc) = self.documents.get_mut(document_id) {
+            doc.last_accessed = std::time::Instant::now();
+        }
+
+        previous
+    }
+
+    /// Get MRU-ordered document IDs (most recent first).
+    pub fn mru_ids(&self) -> &[String] {
+        &self.mru
+    }
+
+    /// Find document_id by context_name.
+    pub fn document_id_for_context(&self, context_name: &str) -> Option<&str> {
+        self.documents
+            .iter()
+            .find(|(_, cached)| cached.context_name == context_name)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Number of cached documents.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    /// Move a document_id to the front of the MRU list.
+    fn touch_mru(&mut self, document_id: &str) {
+        self.mru.retain(|id| id != document_id);
+        self.mru.insert(0, document_id.to_string());
+    }
+
+    /// Evict the least-recently-used document (never the active one).
+    fn evict_lru(&mut self) {
+        // Find the last MRU entry that isn't the active document
+        let evict_id = self
+            .mru
+            .iter()
+            .rev()
+            .find(|id| self.active_id.as_deref() != Some(id.as_str()))
+            .cloned();
+
+        if let Some(id) = evict_id {
+            self.documents.remove(&id);
+            self.mru.retain(|mid| mid != &id);
+            log::info!("DocumentCache: evicted LRU document {}", id);
+        }
+    }
+}
+
 /// Configuration for workspace layout.
 #[derive(Resource, Reflect)]
 #[reflect(Resource)]
@@ -791,6 +937,17 @@ pub struct MainCell;
 pub struct PromptSubmitted {
     /// The text that was submitted.
     pub text: String,
+}
+
+/// Message requesting a context switch.
+///
+/// Emitted by constellation navigation (gt/gT/Ctrl-^/click) and the
+/// context strip widget. The `handle_context_switch` system processes
+/// this to swap documents from the DocumentCache.
+#[derive(Message, Clone, Debug)]
+pub struct ContextSwitchRequested {
+    /// The context_name to switch to (matches constellation node context_id).
+    pub context_name: String,
 }
 
 /// Resource tracking the conversation scroll position.

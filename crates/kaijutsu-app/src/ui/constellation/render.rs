@@ -27,6 +27,12 @@ pub struct ConstellationRendering;
 #[derive(Component)]
 pub struct HasMiniRender;
 
+/// Marker for model label text on constellation nodes.
+#[derive(Component)]
+pub struct ModelLabel {
+    pub context_id: String,
+}
+
 /// Setup the constellation rendering systems
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
@@ -39,6 +45,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_connection_lines,
             attach_mini_renders,
             update_node_visuals,
+            update_model_labels,
             update_connection_visuals,
             despawn_removed_nodes,
             despawn_removed_connections,
@@ -193,7 +200,6 @@ fn spawn_context_nodes(
             ))
             .with_children(|parent| {
                 // Inner label showing context name (truncated)
-                // Wrapped in a semi-transparent background for contrast
                 let label = truncate_context_name(&node.seat_info.id.context, 12);
                 parent
                     .spawn((
@@ -216,7 +222,34 @@ fn spawn_context_nodes(
                         label_bg.spawn((
                             crate::text::MsdfUiText::new(&label)
                                 .with_font_size(12.0)
-                                .with_color(theme.fg), // Bright foreground on dark bg
+                                .with_color(theme.fg),
+                            crate::text::UiTextPositionCache::default(),
+                            Node::default(),
+                        ));
+                    });
+
+                // Model badge below context label (initially empty, filled by update_model_labels)
+                let model_text = node.model.as_deref().map(truncate_model_name).unwrap_or_default();
+                parent
+                    .spawn((
+                        ModelLabel { context_id: node.context_id.clone() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(-40.0), // Below context label
+                            left: Val::Percent(50.0),
+                            margin: UiRect::left(Val::Px(-50.0)),
+                            width: Val::Px(100.0),
+                            min_height: Val::Px(14.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                    ))
+                    .with_children(|model_bg| {
+                        model_bg.spawn((
+                            crate::text::MsdfUiText::new(&model_text)
+                                .with_font_size(9.0)
+                                .with_color(theme.fg_dim),
                             crate::text::UiTextPositionCache::default(),
                             Node::default(),
                         ));
@@ -314,6 +347,7 @@ fn update_node_visuals(
     constellation: Res<Constellation>,
     orbital: Res<OrbitalAnimation>,
     zoom: Res<ConstellationZoom>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     mut nodes: Query<(
@@ -322,9 +356,10 @@ fn update_node_visuals(
         &MaterialNode<PulseRingMaterial>,
     )>,
 ) {
-    // Update when constellation, zoom, or orbital animation changes
+    // Update when constellation, zoom, doc_cache, or orbital animation changes
     let needs_update = constellation.is_changed()
         || zoom.is_changed()
+        || doc_cache.is_changed()
         || (orbital.active && orbital.is_changed());
     if !needs_update {
         return;
@@ -407,16 +442,22 @@ fn update_node_visuals(
                     _ => 0.55,  // Distant: noticeably faded
                 };
 
+                // MRU boost: nodes in the document cache get extra brightness
+                let is_in_cache = doc_cache
+                    .document_id_for_context(&ctx_node.context_id)
+                    .is_some();
+                let mru_boost = if is_in_cache { 0.1 } else { 0.0 };
+
                 // Blend depth opacity with zoom level
                 let base_opacity = if is_focused { 0.9 } else { 0.7 };
-                let effective_opacity = base_opacity - (base_opacity - depth_opacity) * zoom.level;
+                let effective_opacity = (base_opacity - (base_opacity - depth_opacity) * zoom.level + mru_boost).min(1.0);
 
                 // Increase intensity for focused node
                 if is_focused {
                     mat.params.y = 0.08; // thicker rings
                     mat.color.w = effective_opacity;
                 } else {
-                    mat.params.y = 0.05;
+                    mat.params.y = if is_in_cache { 0.06 } else { 0.05 };
                     mat.color.w = effective_opacity;
                 }
             }
@@ -723,5 +764,43 @@ fn truncate_context_name(name: &str, max_len: usize) -> String {
         name.to_string()
     } else {
         format!("{}...", &name[..max_len - 3])
+    }
+}
+
+/// Strip provider prefix from model name for compact display.
+///
+/// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`
+fn truncate_model_name(model: &str) -> String {
+    model.rsplit('/').next().unwrap_or(model).to_string()
+}
+
+/// Update model label text on constellation nodes when model info changes.
+fn update_model_labels(
+    constellation: Res<Constellation>,
+    mut model_labels: Query<(&ModelLabel, &Children)>,
+    mut msdf_texts: Query<&mut crate::text::MsdfUiText>,
+) {
+    if !constellation.is_changed() {
+        return;
+    }
+
+    for (label, children) in model_labels.iter_mut() {
+        // Find the matching constellation node
+        let model_text = constellation
+            .nodes
+            .iter()
+            .find(|n| n.context_id == label.context_id)
+            .and_then(|n| n.model.as_deref())
+            .map(truncate_model_name)
+            .unwrap_or_default();
+
+        // Update the child MsdfUiText
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = msdf_texts.get_mut(child)
+                && msdf_text.text != model_text
+            {
+                msdf_text.text = model_text.clone();
+            }
+        }
     }
 }

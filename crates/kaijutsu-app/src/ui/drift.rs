@@ -30,6 +30,8 @@ pub struct DriftState {
     pub staged: Vec<StagedDriftInfo>,
     /// Our own context short ID (for determining push direction).
     pub local_context_id: Option<String>,
+    /// The context name from our seat (used to resolve local_context_id).
+    pub local_context_name: Option<String>,
     /// Last poll timestamp (from `Time::elapsed_secs_f64()`).
     pub last_poll: f64,
     /// Whether we've received at least one successful poll.
@@ -39,7 +41,8 @@ pub struct DriftState {
 }
 
 impl DriftState {
-    /// Get context info by short ID.
+    /// Get context info by short ID (used by Phase 4 constellation navigation).
+    #[allow(dead_code)]
     pub fn context_by_id(&self, short_id: &str) -> Option<&ContextInfo> {
         self.contexts.iter().find(|c| c.short_id == short_id)
     }
@@ -76,9 +79,9 @@ impl Plugin for DriftPlugin {
                 (
                     poll_drift_state,
                     update_drift_state,
-                    populate_local_context_id,
                     detect_drift_arrival,
                     dismiss_stale_notifications,
+                    sync_model_info_to_constellation,
                 )
                     .chain(),
             );
@@ -136,7 +139,10 @@ fn poll_drift_state(
         .detach();
 }
 
-/// Drain `DriftContextsReceived` and `DriftQueueReceived` into `DriftState`.
+/// Drain `DriftContextsReceived`, `DriftQueueReceived`, and `ContextJoined` into `DriftState`.
+///
+/// All RPC result processing lives here to avoid multiple `MessageReader<RpcResultMessage>`
+/// systems independently consuming the same event stream.
 fn update_drift_state(
     mut drift_state: ResMut<DriftState>,
     mut events: MessageReader<RpcResultMessage>,
@@ -148,27 +154,29 @@ fn update_drift_state(
                 drift_state.contexts = contexts.clone();
                 drift_state.loaded = true;
                 drift_state.last_poll = time.elapsed_secs_f64();
+
+                // Resolve local_context_id to short_id now that we have context data.
+                // local_context_name is the seat's context name (e.g. kernel_id);
+                // we need the short_id that drift blocks use in source_context.
+                if let Some(ref name) = drift_state.local_context_name {
+                    if let Some(ctx) = contexts.iter().find(|c| c.name == *name || c.short_id == *name) {
+                        if drift_state.local_context_id.as_ref() != Some(&ctx.short_id) {
+                            log::info!("DriftState: resolved local context → @{}", ctx.short_id);
+                            drift_state.local_context_id = Some(ctx.short_id.clone());
+                        }
+                    }
+                }
             }
             RpcResultMessage::DriftQueueReceived { staged } => {
                 drift_state.staged = staged.clone();
             }
+            RpcResultMessage::ContextJoined { seat, .. } => {
+                // Store context name from seat — will be resolved to short_id
+                // when contexts arrive from the next poll.
+                drift_state.local_context_name = Some(seat.id.context.clone());
+                log::info!("DriftState: joined context = {}", seat.id.context);
+            }
             _ => {}
-        }
-    }
-}
-
-/// Populate `local_context_id` when we join a context.
-fn populate_local_context_id(
-    mut drift_state: ResMut<DriftState>,
-    mut events: MessageReader<RpcResultMessage>,
-) {
-    for event in events.read() {
-        if let RpcResultMessage::ContextJoined { seat, .. } = event {
-            // The seat.id.context is our context name — we need the short ID.
-            // For now, use the context name; the drift router registers with kernel_id
-            // which maps to the context_name. We'll match against ContextInfo later.
-            drift_state.local_context_id = Some(seat.id.context.clone());
-            log::info!("DriftState: local context = {}", seat.id.context);
         }
     }
 }
@@ -206,5 +214,38 @@ fn dismiss_stale_notifications(
         && time.elapsed_secs_f64() - notif.created_at > NOTIFICATION_DURATION
     {
         drift_state.notification = None;
+    }
+}
+
+/// Sync model info from `DriftState.contexts` to `Constellation` nodes.
+///
+/// When the drift poll returns context info with model names, update the
+/// matching constellation nodes so they can display model badges.
+fn sync_model_info_to_constellation(
+    drift_state: Res<DriftState>,
+    mut constellation: ResMut<crate::ui::constellation::Constellation>,
+) {
+    if !drift_state.is_changed() {
+        return;
+    }
+
+    for ctx_info in &drift_state.contexts {
+        // Find matching constellation node by context name or short_id
+        if let Some(node) = constellation
+            .nodes
+            .iter_mut()
+            .find(|n| n.context_id == ctx_info.name || n.context_id == ctx_info.short_id)
+        {
+            // Update model if it changed
+            let new_model = if ctx_info.model.is_empty() {
+                None
+            } else {
+                Some(ctx_info.model.clone())
+            };
+
+            if node.model != new_model {
+                node.model = new_model;
+            }
+        }
     }
 }

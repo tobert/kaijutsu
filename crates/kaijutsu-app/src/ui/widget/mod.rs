@@ -565,19 +565,21 @@ fn update_connection_widget(
     }
 }
 
-/// Update contexts widget when DriftState changes.
+/// Update contexts widget when DriftState or DocumentCache changes.
 ///
-/// Shows context short IDs with local context highlighted, plus staged count.
+/// Shows MRU context badges from DocumentCache, with active context highlighted.
+/// Falls back to drift state contexts if DocumentCache is empty.
 /// When a notification is active, temporarily shows the notification instead.
 ///
-/// Normal: `@abc @def @ghi  ·2 staged`
+/// With cache: `[@abc main] [@def explore]  ·2 staged`
 /// Notification: `← @abc: "Found the auth bug in..."`
 fn update_contexts_widget(
     drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
 ) {
-    if !drift_state.is_changed() {
+    if !drift_state.is_changed() && !doc_cache.is_changed() {
         return;
     }
 
@@ -594,6 +596,56 @@ fn update_contexts_widget(
             continue;
         }
 
+        let mru_ids = doc_cache.mru_ids();
+        let active_doc_id = doc_cache.active_id();
+
+        // If we have cached documents, show MRU badges
+        if !mru_ids.is_empty() {
+            let mut parts: Vec<String> = Vec::new();
+            let max_display = 5;
+
+            for (i, doc_id) in mru_ids.iter().enumerate() {
+                if i >= max_display {
+                    let remaining = mru_ids.len() - max_display;
+                    parts.push(format!("+{}", remaining));
+                    break;
+                }
+
+                // Look up context name from cache
+                let ctx_name = doc_cache
+                    .get(doc_id)
+                    .map(|c| c.context_name.as_str())
+                    .unwrap_or("?");
+
+                // Truncate long context names
+                let short = if ctx_name.len() > 12 {
+                    &ctx_name[..12]
+                } else {
+                    ctx_name
+                };
+
+                // Active context gets brackets
+                if active_doc_id == Some(doc_id.as_str()) {
+                    parts.push(format!("[{}]", short));
+                } else {
+                    parts.push(short.to_string());
+                }
+            }
+
+            let mut text = parts.join(" ");
+
+            // Append staged count if any
+            let staged = drift_state.staged_count();
+            if staged > 0 {
+                text.push_str(&format!("  ·{} staged", staged));
+            }
+
+            msdf_text.text = text;
+            msdf_text.color = bevy_to_rgba8(theme.accent);
+            continue;
+        }
+
+        // Fall back to drift state contexts
         if drift_state.contexts.is_empty() {
             msdf_text.text = String::new();
             continue;
@@ -620,7 +672,6 @@ fn update_contexts_widget(
         }
 
         // Use accent for the local context, fg_dim for rest
-        // (MsdfUiText is single-color, so we use accent if we're in the list, else dim)
         let color = if drift_state.local_context_id.is_some() {
             theme.accent
         } else {

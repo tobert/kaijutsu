@@ -115,7 +115,8 @@ pub struct Theme {
     pub block_drift_merge: Color,
     /// Drift commit block text color (green — like git)
     pub block_drift_commit: Color,
-    /// Drift border/chrome color (dim)
+    /// Drift border/chrome color (reserved for future rich text rendering)
+    #[allow(dead_code)]
     pub block_drift_border: Color,
 
     // ═══════════════════════════════════════════════════════════════════════

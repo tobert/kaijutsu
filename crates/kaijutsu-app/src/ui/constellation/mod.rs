@@ -181,6 +181,7 @@ impl Constellation {
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
             entity: None,
+            model: None,
         };
 
         self.nodes.push(node);
@@ -251,6 +252,8 @@ pub struct ContextNode {
     pub activity: ActivityState,
     /// Entity ID when spawned
     pub entity: Option<Entity>,
+    /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
+    pub model: Option<String>,
 }
 
 /// Activity state of a context node
@@ -468,6 +471,7 @@ fn sync_zoom_to_mode(
 /// Handle clicks on constellation nodes to focus that context.
 fn handle_node_click(
     mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
 ) {
     for (interaction, node) in nodes.iter() {
@@ -479,9 +483,9 @@ fn handle_node_click(
 
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
-
-            // TODO: Trigger context switch via BootstrapCommand::SpawnActor
-            // For now, just update the focus in the constellation
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_name: node.context_id.clone(),
+            });
         }
     }
 }
@@ -514,13 +518,17 @@ fn handle_mode_toggle(
     }
 }
 
-/// Handle gt/gT and Ctrl-^ for context navigation
+/// Handle gt/gT and Ctrl-^ for context navigation.
+///
+/// After updating constellation focus, emits `ContextSwitchRequested` to trigger
+/// the actual document swap in the cell system.
 fn handle_focus_navigation(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
     current_mode: Res<crate::cell::CurrentMode>,
     modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut pending_g: Local<bool>,
 ) {
     // Skip when a modal dialog is open
@@ -540,7 +548,12 @@ fn handle_focus_navigation(
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
         if keys.just_pressed(KeyCode::Digit6) {
             constellation.toggle_alternate();
-            info!("Switched to alternate context");
+            if let Some(ref focus_id) = constellation.focus_id {
+                info!("Switched to alternate context: {}", focus_id);
+                switch_writer.write(crate::cell::ContextSwitchRequested {
+                    context_name: focus_id.clone(),
+                });
+            }
             return;
         }
     }
@@ -560,12 +573,18 @@ fn handle_focus_navigation(
                 if let Some(id) = constellation.prev_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
                     info!("Focus: previous context {}", id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_name: id,
+                    });
                 }
             } else {
                 // gt = next
                 if let Some(id) = constellation.next_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
                     info!("Focus: next context {}", id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_name: id,
+                    });
                 }
             }
         } else if keys.any_just_pressed([

@@ -5,9 +5,9 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ComposeBlock, ConversationScrollState, CurrentMode, DriftKind, EditingBlockCell, EditorMode,
-    FocusTarget, InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
+    CellState, ComposeBlock, ConversationScrollState, CurrentMode, DriftKind, EditingBlockCell,
+    EditorMode, FocusTarget, InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::CurrentConversation;
@@ -1677,29 +1677,35 @@ pub fn sync_main_cell_to_conversation(
 
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 
-/// Handle block events from the server and update the MainCell's BlockDocument.
+/// Handle block events from the server, routing through DocumentCache.
 ///
 /// This system processes:
 /// - `ServerEventMessage` — streamed block events (inserted, edited, deleted, etc.)
 /// - `RpcResultMessage::ContextJoined` — initial document state after joining a context
 ///
-/// **Frontier-based sync protocol:**
+/// **Multi-context routing:**
+/// All events are routed by `document_id` to the appropriate `CachedDocument` in
+/// `DocumentCache`. For the active document, changes are also mirrored to
+/// `DocumentSyncState` for backward compatibility with `sync_main_cell_to_conversation`.
+///
+/// **Sync protocol (per document):**
 /// - Initial state (ContextJoined) → full sync via `from_oplog()`
 /// - Subsequent BlockInserted → incremental merge via `merge_ops_owned()`
 /// - BlockTextOps → always incremental merge
 ///
 /// Implements terminal-like auto-scroll: if the user is at the bottom when
-/// new content arrives, we stay at the bottom. If they've scrolled up to
-/// read history, we don't interrupt them.
+/// new content arrives, we stay at the bottom.
 pub fn handle_block_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
+    mut doc_cache: ResMut<super::components::DocumentCache>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut current_conv: ResMut<CurrentConversation>,
 ) {
     use kaijutsu_client::ServerEvent;
+    use super::components::CachedDocument;
 
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
@@ -1709,9 +1715,45 @@ pub fn handle_block_events(
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
-        if let RpcResultMessage::ContextJoined { document_id, initial_state, .. } = result {
-            if let Some(state) = initial_state {
-                // Use server's document_id as canonical
+        if let RpcResultMessage::ContextJoined { seat, document_id, initial_state } = result {
+            let context_name = seat.id.context.clone();
+
+            // Create or update cache entry
+            if !doc_cache.contains(document_id) {
+                let mut cached = CachedDocument {
+                    doc: BlockDocument::new(document_id, &agent_id),
+                    sync: super::sync::SyncManager::new(),
+                    context_name: context_name.clone(),
+                    synced_at_generation: 0,
+                    last_accessed: std::time::Instant::now(),
+                    scroll_offset: 0.0,
+                    seat_info: Some(seat.clone()),
+                };
+
+                // Apply initial state if provided
+                if let Some(state) = initial_state {
+                    match cached.sync.apply_initial_state(&mut cached.doc, &state.document_id, &state.ops) {
+                        Ok(result) => {
+                            info!("Cache: initial sync for '{}' ({}) result: {:?}", context_name, document_id, result);
+                        }
+                        Err(e) => {
+                            error!("Cache: initial sync error for '{}' ({}): {}", context_name, document_id, e);
+                        }
+                    }
+                }
+
+                doc_cache.insert(document_id.clone(), cached);
+            }
+
+            // If this is the first context or no active doc yet, make it active
+            let is_first = doc_cache.active_id().is_none();
+            if is_first {
+                doc_cache.set_active(document_id);
+            }
+
+            // Mirror to DocumentSyncState for the active document
+            let is_active = doc_cache.active_id() == Some(document_id.as_str());
+            if is_active {
                 if current_conv.id() != Some(document_id) {
                     info!(
                         "Updating current_conv to server's document_id: {} (was {:?})",
@@ -1721,28 +1763,47 @@ pub fn handle_block_events(
                     current_conv.0 = Some(document_id.clone());
                 }
 
-                match sync_state.apply_initial_state(&state.document_id, &agent_id, &state.ops) {
-                    Ok(result) => {
-                        info!("Initial state sync result: {:?}", result);
-                    }
-                    Err(e) => {
-                        error!("Initial state sync error: {}", e);
+                if let Some(state) = initial_state {
+                    match sync_state.apply_initial_state(&state.document_id, &agent_id, &state.ops) {
+                        Ok(result) => {
+                            info!("Initial state sync result: {:?}", result);
+                        }
+                        Err(e) => {
+                            error!("Initial state sync error: {}", e);
+                        }
                     }
                 }
             }
         }
     }
 
-    // Handle streamed block events
+    let active_doc_id = doc_cache.active_id().map(|s| s.to_string());
+
+    // Handle streamed block events — route by document_id through DocumentCache
     for ServerEventMessage(event) in server_events.read() {
         match event {
             ServerEvent::BlockInserted { document_id, block, ops } => {
-                match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
-                    Ok(result) => {
-                        trace!("Block insert sync result for {:?}: {:?}", block.id, result);
+                // Route to cache entry
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    match cached.sync.apply_block_inserted(&mut cached.doc, document_id, block, ops) {
+                        Ok(result) => {
+                            trace!("Cache: block insert for {} {:?}: {:?}", document_id, block.id, result);
+                        }
+                        Err(e) => {
+                            trace!("Cache: block insert error for {} {:?}: {}", document_id, block.id, e);
+                        }
                     }
-                    Err(e) => {
-                        trace!("Block insert sync error for {:?}: {}", block.id, e);
+                }
+
+                // Mirror to DocumentSyncState if active
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
+                        Ok(result) => {
+                            trace!("Block insert sync result for {:?}: {:?}", block.id, result);
+                        }
+                        Err(e) => {
+                            trace!("Block insert sync error for {:?}: {}", block.id, e);
+                        }
                     }
                 }
             }
@@ -1752,12 +1813,27 @@ pub fn handle_block_events(
                 block_id,
                 ops,
             } => {
-                match sync_state.apply_text_ops(document_id, &agent_id, ops) {
-                    Ok(result) => {
-                        trace!("Text ops sync result for {:?}: {:?}", block_id, result);
+                // Route to cache entry
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    match cached.sync.apply_text_ops(&mut cached.doc, document_id, ops) {
+                        Ok(result) => {
+                            trace!("Cache: text ops for {} {:?}: {:?}", document_id, block_id, result);
+                        }
+                        Err(e) => {
+                            trace!("Cache: text ops error for {} {:?}: {}", document_id, block_id, e);
+                        }
                     }
-                    Err(e) => {
-                        trace!("Text ops sync error for {:?}: {}", block_id, e);
+                }
+
+                // Mirror to DocumentSyncState if active
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    match sync_state.apply_text_ops(document_id, &agent_id, ops) {
+                        Ok(result) => {
+                            trace!("Text ops sync result for {:?}: {:?}", block_id, result);
+                        }
+                        Err(e) => {
+                            trace!("Text ops sync error for {:?}: {}", block_id, e);
+                        }
                     }
                 }
             }
@@ -1767,22 +1843,34 @@ pub fn handle_block_events(
                 block_id,
                 status,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if document_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.set_status(block_id, *status) {
-                    warn!("Failed to update block status: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.set_status(block_id, *status)
+                {
+                    warn!("Cache: failed to update block status for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.set_status(block_id, *status) {
+                        warn!("Failed to update block status: {}", e);
+                    }
                 }
             }
             ServerEvent::BlockDeleted {
                 document_id,
                 block_id,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if document_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.delete_block(block_id) {
-                    warn!("Failed to delete block: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.delete_block(block_id)
+                {
+                    warn!("Cache: failed to delete block for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.delete_block(block_id) {
+                        warn!("Failed to delete block: {}", e);
+                    }
                 }
             }
             ServerEvent::BlockCollapsedChanged {
@@ -1790,11 +1878,17 @@ pub fn handle_block_events(
                 block_id,
                 collapsed,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if document_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
-                    warn!("Failed to update block collapsed state: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.set_collapsed(block_id, *collapsed)
+                {
+                    warn!("Cache: failed to update collapsed for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
+                        warn!("Failed to update block collapsed state: {}", e);
+                    }
                 }
             }
             ServerEvent::BlockMoved {
@@ -1802,11 +1896,17 @@ pub fn handle_block_events(
                 block_id,
                 after_id,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if document_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
-                    warn!("Failed to move block: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.move_block(block_id, after_id.as_ref())
+                {
+                    warn!("Cache: failed to move block for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
+                        warn!("Failed to move block: {}", e);
+                    }
                 }
             }
             // Resource events are not block-related — ignore here
@@ -1819,6 +1919,83 @@ pub fn handle_block_events(
     if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;
+    }
+}
+
+/// Handle context switch requests.
+///
+/// When `ContextSwitchRequested` is received (from constellation gt/gT/Ctrl-^/click):
+/// 1. Save current scroll state to active CachedDocument
+/// 2. Look up target document_id from context_name
+/// 3. **Cache hit**: swap active_id, mirror cached doc to DocumentSyncState, restore scroll
+/// 4. **Cache miss**: log warning (future: trigger join_context RPC)
+pub fn handle_context_switch(
+    mut switch_events: MessageReader<super::components::ContextSwitchRequested>,
+    mut doc_cache: ResMut<super::components::DocumentCache>,
+    mut sync_state: ResMut<super::components::DocumentSyncState>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+    mut current_conv: ResMut<CurrentConversation>,
+) {
+    for event in switch_events.read() {
+        let context_name = &event.context_name;
+
+        // Look up document_id for this context
+        let target_doc_id = match doc_cache.document_id_for_context(context_name) {
+            Some(id) => id.to_string(),
+            None => {
+                warn!(
+                    "Context switch requested for '{}' but no cached document found",
+                    context_name
+                );
+                // TODO: trigger join_context RPC for cache miss
+                continue;
+            }
+        };
+
+        // Skip if already active
+        if doc_cache.active_id() == Some(target_doc_id.as_str()) {
+            continue;
+        }
+
+        // Save current scroll offset to outgoing cache entry
+        if let Some(active_id) = doc_cache.active_id().map(|s| s.to_string())
+            && let Some(cached) = doc_cache.get_mut(&active_id)
+        {
+            cached.scroll_offset = scroll_state.offset;
+        }
+
+        // Switch active document
+        doc_cache.set_active(&target_doc_id);
+
+        // Mirror cached document to DocumentSyncState
+        if let Some(cached) = doc_cache.get(&target_doc_id) {
+            let agent_id = format!("user:{}", whoami::username());
+
+            // Rebuild DocumentSyncState from cached document's oplog
+            let oplog_bytes = cached.doc.oplog_bytes();
+            sync_state.reset();
+            match sync_state.apply_initial_state(&target_doc_id, &agent_id, &oplog_bytes) {
+                Ok(_) => {
+                    info!("Context switch: mirrored '{}' ({}) to DocumentSyncState", context_name, target_doc_id);
+                }
+                Err(e) => {
+                    error!("Context switch: failed to mirror '{}' to DocumentSyncState: {}", context_name, e);
+                }
+            }
+
+            // Update CurrentConversation
+            current_conv.0 = Some(target_doc_id.clone());
+
+            // Restore scroll offset
+            scroll_state.offset = cached.scroll_offset;
+            scroll_state.target_offset = cached.scroll_offset;
+            scroll_state.following = false; // Don't auto-scroll on switch
+
+            info!(
+                "Context switch complete: '{}' → document '{}' (scroll: {:.0})",
+                context_name, target_doc_id, cached.scroll_offset
+            );
+        }
     }
 }
 
