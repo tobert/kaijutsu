@@ -1,13 +1,13 @@
-//! Create context dialog for the constellation
+//! Create/Fork context dialog for the constellation
 //!
-//! Provides a modal dialog that appears when clicking the "+" node,
-//! allowing users to enter a name for a new context.
+//! Provides a modal dialog for creating new contexts (clicking "+") or
+//! forking existing contexts (pressing `f` on a focused node).
 
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use uuid::Uuid;
 
-use crate::connection::{BootstrapChannel, BootstrapCommand};
+use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor};
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -23,6 +23,26 @@ use crate::ui::theme::Theme;
 pub struct ModalDialogOpen(pub bool);
 
 // ============================================================================
+// DIALOG MODE
+// ============================================================================
+
+/// What kind of dialog to show.
+#[derive(Clone, Debug)]
+pub enum DialogMode {
+    /// Create a brand new context (from "+" node click)
+    CreateContext,
+    /// Fork from an existing context (from `f` on focused node)
+    ForkContext {
+        source_context: String,
+        source_document_id: String,
+    },
+}
+
+/// Message requesting the dialog to open in a specific mode.
+#[derive(Message, Clone, Debug)]
+pub struct OpenContextDialog(pub DialogMode);
+
+// ============================================================================
 // COMPONENTS
 // ============================================================================
 
@@ -31,23 +51,18 @@ pub struct ModalDialogOpen(pub bool);
 #[reflect(Component)]
 pub struct CreateContextNode;
 
-/// Marker for the create context dialog (modal overlay)
+/// Marker for the create context dialog (modal overlay).
+/// Carries the dialog mode for submit routing.
 #[derive(Component)]
-pub struct CreateContextDialog;
+pub struct CreateContextDialog {
+    pub mode: DialogMode,
+}
 
 /// Marker for the text input field in the dialog
-#[derive(Component)]
+#[derive(Component, Default)]
 pub struct ContextNameInput {
     /// Current input text
     pub text: String,
-}
-
-impl Default for ContextNameInput {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-        }
-    }
 }
 
 /// Marker for the submit button
@@ -70,10 +85,12 @@ pub struct InputTextDisplay;
 pub fn setup_create_dialog_systems(app: &mut App) {
     app.init_resource::<ModalDialogOpen>()
         .register_type::<CreateContextNode>()
+        .add_message::<OpenContextDialog>()
         .add_systems(
             Update,
             (
                 handle_create_node_click,
+                handle_open_dialog_message,
                 handle_dialog_input,
                 handle_dialog_buttons,
                 handle_dialog_escape,
@@ -182,7 +199,6 @@ fn handle_create_node_click(
     create_nodes: Query<&Interaction, (Changed<Interaction>, With<CreateContextNode>)>,
     existing_dialog: Query<Entity, With<CreateContextDialog>>,
 ) {
-    // Check if dialog already exists
     if !existing_dialog.is_empty() {
         return;
     }
@@ -191,17 +207,49 @@ fn handle_create_node_click(
         if *interaction == Interaction::Pressed {
             info!("Create context node clicked - spawning dialog");
             modal_state.0 = true;
-            spawn_create_dialog(&mut commands, &theme);
+            spawn_context_dialog(&mut commands, &theme, DialogMode::CreateContext);
         }
     }
 }
 
-/// Spawn the create context dialog (modal)
-fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
+/// Handle OpenContextDialog messages (from `f` key on constellation node).
+fn handle_open_dialog_message(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    mut modal_state: ResMut<ModalDialogOpen>,
+    mut events: MessageReader<OpenContextDialog>,
+    existing_dialog: Query<Entity, With<CreateContextDialog>>,
+) {
+    if !existing_dialog.is_empty() {
+        return;
+    }
+
+    for OpenContextDialog(mode) in events.read() {
+        info!("Opening context dialog: {:?}", mode);
+        modal_state.0 = true;
+        spawn_context_dialog(&mut commands, &theme, mode.clone());
+    }
+}
+
+/// Spawn the context dialog (modal) — supports both create and fork modes.
+fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode) {
+    let (title_text, placeholder, submit_label) = match &mode {
+        DialogMode::CreateContext => (
+            "Create New Context".to_string(),
+            "Enter context name...".to_string(),
+            "Create",
+        ),
+        DialogMode::ForkContext { source_context, .. } => (
+            format!("Fork from @{}", source_context),
+            "Enter fork name...".to_string(),
+            "Fork",
+        ),
+    };
+
     // Modal overlay (darkens background)
     commands
         .spawn((
-            CreateContextDialog,
+            CreateContextDialog { mode },
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
@@ -214,7 +262,6 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
             ZIndex(crate::constants::ZLayer::MODAL),
-            // Capture interactions to prevent click-through
             Interaction::None,
         ))
         .with_children(|overlay| {
@@ -237,7 +284,7 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                 .with_children(|dialog| {
                     // Title
                     dialog.spawn((
-                        MsdfUiText::new("Create New Context")
+                        MsdfUiText::new(&title_text)
                             .with_font_size(16.0)
                             .with_color(theme.fg),
                         UiTextPositionCache::default(),
@@ -260,10 +307,9 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                             Outline::new(Val::Px(1.0), Val::ZERO, theme.accent),
                         ))
                         .with_children(|input_field| {
-                            // Input text display (starts with placeholder)
                             input_field.spawn((
                                 InputTextDisplay,
-                                MsdfUiText::new("Enter context name...")
+                                MsdfUiText::new(&placeholder)
                                     .with_font_size(14.0)
                                     .with_color(theme.fg_dim),
                                 UiTextPositionCache::default(),
@@ -303,7 +349,7 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                                     ));
                                 });
 
-                            // Create button
+                            // Submit button
                             buttons
                                 .spawn((
                                     CreateContextSubmit,
@@ -317,7 +363,7 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                                 ))
                                 .with_children(|btn| {
                                     btn.spawn((
-                                        MsdfUiText::new("Create")
+                                        MsdfUiText::new(submit_label)
                                             .with_font_size(12.0)
                                             .with_color(theme.accent),
                                         UiTextPositionCache::default(),
@@ -328,7 +374,7 @@ fn spawn_create_dialog(commands: &mut Commands, theme: &Theme) {
                 });
         });
 
-    info!("Spawned create context dialog");
+    info!("Spawned context dialog");
 }
 
 /// Handle keyboard input in the dialog
@@ -338,10 +384,11 @@ fn handle_dialog_input(
     mut modal_state: ResMut<ModalDialogOpen>,
     mut input_query: Query<&mut ContextNameInput>,
     mut text_query: Query<&mut MsdfUiText, With<InputTextDisplay>>,
-    dialog_query: Query<Entity, With<CreateContextDialog>>,
+    dialog_query: Query<(Entity, &CreateContextDialog)>,
     theme: Res<Theme>,
     bootstrap: Res<BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
+    actor: Option<Res<RpcActor>>,
 ) {
     let Ok(mut input) = input_query.single_mut() else {
         return;
@@ -355,27 +402,21 @@ fn handle_dialog_input(
         }
 
         match (&event.logical_key, &event.text) {
-            // Backspace - remove last character
             (Key::Backspace, _) => {
                 input.text.pop();
                 text_changed = true;
             }
-            // Enter - submit
             (Key::Enter, _) => {
-                if !input.text.is_empty() {
-                    submit_create_context(&input.text, &bootstrap, &conn_state);
-                    // Close dialog and release modal state
+                if !input.text.is_empty()
+                    && let Ok((dialog_entity, dialog)) = dialog_query.single()
+                {
+                    submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
                     modal_state.0 = false;
-                    if let Ok(dialog_entity) = dialog_query.single() {
-                        commands.entity(dialog_entity).despawn();
-                    }
+                    commands.entity(dialog_entity).despawn();
                 }
             }
-            // Escape - handled by separate system
             (Key::Escape, _) => {}
-            // Regular text input
             (_, Some(text)) => {
-                // Filter to valid context name characters
                 for c in text.chars() {
                     if c.is_alphanumeric() || c == '-' || c == '_' {
                         input.text.push(c);
@@ -387,16 +428,25 @@ fn handle_dialog_input(
         }
     }
 
-    // Update the displayed text if it changed
-    if text_changed {
-        if let Ok(mut msdf_text) = text_query.single_mut() {
-            if input.text.is_empty() {
-                msdf_text.text = "Enter context name...".to_string();
-                msdf_text.color = bevy_to_rgba8(theme.fg_dim);
-            } else {
-                msdf_text.text = input.text.clone();
-                msdf_text.color = bevy_to_rgba8(theme.fg);
-            }
+    if text_changed
+        && let Ok(mut msdf_text) = text_query.single_mut()
+    {
+        let placeholder = if dialog_query
+            .single()
+            .map(|(_, d)| matches!(d.mode, DialogMode::ForkContext { .. }))
+            .unwrap_or(false)
+        {
+            "Enter fork name..."
+        } else {
+            "Enter context name..."
+        };
+
+        if input.text.is_empty() {
+            msdf_text.text = placeholder.to_string();
+            msdf_text.color = bevy_to_rgba8(theme.fg_dim);
+        } else {
+            msdf_text.text = input.text.clone();
+            msdf_text.color = bevy_to_rgba8(theme.fg);
         }
     }
 }
@@ -408,31 +458,29 @@ fn handle_dialog_buttons(
     submit_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextSubmit>)>,
     cancel_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextCancel>)>,
     input_query: Query<&ContextNameInput>,
-    dialog_query: Query<Entity, With<CreateContextDialog>>,
+    dialog_query: Query<(Entity, &CreateContextDialog)>,
     bootstrap: Res<BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
+    actor: Option<Res<RpcActor>>,
 ) {
-    let Ok(dialog_entity) = dialog_query.single() else {
+    let Ok((dialog_entity, dialog)) = dialog_query.single() else {
         return;
     };
 
-    // Check submit button
     for interaction in submit_query.iter() {
-        if *interaction == Interaction::Pressed {
-            if let Ok(input) = input_query.single() {
-                if !input.text.is_empty() {
-                    submit_create_context(&input.text, &bootstrap, &conn_state);
-                    modal_state.0 = false;
-                    commands.entity(dialog_entity).despawn();
-                }
-            }
+        if *interaction == Interaction::Pressed
+            && let Ok(input) = input_query.single()
+            && !input.text.is_empty()
+        {
+            submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
+            modal_state.0 = false;
+            commands.entity(dialog_entity).despawn();
         }
     }
 
-    // Check cancel button
     for interaction in cancel_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Create context cancelled");
+            info!("Dialog cancelled");
             modal_state.0 = false;
             commands.entity(dialog_entity).despawn();
         }
@@ -446,34 +494,78 @@ fn handle_dialog_escape(
     keys: Res<ButtonInput<KeyCode>>,
     dialog_query: Query<Entity, With<CreateContextDialog>>,
 ) {
-    if keys.just_pressed(KeyCode::Escape) {
-        if let Ok(dialog_entity) = dialog_query.single() {
-            info!("Create context cancelled (Escape)");
-            modal_state.0 = false;
-            commands.entity(dialog_entity).despawn();
-        }
+    if keys.just_pressed(KeyCode::Escape)
+        && let Ok(dialog_entity) = dialog_query.single()
+    {
+        info!("Dialog cancelled (Escape)");
+        modal_state.0 = false;
+        commands.entity(dialog_entity).despawn();
     }
 }
 
-/// Submit the create context request by respawning the actor with the new context.
-fn submit_create_context(
+/// Submit the dialog — routes to create or fork depending on mode.
+fn submit_dialog(
     name: &str,
+    mode: &DialogMode,
     bootstrap: &BootstrapChannel,
     conn_state: &crate::connection::RpcConnectionState,
+    actor: Option<&RpcActor>,
 ) {
-    let instance = Uuid::new_v4().to_string();
-    info!("Creating context: {} (instance: {})", name, instance);
-
     let kernel_id = conn_state
         .current_kernel
         .as_ref()
         .map(|k| k.id.clone())
         .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
 
-    let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
-        config: conn_state.ssh_config.clone(),
-        kernel_id,
-        context_name: name.to_string(),
-        instance,
-    });
+    match mode {
+        DialogMode::CreateContext => {
+            let instance = Uuid::new_v4().to_string();
+            info!("Creating context: {} (instance: {})", name, instance);
+
+            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+                config: conn_state.ssh_config.clone(),
+                kernel_id,
+                context_name: name.to_string(),
+                instance,
+            });
+        }
+        DialogMode::ForkContext { source_document_id, source_context } => {
+            info!("Forking context: {} from @{} (doc: {})", name, source_context, source_document_id);
+
+            let Some(actor) = actor else {
+                error!("Cannot fork: no active RPC actor");
+                return;
+            };
+
+            // Fork via ActorHandle, then spawn actor to join the new context
+            let handle = actor.handle.clone();
+            let doc_id = source_document_id.clone();
+            let fork_name = name.to_string();
+            let config = conn_state.ssh_config.clone();
+            let kernel_id = kernel_id.clone();
+            let bootstrap_tx = bootstrap.tx.clone();
+
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    // Use version 0 to fork from latest
+                    match handle.fork_from_version(&doc_id, 0, &fork_name).await {
+                        Ok(ctx) => {
+                            info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
+                            // Now spawn actor to join the newly forked context
+                            let instance = Uuid::new_v4().to_string();
+                            let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
+                                config,
+                                kernel_id,
+                                context_name: fork_name,
+                                instance,
+                            });
+                        }
+                        Err(e) => {
+                            error!("Fork failed: {}", e);
+                        }
+                    }
+                })
+                .detach();
+        }
+    }
 }

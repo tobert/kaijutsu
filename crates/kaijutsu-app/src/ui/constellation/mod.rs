@@ -19,6 +19,7 @@
 
 mod create_dialog;
 mod mini;
+pub mod model_picker;
 mod render;
 
 use bevy::prelude::*;
@@ -27,7 +28,7 @@ use kaijutsu_client::SeatInfo;
 use crate::agents::AgentActivityMessage;
 
 // Re-export ModalDialogOpen for use by other systems (e.g., prompt input)
-pub use create_dialog::ModalDialogOpen;
+pub use create_dialog::{DialogMode, ModalDialogOpen, OpenContextDialog};
 
 // Render module provides visual systems (used by the plugin internally)
 // Mini module provides render-to-texture previews for constellation nodes
@@ -72,6 +73,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);
+
+        // Add model picker systems
+        model_picker::setup_model_picker_systems(app);
     }
 }
 
@@ -529,6 +533,9 @@ fn handle_focus_navigation(
     modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+    mut dialog_writer: MessageWriter<OpenContextDialog>,
+    mut model_writer: MessageWriter<model_picker::OpenModelPicker>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     mut pending_g: Local<bool>,
 ) {
     // Skip when a modal dialog is open
@@ -595,6 +602,35 @@ fn handle_focus_navigation(
         ]) {
             // Cancel g prefix on other keys
             *pending_g = false;
+        }
+    }
+
+    // `f` key on focused constellation node = fork that context
+    if !*pending_g && keys.just_pressed(KeyCode::KeyF) {
+        if constellation.mode != ConstellationMode::Focused {
+            if let Some(ref focus_id) = constellation.focus_id {
+                if let Some(doc_id) = doc_cache.document_id_for_context(focus_id) {
+                    info!("Fork requested for context '{}' (doc: {})", focus_id, doc_id);
+                    dialog_writer.write(OpenContextDialog(DialogMode::ForkContext {
+                        source_context: focus_id.clone(),
+                        source_document_id: doc_id.to_string(),
+                    }));
+                } else {
+                    warn!("Cannot fork '{}': not in document cache", focus_id);
+                }
+            }
+        }
+    }
+
+    // `m` key on focused constellation node = open model picker
+    if !*pending_g && keys.just_pressed(KeyCode::KeyM) {
+        if constellation.mode != ConstellationMode::Focused {
+            if let Some(ref focus_id) = constellation.focus_id {
+                info!("Model picker requested for context '{}'", focus_id);
+                model_writer.write(model_picker::OpenModelPicker {
+                    context_name: focus_id.clone(),
+                });
+            }
         }
     }
 }

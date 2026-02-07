@@ -36,7 +36,7 @@ use super::components::{
     BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState, CurrentMode,
     DocumentCache, DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
-    PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
+    PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -94,6 +94,7 @@ impl Plugin for CellPlugin {
             .init_resource::<LayoutGeneration>()
             .init_resource::<DocumentSyncState>()
             .init_resource::<DocumentCache>()
+            .init_resource::<PendingContextSwitch>()
             .init_resource::<systems::EditorEntities>()
             .init_resource::<systems::ConsumedModeKeys>()
             // Bubble system resources
@@ -157,6 +158,10 @@ impl Plugin for CellPlugin {
                     .after(systems::handle_block_events)
                     .after(systems::handle_context_switch)
                     .after(systems::handle_prompt_submitted),
+                // Staleness detection (after block events and context switch)
+                systems::check_cache_staleness
+                    .after(systems::handle_block_events)
+                    .after(systems::handle_context_switch),
                 // Block navigation (j/k) after sync
                 systems::navigate_blocks.after(systems::sync_main_cell_to_conversation),
                 // Expand block with `f` key

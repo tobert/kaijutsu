@@ -1703,6 +1703,9 @@ pub fn handle_block_events(
     mut doc_cache: ResMut<super::components::DocumentCache>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut current_conv: ResMut<CurrentConversation>,
+    mut pending_switch: ResMut<super::components::PendingContextSwitch>,
+    mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
+    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
 ) {
     use kaijutsu_client::ServerEvent;
     use super::components::CachedDocument;
@@ -1742,6 +1745,7 @@ pub fn handle_block_events(
                     }
                 }
 
+                cached.synced_at_generation = sync_gen.0;
                 doc_cache.insert(document_id.clone(), cached);
             }
 
@@ -1749,6 +1753,17 @@ pub fn handle_block_events(
             let is_first = doc_cache.active_id().is_none();
             if is_first {
                 doc_cache.set_active(document_id);
+            }
+
+            // Check if this ContextJoined satisfies a pending context switch
+            if let Some(ref pending_ctx) = pending_switch.0 {
+                if pending_ctx == &context_name {
+                    info!("Pending context switch satisfied: '{}' joined, auto-switching", context_name);
+                    pending_switch.0 = None;
+                    switch_writer.write(super::components::ContextSwitchRequested {
+                        context_name: context_name.clone(),
+                    });
+                }
             }
 
             // Mirror to DocumentSyncState for the active document
@@ -1787,6 +1802,7 @@ pub fn handle_block_events(
                 if let Some(cached) = doc_cache.get_mut(document_id) {
                     match cached.sync.apply_block_inserted(&mut cached.doc, document_id, block, ops) {
                         Ok(result) => {
+                            cached.synced_at_generation = sync_gen.0;
                             trace!("Cache: block insert for {} {:?}: {:?}", document_id, block.id, result);
                         }
                         Err(e) => {
@@ -1817,6 +1833,7 @@ pub fn handle_block_events(
                 if let Some(cached) = doc_cache.get_mut(document_id) {
                     match cached.sync.apply_text_ops(&mut cached.doc, document_id, ops) {
                         Ok(result) => {
+                            cached.synced_at_generation = sync_gen.0;
                             trace!("Cache: text ops for {} {:?}: {:?}", document_id, block_id, result);
                         }
                         Err(e) => {
@@ -1935,6 +1952,9 @@ pub fn handle_context_switch(
     mut sync_state: ResMut<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut current_conv: ResMut<CurrentConversation>,
+    mut pending_switch: ResMut<super::components::PendingContextSwitch>,
+    bootstrap: Res<crate::connection::BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     for event in switch_events.read() {
         let context_name = &event.context_name;
@@ -1943,11 +1963,26 @@ pub fn handle_context_switch(
         let target_doc_id = match doc_cache.document_id_for_context(context_name) {
             Some(id) => id.to_string(),
             None => {
-                warn!(
-                    "Context switch requested for '{}' but no cached document found",
+                // Cache miss — spawn a new actor to join the context, then auto-switch
+                info!(
+                    "Context switch: cache miss for '{}', spawning actor to join",
                     context_name
                 );
-                // TODO: trigger join_context RPC for cache miss
+                pending_switch.0 = Some(context_name.clone());
+
+                let kernel_id = conn_state
+                    .current_kernel
+                    .as_ref()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+
+                let instance = uuid::Uuid::new_v4().to_string();
+                let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
+                    config: conn_state.ssh_config.clone(),
+                    kernel_id,
+                    context_name: context_name.clone(),
+                    instance,
+                });
                 continue;
             }
         };
@@ -1996,6 +2031,70 @@ pub fn handle_context_switch(
                 context_name, target_doc_id, cached.scroll_offset
             );
         }
+    }
+}
+
+/// Check if the active document is stale (missed events while inactive).
+///
+/// Compares the active document's `synced_at_generation` against the current
+/// `SyncGeneration`. If stale, triggers a `get_document_state()` re-fetch
+/// via IoTaskPool to resync the document.
+pub fn check_cache_staleness(
+    doc_cache: Res<super::components::DocumentCache>,
+    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    mut checked_gen: Local<u64>,
+) {
+    // Only check when SyncGeneration actually changed
+    if sync_gen.0 == *checked_gen {
+        return;
+    }
+    *checked_gen = sync_gen.0;
+
+    let Some(active_id) = doc_cache.active_id().map(|s| s.to_string()) else {
+        return;
+    };
+
+    let Some(cached) = doc_cache.get(&active_id) else {
+        return;
+    };
+
+    // If the active document hasn't synced since the last generation bump, it's stale
+    if cached.synced_at_generation < sync_gen.0 {
+        let Some(ref actor) = actor else {
+            return;
+        };
+
+        info!(
+            "Staleness detected: active doc '{}' synced_at={} < current={}",
+            active_id, cached.synced_at_generation, sync_gen.0
+        );
+
+        let handle = actor.handle.clone();
+        let doc_id = active_id.clone();
+
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                match handle.get_document_state(&doc_id).await {
+                    Ok(state) => {
+                        info!(
+                            "Staleness re-fetch complete for {}: {} bytes oplog",
+                            doc_id,
+                            state.ops.len()
+                        );
+                        // The re-fetched state will arrive as a ContextJoined-like event
+                        // through the normal sync path. The actor's subscription system
+                        // handles the replay.
+                    }
+                    Err(e) => {
+                        warn!("Staleness re-fetch failed for {}: {}", doc_id, e);
+                    }
+                }
+            })
+            .detach();
+
+        // Mark as checked to avoid re-triggering until next generation bump
+        // The actual resync will update synced_at_generation when events arrive
     }
 }
 

@@ -758,6 +758,11 @@ impl DocumentCache {
         self.documents.len()
     }
 
+    /// Iterate over all cached documents.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &CachedDocument)> {
+        self.documents.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Move a document_id to the front of the MRU list.
     fn touch_mru(&mut self, document_id: &str) {
         self.mru.retain(|id| id != document_id);
@@ -949,6 +954,14 @@ pub struct ContextSwitchRequested {
     /// The context_name to switch to (matches constellation node context_id).
     pub context_name: String,
 }
+
+/// Resource tracking a pending context switch for cache-miss handling.
+///
+/// When a `ContextSwitchRequested` targets a context not yet in `DocumentCache`,
+/// we spawn a new actor to join the context and store the target here.
+/// Once `ContextJoined` arrives for the matching context, we auto-switch.
+#[derive(Resource, Default)]
+pub struct PendingContextSwitch(pub Option<String>);
 
 /// Resource tracking the conversation scroll position.
 ///
