@@ -80,15 +80,37 @@ impl FileDocumentCache {
         // Detect language from extension
         let language = detect_language(path);
 
-        // Create CRDT document
-        self.block_store
-            .create_document(doc_id.clone(), DocumentKind::Code, language)
-            .map_err(|e| format!("failed to create document for {}: {}", path, e))?;
-
-        let block_id = self
+        // Create CRDT document — handle race where another thread loaded it first
+        let block_id = match self
             .block_store
-            .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, text)
-            .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
+            .create_document(doc_id.clone(), DocumentKind::Code, language)
+        {
+            Ok(()) => {
+                self.block_store
+                    .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, text)
+                    .map_err(|e| format!("failed to insert block for {}: {}", path, e))?
+            }
+            Err(_) => {
+                // Document already exists (concurrent load race). Re-check cache first,
+                // then fall back to fetching the existing block from the store.
+                {
+                    let mut cache = self.cache.write();
+                    if let Some(entry) = cache.get_mut(&doc_id) {
+                        entry.last_access = Instant::now();
+                        return Ok((entry.document_id.clone(), entry.block_id.clone()));
+                    }
+                }
+                // Not in cache yet — the other thread hasn't inserted. Grab from store.
+                let snapshots = self
+                    .block_store
+                    .block_snapshots(&doc_id)
+                    .map_err(|e| format!("failed to read existing doc {}: {}", path, e))?;
+                snapshots
+                    .first()
+                    .map(|s| s.id.clone())
+                    .ok_or_else(|| format!("document {} exists but has no blocks", path))?
+            }
+        };
 
         // Insert into cache (evict if needed)
         {
@@ -306,23 +328,27 @@ impl FileDocumentCache {
         Ok((doc_id, block_id))
     }
 
-    /// Evict oldest entries if cache exceeds max size.
+    /// Evict oldest clean entries if cache exceeds max size.
+    /// Dirty entries are never evicted — they must be flushed first.
     fn evict_if_needed(&self, cache: &mut HashMap<String, CachedFileDoc>) {
         while cache.len() >= self.max_cached {
-            let oldest = cache
+            // Find oldest non-dirty entry
+            let oldest_clean = cache
                 .iter()
+                .filter(|(_, e)| !e.dirty)
                 .min_by_key(|(_, e)| e.last_access)
                 .map(|(k, _)| k.clone());
 
-            if let Some(key) = oldest {
-                if cache.get(&key).is_some_and(|e| e.dirty) {
-                    tracing::warn!(
-                        doc_id = %key,
-                        "Evicting dirty file document — unflushed changes lost"
-                    );
-                }
+            if let Some(key) = oldest_clean {
                 cache.remove(&key);
             } else {
+                // All entries are dirty — can't evict without data loss.
+                // Allow cache to exceed max until a flush clears dirty flags.
+                tracing::warn!(
+                    cache_size = cache.len(),
+                    max = self.max_cached,
+                    "All cached file documents are dirty — skipping eviction. Call flush_dirty()."
+                );
                 break;
             }
         }
@@ -351,7 +377,8 @@ fn detect_language(path: &str) -> Option<String> {
         "zsh" => "zsh",
         "c" => "c",
         "cpp" | "cc" | "cxx" => "cpp",
-        "h" | "hpp" => "c",
+        "h" => "c",
+        "hpp" => "cpp",
         "java" => "java",
         "kt" => "kotlin",
         "toml" => "toml",

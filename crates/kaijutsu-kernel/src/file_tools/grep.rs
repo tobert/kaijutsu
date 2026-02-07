@@ -134,10 +134,21 @@ impl ExecutionEngine for GrepEngine {
             let path_str = file_path.display().to_string();
 
             // Try reading from CRDT cache first (sees uncommitted edits),
-            // fall back to raw VFS read
+            // fall back to raw VFS read with pre-flight size check
             let content = match self.cache.read_content(&path_str).await {
-                Ok(c) => c,
+                Ok(c) => {
+                    if c.len() > MAX_FILE_SIZE {
+                        continue;
+                    }
+                    c
+                }
                 Err(_) => {
+                    // Check size before loading to avoid OOM on huge files
+                    if let Ok(attr) = self.vfs.getattr(file_path).await {
+                        if attr.size as usize > MAX_FILE_SIZE {
+                            continue;
+                        }
+                    }
                     match self.vfs.read_all(file_path).await {
                         Ok(bytes) => match String::from_utf8(bytes) {
                             Ok(s) => s,
@@ -147,10 +158,6 @@ impl ExecutionEngine for GrepEngine {
                     }
                 }
             };
-
-            if content.len() > MAX_FILE_SIZE {
-                continue;
-            }
 
             let lines: Vec<&str> = content.lines().collect();
             let ctx = p.context_lines as usize;
