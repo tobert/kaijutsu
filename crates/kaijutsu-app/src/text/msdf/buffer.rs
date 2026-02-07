@@ -20,6 +20,9 @@ pub struct PositionedGlyph {
     pub y: f32,
     /// Font size used for this glyph (needed to scale MSDF region).
     pub font_size: f32,
+    /// Advance width in pixels from cosmic-text.
+    /// Used by the shader to suppress AA bleed at character cell boundaries.
+    pub advance_width: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
     /// Fractional pixel offset from baseline snapping (for potential subpixel rendering).
@@ -230,6 +233,7 @@ impl MsdfTextBuffer {
                     // Pixel-aligned baseline + grid-fitted vertical offset
                     y: y_adjusted,
                     font_size,
+                    advance_width: glyph.w,
                     color: self.default_color,
                     // Store fractional offset for potential subpixel rendering
                     subpixel_offset: baseline_offset,

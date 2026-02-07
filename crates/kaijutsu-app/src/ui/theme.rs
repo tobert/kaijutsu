@@ -369,13 +369,13 @@ impl Default for Theme {
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
 
             // Font rendering quality defaults
-            font_stem_darkening: 0.15,  // ClearType-like weight for small text
+            font_stem_darkening: 0.15,  // ClearType-like weight (cell boundary fade prevents bleed)
             font_hint_amount: 0.8,      // Strong hinting for crisp stems
             font_taa_enabled: true,     // Temporal AA for smoother edges
             font_taa_convergence_frames: 8, // 8 frames to converge (~133ms at 60fps)
             font_taa_initial_weight: 0.5,   // 50% current frame weight initially
             font_taa_final_weight: 0.1,     // 10% current frame weight at convergence
-            font_horz_scale: 1.1,       // Wider AA for vertical strokes
+            font_horz_scale: 1.1,       // Wider AA for vertical strokes (cell boundary fade prevents bleed)
             font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
             font_text_bias: 0.5,        // Standard SDF threshold
             font_gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark

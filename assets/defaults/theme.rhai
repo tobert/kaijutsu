@@ -141,10 +141,10 @@ let input_backdrop_color = hexa("#1a1b26", 0.85);
 // Font Rendering Quality (MSDF)
 // ============================================================================
 
-let font_stem_darkening = 0.15;             // Stronger stems at small sizes
+let font_stem_darkening = 0.15;             // ClearType-like weight (cell boundary fade prevents bleed)
 let font_hint_amount = 0.8;                 // Hinting strength (shader hinting at 30% was barely visible)
 let font_taa_enabled = true;                // Temporal AA
-let font_horz_scale = 1.1;                  // Wider AA for vertical strokes (l, I, |)
+let font_horz_scale = 1.1;                  // Wider AA for vertical strokes (cell boundary fade prevents bleed)
 let font_vert_scale = 0.6;                  // Sharper AA for horizontal strokes (crossbars)
 let font_text_bias = 0.5;                   // SDF threshold bias
 let font_gamma_correction = 0.85;           // Gamma-correct alpha (< 1.0 widens light-on-dark edges)

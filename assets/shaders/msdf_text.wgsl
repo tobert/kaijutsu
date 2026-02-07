@@ -52,6 +52,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
+    @location(4) cell_x: f32,         // normalized x within advance cell (0=left, 1=right)
 }
 
 struct VertexOutput {
@@ -60,6 +61,7 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) screen_pos: vec2<f32>,
     @location(3) importance: f32,
+    @location(4) cell_x: f32,
 }
 
 // ============================================================================
@@ -88,6 +90,7 @@ fn vertex(in: VertexInput) -> VertexOutput {
     // Screen pos should use original position, not jittered (for effects like rainbow)
     out.screen_pos = (in.position.xy + 1.0) * 0.5 * uniforms.resolution;
     out.importance = in.importance;
+    out.cell_x = in.cell_x;
     return out;
 }
 
@@ -353,8 +356,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
+    // === CELL BOUNDARY FADE ===
+    // Suppress AA bleed at character cell boundaries. MSDF quads extend beyond the
+    // advance width (SDF padding), and the AA transition zone is wider than the font's
+    // sidebearing. cell_x is 0 at the pen position and 1 at the right advance boundary.
+    // The fade starts slightly INSIDE the cell (at 0.97/0.03) to catch the AA zone
+    // of glyph strokes that extend near the sidebearing edge.
+    let cell_mask = smoothstep(-0.03, 0.03, in.cell_x) * smoothstep(1.03, 0.97, in.cell_x);
+    let faded_alpha = text_alpha * cell_mask;
+
     // Blend text using premultiplied alpha
-    output = blend_over_premultiplied(output, text_color, text_alpha * in.color.a);
+    output = blend_over_premultiplied(output, text_color, faded_alpha * in.color.a);
 
     // === LATE DISCARD ===
     // Discard pixels with no visible ink to prevent them writing to the depth buffer.
@@ -362,7 +374,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // transparent padding pixels to pass the threshold and write to depth, occluding the
     // visible edges of adjacent glyphs (the "smeared letters" bug). By discarding based
     // on final alpha instead, only pixels with actual ink claim depth buffer territory.
-    if output.a < 0.01 {
+    if output.a < 0.05 {
         discard;
     }
 
