@@ -566,6 +566,11 @@ impl world::Server for WorldImpl {
                 contexts.insert("default".to_string(), ContextState::new("default".to_string()));
 
                 let mut state_ref = state.borrow_mut();
+
+                // Register in server-level drift router (for listAllContexts).
+                // Use kernel_id as context name — drift RPCs look up by kernel_id.
+                state_ref.drift_router.register(&id, &main_document_id, None);
+
                 state_ref.kernels.insert(
                     id.clone(),
                     KernelState {
@@ -1945,46 +1950,83 @@ impl kernel::Server for KernelImpl {
             cursor_block: None,
         };
 
-        // Update state
-        {
-            let mut state_ref = state.borrow_mut();
+        let state2 = state.clone();
+        let kernel_id2 = kernel_id.clone();
+        let context_name2 = context_name.clone();
 
-            // Ensure context exists (create if not)
-            if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id) {
-                kernel.contexts
-                    .entry(context_name.clone())
-                    .or_insert_with(|| ContextState::new(context_name.clone()))
-                    .seats.push(seat_id.clone());
+        Promise::from_future(async move {
+            // Update state — grab kernel Arc, then drop borrow before async drift registration
+            let kernel_arc = {
+                let mut state_ref = state2.borrow_mut();
 
-                // Auto-create the document for this context if it doesn't exist
-                let doc_id = format!("{}@{}", kernel_id, context_name);
-                if !kernel.documents.contains(&doc_id) {
-                    log::info!("Auto-creating document {} for context", doc_id);
-                    if let Err(e) = kernel.documents.create_document(
-                        doc_id.clone(),
-                        DocumentKind::Conversation,
-                        None,
-                    ) {
-                        log::error!("Failed to create document {}: {}", doc_id, e);
+                // Ensure context exists (create if not)
+                let kernel_arc = if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id2) {
+                    kernel.contexts
+                        .entry(context_name2.clone())
+                        .or_insert_with(|| ContextState::new(context_name2.clone()))
+                        .seats.push(seat_id.clone());
+
+                    // Auto-create the document for this context if it doesn't exist
+                    let doc_id = format!("{}@{}", kernel_id2, context_name2);
+                    if !kernel.documents.contains(&doc_id) {
+                        log::info!("Auto-creating document {} for context", doc_id);
+                        if let Err(e) = kernel.documents.create_document(
+                            doc_id.clone(),
+                            DocumentKind::Conversation,
+                            None,
+                        ) {
+                            log::error!("Failed to create document {}: {}", doc_id, e);
+                        }
                     }
+
+                    Some(kernel.kernel.clone())
+                } else {
+                    None
+                };
+
+                // Track seat in user's seats
+                state_ref.my_seats.insert(seat_id.key(), seat_info.clone());
+                state_ref.current_seat = Some(seat_id);
+
+                kernel_arc
+            };
+            // borrow dropped here — safe to .await
+
+            // Register context in both drift routers so drift operations work
+            if let Some(kernel) = kernel_arc {
+                let doc_id = format!("{}@{}", kernel_id2, context_name2);
+
+                // Kernel-level drift router (used by push/pull/flush/merge RPCs)
+                let already_registered = {
+                    let mut drift = kernel.drift().write().await;
+                    let exists = drift.list_contexts().iter()
+                        .any(|c| c.context_name == context_name2);
+                    if !exists {
+                        drift.register(&context_name2, &doc_id, None);
+                    }
+                    exists
+                };
+
+                // Server-level drift router (used by listAllContexts)
+                if !already_registered {
+                    let mut state_ref = state2.borrow_mut();
+                    let short_id = state_ref.drift_router.register(&context_name2, &doc_id, None);
+                    log::info!("Registered context '{}' (doc: {}, short_id: {}) in DriftRouter",
+                        context_name2, doc_id, short_id);
                 }
             }
 
-            // Track seat in user's seats
-            state_ref.my_seats.insert(seat_id.key(), seat_info.clone());
-            state_ref.current_seat = Some(seat_id);
-        }
+            // Create and return SeatHandle capability
+            let seat_handle = SeatHandleImpl {
+                state: state.clone(),
+                seat_id: seat_info.id.clone(),
+                kernel_id: kernel_id.clone(),
+            };
 
-        // Create and return SeatHandle capability
-        let seat_handle = SeatHandleImpl {
-            state: state.clone(),
-            seat_id: seat_info.id.clone(),
-            kernel_id: kernel_id.clone(),
-        };
+            results.get().set_seat(capnp_rpc::new_client(seat_handle));
 
-        results.get().set_seat(capnp_rpc::new_client(seat_handle));
-
-        Promise::ok(())
+            Ok(())
+        })
     }
 
     // ========================================================================
