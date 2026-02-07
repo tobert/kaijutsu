@@ -1509,10 +1509,10 @@ pub fn prepare_msdf_texts(
             let x1 = x0 + (quad_width * text.scale) * 2.0 / resolution[0];
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
-            // Z-depth: each glyph gets a unique depth value.
-            // Using small increments ensures depth buffer precision is sufficient.
-            // Earlier glyphs have lower z values, so they "win" in depth test (Less).
-            let z = glyph_index as f32 * 0.0001;
+            // Z-depth: later glyphs get lower z values so they draw on top (win depth test).
+            // For LTR text, this means the left edge of 'e' draws over the right padding
+            // of 'm', preventing earlier glyphs' faint AA tails from occluding neighbors.
+            let z = 1.0 - glyph_index as f32 * 0.0001;
             glyph_index += 1;
 
             // Two triangles for the quad
