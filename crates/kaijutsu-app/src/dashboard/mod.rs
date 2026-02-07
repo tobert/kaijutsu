@@ -392,22 +392,31 @@ fn handle_dashboard_keyboard(
             state.selected_context = Some(0);
         }
 
-        // Respawn actor with selected kernel + context
-        if let (Some(kernel), Some(context)) =
-            (state.selected_kernel(), state.selected_context())
-        {
-            let instance = std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "default".to_string());
+        let instance = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "default".to_string());
 
-            info!("Enter pressed - taking seat in context: {}", context.name);
-            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
-                config: conn_state.ssh_config.clone(),
-                kernel_id: kernel.id.clone(),
-                context_name: context.name.clone(),
-                instance,
-            });
-        }
+        // Use selected kernel/context if available, otherwise defaults (reconnect)
+        let (kernel_id, context_name) =
+            if let (Some(kernel), Some(context)) =
+                (state.selected_kernel(), state.selected_context())
+            {
+                (kernel.id.clone(), context.name.clone())
+            } else {
+                info!("Enter pressed with empty lists — reconnecting with defaults");
+                (
+                    crate::constants::DEFAULT_KERNEL_ID.to_string(),
+                    "lobby".to_string(),
+                )
+            };
+
+        info!("Enter pressed - taking seat: kernel={} context={}", kernel_id, context_name);
+        let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+            config: conn_state.ssh_config.clone(),
+            kernel_id,
+            context_name,
+            instance,
+        });
     }
 }
 

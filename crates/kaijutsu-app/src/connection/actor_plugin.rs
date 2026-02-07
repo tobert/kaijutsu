@@ -9,6 +9,7 @@
 //! handle and spawn async tasks via `IoTaskPool`.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use bevy::prelude::*;
 use kaijutsu_client::{ActorHandle, Identity, KernelInfo, SshConfig};
@@ -16,6 +17,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::bootstrap::{self, BootstrapChannel, BootstrapCommand};
 use crate::constants::DEFAULT_KERNEL_ID;
+
+/// How often to retry connection when disconnected (seconds).
+const RECONNECT_INTERVAL_SECS: f64 = 5.0;
 
 // ============================================================================
 // Resources
@@ -72,6 +76,20 @@ impl RpcResultChannel {
 /// Monotonic generation — bumped on broadcast lag or reconnect.
 #[derive(Resource, Default)]
 pub struct SyncGeneration(pub u64);
+
+/// Timer for periodic reconnect attempts when disconnected.
+#[derive(Resource)]
+struct ReconnectTimer {
+    last_attempt: Instant,
+}
+
+impl Default for ReconnectTimer {
+    fn default() -> Self {
+        Self {
+            last_attempt: Instant::now(),
+        }
+    }
+}
 
 // ============================================================================
 // Bevy Messages (written by poll systems, read by consumer systems)
@@ -163,7 +181,8 @@ impl Plugin for ActorPlugin {
         app.insert_resource(bootstrap_channel)
             .insert_resource(RpcResultChannel::new())
             .init_resource::<RpcConnectionState>()
-            .init_resource::<SyncGeneration>();
+            .init_resource::<SyncGeneration>()
+            .init_resource::<ReconnectTimer>();
 
         // Register messages
         app.add_message::<ServerEventMessage>()
@@ -174,6 +193,7 @@ impl Plugin for ActorPlugin {
         app.add_systems(
             Update,
             (
+                periodic_reconnect,
                 poll_bootstrap_results,
                 poll_server_events,
                 poll_connection_status,
@@ -188,6 +208,36 @@ impl Plugin for ActorPlugin {
 // ============================================================================
 // Poll Systems
 // ============================================================================
+
+/// Periodically re-spawn the actor when disconnected.
+///
+/// Handles the case where the initial connection fails (e.g. no SSH keys in agent)
+/// and nothing else triggers a retry. Every `RECONNECT_INTERVAL_SECS`, if we're
+/// not connected, send a fresh `SpawnActor` command to the bootstrap thread.
+fn periodic_reconnect(
+    state: Res<RpcConnectionState>,
+    mut timer: ResMut<ReconnectTimer>,
+    bootstrap: Res<BootstrapChannel>,
+) {
+    if state.connected {
+        return;
+    }
+
+    let elapsed = timer.last_attempt.elapsed().as_secs_f64();
+    if elapsed < RECONNECT_INTERVAL_SECS {
+        return;
+    }
+
+    timer.last_attempt = Instant::now();
+    log::debug!("Periodic reconnect: spawning fresh actor (disconnected for {elapsed:.1}s)");
+
+    let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+        config: state.ssh_config.clone(),
+        kernel_id: DEFAULT_KERNEL_ID.to_string(),
+        context_name: "lobby".to_string(),
+        instance: "bevy-client".to_string(),
+    });
+}
 
 /// Check for new actors from the bootstrap thread.
 ///
