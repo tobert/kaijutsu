@@ -4,42 +4,40 @@
 
 ## Vision
 
-Kaijutsu's drift system enables **cognitive enhancement through multi-context collaboration** — pushing insights between contexts, pulling distilled summaries, merging work across parallel explorations. The server-side implementation is complete (DriftRouter, DriftEngine, all 9 drift RPC methods). But the client tells a different story:
+Kaijutsu's drift system enables **cognitive enhancement through multi-context collaboration** — pushing insights between contexts, pulling distilled summaries, merging work across parallel explorations. The server-side implementation is complete (DriftRouter, DriftEngine, all 9 drift RPC methods).
 
-- **ActorHandle** exists with 11 methods, Send+Sync, concurrent dispatch — but the app doesn't use it
-- **ConnectionBridge** (1,557 lines) duplicates RPC dispatch with its own command/event enums
-- Drift blocks render passively with a `🚂` prefix and dim color — no interactive drift UI exists
-- The constellation shows context nodes but has no drift connection lines or fork-from-UI
+Phases 1–3 are complete. The client now uses ActorHandle exclusively, drift blocks render with variant-specific formatting, and the constellation shows drift-aware connections. Phase 4 (multi-context navigation) remains.
 
-This plan bridges that gap in four phases.
-
-## Current vs Target Architecture
+## Architecture (Post Phase 3)
 
 ```
-CURRENT                                    TARGET
-┌─────────────────────┐                    ┌─────────────────────┐
-│     Bevy App        │                    │     Bevy App        │
-│                     │                    │                     │
-│  ConnectionBridge   │                    │  ActorPlugin        │
-│  ├─ 17 commands     │                    │  ├─ ActorHandle     │
-│  ├─ 26 events       │                    │  ├─ ServerEvent     │
-│  ├─ manual thread   │     ────────►      │  │  broadcast       │
-│  └─ 1557 lines      │                    │  ├─ ConnectionState │
-│                     │                    │  └─ ~300 lines      │
-│  (ActorHandle       │                    │                     │
-│   unused by app)    │                    │  Drift UI           │
-│                     │                    │  ├─ context list    │
-│  No drift UI        │                    │  ├─ drift queue     │
-│                     │                    │  ├─ enhanced blocks │
-│  Single context     │                    │  └─ constellation   │
-│                     │                    │     drift lines     │
-│                     │                    │                     │
-│                     │                    │  Multi-context      │
-│                     │                    │  ├─ constellation   │
-│                     │                    │  │  as navigation   │
-│                     │                    │  ├─ fork-from-UI    │
-│                     │                    │  └─ per-ctx LLM     │
-└─────────────────────┘                    └─────────────────────┘
+┌─────────────────────────────────────────────────┐
+│                   Bevy App                       │
+│                                                  │
+│  ActorPlugin (~340 lines)                        │
+│  ├─ ActorHandle (36 methods, Send+Sync)          │
+│  ├─ ServerEvent broadcast                        │
+│  └─ ConnectionStatus broadcast                   │
+│                                                  │
+│  DriftPlugin                                     │
+│  ├─ DriftState (contexts, staged, notifications) │
+│  ├─ 5s periodic polling via ActorHandle           │
+│  └─ Drift arrival detection from ServerEvents    │
+│                                                  │
+│  Drift UI                                        │
+│  ├─ Variant-specific block rendering             │
+│  │   (Push ←/→, Pull/Distill boxed,             │
+│  │    Merge ⇄, Commit 📝)                        │
+│  ├─ Context list widget (south dock)             │
+│  ├─ Drift notification flash (5s auto-dismiss)   │
+│  └─ Constellation drift-aware connections        │
+│      (ancestry lines, staged drift lines)        │
+│                                                  │
+│  TODO: Multi-context (Phase 4)                   │
+│  ├─ Constellation as navigation                  │
+│  ├─ Fork-from-UI                                 │
+│  └─ Per-context LLM config                       │
+└─────────────────────────────────────────────────┘
 ```
 
 ## Phases
@@ -48,7 +46,7 @@ CURRENT                                    TARGET
 |-------|-----|------|------------|
 | 1 | [phase1-actor.md](phase1-actor.md) | Extend ActorHandle with macro + subscriptions + full coverage | — |
 | 2 | [phase2-bridge.md](phase2-bridge.md) | Replace ConnectionBridge with ActorPlugin | Phase 1 |
-| 3 | [phase3-drift-ui.md](phase3-drift-ui.md) | Drift commands, context list, enhanced rendering | Phase 2 |
+| 3 | [phase3-drift-ui.md](phase3-drift-ui.md) | Drift rendering, context widget, constellation lines | Phase 2 |
 | 4 | [phase4-multi-ctx.md](phase4-multi-ctx.md) | Constellation navigation, fork, per-context LLM | Phase 2, 3 |
 
 ```
@@ -57,35 +55,29 @@ Phase 1 ──► Phase 2 ──┬──► Phase 3
                        (3 and 4 are partially parallel)
 ```
 
-## ActorHandle Coverage Strategy
+## ActorHandle Coverage
 
-The Cap'n Proto schema defines **88 Kernel ordinals + 6 World ordinals**. ActorHandle does NOT wrap them 1:1 — it wraps what the app needs. Server-side operations (VFS, git, blob, config, MCP management, agents) stay behind kaish.
+The Cap'n Proto schema defines **88 Kernel ordinals + 6 World ordinals**. ActorHandle wraps what the app needs (36 methods). Server-side operations (VFS, git, blob, config, MCP management, agents) stay behind kaish.
 
-### Tier 1 — App Needs Now (current: 11, target: ~27)
+### Tier 1 — App Needs (36 methods, all complete)
 
 | Category | Methods | Status |
 |----------|---------|--------|
-| Drift (6) | drift_push, drift_flush, drift_queue, drift_cancel, drift_pull, drift_merge | ✅ Done |
-| Context (2) | list_all_contexts, get_context_id | ✅ Done |
-| CRDT sync (2) | push_ops, get_document_state | ✅ Done |
-| Tool exec (1) | execute_tool | ✅ Done |
-| LLM (2) | prompt, shell_execute | ❌ Phase 1 |
-| MCP tools (1) | call_mcp_tool | ❌ Phase 1 |
-| Timeline (2) | fork_from_version, cherry_pick_block | ❌ Phase 1 |
-| Context mgmt (4) | list_contexts, join_context, create_context, leave_seat | ❌ Phase 1 |
-| World-level (2) | whoami, list_kernels | ❌ Phase 1 |
-| Subscriptions (3) | subscribe_blocks, subscribe_mcp_resources, subscribe_mcp_elicitations | ❌ Phase 1 (broadcast pattern) |
+| Drift (6) | drift_push, drift_flush, drift_queue, drift_cancel, drift_pull, drift_merge | ✅ |
+| Context (2) | list_all_contexts, get_context_id | ✅ |
+| CRDT sync (2) | push_ops, get_document_state | ✅ |
+| Tool exec (1) | execute_tool | ✅ |
+| LLM (2) | prompt, shell_execute | ✅ |
+| MCP tools (1) | call_mcp_tool | ✅ |
+| Timeline (2) | fork_from_version, cherry_pick_block | ✅ |
+| Context mgmt (4) | list_contexts, join_context, create_context, leave_seat | ✅ |
+| World-level (2) | whoami, list_kernels | ✅ |
+| Subscriptions (3) | subscribe_blocks, subscribe_mcp_resources, subscribe_mcp_elicitations | ✅ |
+| LLM config (3) | get_llm_config, set_default_provider, set_default_model | ✅ |
+| Tool filter (2) | get_tool_filter, set_tool_filter | ✅ |
+| Info + history (4) | get_info, get_document_history, get_command_history, list_my_seats | ✅ |
 
-### Tier 2 — Nice to Have
-
-| Category | Methods | When |
-|----------|---------|------|
-| LLM config (3) | get_llm_config, set_default_provider, set_default_model | Phase 4 (early — Step 2) |
-| Tool filter (2) | get_tool_filter, set_tool_filter | Phase 4 |
-| Info (1) | get_info | Phase 2 (dashboard) |
-| History (2) | get_document_history, get_command_history | Later |
-
-### Tier 3 — Kaish-Only (~50 ordinals)
+### Tier 2 — Kaish-Only (~50 ordinals)
 
 These stay server-side, accessed via kaish commands or MCP:
 - VFS (@12-15): vfs, listMounts, mount, unmount
@@ -103,5 +95,5 @@ These stay server-side, accessed via kaish commands or MCP:
 |-------|--------|-------|
 | Phase 1 — ActorHandle | ✅ Complete | 36 methods, broadcast subscriptions, auto-reconnect |
 | Phase 2 — Bridge replacement | ✅ Complete | ActorPlugin (~340 lines) replaces ConnectionBridge (1,302 lines) |
-| Phase 3 — Drift UI | 🔄 In progress | Enhanced rendering, DriftState, context widget, constellation lines |
-| Phase 4 — Multi-context | 🔲 Not started | |
+| Phase 3 — Drift UI | ✅ Complete | Variant rendering, DriftState polling, context widget, constellation drift lines, notifications |
+| Phase 4 — Multi-context | 🔲 Not started | Constellation navigation, fork-from-UI, per-context LLM |
