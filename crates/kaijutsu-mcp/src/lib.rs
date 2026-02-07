@@ -1202,6 +1202,134 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
+    // Kaish Execution (via ActorHandle → ToolRegistry)
+    // ========================================================================
+
+    #[tool(description = "Execute a tool through the kernel's tool registry. Available tools include git, drift, search, and any registered execution engines. Returns the tool's output synchronously. Requires --connect to kaijutsu-server.")]
+    async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: kaish_exec requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.execute_tool(&req.tool, &req.params).await {
+            Ok(result) => {
+                if result.success {
+                    result.output
+                } else {
+                    format!("Tool error: {}", result.output)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect to kaijutsu-server.")]
+    async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: shell requires --connect to kaijutsu-server".to_string(),
+        };
+
+        let actor = &remote.actor;
+        let doc_id = &remote.document_id;
+
+        // Execute command — creates ShellCommand + ShellOutput blocks in the document.
+        // The output block starts as Status::Running and transitions to Done/Error
+        // when execution completes.
+        let cmd_block_id = match actor.shell_execute(&req.command, doc_id).await {
+            Ok(id) => id,
+            Err(e) => return format!("Error starting command: {e}"),
+        };
+
+        tracing::info!(
+            command = %req.command,
+            cmd_block = %cmd_block_id.to_key(),
+            doc = %doc_id,
+            "Shell command dispatched"
+        );
+
+        // Poll until the output block's status leaves Running.
+        let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
+        let start = std::time::Instant::now();
+        let poll_interval = tokio::time::Duration::from_millis(250);
+
+        loop {
+            if start.elapsed().as_secs() > timeout_secs {
+                return format!(
+                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
+                    timeout_secs, cmd_block_id.to_key()
+                );
+            }
+
+            tokio::time::sleep(poll_interval).await;
+
+            let state = match actor.get_document_state(doc_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Error polling document state: {e}");
+                    continue;
+                }
+            };
+
+            // Find the ShellOutput block that is a child of our command
+            let output_block = state.blocks.iter().find(|b| {
+                b.parent_id.as_ref() == Some(&cmd_block_id)
+                    && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
+            });
+
+            if let Some(block) = output_block {
+                match block.status {
+                    kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
+                        tracing::info!(
+                            command = %req.command,
+                            status = %block.status.as_str(),
+                            output_len = block.content.len(),
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "Shell command completed"
+                        );
+                        return if block.content.is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            block.content.clone()
+                        };
+                    }
+                    _ => {} // Still running, keep polling
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Context Identity
+    // ========================================================================
+
+    #[tool(description = "Get this MCP server's identity: context short ID, context name, and authenticated user. Useful for understanding your position in the drift network.")]
+    async fn whoami(&self) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: whoami requires --connect to kaijutsu-server".to_string(),
+        };
+
+        let identity = match actor.whoami().await {
+            Ok(id) => id,
+            Err(e) => return format!("Error getting identity: {e}"),
+        };
+
+        let (short_id, ctx_name) = match actor.get_context_id().await {
+            Ok(pair) => pair,
+            Err(e) => return format!("Error getting context: {e}"),
+        };
+
+        serde_json::json!({
+            "username": identity.username,
+            "display_name": identity.display_name,
+            "context_short_id": short_id,
+            "context_name": ctx_name,
+        }).to_string()
+    }
+
+    // ========================================================================
     // Undo
     // ========================================================================
 

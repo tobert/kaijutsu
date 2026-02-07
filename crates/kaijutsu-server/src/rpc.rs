@@ -40,7 +40,7 @@ use kaijutsu_kernel::{
     // Tool filtering
     ToolFilter,
 };
-use kaijutsu_crdt::{BlockKind, Role};
+use kaijutsu_crdt::{BlockKind, Role, Status};
 use serde_json;
 
 // ============================================================================
@@ -2280,6 +2280,11 @@ impl kernel::Server for KernelImpl {
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
+            // Mark output block as Running — clients poll this to detect completion
+            if let Err(e) = documents.set_status(&cell_id, &output_block_id, Status::Running) {
+                log::warn!("Failed to set output block to Running: {}", e);
+            }
+
             // Spawn execution in background
             let cell_id_clone = cell_id.clone();
             let output_block_id_clone = output_block_id.clone();
@@ -2320,6 +2325,12 @@ impl kernel::Server for KernelImpl {
                                 log::error!("Failed to set display hint: {}", e);
                             }
                         }
+
+                        // Mark complete — status reflects exit code
+                        let final_status = if result.code == 0 { Status::Done } else { Status::Error };
+                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, final_status) {
+                            log::error!("Failed to set output block status: {}", e);
+                        }
                     }
                     Err(e) => {
                         let error_msg = format!("Error: {}", e);
@@ -2327,6 +2338,10 @@ impl kernel::Server for KernelImpl {
                         // Write error to output block
                         if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &error_msg, 0) {
                             log::error!("Failed to update shell output with error: {}", e);
+                        }
+                        // Mark as error
+                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, Status::Error) {
+                            log::error!("Failed to set output block error status: {}", e);
                         }
                     }
                 }
