@@ -201,21 +201,56 @@ fn poll_bootstrap_results(
     let Ok(mut rx) = channel.rx.lock() else { return };
     while let Ok(result) = rx.try_recv() {
         match result {
-            bootstrap::BootstrapResult::ActorReady { handle, generation } => {
-                log::info!("Actor ready (generation {})", generation);
+            bootstrap::BootstrapResult::ActorReady { handle, generation, kernel_id, context_name } => {
+                log::info!("Actor ready (generation {}) kernel={} context={}", generation, kernel_id, context_name);
 
-                // Eagerly connect: fire whoami to trigger ensure_connected,
-                // which does SSH → attach_kernel → join_context → Connected.
+                // Eagerly connect: fire whoami to trigger ensure_connected
+                // (SSH → attach_kernel → join_context → subscriptions → Connected),
+                // then fetch document state and emit ContextJoined so the
+                // cell systems can initialize the DocumentCache and sync state.
                 let h = handle.clone();
                 let tx = result_channel.sender();
+                let kid = kernel_id.clone();
+                let ctx = context_name.clone();
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        match h.whoami().await {
-                            Ok(identity) => {
-                                let _ = tx.send(RpcResultMessage::IdentityReceived(identity));
+                        // 1. whoami triggers ensure_connected + gives us identity
+                        let identity = match h.whoami().await {
+                            Ok(id) => {
+                                let _ = tx.send(RpcResultMessage::IdentityReceived(id.clone()));
+                                Some(id)
                             }
-                            Err(e) => log::warn!("Initial whoami failed: {e}"),
-                        }
+                            Err(e) => {
+                                log::warn!("Initial whoami failed: {e}");
+                                return;
+                            }
+                        };
+
+                        // 2. Fetch initial document state for the joined context
+                        let document_id = format!("{}@{}", kid, ctx);
+                        let initial_state = match h.get_document_state(&document_id).await {
+                            Ok(state) => Some(state),
+                            Err(e) => {
+                                log::warn!("Initial get_document_state failed: {e}");
+                                None
+                            }
+                        };
+
+                        // 3. Construct SeatInfo from what we know
+                        let nick = identity.map(|id| id.username).unwrap_or_default();
+                        let seat = kaijutsu_client::SeatInfo {
+                            id: kaijutsu_client::SeatId::new(&nick, "bevy-client", &kid, &ctx),
+                            owner: nick,
+                            status: kaijutsu_client::SeatStatus::Active,
+                            last_activity: 0,
+                            cursor_block: None,
+                        };
+
+                        let _ = tx.send(RpcResultMessage::ContextJoined {
+                            seat,
+                            document_id,
+                            initial_state,
+                        });
                     })
                     .detach();
 

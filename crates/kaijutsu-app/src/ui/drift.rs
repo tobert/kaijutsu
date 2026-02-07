@@ -99,10 +99,17 @@ impl Plugin for DriftPlugin {
 fn poll_drift_state(
     actor: Option<Res<RpcActor>>,
     drift_state: Res<DriftState>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
     time: Res<Time>,
     result_channel: Res<RpcResultChannel>,
 ) {
     let Some(actor) = actor else { return };
+
+    // Don't fire RPCs when disconnected — they'd just trigger reconnect attempts
+    if !conn_state.connected {
+        return;
+    }
+
     let elapsed = time.elapsed_secs_f64();
 
     // Throttle: only poll every DRIFT_POLL_INTERVAL seconds

@@ -523,6 +523,12 @@ macro_rules! rpc_call {
     }};
 }
 
+/// Maximum backoff between reconnect attempts (30 seconds).
+const MAX_BACKOFF_SECS: f64 = 30.0;
+
+/// Base backoff duration (1 second), doubles each attempt.
+const BASE_BACKOFF_SECS: f64 = 1.0;
+
 /// The actual actor that holds !Send Cap'n Proto types.
 struct RpcActor {
     config: SshConfig,
@@ -537,6 +543,9 @@ struct RpcActor {
     status_tx: broadcast::Sender<ConnectionStatus>,
     /// Reconnection attempt counter (reset on success)
     reconnect_attempts: u32,
+    /// When the next reconnect attempt is allowed (exponential backoff).
+    /// None = no cooldown, reconnect immediately.
+    next_reconnect_at: Option<tokio::time::Instant>,
 }
 
 /// Held by the actor when connected.
@@ -565,13 +574,28 @@ impl RpcActor {
             event_tx,
             status_tx,
             reconnect_attempts: 0,
+            next_reconnect_at: None,
         }
     }
 
     /// Ensure we have a live connection, reconnecting if needed.
+    ///
+    /// Uses exponential backoff (1s, 2s, 4s, ... up to 30s) between reconnect
+    /// attempts. Commands arriving during the cooldown period are rejected with
+    /// `ConnectionLost` so callers aren't blocked waiting for the backoff timer.
     async fn ensure_connected(&mut self) -> Result<(), ActorError> {
         if self.connection.is_some() {
             return Ok(());
+        }
+
+        // Check backoff cooldown — reject immediately if we're in a cooldown period
+        if let Some(next_at) = self.next_reconnect_at {
+            if tokio::time::Instant::now() < next_at {
+                return Err(ActorError::ConnectionLost(format!(
+                    "reconnect backoff (attempt {}, waiting)",
+                    self.reconnect_attempts,
+                )));
+            }
         }
 
         self.reconnect_attempts += 1;
@@ -585,6 +609,32 @@ impl RpcActor {
             self.reconnect_attempts,
         );
 
+        let result = self.try_connect().await;
+
+        match result {
+            Ok(()) => {
+                self.reconnect_attempts = 0;
+                self.next_reconnect_at = None;
+                let _ = self.status_tx.send(ConnectionStatus::Connected);
+                Ok(())
+            }
+            Err(e) => {
+                // Set backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
+                let backoff_secs = (BASE_BACKOFF_SECS * 2.0_f64.powi(self.reconnect_attempts.saturating_sub(1) as i32))
+                    .min(MAX_BACKOFF_SECS);
+                self.next_reconnect_at = Some(
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(backoff_secs),
+                );
+                log::debug!(
+                    "Reconnect failed, next attempt in {backoff_secs:.1}s: {e}",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempt SSH connect → attach_kernel → join_context → subscriptions.
+    async fn try_connect(&mut self) -> Result<(), ActorError> {
         let client = connect_ssh(self.config.clone())
             .await
             .map_err(|e| {
@@ -611,12 +661,9 @@ impl RpcActor {
             })?;
 
         self.connection = Some(ConnectionState { client, kernel });
-        self.reconnect_attempts = 0;
 
         // Set up subscriptions on the new connection
         self.setup_subscriptions().await?;
-
-        let _ = self.status_tx.send(ConnectionStatus::Connected);
         Ok(())
     }
 
@@ -657,10 +704,6 @@ impl RpcActor {
     async fn run(mut self, mut rx: mpsc::Receiver<RpcCommand>) {
         let (err_tx, mut err_rx) = mpsc::unbounded_channel::<()>();
 
-        // TODO: If the server is down and commands queue up, we'll busy-retry
-        // ensure_connected() for each one. Consider a circuit breaker / backoff
-        // state that short-circuits commands for a cooldown period after N
-        // consecutive connection failures.
         loop {
             tokio::select! {
                 // Prioritize error signals so we disconnect before spawning

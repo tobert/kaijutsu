@@ -33,6 +33,8 @@ pub enum BootstrapResult {
     ActorReady {
         handle: ActorHandle,
         generation: u64,
+        kernel_id: String,
+        context_name: String,
     },
     /// Spawn failed (e.g. initial SSH connect failure).
     /// The actor will retry internally, but we report the first error.
@@ -121,8 +123,8 @@ fn bootstrap_thread(
                             // this LocalSet if latency becomes an issue.
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
-                                kernel_id,
-                                context_name,
+                                kernel_id.clone(),
+                                context_name.clone(),
                                 instance,
                                 None,
                             );
@@ -130,6 +132,8 @@ fn bootstrap_thread(
                             let _ = result_tx.send(BootstrapResult::ActorReady {
                                 handle,
                                 generation: current_gen,
+                                kernel_id,
+                                context_name,
                             });
                         }
                     }

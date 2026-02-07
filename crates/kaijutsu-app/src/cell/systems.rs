@@ -966,6 +966,11 @@ pub fn handle_prompt_submitted(
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
 ) {
+    // Early exit: don't do any work unless there are actually events to process
+    if submit_events.is_empty() {
+        return;
+    }
+
     // Get the current conversation ID
     let Some(conv_id) = current_conv.id() else {
         warn!("No current conversation to add message to");
