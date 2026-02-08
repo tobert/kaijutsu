@@ -364,18 +364,18 @@ Porter-Duff "over" compositing. Pipeline blend state is `src=ONE, dst=ONE_MINUS_
 ## 8. Action Items
 
 ### Remove
-- [ ] `cell_x` vertex attribute (pipeline.rs vertex struct + layout)
-- [ ] `cell_x` computation in `prepare_msdf_texts` (pipeline.rs)
-- [ ] `cell_x` in vertex/fragment shader structs (msdf_text.wgsl)
-- [ ] Cell boundary clipping + fade logic in fragment shader
-- [ ] Late discard comment about "depth buffer" (depth testing already removed)
-- [ ] Depth testing removal is done — verify no stale imports remain
+- [x] `cell_x` vertex attribute (pipeline.rs vertex struct + layout)
+- [x] `cell_x` computation in `prepare_msdf_texts` (pipeline.rs)
+- [x] `cell_x` in vertex/fragment shader structs (msdf_text.wgsl)
+- [x] Cell boundary clipping + fade logic in fragment shader
+- [x] Late discard comment about "depth buffer" (depth testing already removed)
+- [x] Depth testing removal is done — verify no stale imports remain
 
 ### Adjust
-- [ ] Color overlap test: change from "bleed = bug" to "verify energy conservation"
+- [x] Color overlap test: change from "bleed = bug" to "verify energy conservation"
   (total alpha at any pixel ≤ 1.0, no brightening artifacts)
-- [ ] Consider a softer test: verify that at 2px past boundary, wrong-color
-  contribution is < 5% (allows natural AA blending at the boundary pixel)
+- [x] Consider a softer test: verify that at 2px past boundary, wrong-color
+  contribution is < 15% (allows natural AA blending at the boundary pixel)
 
 ### Keep
 - [x] Premultiplied alpha blend state

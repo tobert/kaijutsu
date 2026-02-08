@@ -52,7 +52,6 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
-    @location(4) cell_x: f32,         // normalized x within advance cell (0=left, 1=right)
 }
 
 struct VertexOutput {
@@ -61,7 +60,6 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) screen_pos: vec2<f32>,
     @location(3) importance: f32,
-    @location(4) cell_x: f32,
 }
 
 // ============================================================================
@@ -89,7 +87,6 @@ fn vertex(in: VertexInput) -> VertexOutput {
     // Screen pos should use original position, not jittered (for effects like rainbow)
     out.screen_pos = (in.position.xy + 1.0) * 0.5 * uniforms.resolution;
     out.importance = in.importance;
-    out.cell_x = in.cell_x;
     return out;
 }
 
@@ -355,26 +352,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
-    // === CELL BOUNDARY CLIPPING ===
-    // Hard-clip fragments outside the advance cell. The margin (0.04 ≈ 0.5px at
-    // typical monospace sizes) accounts for sub-pixel positioning differences between
-    // the pen position and the nearest pixel center.
-    if in.cell_x < 0.04 || in.cell_x > 0.96 {
-        discard;
-    }
-
-    // === CELL BOUNDARY FADE ===
-    // Smooth fade within the clipped zone to avoid hard edges. The ramp runs from
-    // the clip boundary (0.04) inward to 0.10, giving ~0.8px of transition.
-    let cell_mask = smoothstep(0.04, 0.10, in.cell_x) * smoothstep(0.96, 0.90, in.cell_x);
-    let faded_alpha = text_alpha * cell_mask;
-
-    // Blend text using premultiplied alpha
-    output = blend_over_premultiplied(output, text_color, faded_alpha * in.color.a);
+    // Blend text using premultiplied alpha.
+    // Overlapping quad padding zones are handled by the SDF evaluation:
+    // outside the glyph shape, sd < 0.5, so text_alpha drops to ~0.
+    output = blend_over_premultiplied(output, text_color, text_alpha * in.color.a);
 
     // === LATE DISCARD ===
-    // Discard pixels with no visible ink to prevent them writing to the depth buffer.
-    if output.a < 0.05 {
+    // Discard pixels with no visible ink (saves fill rate on transparent regions).
+    if output.a < 0.01 {
         discard;
     }
 

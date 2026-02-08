@@ -63,12 +63,12 @@ fn debug_dot(
     let uv = [0.5, 0.5];
 
     // Two triangles for the quad
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, cell_x: 0.5 });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
 }
 
 /// Generate a rectangle outline (4 thin quads) for the given screen rect.
@@ -97,42 +97,42 @@ fn debug_rect_outline(
     // Top edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + width, y + LINE_WIDTH);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Bottom edge
     let [x0, y0] = to_ndc(x, y + height - LINE_WIDTH);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Left edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + LINE_WIDTH, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 
     // Right edge
     let [x0, y0] = to_ndc(x + width - LINE_WIDTH, y);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, cell_x: 0.5 });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
 }
 
 /// Label for the MSDF text render node.
@@ -153,11 +153,6 @@ pub struct MsdfVertex {
     /// Semantic importance (0.0 = faded/thin, 0.5 = normal, 1.0 = bold/emphasized).
     /// Used by shader to adjust stroke weight based on cursor proximity or agent activity.
     pub importance: f32,
-    /// Normalized position within the character's advance cell.
-    /// 0.0 = left advance boundary (pen position), 1.0 = right advance boundary.
-    /// Values < 0 or > 1 are in the MSDF padding zone beyond the cell.
-    /// The fragment shader uses this to suppress AA bleed at cell boundaries.
-    pub cell_x: f32,
 }
 
 /// GPU uniform for MSDF rendering.
@@ -228,12 +223,11 @@ impl Default for MsdfUniforms {
             sdf_texel: [1.0 / 1024.0, 1.0 / 1024.0], // Default atlas size
             hint_amount: 0.8, // Enable hinting by default (80% strength)
             // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
-            // Cell boundary fade prevents this from bleeding into neighbor glyphs
             stem_darkening: 0.15,
             jitter_offset: [0.0, 0.0],
             taa_frame_index: 0,
             taa_enabled: 1, // Enable TAA jitter by default
-            horz_scale: 1.1, // Wider AA for vertical strokes (cell boundary fade prevents bleed)
+            horz_scale: 1.1, // Wider AA for vertical strokes
             vert_scale: 0.6, // Sharper AA for horizontal strokes
             text_bias: 0.5,  // Standard SDF threshold
             gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
@@ -1493,29 +1487,19 @@ pub fn prepare_msdf_texts(
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
             // Z is flat — depth testing is disabled. Overlap between adjacent
-            // glyph quads is resolved by cell_mask + premultiplied alpha blending.
+            // glyph quads is resolved by premultiplied alpha blending.
             let z = 0.5;
-
-            // Compute cell_x: normalized position within the advance cell.
-            // cell_x=0 at pen position (left advance boundary), cell_x=1 at right advance boundary.
-            // The shader uses this to suppress AA bleed outside the character cell.
-            let (cell_x_left, cell_x_right) = if glyph.advance_width > 0.1 {
-                let adv = glyph.advance_width;
-                (-anchor_x / adv, (quad_width - anchor_x) / adv)
-            } else {
-                (0.5, 0.5) // Zero-width glyphs: no cell boundary fade
-            };
 
             // Two triangles for the quad
             // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
             let imp = glyph.importance;
-            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color, importance: imp, cell_x: cell_x_left });
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp, cell_x: cell_x_right });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp, cell_x: cell_x_left });
+            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
 
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp, cell_x: cell_x_right });
-            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color, importance: imp, cell_x: cell_x_right });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp, cell_x: cell_x_left });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
 
             // === DEBUG GEOMETRY ===
             // Generate debug visualization when debug mode is 1 or 2
@@ -1770,13 +1754,12 @@ pub fn init_msdf_resources(
     });
 
     // Create pipeline descriptor
-    // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) + cell_x(4) = 32 bytes
-    // Note: color is 4 bytes (u8x4), importance and cell_x are 4 bytes (f32) each
+    // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) = 28 bytes
     let vertex_layout = VertexBufferLayout {
         array_stride: std::mem::size_of::<MsdfVertex>() as u64,
         step_mode: VertexStepMode::Vertex,
         attributes: vec![
-            // Position (x, y, z) - z is used for depth testing
+            // Position (x, y, z)
             VertexAttribute {
                 format: VertexFormat::Float32x3,
                 offset: 0,
@@ -1800,12 +1783,6 @@ pub fn init_msdf_resources(
                 offset: 24, // 20 + 4 (color is 4 bytes)
                 shader_location: 3,
             },
-            // Cell X (normalized position within advance cell, for boundary fade)
-            VertexAttribute {
-                format: VertexFormat::Float32,
-                offset: 28, // 24 + 4 (importance is 4 bytes)
-                shader_location: 4,
-            },
         ],
     };
 
@@ -1823,10 +1800,9 @@ pub fn init_msdf_resources(
             topology: PrimitiveTopology::TriangleList,
             ..default()
         },
-        // No depth testing — overlap between adjacent glyph quads is handled by
-        // cell_mask (smoothstep fade at advance boundaries) + premultiplied alpha
-        // blending. Depth testing caused asymmetric right-into-left bleed because
-        // later glyphs won the depth test and occluded the left glyph's legitimate ink.
+        // No depth testing — overlap between adjacent glyph quads is handled
+        // purely by premultiplied alpha blending. Outside the glyph shape,
+        // the SDF evaluates to sd < 0.5, so text_alpha drops to ~0 naturally.
         depth_stencil: None,
         multisample: MultisampleState {
             count: 1,

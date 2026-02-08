@@ -21,7 +21,8 @@ pub struct PositionedGlyph {
     /// Font size used for this glyph (needed to scale MSDF region).
     pub font_size: f32,
     /// Advance width in pixels from cosmic-text.
-    /// Used by the pipeline to compute cell_x for boundary fade.
+    /// Used by tests for boundary analysis (no longer needed by pipeline).
+    #[allow(dead_code)]
     pub advance_width: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
