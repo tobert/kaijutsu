@@ -604,11 +604,8 @@ pub struct MsdfTextResources {
     /// Batches of vertices grouped by scissor bounds.
     /// Each batch has a scissor rect in physical pixels.
     pub batches: Vec<TextBatch>,
-    /// Depth texture for per-glyph depth testing.
-    pub depth_texture: Option<Texture>,
-    pub depth_texture_view: Option<TextureView>,
-    /// Cached resolution for depth texture recreation.
-    pub depth_texture_size: (u32, u32),
+    /// Cached resolution for resize detection.
+    pub texture_size: (u32, u32),
     /// Intermediate texture for TAA - MSDF renders here, TAA blends to ViewTarget.
     /// Only used when TAA is enabled.
     pub intermediate_texture: Option<Texture>,
@@ -805,12 +802,12 @@ impl ViewNode for MsdfTextRenderNode {
         };
 
         // Skip rendering during resize - detect by comparing config resolution
-        // against our depth texture size. Due to pipelining, config may have new
+        // against our cached texture size. Due to pipelining, config may have new
         // resolution before our resources are recreated.
         let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
         if let Some(config) = render_config {
             let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
-            if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+            if config_size != resources.texture_size && resources.texture_size != (0, 0) {
                 // Resolution mismatch - skip this frame to avoid scissor errors
                 return Ok(());
             }
@@ -830,11 +827,6 @@ impl ViewNode for MsdfTextRenderNode {
 
         let pipeline_cache = world.resource::<PipelineCache>();
         let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.pipeline) else {
-            return Ok(());
-        };
-
-        // Require depth texture for proper overlap handling
-        let Some(depth_texture_view) = &resources.depth_texture_view else {
             return Ok(());
         };
 
@@ -867,16 +859,7 @@ impl ViewNode for MsdfTextRenderNode {
                     },
                     depth_slice: None,
                 })],
-                // Use depth buffer for per-glyph depth testing
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: depth_texture_view,
-                    depth_ops: Some(Operations {
-                        // Clear depth buffer at start of each frame
-                        load: LoadOp::Clear(1.0),
-                        store: StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             },
@@ -958,7 +941,7 @@ impl ViewNode for MsdfTextTaaNode {
         if let Some(config) = render_config {
             if let Some(resources) = world.get_resource::<MsdfTextResources>() {
                 let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
-                if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+                if config_size != resources.texture_size && resources.texture_size != (0, 0) {
                     return Ok(());
                 }
             }
@@ -1429,11 +1412,6 @@ pub fn prepare_msdf_texts(
     #[cfg(debug_assertions)]
     let mut debug_logged_first = false;
 
-    // Track glyph index for z-depth assignment.
-    // Each glyph gets a unique z-value so depth testing resolves overlaps.
-    // Earlier glyphs (lower index) have lower z and "win" in overlap regions.
-    let mut glyph_index: u32 = 0;
-
     for text in &extracted.texts {
         // Convert logical bounds to physical pixel scissor rect
         let scissor = [
@@ -1514,11 +1492,9 @@ pub fn prepare_msdf_texts(
             let x1 = x0 + (quad_width * text.scale) * 2.0 / resolution[0];
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
-            // Z-depth: later glyphs get lower z values so they draw on top (win depth test).
-            // For LTR text, this means the left edge of 'e' draws over the right padding
-            // of 'm', preventing earlier glyphs' faint AA tails from occluding neighbors.
-            let z = 1.0 - glyph_index as f32 * 0.0001;
-            glyph_index += 1;
+            // Z is flat — depth testing is disabled. Overlap between adjacent
+            // glyph quads is resolved by cell_mask + premultiplied alpha blending.
+            let z = 0.5;
 
             // Compute cell_x: normalized position within the advance cell.
             // cell_x=0 at pen position (left advance boundary), cell_x=1 at right advance boundary.
@@ -1616,37 +1592,19 @@ pub fn prepare_msdf_texts(
         queue.write_buffer(buffer, 0, vertex_data);
     }
 
-    // Create or update depth texture if resolution changed.
-    // Always recreate - render node will skip if sizes don't match ViewTarget yet.
+    // Track resolution for resize detection in render nodes.
     let width = resolution[0] as u32;
     let height = resolution[1] as u32;
-    if resources.depth_texture_size != (width, height) && width > 0 && height > 0 {
-        let depth_texture = device.create_texture(&TextureDescriptor {
-            label: Some("msdf_depth_texture"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Depth32Float,
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let depth_texture_view = depth_texture.create_view(&TextureViewDescriptor::default());
-        resources.depth_texture = Some(depth_texture);
-        resources.depth_texture_view = Some(depth_texture_view);
-        resources.depth_texture_size = (width, height);
+    if resources.texture_size != (width, height) && width > 0 && height > 0 {
+        resources.texture_size = (width, height);
         // Mark intermediate texture for recreation at new size
         resources.intermediate_texture = None;
         resources.intermediate_texture_view = None;
     }
 
-    // Create intermediate texture for TAA if needed (separate from depth texture)
+    // Create intermediate texture for TAA if needed.
     // This must be checked every frame because TAA can be toggled and resources
-    // may be initialized after the depth texture already exists.
+    // may be initialized after the texture size is already tracked.
     if taa_state.enabled
         && resources.intermediate_texture_view.is_none()
         && width > 0
@@ -1865,15 +1823,11 @@ pub fn init_msdf_resources(
             topology: PrimitiveTopology::TriangleList,
             ..default()
         },
-        // Enable depth testing so each glyph "wins" in overlapping regions.
-        // Glyphs rendered first (lower z) take precedence, preventing double-blend.
-        depth_stencil: Some(DepthStencilState {
-            format: TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: CompareFunction::Less,
-            stencil: StencilState::default(),
-            bias: DepthBiasState::default(),
-        }),
+        // No depth testing — overlap between adjacent glyph quads is handled by
+        // cell_mask (smoothstep fade at advance boundaries) + premultiplied alpha
+        // blending. Depth testing caused asymmetric right-into-left bleed because
+        // later glyphs won the depth test and occluded the left glyph's legitimate ink.
+        depth_stencil: None,
         multisample: MultisampleState {
             count: 1,
             mask: !0,
@@ -1915,9 +1869,7 @@ pub fn init_msdf_resources(
         bind_group: None,
         vertex_count: 0,
         batches: Vec::new(),
-        depth_texture: None,
-        depth_texture_view: None,
-        depth_texture_size: (0, 0),
+        texture_size: (0, 0),
         intermediate_texture: None,
         intermediate_texture_view: None,
         format, // Store the format used for pipeline creation

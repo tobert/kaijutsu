@@ -48,7 +48,7 @@ struct Uniforms {
 @group(0) @binding(2) var atlas_sampler: sampler;
 
 struct VertexInput {
-    @location(0) position: vec3<f32>,  // x, y in NDC, z for depth testing
+    @location(0) position: vec3<f32>,  // x, y in NDC, z unused (depth testing removed)
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
@@ -83,7 +83,6 @@ fn vertex(in: VertexInput) -> VertexOutput {
         jittered_pos = jittered_pos + jitter_ndc;
     }
 
-    // Use z from input for depth testing (earlier glyphs have lower z, winning depth test)
     out.clip_position = vec4<f32>(jittered_pos, in.position.z, 1.0);
     out.uv = in.uv;
     out.color = in.color;
@@ -356,13 +355,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
+    // === CELL BOUNDARY CLIPPING ===
+    // Hard-clip fragments outside the advance cell. The margin (0.04 ≈ 0.5px at
+    // typical monospace sizes) accounts for sub-pixel positioning differences between
+    // the pen position and the nearest pixel center.
+    if in.cell_x < 0.04 || in.cell_x > 0.96 {
+        discard;
+    }
+
     // === CELL BOUNDARY FADE ===
-    // Suppress AA bleed at character cell boundaries. MSDF quads extend beyond the
-    // advance width (SDF padding), and the AA transition zone is wider than the font's
-    // sidebearing. cell_x is 0 at the pen position and 1 at the right advance boundary.
-    // The fade starts slightly INSIDE the cell (at 0.97/0.03) to catch the AA zone
-    // of glyph strokes that extend near the sidebearing edge.
-    let cell_mask = smoothstep(-0.03, 0.03, in.cell_x) * smoothstep(1.03, 0.97, in.cell_x);
+    // Smooth fade within the clipped zone to avoid hard edges. The ramp runs from
+    // the clip boundary (0.04) inward to 0.10, giving ~0.8px of transition.
+    let cell_mask = smoothstep(0.04, 0.10, in.cell_x) * smoothstep(0.96, 0.90, in.cell_x);
     let faded_alpha = text_alpha * cell_mask;
 
     // Blend text using premultiplied alpha
@@ -370,10 +374,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // === LATE DISCARD ===
     // Discard pixels with no visible ink to prevent them writing to the depth buffer.
-    // Previous approach discarded based on raw SDF distance (sd < 0.48), but this caused
-    // transparent padding pixels to pass the threshold and write to depth, occluding the
-    // visible edges of adjacent glyphs (the "smeared letters" bug). By discarding based
-    // on final alpha instead, only pixels with actual ink claim depth buffer territory.
     if output.a < 0.05 {
         discard;
     }
