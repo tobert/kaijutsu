@@ -109,6 +109,12 @@ pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
     ]
 }
 
+/// Convert Bevy Color to cosmic-text Color (packed ARGB u32).
+pub fn bevy_to_cosmic_color(color: Color) -> cosmic_text::Color {
+    let [r, g, b, a] = bevy_to_rgba8(color);
+    cosmic_text::Color::rgba(r, g, b, a)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MSDF Render Configuration
 // ─────────────────────────────────────────────────────────────────────────────

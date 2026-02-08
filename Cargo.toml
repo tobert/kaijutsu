@@ -28,7 +28,7 @@ kaijutsu-client = { path = "crates/kaijutsu-client" }
 # Kaish (execution engine + client)
 kaish-kernel = { git = "https://github.com/tobert/kaish", branch = "main" }
 kaish-client = { git = "https://github.com/tobert/kaish", branch = "main" }
-kaish-glob = { git = "https://github.com/tobert/kaish", branch = "main" }
+kaish-glob = { path = "../kaish/crates/kaish-glob" }
 
 # Cap'n Proto
 capnp = "0.25"
@@ -64,6 +64,7 @@ bevy_brp_extras = { git = "https://github.com/tobert/bevy_brp", branch = "fix/se
 
 # Text rendering
 cosmic-text = "0.16"
+pulldown-cmark = "0.12"
 
 # CRDT + Persistence
 # Using diamond-types-extended - unified CRDT library forked from diamond-types (local source for development)

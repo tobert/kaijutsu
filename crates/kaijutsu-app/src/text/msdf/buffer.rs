@@ -112,6 +112,26 @@ impl MsdfTextBuffer {
         self.text_hash = Self::hash_str(text);
     }
 
+    /// Set rich text with per-span attributes (bold, italic, color, etc.).
+    ///
+    /// This wraps cosmic-text's `Buffer::set_rich_text()` for markdown rendering.
+    /// Per-span colors are propagated through `LayoutGlyph::color_opt` and read
+    /// back in `update_glyphs()` as per-glyph colors.
+    pub fn set_rich_text<'r, 's, I>(
+        &mut self,
+        font_system: &mut FontSystem,
+        spans: I,
+        default_attrs: &Attrs<'_>,
+        shaping: Shaping,
+    ) where
+        I: IntoIterator<Item = (&'s str, Attrs<'r>)>,
+    {
+        self.buffer.set_rich_text(font_system, spans, default_attrs, shaping, None);
+        self.dirty = true;
+        // Hash the buffer text for change detection
+        self.text_hash = Self::hash_str(&self.text());
+    }
+
     /// Enable horizontal pixel snapping for monospace fonts.
     ///
     /// When enabled, glyph x-positions are rounded to pixel boundaries so that
@@ -228,6 +248,15 @@ impl MsdfTextBuffer {
                 // character cell starts at an integer offset
                 let x = if self.snap_x { glyph.x.round() } else { glyph.x };
 
+                // Per-glyph color from cosmic-text rich text (ARGB packed u32 → [R,G,B,A])
+                let color = glyph
+                    .color_opt
+                    .map(|c| {
+                        let (r, g, b, a) = c.as_rgba_tuple();
+                        [r, g, b, a]
+                    })
+                    .unwrap_or(self.default_color);
+
                 self.glyphs.push(PositionedGlyph {
                     key,
                     x,
@@ -235,7 +264,7 @@ impl MsdfTextBuffer {
                     y: y_adjusted,
                     font_size,
                     advance_width: glyph.w,
-                    color: self.default_color,
+                    color,
                     // Store fractional offset for potential subpixel rendering
                     subpixel_offset: baseline_offset,
                     // Default importance 0.5 = normal weight

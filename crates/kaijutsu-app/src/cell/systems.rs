@@ -11,7 +11,11 @@ use super::components::{
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::CurrentConversation;
-use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
+use crate::text::{
+    bevy_to_cosmic_color, FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig,
+    MsdfTextBuffer, TextMetrics,
+};
+use crate::text::markdown::{self, MarkdownColors};
 use crate::ui::format::format_for_display;
 use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
@@ -33,12 +37,6 @@ const ROLE_HEADER_HEIGHT: f32 = 20.0;
 /// Spacing between role header and block content.
 const ROLE_HEADER_SPACING: f32 = 4.0;
 
-/// Height of the status bar at bottom of window.
-const STATUS_BAR_HEIGHT: f32 = 32.0;
-
-/// Minimum height reserved for compose block (min_height + margins).
-/// ComposeBlock: 60px min + 8px top margin + 16px bottom margin = 84px
-const COMPOSE_BLOCK_MIN_HEIGHT: f32 = 84.0;
 
 // ============================================================================
 // BLOCK COLOR MAPPING
@@ -399,13 +397,9 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                     output.push_str(name);
                 }
                 output.push('\n');
-                // Pretty-print JSON input
+                // Pretty-print JSON input with real newlines in string values
                 if let Some(ref input) = block.tool_input {
-                    if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                        output.push_str(&pretty);
-                    } else {
-                        output.push_str(&input.to_string());
-                    }
+                    output.push_str(&display_json_value(input, 0));
                 }
             }
             BlockKind::ToolResult => {
@@ -536,14 +530,26 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String 
 /// For cells with content blocks, formats them with visual markers.
 /// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer), Changed<CellEditor>>,
+    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer, Option<&BlockCellContainer>), Changed<CellEditor>>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
         return;
     };
 
-    for (editor, mut buffer) in cells.iter_mut() {
+    for (editor, mut buffer, container) in cells.iter_mut() {
+        // Skip cells that have BlockCells — they render per-block via sync_block_cell_buffers.
+        // Clear the MainCell buffer so it doesn't render an overlapping text wall.
+        if container.is_some_and(|c| !c.block_cells.is_empty()) {
+            buffer.set_text(
+                &mut font_system,
+                "",
+                cosmic_text::Attrs::new(),
+                cosmic_text::Shaping::Advanced,
+            );
+            continue;
+        }
+
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
 
         // Use block-formatted text if we have blocks, otherwise use raw text
@@ -1036,28 +1042,30 @@ pub fn handle_prompt_submitted(
     }
 }
 
-/// Auto-focus the prompt cell when entering Input mode.
 /// Smooth scroll interpolation system.
 ///
 /// Runs every frame to smoothly interpolate scroll position toward target.
 ///
 /// Key insight: In follow mode, we lock directly to bottom (no interpolation).
-/// Interpolation is only used for manual scrolling and transitions INTO follow mode.
+/// Interpolation is only used for manual scrolling (wheel, Page Up/Down, etc.).
 /// This prevents the "chasing a moving target" stutter during streaming.
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
+    time: Res<Time>,
 ) {
     // Clear the user_scrolled flag at end of frame
     // (This system runs late in the frame after block events)
     scroll_state.user_scrolled_this_frame = false;
 
+    // Clamp target in case content shrank (context switch, block collapse)
+    scroll_state.clamp_target();
+
     let max = scroll_state.max_offset();
 
-    // In follow mode, lock directly to bottom - no interpolation needed
-    // This is how terminals work: content grows, viewport stays anchored
+    // In follow mode, lock directly to bottom — no interpolation needed.
+    // This is how terminals work: content grows, viewport stays anchored.
     if scroll_state.following {
         // Jitter prevention: only update if max changed by at least 1 pixel
-        // This prevents sub-pixel oscillation during streaming
         if (max - scroll_state.offset).abs() >= 1.0 {
             scroll_state.offset = max;
             scroll_state.target_offset = max;
@@ -1065,9 +1073,19 @@ pub fn smooth_scroll(
         return;
     }
 
-    // Not following: immediate scroll (no smoothing for now)
-    scroll_state.clamp_target();
-    scroll_state.offset = scroll_state.target_offset;
+    // Manual scroll: lerp toward target for smooth motion
+    const SCROLL_SPEED: f32 = 12.0;
+    let target = scroll_state.target_offset;
+    let offset = scroll_state.offset;
+    let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
+    let new_offset = offset + (target - offset) * t;
+
+    // Snap when close enough to prevent sub-pixel jitter
+    scroll_state.offset = if (new_offset - target).abs() < 0.5 {
+        target
+    } else {
+        new_offset
+    };
 }
 
 /// Handle mouse wheel scrolling for the conversation area.
@@ -1670,7 +1688,7 @@ pub fn sync_main_cell_to_conversation(
         }
     }
 
-    info!(
+    trace!(
         "Synced MainCell to conversation {} (version {})",
         conv_id, sync_version
     );
@@ -2109,6 +2127,54 @@ pub fn check_cache_staleness(
 
 use super::components::{BlockCell, BlockCellContainer, BlockCellLayout};
 
+/// Display a JSON value with real newlines in string values.
+///
+/// `serde_json::to_string_pretty` re-escapes newlines in string values as `\n`,
+/// which renders as literal backslash-n in the UI. This walks the JSON tree and
+/// outputs string content directly so embedded newlines display correctly.
+fn display_json_value(value: &serde_json::Value, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            // Output string content directly — preserves real \n as newlines
+            // Indent continuation lines to align with the opening quote
+            let continuation_pad = "  ".repeat(indent + 1);
+            let indented = s.replace('\n', &format!("\n{continuation_pad}"));
+            format!("\"{indented}\"")
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return "[]".to_string();
+            }
+            let inner_pad = "  ".repeat(indent + 1);
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| format!("{inner_pad}{}", display_json_value(v, indent + 1)))
+                .collect();
+            format!("[\n{}\n{pad}]", items.join(",\n"))
+        }
+        serde_json::Value::Object(obj) => {
+            if obj.is_empty() {
+                return "{}".to_string();
+            }
+            let inner_pad = "  ".repeat(indent + 1);
+            let entries: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{inner_pad}\"{k}\": {}",
+                        display_json_value(v, indent + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{pad}}}", entries.join(",\n"))
+        }
+    }
+}
+
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
@@ -2130,11 +2196,7 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
             let name = block.tool_name.as_deref().unwrap_or("unknown");
             let mut output = format!("🔧 Tool: {}\n", name);
             if let Some(ref input) = block.tool_input {
-                if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                    output.push_str(&pretty);
-                } else {
-                    output.push_str(&input.to_string());
-                }
+                output.push_str(&display_json_value(input, 0));
             }
             output
         }
@@ -2441,11 +2503,31 @@ pub fn sync_block_cell_buffers(
         // no longer prepended inline. See layout_block_cells for space reservation.
         let local_ctx = drift_state.local_context_id.as_deref();
         let text = format_single_block(block, local_ctx);
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
 
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
+
+        // Use rich text (markdown) for Text blocks, plain text for everything else
+        let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
+        if block.kind == BlockKind::Text {
+            // Build markdown colors from theme, with base block color as default
+            let md_colors = MarkdownColors {
+                heading: bevy_to_cosmic_color(theme.md_heading_color),
+                code: bevy_to_cosmic_color(theme.md_code_fg),
+                strong: theme.md_strong_color.map(bevy_to_cosmic_color),
+                code_block: bevy_to_cosmic_color(theme.md_code_block_fg),
+            };
+            let rich_spans = markdown::parse_to_rich_spans(&text);
+            let cosmic_spans = markdown::to_cosmic_spans(&rich_spans, &base_attrs, &md_colors);
+            buffer.set_rich_text(
+                &mut font_system,
+                cosmic_spans.into_iter(),
+                &base_attrs,
+                cosmic_text::Shaping::Advanced,
+            );
+        } else {
+            buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
+        }
 
         // Apply timeline visibility opacity (dimmed when viewing historical states)
         let color = if let Some(vis) = timeline_vis {
@@ -2635,8 +2717,7 @@ pub fn apply_block_cell_positions(
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
-    windows: Query<&Window>,
+    dag_view: Query<(&ComputedNode, &UiGlobalTransform), With<super::components::ConversationContainer>>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
@@ -2664,19 +2745,20 @@ pub fn apply_block_cell_positions(
     *prev_scroll = scroll_state.offset;
     // === End performance optimization ===
 
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    // Visible area for conversation content
-    // Reserve space for: header (workspace_margin_top), compose block, and status bar
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - STATUS_BAR_HEIGHT - COMPOSE_BLOCK_MIN_HEIGHT;
-    let visible_height = (visible_bottom - visible_top).max(100.0); // Ensure positive
+    // Derive visible bounds from the DagView's actual computed layout.
+    // This respects the flex layout (North dock, ComposeBlock, South dock)
+    // instead of relying on hardcoded constants that drift out of sync.
+    let Ok((node, transform)) = dag_view.single() else {
+        warn!("apply_block_cell_positions: DagView (ConversationContainer) not found");
+        return;
+    };
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = node.content_box();
+    let visible_top = translation.y + content.min.y;
+    let visible_bottom = translation.y + content.max.y;
+    let base_width = content.width();
+    let visible_height = (visible_bottom - visible_top).max(100.0);
     let margin = layout.workspace_margin_left;
-    let base_width = window_width - (margin * 2.0);
 
     // Update scroll state with visible area
     // Note: smooth_scroll handles clamping, so we don't call clamp_target() here

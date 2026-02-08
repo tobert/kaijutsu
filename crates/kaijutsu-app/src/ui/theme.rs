@@ -204,6 +204,19 @@ pub struct Theme {
     pub input_backdrop_color: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Markdown Rendering Colors
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Heading text color (bright accent)
+    pub md_heading_color: Color,
+    /// Inline `code` foreground color
+    pub md_code_fg: Color,
+    /// Fenced code block foreground color
+    pub md_code_block_fg: Color,
+    /// Bold/strong emphasis color (None = inherit base block color)
+    pub md_strong_color: Option<Color>,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Font Rendering Quality (MSDF text)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -367,6 +380,12 @@ impl Default for Theme {
             input_docked_height: 80.0,
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
+
+            // Markdown rendering defaults (Tokyo Night palette)
+            md_heading_color: Color::srgb(0.73, 0.60, 0.97),    // #bb9af7 purple accent
+            md_code_fg: Color::srgb(0.62, 0.81, 0.42),          // #9ece6a green
+            md_code_block_fg: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue
+            md_strong_color: None,                                // Inherit base block color
 
             // Font rendering quality defaults
             font_stem_darkening: 0.15,  // ClearType-like weight (cell boundary fade prevents bleed)

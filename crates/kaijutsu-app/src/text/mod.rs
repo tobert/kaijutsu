@@ -15,6 +15,7 @@
 //! msdf_text.wgsl (GPU rendering with effects)
 //! ```
 
+pub mod markdown;
 pub mod msdf;
 mod plugin;
 mod resources;
@@ -24,4 +25,4 @@ pub use msdf::{
     TextBounds, UiTextPositionCache,
 };
 pub use plugin::TextRenderPlugin;
-pub use resources::{bevy_to_rgba8, SharedFontSystem, TextMetrics};
+pub use resources::{bevy_to_cosmic_color, bevy_to_rgba8, SharedFontSystem, TextMetrics};
