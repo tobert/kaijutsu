@@ -98,6 +98,9 @@ struct TestConfig {
     color: Color,
     /// Enable glow effect.
     glow: bool,
+    /// Alternating per-glyph colors for overlap detection.
+    /// When set, even glyphs get color_a, odd glyphs get color_b.
+    alternating_colors: Option<([u8; 4], [u8; 4])>,
     /// Frames remaining before capture.
     frames_remaining: u32,
     /// Whether we've received and processed the image.
@@ -121,6 +124,7 @@ impl TestConfig {
             scale: 1.0,
             color: Color::WHITE,
             glow: false,
+            alternating_colors: None,
             frames_remaining: PRE_ROLL_FRAMES,
             done: Arc::new(AtomicBool::new(false)),
         }
@@ -149,6 +153,11 @@ impl TestConfig {
 
     fn with_font_family(mut self, family: TestFontFamily) -> Self {
         self.font_family = family;
+        self
+    }
+
+    fn with_alternating_colors(mut self, color_a: [u8; 4], color_b: [u8; 4]) -> Self {
+        self.alternating_colors = Some((color_a, color_b));
         self
     }
 }
@@ -663,6 +672,11 @@ fn setup_test_scene(
         buffer.set_text(&mut fs, &config.text, attrs, cosmic_text::Shaping::Advanced);
         buffer.set_color(config.color);
         buffer.visual_line_count(&mut fs, config.width as f32, None);
+
+        // Apply per-glyph alternating colors if requested
+        if let Some((color_a, color_b)) = config.alternating_colors {
+            buffer.set_alternating_colors(color_a, color_b);
+        }
 
         // Position and scale from config
         let text_config = MsdfTextAreaConfig {
@@ -2300,6 +2314,686 @@ fn golden_code_15px_mono() {
     let config = TestConfig::new("fn main() {", 15.0, 200, 40, true);
     let output = render_with_config(config);
     assert_matches_golden(&output, "golden_code_15px_mono");
+}
+
+// ============================================================================
+// METRIC VALIDATION TESTS
+// ============================================================================
+//
+// Numerical tests that catch sizing/spacing problems independent of
+// pixel-level rendering differences between FreeType and MSDF.
+
+/// Horizontal ink extent: (first_col, last_col) where average column
+/// luminance exceeds threshold, scanning only rows with visible text.
+///
+/// Returns `None` if no columns exceed the threshold.
+fn ink_extent(output: &TestOutput, threshold: f32) -> Option<(u32, u32)> {
+    // Find vertical extent of text (rows with any significant ink)
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > threshold {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if min_y > max_y {
+        return None;
+    }
+
+    let text_rows = (max_y - min_y + 1) as f32;
+    let mut first_col = None;
+    let mut last_col = None;
+
+    for x in 0..output.width {
+        let mut sum = 0.0f32;
+        for y in min_y..=max_y {
+            sum += output.pixel(x, y).luminance();
+        }
+        let avg = sum / text_rows;
+        if avg > threshold {
+            if first_col.is_none() {
+                first_col = Some(x);
+            }
+            last_col = Some(x);
+        }
+    }
+
+    match (first_col, last_col) {
+        (Some(f), Some(l)) => Some((f, l)),
+        _ => None,
+    }
+}
+
+/// Test: String ink width matches FreeType golden within tolerance.
+///
+/// For each golden test case, compare the horizontal extent of visible ink
+/// between MSDF render and FreeType golden. If MSDF glyphs are oversized,
+/// the total ink span will be wider than FreeType's.
+///
+/// Monospace cases use tight tolerance (3px). Serif/variable-width cases
+/// use wider tolerance (5px) because serifs and kerning pairs cause more
+/// AA spread difference between FreeType and MSDF renderers.
+#[test]
+fn golden_metrics_ink_width() {
+    let threshold = 0.15;
+
+    // (name, text, font_size, width, height, use_mono, font_family, width_tol, start_tol)
+    let cases: &[(&str, &str, f32, u32, u32, bool, Option<TestFontFamily>, i32, i32)] = &[
+        ("golden_document_22px_mono", "document", 22.0, 250, 60, true, None, 3, 3),
+        ("golden_mm_22px_mono", "mm", 22.0, 100, 50, true, None, 3, 3),
+        ("golden_hello_15px_mono", "Hello, World!", 15.0, 200, 40, true, None, 3, 3),
+        ("golden_av_22px_serif", "AV", 22.0, 100, 50, false, Some(TestFontFamily::Serif), 5, 3),
+        ("golden_code_15px_mono", "fn main() {", 15.0, 200, 40, true, None, 3, 3),
+    ];
+
+    for &(name, text, font_size, width, height, use_mono, ref font_family, width_tolerance, start_tolerance) in cases {
+        // Load FreeType golden
+        let Some(golden) = load_golden(name) else {
+            eprintln!("Skipping {name}: no golden image");
+            continue;
+        };
+
+        let mut config = TestConfig::new(text, font_size, width, height, use_mono);
+        if let Some(family) = font_family {
+            config = config.with_font_family(*family);
+        }
+        let output = render_with_config(config);
+
+        let golden_extent = ink_extent(&golden, threshold);
+        let msdf_extent = ink_extent(&output, threshold);
+
+        match (golden_extent, msdf_extent) {
+            (Some((gf, gl)), Some((mf, ml))) => {
+                let g_width = gl - gf;
+                let m_width = ml - mf;
+                let width_diff = (m_width as i32 - g_width as i32).abs();
+                let start_diff = (mf as i32 - gf as i32).abs();
+
+                eprintln!(
+                    "{name}: golden ink [{gf}..{gl}] (w={g_width}), \
+                     msdf ink [{mf}..{ml}] (w={m_width}), \
+                     width_diff={width_diff}, start_diff={start_diff}"
+                );
+
+                assert!(
+                    width_diff <= width_tolerance,
+                    "{name}: ink width differs by {width_diff}px (tolerance {width_tolerance}px). \
+                     golden={g_width}px, msdf={m_width}px"
+                );
+
+                assert!(
+                    start_diff <= start_tolerance,
+                    "{name}: ink start differs by {start_diff}px (tolerance {start_tolerance}px). \
+                     golden starts at {gf}, msdf at {mf}"
+                );
+            }
+            (None, _) => {
+                eprintln!("{name}: golden has no ink above threshold {threshold} — skipping");
+            }
+            (_, None) => {
+                panic!("{name}: MSDF render has no ink above threshold {threshold}!");
+            }
+        }
+    }
+}
+
+/// Test: Glyph ink fits within advance cell for monospace font.
+///
+/// For the widest monospace glyphs, render individually and verify visible
+/// ink doesn't significantly overshoot the advance width boundary.
+#[test]
+fn monospace_advance_contains_ink() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let threshold = 0.1;
+    let overshoot_tolerance = 1i32; // 1px tolerance for AA bleed
+
+    let test_chars = ['m', 'w', 'W', 'M', '@'];
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(22.0, 26.4);
+
+    for ch in &test_chars {
+        let text = ch.to_string();
+
+        // Get advance width from cosmic-text
+        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+        let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+        buffer.set_text(&mut font_system, &text, attrs, Shaping::Advanced);
+        buffer.visual_line_count(&mut font_system, 400.0, None);
+
+        let glyphs = buffer.glyphs();
+        assert!(
+            !glyphs.is_empty(),
+            "'{ch}' should produce at least one glyph"
+        );
+        let advance_width = glyphs[0].advance_width;
+        let left_margin = 10.0f32; // TestConfig default left
+
+        // Render single character
+        let config = TestConfig::new(&text, 22.0, 80, 50, true);
+        let output = render_with_config(config);
+        output.save_png(&format!("metric_advance_{ch}"));
+
+        let Some((first_ink, last_ink)) = ink_extent(&output, threshold) else {
+            panic!("'{ch}' rendered no visible ink!");
+        };
+
+        // ink_start and ink_end relative to pen position
+        let ink_start_rel = first_ink as f32 - left_margin;
+        let ink_end_rel = last_ink as f32 - left_margin;
+
+        eprintln!(
+            "'{ch}': advance={advance_width:.1}px, \
+             ink=[{first_ink}..{last_ink}] (rel pen: {ink_start_rel:.1}..{ink_end_rel:.1})"
+        );
+
+        assert!(
+            ink_end_rel <= advance_width + overshoot_tolerance as f32,
+            "'{ch}' ink extends {:.1}px past advance boundary \
+             (ink_end_rel={ink_end_rel:.1}, advance={advance_width:.1}, tolerance={overshoot_tolerance}px)",
+            ink_end_rel - advance_width
+        );
+
+        assert!(
+            ink_start_rel >= -(overshoot_tolerance as f32),
+            "'{ch}' ink starts {:.1}px before pen position (tolerance={overshoot_tolerance}px)",
+            -ink_start_rel
+        );
+    }
+}
+
+/// Test: Total rendered ink width = N * advance for monospace strings.
+///
+/// For monospace fonts, the total rendered ink width should equal
+/// `num_chars * advance_width` (within tolerance).
+#[test]
+fn monospace_string_width_matches_advances() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let threshold = 0.15;
+    let text = "document";
+    let num_chars = text.len() as f32;
+
+    // Get advance width from cosmic-text
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(22.0, 26.4);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, text, attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+
+    let glyphs = buffer.glyphs();
+    assert!(
+        !glyphs.is_empty(),
+        "'document' should produce glyphs"
+    );
+    let advance_width = glyphs[0].advance_width;
+    let expected_width = (num_chars * advance_width).round() as i32;
+
+    // Render
+    let config = TestConfig::new(text, 22.0, 250, 60, true);
+    let output = render_with_config(config);
+    output.save_png("metric_string_width_document");
+
+    let Some((first_ink, last_ink)) = ink_extent(&output, threshold) else {
+        panic!("'document' rendered no visible ink!");
+    };
+    let actual_width = (last_ink - first_ink) as i32;
+
+    eprintln!(
+        "'document' at 22px mono: advance={advance_width:.1}px, \
+         expected_width={expected_width}px (8*{advance_width:.1}), \
+         actual_width={actual_width}px, ink=[{first_ink}..{last_ink}]"
+    );
+
+    // Verify all advances are equal (monospace)
+    for (i, g) in glyphs.iter().enumerate() {
+        let diff = (g.advance_width - advance_width).abs();
+        assert!(
+            diff < 0.01,
+            "Glyph {i} advance ({:.2}) differs from glyph 0 ({advance_width:.2})",
+            g.advance_width
+        );
+    }
+
+    assert!(
+        actual_width <= expected_width + 2,
+        "'document' ink width ({actual_width}px) exceeds expected ({expected_width}px) by {}px (tolerance 2px)",
+        actual_width - expected_width
+    );
+
+    assert!(
+        actual_width >= expected_width - 4,
+        "'document' ink width ({actual_width}px) is {}px narrower than expected ({expected_width}px) (tolerance 4px)",
+        expected_width - actual_width
+    );
+}
+
+/// Test: Adjacent monospace glyphs have visible luminance dip at boundary.
+///
+/// Strengthens the existing `no_dark_seam_at_advance_boundary` test.
+/// Between adjacent monospace glyphs, there should be a luminance dip
+/// (not a solid merged mass) at the advance boundary.
+#[test]
+fn monospace_inter_glyph_separation() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    // Render "mm" at 22px monospace
+    let config = TestConfig::new("mm", 22.0, 100, 50, true);
+    let output = render_with_config(config);
+    output.save_png("metric_inter_glyph_mm");
+
+    // Find vertical extent of text
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > 0.1 {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    assert!(min_y < max_y, "'mm' should have visible text rows");
+
+    let text_rows = (max_y - min_y + 1) as f32;
+
+    // Compute per-column average luminance in text rows
+    let col_avg_lum: Vec<f32> = (0..output.width)
+        .map(|x| {
+            let sum: f32 = (min_y..=max_y)
+                .map(|y| output.pixel(x, y).luminance())
+                .sum();
+            sum / text_rows
+        })
+        .collect();
+
+    let peak_lum = col_avg_lum.iter().cloned().fold(0.0f32, f32::max);
+
+    // Get advance boundary from cosmic-text
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(22.0, 26.4);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, "mm", attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+
+    let glyphs = buffer.glyphs();
+    assert!(glyphs.len() >= 2, "Need at least 2 glyphs for 'mm'");
+
+    let left_margin = 10.0f32;
+    let boundary_x = (left_margin + glyphs[0].x + glyphs[0].advance_width).round() as u32;
+
+    // Find minimum luminance in a 3-column window around the boundary
+    let check_start = boundary_x.saturating_sub(1);
+    let check_end = (boundary_x + 1).min(output.width - 1);
+
+    let boundary_min_lum = (check_start..=check_end)
+        .filter_map(|x| col_avg_lum.get(x as usize).copied())
+        .fold(f32::MAX, f32::min);
+
+    let ratio = if peak_lum > 0.01 {
+        boundary_min_lum / peak_lum
+    } else {
+        1.0
+    };
+
+    eprintln!(
+        "'mm' inter-glyph: boundary_x={boundary_x}, peak_lum={peak_lum:.3}, \
+         boundary_min_lum={boundary_min_lum:.3}, ratio={ratio:.3}"
+    );
+
+    eprintln!("Column luminances around boundary:");
+    for x in check_start..=check_end {
+        if let Some(&lum) = col_avg_lum.get(x as usize) {
+            eprintln!("  col {x}: avg_lum={lum:.3}");
+        }
+    }
+
+    // The boundary luminance should dip below 85% of peak — proving
+    // the glyphs aren't a solid merged mass. This is complementary to
+    // no_dark_seam_at_advance_boundary which checks it's not TOO dark.
+    assert!(
+        ratio < 0.85,
+        "GLYPHS MERGED: luminance at advance boundary ({boundary_min_lum:.3}) is {:.0}% of peak ({peak_lum:.3}). \
+         Expected < 85% — adjacent glyphs should have a visible dip, not solid ink.",
+        ratio * 100.0
+    );
+}
+
+// ============================================================================
+// COLOR-CHANNEL OVERLAP DETECTION TESTS
+// ============================================================================
+//
+// By rendering even glyphs in red and odd glyphs in blue, we can measure
+// exactly how much each glyph's rendering bleeds into its neighbor's cell.
+// At the advance boundary between a red glyph and a blue glyph:
+//   - Red channel = contribution from the red (left) glyph only
+//   - Blue channel = contribution from the blue (right) glyph only
+//   - If both channels are high at the same pixel, that's quad overlap
+// This is far more precise than luminance-only analysis with white text.
+
+/// Per-column color channel stats for overlap analysis.
+#[derive(Debug)]
+struct ColumnChannelStats {
+    /// Average red channel value (0.0–1.0) across text rows.
+    avg_red: f32,
+    /// Average blue channel value (0.0–1.0) across text rows.
+    avg_blue: f32,
+}
+
+/// Compute per-column red and blue channel averages across text rows.
+fn column_channel_stats(output: &TestOutput, min_y: u32, max_y: u32) -> Vec<ColumnChannelStats> {
+    let text_rows = (max_y - min_y + 1) as f32;
+    (0..output.width)
+        .map(|x| {
+            let mut sum_r = 0.0f32;
+            let mut sum_b = 0.0f32;
+            for y in min_y..=max_y {
+                let px = output.pixel(x, y);
+                sum_r += px.r as f32 / 255.0;
+                sum_b += px.b as f32 / 255.0;
+            }
+            ColumnChannelStats {
+                avg_red: sum_r / text_rows,
+                avg_blue: sum_b / text_rows,
+            }
+        })
+        .collect()
+}
+
+/// Find vertical extent of text (rows with luminance > threshold).
+fn text_row_extent(output: &TestOutput, threshold: f32) -> Option<(u32, u32)> {
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > threshold {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if min_y <= max_y { Some((min_y, max_y)) } else { None }
+}
+
+/// Test: color-channel overlap detection on "mmmmm" at 22px mono.
+///
+/// Renders alternating red/blue glyphs and measures how much each
+/// glyph's color bleeds across the advance boundary into its neighbor's cell.
+///
+/// At each boundary between a red glyph (even) and blue glyph (odd):
+///   - The red channel should drop to near-zero inside the blue glyph's cell
+///   - The blue channel should drop to near-zero inside the red glyph's cell
+///   - 2px past the boundary, the "wrong" color should be below the threshold
+///
+/// This directly measures MSDF quad AA bleed in a way that white-on-black
+/// luminance analysis cannot.
+#[test]
+fn color_overlap_mm_boundary_bleed() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let text = "mmmmm";
+    let font_size = 22.0;
+
+    // Pure red and pure blue — maximally separated channels
+    let red: [u8; 4] = [255, 0, 0, 255];
+    let blue: [u8; 4] = [0, 0, 255, 255];
+
+    let config = TestConfig::new(text, font_size, 200, 60, true)
+        .with_alternating_colors(red, blue);
+    let output = render_with_config(config);
+    output.save_png("color_overlap_mmmmm");
+
+    // Get advance width
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, text, attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+    let glyphs = buffer.glyphs();
+    let advance = glyphs[0].advance_width;
+    let left_margin = 10.0f32;
+
+    // Find text rows
+    let (min_y, max_y) = text_row_extent(&output, 0.05)
+        .expect("Should have visible text");
+
+    let stats = column_channel_stats(&output, min_y, max_y);
+
+    // Check each advance boundary
+    // Boundaries are at: left_margin + (i+1) * advance for i = 0..num_glyphs-1
+    // Check 1px past boundary — the neighbor's color should already be faded.
+    // At 2px it's typically clean, but 1px catches actual AA bleed from
+    // oversized MSDF quads extending past the advance boundary.
+    let bleed_check_offset = 1u32;
+    let bleed_threshold = 0.10; // wrong color should be below 10%
+
+    eprintln!("advance={advance:.1}px, checking {}-glyph boundaries:", text.len() - 1);
+    eprintln!("  bleed_check_offset={bleed_check_offset}px, threshold={bleed_threshold}");
+
+    let mut worst_bleed = 0.0f32;
+    let mut worst_boundary = 0usize;
+    let mut failures = Vec::new();
+
+    for boundary_idx in 0..(text.len() - 1) {
+        let boundary_col = (left_margin + (boundary_idx as f32 + 1.0) * advance).round() as u32;
+        let left_is_red = boundary_idx % 2 == 0; // even glyph = red
+
+        // Check inside the right glyph's cell (boundary + offset):
+        // the left glyph's color should be fading out
+        let check_col_right = boundary_col + bleed_check_offset;
+        // Check inside the left glyph's cell (boundary - offset):
+        // the right glyph's color should be fading out
+        let check_col_left = boundary_col.saturating_sub(bleed_check_offset);
+
+        if let (Some(right_stats), Some(left_stats)) = (
+            stats.get(check_col_right as usize),
+            stats.get(check_col_left as usize),
+        ) {
+            // If left glyph is red, check that red has faded by check_col_right
+            // and that blue has faded by check_col_left
+            let (bleed_into_right, bleed_into_left) = if left_is_red {
+                (right_stats.avg_red, left_stats.avg_blue)
+            } else {
+                (right_stats.avg_blue, left_stats.avg_red)
+            };
+
+            let left_color = if left_is_red { "red" } else { "blue" };
+            let right_color = if left_is_red { "blue" } else { "red" };
+
+            eprintln!(
+                "  boundary {boundary_idx} (col {boundary_col}): \
+                 {left_color}→{right_color}  \
+                 bleed_into_right={bleed_into_right:.3} (col {check_col_right}), \
+                 bleed_into_left={bleed_into_left:.3} (col {check_col_left})"
+            );
+
+            let max_bleed = bleed_into_right.max(bleed_into_left);
+            if max_bleed > worst_bleed {
+                worst_bleed = max_bleed;
+                worst_boundary = boundary_idx;
+            }
+
+            if bleed_into_right > bleed_threshold {
+                failures.push(format!(
+                    "boundary {boundary_idx}: {left_color} bleeds {bleed_into_right:.3} into {right_color} cell \
+                     (col {check_col_right}, threshold {bleed_threshold})"
+                ));
+            }
+            if bleed_into_left > bleed_threshold {
+                failures.push(format!(
+                    "boundary {boundary_idx}: {right_color} bleeds {bleed_into_left:.3} into {left_color} cell \
+                     (col {check_col_left}, threshold {bleed_threshold})"
+                ));
+            }
+        }
+    }
+
+    eprintln!(
+        "\nWorst bleed: {worst_bleed:.3} at boundary {worst_boundary}"
+    );
+
+    // Dump a few key columns for diagnosis
+    eprintln!("\nFull channel profile around first boundary:");
+    let first_boundary = (left_margin + advance).round() as u32;
+    for x in first_boundary.saturating_sub(4)..=(first_boundary + 4).min(output.width - 1) {
+        if let Some(s) = stats.get(x as usize) {
+            let marker = if x == first_boundary { " <-- boundary" } else { "" };
+            eprintln!(
+                "  col {x:3}: R={:.3}  B={:.3}{marker}",
+                s.avg_red, s.avg_blue
+            );
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "COLOR BLEED DETECTED — {} violations:\n  {}\n\n\
+             Adjacent MSDF glyph quads bleed color across the advance boundary.\n\
+             This means glyph sizing/AA extends too far into neighbor cells.\n\
+             See /tmp/msdf_tests/color_overlap_mmmmm.png for visual.",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+}
+
+/// Test: color-channel overlap on mixed-width chars "umUMumUWeoeo".
+///
+/// Tests a variety of glyph shapes at advance boundaries. Wide glyphs
+/// like 'M' and 'W' are most likely to bleed; narrow ones like 'e'
+/// should have plenty of sidebearing room.
+#[test]
+fn color_overlap_mixed_chars() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let text = "umUMumUWeoeo";
+    let font_size = 22.0;
+
+    let red: [u8; 4] = [255, 0, 0, 255];
+    let blue: [u8; 4] = [0, 0, 255, 255];
+
+    let config = TestConfig::new(text, font_size, 300, 60, true)
+        .with_alternating_colors(red, blue);
+    let output = render_with_config(config);
+    output.save_png("color_overlap_mixed");
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, text, attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+    let glyphs = buffer.glyphs();
+    let advance = glyphs[0].advance_width;
+    let left_margin = 10.0f32;
+
+    let (min_y, max_y) = text_row_extent(&output, 0.05)
+        .expect("Should have visible text");
+    let stats = column_channel_stats(&output, min_y, max_y);
+
+    let bleed_check_offset = 1u32;
+    let bleed_threshold = 0.10;
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut failures = Vec::new();
+
+    eprintln!("Mixed chars '{text}' — advance={advance:.1}px:");
+
+    for boundary_idx in 0..(chars.len() - 1) {
+        let boundary_col = (left_margin + (boundary_idx as f32 + 1.0) * advance).round() as u32;
+        let left_is_red = boundary_idx % 2 == 0;
+
+        let check_right = boundary_col + bleed_check_offset;
+        let check_left = boundary_col.saturating_sub(bleed_check_offset);
+
+        if let (Some(rs), Some(ls)) = (
+            stats.get(check_right as usize),
+            stats.get(check_left as usize),
+        ) {
+            let (bleed_right, bleed_left) = if left_is_red {
+                (rs.avg_red, ls.avg_blue)
+            } else {
+                (rs.avg_blue, ls.avg_red)
+            };
+
+            let left_ch = chars[boundary_idx];
+            let right_ch = chars[boundary_idx + 1];
+
+            if bleed_right > bleed_threshold || bleed_left > bleed_threshold {
+                eprintln!(
+                    "  '{left_ch}'→'{right_ch}' (col {boundary_col}): \
+                     bleed_right={bleed_right:.3}, bleed_left={bleed_left:.3} ⚠"
+                );
+            }
+
+            if bleed_right > bleed_threshold {
+                failures.push(format!(
+                    "'{left_ch}'→'{right_ch}': left bleeds {bleed_right:.3} into right cell"
+                ));
+            }
+            if bleed_left > bleed_threshold {
+                failures.push(format!(
+                    "'{left_ch}'→'{right_ch}': right bleeds {bleed_left:.3} into left cell"
+                ));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "COLOR BLEED in mixed chars — {} violations:\n  {}\n\n\
+             See /tmp/msdf_tests/color_overlap_mixed.png",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
+}
+
+/// Test: single glyph color isolation — 'm' alone should have ZERO blue.
+///
+/// Sanity check: render a single red 'm' and verify zero blue channel.
+/// This confirms the color separation technique works correctly before
+/// we use it to detect inter-glyph bleed.
+#[test]
+fn color_isolation_single_glyph() {
+    let red: [u8; 4] = [255, 0, 0, 255];
+    let blue: [u8; 4] = [0, 0, 255, 255];
+
+    // Single 'm' — will be red (even index 0)
+    let config = TestConfig::new("m", 22.0, 80, 50, true)
+        .with_alternating_colors(red, blue);
+    let output = render_with_config(config);
+    output.save_png("color_isolation_m");
+
+    // There should be NO blue pixels anywhere — only red on black
+    let mut max_blue = 0u8;
+    let mut max_blue_pos = (0u32, 0u32);
+    for y in 0..output.height {
+        for x in 0..output.width {
+            let px = output.pixel(x, y);
+            if px.b > max_blue {
+                max_blue = px.b;
+                max_blue_pos = (x, y);
+            }
+        }
+    }
+
+    eprintln!("Single 'm' (red): max blue channel = {} at ({}, {})", max_blue, max_blue_pos.0, max_blue_pos.1);
+
+    assert!(
+        max_blue < 5,
+        "Single red glyph should have no blue: max_blue={max_blue} at {:?}. \
+         Color separation technique is broken!",
+        max_blue_pos
+    );
 }
 
 // ============================================================================

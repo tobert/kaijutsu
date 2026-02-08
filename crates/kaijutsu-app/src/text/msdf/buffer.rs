@@ -21,7 +21,7 @@ pub struct PositionedGlyph {
     /// Font size used for this glyph (needed to scale MSDF region).
     pub font_size: f32,
     /// Advance width in pixels from cosmic-text.
-    /// Used by the shader to suppress AA bleed at character cell boundaries.
+    /// Used by the pipeline to compute cell_x for boundary fade.
     pub advance_width: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
@@ -254,6 +254,18 @@ impl MsdfTextBuffer {
     #[cfg(test)]
     pub fn glyph_positions(&self) -> Vec<(f32, f32)> {
         self.glyphs.iter().map(|g| (g.x, g.y)).collect()
+    }
+
+    /// Set alternating glyph colors for overlap detection tests.
+    ///
+    /// Even-indexed glyphs get `color_a`, odd-indexed get `color_b`.
+    /// When rendered, channel separation at advance boundaries reveals
+    /// whether adjacent glyph quads bleed into each other's cells.
+    #[cfg(test)]
+    pub fn set_alternating_colors(&mut self, color_a: [u8; 4], color_b: [u8; 4]) {
+        for (i, glyph) in self.glyphs.iter_mut().enumerate() {
+            glyph.color = if i % 2 == 0 { color_a } else { color_b };
+        }
     }
 
     /// Get the number of lines (for testing).
