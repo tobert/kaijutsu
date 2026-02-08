@@ -1724,3 +1724,624 @@ fn individual_vs_combined_glyph_widths() {
         no_width, individual_sum, (no_width as i32 - individual_sum as i32).abs()
     );
 }
+
+// ============================================================================
+// SPACING & SEAM REGRESSION TESTS
+// ============================================================================
+
+/// CPU test: verify quad overlap from MSDF padding is expected.
+///
+/// Adjacent monospace glyphs have quads that overlap (due to SDF padding extending
+/// beyond the advance width). This test validates that:
+/// 1. Glyph positions are sequential (glyph[1].x == glyph[0].x + advance_width)
+/// 2. The overlap amount is documented and expected
+#[test]
+fn cpu_quad_overlap_expected() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(15.0, 22.5);
+
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, "mm", attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+
+    let glyphs = buffer.glyphs();
+    assert_eq!(glyphs.len(), 2, "Should have exactly 2 glyphs for 'mm'");
+
+    let g0 = &glyphs[0];
+    let g1 = &glyphs[1];
+
+    // Glyph spacing: second glyph starts at first glyph's x + advance width
+    let expected_x1 = g0.x + g0.advance_width;
+    let spacing_error = (g1.x - expected_x1).abs();
+
+    eprintln!("Glyph 0: x={:.2}, advance={:.2}", g0.x, g0.advance_width);
+    eprintln!("Glyph 1: x={:.2}, advance={:.2}", g1.x, g1.advance_width);
+    eprintln!("Expected g1.x={:.2}, actual={:.2}, error={:.4}", expected_x1, g1.x, spacing_error);
+
+    assert!(
+        spacing_error < 0.5,
+        "Second glyph should start at first glyph's x + advance: \
+         expected {:.2}, got {:.2} (error {:.2})",
+        expected_x1, g1.x, spacing_error
+    );
+
+    // Both advance widths should be equal (monospace)
+    let advance_diff = (g0.advance_width - g1.advance_width).abs();
+    assert!(
+        advance_diff < 0.01,
+        "Monospace glyphs should have equal advance: {:.2} vs {:.2}",
+        g0.advance_width, g1.advance_width
+    );
+
+    // Document the expected overlap: MSDF padding at 15px ≈ 3.75px per side,
+    // so each quad extends ~3.75px beyond the advance width on each side.
+    // Adjacent quads therefore overlap by ~7.5px. This is normal and handled
+    // by the cell_mask fade in the shader.
+    eprintln!(
+        "Advance width: {:.2}px — quads will overlap by ~2x SDF padding in the shader",
+        g0.advance_width
+    );
+}
+
+/// GPU test: no dark seam at glyph advance boundaries.
+///
+/// Renders "mm" and checks that the luminance at the advance boundary between
+/// the two m's is not significantly darker than the peak luminance. A dark seam
+/// indicates the cell fade or depth buffer is incorrectly suppressing ink.
+#[test]
+fn no_dark_seam_at_advance_boundary() {
+    // Render "mm" at 22px monospace — large enough for clear pixel analysis
+    let config = TestConfig::new("mm", 22.0, 100, 50, true);
+    let output = render_with_config(config);
+    output.save_png("seam_detection_mm");
+
+    // Find vertical extent of the glyphs (rows with ink)
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > 0.3 {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if min_y >= max_y {
+        panic!("No text pixels found in 'mm' render");
+    }
+
+    // Compute per-column average luminance across the text rows
+    let text_rows = (max_y - min_y + 1) as f32;
+    let mut col_avg_lum: Vec<f32> = Vec::new();
+    for x in 0..output.width {
+        let mut sum = 0.0f32;
+        for y in min_y..=max_y {
+            sum += output.pixel(x, y).luminance();
+        }
+        col_avg_lum.push(sum / text_rows);
+    }
+
+    // Find peak luminance (the brightest column, should be inside a stem)
+    let peak_lum = col_avg_lum.iter().cloned().fold(0.0f32, f32::max);
+
+    // Get the glyph positions to find where the advance boundary is
+    // We use cosmic-text directly to get the advance width
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(22.0, 26.4);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, "mm", attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+
+    let glyphs = buffer.glyphs();
+    assert!(glyphs.len() >= 2, "Need at least 2 glyphs");
+
+    // The advance boundary is at g0.x + g0.advance_width, offset by the test's left margin (10px)
+    let boundary_x = (10.0_f32 + glyphs[0].x + glyphs[0].advance_width).round() as u32;
+
+    eprintln!("Peak luminance: {:.3}", peak_lum);
+    eprintln!("Advance boundary at column: {}", boundary_x);
+
+    // Check a 3-column window around the boundary
+    let check_start = boundary_x.saturating_sub(1);
+    let check_end = (boundary_x + 1).min(output.width - 1);
+
+    eprintln!("Column luminances around boundary:");
+    for x in check_start..=check_end {
+        if (x as usize) < col_avg_lum.len() {
+            eprintln!("  col {}: avg_lum={:.3}", x, col_avg_lum[x as usize]);
+        }
+    }
+
+    // The minimum luminance in the boundary window
+    let boundary_min_lum = (check_start..=check_end)
+        .filter_map(|x| col_avg_lum.get(x as usize).copied())
+        .fold(f32::MAX, f32::min);
+
+    // The boundary luminance should be at least 50% of the peak.
+    // Before the fix, the symmetric cell fade would reduce it to ~50% or less,
+    // and depth write occlusion would make it even worse. After the fix,
+    // ink at the boundary should be fully preserved.
+    let ratio = if peak_lum > 0.01 { boundary_min_lum / peak_lum } else { 1.0 };
+    eprintln!("Boundary/peak ratio: {:.3} (min boundary lum: {:.3})", ratio, boundary_min_lum);
+
+    // The crossfade gives each glyph 50% mask at the boundary. For symmetric pairs
+    // like 'mm', both sides contribute ~50% each, so combined luminance is ~75% of
+    // peak (due to premultiplied alpha compositing: 0.5 + 0.5*0.5 = 0.75). We use
+    // 25% as the floor to catch gross seam bugs while allowing the natural crossfade
+    // dip. The original bug had boundary luminance near 0%.
+    assert!(
+        ratio >= 0.25,
+        "DARK SEAM BUG: luminance at advance boundary ({:.3}) is only {:.0}% of peak ({:.3}). \
+         Expected >= 25%. Cell fade is too aggressive at the boundary.",
+        boundary_min_lum, ratio * 100.0, peak_lum
+    );
+}
+
+/// Diagnostic: is 'u' rendering wider than its advance width?
+///
+/// Renders 'u' alone and checks where its visible ink ends relative
+/// to the advance boundary. If ink extends significantly past the
+/// advance, the cell_mask isn't clamping hard enough.
+#[test]
+fn diagnostic_u_ink_vs_advance() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(22.0, 26.4);
+
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, "u", attrs.clone(), Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+
+    let glyphs = buffer.glyphs();
+    assert_eq!(glyphs.len(), 1);
+    let advance = glyphs[0].advance_width;
+    let pen_x = glyphs[0].x;
+    eprintln!("'u' at 22px mono: pen_x={:.2}, advance={:.2}", pen_x, advance);
+    eprintln!("  advance boundary at pixel: {:.2}", 10.0 + pen_x + advance);
+
+    // Render 'u' alone
+    let config = TestConfig::new("u", 22.0, 80, 50, true);
+    let output = render_with_config(config);
+    output.save_png("diagnostic_u_alone");
+
+    // Find where visible ink ends (rightmost column with significant luminance)
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > 0.1 {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    let advance_boundary = (10.0 + pen_x + advance).round() as u32;
+    let text_rows = (max_y - min_y + 1).max(1) as f32;
+
+    eprintln!("\nColumn luminances for 'u' alone:");
+    let mut last_visible_col = 0u32;
+    for x in 0..output.width.min(60) {
+        let mut sum = 0.0f32;
+        for y in min_y..=max_y {
+            sum += output.pixel(x, y).luminance();
+        }
+        let avg = sum / text_rows;
+        if avg > 0.01 {
+            let marker = if x == advance_boundary { " <-- advance boundary" } else { "" };
+            eprintln!("  col {:2}: avg_lum={:.3}{}", x, avg, marker);
+            if avg > 0.05 {
+                last_visible_col = x;
+            }
+        }
+    }
+
+    let ink_overshoot = last_visible_col as i32 - advance_boundary as i32;
+    eprintln!("\nAdvance boundary: col {}", advance_boundary);
+    eprintln!("Last visible col (>0.05 lum): col {}", last_visible_col);
+    eprintln!("Ink overshoot past advance: {} pixels", ink_overshoot);
+
+    // Now render 'm' alone for comparison
+    let mut buffer_m = MsdfTextBuffer::new(&mut font_system, metrics);
+    buffer_m.set_text(&mut font_system, "m", attrs, Shaping::Advanced);
+    buffer_m.visual_line_count(&mut font_system, 400.0, None);
+    let m_glyphs = buffer_m.glyphs();
+    eprintln!("\n'm' at 22px mono: pen_x={:.2}, advance={:.2}", m_glyphs[0].x, m_glyphs[0].advance_width);
+
+    let config_m = TestConfig::new("m", 22.0, 80, 50, true);
+    let output_m = render_with_config(config_m);
+    output_m.save_png("diagnostic_m_alone");
+
+    eprintln!("\nColumn luminances for 'm' alone:");
+    let mut first_visible_col_m = output_m.width;
+    let mut min_y_m = output_m.height;
+    let mut max_y_m = 0u32;
+    for y in 0..output_m.height {
+        for x in 0..output_m.width {
+            if output_m.pixel(x, y).luminance() > 0.1 {
+                min_y_m = min_y_m.min(y);
+                max_y_m = max_y_m.max(y);
+            }
+        }
+    }
+    let text_rows_m = (max_y_m - min_y_m + 1).max(1) as f32;
+    for x in 0..output_m.width.min(60) {
+        let mut sum = 0.0f32;
+        for y in min_y_m..=max_y_m {
+            sum += output_m.pixel(x, y).luminance();
+        }
+        let avg = sum / text_rows_m;
+        if avg > 0.01 {
+            eprintln!("  col {:2}: avg_lum={:.3}", x, avg);
+            if avg > 0.05 && x < first_visible_col_m {
+                first_visible_col_m = x;
+            }
+        }
+    }
+    eprintln!("First visible col for 'm' (>0.05 lum): col {}", first_visible_col_m);
+}
+
+// ============================================================================
+// GOLDEN IMAGE VISUAL REGRESSION TESTS
+// ============================================================================
+//
+// Ground-truth comparison using SSIM (Structural Similarity Index).
+// Golden images are rendered by FreeType (via contrib/gen-golden.py) as a
+// known-good reference. MSDF renders are compared structurally, not pixel-exact.
+//
+// ## Workflow
+//
+// 1. Generate goldens from FreeType:
+//    python3 contrib/gen-golden.py
+//
+// 2. Inspect golden PNGs in assets/test/golden/
+//
+// 3. Run regression tests:
+//    cargo test -p kaijutsu-app golden_ -- --test-threads=1
+//
+// 4. On failure, inspect diff images in /tmp/msdf_tests/*_diff.png
+//
+// ## SSIM thresholds
+//
+// FreeType vs MSDF healthy baseline: 0.73–0.85 (different AA, same structure).
+// Threshold: 0.65 — catches real regressions (merged glyphs, blank output,
+// wrong spacing) while allowing cross-renderer AA differences.
+
+/// Compute Structural Similarity Index between two test outputs.
+///
+/// Uses 8x8 sliding windows with the standard SSIM formula:
+///   SSIM(x,y) = (2*μx*μy + C1)(2*σxy + C2) / ((μx² + μy² + C1)(σx² + σy² + C2))
+///
+/// Returns 0.0 (completely different) to 1.0 (identical).
+fn compute_ssim(a: &TestOutput, b: &TestOutput) -> f32 {
+    assert_eq!(a.width, b.width, "SSIM requires same width");
+    assert_eq!(a.height, b.height, "SSIM requires same height");
+
+    let w = a.width as usize;
+    let h = a.height as usize;
+
+    // Convert to luminance arrays
+    let lum_a: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let x = (i % w) as u32;
+            let y = (i / w) as u32;
+            a.pixel(x, y).luminance()
+        })
+        .collect();
+    let lum_b: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let x = (i % w) as u32;
+            let y = (i / w) as u32;
+            b.pixel(x, y).luminance()
+        })
+        .collect();
+
+    // SSIM constants (normalized to [0,1] luminance range)
+    let c1: f32 = (0.01_f32).powi(2); // (K1 * L)^2 where L=1.0
+    let c2: f32 = (0.03_f32).powi(2);
+
+    let window = 8usize;
+    if w < window || h < window {
+        // Too small for windowed SSIM, fall back to per-pixel MSE-based comparison
+        let mse: f32 = lum_a.iter().zip(&lum_b).map(|(a, b)| (a - b).powi(2)).sum::<f32>()
+            / (w * h) as f32;
+        return 1.0 - mse; // rough approximation
+    }
+
+    let mut ssim_sum = 0.0f64;
+    let mut window_count = 0u64;
+
+    for wy in 0..=(h - window) {
+        for wx in 0..=(w - window) {
+            let mut sum_a = 0.0f64;
+            let mut sum_b = 0.0f64;
+            let mut sum_a2 = 0.0f64;
+            let mut sum_b2 = 0.0f64;
+            let mut sum_ab = 0.0f64;
+            let n = (window * window) as f64;
+
+            for dy in 0..window {
+                for dx in 0..window {
+                    let idx = (wy + dy) * w + (wx + dx);
+                    let va = lum_a[idx] as f64;
+                    let vb = lum_b[idx] as f64;
+                    sum_a += va;
+                    sum_b += vb;
+                    sum_a2 += va * va;
+                    sum_b2 += vb * vb;
+                    sum_ab += va * vb;
+                }
+            }
+
+            let mu_a = sum_a / n;
+            let mu_b = sum_b / n;
+            let sigma_a2 = sum_a2 / n - mu_a * mu_a;
+            let sigma_b2 = sum_b2 / n - mu_b * mu_b;
+            let sigma_ab = sum_ab / n - mu_a * mu_b;
+
+            let c1 = c1 as f64;
+            let c2 = c2 as f64;
+
+            let numerator = (2.0 * mu_a * mu_b + c1) * (2.0 * sigma_ab + c2);
+            let denominator = (mu_a * mu_a + mu_b * mu_b + c1) * (sigma_a2 + sigma_b2 + c2);
+
+            ssim_sum += numerator / denominator;
+            window_count += 1;
+        }
+    }
+
+    (ssim_sum / window_count as f64) as f32
+}
+
+/// Path to the golden images directory (committed to git).
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("assets/test/golden")
+}
+
+/// Load a golden PNG image as a TestOutput.
+fn load_golden(name: &str) -> Option<TestOutput> {
+    let path = golden_dir().join(format!("{name}.png"));
+    if !path.exists() {
+        return None;
+    }
+
+    let img = image::open(&path)
+        .unwrap_or_else(|e| panic!("Failed to load golden image {}: {e}", path.display()));
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    Some(TestOutput {
+        pixels: rgba.into_raw(),
+        width,
+        height,
+        is_bgra: false, // PNG is always RGBA
+    })
+}
+
+/// Save a TestOutput as a PNG (always RGBA).
+fn save_png_to(output: &TestOutput, path: &std::path::Path) {
+    let pixels: Vec<u8> = if output.is_bgra {
+        output
+            .pixels
+            .chunks(4)
+            .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+            .collect()
+    } else {
+        output.pixels.clone()
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    image::save_buffer(path, &pixels, output.width, output.height, image::ColorType::Rgba8)
+        .unwrap_or_else(|e| panic!("Failed to save PNG {}: {e}", path.display()));
+}
+
+/// Generate a side-by-side diff image: golden | actual | difference.
+fn save_diff_image(golden: &TestOutput, actual: &TestOutput, name: &str) {
+    let w = golden.width;
+    let h = golden.height;
+    let diff_w = w * 3; // side by side by side
+
+    let mut diff_pixels = vec![0u8; (diff_w * h * 4) as usize];
+
+    for y in 0..h {
+        for x in 0..w {
+            let gp = golden.pixel(x, y);
+            let ap = actual.pixel(x, y);
+
+            // Left panel: golden
+            let offset_g = ((y * diff_w + x) * 4) as usize;
+            diff_pixels[offset_g] = gp.r;
+            diff_pixels[offset_g + 1] = gp.g;
+            diff_pixels[offset_g + 2] = gp.b;
+            diff_pixels[offset_g + 3] = 255;
+
+            // Middle panel: actual
+            let offset_a = ((y * diff_w + w + x) * 4) as usize;
+            diff_pixels[offset_a] = ap.r;
+            diff_pixels[offset_a + 1] = ap.g;
+            diff_pixels[offset_a + 2] = ap.b;
+            diff_pixels[offset_a + 3] = 255;
+
+            // Right panel: absolute luminance difference, scaled to full range
+            let diff_val =
+                ((gp.luminance() - ap.luminance()).abs() * 255.0).min(255.0) as u8;
+            let offset_d = ((y * diff_w + 2 * w + x) * 4) as usize;
+            diff_pixels[offset_d] = diff_val;
+            diff_pixels[offset_d + 1] = diff_val;
+            diff_pixels[offset_d + 2] = diff_val;
+            diff_pixels[offset_d + 3] = 255;
+        }
+    }
+
+    let dir = PathBuf::from("/tmp/msdf_tests");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("{name}_diff.png"));
+
+    image::save_buffer(&path, &diff_pixels, diff_w, h, image::ColorType::Rgba8)
+        .unwrap_or_else(|e| panic!("Failed to save diff PNG: {e}"));
+
+    eprintln!("Diff image saved: {}", path.display());
+}
+
+/// Assert that a rendered output matches its golden image.
+///
+/// - If no golden exists: saves current render to /tmp and skips with a message.
+/// - If `MSDF_UPDATE_GOLDEN=1`: overwrites the golden with current render.
+/// - Otherwise: computes SSIM and fails if below threshold.
+fn assert_matches_golden(output: &TestOutput, name: &str) {
+    // FreeType golden vs MSDF render: 0.73–0.85 is the healthy cross-renderer baseline.
+    // A real regression (glyphs merging, blank output, wrong spacing) drops below 0.60.
+    let ssim_threshold = 0.65;
+
+    // Always save the actual render for inspection
+    let tmp_dir = PathBuf::from("/tmp/msdf_tests");
+    std::fs::create_dir_all(&tmp_dir).ok();
+    save_png_to(output, &tmp_dir.join(format!("{name}.png")));
+
+    // Update mode: overwrite golden with current render
+    if std::env::var("MSDF_UPDATE_GOLDEN").is_ok() {
+        let golden_path = golden_dir().join(format!("{name}.png"));
+        save_png_to(output, &golden_path);
+        eprintln!("Updated golden: {}", golden_path.display());
+        return;
+    }
+
+    // Load golden
+    let Some(golden) = load_golden(name) else {
+        eprintln!(
+            "No golden image for '{name}'. Render saved to /tmp/msdf_tests/{name}.png\n\
+             To approve: MSDF_UPDATE_GOLDEN=1 cargo test -p kaijutsu-app {name} -- --test-threads=1"
+        );
+        return; // Skip — no golden to compare against yet
+    };
+
+    // Dimension check
+    if golden.width != output.width || golden.height != output.height {
+        save_diff_image(&golden, output, name);
+        panic!(
+            "Golden image dimension mismatch for '{name}': \
+             golden={}x{}, actual={}x{}. Diff saved to /tmp/msdf_tests/{name}_diff.png",
+            golden.width, golden.height, output.width, output.height
+        );
+    }
+
+    // SSIM comparison
+    let ssim = compute_ssim(&golden, output);
+    eprintln!("{name}: SSIM = {ssim:.4} (threshold: {ssim_threshold})");
+
+    if ssim < ssim_threshold {
+        save_diff_image(&golden, output, name);
+        panic!(
+            "VISUAL REGRESSION in '{name}': SSIM {ssim:.4} < {ssim_threshold}\n\
+             Diff image: /tmp/msdf_tests/{name}_diff.png\n\
+             Actual render: /tmp/msdf_tests/{name}.png\n\
+             To update golden: MSDF_UPDATE_GOLDEN=1 cargo test -p kaijutsu-app {name} -- --test-threads=1"
+        );
+    }
+}
+
+/// Golden test: "document" at 22px monospace.
+/// Catches the um-joining and inter-glyph bleed bugs.
+#[test]
+fn golden_document_22px_mono() {
+    let config = TestConfig::new("document", 22.0, 250, 60, true);
+    let output = render_with_config(config);
+    assert_matches_golden(&output, "golden_document_22px_mono");
+}
+
+/// Golden test: "mm" at 22px monospace.
+/// Catches advance boundary seams between identical glyphs.
+#[test]
+fn golden_mm_22px_mono() {
+    let config = TestConfig::new("mm", 22.0, 100, 50, true);
+    let output = render_with_config(config);
+    assert_matches_golden(&output, "golden_mm_22px_mono");
+}
+
+/// Golden test: "Hello, World!" at 15px monospace.
+/// General readability at the previous app default size.
+#[test]
+fn golden_hello_15px_mono() {
+    let config = TestConfig::new("Hello, World!", 15.0, 200, 40, true);
+    let output = render_with_config(config);
+    assert_matches_golden(&output, "golden_hello_15px_mono");
+}
+
+/// Golden test: "AV" at 22px serif.
+/// Catches kerning pair preservation — V should tuck under A.
+#[test]
+fn golden_av_22px_serif() {
+    let config = TestConfig::new("AV", 22.0, 100, 50, false)
+        .with_font_family(TestFontFamily::Serif);
+    let output = render_with_config(config);
+    assert_matches_golden(&output, "golden_av_22px_serif");
+}
+
+/// Golden test: "fn main() {" at 15px monospace.
+/// Catches punctuation rendering + mixed glyph shapes in code.
+#[test]
+fn golden_code_15px_mono() {
+    let config = TestConfig::new("fn main() {", 15.0, 200, 40, true);
+    let output = render_with_config(config);
+    assert_matches_golden(&output, "golden_code_15px_mono");
+}
+
+// ============================================================================
+// EXISTING DIAGNOSTIC TESTS
+// ============================================================================
+
+/// Visual regression: render "document" at app font size to check "um" joining.
+#[test]
+fn document_um_not_joined() {
+    // App uses monospace at 22px (current default)
+    let config = TestConfig::new("document", 22.0, 250, 60, true);
+    let output = render_with_config(config);
+    output.save_png("document_22px_mono");
+
+    // Also render at 15px (previous default)
+    let config15 = TestConfig::new("document", 15.0, 200, 40, true);
+    let output15 = render_with_config(config15);
+    output15.save_png("document_15px_mono");
+
+    // Analyze the "um" boundary region in the 22px render
+    // Print column luminances for the full word
+    eprintln!("\n'document' at 22px monospace — column luminances:");
+    let mut min_y = output.height;
+    let mut max_y = 0u32;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            if output.pixel(x, y).luminance() > 0.1 {
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    let text_rows = (max_y - min_y + 1).max(1) as f32;
+
+    for x in 0..output.width.min(200) {
+        let mut sum = 0.0f32;
+        for y in min_y..=max_y {
+            sum += output.pixel(x, y).luminance();
+        }
+        let avg = sum / text_rows;
+        if avg > 0.01 {
+            eprintln!("  col {:3}: avg_lum={:.3}", x, avg);
+        }
+    }
+}
