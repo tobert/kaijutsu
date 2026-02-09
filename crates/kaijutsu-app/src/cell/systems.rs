@@ -3216,6 +3216,13 @@ pub fn handle_compose_block_input(
         return;
     }
 
+    // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
+    // This prevents the mode-switch key from being inserted as text
+    // (Same guard as handle_cell_input)
+    if mode.is_changed() {
+        return;
+    }
+
     // If there's an active bubble, input goes there instead
     if bubble_registry.active().is_some() {
         // Consume events so they don't get processed by other systems

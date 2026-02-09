@@ -235,7 +235,27 @@ impl SyncManager {
         }
 
         // Determine sync strategy
+        //
+        // When needs_full_sync is true but the document already has content,
+        // try incremental merge first. This handles the common recovery case:
+        // BlockTextOps fail (DataMissing) → frontier resets → next BlockInserted
+        // triggers full sync. But the ops in BlockInserted are incremental (not
+        // a full oplog), so from_oplog destroys the existing document and fails.
+        // The existing document already has the base state; incremental merge
+        // should succeed because the new ops build on that state.
         if self.needs_full_sync(document_id) {
+            if !doc.is_empty() {
+                // Try incremental merge first — preserves existing document
+                match self.do_incremental_merge(doc, ops, Some(&block.id)) {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        warn!(
+                            "Recovery: incremental merge failed for {:?}, falling back to full sync: {}",
+                            block.id, e
+                        );
+                    }
+                }
+            }
             self.do_full_sync(doc, document_id, ops, Some(&block.id))
         } else {
             self.do_incremental_merge(doc, ops, Some(&block.id))
@@ -244,8 +264,12 @@ impl SyncManager {
 
     /// Apply text ops event (BlockTextOps).
     ///
-    /// Always attempts incremental merge (text streaming).
-    /// On failure, resets frontier to trigger full sync on next block event.
+    /// Attempts incremental merge (text streaming).
+    /// On deserialization failure, resets frontier to trigger full sync.
+    /// On CRDT merge failure (DataMissing), does NOT reset frontier — this is
+    /// likely a race condition where text ops arrived before the corresponding
+    /// BlockInserted event. The frontier is still valid; the BlockInserted will
+    /// bring the missing ops.
     ///
     /// Note: This method does NOT fall back to full sync even when `needs_full_sync()`
     /// is true. Text ops are incremental by nature - if we're out of sync, recovery
@@ -263,6 +287,15 @@ impl SyncManager {
                     expected: doc.document_id().to_string(),
                     got: document_id.to_string(),
                 },
+            });
+        }
+
+        // If we already need a full sync, skip text ops entirely —
+        // they can't help us recover, only BlockInserted can
+        if self.needs_full_sync(document_id) {
+            trace!("Skipping text ops while waiting for full sync");
+            return Ok(SyncResult::Skipped {
+                reason: SkipReason::EmptyOplog,  // Reusing existing variant
             });
         }
 
@@ -625,12 +658,17 @@ mod tests {
         let full_oplog = server.oplog_bytes();
         let new_block = server.get_block_snapshot(&new_block_id).expect("new block exists");
 
-        // Apply block inserted - should trigger full sync since frontier was reset
+        // Apply block inserted - recovery tries incremental merge first since
+        // the document already has content, then falls back to full sync if needed.
+        // With a full oplog, incremental merge succeeds (it includes new ops too).
         let result = sync
             .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery sync");
 
-        assert!(matches!(result, SyncResult::FullSync { block_count: 2 }));
+        assert!(
+            matches!(result, SyncResult::IncrementalMerge | SyncResult::FullSync { .. }),
+            "Expected recovery via incremental merge or full sync, got {:?}", result
+        );
         assert!(!sync.needs_full_sync("doc-1"));
         assert!(client.full_text().contains("Recovery content"));
     }
@@ -796,12 +834,16 @@ mod tests {
         let full_oplog = server.oplog_bytes();
         let new_block = server.get_block_snapshot(&new_block_id).expect("new block exists");
 
-        // Recovery via full sync
+        // Recovery — tries incremental merge first since document has content,
+        // falls back to full sync if needed
         let result = sync
             .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery");
 
-        assert!(matches!(result, SyncResult::FullSync { block_count: 2 }));
+        assert!(
+            matches!(result, SyncResult::IncrementalMerge | SyncResult::FullSync { .. }),
+            "Expected recovery via incremental merge or full sync, got {:?}", result
+        );
         assert!(!sync.needs_full_sync("doc-1"));
         assert!(client.full_text().contains("After error"));
     }
