@@ -16,6 +16,8 @@
 //! - `tree`: DAG visualization as ASCII tree
 
 mod helpers;
+pub mod hook_listener;
+pub mod hook_types;
 mod models;
 mod tree;
 
@@ -321,6 +323,11 @@ impl KaijutsuMcp {
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
         })
+    }
+
+    /// Get the backend variant (for hook listener setup, etc.).
+    pub fn backend(&self) -> &Backend {
+        &self.backend
     }
 
     /// Get the underlying store for tool operations.
