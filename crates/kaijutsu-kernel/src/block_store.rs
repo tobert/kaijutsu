@@ -101,7 +101,7 @@ impl DocumentEntry {
     }
 
     /// Increment version and record agent.
-    fn touch(&self, agent_id: &str) {
+    pub fn touch(&self, agent_id: &str) {
         self.version.fetch_add(1, Ordering::SeqCst);
         *self.last_agent.write() = agent_id.to_string();
     }
