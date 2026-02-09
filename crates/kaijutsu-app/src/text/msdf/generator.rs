@@ -165,12 +165,12 @@ pub struct MsdfGenerator {
 impl MsdfGenerator {
     /// Create a new generator with default settings.
     ///
-    /// MSDF range of 6.0 at 64px/em gives ~6px antialiasing at 16px font size,
-    /// providing stable stroke weights and smooth edges at small sizes.
+    /// MSDF range of 4.0 at 64px/em gives ~4px effective AA at 16px font size.
+    /// The 64px atlas resolution provides the fidelity; range=4 keeps quads tight.
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
-            msdf_range: 6.0,
+            msdf_range: 4.0,
             px_per_em: 64.0,
             angle_threshold: 3.0,
         }
