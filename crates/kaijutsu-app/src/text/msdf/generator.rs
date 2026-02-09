@@ -165,13 +165,13 @@ pub struct MsdfGenerator {
 impl MsdfGenerator {
     /// Create a new generator with default settings.
     ///
-    /// MSDF range of 4.0 at 32px/em gives ~1.9px antialiasing at 15px font size,
-    /// which provides smooth edges without excessive bleed between characters.
+    /// MSDF range of 6.0 at 64px/em gives ~6px antialiasing at 16px font size,
+    /// providing stable stroke weights and smooth edges at small sizes.
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
-            msdf_range: 4.0,  // Reduced from 8.0 to minimize inter-character bleed
-            px_per_em: 32.0,
+            msdf_range: 6.0,
+            px_per_em: 64.0,
             angle_threshold: 3.0,
         }
     }

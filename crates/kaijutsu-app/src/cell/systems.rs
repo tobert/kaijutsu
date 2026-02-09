@@ -344,6 +344,7 @@ pub fn init_cell_buffers(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Initialize with current editor text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -794,7 +795,7 @@ pub fn spawn_cursor(
     });
 
     // Derive cursor size from TextMetrics for consistency with text rendering
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
     let entity = commands
@@ -854,7 +855,7 @@ pub fn update_cursor(
     let (row, col) = cursor_position(&mut editor);
 
     // Position relative to cell bounds using TextMetrics for consistency
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);
@@ -1446,6 +1447,7 @@ pub fn spawn_expanded_block_view(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         let color = block_color(block, &theme);
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -2381,6 +2383,7 @@ pub fn init_role_header_buffers(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Set header text based on role
         let text = match header.role {
@@ -3149,7 +3152,7 @@ pub fn update_block_edit_cursor(
     };
 
     // Position cursor relative to block cell's text area
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);
@@ -3177,6 +3180,7 @@ pub fn init_compose_block_buffer(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Initialize with placeholder text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -3869,7 +3873,7 @@ pub fn update_bubble_cursor(
         .map(|pos| offset - pos - 1)
         .unwrap_or(offset);
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);

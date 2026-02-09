@@ -20,8 +20,10 @@ use super::buffer::{MsdfTextAreaConfig, MsdfTextBuffer, PositionedGlyph, TextBou
 use super::{MsdfText, SdfTextEffects};
 use crate::text::resources::MsdfRenderConfig;
 
-/// MSDF textures are generated at 32 pixels per em.
-pub const MSDF_PX_PER_EM: f32 = 32.0;
+/// MSDF textures are generated at 64 pixels per em.
+/// Higher resolution provides 4px effective range at 16px rendering,
+/// eliminating stroke weight instability from insufficient distance field fidelity.
+pub const MSDF_PX_PER_EM: f32 = 64.0;
 
 // ============================================================================
 // DEBUG GEOMETRY HELPERS
@@ -213,7 +215,7 @@ impl Default for MsdfUniforms {
     fn default() -> Self {
         Self {
             resolution: [1280.0, 720.0],
-            msdf_range: 4.0, // Must match MsdfAtlas::DEFAULT_RANGE
+            msdf_range: 6.0, // Must match MsdfAtlas::DEFAULT_RANGE
             time: 0.0,
             rainbow: 0,
             glow_intensity: 0.0,
@@ -1876,24 +1878,24 @@ mod tests {
 
     /// Test MSDF scale calculation.
     ///
-    /// MSDF textures are generated at 32px/em. When rendering at a different
+    /// MSDF textures are generated at 64px/em. When rendering at a different
     /// font size, we scale the atlas region accordingly.
     #[test]
     fn msdf_scale_calculation() {
-        // 16px font = half the MSDF generation size
+        // 16px font = quarter the MSDF generation size
         let font_size: f32 = 16.0;
         let scale = font_size / MSDF_PX_PER_EM;
-        assert!((scale - 0.5).abs() < 0.001, "16px font should be 0.5x scale");
+        assert!((scale - 0.25).abs() < 0.001, "16px font should be 0.25x scale");
 
-        // 32px font = same as MSDF generation size
-        let font_size_32: f32 = 32.0;
-        let scale_32 = font_size_32 / MSDF_PX_PER_EM;
-        assert!((scale_32 - 1.0).abs() < 0.001, "32px font should be 1.0x scale");
-
-        // 64px font = double the MSDF generation size
+        // 64px font = same as MSDF generation size
         let font_size_64: f32 = 64.0;
         let scale_64 = font_size_64 / MSDF_PX_PER_EM;
-        assert!((scale_64 - 2.0).abs() < 0.001, "64px font should be 2.0x scale");
+        assert!((scale_64 - 1.0).abs() < 0.001, "64px font should be 1.0x scale");
+
+        // 128px font = double the MSDF generation size
+        let font_size_128: f32 = 128.0;
+        let scale_128 = font_size_128 / MSDF_PX_PER_EM;
+        assert!((scale_128 - 2.0).abs() < 0.001, "128px font should be 2.0x scale");
     }
 
     /// Test quad size calculation from atlas region.
@@ -1902,12 +1904,12 @@ mod tests {
     #[test]
     fn quad_size_from_region() {
         let region_width: f32 = 40.0; // MSDF was generated with 40px wide bitmap
-        let msdf_scale: f32 = 0.5; // 16px font
+        let msdf_scale: f32 = 0.25; // 16px font at 64px/em
         let quad_width = region_width * msdf_scale;
 
-        assert!((quad_width - 20.0).abs() < 0.001, "40px region at 0.5x scale = 20px quad");
+        assert!((quad_width - 10.0).abs() < 0.001, "40px region at 0.25x scale = 10px quad");
 
-        // At native MSDF size
+        // At native MSDF size (64px font)
         let msdf_scale_1: f32 = 1.0;
         let quad_width_1 = region_width * msdf_scale_1;
         assert!((quad_width_1 - 40.0).abs() < 0.001, "40px region at 1.0x scale = 40px quad");
@@ -1981,14 +1983,14 @@ mod tests {
         let region_anchor_x: f32 = 0.25; // em units (MSDF padding / px_per_em)
 
         // Calculations (mirroring prepare_msdf_texts)
-        let msdf_scale = font_size / MSDF_PX_PER_EM; // 0.5
-        let quad_width = region_width as f32 * msdf_scale; // 20.0
+        let msdf_scale = font_size / MSDF_PX_PER_EM; // 0.25
+        let quad_width = region_width as f32 * msdf_scale; // 10.0
         let anchor_x = region_anchor_x * font_size; // 4.0
         // Subtract anchor to align glyph origin with pen position
         let px_x = text_left + (glyph_x - anchor_x) * text_scale; // 50 + (0 - 4) = 46
 
-        assert!((msdf_scale - 0.5).abs() < 0.001);
-        assert!((quad_width - 20.0).abs() < 0.001);
+        assert!((msdf_scale - 0.25).abs() < 0.001);
+        assert!((quad_width - 10.0).abs() < 0.001);
         assert!((anchor_x - 4.0).abs() < 0.001);
         assert!((px_x - 46.0).abs() < 0.001);
     }

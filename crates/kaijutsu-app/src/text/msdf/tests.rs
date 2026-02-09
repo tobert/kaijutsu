@@ -101,6 +101,8 @@ struct TestConfig {
     /// Alternating per-glyph colors for overlap detection.
     /// When set, even glyphs get color_a, odd glyphs get color_b.
     alternating_colors: Option<([u8; 4], [u8; 4])>,
+    /// Optional debug mode to force.
+    debug_mode: Option<super::DebugOverlayMode>,
     /// Frames remaining before capture.
     frames_remaining: u32,
     /// Whether we've received and processed the image.
@@ -125,9 +127,15 @@ impl TestConfig {
             color: Color::WHITE,
             glow: false,
             alternating_colors: None,
+            debug_mode: None,
             frames_remaining: PRE_ROLL_FRAMES,
             done: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn with_debug_mode(mut self, mode: super::DebugOverlayMode) -> Self {
+        self.debug_mode = Some(mode);
+        self
     }
 
     fn with_position(mut self, left: f32, top: f32) -> Self {
@@ -585,8 +593,8 @@ fn render_with_config(mut config: TestConfig) -> TestOutput {
     let is_bgra = matches!(format,
         TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb);
 
-    App::new()
-        .add_plugins(
+    let mut app = App::new();
+    app.add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
                     file_path: workspace_root.join("assets").to_string_lossy().to_string(),
@@ -609,8 +617,16 @@ fn render_with_config(mut config: TestConfig) -> TestOutput {
             receiver: receiver.clone(),
         })
         .insert_resource(ClearColor(Color::BLACK))
-        .insert_resource(config)
-        .add_systems(Startup, setup_test_scene)
+        .insert_resource(config);
+
+    if let Some(debug_mode) = app.world().resource::<TestConfig>().debug_mode {
+        app.insert_resource(super::MsdfDebugOverlay {
+            mode: debug_mode,
+            show_hud: false,
+        });
+    }
+
+    app.add_systems(Startup, setup_test_scene)
         .add_systems(PostUpdate, process_captured_image)
         .run();
 
@@ -2683,24 +2699,30 @@ fn monospace_inter_glyph_seamless() {
 struct ColumnChannelStats {
     /// Average red channel value (0.0–1.0) across text rows.
     avg_red: f32,
+    /// Average green channel value (0.0–1.0) across text rows.
+    #[allow(dead_code)]
+    avg_green: f32,
     /// Average blue channel value (0.0–1.0) across text rows.
     avg_blue: f32,
 }
 
-/// Compute per-column red and blue channel averages across text rows.
+/// Compute per-column red, green, and blue channel averages across text rows.
 fn column_channel_stats(output: &TestOutput, min_y: u32, max_y: u32) -> Vec<ColumnChannelStats> {
     let text_rows = (max_y - min_y + 1) as f32;
     (0..output.width)
         .map(|x| {
             let mut sum_r = 0.0f32;
+            let mut sum_g = 0.0f32;
             let mut sum_b = 0.0f32;
             for y in min_y..=max_y {
                 let px = output.pixel(x, y);
                 sum_r += px.r as f32 / 255.0;
+                sum_g += px.g as f32 / 255.0;
                 sum_b += px.b as f32 / 255.0;
             }
             ColumnChannelStats {
                 avg_red: sum_r / text_rows,
+                avg_green: sum_g / text_rows,
                 avg_blue: sum_b / text_rows,
             }
         })
@@ -2872,6 +2894,127 @@ fn color_overlap_mm_boundary_bleed() {
              See /tmp/msdf_tests/color_overlap_mmmmm.png for visual.",
             failures.len(),
             failures.join("\n  ")
+        );
+    }
+}
+
+/// Per-column luminance stats for gap analysis.
+struct ColumnLuminance {
+    avg: f32,
+    #[allow(dead_code)]
+    max: f32,
+}
+
+/// Compute per-column average and max luminance across text rows.
+fn column_luminance_stats(output: &TestOutput, min_y: u32, max_y: u32) -> Vec<ColumnLuminance> {
+    let text_rows = (max_y - min_y + 1) as f32;
+    (0..output.width)
+        .map(|x| {
+            let mut sum_lum = 0.0f32;
+            let mut max_lum = 0.0f32;
+            for y in min_y..=max_y {
+                let lum = output.pixel(x, y).luminance();
+                sum_lum += lum;
+                max_lum = max_lum.max(lum);
+            }
+            ColumnLuminance {
+                avg: sum_lum / text_rows,
+                max: max_lum,
+            }
+        })
+        .collect()
+}
+
+/// Test: luminance dip at "mm" boundary.
+///
+/// Verifies that there is a proper gap between adjacent characters.
+/// The current broken state has nearly 100% luminance at the boundary.
+/// FreeType/ClearType produce a dip to ~50-80% luminance depending on spacing.
+///
+/// This test fails if the boundary is "filled in" (crowded).
+/// Marked `#[ignore]` — documents the known crowding issue and provides a
+/// quantitative benchmark. Run manually to measure progress:
+///   cargo test -p kaijutsu-app -- mm_gap_luminance --ignored --nocapture
+#[test]
+#[ignore]
+fn mm_gap_luminance() {
+    use cosmic_text::{Attrs, FontSystem, Metrics, Shaping};
+
+    let text = "mm";
+    let font_size = 16.0;
+
+    // Get advance width for boundary calculation
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
+    let attrs = Attrs::new().family(cosmic_text::Family::Monospace);
+    buffer.set_text(&mut font_system, text, attrs, Shaping::Advanced);
+    buffer.visual_line_count(&mut font_system, 400.0, None);
+    let glyphs = buffer.glyphs();
+    let advance = glyphs[0].advance_width;
+    let left_margin = 10.0f32;
+
+    // Debug render with dots overlay for visual inspection
+    let debug_config = TestConfig::new(text, font_size, 100, 60, true)
+        .with_debug_mode(super::DebugOverlayMode::Dots);
+    let debug_output = render_with_config(debug_config);
+    debug_output.save_png("mm_gap_luminance_debug");
+
+    // Normal render for luminance measurement
+    let config = TestConfig::new(text, font_size, 100, 60, true);
+    let output = render_with_config(config);
+    output.save_png("mm_gap_luminance");
+
+    // Boundary between first and second 'm'
+    let boundary_col = (left_margin + advance).round() as u32;
+
+    // Find text rows
+    let (min_y, max_y) = text_row_extent(&output, 0.05)
+        .expect("Should have visible text");
+
+    let stats = column_luminance_stats(&output, min_y, max_y);
+
+    // Check luminance in a 3px window around boundary
+    let mut min_boundary_lum = 1.0f32;
+    for x in (boundary_col - 1)..=(boundary_col + 1) {
+        if let Some(col_stats) = stats.get(x as usize) {
+            min_boundary_lum = min_boundary_lum.min(col_stats.avg);
+        }
+    }
+
+    // Peak luminance in the glyph bodies (center of first 'm')
+    let center_col = (left_margin + advance * 0.5).round() as u32;
+    let mut peak_lum = 0.0f32;
+    for x in (center_col - 2)..=(center_col + 2) {
+        if let Some(col_stats) = stats.get(x as usize) {
+            peak_lum = peak_lum.max(col_stats.avg);
+        }
+    }
+
+    eprintln!("Luminance profile around boundary (col {}):", boundary_col);
+    for x in (boundary_col - 5)..=(boundary_col + 5) {
+        if let Some(s) = stats.get(x as usize) {
+            let marker = if x == boundary_col { " <-- boundary" } else { "" };
+            eprintln!("  col {x:3}: {:.3}{marker}", s.avg);
+        }
+    }
+
+    eprintln!("Peak luminance (glyph body): {:.3}", peak_lum);
+    eprintln!("Min luminance (boundary):    {:.3}", min_boundary_lum);
+    eprintln!("Ratio (min/peak):            {:.3}", min_boundary_lum / peak_lum);
+
+    // The gap should be distinct. If ratio > 0.90, it's effectively no gap.
+    // FreeType typically shows a ratio < 0.85 for this font/size.
+    // Our broken render shows ~0.96.
+    let ratio_threshold = 0.90;
+
+    if min_boundary_lum / peak_lum > ratio_threshold {
+        panic!(
+            "Boundary gap is filled in! Ratio {:.3} > threshold {:.2}. \
+             The characters are crowding each other.\n\
+             See /tmp/msdf_tests/mm_gap_luminance.png for visual.",
+            min_boundary_lum / peak_lum,
+            ratio_threshold
         );
     }
 }

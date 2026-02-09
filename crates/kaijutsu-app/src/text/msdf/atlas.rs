@@ -89,9 +89,9 @@ pub struct MsdfAtlas {
 impl MsdfAtlas {
     /// Default MSDF range (distance field extent in pixels).
     /// Must match MsdfGenerator::new() msdf_range for correct shader AA math.
-    pub const DEFAULT_RANGE: f32 = 4.0;
+    pub const DEFAULT_RANGE: f32 = 6.0;
     /// Default pixels per em for MSDF generation.
-    pub const DEFAULT_PX_PER_EM: f64 = 32.0;
+    pub const DEFAULT_PX_PER_EM: f64 = 64.0;
 
     /// Create a new atlas with the given initial dimensions.
     pub fn new(images: &mut Assets<Image>, width: u32, height: u32) -> Self {

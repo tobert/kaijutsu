@@ -18,10 +18,13 @@ use std::sync::{Arc, Mutex};
 /// user preferences in the future.
 #[derive(Resource, Clone)]
 pub struct TextMetrics {
-    /// Base font size for content cells (blocks, code). Default: 22.0
+    /// Base font size for content cells (blocks, code). Default: 16.0
     pub cell_font_size: f32,
-    /// Line height for content cells. Default: 33.0 (1.5x font size)
+    /// Line height for content cells. Default: 24.0 (1.5x font size)
     pub cell_line_height: f32,
+    /// Extra letter-spacing in pixels. Default: 0.5
+    /// Applied per-glyph as cumulative offset to widen gaps between characters.
+    pub letter_spacing: f32,
     /// Window scale factor, updated from window resize events.
     /// Applied automatically in scaled_*_metrics() methods.
     pub scale_factor: f32,
@@ -30,8 +33,9 @@ pub struct TextMetrics {
 impl Default for TextMetrics {
     fn default() -> Self {
         Self {
-            cell_font_size: 22.0,
-            cell_line_height: 33.0, // 1.5x for comfortable reading
+            cell_font_size: 16.0,
+            cell_line_height: 24.0, // 1.5x for comfortable reading
+            letter_spacing: 0.5,
             scale_factor: 1.0,
         }
     }
