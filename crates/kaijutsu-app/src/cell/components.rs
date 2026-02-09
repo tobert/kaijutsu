@@ -540,7 +540,7 @@ pub struct DocumentSyncState {
     /// The authoritative document (None until first sync).
     pub doc: Option<BlockDocument>,
     /// Sync manager for frontier tracking.
-    manager: super::sync::SyncManager,
+    manager: kaijutsu_client::SyncManager,
 }
 
 #[allow(dead_code)]
@@ -549,7 +549,7 @@ impl DocumentSyncState {
     pub fn new() -> Self {
         Self {
             doc: None,
-            manager: super::sync::SyncManager::new(),
+            manager: kaijutsu_client::SyncManager::new(),
         }
     }
 
@@ -577,7 +577,7 @@ impl DocumentSyncState {
         document_id: &str,
         agent_id: &str,
         oplog_bytes: &[u8],
-    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         // Create document if needed, or get existing
         let doc = self.doc.get_or_insert_with(|| {
             BlockDocument::new(document_id, agent_id)
@@ -597,7 +597,7 @@ impl DocumentSyncState {
         agent_id: &str,
         block: &BlockSnapshot,
         ops: &[u8],
-    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
             BlockDocument::new(document_id, agent_id)
         });
@@ -613,7 +613,7 @@ impl DocumentSyncState {
         document_id: &str,
         agent_id: &str,
         ops: &[u8],
-    ) -> Result<super::sync::SyncResult, super::sync::SyncError> {
+    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
             BlockDocument::new(document_id, agent_id)
         });
@@ -631,7 +631,7 @@ impl DocumentSyncState {
 
     /// Get a reference to the underlying sync manager (for testing/debugging).
     #[allow(dead_code)]
-    pub fn manager(&self) -> &super::sync::SyncManager {
+    pub fn manager(&self) -> &kaijutsu_client::SyncManager {
         &self.manager
     }
 }
@@ -646,7 +646,7 @@ pub struct CachedDocument {
     /// The CRDT document — authoritative content for this context.
     pub doc: BlockDocument,
     /// Sync manager for frontier tracking (one per document).
-    pub sync: super::sync::SyncManager,
+    pub sync: kaijutsu_client::SyncManager,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
     /// Generation counter at last sync (for staleness detection).

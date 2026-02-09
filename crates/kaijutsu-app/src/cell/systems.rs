@@ -1750,7 +1750,7 @@ pub fn handle_block_events(
             if !doc_cache.contains(document_id) {
                 let mut cached = CachedDocument {
                     doc: BlockDocument::new(document_id, &agent_id),
-                    sync: super::sync::SyncManager::new(),
+                    sync: kaijutsu_client::SyncManager::new(),
                     context_name: context_name.clone(),
                     synced_at_generation: 0,
                     last_accessed: std::time::Instant::now(),

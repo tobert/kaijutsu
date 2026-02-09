@@ -47,8 +47,8 @@ use rmcp::{
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
-use kaijutsu_client::{ActorHandle, SshConfig, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{ConversationDAG, LV};
+use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
+use kaijutsu_crdt::{BlockDocument, ConversationDAG};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -110,6 +110,11 @@ pub enum Backend {
 ///
 /// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
 /// types in a `spawn_local` task with auto-reconnect.
+///
+/// Maintains a local `BlockDocument` kept in sync via a background event
+/// listener that applies `ServerEvent::BlockInserted` / `BlockTextOps`
+/// through `SyncManager`. The `store` is still populated for other tool
+/// reads (query, list, etc.).
 #[derive(Clone)]
 pub struct RemoteState {
     /// The document ID from our seat
@@ -120,9 +125,10 @@ pub struct RemoteState {
     pub store: SharedBlockStore,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
-    /// Server's frontier at last sync (used to calculate ops to push)
-    /// Protected by Arc<Mutex<>> for thread-safe updates
-    pub last_sync_frontier: Arc<Mutex<Vec<LV>>>,
+    /// Local CRDT document kept in sync by the background event listener.
+    pub doc: Arc<Mutex<BlockDocument>>,
+    /// Frontier-tracking sync state machine.
+    pub sync: Arc<Mutex<SyncManager>>,
 }
 
 // ============================================================================
@@ -230,38 +236,46 @@ impl KaijutsuMcp {
         // Sync document state from server
         let doc_state = kernel.get_document_state(&document_id).await?;
 
-        // Create the document from the server's oplog
-        if !doc_state.ops.is_empty() {
+        // Create the local BlockDocument from the server's oplog
+        let doc = if !doc_state.ops.is_empty() {
+            // Also populate the store (other MCP tools use it for reads)
             store.create_document_from_oplog(
                 doc_state.document_id.clone(),
                 DocumentKind::Conversation,
                 None,
                 &doc_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
-            tracing::debug!(
-                doc = %doc_state.document_id,
-                blocks = %doc_state.blocks.len(),
-                ops_bytes = %doc_state.ops.len(),
-                "Synced document state"
-            );
+
+            BlockDocument::from_oplog(
+                doc_state.document_id.clone(),
+                "mcp-agent",
+                &doc_state.ops,
+            ).map_err(|e| anyhow::anyhow!("from_oplog: {e}"))?
         } else {
-            // Empty document - just create fresh
+            // Empty document - create fresh in both store and local doc
             store.create_document(
                 doc_state.document_id.clone(),
                 DocumentKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
-        }
 
-        // Get the local frontier after syncing (this represents what we received from server)
-        let frontier = store.frontier(&doc_state.document_id)
-            .unwrap_or_default();
+            BlockDocument::new(&doc_state.document_id, "mcp-agent")
+        };
+
+        let frontier = doc.frontier();
+        let sync = SyncManager::with_state(
+            Some(doc_state.document_id.clone()),
+            Some(frontier),
+        );
 
         tracing::debug!(
             doc = %doc_state.document_id,
-            frontier = ?frontier,
-            "Initial sync complete, recorded frontier"
+            blocks = doc.block_count(),
+            "Initial sync complete, SyncManager initialized"
         );
+
+        let doc_arc = Arc::new(Mutex::new(doc));
+        let sync_arc = Arc::new(Mutex::new(sync));
 
         // Spawn actor with the existing connection (no double-connect)
         let actor = spawn_actor(
@@ -274,13 +288,39 @@ impl KaijutsuMcp {
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 
+        // Spawn background event listener to keep local doc in sync
+        {
+            let mut event_rx = actor.subscribe_events();
+            let doc_bg = Arc::clone(&doc_arc);
+            let sync_bg = Arc::clone(&sync_arc);
+            let doc_id_bg = document_id.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            apply_server_event(&doc_bg, &sync_bg, &doc_id_bg, event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Missed {n} events, forcing full resync");
+                            if let Ok(mut s) = sync_bg.lock() {
+                                s.reset();
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             backend: Backend::Remote(RemoteState {
                 document_id,
                 kernel_id: kernel_id.to_string(),
                 store,
                 actor,
-                last_sync_frontier: Arc::new(Mutex::new(frontier)),
+                doc: doc_arc,
+                sync: sync_arc,
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -311,10 +351,12 @@ impl KaijutsuMcp {
         let remote = self.remote()
             .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
 
-        // Get ops since last sync
-        let frontier = remote.last_sync_frontier.lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
-            .clone();
+        // Get ops since last sync frontier from SyncManager
+        let frontier = {
+            let sync = remote.sync.lock()
+                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            sync.frontier().map(|f| f.to_vec()).unwrap_or_default()
+        };
 
         let ops = remote.store.ops_since(&remote.document_id, &frontier)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -337,12 +379,6 @@ impl KaijutsuMcp {
         // Push via persistent actor (no reconnect dance)
         let ack_version = remote.actor.push_ops(&remote.document_id, &ops_bytes).await
             .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
-
-        // Update last sync frontier to current local frontier
-        let new_frontier = remote.store.frontier(&remote.document_id)
-            .unwrap_or_default();
-        *remote.last_sync_frontier.lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))? = new_frontier;
 
         tracing::info!(doc = %remote.document_id, ack_version, "Pushed ops");
 
@@ -1249,10 +1285,15 @@ impl KaijutsuMcp {
             "Shell command dispatched"
         );
 
-        // Poll until the output block's status leaves Running.
+        // Wait for completion via event stream + periodic fallback.
+        //
+        // Primary: listen for BlockStatusChanged matching our command's output block.
+        // Fallback: every 500ms, check local doc (kept in sync by background listener).
+        // This eliminates N full-document round-trips per shell command.
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
         let start = std::time::Instant::now();
-        let poll_interval = tokio::time::Duration::from_millis(250);
+        let mut event_rx = remote.actor.subscribe_events();
+        let fallback_interval = tokio::time::Duration::from_millis(500);
 
         loop {
             if start.elapsed().as_secs() > timeout_secs {
@@ -1262,39 +1303,65 @@ impl KaijutsuMcp {
                 );
             }
 
-            tokio::time::sleep(poll_interval).await;
+            // Wait for either an event or the fallback timeout
+            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
 
-            let state = match actor.get_document_state(doc_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Error polling document state: {e}");
-                    continue;
-                }
-            };
-
-            // Find the ShellOutput block that is a child of our command
-            let output_block = state.blocks.iter().find(|b| {
-                b.parent_id.as_ref() == Some(&cmd_block_id)
-                    && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
-            });
-
-            if let Some(block) = output_block {
-                match block.status {
-                    kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
-                        tracing::info!(
-                            command = %req.command,
-                            status = %block.status.as_str(),
-                            output_len = block.content.len(),
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            "Shell command completed"
-                        );
-                        return if block.content.is_empty() {
-                            "(no output)".to_string()
-                        } else {
-                            block.content.clone()
-                        };
+            match event {
+                Ok(Ok(ServerEvent::BlockStatusChanged { block_id, status, .. })) => {
+                    // Check if this status change is for a child of our command block
+                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) {
+                        // Read the output from our local doc (kept in sync by background listener)
+                        if let Ok(doc) = remote.doc.lock() {
+                            if let Some(output) = doc.blocks_ordered().iter().find(|b| {
+                                b.parent_id.as_ref() == Some(&cmd_block_id)
+                                    && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
+                                    && b.id == block_id
+                            }) {
+                                tracing::info!(
+                                    command = %req.command,
+                                    status = %output.status.as_str(),
+                                    output_len = output.content.len(),
+                                    elapsed_ms = start.elapsed().as_millis() as u64,
+                                    "Shell command completed (via event)"
+                                );
+                                return if output.content.is_empty() {
+                                    "(no output)".to_string()
+                                } else {
+                                    output.content.clone()
+                                };
+                            }
+                        }
                     }
-                    _ => {} // Still running, keep polling
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return "Error: event stream closed".to_string();
+                }
+                _ => {
+                    // Timeout or other event — fallback: check local doc state
+                    if let Ok(doc) = remote.doc.lock() {
+                        if let Some(output) = doc.blocks_ordered().iter().find(|b| {
+                            b.parent_id.as_ref() == Some(&cmd_block_id)
+                                && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
+                        }) {
+                            match output.status {
+                                kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
+                                    tracing::info!(
+                                        command = %req.command,
+                                        status = %output.status.as_str(),
+                                        output_len = output.content.len(),
+                                        elapsed_ms = start.elapsed().as_millis() as u64,
+                                        "Shell command completed (via fallback)"
+                                    );
+                                    return if output.content.is_empty() {
+                                        "(no output)".to_string()
+                                    } else {
+                                        output.content.clone()
+                                    };
+                                }
+                                _ => {} // Still running
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1684,6 +1751,63 @@ impl KaijutsuMcp {
                 },
             }],
         })
+    }
+}
+
+// ============================================================================
+// Background Event Listener
+// ============================================================================
+
+/// Apply a server event to the local BlockDocument via SyncManager.
+///
+/// Called by the background event listener spawned in `connect()`.
+/// Only handles CRDT-relevant events (BlockInserted, BlockTextOps, BlockStatusChanged).
+/// Lock scopes are kept short — never held across async boundaries.
+fn apply_server_event(
+    doc: &Arc<Mutex<BlockDocument>>,
+    sync: &Arc<Mutex<SyncManager>>,
+    document_id: &str,
+    event: ServerEvent,
+) {
+    match event {
+        ServerEvent::BlockInserted { document_id: event_doc_id, block, ops, .. } => {
+            if event_doc_id != document_id {
+                return;
+            }
+            let (mut d, mut s) = match (doc.lock(), sync.lock()) {
+                (Ok(d), Ok(s)) => (d, s),
+                _ => return,
+            };
+            match s.apply_block_inserted(&mut d, &event_doc_id, &block, &ops) {
+                Ok(_) => tracing::trace!(block = ?block.id, "Applied BlockInserted"),
+                Err(e) => tracing::warn!(block = ?block.id, "BlockInserted sync error: {e}"),
+            }
+        }
+        ServerEvent::BlockTextOps { document_id: event_doc_id, ops, .. } => {
+            if event_doc_id != document_id {
+                return;
+            }
+            let (mut d, mut s) = match (doc.lock(), sync.lock()) {
+                (Ok(d), Ok(s)) => (d, s),
+                _ => return,
+            };
+            match s.apply_text_ops(&mut d, &event_doc_id, &ops) {
+                Ok(_) => tracing::trace!("Applied BlockTextOps"),
+                Err(e) => tracing::warn!("BlockTextOps sync error: {e}"),
+            }
+        }
+        ServerEvent::BlockStatusChanged { document_id: event_doc_id, block_id, status } => {
+            if event_doc_id != document_id {
+                return;
+            }
+            // Status changes don't affect CRDT oplog, but we update the local doc
+            // so the shell tool can read final status without a server round-trip.
+            if let Ok(mut d) = doc.lock() {
+                let _ = d.set_status(&block_id, status);
+            }
+        }
+        // Other event variants don't affect CRDT state
+        _ => {}
     }
 }
 

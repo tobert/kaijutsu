@@ -18,7 +18,6 @@
 mod components;
 pub mod frame_assembly;
 pub mod plugin;
-mod sync;
 mod systems;
 
 // Re-export public API
