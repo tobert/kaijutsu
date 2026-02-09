@@ -35,7 +35,7 @@ impl Default for TextMetrics {
         Self {
             cell_font_size: 16.0,
             cell_line_height: 24.0, // 1.5x for comfortable reading
-            letter_spacing: 0.5,
+            letter_spacing: 1.0,
             scale_factor: 1.0,
         }
     }
