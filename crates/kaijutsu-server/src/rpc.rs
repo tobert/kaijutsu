@@ -26,7 +26,11 @@ use kaijutsu_kernel::{
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, DriftEngine, GitEngine,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine, GitEngine,
+    // Drift engines (split)
+    DriftLsEngine, DriftPushEngine, DriftPullEngine, DriftFlushEngine, DriftMergeEngine,
+    // File tools
+    FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
     // MCP
     McpServerPool, McpServerConfig, McpToolEngine,
     // FlowBus
@@ -40,7 +44,7 @@ use kaijutsu_kernel::{
     // Tool filtering
     ToolFilter,
 };
-use kaijutsu_crdt::{BlockKind, Role};
+use kaijutsu_crdt::{BlockKind, Role, Status};
 use serde_json;
 
 // ============================================================================
@@ -104,15 +108,56 @@ async fn register_block_tools(
         Arc::new(KernelSearchEngine::new(documents.clone())),
     ).await;
 
+    // ── Drift tools (split into individual engines) ──
     kernel.register_tool_with_engine(
-        ToolInfo::new("drift", "Cross-context drift: push, pull, merge between contexts", "drift"),
-        Arc::new(DriftEngine::new(
-            kernel,
-            documents.clone(),
-            "default",
-        )),
+        ToolInfo::new("drift_ls", "List all contexts in this kernel's drift router", "drift"),
+        Arc::new(DriftLsEngine::new(kernel, "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_push", "Stage content for transfer to another context", "drift"),
+        Arc::new(DriftPushEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_pull", "Read and LLM-summarize another context's conversation", "drift"),
+        Arc::new(DriftPullEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_flush", "Deliver all staged drifts to target documents", "drift"),
+        Arc::new(DriftFlushEngine::new(kernel, documents.clone(), "default")),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("drift_merge", "Summarize a forked context back into its parent", "drift"),
+        Arc::new(DriftMergeEngine::new(kernel, documents.clone(), "default")),
     ).await;
 
+    // ── File tools (CRDT-backed) ──
+    let file_cache = Arc::new(FileDocumentCache::new(documents.clone(), kernel.vfs().clone()));
+    kernel.register_tool_with_engine(
+        ToolInfo::new("read", "Read file content with optional line numbers", "file"),
+        Arc::new(ReadEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
+        Arc::new(EditEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("write", "Write or create a file with the given content", "file"),
+        Arc::new(WriteEngine::new(file_cache.clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
+        Arc::new(GlobEngine::new(kernel.vfs().clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("grep", "Search file content with regex", "file"),
+        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone())),
+    ).await;
+    kernel.register_tool_with_engine(
+        ToolInfo::new("whoami", "Show current context identity", "drift"),
+        Arc::new(WhoamiEngine::new(kernel.drift().clone(), "default")),
+    ).await;
+
+    // ── VCS ──
     kernel.register_tool_with_engine(
         ToolInfo::new("git", "Context-aware git with LLM commit summaries", "vcs"),
         Arc::new(GitEngine::new(
@@ -566,6 +611,11 @@ impl world::Server for WorldImpl {
                 contexts.insert("default".to_string(), ContextState::new("default".to_string()));
 
                 let mut state_ref = state.borrow_mut();
+
+                // Register in server-level drift router (for listAllContexts).
+                // Use kernel_id as context name — drift RPCs look up by kernel_id.
+                state_ref.drift_router.register(&id, &main_document_id, None);
+
                 state_ref.kernels.insert(
                     id.clone(),
                     KernelState {
@@ -1945,46 +1995,83 @@ impl kernel::Server for KernelImpl {
             cursor_block: None,
         };
 
-        // Update state
-        {
-            let mut state_ref = state.borrow_mut();
+        let state2 = state.clone();
+        let kernel_id2 = kernel_id.clone();
+        let context_name2 = context_name.clone();
 
-            // Ensure context exists (create if not)
-            if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id) {
-                kernel.contexts
-                    .entry(context_name.clone())
-                    .or_insert_with(|| ContextState::new(context_name.clone()))
-                    .seats.push(seat_id.clone());
+        Promise::from_future(async move {
+            // Update state — grab kernel Arc, then drop borrow before async drift registration
+            let kernel_arc = {
+                let mut state_ref = state2.borrow_mut();
 
-                // Auto-create the document for this context if it doesn't exist
-                let doc_id = format!("{}@{}", kernel_id, context_name);
-                if !kernel.documents.contains(&doc_id) {
-                    log::info!("Auto-creating document {} for context", doc_id);
-                    if let Err(e) = kernel.documents.create_document(
-                        doc_id.clone(),
-                        DocumentKind::Conversation,
-                        None,
-                    ) {
-                        log::error!("Failed to create document {}: {}", doc_id, e);
+                // Ensure context exists (create if not)
+                let kernel_arc = if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id2) {
+                    kernel.contexts
+                        .entry(context_name2.clone())
+                        .or_insert_with(|| ContextState::new(context_name2.clone()))
+                        .seats.push(seat_id.clone());
+
+                    // Auto-create the document for this context if it doesn't exist
+                    let doc_id = format!("{}@{}", kernel_id2, context_name2);
+                    if !kernel.documents.contains(&doc_id) {
+                        log::info!("Auto-creating document {} for context", doc_id);
+                        if let Err(e) = kernel.documents.create_document(
+                            doc_id.clone(),
+                            DocumentKind::Conversation,
+                            None,
+                        ) {
+                            log::error!("Failed to create document {}: {}", doc_id, e);
+                        }
                     }
+
+                    Some(kernel.kernel.clone())
+                } else {
+                    None
+                };
+
+                // Track seat in user's seats
+                state_ref.my_seats.insert(seat_id.key(), seat_info.clone());
+                state_ref.current_seat = Some(seat_id);
+
+                kernel_arc
+            };
+            // borrow dropped here — safe to .await
+
+            // Register context in both drift routers so drift operations work
+            if let Some(kernel) = kernel_arc {
+                let doc_id = format!("{}@{}", kernel_id2, context_name2);
+
+                // Kernel-level drift router (used by push/pull/flush/merge RPCs)
+                let already_registered = {
+                    let mut drift = kernel.drift().write().await;
+                    let exists = drift.list_contexts().iter()
+                        .any(|c| c.context_name == context_name2);
+                    if !exists {
+                        drift.register(&context_name2, &doc_id, None);
+                    }
+                    exists
+                };
+
+                // Server-level drift router (used by listAllContexts)
+                if !already_registered {
+                    let mut state_ref = state2.borrow_mut();
+                    let short_id = state_ref.drift_router.register(&context_name2, &doc_id, None);
+                    log::info!("Registered context '{}' (doc: {}, short_id: {}) in DriftRouter",
+                        context_name2, doc_id, short_id);
                 }
             }
 
-            // Track seat in user's seats
-            state_ref.my_seats.insert(seat_id.key(), seat_info.clone());
-            state_ref.current_seat = Some(seat_id);
-        }
+            // Create and return SeatHandle capability
+            let seat_handle = SeatHandleImpl {
+                state: state.clone(),
+                seat_id: seat_info.id.clone(),
+                kernel_id: kernel_id.clone(),
+            };
 
-        // Create and return SeatHandle capability
-        let seat_handle = SeatHandleImpl {
-            state: state.clone(),
-            seat_id: seat_info.id.clone(),
-            kernel_id: kernel_id.clone(),
-        };
+            results.get().set_seat(capnp_rpc::new_client(seat_handle));
 
-        results.get().set_seat(capnp_rpc::new_client(seat_handle));
-
-        Promise::ok(())
+            Ok(())
+        })
     }
 
     // ========================================================================
@@ -2280,6 +2367,11 @@ impl kernel::Server for KernelImpl {
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
+            // Mark output block as Running — clients poll this to detect completion
+            if let Err(e) = documents.set_status(&cell_id, &output_block_id, Status::Running) {
+                log::warn!("Failed to set output block to Running: {}", e);
+            }
+
             // Spawn execution in background
             let cell_id_clone = cell_id.clone();
             let output_block_id_clone = output_block_id.clone();
@@ -2320,6 +2412,12 @@ impl kernel::Server for KernelImpl {
                                 log::error!("Failed to set display hint: {}", e);
                             }
                         }
+
+                        // Mark complete — status reflects exit code
+                        let final_status = if result.code == 0 { Status::Done } else { Status::Error };
+                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, final_status) {
+                            log::error!("Failed to set output block status: {}", e);
+                        }
                     }
                     Err(e) => {
                         let error_msg = format!("Error: {}", e);
@@ -2327,6 +2425,10 @@ impl kernel::Server for KernelImpl {
                         // Write error to output block
                         if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &error_msg, 0) {
                             log::error!("Failed to update shell output with error: {}", e);
+                        }
+                        // Mark as error
+                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, Status::Error) {
+                            log::error!("Failed to set output block error status: {}", e);
                         }
                     }
                 }

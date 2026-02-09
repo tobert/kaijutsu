@@ -20,8 +20,10 @@ use super::buffer::{MsdfTextAreaConfig, MsdfTextBuffer, PositionedGlyph, TextBou
 use super::{MsdfText, SdfTextEffects};
 use crate::text::resources::MsdfRenderConfig;
 
-/// MSDF textures are generated at 32 pixels per em.
-pub const MSDF_PX_PER_EM: f32 = 32.0;
+/// MSDF textures are generated at 64 pixels per em.
+/// Higher resolution provides 4px effective range at 16px rendering,
+/// eliminating stroke weight instability from insufficient distance field fidelity.
+pub const MSDF_PX_PER_EM: f32 = 64.0;
 
 // ============================================================================
 // DEBUG GEOMETRY HELPERS
@@ -204,15 +206,16 @@ pub struct MsdfUniforms {
     /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
     /// Default 0.5 is the edge of the signed distance field.
     pub text_bias: f32,
-    /// Padding for 16-byte alignment (3 u32s + 3 f32s = 24 bytes → pad to 32).
-    pub _padding: f32,
+    /// Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    /// Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    pub gamma_correction: f32,
 }
 
 impl Default for MsdfUniforms {
     fn default() -> Self {
         Self {
             resolution: [1280.0, 720.0],
-            msdf_range: 8.0,
+            msdf_range: 4.0, // Must match MsdfAtlas::DEFAULT_RANGE
             time: 0.0,
             rainbow: 0,
             glow_intensity: 0.0,
@@ -222,7 +225,6 @@ impl Default for MsdfUniforms {
             sdf_texel: [1.0 / 1024.0, 1.0 / 1024.0], // Default atlas size
             hint_amount: 0.8, // Enable hinting by default (80% strength)
             // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
-            // Higher values (0.2-0.3) for heavier weight, 0.0 to disable
             stem_darkening: 0.15,
             jitter_offset: [0.0, 0.0],
             taa_frame_index: 0,
@@ -230,7 +232,7 @@ impl Default for MsdfUniforms {
             horz_scale: 1.1, // Wider AA for vertical strokes
             vert_scale: 0.6, // Sharper AA for horizontal strokes
             text_bias: 0.5,  // Standard SDF threshold
-            _padding: 0.0,
+            gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
         }
     }
 }
@@ -357,6 +359,8 @@ pub struct ExtractedMsdfRenderConfig {
     pub vert_scale: f32,
     /// SDF threshold for text rendering.
     pub text_bias: f32,
+    /// Gamma correction for alpha.
+    pub gamma_correction: f32,
     /// Glow intensity (0.0-1.0).
     pub glow_intensity: f32,
     /// Glow spread in pixels.
@@ -596,11 +600,8 @@ pub struct MsdfTextResources {
     /// Batches of vertices grouped by scissor bounds.
     /// Each batch has a scissor rect in physical pixels.
     pub batches: Vec<TextBatch>,
-    /// Depth texture for per-glyph depth testing.
-    pub depth_texture: Option<Texture>,
-    pub depth_texture_view: Option<TextureView>,
-    /// Cached resolution for depth texture recreation.
-    pub depth_texture_size: (u32, u32),
+    /// Cached resolution for resize detection.
+    pub texture_size: (u32, u32),
     /// Intermediate texture for TAA - MSDF renders here, TAA blends to ViewTarget.
     /// Only used when TAA is enabled.
     pub intermediate_texture: Option<Texture>,
@@ -797,12 +798,12 @@ impl ViewNode for MsdfTextRenderNode {
         };
 
         // Skip rendering during resize - detect by comparing config resolution
-        // against our depth texture size. Due to pipelining, config may have new
+        // against our cached texture size. Due to pipelining, config may have new
         // resolution before our resources are recreated.
         let render_config = world.get_resource::<ExtractedMsdfRenderConfig>();
         if let Some(config) = render_config {
             let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
-            if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+            if config_size != resources.texture_size && resources.texture_size != (0, 0) {
                 // Resolution mismatch - skip this frame to avoid scissor errors
                 return Ok(());
             }
@@ -822,11 +823,6 @@ impl ViewNode for MsdfTextRenderNode {
 
         let pipeline_cache = world.resource::<PipelineCache>();
         let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.pipeline) else {
-            return Ok(());
-        };
-
-        // Require depth texture for proper overlap handling
-        let Some(depth_texture_view) = &resources.depth_texture_view else {
             return Ok(());
         };
 
@@ -859,16 +855,7 @@ impl ViewNode for MsdfTextRenderNode {
                     },
                     depth_slice: None,
                 })],
-                // Use depth buffer for per-glyph depth testing
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: depth_texture_view,
-                    depth_ops: Some(Operations {
-                        // Clear depth buffer at start of each frame
-                        load: LoadOp::Clear(1.0),
-                        store: StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             },
@@ -950,7 +937,7 @@ impl ViewNode for MsdfTextTaaNode {
         if let Some(config) = render_config {
             if let Some(resources) = world.get_resource::<MsdfTextResources>() {
                 let config_size = (config.resolution[0] as u32, config.resolution[1] as u32);
-                if config_size != resources.depth_texture_size && resources.depth_texture_size != (0, 0) {
+                if config_size != resources.texture_size && resources.texture_size != (0, 0) {
                     return Ok(());
                 }
             }
@@ -1184,6 +1171,7 @@ pub fn extract_msdf_render_config(
         horz_scale: theme.font_horz_scale,
         vert_scale: theme.font_vert_scale,
         text_bias: theme.font_text_bias,
+        gamma_correction: theme.font_gamma_correction,
         glow_intensity: theme.font_glow_intensity,
         glow_spread: theme.font_glow_spread,
         glow_color: [glow_srgba.red, glow_srgba.green, glow_srgba.blue, glow_srgba.alpha],
@@ -1399,7 +1387,7 @@ pub fn prepare_msdf_texts(
         horz_scale: render_config.horz_scale,
         vert_scale: render_config.vert_scale,
         text_bias: render_config.text_bias,
-        _padding: 0.0,
+        gamma_correction: render_config.gamma_correction,
     };
 
     queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -1419,11 +1407,6 @@ pub fn prepare_msdf_texts(
 
     #[cfg(debug_assertions)]
     let mut debug_logged_first = false;
-
-    // Track glyph index for z-depth assignment.
-    // Each glyph gets a unique z-value so depth testing resolves overlaps.
-    // Earlier glyphs (lower index) have lower z and "win" in overlap regions.
-    let mut glyph_index: u32 = 0;
 
     for text in &extracted.texts {
         // Convert logical bounds to physical pixel scissor rect
@@ -1505,11 +1488,9 @@ pub fn prepare_msdf_texts(
             let x1 = x0 + (quad_width * text.scale) * 2.0 / resolution[0];
             let y1 = y0 - (quad_height * text.scale) * 2.0 / resolution[1];
 
-            // Z-depth: each glyph gets a unique depth value.
-            // Using small increments ensures depth buffer precision is sufficient.
-            // Earlier glyphs have lower z values, so they "win" in depth test (Less).
-            let z = glyph_index as f32 * 0.0001;
-            glyph_index += 1;
+            // Z is flat — depth testing is disabled. Overlap between adjacent
+            // glyph quads is resolved by premultiplied alpha blending.
+            let z = 0.5;
 
             // Two triangles for the quad
             // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
@@ -1597,37 +1578,19 @@ pub fn prepare_msdf_texts(
         queue.write_buffer(buffer, 0, vertex_data);
     }
 
-    // Create or update depth texture if resolution changed.
-    // Always recreate - render node will skip if sizes don't match ViewTarget yet.
+    // Track resolution for resize detection in render nodes.
     let width = resolution[0] as u32;
     let height = resolution[1] as u32;
-    if resources.depth_texture_size != (width, height) && width > 0 && height > 0 {
-        let depth_texture = device.create_texture(&TextureDescriptor {
-            label: Some("msdf_depth_texture"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Depth32Float,
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let depth_texture_view = depth_texture.create_view(&TextureViewDescriptor::default());
-        resources.depth_texture = Some(depth_texture);
-        resources.depth_texture_view = Some(depth_texture_view);
-        resources.depth_texture_size = (width, height);
+    if resources.texture_size != (width, height) && width > 0 && height > 0 {
+        resources.texture_size = (width, height);
         // Mark intermediate texture for recreation at new size
         resources.intermediate_texture = None;
         resources.intermediate_texture_view = None;
     }
 
-    // Create intermediate texture for TAA if needed (separate from depth texture)
+    // Create intermediate texture for TAA if needed.
     // This must be checked every frame because TAA can be toggled and resources
-    // may be initialized after the depth texture already exists.
+    // may be initialized after the texture size is already tracked.
     if taa_state.enabled
         && resources.intermediate_texture_view.is_none()
         && width > 0
@@ -1794,12 +1757,11 @@ pub fn init_msdf_resources(
 
     // Create pipeline descriptor
     // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) = 28 bytes
-    // Note: color is 4 bytes (u8x4), importance is 4 bytes (f32)
     let vertex_layout = VertexBufferLayout {
         array_stride: std::mem::size_of::<MsdfVertex>() as u64,
         step_mode: VertexStepMode::Vertex,
         attributes: vec![
-            // Position (x, y, z) - z is used for depth testing
+            // Position (x, y, z)
             VertexAttribute {
                 format: VertexFormat::Float32x3,
                 offset: 0,
@@ -1840,15 +1802,10 @@ pub fn init_msdf_resources(
             topology: PrimitiveTopology::TriangleList,
             ..default()
         },
-        // Enable depth testing so each glyph "wins" in overlapping regions.
-        // Glyphs rendered first (lower z) take precedence, preventing double-blend.
-        depth_stencil: Some(DepthStencilState {
-            format: TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: CompareFunction::Less,
-            stencil: StencilState::default(),
-            bias: DepthBiasState::default(),
-        }),
+        // No depth testing — overlap between adjacent glyph quads is handled
+        // purely by premultiplied alpha blending. Outside the glyph shape,
+        // the SDF evaluates to sd < 0.5, so text_alpha drops to ~0 naturally.
+        depth_stencil: None,
         multisample: MultisampleState {
             count: 1,
             mask: !0,
@@ -1890,9 +1847,7 @@ pub fn init_msdf_resources(
         bind_group: None,
         vertex_count: 0,
         batches: Vec::new(),
-        depth_texture: None,
-        depth_texture_view: None,
-        depth_texture_size: (0, 0),
+        texture_size: (0, 0),
         intermediate_texture: None,
         intermediate_texture_view: None,
         format, // Store the format used for pipeline creation
@@ -1923,24 +1878,24 @@ mod tests {
 
     /// Test MSDF scale calculation.
     ///
-    /// MSDF textures are generated at 32px/em. When rendering at a different
+    /// MSDF textures are generated at 64px/em. When rendering at a different
     /// font size, we scale the atlas region accordingly.
     #[test]
     fn msdf_scale_calculation() {
-        // 16px font = half the MSDF generation size
+        // 16px font = quarter the MSDF generation size
         let font_size: f32 = 16.0;
         let scale = font_size / MSDF_PX_PER_EM;
-        assert!((scale - 0.5).abs() < 0.001, "16px font should be 0.5x scale");
+        assert!((scale - 0.25).abs() < 0.001, "16px font should be 0.25x scale");
 
-        // 32px font = same as MSDF generation size
-        let font_size_32: f32 = 32.0;
-        let scale_32 = font_size_32 / MSDF_PX_PER_EM;
-        assert!((scale_32 - 1.0).abs() < 0.001, "32px font should be 1.0x scale");
-
-        // 64px font = double the MSDF generation size
+        // 64px font = same as MSDF generation size
         let font_size_64: f32 = 64.0;
         let scale_64 = font_size_64 / MSDF_PX_PER_EM;
-        assert!((scale_64 - 2.0).abs() < 0.001, "64px font should be 2.0x scale");
+        assert!((scale_64 - 1.0).abs() < 0.001, "64px font should be 1.0x scale");
+
+        // 128px font = double the MSDF generation size
+        let font_size_128: f32 = 128.0;
+        let scale_128 = font_size_128 / MSDF_PX_PER_EM;
+        assert!((scale_128 - 2.0).abs() < 0.001, "128px font should be 2.0x scale");
     }
 
     /// Test quad size calculation from atlas region.
@@ -1949,12 +1904,12 @@ mod tests {
     #[test]
     fn quad_size_from_region() {
         let region_width: f32 = 40.0; // MSDF was generated with 40px wide bitmap
-        let msdf_scale: f32 = 0.5; // 16px font
+        let msdf_scale: f32 = 0.25; // 16px font at 64px/em
         let quad_width = region_width * msdf_scale;
 
-        assert!((quad_width - 20.0).abs() < 0.001, "40px region at 0.5x scale = 20px quad");
+        assert!((quad_width - 10.0).abs() < 0.001, "40px region at 0.25x scale = 10px quad");
 
-        // At native MSDF size
+        // At native MSDF size (64px font)
         let msdf_scale_1: f32 = 1.0;
         let quad_width_1 = region_width * msdf_scale_1;
         assert!((quad_width_1 - 40.0).abs() < 0.001, "40px region at 1.0x scale = 40px quad");
@@ -2028,14 +1983,14 @@ mod tests {
         let region_anchor_x: f32 = 0.25; // em units (MSDF padding / px_per_em)
 
         // Calculations (mirroring prepare_msdf_texts)
-        let msdf_scale = font_size / MSDF_PX_PER_EM; // 0.5
-        let quad_width = region_width as f32 * msdf_scale; // 20.0
+        let msdf_scale = font_size / MSDF_PX_PER_EM; // 0.25
+        let quad_width = region_width as f32 * msdf_scale; // 10.0
         let anchor_x = region_anchor_x * font_size; // 4.0
         // Subtract anchor to align glyph origin with pen position
         let px_x = text_left + (glyph_x - anchor_x) * text_scale; // 50 + (0 - 4) = 46
 
-        assert!((msdf_scale - 0.5).abs() < 0.001);
-        assert!((quad_width - 20.0).abs() < 0.001);
+        assert!((msdf_scale - 0.25).abs() < 0.001);
+        assert!((quad_width - 10.0).abs() < 0.001);
         assert!((anchor_x - 4.0).abs() < 0.001);
         assert!((px_x - 46.0).abs() < 0.001);
     }

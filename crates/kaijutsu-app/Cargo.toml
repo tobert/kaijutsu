@@ -19,6 +19,7 @@ bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "ma
 
 # Text rendering (MSDF-based)
 cosmic-text.workspace = true
+pulldown-cmark.workspace = true
 # Font metrics for shader-based hinting
 swash = "0.2"
 

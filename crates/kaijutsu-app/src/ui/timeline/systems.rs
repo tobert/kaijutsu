@@ -5,7 +5,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 
 use super::components::*;
 use crate::cell::{CellEditor, CurrentMode, MainCell, ViewingConversation};
-use crate::connection::bridge::{ConnectionCommands, ConnectionCommand, ConnectionEvent};
+use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 
 // ============================================================================
 // VERSION SYNC
@@ -129,20 +129,22 @@ pub fn update_block_visibility(
 
 /// Process fork requests.
 ///
-/// This sends the fork request to the server via RPC.
-/// The actual forking happens server-side.
+/// Sends the fork request to the server via ActorHandle async task.
+/// The actual forking happens server-side; results arrive via RpcResultChannel.
 pub fn process_fork_requests(
     mut fork_reader: MessageReader<ForkRequest>,
-    cmds: Res<ConnectionCommands>,
+    actor: Option<Res<RpcActor>>,
+    channel: Res<RpcResultChannel>,
     conversation_query: Query<&ViewingConversation, With<MainCell>>,
 ) {
+    let Some(actor) = actor else { return };
+
     for request in fork_reader.read() {
         info!(
             "Fork requested from version {} with name {:?}",
             request.from_version, request.name
         );
 
-        // Get the current document ID from the conversation
         let document_id = if let Ok(viewing) = conversation_query.single() {
             viewing.conversation_id.clone()
         } else {
@@ -150,27 +152,52 @@ pub fn process_fork_requests(
             continue;
         };
 
-        // Generate context name if not provided
         let context_name = request.name.clone().unwrap_or_else(|| {
             format!("fork-v{}", request.from_version)
         });
 
-        // Send to server via connection bridge
-        cmds.send(ConnectionCommand::ForkDocument {
-            document_id,
-            version: request.from_version,
-            context_name,
-        });
+        let handle = actor.handle.clone();
+        let tx = channel.sender();
+        let version = request.from_version;
+        let doc_id = document_id.clone();
+        let ctx_name = context_name.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                match handle.fork_from_version(&doc_id, version, &ctx_name).await {
+                    Ok(context) => {
+                        let new_doc_id = format!(
+                            "{}@{}",
+                            doc_id.split('@').next().unwrap_or(&doc_id),
+                            context.name
+                        );
+                        let _ = tx.send(RpcResultMessage::Forked {
+                            success: true,
+                            context_name: Some(context.name),
+                            document_id: Some(new_doc_id),
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(RpcResultMessage::Forked {
+                            success: false,
+                            context_name: None,
+                            document_id: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            })
+            .detach();
     }
 }
 
-/// Handle fork completion events from the connection bridge.
+/// Handle fork completion results from async RPC tasks.
 pub fn handle_fork_complete(
-    mut events: MessageReader<ConnectionEvent>,
+    mut events: MessageReader<RpcResultMessage>,
     mut result_writer: MessageWriter<ForkResult>,
 ) {
     for event in events.read() {
-        if let ConnectionEvent::ForkComplete { success, context_name, error, .. } = event {
+        if let RpcResultMessage::Forked { success, context_name, error, .. } = event {
             result_writer.write(ForkResult {
                 success: *success,
                 context_id: context_name.clone(),
@@ -180,32 +207,54 @@ pub fn handle_fork_complete(
     }
 }
 
-/// Process cherry-pick requests.
+/// Process cherry-pick requests via ActorHandle async task.
 pub fn process_cherry_pick_requests(
     mut pick_reader: MessageReader<CherryPickRequest>,
-    cmds: Res<ConnectionCommands>,
+    actor: Option<Res<RpcActor>>,
+    channel: Res<RpcResultChannel>,
 ) {
+    let Some(actor) = actor else { return };
+
     for request in pick_reader.read() {
         info!(
             "Cherry-pick requested for block {:?} to context {}",
             request.block_id, request.target_context
         );
 
-        // Send to server via connection bridge
-        cmds.send(ConnectionCommand::CherryPickBlock {
-            block_id: request.block_id.clone(),
-            target_context: request.target_context.clone(),
-        });
+        let handle = actor.handle.clone();
+        let tx = channel.sender();
+        let block_id = request.block_id.clone();
+        let target = request.target_context.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                match handle.cherry_pick_block(&block_id, &target).await {
+                    Ok(new_id) => {
+                        let _ = tx.send(RpcResultMessage::CherryPicked {
+                            success: true,
+                            new_block_id: Some(new_id),
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(RpcResultMessage::CherryPicked {
+                            success: false,
+                            new_block_id: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            })
+            .detach();
     }
 }
 
-/// Handle cherry-pick completion events from the connection bridge.
+/// Handle cherry-pick completion results from async RPC tasks.
 pub fn handle_cherry_pick_complete(
-    mut events: MessageReader<ConnectionEvent>,
+    mut events: MessageReader<RpcResultMessage>,
     mut result_writer: MessageWriter<CherryPickResult>,
 ) {
     for event in events.read() {
-        if let ConnectionEvent::CherryPickComplete { success, new_block_id, error } = event {
+        if let RpcResultMessage::CherryPicked { success, new_block_id, error } = event {
             result_writer.write(CherryPickResult {
                 success: *success,
                 new_block_id: new_block_id.clone(),

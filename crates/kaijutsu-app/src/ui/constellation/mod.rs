@@ -19,6 +19,7 @@
 
 mod create_dialog;
 mod mini;
+pub mod model_picker;
 mod render;
 
 use bevy::prelude::*;
@@ -27,7 +28,7 @@ use kaijutsu_client::SeatInfo;
 use crate::agents::AgentActivityMessage;
 
 // Re-export ModalDialogOpen for use by other systems (e.g., prompt input)
-pub use create_dialog::ModalDialogOpen;
+pub use create_dialog::{DialogMode, ModalDialogOpen, OpenContextDialog};
 
 // Render module provides visual systems (used by the plugin internally)
 // Mini module provides render-to-texture previews for constellation nodes
@@ -45,6 +46,7 @@ impl Plugin for ConstellationPlugin {
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()
             .register_type::<ConstellationConnection>()
+            .register_type::<DriftConnectionKind>()
             .register_type::<ConstellationZoom>()
             .add_systems(
                 Update,
@@ -71,6 +73,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);
+
+        // Add model picker systems
+        model_picker::setup_model_picker_systems(app);
     }
 }
 
@@ -180,6 +185,7 @@ impl Constellation {
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
             entity: None,
+            model: None,
         };
 
         self.nodes.push(node);
@@ -250,6 +256,8 @@ pub struct ContextNode {
     pub activity: ActivityState,
     /// Entity ID when spawned
     pub entity: Option<Entity>,
+    /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
+    pub model: Option<String>,
 }
 
 /// Activity state of a context node
@@ -312,21 +320,21 @@ impl ConstellationMode {
 // SYSTEMS
 // ============================================================================
 
-/// Track seat events to add/remove constellation nodes
+/// Track seat events to add/remove constellation nodes.
 fn track_seat_events(
     mut constellation: ResMut<Constellation>,
-    mut events: MessageReader<crate::connection::ConnectionEvent>,
+    mut events: MessageReader<crate::connection::RpcResultMessage>,
 ) {
-    use crate::connection::ConnectionEvent;
+    use crate::connection::RpcResultMessage;
 
     for event in events.read() {
         match event {
-            ConnectionEvent::SeatTaken { seat } => {
+            RpcResultMessage::ContextJoined { seat, .. } => {
                 info!("Constellation: Adding node for context '{}' (kernel: {})", seat.id.context, seat.id.kernel);
                 constellation.add_node(seat.clone());
             }
-            ConnectionEvent::SeatLeft => {
-                // We don't remove nodes on SeatLeft - contexts persist
+            RpcResultMessage::ContextLeft => {
+                // We don't remove nodes on ContextLeft - contexts persist
                 // They just become "idle" in the constellation
                 if let Some(node) = constellation.focused_node_mut() {
                     node.activity = ActivityState::Idle;
@@ -467,6 +475,7 @@ fn sync_zoom_to_mode(
 /// Handle clicks on constellation nodes to focus that context.
 fn handle_node_click(
     mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
 ) {
     for (interaction, node) in nodes.iter() {
@@ -478,10 +487,9 @@ fn handle_node_click(
 
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
-
-            // TODO: Trigger context switch via RPC
-            // For now, just update the focus - actual context loading would
-            // need to send an event to the connection bridge
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_name: node.context_id.clone(),
+            });
         }
     }
 }
@@ -514,13 +522,20 @@ fn handle_mode_toggle(
     }
 }
 
-/// Handle gt/gT and Ctrl-^ for context navigation
+/// Handle gt/gT and Ctrl-^ for context navigation.
+///
+/// After updating constellation focus, emits `ContextSwitchRequested` to trigger
+/// the actual document swap in the cell system.
 fn handle_focus_navigation(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
     current_mode: Res<crate::cell::CurrentMode>,
     modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+    mut dialog_writer: MessageWriter<OpenContextDialog>,
+    mut model_writer: MessageWriter<model_picker::OpenModelPicker>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     mut pending_g: Local<bool>,
 ) {
     // Skip when a modal dialog is open
@@ -540,7 +555,12 @@ fn handle_focus_navigation(
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
         if keys.just_pressed(KeyCode::Digit6) {
             constellation.toggle_alternate();
-            info!("Switched to alternate context");
+            if let Some(ref focus_id) = constellation.focus_id {
+                info!("Switched to alternate context: {}", focus_id);
+                switch_writer.write(crate::cell::ContextSwitchRequested {
+                    context_name: focus_id.clone(),
+                });
+            }
             return;
         }
     }
@@ -560,12 +580,18 @@ fn handle_focus_navigation(
                 if let Some(id) = constellation.prev_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
                     info!("Focus: previous context {}", id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_name: id,
+                    });
                 }
             } else {
                 // gt = next
                 if let Some(id) = constellation.next_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
                     info!("Focus: next context {}", id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_name: id,
+                    });
                 }
             }
         } else if keys.any_just_pressed([
@@ -576,6 +602,35 @@ fn handle_focus_navigation(
         ]) {
             // Cancel g prefix on other keys
             *pending_g = false;
+        }
+    }
+
+    // `f` key on focused constellation node = fork that context
+    if !*pending_g && keys.just_pressed(KeyCode::KeyF) {
+        if constellation.mode != ConstellationMode::Focused {
+            if let Some(ref focus_id) = constellation.focus_id {
+                if let Some(doc_id) = doc_cache.document_id_for_context(focus_id) {
+                    info!("Fork requested for context '{}' (doc: {})", focus_id, doc_id);
+                    dialog_writer.write(OpenContextDialog(DialogMode::ForkContext {
+                        source_context: focus_id.clone(),
+                        source_document_id: doc_id.to_string(),
+                    }));
+                } else {
+                    warn!("Cannot fork '{}': not in document cache", focus_id);
+                }
+            }
+        }
+    }
+
+    // `m` key on focused constellation node = open model picker
+    if !*pending_g && keys.just_pressed(KeyCode::KeyM) {
+        if constellation.mode != ConstellationMode::Focused {
+            if let Some(ref focus_id) = constellation.focus_id {
+                info!("Model picker requested for context '{}'", focus_id);
+                model_writer.write(model_picker::OpenModelPicker {
+                    context_name: focus_id.clone(),
+                });
+            }
         }
     }
 }
@@ -654,10 +709,21 @@ pub struct ConstellationNode {
     pub context_id: String,
 }
 
+/// What kind of connection this line represents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum DriftConnectionKind {
+    /// Parent-child ancestry from fork/thread
+    #[default]
+    Ancestry,
+    /// Active staged drift between contexts
+    StagedDrift,
+}
+
 /// Marker for a constellation connection line entity
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
 pub struct ConstellationConnection {
     pub from: String,
     pub to: String,
+    pub kind: DriftConnectionKind,
 }

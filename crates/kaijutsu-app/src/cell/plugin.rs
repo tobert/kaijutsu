@@ -34,9 +34,9 @@ pub enum CellPhase {
 use super::components::{
     BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
     BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
-    ConversationContainer, ConversationScrollState, CurrentMode,
-    DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
-    PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
+    ContextSwitchRequested, ConversationContainer, ConversationScrollState, CurrentMode,
+    DocumentCache, DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
+    PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
 use super::systems;
@@ -48,7 +48,8 @@ pub struct CellPlugin;
 impl Plugin for CellPlugin {
     fn build(&self, app: &mut App) {
         // Register messages
-        app.add_message::<PromptSubmitted>();
+        app.add_message::<PromptSubmitted>()
+            .add_message::<ContextSwitchRequested>();
 
         // Register types for BRP reflection
         app.register_type::<EditorMode>()
@@ -92,6 +93,8 @@ impl Plugin for CellPlugin {
             .init_resource::<ConversationScrollState>()
             .init_resource::<LayoutGeneration>()
             .init_resource::<DocumentSyncState>()
+            .init_resource::<DocumentCache>()
+            .init_resource::<PendingContextSwitch>()
             .init_resource::<systems::EditorEntities>()
             .init_resource::<systems::ConsumedModeKeys>()
             // Bubble system resources
@@ -143,15 +146,22 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
-                // Block event handling (server → client sync)
+                // Block event handling (server → client sync, routes through DocumentCache)
                 // Must run AFTER DashboardEventHandling so SeatTaken creates conversation first
                 systems::handle_block_events.after(DashboardEventHandling),
+                // Context switching (reads ContextSwitchRequested, swaps active cache entry)
+                systems::handle_context_switch.after(systems::handle_block_events),
                 // Handle prompt submission
                 systems::handle_prompt_submitted,
-                // Sync main cell to conversation (after both block events and prompt submission)
+                // Sync main cell to conversation (after block events, context switch, and prompt submission)
                 systems::sync_main_cell_to_conversation
                     .after(systems::handle_block_events)
+                    .after(systems::handle_context_switch)
                     .after(systems::handle_prompt_submitted),
+                // Staleness detection (after block events and context switch)
+                systems::check_cache_staleness
+                    .after(systems::handle_block_events)
+                    .after(systems::handle_context_switch),
                 // Block navigation (j/k) after sync
                 systems::navigate_blocks.after(systems::sync_main_cell_to_conversation),
                 // Expand block with `f` key

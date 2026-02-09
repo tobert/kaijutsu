@@ -19,13 +19,26 @@
 //! and slots free up. The system recovers as in-flight RPCs finish.
 
 use kaijutsu_crdt::BlockId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::rpc::{ContextInfo, DocumentState, StagedDriftInfo, ToolResult};
+use crate::rpc::{
+    ClientToolFilter, Completion, Context, ContextInfo, DocumentState, HistoryEntry, Identity,
+    KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, StagedDriftInfo,
+    ToolResult, VersionSnapshot,
+};
+use crate::subscriptions::{
+    BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
+};
 use crate::{connect_ssh, KernelHandle, RpcClient, SshConfig};
 
 /// Channel capacity — when 32 commands are in-flight, callers block on send.
 const CHANNEL_CAPACITY: usize = 32;
+
+/// Broadcast capacity for server events.
+const EVENT_BROADCAST_CAPACITY: usize = 256;
+
+/// Broadcast capacity for connection status events.
+const STATUS_BROADCAST_CAPACITY: usize = 16;
 
 // ============================================================================
 // Error Type
@@ -45,63 +58,73 @@ pub enum ActorError {
 }
 
 // ============================================================================
-// Commands (internal)
+// RPC Commands
 // ============================================================================
 
 /// Internal command sent from ActorHandle → RpcActor via mpsc.
+///
+/// Each variant carries its arguments and a oneshot reply channel.
+/// World-level commands (Whoami, ListKernels) are handled inline in the
+/// run loop; kernel commands are dispatched concurrently via spawn_local.
+#[allow(clippy::large_enum_variant)]
 enum RpcCommand {
-    // Drift
-    DriftPush {
-        target_ctx: String,
-        content: String,
-        summarize: bool,
-        reply: oneshot::Sender<Result<u64, ActorError>>,
-    },
-    DriftFlush {
-        reply: oneshot::Sender<Result<u32, ActorError>>,
-    },
-    DriftQueue {
-        reply: oneshot::Sender<Result<Vec<StagedDriftInfo>, ActorError>>,
-    },
-    DriftCancel {
-        staged_id: u64,
-        reply: oneshot::Sender<Result<bool, ActorError>>,
-    },
-    DriftPull {
-        source_ctx: String,
-        prompt: Option<String>,
-        reply: oneshot::Sender<Result<BlockId, ActorError>>,
-    },
-    DriftMerge {
-        source_ctx: String,
-        reply: oneshot::Sender<Result<BlockId, ActorError>>,
-    },
+    // ── Drift ────────────────────────────────────────────────────────────
+    DriftPush { target_ctx: String, content: String, summarize: bool, reply: oneshot::Sender<Result<u64, ActorError>> },
+    DriftFlush { reply: oneshot::Sender<Result<u32, ActorError>> },
+    DriftQueue { reply: oneshot::Sender<Result<Vec<StagedDriftInfo>, ActorError>> },
+    DriftCancel { staged_id: u64, reply: oneshot::Sender<Result<bool, ActorError>> },
+    DriftPull { source_ctx: String, prompt: Option<String>, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    DriftMerge { source_ctx: String, reply: oneshot::Sender<Result<BlockId, ActorError>> },
 
-    // Context
-    ListAllContexts {
-        reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>>,
-    },
-    GetContextId {
-        reply: oneshot::Sender<Result<(String, String), ActorError>>,
-    },
+    // ── Context ──────────────────────────────────────────────────────────
+    ListAllContexts { reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>> },
+    GetContextId { reply: oneshot::Sender<Result<(String, String), ActorError>> },
+    ListContexts { reply: oneshot::Sender<Result<Vec<Context>, ActorError>> },
+    CreateContext { name: String, reply: oneshot::Sender<Result<Context, ActorError>> },
+    AttachDocument { context_name: String, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
+    DetachDocument { context_name: String, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
 
-    // CRDT sync
-    PushOps {
-        document_id: String,
-        ops: Vec<u8>,
-        reply: oneshot::Sender<Result<u64, ActorError>>,
-    },
-    GetDocumentState {
-        document_id: String,
-        reply: oneshot::Sender<Result<DocumentState, ActorError>>,
-    },
+    // ── CRDT Sync ────────────────────────────────────────────────────────
+    PushOps { document_id: String, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
+    GetDocumentState { document_id: String, reply: oneshot::Sender<Result<DocumentState, ActorError>> },
 
-    // Generic tool execution
-    ExecuteTool {
-        tool: String,
-        params: String,
-        reply: oneshot::Sender<Result<ToolResult, ActorError>>,
-    },
+    // ── Shell / Execution ────────────────────────────────────────────────
+    Execute { code: String, reply: oneshot::Sender<Result<u64, ActorError>> },
+    ShellExecute { code: String, cell_id: String, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    Interrupt { exec_id: u64, reply: oneshot::Sender<Result<(), ActorError>> },
+    Complete { partial: String, cursor: u32, reply: oneshot::Sender<Result<Vec<Completion>, ActorError>> },
+    GetCommandHistory { limit: u32, reply: oneshot::Sender<Result<Vec<HistoryEntry>, ActorError>> },
+
+    // ── Tool Execution ───────────────────────────────────────────────────
+    ExecuteTool { tool: String, params: String, reply: oneshot::Sender<Result<ToolResult, ActorError>> },
+    CallMcpTool { server: String, tool: String, arguments: serde_json::Value, reply: oneshot::Sender<Result<McpToolResult, ActorError>> },
+
+    // ── MCP Resources ────────────────────────────────────────────────────
+    ListMcpResources { server: String, reply: oneshot::Sender<Result<Vec<McpResource>, ActorError>> },
+    ReadMcpResource { server: String, uri: String, reply: oneshot::Sender<Result<Option<McpResourceContents>, ActorError>> },
+
+    // ── LLM ──────────────────────────────────────────────────────────────
+    Prompt { content: String, model: Option<String>, cell_id: String, reply: oneshot::Sender<Result<String, ActorError>> },
+    ConfigureLlm { provider: String, model: String, reply: oneshot::Sender<Result<bool, ActorError>> },
+    GetLlmConfig { reply: oneshot::Sender<Result<LlmConfigInfo, ActorError>> },
+    SetDefaultProvider { provider: String, reply: oneshot::Sender<Result<bool, ActorError>> },
+    SetDefaultModel { provider: String, model: String, reply: oneshot::Sender<Result<bool, ActorError>> },
+
+    // ── Tool Filter ──────────────────────────────────────────────────────
+    GetToolFilter { reply: oneshot::Sender<Result<ClientToolFilter, ActorError>> },
+    SetToolFilter { filter: ClientToolFilter, reply: oneshot::Sender<Result<bool, ActorError>> },
+
+    // ── Timeline / Fork ──────────────────────────────────────────────────
+    ForkFromVersion { document_id: String, version: u64, context_name: String, reply: oneshot::Sender<Result<Context, ActorError>> },
+    CherryPickBlock { block_id: BlockId, target_context: String, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    GetDocumentHistory { document_id: String, limit: u32, reply: oneshot::Sender<Result<Vec<VersionSnapshot>, ActorError>> },
+
+    // ── Kernel Info ──────────────────────────────────────────────────────
+    GetInfo { reply: oneshot::Sender<Result<KernelInfo, ActorError>> },
+
+    // ── World-level (handled inline, not dispatched to child tasks) ──────
+    Whoami { reply: oneshot::Sender<Result<Identity, ActorError>> },
+    ListKernels { reply: oneshot::Sender<Result<Vec<KernelInfo>, ActorError>> },
 }
 
 impl RpcCommand {
@@ -116,9 +139,34 @@ impl RpcCommand {
             Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListAllContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::AttachDocument { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DetachDocument { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetDocumentState { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ShellExecute { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Interrupt { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Complete { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ReadMcpResource { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ConfigureLlm { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetLlmConfig { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetDefaultProvider { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetDefaultModel { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetToolFilter { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetToolFilter { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ForkFromVersion { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetDocumentHistory { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Whoami { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
         }
     }
 }
@@ -138,9 +186,39 @@ impl RpcCommand {
 #[derive(Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<RpcCommand>,
+    event_tx: broadcast::Sender<ServerEvent>,
+    status_tx: broadcast::Sender<ConnectionStatus>,
 }
 
 impl ActorHandle {
+    /// Generic send helper — creates a oneshot, sends the command, awaits reply.
+    async fn send<T: Send + 'static>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T, ActorError>>) -> RpcCommand,
+    ) -> Result<T, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(build(reply))
+            .await
+            .map_err(|_| ActorError::Shutdown)?;
+        rx.await.map_err(|_| ActorError::Shutdown)?
+    }
+
+    // ── Subscriptions ────────────────────────────────────────────────────
+
+    /// Subscribe to server-push events (block changes, resource updates).
+    ///
+    /// Returns a broadcast receiver. Dropping it is fine — no backpressure
+    /// on the sender side; lagged receivers get `RecvError::Lagged`.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Subscribe to connection lifecycle events.
+    pub fn subscribe_status(&self) -> broadcast::Receiver<ConnectionStatus> {
+        self.status_tx.subscribe()
+    }
+
     // ── Drift ────────────────────────────────────────────────────────────
 
     /// Stage a drift push to another context.
@@ -150,38 +228,24 @@ impl ActorHandle {
         content: &str,
         summarize: bool,
     ) -> Result<u64, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftPush {
-            target_ctx: target_ctx.to_string(),
-            content: content.to_string(),
-            summarize,
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftPush {
+            target_ctx: target_ctx.into(), content: content.into(), summarize, reply,
+        }).await
     }
 
     /// Flush all staged drifts.
     pub async fn drift_flush(&self) -> Result<u32, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftFlush { reply }).await
-            .map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftFlush { reply }).await
     }
 
     /// View the drift staging queue.
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftQueue { reply }).await
-            .map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftQueue { reply }).await
     }
 
     /// Cancel a staged drift.
     pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftCancel { staged_id, reply }).await
-            .map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftCancel { staged_id, reply }).await
     }
 
     /// Pull summarized content from another context.
@@ -190,111 +254,251 @@ impl ActorHandle {
         source_ctx: &str,
         prompt: Option<&str>,
     ) -> Result<BlockId, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftPull {
-            source_ctx: source_ctx.to_string(),
-            prompt: prompt.map(String::from),
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftPull {
+            source_ctx: source_ctx.into(), prompt: prompt.map(String::from), reply,
+        }).await
     }
 
     /// Merge a forked context back into its parent.
     pub async fn drift_merge(&self, source_ctx: &str) -> Result<BlockId, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::DriftMerge {
-            source_ctx: source_ctx.to_string(),
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::DriftMerge { source_ctx: source_ctx.into(), reply }).await
     }
 
     // ── Context ──────────────────────────────────────────────────────────
 
     /// List all registered drift contexts.
     pub async fn list_all_contexts(&self) -> Result<Vec<ContextInfo>, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::ListAllContexts { reply }).await
-            .map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::ListAllContexts { reply }).await
     }
 
     /// Get this kernel's context short ID and name.
     pub async fn get_context_id(&self) -> Result<(String, String), ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::GetContextId { reply }).await
-            .map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        self.send(|reply| RpcCommand::GetContextId { reply }).await
+    }
+
+    /// List all contexts in this kernel.
+    pub async fn list_contexts(&self) -> Result<Vec<Context>, ActorError> {
+        self.send(|reply| RpcCommand::ListContexts { reply }).await
+    }
+
+    /// Create a new context.
+    pub async fn create_context(&self, name: &str) -> Result<Context, ActorError> {
+        self.send(|reply| RpcCommand::CreateContext { name: name.into(), reply }).await
+    }
+
+    /// Attach a document to a context.
+    pub async fn attach_document(
+        &self,
+        context_name: &str,
+        document_id: &str,
+    ) -> Result<(), ActorError> {
+        self.send(|reply| RpcCommand::AttachDocument {
+            context_name: context_name.into(), document_id: document_id.into(), reply,
+        }).await
+    }
+
+    /// Detach a document from a context.
+    pub async fn detach_document(
+        &self,
+        context_name: &str,
+        document_id: &str,
+    ) -> Result<(), ActorError> {
+        self.send(|reply| RpcCommand::DetachDocument {
+            context_name: context_name.into(), document_id: document_id.into(), reply,
+        }).await
     }
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
 
     /// Push CRDT operations to the server.
-    pub async fn push_ops(
-        &self,
-        document_id: &str,
-        ops: &[u8],
-    ) -> Result<u64, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::PushOps {
-            document_id: document_id.to_string(),
-            ops: ops.to_vec(),
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+    pub async fn push_ops(&self, document_id: &str, ops: &[u8]) -> Result<u64, ActorError> {
+        self.send(|reply| RpcCommand::PushOps {
+            document_id: document_id.into(), ops: ops.to_vec(), reply,
+        }).await
     }
 
     /// Get full document state from the server.
-    pub async fn get_document_state(
-        &self,
-        document_id: &str,
-    ) -> Result<DocumentState, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::GetDocumentState {
-            document_id: document_id.to_string(),
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+    pub async fn get_document_state(&self, document_id: &str) -> Result<DocumentState, ActorError> {
+        self.send(|reply| RpcCommand::GetDocumentState { document_id: document_id.into(), reply }).await
     }
 
-    // ── Generic Tool Execution ───────────────────────────────────────────
+    // ── Shell / Execution ────────────────────────────────────────────────
+
+    /// Execute code in the kernel's embedded kaish.
+    pub async fn execute(&self, code: &str) -> Result<u64, ActorError> {
+        self.send(|reply| RpcCommand::Execute { code: code.into(), reply }).await
+    }
+
+    /// Execute shell command with block output (kaish REPL mode).
+    pub async fn shell_execute(&self, code: &str, cell_id: &str) -> Result<BlockId, ActorError> {
+        self.send(|reply| RpcCommand::ShellExecute {
+            code: code.into(), cell_id: cell_id.into(), reply,
+        }).await
+    }
+
+    /// Interrupt an execution.
+    pub async fn interrupt(&self, exec_id: u64) -> Result<(), ActorError> {
+        self.send(|reply| RpcCommand::Interrupt { exec_id, reply }).await
+    }
+
+    /// Get completions for partial input.
+    pub async fn complete(&self, partial: &str, cursor: u32) -> Result<Vec<Completion>, ActorError> {
+        self.send(|reply| RpcCommand::Complete { partial: partial.into(), cursor, reply }).await
+    }
+
+    /// Get command history.
+    pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, ActorError> {
+        self.send(|reply| RpcCommand::GetCommandHistory { limit, reply }).await
+    }
+
+    // ── Tool Execution ───────────────────────────────────────────────────
 
     /// Execute a tool on the server (git, etc).
-    pub async fn execute_tool(
+    pub async fn execute_tool(&self, tool: &str, params: &str) -> Result<ToolResult, ActorError> {
+        self.send(|reply| RpcCommand::ExecuteTool {
+            tool: tool.into(), params: params.into(), reply,
+        }).await
+    }
+
+    /// Call an MCP tool.
+    pub async fn call_mcp_tool(
         &self,
+        server: &str,
         tool: &str,
-        params: &str,
-    ) -> Result<ToolResult, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx.send(RpcCommand::ExecuteTool {
-            tool: tool.to_string(),
-            params: params.to_string(),
-            reply,
-        }).await.map_err(|_| ActorError::Shutdown)?;
-        rx.await.map_err(|_| ActorError::Shutdown)?
+        arguments: &serde_json::Value,
+    ) -> Result<McpToolResult, ActorError> {
+        self.send(|reply| RpcCommand::CallMcpTool {
+            server: server.into(), tool: tool.into(), arguments: arguments.clone(), reply,
+        }).await
+    }
+
+    // ── MCP Resources ────────────────────────────────────────────────────
+
+    /// List resources from an MCP server.
+    pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, ActorError> {
+        self.send(|reply| RpcCommand::ListMcpResources { server: server.into(), reply }).await
+    }
+
+    /// Read a resource from an MCP server.
+    pub async fn read_mcp_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<Option<McpResourceContents>, ActorError> {
+        self.send(|reply| RpcCommand::ReadMcpResource {
+            server: server.into(), uri: uri.into(), reply,
+        }).await
+    }
+
+    // ── LLM ──────────────────────────────────────────────────────────────
+
+    /// Send a prompt to the server-side LLM.
+    pub async fn prompt(
+        &self,
+        content: &str,
+        model: Option<&str>,
+        cell_id: &str,
+    ) -> Result<String, ActorError> {
+        self.send(|reply| RpcCommand::Prompt {
+            content: content.into(), model: model.map(String::from), cell_id: cell_id.into(), reply,
+        }).await
+    }
+
+    /// Configure the LLM provider and model for this kernel.
+    pub async fn configure_llm(&self, provider: &str, model: &str) -> Result<bool, ActorError> {
+        self.send(|reply| RpcCommand::ConfigureLlm {
+            provider: provider.into(), model: model.into(), reply,
+        }).await
+    }
+
+    /// Get current LLM configuration.
+    pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, ActorError> {
+        self.send(|reply| RpcCommand::GetLlmConfig { reply }).await
+    }
+
+    /// Set the default LLM provider.
+    pub async fn set_default_provider(&self, provider: &str) -> Result<bool, ActorError> {
+        self.send(|reply| RpcCommand::SetDefaultProvider { provider: provider.into(), reply }).await
+    }
+
+    /// Set the default model for a provider.
+    pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, ActorError> {
+        self.send(|reply| RpcCommand::SetDefaultModel {
+            provider: provider.into(), model: model.into(), reply,
+        }).await
+    }
+
+    // ── Tool Filter ──────────────────────────────────────────────────────
+
+    /// Get current tool filter configuration.
+    pub async fn get_tool_filter(&self) -> Result<ClientToolFilter, ActorError> {
+        self.send(|reply| RpcCommand::GetToolFilter { reply }).await
+    }
+
+    /// Set tool filter configuration.
+    pub async fn set_tool_filter(&self, filter: ClientToolFilter) -> Result<bool, ActorError> {
+        self.send(|reply| RpcCommand::SetToolFilter { filter, reply }).await
+    }
+
+    // ── Timeline / Fork ──────────────────────────────────────────────────
+
+    /// Fork a document at a specific version, creating a new context.
+    pub async fn fork_from_version(
+        &self,
+        document_id: &str,
+        version: u64,
+        context_name: &str,
+    ) -> Result<Context, ActorError> {
+        self.send(|reply| RpcCommand::ForkFromVersion {
+            document_id: document_id.into(), version, context_name: context_name.into(), reply,
+        }).await
+    }
+
+    /// Cherry-pick a block from one context into another.
+    pub async fn cherry_pick_block(
+        &self,
+        block_id: &BlockId,
+        target_context: &str,
+    ) -> Result<BlockId, ActorError> {
+        self.send(|reply| RpcCommand::CherryPickBlock {
+            block_id: block_id.clone(), target_context: target_context.into(), reply,
+        }).await
+    }
+
+    /// Get document history (version snapshots).
+    pub async fn get_document_history(
+        &self,
+        document_id: &str,
+        limit: u32,
+    ) -> Result<Vec<VersionSnapshot>, ActorError> {
+        self.send(|reply| RpcCommand::GetDocumentHistory {
+            document_id: document_id.into(), limit, reply,
+        }).await
+    }
+
+    // ── Kernel Info ──────────────────────────────────────────────────────
+
+    /// Get kernel info.
+    pub async fn get_info(&self) -> Result<KernelInfo, ActorError> {
+        self.send(|reply| RpcCommand::GetInfo { reply }).await
+    }
+
+    // ── World-level Methods ──────────────────────────────────────────────
+
+    /// Get the current user's identity.
+    pub async fn whoami(&self) -> Result<Identity, ActorError> {
+        self.send(|reply| RpcCommand::Whoami { reply }).await
+    }
+
+    /// List available kernels.
+    pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, ActorError> {
+        self.send(|reply| RpcCommand::ListKernels { reply }).await
     }
 }
 
 // ============================================================================
 // RpcActor (internal, !Send, runs in spawn_local)
 // ============================================================================
-
-/// The actual actor that holds !Send Cap'n Proto types.
-struct RpcActor {
-    config: SshConfig,
-    kernel_id: String,
-    context_name: String,
-    instance: String,
-    /// Live connection state (None = disconnected, will reconnect)
-    connection: Option<ConnectionState>,
-}
-
-/// Held by the actor when connected.
-struct ConnectionState {
-    #[allow(dead_code)]
-    client: RpcClient,
-    kernel: KernelHandle,
-}
 
 /// Call an RPC method on a cloned KernelHandle, signaling errors to the actor.
 ///
@@ -319,6 +523,37 @@ macro_rules! rpc_call {
     }};
 }
 
+/// Maximum backoff between reconnect attempts (30 seconds).
+const MAX_BACKOFF_SECS: f64 = 30.0;
+
+/// Base backoff duration (1 second), doubles each attempt.
+const BASE_BACKOFF_SECS: f64 = 1.0;
+
+/// The actual actor that holds !Send Cap'n Proto types.
+struct RpcActor {
+    config: SshConfig,
+    kernel_id: String,
+    context_name: String,
+    instance: String,
+    /// Live connection state (None = disconnected, will reconnect)
+    connection: Option<ConnectionState>,
+    /// Broadcast sender for server events
+    event_tx: broadcast::Sender<ServerEvent>,
+    /// Broadcast sender for connection status
+    status_tx: broadcast::Sender<ConnectionStatus>,
+    /// Reconnection attempt counter (reset on success)
+    reconnect_attempts: u32,
+    /// When the next reconnect attempt is allowed (exponential backoff).
+    /// None = no cooldown, reconnect immediately.
+    next_reconnect_at: Option<tokio::time::Instant>,
+}
+
+/// Held by the actor when connected.
+struct ConnectionState {
+    client: RpcClient,
+    kernel: KernelHandle,
+}
+
 impl RpcActor {
     fn new(
         config: SshConfig,
@@ -326,6 +561,8 @@ impl RpcActor {
         context_name: String,
         instance: String,
         existing: Option<(RpcClient, KernelHandle)>,
+        event_tx: broadcast::Sender<ServerEvent>,
+        status_tx: broadcast::Sender<ConnectionStatus>,
     ) -> Self {
         let connection = existing.map(|(client, kernel)| ConnectionState { client, kernel });
         Self {
@@ -334,40 +571,128 @@ impl RpcActor {
             context_name,
             instance,
             connection,
+            event_tx,
+            status_tx,
+            reconnect_attempts: 0,
+            next_reconnect_at: None,
         }
     }
 
     /// Ensure we have a live connection, reconnecting if needed.
-    async fn ensure_connected(&mut self) -> Result<&KernelHandle, ActorError> {
+    ///
+    /// Uses exponential backoff (1s, 2s, 4s, ... up to 30s) between reconnect
+    /// attempts. Commands arriving during the cooldown period are rejected with
+    /// `ConnectionLost` so callers aren't blocked waiting for the backoff timer.
+    async fn ensure_connected(&mut self) -> Result<(), ActorError> {
         if self.connection.is_some() {
-            return Ok(&self.connection.as_ref().unwrap().kernel);
+            return Ok(());
         }
 
+        // Check backoff cooldown — reject immediately if we're in a cooldown period
+        if let Some(next_at) = self.next_reconnect_at {
+            if tokio::time::Instant::now() < next_at {
+                return Err(ActorError::ConnectionLost(format!(
+                    "reconnect backoff (attempt {}, waiting)",
+                    self.reconnect_attempts,
+                )));
+            }
+        }
+
+        self.reconnect_attempts += 1;
+        let _ = self.status_tx.send(ConnectionStatus::Reconnecting {
+            attempt: self.reconnect_attempts,
+        });
+
         log::info!(
-            "Actor reconnecting to {}:{} kernel={} context={}",
-            self.config.host, self.config.port, self.kernel_id, self.context_name
+            "Actor reconnecting to {}:{} kernel={} context={} (attempt {})",
+            self.config.host, self.config.port, self.kernel_id, self.context_name,
+            self.reconnect_attempts,
         );
 
+        let result = self.try_connect().await;
+
+        match result {
+            Ok(()) => {
+                self.reconnect_attempts = 0;
+                self.next_reconnect_at = None;
+                let _ = self.status_tx.send(ConnectionStatus::Connected);
+                Ok(())
+            }
+            Err(e) => {
+                // Set backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
+                let backoff_secs = (BASE_BACKOFF_SECS * 2.0_f64.powi(self.reconnect_attempts.saturating_sub(1) as i32))
+                    .min(MAX_BACKOFF_SECS);
+                self.next_reconnect_at = Some(
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(backoff_secs),
+                );
+                log::debug!(
+                    "Reconnect failed, next attempt in {backoff_secs:.1}s: {e}",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempt SSH connect → attach_kernel → join_context → subscriptions.
+    async fn try_connect(&mut self) -> Result<(), ActorError> {
         let client = connect_ssh(self.config.clone())
             .await
-            .map_err(|e| ActorError::ConnectionLost(format!("SSH: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("SSH: {e}");
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                ActorError::ConnectionLost(msg)
+            })?;
 
         let kernel = client.attach_kernel(&self.kernel_id)
             .await
-            .map_err(|e| ActorError::Rpc(format!("attach_kernel: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("attach_kernel: {e}");
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                ActorError::Rpc(msg)
+            })?;
 
         // Join context to register our presence
         let _seat = kernel.join_context(&self.context_name, &self.instance)
             .await
-            .map_err(|e| ActorError::Rpc(format!("join_context: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("join_context: {e}");
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                ActorError::Rpc(msg)
+            })?;
 
         self.connection = Some(ConnectionState { client, kernel });
-        Ok(&self.connection.as_ref().unwrap().kernel)
+
+        // Set up subscriptions on the new connection
+        self.setup_subscriptions().await?;
+        Ok(())
+    }
+
+    /// Register block and resource event subscriptions on the current connection.
+    async fn setup_subscriptions(&self) -> Result<(), ActorError> {
+        let conn = self.connection.as_ref().ok_or(ActorError::NotConnected)?;
+
+        // Block events
+        let block_fwd = BlockEventsForwarder { event_tx: self.event_tx.clone() };
+        let block_client: crate::kaijutsu_capnp::block_events::Client =
+            capnp_rpc::new_client(block_fwd);
+        conn.kernel.subscribe_blocks(block_client).await
+            .map_err(|e| ActorError::Rpc(format!("subscribe_blocks: {e}")))?;
+
+        // Resource events
+        let resource_fwd = ResourceEventsForwarder { event_tx: self.event_tx.clone() };
+        let resource_client: crate::kaijutsu_capnp::resource_events::Client =
+            capnp_rpc::new_client(resource_fwd);
+        conn.kernel.subscribe_mcp_resources(resource_client).await
+            .map_err(|e| ActorError::Rpc(format!("subscribe_resources: {e}")))?;
+
+        log::debug!("Subscriptions registered for block and resource events");
+        Ok(())
     }
 
     /// Drop the connection so next call triggers reconnect.
     fn disconnect(&mut self) {
         self.connection = None;
+        let _ = self.status_tx.send(ConnectionStatus::Disconnected);
     }
 
     /// Process commands concurrently until the channel closes.
@@ -379,10 +704,6 @@ impl RpcActor {
     async fn run(mut self, mut rx: mpsc::Receiver<RpcCommand>) {
         let (err_tx, mut err_rx) = mpsc::unbounded_channel::<()>();
 
-        // TODO: If the server is down and commands queue up, we'll busy-retry
-        // ensure_connected() for each one. Consider a circuit breaker / backoff
-        // state that short-circuits commands for a cooldown period after N
-        // consecutive connection failures.
         loop {
             tokio::select! {
                 // Prioritize error signals so we disconnect before spawning
@@ -397,13 +718,32 @@ impl RpcActor {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
 
-                    // Serial: ensure connection, clone handle for the task
-                    let kernel = match self.ensure_connected().await {
-                        Ok(k) => k.clone(),
-                        Err(e) => { cmd.reply_err(e); continue; }
-                    };
+                    // Serial: ensure connection
+                    if let Err(e) = self.ensure_connected().await {
+                        cmd.reply_err(e);
+                        continue;
+                    }
+                    let conn = self.connection.as_ref().unwrap();
 
-                    // Concurrent: spawn the actual RPC call as a child task
+                    // World-level commands need RpcClient — handle inline
+                    match cmd {
+                        RpcCommand::Whoami { reply } => {
+                            let result = conn.client.whoami().await
+                                .map_err(|e| ActorError::Rpc(e.to_string()));
+                            let _ = reply.send(result);
+                            continue;
+                        }
+                        RpcCommand::ListKernels { reply } => {
+                            let result = conn.client.list_kernels().await
+                                .map_err(|e| ActorError::Rpc(e.to_string()));
+                            let _ = reply.send(result);
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    // Kernel-level commands: clone handles and dispatch concurrently
+                    let kernel = conn.kernel.clone();
                     let err_tx = err_tx.clone();
                     tokio::task::spawn_local(async move {
                         dispatch_command(cmd, kernel, err_tx).await;
@@ -415,10 +755,12 @@ impl RpcActor {
     }
 }
 
-/// Dispatch a single RPC command on a cloned KernelHandle.
+/// Dispatch a single kernel-level RPC command on a cloned KernelHandle.
 ///
 /// Runs in a spawn_local child task. On RPC error, signals the actor
 /// via err_tx so it disconnects and reconnects on the next command.
+/// World-level commands (Whoami, ListKernels) are handled inline in the
+/// run loop and never reach this function.
 async fn dispatch_command(
     cmd: RpcCommand,
     kernel: KernelHandle,
@@ -452,6 +794,18 @@ async fn dispatch_command(
         RpcCommand::GetContextId { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_context_id());
         }
+        RpcCommand::ListContexts { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.list_contexts());
+        }
+        RpcCommand::CreateContext { name, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.create_context(&name));
+        }
+        RpcCommand::AttachDocument { context_name, document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.attach_document(&context_name, &document_id));
+        }
+        RpcCommand::DetachDocument { context_name, document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.detach_document(&context_name, &document_id));
+        }
 
         // ── CRDT Sync ────────────────────────────────────────────
         RpcCommand::PushOps { document_id, ops, reply } => {
@@ -461,9 +815,86 @@ async fn dispatch_command(
             rpc_call!(kernel, reply, err_tx, k, k.get_document_state(&document_id));
         }
 
+        // ── Shell / Execution ────────────────────────────────────
+        RpcCommand::Execute { code, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.execute(&code));
+        }
+        RpcCommand::ShellExecute { code, cell_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.shell_execute(&code, &cell_id));
+        }
+        RpcCommand::Interrupt { exec_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.interrupt(exec_id));
+        }
+        RpcCommand::Complete { partial, cursor, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.complete(&partial, cursor));
+        }
+        RpcCommand::GetCommandHistory { limit, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_command_history(limit));
+        }
+
         // ── Tool Execution ───────────────────────────────────────
         RpcCommand::ExecuteTool { tool, params, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.execute_tool(&tool, &params));
+        }
+        RpcCommand::CallMcpTool { server, tool, arguments, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.call_mcp_tool(&server, &tool, &arguments));
+        }
+
+        // ── MCP Resources ────────────────────────────────────────
+        RpcCommand::ListMcpResources { server, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.list_mcp_resources(&server));
+        }
+        RpcCommand::ReadMcpResource { server, uri, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.read_mcp_resource(&server, &uri));
+        }
+
+        // ── LLM ─────────────────────────────────────────────────
+        RpcCommand::Prompt { content, model, cell_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.prompt(&content, model.as_deref(), &cell_id));
+        }
+        RpcCommand::ConfigureLlm { provider, model, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.configure_llm(&provider, &model));
+        }
+        RpcCommand::GetLlmConfig { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_llm_config());
+        }
+        RpcCommand::SetDefaultProvider { provider, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.set_default_provider(&provider));
+        }
+        RpcCommand::SetDefaultModel { provider, model, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.set_default_model(&provider, &model));
+        }
+
+        // ── Tool Filter ──────────────────────────────────────────
+        RpcCommand::GetToolFilter { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_tool_filter());
+        }
+        RpcCommand::SetToolFilter { filter, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.set_tool_filter(&filter));
+        }
+
+        // ── Timeline / Fork ──────────────────────────────────────
+        RpcCommand::ForkFromVersion { document_id, version, context_name, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.fork_from_version(&document_id, version, &context_name));
+        }
+        RpcCommand::CherryPickBlock { block_id, target_context, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.cherry_pick_block(&block_id, &target_context));
+        }
+        RpcCommand::GetDocumentHistory { document_id, limit, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_document_history(&document_id, limit));
+        }
+
+        // ── Kernel Info ──────────────────────────────────────────
+        RpcCommand::GetInfo { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_info());
+        }
+
+        // World-level commands are handled inline in run() — unreachable here
+        RpcCommand::Whoami { reply } => {
+            let _ = reply.send(Err(ActorError::Rpc("world command in kernel dispatch".into())));
+        }
+        RpcCommand::ListKernels { reply } => {
+            let _ = reply.send(Err(ActorError::Rpc("world command in kernel dispatch".into())));
         }
     }
 }
@@ -483,19 +914,18 @@ async fn dispatch_command(
 /// commands complete. This provides automatic backpressure without explicit
 /// semaphores — the system slows down under load and recovers as RPCs finish.
 ///
+/// # Subscriptions
+///
+/// The returned handle includes broadcast channels for server events and
+/// connection status. Call [`ActorHandle::subscribe_events()`] and
+/// [`ActorHandle::subscribe_status()`] to receive them. Subscriptions are
+/// automatically registered on connect/reconnect.
+///
 /// # Safety
 ///
 /// Must be called from within a `tokio::task::LocalSet` context because
 /// Cap'n Proto RPC types (`RpcClient`, `KernelHandle`) are `!Send` and
 /// must stay on the spawning thread.
-///
-/// # Parameters
-///
-/// - `config`: SSH connection parameters
-/// - `kernel_id`: Kernel to attach to
-/// - `context_name`: Context to join (creates if doesn't exist)
-/// - `instance`: Instance identifier for the seat
-/// - `existing`: Optional pre-connected client/kernel to avoid double-connect
 pub fn spawn_actor(
     config: SshConfig,
     kernel_id: String,
@@ -504,7 +934,19 @@ pub fn spawn_actor(
     existing: Option<(RpcClient, KernelHandle)>,
 ) -> ActorHandle {
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let actor = RpcActor::new(config, kernel_id, context_name, instance, existing);
+    let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+    let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
+
+    let actor = RpcActor::new(
+        config,
+        kernel_id,
+        context_name,
+        instance,
+        existing,
+        event_tx.clone(),
+        status_tx.clone(),
+    );
     tokio::task::spawn_local(actor.run(rx));
-    ActorHandle { tx }
+
+    ActorHandle { tx, event_tx, status_tx }
 }

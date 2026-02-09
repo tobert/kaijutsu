@@ -34,7 +34,7 @@ use tokio::sync::RwLock;
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
-use crate::tools::{EngineArgs, ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine};
 
 /// Short ID length — first 6 hex chars of a UUID.
 const SHORT_ID_LEN: usize = 6;
@@ -484,96 +484,66 @@ pub fn build_commit_prompt(diff: &str, context_blocks: &[BlockSnapshot]) -> Stri
 }
 
 // ============================================================================
-// DriftEngine — ExecutionEngine for the `drift` kaish command
+// Individual drift engines — one per operation
 // ============================================================================
 
-/// Execution engine for the `drift` shell command.
-///
-/// **Context binding limitation:** Currently instantiated once per kernel with a
-/// fixed `context_name` (typically `"default"`). Multi-context scenarios require
-/// either per-context engine instances or a mechanism to pass the active context
-/// through `ExecutionEngine::execute()`. See also `GitEngine`.
-///
-/// Provides commands for cross-context drift within a kernel:
-/// - `drift ls` — list contexts in this kernel
-/// - `drift push <ctx> "content"` — stage content for target context
-/// - `drift push <ctx> --summarize` — LLM-summarize before staging
-/// - `drift queue` — show staged drifts
-/// - `drift cancel <id>` — cancel staged drift
-/// - `drift flush` — deliver staged drifts to target documents
-/// - `drift pull <ctx> [prompt]` — read + summarize source context
-/// - `drift merge <ctx>` — summarize forked context into parent
-/// - `drift help` — usage info
-pub struct DriftEngine {
-    /// Weak reference to the kernel (avoids Kernel→ToolRegistry→DriftEngine→Kernel cycle).
+/// Upgrade a weak kernel reference, or return an error string.
+fn drift_kernel(
+    kernel: &std::sync::Weak<crate::kernel::Kernel>,
+) -> Result<Arc<crate::kernel::Kernel>, String> {
+    kernel
+        .upgrade()
+        .ok_or_else(|| "kernel has been dropped".to_string())
+}
+
+/// Get the caller's short ID from the drift router.
+async fn drift_caller_short_id(
+    kernel: &Arc<crate::kernel::Kernel>,
+    context_name: &str,
+) -> Result<String, String> {
+    let router = kernel.drift().read().await;
+    router
+        .short_id_for_context(context_name)
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("context '{}' not registered in drift router", context_name))
+}
+
+// ── DriftLsEngine ─────────────────────────────────────────────────────────
+
+/// List all contexts in the kernel's drift router.
+pub struct DriftLsEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
-    /// Shared BlockStore (all contexts' documents).
-    documents: SharedBlockStore,
-    /// Which context this engine operates as (the "caller").
     context_name: String,
 }
 
-impl DriftEngine {
-    /// Create a new drift engine.
-    ///
-    /// Takes an `Arc<Kernel>` but stores it as `Weak` to avoid a reference cycle
-    /// (Kernel owns ToolRegistry which owns DriftEngine).
-    pub fn new(
-        kernel: &Arc<crate::kernel::Kernel>,
-        documents: SharedBlockStore,
-        context_name: impl Into<String>,
-    ) -> Self {
+impl DriftLsEngine {
+    pub fn new(kernel: &Arc<crate::kernel::Kernel>, context_name: impl Into<String>) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
-            documents,
             context_name: context_name.into(),
         }
     }
+}
 
-    /// Upgrade the weak kernel reference, or return an error.
-    fn kernel(&self) -> Result<Arc<crate::kernel::Kernel>, String> {
-        self.kernel.upgrade().ok_or_else(|| "kernel has been dropped".to_string())
+#[async_trait]
+impl ExecutionEngine for DriftLsEngine {
+    fn name(&self) -> &str { "drift_ls" }
+    fn description(&self) -> &str { "List all contexts in this kernel's drift router" }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "description": "No parameters needed"
+        }))
     }
 
-    /// Get the caller's short ID from the router.
-    async fn caller_short_id(&self) -> Result<String, String> {
-        let kernel = self.kernel()?;
-        let router = kernel.drift().read().await;
-        router
-            .short_id_for_context(&self.context_name)
-            .map(|s| s.to_string())
-            .ok_or_else(|| format!("context '{}' not registered in drift router", self.context_name))
-    }
+    async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
+        let kernel = match drift_kernel(&self.kernel) {
+            Ok(k) => k,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
 
-    fn execute_inner(
-        &self,
-        args: Vec<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecResult, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            if args.is_empty() {
-                return self.show_help();
-            }
-
-            match args[0].as_str() {
-                "ls" | "list" => self.cmd_ls().await,
-                "push" => self.cmd_push(&args[1..]).await,
-                "queue" | "q" => self.cmd_queue().await,
-                "cancel" => self.cmd_cancel(&args[1..]).await,
-                "flush" => self.cmd_flush().await,
-                "pull" => self.cmd_pull(&args[1..]).await,
-                "merge" => self.cmd_merge(&args[1..]).await,
-                "help" | "-h" | "--help" => self.show_help(),
-                other => Err(format!(
-                    "Unknown subcommand: {}. Use 'drift help' for usage.",
-                    other
-                )),
-            }
-        })
-    }
-
-    async fn cmd_ls(&self) -> Result<ExecResult, String> {
-        let kernel = self.kernel()?;
         let router = kernel.drift().read().await;
         let contexts = router.list_contexts();
         let caller_short = router
@@ -582,11 +552,7 @@ impl DriftEngine {
 
         let mut output = String::new();
         for ctx in &contexts {
-            let marker = if ctx.short_id == caller_short {
-                "* "
-            } else {
-                "  "
-            };
+            let marker = if ctx.short_id == caller_short { "* " } else { "  " };
             let provider_info = match (&ctx.provider, &ctx.model) {
                 (Some(p), Some(m)) => format!(" ({}:{})", p, m),
                 (Some(p), None) => format!(" ({})", p),
@@ -610,156 +576,320 @@ impl DriftEngine {
         Ok(ExecResult::success(output))
     }
 
-    async fn cmd_push(&self, args: &[String]) -> Result<ExecResult, String> {
-        if args.is_empty() {
-            return Err("Usage: drift push <target-ctx> \"content\" [--summarize]".to_string());
+    async fn is_available(&self) -> bool { true }
+}
+
+// ── DriftPushEngine ───────────────────────────────────────────────────────
+
+/// Stage content for transfer to another context.
+pub struct DriftPushEngine {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    documents: SharedBlockStore,
+    context_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DriftPushParams {
+    target_ctx: String,
+    content: Option<String>,
+    #[serde(default)]
+    summarize: bool,
+}
+
+impl DriftPushEngine {
+    pub fn new(
+        kernel: &Arc<crate::kernel::Kernel>,
+        documents: SharedBlockStore,
+        context_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kernel: Arc::downgrade(kernel),
+            documents,
+            context_name: context_name.into(),
         }
+    }
+}
 
-        let kernel = self.kernel()?;
-        let target_ctx = &args[0];
-        let summarize = args.iter().any(|a| a == "--summarize" || a == "-s");
+#[async_trait]
+impl ExecutionEngine for DriftPushEngine {
+    fn name(&self) -> &str { "drift_push" }
+    fn description(&self) -> &str { "Stage content for transfer to another context (optionally LLM-summarized)" }
 
-        let content = args[1..]
-            .iter()
-            .filter(|a| *a != "--summarize" && *a != "-s")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target_ctx": {
+                    "type": "string",
+                    "description": "Short ID of the target context"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to push (required unless summarize=true)"
+                },
+                "summarize": {
+                    "type": "boolean",
+                    "description": "LLM-summarize this context before pushing (default: false)",
+                    "default": false
+                }
+            },
+            "required": ["target_ctx"]
+        }))
+    }
 
-        let caller_short = self.caller_short_id().await?;
+    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+        let p: DriftPushParams = match serde_json::from_str(params) {
+            Ok(v) => v,
+            Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
+        };
 
-        if summarize {
-            // LLM-summarize path
-            let router = kernel.drift().read().await;
-            let source_handle = router
-                .get(&caller_short)
-                .ok_or_else(|| format!("caller context {} not found", caller_short))?;
-            let source_doc_id = source_handle.document_id.clone();
-            let source_model = source_handle.model.clone();
-            drop(router);
+        let kernel = match drift_kernel(&self.kernel) {
+            Ok(k) => k,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
 
-            let blocks = self
-                .documents
-                .block_snapshots(&source_doc_id)
-                .map_err(|e| format!("failed to read blocks: {}", e))?;
+        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
+
+        if p.summarize {
+            let (source_doc_id, source_model) = {
+                let router = kernel.drift().read().await;
+                let source_handle = match router.get(&caller_short) {
+                    Some(h) => h,
+                    None => return Ok(ExecResult::failure(1, format!("caller context {} not found", caller_short))),
+                };
+                (source_handle.document_id.clone(), source_handle.model.clone())
+            };
+
+            let blocks = match self.documents.block_snapshots(&source_doc_id) {
+                Ok(b) => b,
+                Err(e) => return Ok(ExecResult::failure(1, format!("failed to read blocks: {}", e))),
+            };
 
             let user_prompt = build_distillation_prompt(&blocks, None);
 
             let registry = kernel.llm().read().await;
-            let provider = registry
-                .default_provider()
-                .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
+            let provider = match registry.default_provider() {
+                Some(p) => p,
+                None => return Ok(ExecResult::failure(1, "LLM not configured — check llm.rhai")),
+            };
             let model = source_model.as_deref().unwrap_or_else(|| {
-                provider
-                    .available_models()
-                    .first()
-                    .copied()
-                    .unwrap_or("claude-sonnet-4-5-20250929")
+                provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
             });
             drop(registry);
 
-            let summary = provider
+            let summary = match provider
                 .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
                 .await
-                .map_err(|e| format!("distillation failed: {}", e))?;
+            {
+                Ok(s) => s,
+                Err(e) => return Ok(ExecResult::failure(1, format!("distillation failed: {}", e))),
+            };
 
             let mut router = kernel.drift().write().await;
-            let staged_id = router
-                .stage(
-                    &caller_short,
-                    target_ctx,
-                    summary,
-                    Some(model.to_string()),
-                    DriftKind::Distill,
-                )
-                .map_err(|e| e.to_string())?;
+            let staged_id = match router.stage(&caller_short, &p.target_ctx, summary, Some(model.to_string()), DriftKind::Distill) {
+                Ok(id) => id,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            };
 
-            Ok(ExecResult::success(format!(
-                "Staged distilled drift → {} (id={})",
-                target_ctx, staged_id
-            )))
+            Ok(ExecResult::success(format!("Staged distilled drift → {} (id={})", p.target_ctx, staged_id)))
         } else {
-            // Direct push
-            if content.is_empty() {
-                return Err(
-                    "Content required for direct push. Use --summarize for auto-summary."
-                        .to_string(),
-                );
+            let content = match p.content {
+                Some(c) if !c.is_empty() => c,
+                _ => return Ok(ExecResult::failure(1, "Content required for direct push. Use summarize: true for auto-summary.")),
+            };
+
+            let mut router = kernel.drift().write().await;
+            let source_model = router.get(&caller_short).and_then(|h| h.model.clone());
+            let staged_id = match router.stage(&caller_short, &p.target_ctx, content, source_model, DriftKind::Push) {
+                Ok(id) => id,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            };
+
+            Ok(ExecResult::success(format!("Staged drift → {} (id={})", p.target_ctx, staged_id)))
+        }
+    }
+
+    async fn is_available(&self) -> bool { true }
+}
+
+// ── DriftPullEngine ───────────────────────────────────────────────────────
+
+/// Read and LLM-summarize another context's conversation.
+pub struct DriftPullEngine {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    documents: SharedBlockStore,
+    context_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DriftPullParams {
+    source_ctx: String,
+    prompt: Option<String>,
+}
+
+impl DriftPullEngine {
+    pub fn new(
+        kernel: &Arc<crate::kernel::Kernel>,
+        documents: SharedBlockStore,
+        context_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kernel: Arc::downgrade(kernel),
+            documents,
+            context_name: context_name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for DriftPullEngine {
+    fn name(&self) -> &str { "drift_pull" }
+    fn description(&self) -> &str { "Read and LLM-summarize another context's conversation into this one" }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source_ctx": { "type": "string", "description": "Short ID of the source context" },
+                "prompt": { "type": "string", "description": "Optional focus prompt to guide the summary" }
+            },
+            "required": ["source_ctx"]
+        }))
+    }
+
+    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+        let p: DriftPullParams = match serde_json::from_str(params) {
+            Ok(v) => v,
+            Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
+        };
+
+        let kernel = match drift_kernel(&self.kernel) {
+            Ok(k) => k,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
+
+        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
+
+        let (source_doc_id, source_model) = {
+            let router = kernel.drift().read().await;
+            match router.get(&p.source_ctx) {
+                Some(h) => (h.document_id.clone(), h.model.clone()),
+                None => return Ok(ExecResult::failure(1, format!("unknown source context: {}", p.source_ctx))),
             }
+        };
 
-            let mut router = kernel.drift().write().await;
-            let source_model = router
-                .get(&caller_short)
-                .and_then(|h| h.model.clone());
-            let staged_id = router
-                .stage(
-                    &caller_short,
-                    target_ctx,
-                    content,
-                    source_model,
-                    DriftKind::Push,
-                )
-                .map_err(|e| e.to_string())?;
+        let blocks = match self.documents.block_snapshots(&source_doc_id) {
+            Ok(b) => b,
+            Err(e) => return Ok(ExecResult::failure(1, format!("failed to read source blocks: {}", e))),
+        };
 
-            Ok(ExecResult::success(format!(
-                "Staged drift → {} (id={})",
-                target_ctx, staged_id
-            )))
-        }
+        let user_prompt = build_distillation_prompt(&blocks, p.prompt.as_deref());
+
+        let registry = kernel.llm().read().await;
+        let provider = match registry.default_provider() {
+            Some(p) => p,
+            None => return Ok(ExecResult::failure(1, "LLM not configured — check llm.rhai")),
+        };
+        let model = source_model.as_deref().unwrap_or_else(|| {
+            provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
+        });
+        drop(registry);
+
+        tracing::info!("Pulling from {} ({} blocks, model={}) → {}", p.source_ctx, blocks.len(), model, caller_short);
+
+        let summary = match provider
+            .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, format!("distillation LLM call failed: {}", e))),
+        };
+
+        let caller_doc_id = {
+            let router = kernel.drift().read().await;
+            match router.get(&caller_short) {
+                Some(h) => h.document_id.clone(),
+                None => return Ok(ExecResult::failure(1, format!("caller context {} not found", caller_short))),
+            }
+        };
+
+        let staged = StagedDrift {
+            id: 0,
+            source_ctx: p.source_ctx.clone(),
+            target_ctx: caller_short.clone(),
+            content: summary,
+            source_model: Some(model.to_string()),
+            drift_kind: DriftKind::Pull,
+            created_at: now_epoch(),
+        };
+
+        let author = format!("drift:{}", p.source_ctx);
+        let snapshot = DriftRouter::build_drift_block(&staged, &author);
+        let after = self.documents.last_block_id(&caller_doc_id);
+
+        let block_id = match self.documents.insert_from_snapshot(&caller_doc_id, snapshot, after.as_ref()) {
+            Ok(id) => id,
+            Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject drift block: {}", e))),
+        };
+
+        Ok(ExecResult::success(format!("Pulled from {} → {} (block={})", p.source_ctx, caller_short, block_id.to_key())))
     }
 
-    async fn cmd_queue(&self) -> Result<ExecResult, String> {
-        let kernel = self.kernel()?;
-        let router = kernel.drift().read().await;
-        let queue = router.queue();
+    async fn is_available(&self) -> bool { true }
+}
 
-        if queue.is_empty() {
-            return Ok(ExecResult::success("No staged drifts.\n"));
-        }
+// ── DriftFlushEngine ──────────────────────────────────────────────────────
 
-        let mut output = String::new();
-        for drift in queue {
-            output.push_str(&format!(
-                "  #{}: {} → {} [{}] ({})\n",
-                drift.id,
-                drift.source_ctx,
-                drift.target_ctx,
-                drift.drift_kind,
-                if drift.content.len() > 60 {
-                    format!("{}...", &drift.content[..60])
-                } else {
-                    drift.content.clone()
-                }
-            ));
-        }
+/// Deliver all staged drifts to their target documents.
+pub struct DriftFlushEngine {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    documents: SharedBlockStore,
+    context_name: String,
+}
 
-        Ok(ExecResult::success(output))
-    }
-
-    async fn cmd_cancel(&self, args: &[String]) -> Result<ExecResult, String> {
-        if args.is_empty() {
-            return Err("Usage: drift cancel <staged-id>".to_string());
-        }
-
-        let staged_id: u64 = args[0]
-            .parse()
-            .map_err(|_| format!("Invalid staged ID: {}", args[0]))?;
-
-        let kernel = self.kernel()?;
-        let mut router = kernel.drift().write().await;
-        if router.cancel(staged_id) {
-            Ok(ExecResult::success(format!(
-                "Cancelled staged drift #{}",
-                staged_id
-            )))
-        } else {
-            Err(format!("Staged drift #{} not found", staged_id))
+impl DriftFlushEngine {
+    pub fn new(
+        kernel: &Arc<crate::kernel::Kernel>,
+        documents: SharedBlockStore,
+        context_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kernel: Arc::downgrade(kernel),
+            documents,
+            context_name: context_name.into(),
         }
     }
+}
 
-    async fn cmd_flush(&self) -> Result<ExecResult, String> {
-        let kernel = self.kernel()?;
-        let caller_short = self.caller_short_id().await?;
+#[async_trait]
+impl ExecutionEngine for DriftFlushEngine {
+    fn name(&self) -> &str { "drift_flush" }
+    fn description(&self) -> &str { "Deliver all staged drifts to their target documents" }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "description": "No parameters needed"
+        }))
+    }
+
+    async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
+        let kernel = match drift_kernel(&self.kernel) {
+            Ok(k) => k,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
+
+        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
 
         let staged = {
             let mut router = kernel.drift().write().await;
@@ -770,16 +900,12 @@ impl DriftEngine {
         let mut injected = 0;
 
         for drift in &staged {
-            // Look up target document from the router
             let target_doc_id = {
                 let router = kernel.drift().read().await;
                 match router.get(&drift.target_ctx) {
                     Some(h) => h.document_id.clone(),
                     None => {
-                        tracing::warn!(
-                            "Drift flush: target context {} not found, skipping",
-                            drift.target_ctx
-                        );
+                        tracing::warn!("Drift flush: target context {} not found, skipping", drift.target_ctx);
                         continue;
                     }
                 }
@@ -789,215 +915,129 @@ impl DriftEngine {
             let snapshot = DriftRouter::build_drift_block(drift, &author);
             let after = self.documents.last_block_id(&target_doc_id);
 
-            match self
-                .documents
-                .insert_from_snapshot(&target_doc_id, snapshot, after.as_ref())
-            {
+            match self.documents.insert_from_snapshot(&target_doc_id, snapshot, after.as_ref()) {
                 Ok(block_id) => {
-                    tracing::info!(
-                        "Drift flushed: {} → {} (block={})",
-                        drift.source_ctx,
-                        drift.target_ctx,
-                        block_id.to_key()
-                    );
+                    tracing::info!("Drift flushed: {} → {} (block={})", drift.source_ctx, drift.target_ctx, block_id.to_key());
                     injected += 1;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Drift flush failed for {} → {}: {}",
-                        drift.source_ctx,
-                        drift.target_ctx,
-                        e
-                    );
+                    tracing::error!("Drift flush failed for {} → {}: {}", drift.source_ctx, drift.target_ctx, e);
                 }
             }
         }
 
-        Ok(ExecResult::success(format!(
-            "Flushed {} drifts ({} injected)",
-            count, injected
-        )))
+        Ok(ExecResult::success(format!("Flushed {} drifts ({} injected)", count, injected)))
     }
 
-    async fn cmd_pull(&self, args: &[String]) -> Result<ExecResult, String> {
-        if args.is_empty() {
-            return Err("Usage: drift pull <source-ctx> [focus prompt]".to_string());
+    async fn is_available(&self) -> bool { true }
+}
+
+// ── DriftMergeEngine ──────────────────────────────────────────────────────
+
+/// Summarize a forked context back into its parent.
+pub struct DriftMergeEngine {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    documents: SharedBlockStore,
+    #[allow(dead_code)] // kept for structural consistency; may be used for auth checks
+    context_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DriftMergeParams {
+    source_ctx: String,
+}
+
+impl DriftMergeEngine {
+    pub fn new(
+        kernel: &Arc<crate::kernel::Kernel>,
+        documents: SharedBlockStore,
+        context_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kernel: Arc::downgrade(kernel),
+            documents,
+            context_name: context_name.into(),
         }
+    }
+}
 
-        let kernel = self.kernel()?;
-        let source_ctx = &args[0];
-        let directed_prompt = if args.len() > 1 {
-            Some(args[1..].join(" "))
-        } else {
-            None
-        };
+#[async_trait]
+impl ExecutionEngine for DriftMergeEngine {
+    fn name(&self) -> &str { "drift_merge" }
+    fn description(&self) -> &str { "Summarize a forked context and inject the summary into its parent" }
 
-        let caller_short = self.caller_short_id().await?;
-
-        // Read source context info
-        let (source_doc_id, source_model) = {
-            let router = kernel.drift().read().await;
-            let source_handle = router
-                .get(source_ctx)
-                .ok_or_else(|| format!("unknown source context: {}", source_ctx))?;
-            (
-                source_handle.document_id.clone(),
-                source_handle.model.clone(),
-            )
-        };
-
-        // Read source blocks
-        let blocks = self
-            .documents
-            .block_snapshots(&source_doc_id)
-            .map_err(|e| format!("failed to read source blocks: {}", e))?;
-
-        let user_prompt =
-            build_distillation_prompt(&blocks, directed_prompt.as_deref());
-
-        // Get LLM
-        let registry = kernel.llm().read().await;
-        let provider = registry
-            .default_provider()
-            .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
-        let model = source_model.as_deref().unwrap_or_else(|| {
-            provider
-                .available_models()
-                .first()
-                .copied()
-                .unwrap_or("claude-sonnet-4-5-20250929")
-        });
-        drop(registry);
-
-        tracing::info!(
-            "Pulling from {} ({} blocks, model={}) → {}",
-            source_ctx,
-            blocks.len(),
-            model,
-            caller_short
-        );
-
-        let summary = provider
-            .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
-            .await
-            .map_err(|e| format!("distillation LLM call failed: {}", e))?;
-
-        // Inject drift block directly into caller's document
-        let caller_doc_id = {
-            let router = kernel.drift().read().await;
-            router
-                .get(&caller_short)
-                .ok_or_else(|| format!("caller context {} not found", caller_short))?
-                .document_id
-                .clone()
-        };
-
-        let staged = StagedDrift {
-            id: 0,
-            source_ctx: source_ctx.to_string(),
-            target_ctx: caller_short.clone(),
-            content: summary,
-            source_model: Some(model.to_string()),
-            drift_kind: DriftKind::Pull,
-            created_at: now_epoch(),
-        };
-
-        let author = format!("drift:{}", source_ctx);
-        let snapshot = DriftRouter::build_drift_block(&staged, &author);
-        let after = self.documents.last_block_id(&caller_doc_id);
-
-        let block_id = self
-            .documents
-            .insert_from_snapshot(&caller_doc_id, snapshot, after.as_ref())
-            .map_err(|e| format!("failed to inject drift block: {}", e))?;
-
-        Ok(ExecResult::success(format!(
-            "Pulled from {} → {} (block={})",
-            source_ctx,
-            caller_short,
-            block_id.to_key()
-        )))
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source_ctx": { "type": "string", "description": "Short ID of the forked context to merge back" }
+            },
+            "required": ["source_ctx"]
+        }))
     }
 
-    async fn cmd_merge(&self, args: &[String]) -> Result<ExecResult, String> {
-        if args.is_empty() {
-            return Err("Usage: drift merge <source-ctx>".to_string());
-        }
+    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+        let p: DriftMergeParams = match serde_json::from_str(params) {
+            Ok(v) => v,
+            Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
+        };
 
-        let kernel = self.kernel()?;
-        let source_ctx = &args[0];
+        let kernel = match drift_kernel(&self.kernel) {
+            Ok(k) => k,
+            Err(e) => return Ok(ExecResult::failure(1, e)),
+        };
 
-        // Read source context + parent info
         let (source_doc_id, source_model, parent_ctx_id) = {
             let router = kernel.drift().read().await;
-            let source_handle = router
-                .get(source_ctx)
-                .ok_or_else(|| format!("unknown source context: {}", source_ctx))?;
-            let parent = source_handle
-                .parent_short_id
-                .clone()
-                .ok_or_else(|| {
-                    format!(
-                        "context {} has no parent — cannot merge",
-                        source_ctx
-                    )
-                })?;
-            (
-                source_handle.document_id.clone(),
-                source_handle.model.clone(),
-                parent,
-            )
+            let source_handle = match router.get(&p.source_ctx) {
+                Some(h) => h,
+                None => return Ok(ExecResult::failure(1, format!("unknown source context: {}", p.source_ctx))),
+            };
+            let parent = match &source_handle.parent_short_id {
+                Some(p) => p.clone(),
+                None => return Ok(ExecResult::failure(1, format!("context {} has no parent — cannot merge", p.source_ctx))),
+            };
+            (source_handle.document_id.clone(), source_handle.model.clone(), parent)
         };
 
-        // Get parent's document ID
         let parent_doc_id = {
             let router = kernel.drift().read().await;
-            router
-                .get(&parent_ctx_id)
-                .ok_or_else(|| format!("parent context {} not found", parent_ctx_id))?
-                .document_id
-                .clone()
+            match router.get(&parent_ctx_id) {
+                Some(h) => h.document_id.clone(),
+                None => return Ok(ExecResult::failure(1, format!("parent context {} not found", parent_ctx_id))),
+            }
         };
 
-        // Read source blocks
-        let blocks = self
-            .documents
-            .block_snapshots(&source_doc_id)
-            .map_err(|e| format!("failed to read source blocks: {}", e))?;
+        let blocks = match self.documents.block_snapshots(&source_doc_id) {
+            Ok(b) => b,
+            Err(e) => return Ok(ExecResult::failure(1, format!("failed to read source blocks: {}", e))),
+        };
 
         let user_prompt = build_distillation_prompt(&blocks, None);
 
-        // Get LLM
         let registry = kernel.llm().read().await;
-        let provider = registry
-            .default_provider()
-            .ok_or_else(|| "LLM not configured — check llm.rhai".to_string())?;
+        let provider = match registry.default_provider() {
+            Some(p) => p,
+            None => return Ok(ExecResult::failure(1, "LLM not configured — check llm.rhai")),
+        };
         let model = source_model.as_deref().unwrap_or_else(|| {
-            provider
-                .available_models()
-                .first()
-                .copied()
-                .unwrap_or("claude-sonnet-4-5-20250929")
+            provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
         });
         drop(registry);
 
-        tracing::info!(
-            "Merging {} ({} blocks, model={}) → parent {}",
-            source_ctx,
-            blocks.len(),
-            model,
-            parent_ctx_id
-        );
+        tracing::info!("Merging {} ({} blocks, model={}) → parent {}", p.source_ctx, blocks.len(), model, parent_ctx_id);
 
-        let summary = provider
+        let summary = match provider
             .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
             .await
-            .map_err(|e| format!("distillation LLM call failed: {}", e))?;
+        {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, format!("distillation LLM call failed: {}", e))),
+        };
 
-        // Build drift block and inject into parent document
         let staged = StagedDrift {
             id: 0,
-            source_ctx: source_ctx.to_string(),
+            source_ctx: p.source_ctx.clone(),
             target_ctx: parent_ctx_id.clone(),
             content: summary,
             source_model: Some(model.to_string()),
@@ -1005,105 +1045,22 @@ impl DriftEngine {
             created_at: now_epoch(),
         };
 
-        let author = format!("drift:{}", source_ctx);
+        let author = format!("drift:{}", p.source_ctx);
         let snapshot = DriftRouter::build_drift_block(&staged, &author);
         let after = self.documents.last_block_id(&parent_doc_id);
 
-        let block_id = self
-            .documents
-            .insert_from_snapshot(&parent_doc_id, snapshot, after.as_ref())
-            .map_err(|e| format!("failed to inject merge block: {}", e))?;
-
-        Ok(ExecResult::success(format!(
-            "Merged {} → parent {} (block={})",
-            source_ctx,
-            parent_ctx_id,
-            block_id.to_key()
-        )))
-    }
-
-    fn show_help(&self) -> Result<ExecResult, String> {
-        Ok(ExecResult::success(
-            r#"drift - Cross-context communication within a kernel
-
-USAGE:
-    drift <command> [args]
-
-COMMANDS:
-    ls                          List contexts in this kernel
-    push <ctx> "content"        Stage content for target context
-    push <ctx> --summarize      LLM-summarize before staging
-    queue                       Show staged drifts
-    cancel <id>                 Cancel staged drift
-    flush                       Deliver staged drifts to target documents
-    pull <ctx> [focus prompt]   Read + summarize source context
-    merge <ctx>                 Summarize forked context into parent
-    help                        Show this help
-
-EXAMPLES:
-    drift ls
-    drift push d4e5f6 "Here's what I found about the auth bug"
-    drift push d4e5f6 --summarize
-    drift queue
-    drift flush
-    drift pull a1b2c3 "what was decided about caching?"
-    drift merge a1b2c3
-"#,
-        ))
-    }
-}
-
-#[async_trait]
-impl ExecutionEngine for DriftEngine {
-    fn name(&self) -> &str {
-        "drift"
-    }
-
-    fn description(&self) -> &str {
-        "Cross-context drift: push, pull, merge between contexts within a kernel"
-    }
-
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "_positional": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Subcommand and arguments: ls|push|queue|cancel|flush|pull|merge|help [args]"
-                }
-            },
-            "required": []
-        }))
-    }
-
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
-        let parsed: serde_json::Value = match serde_json::from_str(params) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(ExecResult::failure(
-                    1,
-                    format!("Invalid parameters: {}", e),
-                ));
-            }
+        let block_id = match self.documents.insert_from_snapshot(&parent_doc_id, snapshot, after.as_ref()) {
+            Ok(id) => id,
+            Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject merge block: {}", e))),
         };
 
-        let args = EngineArgs::from_json(&parsed).to_argv();
-
-        match self.execute_inner(args).await {
-            Ok(result) => Ok(result),
-            Err(e) => Ok(ExecResult::failure(1, e)),
-        }
+        Ok(ExecResult::success(format!("Merged {} → parent {} (block={})", p.source_ctx, parent_ctx_id, block_id.to_key())))
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
+    async fn is_available(&self) -> bool { true }
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
+// (DriftEngine removed — replaced by the 5 individual engines above)
 
 /// Current Unix epoch in seconds.
 fn now_epoch() -> u64 {
@@ -1412,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drift_engine_ls() {
+    async fn test_drift_ls_engine() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         {
             let mut r = kernel.drift().write().await;
@@ -1420,12 +1377,8 @@ mod tests {
             r.register("debug", "doc-debug", None);
         }
 
-        let documents = crate::block_store::shared_block_store("test");
-        let engine = DriftEngine::new(&kernel, documents, "main");
-        let result = engine
-            .execute(r#"{"_positional": ["ls"]}"#)
-            .await
-            .unwrap();
+        let engine = DriftLsEngine::new(&kernel, "main");
+        let result = engine.execute("{}").await.unwrap();
 
         assert!(result.success);
         assert!(result.stdout.contains("main"));
@@ -1433,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drift_engine_push_queue_flush() {
+    async fn test_drift_push_and_flush_engines() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         let src_short;
         let tgt_short;
@@ -1449,32 +1402,29 @@ mod tests {
             .create_document("doc-tgt".to_string(), crate::db::DocumentKind::Conversation, None)
             .unwrap();
 
-        let engine = DriftEngine::new(&kernel, documents.clone(), "source");
-
-        // Push content
-        let push_result = engine
+        // Push via DriftPushEngine
+        let push_engine = DriftPushEngine::new(&kernel, documents.clone(), "source");
+        let push_result = push_engine
             .execute(&format!(
-                r#"{{"_positional": ["push", "{}", "hello from source"]}}"#,
+                r#"{{"target_ctx": "{}", "content": "hello from source"}}"#,
                 tgt_short
             ))
             .await
             .unwrap();
         assert!(push_result.success, "push failed: {}", push_result.stderr);
 
-        // Check queue
-        let queue_result = engine
-            .execute(r#"{"_positional": ["queue"]}"#)
-            .await
-            .unwrap();
-        assert!(queue_result.success);
-        assert!(queue_result.stdout.contains(&src_short));
-        assert!(queue_result.stdout.contains(&tgt_short));
+        // Verify queue directly on router
+        {
+            let router = kernel.drift().read().await;
+            let queue = router.queue();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].source_ctx, src_short);
+            assert_eq!(queue[0].target_ctx, tgt_short);
+        }
 
-        // Flush
-        let flush_result = engine
-            .execute(r#"{"_positional": ["flush"]}"#)
-            .await
-            .unwrap();
+        // Flush via DriftFlushEngine
+        let flush_engine = DriftFlushEngine::new(&kernel, documents.clone(), "source");
+        let flush_result = flush_engine.execute("{}").await.unwrap();
         assert!(flush_result.success, "flush failed: {}", flush_result.stderr);
         assert!(flush_result.stdout.contains("Flushed 1 drifts"));
 

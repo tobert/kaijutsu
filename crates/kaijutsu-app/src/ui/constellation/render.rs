@@ -12,9 +12,11 @@ use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
     mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
-    ConstellationMode, ConstellationNode, ConstellationZoom, OrbitalAnimation,
+    ConstellationMode, ConstellationNode, ConstellationZoom, DriftConnectionKind,
+    OrbitalAnimation,
 };
 use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
+use crate::ui::drift::DriftState;
 use crate::ui::theme::{color_to_vec4, Theme};
 
 /// System set for constellation rendering
@@ -24,6 +26,12 @@ pub struct ConstellationRendering;
 /// Marker component for nodes that have a mini-render attached
 #[derive(Component)]
 pub struct HasMiniRender;
+
+/// Marker for model label text on constellation nodes.
+#[derive(Component)]
+pub struct ModelLabel {
+    pub context_id: String,
+}
 
 /// Setup the constellation rendering systems
 pub fn setup_constellation_rendering(app: &mut App) {
@@ -37,6 +45,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_connection_lines,
             attach_mini_renders,
             update_node_visuals,
+            update_model_labels,
             update_connection_visuals,
             despawn_removed_nodes,
             despawn_removed_connections,
@@ -191,7 +200,6 @@ fn spawn_context_nodes(
             ))
             .with_children(|parent| {
                 // Inner label showing context name (truncated)
-                // Wrapped in a semi-transparent background for contrast
                 let label = truncate_context_name(&node.seat_info.id.context, 12);
                 parent
                     .spawn((
@@ -214,7 +222,34 @@ fn spawn_context_nodes(
                         label_bg.spawn((
                             crate::text::MsdfUiText::new(&label)
                                 .with_font_size(12.0)
-                                .with_color(theme.fg), // Bright foreground on dark bg
+                                .with_color(theme.fg),
+                            crate::text::UiTextPositionCache::default(),
+                            Node::default(),
+                        ));
+                    });
+
+                // Model badge below context label (initially empty, filled by update_model_labels)
+                let model_text = node.model.as_deref().map(truncate_model_name).unwrap_or_default();
+                parent
+                    .spawn((
+                        ModelLabel { context_id: node.context_id.clone() },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(-40.0), // Below context label
+                            left: Val::Percent(50.0),
+                            margin: UiRect::left(Val::Px(-50.0)),
+                            width: Val::Px(100.0),
+                            min_height: Val::Px(14.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                    ))
+                    .with_children(|model_bg| {
+                        model_bg.spawn((
+                            crate::text::MsdfUiText::new(&model_text)
+                                .with_font_size(9.0)
+                                .with_color(theme.fg_dim),
                             crate::text::UiTextPositionCache::default(),
                             Node::default(),
                         ));
@@ -312,6 +347,7 @@ fn update_node_visuals(
     constellation: Res<Constellation>,
     orbital: Res<OrbitalAnimation>,
     zoom: Res<ConstellationZoom>,
+    doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     mut nodes: Query<(
@@ -320,9 +356,10 @@ fn update_node_visuals(
         &MaterialNode<PulseRingMaterial>,
     )>,
 ) {
-    // Update when constellation, zoom, or orbital animation changes
+    // Update when constellation, zoom, doc_cache, or orbital animation changes
     let needs_update = constellation.is_changed()
         || zoom.is_changed()
+        || doc_cache.is_changed()
         || (orbital.active && orbital.is_changed());
     if !needs_update {
         return;
@@ -405,16 +442,22 @@ fn update_node_visuals(
                     _ => 0.55,  // Distant: noticeably faded
                 };
 
+                // MRU boost: nodes in the document cache get extra brightness
+                let is_in_cache = doc_cache
+                    .document_id_for_context(&ctx_node.context_id)
+                    .is_some();
+                let mru_boost = if is_in_cache { 0.1 } else { 0.0 };
+
                 // Blend depth opacity with zoom level
                 let base_opacity = if is_focused { 0.9 } else { 0.7 };
-                let effective_opacity = base_opacity - (base_opacity - depth_opacity) * zoom.level;
+                let effective_opacity = (base_opacity - (base_opacity - depth_opacity) * zoom.level + mru_boost).min(1.0);
 
                 // Increase intensity for focused node
                 if is_focused {
                     mat.params.y = 0.08; // thicker rings
                     mat.color.w = effective_opacity;
                 } else {
-                    mat.params.y = 0.05;
+                    mat.params.y = if is_in_cache { 0.06 } else { 0.05 };
                     mat.color.w = effective_opacity;
                 }
             }
@@ -437,10 +480,17 @@ fn despawn_removed_nodes(
     }
 }
 
-/// Spawn connection lines between constellation nodes
+/// Spawn drift-aware connection lines between constellation nodes.
+///
+/// Three connection types:
+/// - **Ancestry**: parent→child lines from fork/thread (thin, dim, slow flow)
+/// - **Staged drift**: pulsing accent-color lines for pending drift operations
+///
+/// Replaces the old circular-ring adjacency connections.
 fn spawn_connection_lines(
     mut commands: Commands,
     constellation: Res<Constellation>,
+    drift_state: Res<DriftState>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
     container: Query<Entity, With<ConstellationContainer>>,
@@ -450,81 +500,105 @@ fn spawn_connection_lines(
         return;
     };
 
-    // Only spawn connections when we have 2+ nodes
     if constellation.nodes.len() < 2 {
         return;
     }
 
-    // Build list of existing connections
-    let existing: Vec<(String, String)> = existing_connections
+    // Build set of existing connections (from, to, kind)
+    let existing: Vec<(String, String, DriftConnectionKind)> = existing_connections
         .iter()
-        .map(|c| (c.from.clone(), c.to.clone()))
+        .map(|c| (c.from.clone(), c.to.clone(), c.kind))
         .collect();
 
-    // Generate connections for adjacent nodes (circular layout)
-    let node_count = constellation.nodes.len();
-    for i in 0..node_count {
-        let next_i = (i + 1) % node_count;
-        let from_id = &constellation.nodes[i].context_id;
-        let to_id = &constellation.nodes[next_i].context_id;
+    // Collect connections to spawn: (from_id, to_id, kind)
+    let mut wanted: Vec<(String, String, DriftConnectionKind)> = Vec::new();
 
-        // Skip if connection already exists
-        if existing.iter().any(|(f, t)| f == from_id && t == to_id) {
+    // 1. Ancestry lines from DriftState.contexts (parent_id → child)
+    for ctx in &drift_state.contexts {
+        if let Some(ref parent_id) = ctx.parent_id {
+            // Find the parent context's short_id to match constellation nodes
+            // The parent_id from ContextInfo is a short_id
+            wanted.push((parent_id.clone(), ctx.short_id.clone(), DriftConnectionKind::Ancestry));
+        }
+    }
+
+    // 2. Staged drift lines (source → target)
+    for staged in &drift_state.staged {
+        wanted.push((
+            staged.source_ctx.clone(),
+            staged.target_ctx.clone(),
+            DriftConnectionKind::StagedDrift,
+        ));
+    }
+
+    // Spawn missing connections
+    let padding = theme.constellation_node_size;
+    let container_center =
+        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
+
+    for (from_id, to_id, kind) in &wanted {
+        // Skip if already exists
+        if existing.iter().any(|(f, t, k)| f == from_id && t == to_id && k == kind) {
             continue;
         }
 
-        let from_node = &constellation.nodes[i];
-        let to_node = &constellation.nodes[next_i];
+        // Both nodes must exist in the constellation
+        let Some(from_node) = constellation.node_by_id(from_id) else { continue };
+        let Some(to_node) = constellation.node_by_id(to_id) else { continue };
 
-        // Calculate bounding box for the connection line
+        // Material params vary by connection kind
+        let (color, intensity, flow_speed) = match kind {
+            DriftConnectionKind::Ancestry => (
+                theme.constellation_connection_color,
+                0.2,  // dim
+                0.1,  // slow flow
+            ),
+            DriftConnectionKind::StagedDrift => (
+                Color::srgba(0.49, 0.85, 0.82, 0.8), // bright cyan
+                0.6,  // medium bright
+                0.5,  // moderate flow
+            ),
+        };
+
+        // Calculate bounding box
         let min_x = from_node.position.x.min(to_node.position.x);
         let max_x = from_node.position.x.max(to_node.position.x);
         let min_y = from_node.position.y.min(to_node.position.y);
         let max_y = from_node.position.y.max(to_node.position.y);
 
-        // Add padding so the line isn't clipped
-        let padding = theme.constellation_node_size;
         let width = (max_x - min_x).max(padding);
         let height = (max_y - min_y).max(padding);
 
-        // Container center offset
-        let container_center =
-            theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
-
-        // Calculate endpoints relative to the connection's bounding box (0-1 UV space)
         let rel_from_x = (from_node.position.x - min_x + padding / 2.0) / (width + padding);
         let rel_from_y = (from_node.position.y - min_y + padding / 2.0) / (height + padding);
         let rel_to_x = (to_node.position.x - min_x + padding / 2.0) / (width + padding);
         let rel_to_y = (to_node.position.y - min_y + padding / 2.0) / (height + padding);
 
-        // Calculate activity level based on both nodes
         let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
 
-        // Calculate aspect ratio for shader
         let mat_width = width + padding;
         let mat_height = height + padding;
         let aspect = mat_width / mat_height.max(1.0);
 
-        // Create connection material with aspect ratio correction
         let material = connection_materials.add(ConnectionLineMaterial {
-            color: color_to_vec4(theme.constellation_connection_color),
+            color: color_to_vec4(color),
             params: Vec4::new(
-                0.08,                              // glow_width
-                theme.constellation_connection_glow, // intensity
-                0.5,                               // flow_speed
-                0.0,                               // unused
+                0.08,        // glow_width
+                intensity,   // intensity (kind-specific)
+                flow_speed,  // flow_speed (kind-specific)
+                0.0,         // unused
             ),
             time: Vec4::new(0.0, activity, 0.0, 0.0),
             endpoints: Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y),
-            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0), // width, height, aspect, falloff
+            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0),
         });
 
-        // Spawn connection line entity
         let connection_entity = commands
             .spawn((
                 ConstellationConnection {
                     from: from_id.clone(),
                     to: to_id.clone(),
+                    kind: *kind,
                 },
                 Node {
                     position_type: PositionType::Absolute,
@@ -535,7 +609,6 @@ fn spawn_connection_lines(
                     ..default()
                 },
                 MaterialNode(material),
-                // Render behind nodes
                 ZIndex(-1),
             ))
             .id();
@@ -543,8 +616,8 @@ fn spawn_connection_lines(
         commands.entity(container_entity).add_child(connection_entity);
 
         info!(
-            "Spawned connection line: {} -> {}",
-            from_id, to_id
+            "Spawned {:?} connection: {} -> {}",
+            kind, from_id, to_id
         );
     }
 }
@@ -617,22 +690,32 @@ fn update_connection_visuals(
     }
 }
 
-/// Despawn connection lines for removed connections
+/// Despawn connection lines whose nodes no longer exist or whose drift state is stale.
 fn despawn_removed_connections(
     mut commands: Commands,
     constellation: Res<Constellation>,
+    drift_state: Res<DriftState>,
     connections: Query<(Entity, &ConstellationConnection)>,
 ) {
     for (entity, marker) in connections.iter() {
         let from_exists = constellation.node_by_id(&marker.from).is_some();
         let to_exists = constellation.node_by_id(&marker.to).is_some();
 
+        // Despawn if either node is gone
         if !from_exists || !to_exists {
             commands.entity(entity).despawn();
-            info!(
-                "Despawned connection line: {} -> {}",
-                marker.from, marker.to
-            );
+            continue;
+        }
+
+        // For staged drift lines, despawn if the staged item is gone (flushed/cancelled)
+        if marker.kind == DriftConnectionKind::StagedDrift {
+            let still_staged = drift_state.staged.iter().any(|s| {
+                s.source_ctx == marker.from && s.target_ctx == marker.to
+            });
+            if !still_staged {
+                commands.entity(entity).despawn();
+                info!("Despawned flushed drift line: {} -> {}", marker.from, marker.to);
+            }
         }
     }
 }
@@ -681,5 +764,43 @@ fn truncate_context_name(name: &str, max_len: usize) -> String {
         name.to_string()
     } else {
         format!("{}...", &name[..max_len - 3])
+    }
+}
+
+/// Strip provider prefix from model name for compact display.
+///
+/// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`
+fn truncate_model_name(model: &str) -> String {
+    model.rsplit('/').next().unwrap_or(model).to_string()
+}
+
+/// Update model label text on constellation nodes when model info changes.
+fn update_model_labels(
+    constellation: Res<Constellation>,
+    mut model_labels: Query<(&ModelLabel, &Children)>,
+    mut msdf_texts: Query<&mut crate::text::MsdfUiText>,
+) {
+    if !constellation.is_changed() {
+        return;
+    }
+
+    for (label, children) in model_labels.iter_mut() {
+        // Find the matching constellation node
+        let model_text = constellation
+            .nodes
+            .iter()
+            .find(|n| n.context_id == label.context_id)
+            .and_then(|n| n.model.as_deref())
+            .map(truncate_model_name)
+            .unwrap_or_default();
+
+        // Update the child MsdfUiText
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = msdf_texts.get_mut(child)
+                && msdf_text.text != model_text
+            {
+                msdf_text.text = model_text.clone();
+            }
+        }
     }
 }

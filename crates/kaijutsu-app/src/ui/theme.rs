@@ -107,6 +107,17 @@ pub struct Theme {
     /// Focused block highlight color (border/background accent)
     #[allow(dead_code)]
     pub block_focus: Color,
+    /// Drift push block text color (cyan — conversational)
+    pub block_drift_push: Color,
+    /// Drift pull/distill block text color (blue — substantive)
+    pub block_drift_pull: Color,
+    /// Drift merge block text color (purple — structural)
+    pub block_drift_merge: Color,
+    /// Drift commit block text color (green — like git)
+    pub block_drift_commit: Color,
+    /// Drift border/chrome color (reserved for future rich text rendering)
+    #[allow(dead_code)]
+    pub block_drift_border: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Semantic colors
@@ -193,6 +204,19 @@ pub struct Theme {
     pub input_backdrop_color: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Markdown Rendering Colors
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Heading text color (bright accent)
+    pub md_heading_color: Color,
+    /// Inline `code` foreground color
+    pub md_code_fg: Color,
+    /// Fenced code block foreground color
+    pub md_code_block_fg: Color,
+    /// Bold/strong emphasis color (None = inherit base block color)
+    pub md_strong_color: Option<Color>,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Font Rendering Quality (MSDF text)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -215,6 +239,9 @@ pub struct Theme {
     pub font_vert_scale: f32,
     /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
     pub font_text_bias: f32,
+    /// Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    /// Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    pub font_gamma_correction: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Font Effects (MSDF text)
@@ -285,6 +312,11 @@ impl Default for Theme {
             block_shell_cmd: Color::srgb(0.49, 0.85, 0.82),    // Cyan (ansi.cyan)
             block_shell_output: Color::srgb(0.70, 0.72, 0.78), // Light gray
             block_focus: Color::srgba(0.48, 0.64, 0.97, 0.3),      // Soft blue highlight (#7aa2f7)
+            block_drift_push: Color::srgb(0.49, 0.85, 0.82),         // Cyan — conversational
+            block_drift_pull: Color::srgb(0.58, 0.74, 1.00),         // Blue — substantive
+            block_drift_merge: Color::srgb(0.73, 0.47, 0.91),        // Purple — structural
+            block_drift_commit: Color::srgb(0.62, 0.81, 0.42),       // Green — like git
+            block_drift_border: Color::srgb(0.30, 0.32, 0.38),       // Dim border chars
 
             // Semantic
             error: Color::srgb(0.97, 0.38, 0.45),     // Red
@@ -349,16 +381,23 @@ impl Default for Theme {
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
 
+            // Markdown rendering defaults (Tokyo Night palette)
+            md_heading_color: Color::srgb(0.73, 0.60, 0.97),    // #bb9af7 purple accent
+            md_code_fg: Color::srgb(0.62, 0.81, 0.42),          // #9ece6a green
+            md_code_block_fg: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue
+            md_strong_color: None,                                // Inherit base block color
+
             // Font rendering quality defaults
-            font_stem_darkening: 0.15,  // ClearType-like weight for small text
+            font_stem_darkening: 0.15,  // ClearType-like weight (cell boundary fade prevents bleed)
             font_hint_amount: 0.8,      // Strong hinting for crisp stems
             font_taa_enabled: true,     // Temporal AA for smoother edges
             font_taa_convergence_frames: 8, // 8 frames to converge (~133ms at 60fps)
             font_taa_initial_weight: 0.5,   // 50% current frame weight initially
             font_taa_final_weight: 0.1,     // 10% current frame weight at convergence
-            font_horz_scale: 1.1,       // Wider AA for vertical strokes
+            font_horz_scale: 1.1,       // Wider AA for vertical strokes (cell boundary fade prevents bleed)
             font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
             font_text_bias: 0.5,        // Standard SDF threshold
+            font_gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
 
             // Font effects defaults
             font_glow_intensity: 0.0,   // Glow off by default

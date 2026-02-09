@@ -251,6 +251,38 @@ fn default_undo_steps() -> u32 {
 }
 
 // ============================================================================
+// Kaish Execution Types
+// ============================================================================
+
+/// Execute a tool through the kernel's tool registry (git, drift, etc.).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KaishExecRequest {
+    /// Tool name to execute (e.g., "git", "drift", "search")
+    #[schemars(description = "Tool name to execute (e.g., 'git', 'drift', 'search')")]
+    pub tool: String,
+    /// JSON parameters for the tool
+    #[schemars(description = "JSON parameters for the tool (tool-specific)")]
+    #[serde(default = "default_empty_params")]
+    pub params: String,
+}
+
+fn default_empty_params() -> String {
+    "{}".to_string()
+}
+
+/// Execute a kaish command through the kernel's embedded shell.
+/// Output is written to CRDT blocks and observable in kaijutsu-app.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShellRequest {
+    /// The kaish command to execute (e.g., "cargo check", "git status", "ls -la")
+    #[schemars(description = "The kaish command to execute (e.g., 'cargo check', 'git status')")]
+    pub command: String,
+    /// Timeout in seconds (default: 300)
+    #[schemars(description = "Timeout in seconds (default: 300, max: 600)")]
+    pub timeout_secs: Option<u64>,
+}
+
+// ============================================================================
 // Drift Types
 // ============================================================================
 

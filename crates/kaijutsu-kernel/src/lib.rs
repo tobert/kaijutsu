@@ -20,6 +20,7 @@ pub mod conversation;
 pub mod conversation_db;
 pub mod db;
 pub mod drift;
+pub mod file_tools;
 pub mod flows;
 pub mod git_engine;
 pub mod git_ops;
@@ -83,12 +84,17 @@ pub use config_backend::{
 };
 
 pub use drift::{
-    ContextHandle, DriftEngine, DriftError, DriftRouter,
+    ContextHandle, DriftError, DriftRouter,
     SharedDriftRouter, StagedDrift, shared_drift_router,
+    // Individual drift engines
+    DriftLsEngine, DriftPushEngine, DriftPullEngine, DriftFlushEngine, DriftMergeEngine,
     // Distillation helpers
     DISTILLATION_SYSTEM_PROMPT, build_distillation_prompt,
     // Commit helpers
     COMMIT_SYSTEM_PROMPT, build_commit_prompt,
+};
+pub use file_tools::{
+    FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
 };
 pub use git_engine::GitEngine;
 

@@ -18,13 +18,14 @@
 mod components;
 pub mod frame_assembly;
 pub mod plugin;
-mod sync;
 mod systems;
 
 // Re-export public API
+#[allow(unused_imports)]
 pub use components::{
-    Cell, CellEditor, ComposeBlock, ConversationContainer, CurrentMode, EditorMode, FocusTarget,
-    FocusedBlockCell, InputKind, MainCell, ViewingConversation,
+    Cell, CellEditor, ComposeBlock, ContextSwitchRequested, ConversationContainer, CurrentMode,
+    DocumentCache, EditorMode, FocusTarget, FocusedBlockCell, InputKind, MainCell,
+    ViewingConversation,
 };
 pub use plugin::CellPlugin;
 // CellPhase is pub in plugin.rs but not re-exported - use cell::plugin::CellPhase if needed

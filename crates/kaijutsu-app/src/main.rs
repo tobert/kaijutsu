@@ -82,7 +82,7 @@ fn main() {
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
-        .add_plugins(connection::ConnectionBridgePlugin)
+        .add_plugins(connection::ActorPlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
         // App screen state management (Dashboard vs Conversation)
@@ -95,6 +95,8 @@ fn main() {
         .add_plugins(ui::constellation::ConstellationPlugin)
         // Widget system - unified docked/floating UI primitives
         .add_plugins(ui::widget::WidgetPlugin)
+        // Drift state - context list + staged queue polling
+        .add_plugins(ui::drift::DriftPlugin)
         // Layout system - RON-driven view layouts
         .add_plugins(ui::layout::LayoutPlugin)
         // Timeline navigation - temporal scrubbing through history

@@ -38,8 +38,9 @@ struct Uniforms {
     vert_scale: f32,
     // SDF threshold for text rendering (0.45-0.55). Default 0.5.
     text_bias: f32,
-    // Padding for alignment
-    _padding: f32,
+    // Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
+    // Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
+    gamma_correction: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -47,7 +48,7 @@ struct Uniforms {
 @group(0) @binding(2) var atlas_sampler: sampler;
 
 struct VertexInput {
-    @location(0) position: vec3<f32>,  // x, y in NDC, z for depth testing
+    @location(0) position: vec3<f32>,  // x, y in NDC, z unused (depth testing removed)
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
@@ -80,7 +81,6 @@ fn vertex(in: VertexInput) -> VertexOutput {
         jittered_pos = jittered_pos + jitter_ndc;
     }
 
-    // Use z from input for depth testing (earlier glyphs have lower z, winning depth test)
     out.clip_position = vec4<f32>(jittered_pos, in.position.z, 1.0);
     out.uv = in.uv;
     out.color = in.color;
@@ -217,6 +217,11 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
     // This compensates for the sharper AA making them appear lighter
     alpha = pow(alpha, 1.0 + 0.2 * vgrad * uniforms.hint_amount);
 
+    // Gamma-correct alpha: compensates for perceptual non-linearity.
+    // Values < 1.0 widen the AA transition (thicker light-on-dark text).
+    // Values > 1.0 narrow it (thicker dark-on-light text).
+    alpha = pow(alpha, uniforms.gamma_correction);
+
     return alpha;
 }
 
@@ -321,22 +326,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // === SAMPLE MSDF FOR TERRITORY CLAIM ===
-    // Sample the signed distance to determine if this pixel is "owned" by this glyph.
-    // Depth testing ensures the first glyph to render claims overlapping regions.
-    let sample = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let msdf_sd = median(sample.r, sample.g, sample.b);
-    let sd = min(msdf_sd, sample.a);
-
-    // Discard pixels clearly outside this glyph's territory.
-    // The glyph edge is at sd=0.5. Threshold 0.48 allows a thin AA transition
-    // while minimizing territory claiming — where earlier glyphs' SDF fields
-    // "nibble" the left edges of later glyphs via depth-test priority.
-    // Glow extends inward from the edge, so this threshold doesn't affect it.
-    if sd < 0.48 {
-        discard;
-    }
-
     var output = vec4<f32>(0.0);
 
     // === GLOW LAYER ===
@@ -363,8 +352,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 
-    // Blend text using premultiplied alpha
+    // Blend text using premultiplied alpha.
+    // Overlapping quad padding zones are handled by the SDF evaluation:
+    // outside the glyph shape, sd < 0.5, so text_alpha drops to ~0.
     output = blend_over_premultiplied(output, text_color, text_alpha * in.color.a);
+
+    // === LATE DISCARD ===
+    // Discard pixels with no visible ink (saves fill rate on transparent regions).
+    if output.a < 0.01 {
+        discard;
+    }
 
     // Output is already in premultiplied form (rgb * alpha) which matches our blend state
     return output;

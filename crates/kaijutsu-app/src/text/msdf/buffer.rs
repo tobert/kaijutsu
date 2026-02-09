@@ -20,6 +20,10 @@ pub struct PositionedGlyph {
     pub y: f32,
     /// Font size used for this glyph (needed to scale MSDF region).
     pub font_size: f32,
+    /// Advance width in pixels from cosmic-text.
+    /// Used by tests for boundary analysis (no longer needed by pipeline).
+    #[allow(dead_code)]
+    pub advance_width: f32,
     /// Color (RGBA).
     pub color: [u8; 4],
     /// Fractional pixel offset from baseline snapping (for potential subpixel rendering).
@@ -61,6 +65,9 @@ pub struct MsdfTextBuffer {
     /// Enables uniform character cell widths for monospace fonts where
     /// fractional positioning causes visible spacing inconsistency.
     snap_x: bool,
+    /// Extra pixels added between each glyph (letter-spacing / tracking).
+    /// Applied as cumulative offset: glyph N gets N * letter_spacing extra px.
+    letter_spacing: f32,
 }
 
 #[allow(dead_code)]
@@ -76,6 +83,7 @@ impl MsdfTextBuffer {
             text_hash: 0,
             default_color: [220, 220, 240, 255],
             snap_x: false,
+            letter_spacing: 0.0,
         }
     }
 
@@ -92,6 +100,7 @@ impl MsdfTextBuffer {
             text_hash: 0,
             default_color: [220, 220, 240, 255],
             snap_x: false,
+            letter_spacing: 0.0,
         }
     }
 
@@ -108,6 +117,26 @@ impl MsdfTextBuffer {
         self.text_hash = Self::hash_str(text);
     }
 
+    /// Set rich text with per-span attributes (bold, italic, color, etc.).
+    ///
+    /// This wraps cosmic-text's `Buffer::set_rich_text()` for markdown rendering.
+    /// Per-span colors are propagated through `LayoutGlyph::color_opt` and read
+    /// back in `update_glyphs()` as per-glyph colors.
+    pub fn set_rich_text<'r, 's, I>(
+        &mut self,
+        font_system: &mut FontSystem,
+        spans: I,
+        default_attrs: &Attrs<'_>,
+        shaping: Shaping,
+    ) where
+        I: IntoIterator<Item = (&'s str, Attrs<'r>)>,
+    {
+        self.buffer.set_rich_text(font_system, spans, default_attrs, shaping, None);
+        self.dirty = true;
+        // Hash the buffer text for change detection
+        self.text_hash = Self::hash_str(&self.text());
+    }
+
     /// Enable horizontal pixel snapping for monospace fonts.
     ///
     /// When enabled, glyph x-positions are rounded to pixel boundaries so that
@@ -117,6 +146,18 @@ impl MsdfTextBuffer {
     pub fn set_snap_x(&mut self, snap: bool) {
         if self.snap_x != snap {
             self.snap_x = snap;
+            self.dirty = true;
+        }
+    }
+
+    /// Set extra letter-spacing in pixels.
+    ///
+    /// Each glyph gets `glyph_index * spacing` extra horizontal offset,
+    /// widening the gaps between characters beyond what the font recommends.
+    /// Useful for improving readability at small sizes where glyphs crowd.
+    pub fn set_letter_spacing(&mut self, spacing: f32) {
+        if (self.letter_spacing - spacing).abs() > f32::EPSILON {
+            self.letter_spacing = spacing;
             self.dirty = true;
         }
     }
@@ -192,7 +233,7 @@ impl MsdfTextBuffer {
             let line_y_snapped = run.line_y.round();
             let baseline_offset = line_y_snapped - run.line_y;
 
-            for glyph in run.glyphs {
+            for (glyph_idx, glyph) in run.glyphs.iter().enumerate() {
                 let font_id = glyph.font_id;
                 let glyph_id = glyph.glyph_id;
                 let key = GlyphKey::new(font_id, glyph_id);
@@ -220,9 +261,18 @@ impl MsdfTextBuffer {
                     line_y_snapped + glyph.y
                 };
 
-                // Snap x to pixel boundary for monospace fonts so every
-                // character cell starts at an integer offset
-                let x = if self.snap_x { glyph.x.round() } else { glyph.x };
+                // Apply letter-spacing then snap to pixel boundary
+                let x_raw = glyph.x + (glyph_idx as f32 * self.letter_spacing);
+                let x = if self.snap_x { x_raw.round() } else { x_raw };
+
+                // Per-glyph color from cosmic-text rich text (ARGB packed u32 → [R,G,B,A])
+                let color = glyph
+                    .color_opt
+                    .map(|c| {
+                        let (r, g, b, a) = c.as_rgba_tuple();
+                        [r, g, b, a]
+                    })
+                    .unwrap_or(self.default_color);
 
                 self.glyphs.push(PositionedGlyph {
                     key,
@@ -230,7 +280,8 @@ impl MsdfTextBuffer {
                     // Pixel-aligned baseline + grid-fitted vertical offset
                     y: y_adjusted,
                     font_size,
-                    color: self.default_color,
+                    advance_width: glyph.w,
+                    color,
                     // Store fractional offset for potential subpixel rendering
                     subpixel_offset: baseline_offset,
                     // Default importance 0.5 = normal weight
@@ -250,6 +301,18 @@ impl MsdfTextBuffer {
     #[cfg(test)]
     pub fn glyph_positions(&self) -> Vec<(f32, f32)> {
         self.glyphs.iter().map(|g| (g.x, g.y)).collect()
+    }
+
+    /// Set alternating glyph colors for overlap detection tests.
+    ///
+    /// Even-indexed glyphs get `color_a`, odd-indexed get `color_b`.
+    /// When rendered, channel separation at advance boundaries reveals
+    /// whether adjacent glyph quads bleed into each other's cells.
+    #[cfg(test)]
+    pub fn set_alternating_colors(&mut self, color_a: [u8; 4], color_b: [u8; 4]) {
+        for (i, glyph) in self.glyphs.iter_mut().enumerate() {
+            glyph.color = if i % 2 == 0 { color_a } else { color_b };
+        }
     }
 
     /// Get the number of lines (for testing).

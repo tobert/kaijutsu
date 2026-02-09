@@ -461,6 +461,9 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     if let Some(v) = get_float(&scope, "font_text_bias") {
         theme.font_text_bias = v;
     }
+    if let Some(v) = get_float(&scope, "font_gamma_correction") {
+        theme.font_gamma_correction = v;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Font effects (MSDF text)

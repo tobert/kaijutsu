@@ -28,8 +28,9 @@
 use bevy::prelude::*;
 
 use crate::cell::{CurrentMode, EditorMode, InputKind};
-use crate::connection::bridge::ConnectionState;
+use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -111,8 +112,10 @@ pub enum WidgetContent {
     Title,
     /// Mode indicator - reactive to CurrentMode
     Mode,
-    /// Connection status - reactive to ConnectionState
+    /// Connection status - reactive to RpcConnectionState
     Connection,
+    /// Drift context list - reactive to DriftState
+    Contexts,
 }
 
 impl Default for WidgetContent {
@@ -170,6 +173,13 @@ impl Widget {
 pub struct WidgetText {
     /// Parent widget's name for lookup
     pub widget_name: String,
+}
+
+/// Clickable badge for a context in the South dock context strip.
+#[derive(Component, Debug, Clone)]
+pub struct ContextBadge {
+    /// Context name this badge represents (used for switch-on-click).
+    pub context_name: String,
 }
 
 // ============================================================================
@@ -237,6 +247,8 @@ impl Plugin for WidgetPlugin {
                     spawn_initial_widgets,
                     update_mode_widget,
                     update_connection_widget,
+                    update_contexts_widget,
+                    handle_context_badge_click,
                 )
                     .chain(),
             );
@@ -397,9 +409,30 @@ fn spawn_initial_widgets(
     );
     commands.entity(south).add_child(mode_widget);
 
-    // Spacer
-    let south_spacer = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
-    commands.entity(south).add_child(south_spacer);
+    // Spacer (left)
+    let south_spacer_l = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
+    commands.entity(south).add_child(south_spacer_l);
+
+    // Context list widget (center)
+    let contexts_widget = spawn_widget(
+        &mut commands,
+        &mut config,
+        &theme,
+        Widget::new("contexts", WidgetContent::Contexts)
+            .with_state(WidgetState::Docked {
+                edge: Edge::South,
+                order: 50,
+            })
+            .with_size(WidgetSize::min(200.0, 16.0)),
+        "",
+        11.0,
+        theme.fg_dim,
+    );
+    commands.entity(south).add_child(contexts_widget);
+
+    // Spacer (right)
+    let south_spacer_r = commands.spawn((DockSpacer, Node { flex_grow: 1.0, ..default() })).id();
+    commands.entity(south).add_child(south_spacer_r);
 
     // Key hints widget (right side)
     let hints_widget = spawn_widget(
@@ -503,9 +536,9 @@ fn update_mode_widget(
     }
 }
 
-/// Update connection widget when ConnectionState changes.
+/// Update connection widget when RpcConnectionState changes.
 fn update_connection_widget(
-    conn_state: Res<ConnectionState>,
+    conn_state: Res<RpcConnectionState>,
     theme: Res<Theme>,
     mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
 ) {
@@ -537,5 +570,215 @@ fn update_connection_widget(
 
         msdf_text.text = text;
         msdf_text.color = bevy_to_rgba8(color);
+    }
+}
+
+/// Update contexts widget when DriftState or DocumentCache changes.
+///
+/// Shows MRU context badges from DocumentCache as clickable children, with
+/// active context highlighted. Falls back to drift state or single-text
+/// for notifications.
+///
+/// Badges: `[main] explore research`  (each is a clickable ContextBadge)
+/// Notification: `← @abc: "Found the auth bug in..."`
+fn update_contexts_widget(
+    mut commands: Commands,
+    drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    theme: Res<Theme>,
+    widgets: Query<(Entity, &Widget, &Children)>,
+    existing_badges: Query<Entity, With<ContextBadge>>,
+    mut widget_texts: Query<(&WidgetText, &mut MsdfUiText)>,
+) {
+    if !drift_state.is_changed() && !doc_cache.is_changed() {
+        return;
+    }
+
+    // Find the contexts widget entity
+    let Some((widget_entity, _, _children)) = widgets
+        .iter()
+        .find(|(_, w, _)| w.name == "contexts")
+    else {
+        return;
+    };
+
+    // If there's an active notification, show as single text (despawn badges)
+    if let Some(ref notif) = drift_state.notification {
+        for entity in existing_badges.iter() {
+            commands.entity(entity).despawn();
+        }
+        for (wt, mut msdf_text) in widget_texts.iter_mut() {
+            if wt.widget_name == "contexts" {
+                msdf_text.text = format!("← @{}: \"{}\"", notif.source_ctx, notif.preview);
+                msdf_text.color = bevy_to_rgba8(theme.accent);
+            }
+        }
+        return;
+    }
+
+    let mru_ids = doc_cache.mru_ids();
+    let active_doc_id = doc_cache.active_id();
+
+    if !mru_ids.is_empty() {
+        // Hide the WidgetText child (set to empty)
+        for (wt, mut msdf_text) in widget_texts.iter_mut() {
+            if wt.widget_name == "contexts" {
+                msdf_text.text = String::new();
+            }
+        }
+
+        // Despawn old badges
+        for entity in existing_badges.iter() {
+            commands.entity(entity).despawn();
+        }
+
+        // Spawn new badges
+        let max_display = 5;
+        for (i, doc_id) in mru_ids.iter().enumerate() {
+            if i >= max_display {
+                // Overflow indicator (not clickable)
+                let remaining = mru_ids.len() - max_display;
+                let overflow = commands
+                    .spawn(Node {
+                        padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                        ..default()
+                    })
+                    .with_children(|parent| {
+                        parent.spawn((
+                            MsdfUiText::new(&format!("+{}", remaining))
+                                .with_font_size(11.0)
+                                .with_color(theme.fg_dim),
+                            UiTextPositionCache::default(),
+                            Node::default(),
+                        ));
+                    })
+                    .id();
+                commands.entity(widget_entity).add_child(overflow);
+                break;
+            }
+
+            let ctx_name = doc_cache
+                .get(doc_id)
+                .map(|c| c.context_name.as_str())
+                .unwrap_or("?");
+
+            let short = if ctx_name.len() > 12 {
+                &ctx_name[..12]
+            } else {
+                ctx_name
+            };
+
+            let is_active = active_doc_id == Some(doc_id.as_str());
+            let label = if is_active {
+                format!("[{}]", short)
+            } else {
+                short.to_string()
+            };
+            let color = if is_active { theme.accent } else { theme.fg_dim };
+
+            let badge = commands
+                .spawn((
+                    ContextBadge {
+                        context_name: ctx_name.to_string(),
+                    },
+                    Node {
+                        padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        ..default()
+                    },
+                    Interaction::None,
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
+                        MsdfUiText::new(&label)
+                            .with_font_size(11.0)
+                            .with_color(color),
+                        UiTextPositionCache::default(),
+                        Node::default(),
+                    ));
+                })
+                .id();
+            commands.entity(widget_entity).add_child(badge);
+        }
+
+        // Append staged count as a non-clickable text
+        let staged = drift_state.staged_count();
+        if staged > 0 {
+            let staged_text = commands
+                .spawn(Node {
+                    padding: UiRect::left(Val::Px(8.0)),
+                    ..default()
+                })
+                .with_children(|parent| {
+                    parent.spawn((
+                        MsdfUiText::new(&format!("·{} staged", staged))
+                            .with_font_size(11.0)
+                            .with_color(theme.fg_dim),
+                        UiTextPositionCache::default(),
+                        Node::default(),
+                    ));
+                })
+                .id();
+            commands.entity(widget_entity).add_child(staged_text);
+        }
+        return;
+    }
+
+    // No cached docs — despawn badges and fall back to single text
+    for entity in existing_badges.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Fall back to drift state contexts as single text
+    for (wt, mut msdf_text) in widget_texts.iter_mut() {
+        if wt.widget_name != "contexts" {
+            continue;
+        }
+
+        if drift_state.contexts.is_empty() {
+            msdf_text.text = String::new();
+            continue;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let max_display = 5;
+
+        for (i, ctx) in drift_state.contexts.iter().enumerate() {
+            if i >= max_display {
+                let remaining = drift_state.contexts.len() - max_display;
+                parts.push(format!("+{} more", remaining));
+                break;
+            }
+            parts.push(format!("@{}", ctx.short_id));
+        }
+
+        let mut text = parts.join(" ");
+        let staged = drift_state.staged_count();
+        if staged > 0 {
+            text.push_str(&format!("  ·{} staged", staged));
+        }
+
+        let color = if drift_state.local_context_id.is_some() {
+            theme.accent
+        } else {
+            theme.fg_dim
+        };
+
+        msdf_text.text = text;
+        msdf_text.color = bevy_to_rgba8(color);
+    }
+}
+
+/// Handle clicks on context badges in the South dock strip.
+fn handle_context_badge_click(
+    badges: Query<(&Interaction, &ContextBadge), Changed<Interaction>>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+) {
+    for (interaction, badge) in badges.iter() {
+        if *interaction == Interaction::Pressed {
+            info!("Context badge clicked: {}", badge.context_name);
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_name: badge.context_name.clone(),
+            });
+        }
     }
 }

@@ -5,13 +5,17 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
-    BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition, CellState,
-    ComposeBlock, ConversationScrollState, CurrentMode, EditingBlockCell, EditorMode, FocusTarget,
-    InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
+    CellState, ComposeBlock, ConversationScrollState, CurrentMode, DriftKind, EditingBlockCell,
+    EditorMode, FocusTarget, InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
 use crate::conversation::CurrentConversation;
-use crate::text::{FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics};
+use crate::text::{
+    bevy_to_cosmic_color, FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig,
+    MsdfTextBuffer, TextMetrics,
+};
+use crate::text::markdown::{self, MarkdownColors};
 use crate::ui::format::format_for_display;
 use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
@@ -33,12 +37,6 @@ const ROLE_HEADER_HEIGHT: f32 = 20.0;
 /// Spacing between role header and block content.
 const ROLE_HEADER_SPACING: f32 = 4.0;
 
-/// Height of the status bar at bottom of window.
-const STATUS_BAR_HEIGHT: f32 = 32.0;
-
-/// Minimum height reserved for compose block (min_height + margins).
-/// ComposeBlock: 60px min + 8px top margin + 16px bottom margin = 84px
-const COMPOSE_BLOCK_MIN_HEIGHT: f32 = 84.0;
 
 // ============================================================================
 // BLOCK COLOR MAPPING
@@ -77,7 +75,13 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
         }
         BlockKind::ShellCommand => theme.block_shell_cmd,
         BlockKind::ShellOutput => theme.block_shell_output,
-        BlockKind::Drift => theme.fg_dim, // Drift blocks use dim system color
+        BlockKind::Drift => match block.drift_kind {
+            Some(DriftKind::Push) => theme.block_drift_push,
+            Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
+            Some(DriftKind::Merge) => theme.block_drift_merge,
+            Some(DriftKind::Commit) => theme.block_drift_commit,
+            None => theme.fg_dim,
+        },
     }
 }
 
@@ -340,6 +344,7 @@ pub fn init_cell_buffers(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Initialize with current editor text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -393,13 +398,9 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                     output.push_str(name);
                 }
                 output.push('\n');
-                // Pretty-print JSON input
+                // Pretty-print JSON input with real newlines in string values
                 if let Some(ref input) = block.tool_input {
-                    if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                        output.push_str(&pretty);
-                    } else {
-                        output.push_str(&input.to_string());
-                    }
+                    output.push_str(&display_json_value(input, 0));
                 }
             }
             BlockKind::ToolResult => {
@@ -420,10 +421,7 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
                 output.push_str(&formatted.text);
             }
             BlockKind::Drift => {
-                let ctx = block.source_context.as_deref().unwrap_or("?");
-                let model = block.source_model.as_deref().unwrap_or("unknown");
-                output.push_str(&format!("🌊 Drift from {} ({})\n", ctx, model));
-                output.push_str(&block.content);
+                output.push_str(&format_drift_block(block, None));
             }
         }
     }
@@ -431,19 +429,128 @@ fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
     output
 }
 
+/// Strip provider prefix from model name for compact display.
+///
+/// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`
+/// `"claude-opus-4-6"` → `"claude-opus-4-6"`
+fn truncate_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Draw a box-drawing frame around content.
+///
+/// ```text
+/// ┌─ header ──────────────────┐
+/// │ content line 1             │
+/// │ content line 2             │
+/// └────────────────────────────┘
+/// ```
+fn draw_box(header: &str, content: &str, width: usize) -> String {
+    let inner = width.saturating_sub(4); // account for "│ " and " │"
+    let header_pad = inner.saturating_sub(header.chars().count() + 2);
+    let mut out = String::new();
+
+    // Top border
+    out.push_str("┌─ ");
+    out.push_str(header);
+    out.push(' ');
+    for _ in 0..header_pad {
+        out.push('─');
+    }
+    out.push_str("┐\n");
+
+    // Content lines
+    for line in content.lines() {
+        out.push_str("│ ");
+        let line_chars: usize = line.chars().count();
+        out.push_str(line);
+        let pad = inner.saturating_sub(line_chars);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        out.push_str(" │\n");
+    }
+    // Handle empty content
+    if content.is_empty() {
+        out.push_str("│ ");
+        for _ in 0..inner {
+            out.push(' ');
+        }
+        out.push_str(" │\n");
+    }
+
+    // Bottom border
+    out.push('└');
+    for _ in 0..inner + 2 {
+        out.push('─');
+    }
+    out.push_str("┘\n");
+
+    out
+}
+
+/// Format a drift block with variant-specific visual treatment.
+///
+/// `local_ctx`: if provided, determines push direction arrow (→ outgoing, ← incoming).
+fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
+    let ctx = block.source_context.as_deref().unwrap_or("?");
+    let model = block.source_model.as_deref().map(truncate_model).unwrap_or("unknown");
+    let ctx_label = format!("@{}", ctx);
+    let width = 72;
+
+    // Determine direction arrow: → if we sent it, ← if we received it
+    let arrow = match local_ctx {
+        Some(local) if ctx == local => "→",
+        _ => "←",
+    };
+
+    match block.drift_kind {
+        Some(DriftKind::Push) => {
+            let preview = block.content.lines().next().unwrap_or("");
+            format!("{} {} ({})  {}\n", arrow, ctx_label, model, preview)
+        }
+        Some(DriftKind::Pull) | Some(DriftKind::Distill) => {
+            let header = format!("pulled from {} ({})", ctx_label, model);
+            draw_box(&header, &block.content, width)
+        }
+        Some(DriftKind::Merge) => {
+            let header = format!("⇄ merged from {} ({})", ctx_label, model);
+            draw_box(&header, &block.content, width)
+        }
+        Some(DriftKind::Commit) => {
+            format!("📝 {}  {}\n", ctx_label, block.content.lines().next().unwrap_or(""))
+        }
+        None => {
+            format!("🌊 {} ({})  {}\n", ctx_label, model, block.content.lines().next().unwrap_or(""))
+        }
+    }
+}
+
 /// Update MsdfTextBuffer from CellEditor when dirty.
 ///
 /// For cells with content blocks, formats them with visual markers.
 /// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer), Changed<CellEditor>>,
+    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer, Option<&BlockCellContainer>), Changed<CellEditor>>,
     font_system: Res<SharedFontSystem>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
         return;
     };
 
-    for (editor, mut buffer) in cells.iter_mut() {
+    for (editor, mut buffer, container) in cells.iter_mut() {
+        // Skip cells that have BlockCells — they render per-block via sync_block_cell_buffers.
+        // Clear the MainCell buffer so it doesn't render an overlapping text wall.
+        if container.is_some_and(|c| !c.block_cells.is_empty()) {
+            buffer.set_text(
+                &mut font_system,
+                "",
+                cosmic_text::Attrs::new(),
+                cosmic_text::Shaping::Advanced,
+            );
+            continue;
+        }
+
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
 
         // Use block-formatted text if we have blocks, otherwise use raw text
@@ -688,7 +795,7 @@ pub fn spawn_cursor(
     });
 
     // Derive cursor size from TextMetrics for consistency with text rendering
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
     let entity = commands
@@ -748,7 +855,7 @@ pub fn update_cursor(
     let (row, col) = cursor_position(&mut editor);
 
     // Position relative to cell bounds using TextMetrics for consistency
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);
@@ -863,8 +970,14 @@ pub fn handle_prompt_submitted(
     current_conv: Res<CurrentConversation>,
     sync_state: Res<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    cmds: Option<Res<crate::connection::ConnectionCommands>>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    channel: Res<crate::connection::RpcResultChannel>,
 ) {
+    // Early exit: don't do any work unless there are actually events to process
+    if submit_events.is_empty() {
+        return;
+    }
+
     // Get the current conversation ID
     let Some(conv_id) = current_conv.id() else {
         warn!("No current conversation to add message to");
@@ -880,33 +993,45 @@ pub fn handle_prompt_submitted(
     let doc_cell_id = doc.document_id().to_string();
 
     for event in submit_events.read() {
-        if let Some(ref cmds) = cmds {
+        if let Some(ref actor) = actor {
+            let handle = actor.handle.clone();
+            let text = event.text.clone();
+            let cell_id = doc_cell_id.clone();
+            let conv = conv_id.to_string();
+
+            let tx = channel.sender();
             match mode.0 {
                 EditorMode::Input(InputKind::Shell) => {
-                    // Shell mode: execute as kaish command
-                    cmds.send(crate::connection::ConnectionCommand::ShellExecute {
-                        command: event.text.clone(),
-                        cell_id: doc_cell_id.clone(),
-                    });
-                    info!(
-                        "Sent shell command to server (conv={}, cell_id={})",
-                        conv_id, doc_cell_id
-                    );
+                    // Shell mode: fire-and-forget, results via ServerEvent broadcast
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.shell_execute(&text, &cell_id).await {
+                                log::error!("shell_execute failed: {e}");
+                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                    operation: "shell_execute".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        })
+                        .detach();
+                    info!("Sent shell command to server (conv={}, cell_id={})", conv, doc_cell_id);
                 }
                 EditorMode::Input(InputKind::Chat) => {
-                    // Chat mode: send to LLM
-                    cmds.send(crate::connection::ConnectionCommand::Prompt {
-                        content: event.text.clone(),
-                        model: None, // Use server default
-                        cell_id: doc_cell_id.clone(),
-                    });
-                    info!(
-                        "Sent prompt to server (conv={}, cell_id={})",
-                        conv_id, doc_cell_id
-                    );
+                    // Chat mode: fire-and-forget, results via ServerEvent broadcast
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.prompt(&text, None, &cell_id).await {
+                                log::error!("prompt failed: {e}");
+                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                    operation: "prompt".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        })
+                        .detach();
+                    info!("Sent prompt to server (conv={}, cell_id={})", conv, doc_cell_id);
                 }
                 _ => {
-                    // Other modes shouldn't submit prompts, but handle gracefully
                     warn!("Unexpected prompt submission in {:?} mode", mode.0);
                 }
             }
@@ -918,28 +1043,30 @@ pub fn handle_prompt_submitted(
     }
 }
 
-/// Auto-focus the prompt cell when entering Input mode.
 /// Smooth scroll interpolation system.
 ///
 /// Runs every frame to smoothly interpolate scroll position toward target.
 ///
 /// Key insight: In follow mode, we lock directly to bottom (no interpolation).
-/// Interpolation is only used for manual scrolling and transitions INTO follow mode.
+/// Interpolation is only used for manual scrolling (wheel, Page Up/Down, etc.).
 /// This prevents the "chasing a moving target" stutter during streaming.
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
+    time: Res<Time>,
 ) {
     // Clear the user_scrolled flag at end of frame
     // (This system runs late in the frame after block events)
     scroll_state.user_scrolled_this_frame = false;
 
+    // Clamp target in case content shrank (context switch, block collapse)
+    scroll_state.clamp_target();
+
     let max = scroll_state.max_offset();
 
-    // In follow mode, lock directly to bottom - no interpolation needed
-    // This is how terminals work: content grows, viewport stays anchored
+    // In follow mode, lock directly to bottom — no interpolation needed.
+    // This is how terminals work: content grows, viewport stays anchored.
     if scroll_state.following {
         // Jitter prevention: only update if max changed by at least 1 pixel
-        // This prevents sub-pixel oscillation during streaming
         if (max - scroll_state.offset).abs() >= 1.0 {
             scroll_state.offset = max;
             scroll_state.target_offset = max;
@@ -947,9 +1074,19 @@ pub fn smooth_scroll(
         return;
     }
 
-    // Not following: immediate scroll (no smoothing for now)
-    scroll_state.clamp_target();
-    scroll_state.offset = scroll_state.target_offset;
+    // Manual scroll: lerp toward target for smooth motion
+    const SCROLL_SPEED: f32 = 12.0;
+    let target = scroll_state.target_offset;
+    let offset = scroll_state.offset;
+    let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
+    let new_offset = offset + (target - offset) * t;
+
+    // Snap when close enough to prevent sub-pixel jitter
+    scroll_state.offset = if (new_offset - target).abs() < 0.5 {
+        target
+    } else {
+        new_offset
+    };
 }
 
 /// Handle mouse wheel scrolling for the conversation area.
@@ -1310,6 +1447,7 @@ pub fn spawn_expanded_block_view(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         let color = block_color(block, &theme);
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -1552,7 +1690,7 @@ pub fn sync_main_cell_to_conversation(
         }
     }
 
-    info!(
+    trace!(
         "Synced MainCell to conversation {} (version {})",
         conv_id, sync_version
     );
@@ -1562,157 +1700,426 @@ pub fn sync_main_cell_to_conversation(
 // BLOCK EVENT HANDLING (Server → Client Block Sync)
 // ============================================================================
 
-use crate::connection::ConnectionEvent;
+use crate::connection::{RpcResultMessage, ServerEventMessage};
 
-/// Handle block events from the server and update the MainCell's BlockDocument.
+/// Handle block events from the server, routing through DocumentCache.
 ///
-/// This system processes streamed block events (inserted, edited, deleted, etc.)
-/// from the server and applies them to the local document for live updates.
+/// This system processes:
+/// - `ServerEventMessage` — streamed block events (inserted, edited, deleted, etc.)
+/// - `RpcResultMessage::ContextJoined` — initial document state after joining a context
 ///
-/// **Frontier-based sync protocol:**
-/// - First BlockInserted (or cell_id change) → full sync via `from_oplog()`
+/// **Multi-context routing:**
+/// All events are routed by `document_id` to the appropriate `CachedDocument` in
+/// `DocumentCache`. For the active document, changes are also mirrored to
+/// `DocumentSyncState` for backward compatibility with `sync_main_cell_to_conversation`.
+///
+/// **Sync protocol (per document):**
+/// - Initial state (ContextJoined) → full sync via `from_oplog()`
 /// - Subsequent BlockInserted → incremental merge via `merge_ops_owned()`
 /// - BlockTextOps → always incremental merge
 ///
 /// Implements terminal-like auto-scroll: if the user is at the bottom when
-/// new content arrives, we stay at the bottom. If they've scrolled up to
-/// read history, we don't interrupt them.
+/// new content arrives, we stay at the bottom.
 pub fn handle_block_events(
-    mut events: MessageReader<ConnectionEvent>,
+    mut server_events: MessageReader<ServerEventMessage>,
+    mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut sync_state: ResMut<super::components::DocumentSyncState>,
+    mut doc_cache: ResMut<super::components::DocumentCache>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut current_conv: ResMut<CurrentConversation>,
+    mut pending_switch: ResMut<super::components::PendingContextSwitch>,
+    mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
+    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
 ) {
+    use kaijutsu_client::ServerEvent;
+    use super::components::CachedDocument;
+
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
 
     // Get agent ID for creating documents
     let agent_id = format!("user:{}", whoami::username());
 
-    for event in events.read() {
-        match event {
-            // Initial state from server - single path through DocumentSyncState
-            ConnectionEvent::BlockCellInitialState { cell_id, ops, blocks: _ } => {
-                if current_conv.id().is_none() {
-                    warn!(
-                        "BlockCellInitialState arrived but no current conversation set. \
-                         This indicates a system ordering bug - handle_block_events should \
-                         run after DashboardEventHandling."
-                    );
-                    continue;
+    // Handle initial document state from ContextJoined
+    for result in result_events.read() {
+        if let RpcResultMessage::ContextJoined { seat, document_id, initial_state } = result {
+            let context_name = seat.id.context.clone();
+
+            // Create or update cache entry
+            if !doc_cache.contains(document_id) {
+                let mut cached = CachedDocument {
+                    doc: BlockDocument::new(document_id, &agent_id),
+                    sync: kaijutsu_client::SyncManager::new(),
+                    context_name: context_name.clone(),
+                    synced_at_generation: 0,
+                    last_accessed: std::time::Instant::now(),
+                    scroll_offset: 0.0,
+                    seat_info: Some(seat.clone()),
+                };
+
+                // Apply initial state if provided
+                if let Some(state) = initial_state {
+                    match cached.sync.apply_initial_state(&mut cached.doc, &state.document_id, &state.ops) {
+                        Ok(result) => {
+                            info!("Cache: initial sync for '{}' ({}) result: {:?}", context_name, document_id, result);
+                        }
+                        Err(e) => {
+                            error!("Cache: initial sync error for '{}' ({}): {}", context_name, document_id, e);
+                        }
+                    }
                 }
 
-                // Use server's cell_id as canonical document ID to avoid format mismatches
-                // between client-generated "kernel@context" and server's stored document_id
-                if current_conv.id() != Some(cell_id) {
+                cached.synced_at_generation = sync_gen.0;
+                doc_cache.insert(document_id.clone(), cached);
+            }
+
+            // If this is the first context or no active doc yet, make it active
+            let is_first = doc_cache.active_id().is_none();
+            if is_first {
+                doc_cache.set_active(document_id);
+            }
+
+            // Check if this ContextJoined satisfies a pending context switch
+            if let Some(ref pending_ctx) = pending_switch.0 {
+                if pending_ctx == &context_name {
+                    info!("Pending context switch satisfied: '{}' joined, auto-switching", context_name);
+                    pending_switch.0 = None;
+                    switch_writer.write(super::components::ContextSwitchRequested {
+                        context_name: context_name.clone(),
+                    });
+                }
+            }
+
+            // Mirror to DocumentSyncState for the active document
+            let is_active = doc_cache.active_id() == Some(document_id.as_str());
+            if is_active {
+                if current_conv.id() != Some(document_id) {
                     info!(
                         "Updating current_conv to server's document_id: {} (was {:?})",
-                        cell_id,
+                        document_id,
                         current_conv.id()
                     );
-                    current_conv.0 = Some(cell_id.clone());
+                    current_conv.0 = Some(document_id.clone());
                 }
 
-                match sync_state.apply_initial_state(cell_id, &agent_id, ops) {
-                    Ok(result) => {
-                        info!("Initial state sync result: {:?}", result);
+                if let Some(state) = initial_state {
+                    match sync_state.apply_initial_state(&state.document_id, &agent_id, &state.ops) {
+                        Ok(result) => {
+                            info!("Initial state sync result: {:?}", result);
+                        }
+                        Err(e) => {
+                            error!("Initial state sync error: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        error!("Initial state sync error: {}", e);
+                }
+            }
+        }
+    }
+
+    let active_doc_id = doc_cache.active_id().map(|s| s.to_string());
+
+    // Handle streamed block events — route by document_id through DocumentCache
+    for ServerEventMessage(event) in server_events.read() {
+        match event {
+            ServerEvent::BlockInserted { document_id, block, ops } => {
+                // Route to cache entry
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    match cached.sync.apply_block_inserted(&mut cached.doc, document_id, block, ops) {
+                        Ok(result) => {
+                            cached.synced_at_generation = sync_gen.0;
+                            trace!("Cache: block insert for {} {:?}: {:?}", document_id, block.id, result);
+                        }
+                        Err(e) => {
+                            trace!("Cache: block insert error for {} {:?}: {}", document_id, block.id, e);
+                        }
+                    }
+                }
+
+                // Mirror to DocumentSyncState if active
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
+                        Ok(result) => {
+                            trace!("Block insert sync result for {:?}: {:?}", block.id, result);
+                        }
+                        Err(e) => {
+                            trace!("Block insert sync error for {:?}: {}", block.id, e);
+                        }
                     }
                 }
             }
 
-            // Block insertion - single path through DocumentSyncState
-            ConnectionEvent::BlockInserted { cell_id, block, ops } => {
-                match sync_state.apply_block_inserted(cell_id, &agent_id, block, ops) {
-                    Ok(result) => {
-                        trace!("Block insert sync result for {:?}: {:?}", block.id, result);
-                    }
-                    Err(e) => {
-                        trace!("Block insert sync error for {:?}: {}", block.id, e);
-                    }
-                }
-            }
-
-            // Text streaming ops - single path through DocumentSyncState
-            ConnectionEvent::BlockTextOps {
-                cell_id,
+            ServerEvent::BlockTextOps {
+                document_id,
                 block_id,
                 ops,
             } => {
-                match sync_state.apply_text_ops(cell_id, &agent_id, ops) {
-                    Ok(result) => {
-                        trace!("Text ops sync result for {:?}: {:?}", block_id, result);
+                // Route to cache entry
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    match cached.sync.apply_text_ops(&mut cached.doc, document_id, ops) {
+                        Ok(result) => {
+                            cached.synced_at_generation = sync_gen.0;
+                            trace!("Cache: text ops for {} {:?}: {:?}", document_id, block_id, result);
+                        }
+                        Err(e) => {
+                            trace!("Cache: text ops error for {} {:?}: {}", document_id, block_id, e);
+                        }
                     }
-                    Err(e) => {
-                        trace!("Text ops sync error for {:?}: {}", block_id, e);
+                }
+
+                // Mirror to DocumentSyncState if active
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    match sync_state.apply_text_ops(document_id, &agent_id, ops) {
+                        Ok(result) => {
+                            trace!("Text ops sync result for {:?}: {:?}", block_id, result);
+                        }
+                        Err(e) => {
+                            trace!("Text ops sync error for {:?}: {}", block_id, e);
+                        }
                     }
                 }
             }
 
-            // Non-CRDT events - operate on sync_state.doc
-            ConnectionEvent::BlockStatusChanged {
-                cell_id,
+            ServerEvent::BlockStatusChanged {
+                document_id,
                 block_id,
                 status,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.set_status(block_id, *status) {
-                    warn!("Failed to update block status: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.set_status(block_id, *status)
+                {
+                    warn!("Cache: failed to update block status for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.set_status(block_id, *status) {
+                        warn!("Failed to update block status: {}", e);
+                    }
                 }
             }
-            ConnectionEvent::BlockDeleted {
-                cell_id,
+            ServerEvent::BlockDeleted {
+                document_id,
                 block_id,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.delete_block(block_id) {
-                    warn!("Failed to delete block: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.delete_block(block_id)
+                {
+                    warn!("Cache: failed to delete block for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.delete_block(block_id) {
+                        warn!("Failed to delete block: {}", e);
+                    }
                 }
             }
-            ConnectionEvent::BlockCollapsedChanged {
-                cell_id,
+            ServerEvent::BlockCollapsedChanged {
+                document_id,
                 block_id,
                 collapsed,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
-                    warn!("Failed to update block collapsed state: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.set_collapsed(block_id, *collapsed)
+                {
+                    warn!("Cache: failed to update collapsed for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
+                        warn!("Failed to update block collapsed state: {}", e);
+                    }
                 }
             }
-            ConnectionEvent::BlockMoved {
-                cell_id,
+            ServerEvent::BlockMoved {
+                document_id,
                 block_id,
                 after_id,
             } => {
-                let Some(ref mut doc) = sync_state.doc else { continue; };
-                if cell_id != doc.document_id() { continue; }
-
-                if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
-                    warn!("Failed to move block: {}", e);
+                if let Some(cached) = doc_cache.get_mut(document_id)
+                    && let Err(e) = cached.doc.move_block(block_id, after_id.as_ref())
+                {
+                    warn!("Cache: failed to move block for {}: {}", document_id, e);
+                }
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    let Some(ref mut doc) = sync_state.doc else { continue; };
+                    if document_id != doc.document_id() { continue; }
+                    if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
+                        warn!("Failed to move block: {}", e);
+                    }
                 }
             }
-            // Ignore other connection events - they're handled elsewhere
-            _ => {}
+            // Resource events are not block-related — ignore here
+            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => {}
         }
     }
 
     // Terminal-like auto-scroll: if we were at the bottom before processing
     // events and content changed, enable follow mode to smoothly track new content.
-    // If user had scrolled up, we don't interrupt them.
-    // IMPORTANT: Don't re-enable following if user explicitly scrolled this frame.
-    // Use LayoutGeneration to detect content changes (bumped by sync_block_cell_buffers).
     if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;
+    }
+}
+
+/// Handle context switch requests.
+///
+/// When `ContextSwitchRequested` is received (from constellation gt/gT/Ctrl-^/click):
+/// 1. Save current scroll state to active CachedDocument
+/// 2. Look up target document_id from context_name
+/// 3. **Cache hit**: swap active_id, mirror cached doc to DocumentSyncState, restore scroll
+/// 4. **Cache miss**: log warning (future: trigger join_context RPC)
+pub fn handle_context_switch(
+    mut switch_events: MessageReader<super::components::ContextSwitchRequested>,
+    mut doc_cache: ResMut<super::components::DocumentCache>,
+    mut sync_state: ResMut<super::components::DocumentSyncState>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+    mut current_conv: ResMut<CurrentConversation>,
+    mut pending_switch: ResMut<super::components::PendingContextSwitch>,
+    bootstrap: Res<crate::connection::BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
+) {
+    for event in switch_events.read() {
+        let context_name = &event.context_name;
+
+        // Look up document_id for this context
+        let target_doc_id = match doc_cache.document_id_for_context(context_name) {
+            Some(id) => id.to_string(),
+            None => {
+                // Cache miss — spawn a new actor to join the context, then auto-switch
+                info!(
+                    "Context switch: cache miss for '{}', spawning actor to join",
+                    context_name
+                );
+                pending_switch.0 = Some(context_name.clone());
+
+                let kernel_id = conn_state
+                    .current_kernel
+                    .as_ref()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+
+                let instance = uuid::Uuid::new_v4().to_string();
+                let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
+                    config: conn_state.ssh_config.clone(),
+                    kernel_id,
+                    context_name: context_name.clone(),
+                    instance,
+                });
+                continue;
+            }
+        };
+
+        // Skip if already active
+        if doc_cache.active_id() == Some(target_doc_id.as_str()) {
+            continue;
+        }
+
+        // Save current scroll offset to outgoing cache entry
+        if let Some(active_id) = doc_cache.active_id().map(|s| s.to_string())
+            && let Some(cached) = doc_cache.get_mut(&active_id)
+        {
+            cached.scroll_offset = scroll_state.offset;
+        }
+
+        // Switch active document
+        doc_cache.set_active(&target_doc_id);
+
+        // Mirror cached document to DocumentSyncState
+        if let Some(cached) = doc_cache.get(&target_doc_id) {
+            let agent_id = format!("user:{}", whoami::username());
+
+            // Rebuild DocumentSyncState from cached document's oplog
+            let oplog_bytes = cached.doc.oplog_bytes();
+            sync_state.reset();
+            match sync_state.apply_initial_state(&target_doc_id, &agent_id, &oplog_bytes) {
+                Ok(_) => {
+                    info!("Context switch: mirrored '{}' ({}) to DocumentSyncState", context_name, target_doc_id);
+                }
+                Err(e) => {
+                    error!("Context switch: failed to mirror '{}' to DocumentSyncState: {}", context_name, e);
+                }
+            }
+
+            // Update CurrentConversation
+            current_conv.0 = Some(target_doc_id.clone());
+
+            // Restore scroll offset
+            scroll_state.offset = cached.scroll_offset;
+            scroll_state.target_offset = cached.scroll_offset;
+            scroll_state.following = false; // Don't auto-scroll on switch
+
+            info!(
+                "Context switch complete: '{}' → document '{}' (scroll: {:.0})",
+                context_name, target_doc_id, cached.scroll_offset
+            );
+        }
+    }
+}
+
+/// Check if the active document is stale (missed events while inactive).
+///
+/// Compares the active document's `synced_at_generation` against the current
+/// `SyncGeneration`. If stale, triggers a `get_document_state()` re-fetch
+/// via IoTaskPool to resync the document.
+pub fn check_cache_staleness(
+    doc_cache: Res<super::components::DocumentCache>,
+    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    mut checked_gen: Local<u64>,
+) {
+    // Only check when SyncGeneration actually changed
+    if sync_gen.0 == *checked_gen {
+        return;
+    }
+    *checked_gen = sync_gen.0;
+
+    let Some(active_id) = doc_cache.active_id().map(|s| s.to_string()) else {
+        return;
+    };
+
+    let Some(cached) = doc_cache.get(&active_id) else {
+        return;
+    };
+
+    // If the active document hasn't synced since the last generation bump, it's stale
+    if cached.synced_at_generation < sync_gen.0 {
+        let Some(ref actor) = actor else {
+            return;
+        };
+
+        info!(
+            "Staleness detected: active doc '{}' synced_at={} < current={}",
+            active_id, cached.synced_at_generation, sync_gen.0
+        );
+
+        let handle = actor.handle.clone();
+        let doc_id = active_id.clone();
+
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                match handle.get_document_state(&doc_id).await {
+                    Ok(state) => {
+                        info!(
+                            "Staleness re-fetch complete for {}: {} bytes oplog",
+                            doc_id,
+                            state.ops.len()
+                        );
+                        // The re-fetched state will arrive as a ContextJoined-like event
+                        // through the normal sync path. The actor's subscription system
+                        // handles the replay.
+                    }
+                    Err(e) => {
+                        warn!("Staleness re-fetch failed for {}: {}", doc_id, e);
+                    }
+                }
+            })
+            .detach();
+
+        // Mark as checked to avoid re-triggering until next generation bump
+        // The actual resync will update synced_at_generation when events arrive
     }
 }
 
@@ -1722,10 +2129,59 @@ pub fn handle_block_events(
 
 use super::components::{BlockCell, BlockCellContainer, BlockCellLayout};
 
+/// Display a JSON value with real newlines in string values.
+///
+/// `serde_json::to_string_pretty` re-escapes newlines in string values as `\n`,
+/// which renders as literal backslash-n in the UI. This walks the JSON tree and
+/// outputs string content directly so embedded newlines display correctly.
+fn display_json_value(value: &serde_json::Value, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            // Output string content directly — preserves real \n as newlines
+            // Indent continuation lines to align with the opening quote
+            let continuation_pad = "  ".repeat(indent + 1);
+            let indented = s.replace('\n', &format!("\n{continuation_pad}"));
+            format!("\"{indented}\"")
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                return "[]".to_string();
+            }
+            let inner_pad = "  ".repeat(indent + 1);
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| format!("{inner_pad}{}", display_json_value(v, indent + 1)))
+                .collect();
+            format!("[\n{}\n{pad}]", items.join(",\n"))
+        }
+        serde_json::Value::Object(obj) => {
+            if obj.is_empty() {
+                return "{}".to_string();
+            }
+            let inner_pad = "  ".repeat(indent + 1);
+            let entries: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{inner_pad}\"{k}\": {}",
+                        display_json_value(v, indent + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{pad}}}", entries.join(",\n"))
+        }
+    }
+}
+
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
-pub fn format_single_block(block: &BlockSnapshot) -> String {
+/// `local_ctx`: optional local context ID for drift push direction.
+pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
@@ -1742,11 +2198,7 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
             let mut output = format!("🔧 Tool: {}\n", name);
             if let Some(ref input) = block.tool_input {
-                if let Ok(pretty) = serde_json::to_string_pretty(input) {
-                    output.push_str(&pretty);
-                } else {
-                    output.push_str(&input.to_string());
-                }
+                output.push_str(&display_json_value(input, 0));
             }
             output
         }
@@ -1765,11 +2217,7 @@ pub fn format_single_block(block: &BlockSnapshot) -> String {
             let formatted = format_for_display(&block.content, block.display_hint.as_deref());
             formatted.text
         }
-        BlockKind::Drift => {
-            let ctx = block.source_context.as_deref().unwrap_or("?");
-            let model = block.source_model.as_deref().unwrap_or("unknown");
-            format!("🌊 Drift from {} ({})\n{}", ctx, model, block.content)
-        }
+        BlockKind::Drift => format_drift_block(block, local_ctx),
     }
 }
 
@@ -1935,6 +2383,7 @@ pub fn init_role_header_buffers(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Set header text based on role
         let text = match header.role {
@@ -1986,6 +2435,7 @@ pub fn sync_block_cell_buffers(
     mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
+    drift_state: Res<crate::ui::drift::DriftState>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -2054,12 +2504,33 @@ pub fn sync_block_cell_buffers(
         // Format and update the buffer
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
-        let text = format_single_block(block);
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut font_system, &text, attrs, cosmic_text::Shaping::Advanced);
+        let local_ctx = drift_state.local_context_id.as_deref();
+        let text = format_single_block(block, local_ctx);
 
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
+
+        // Use rich text (markdown) for Text blocks, plain text for everything else
+        let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
+        if block.kind == BlockKind::Text {
+            // Build markdown colors from theme, with base block color as default
+            let md_colors = MarkdownColors {
+                heading: bevy_to_cosmic_color(theme.md_heading_color),
+                code: bevy_to_cosmic_color(theme.md_code_fg),
+                strong: theme.md_strong_color.map(bevy_to_cosmic_color),
+                code_block: bevy_to_cosmic_color(theme.md_code_block_fg),
+            };
+            let rich_spans = markdown::parse_to_rich_spans(&text);
+            let cosmic_spans = markdown::to_cosmic_spans(&rich_spans, &base_attrs, &md_colors);
+            buffer.set_rich_text(
+                &mut font_system,
+                cosmic_spans.into_iter(),
+                &base_attrs,
+                cosmic_text::Shaping::Advanced,
+            );
+        } else {
+            buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
+        }
 
         // Apply timeline visibility opacity (dimmed when viewing historical states)
         let color = if let Some(vis) = timeline_vis {
@@ -2249,8 +2720,7 @@ pub fn apply_block_cell_positions(
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
-    windows: Query<&Window>,
+    dag_view: Query<(&ComputedNode, &UiGlobalTransform), With<super::components::ConversationContainer>>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
@@ -2278,19 +2748,20 @@ pub fn apply_block_cell_positions(
     *prev_scroll = scroll_state.offset;
     // === End performance optimization ===
 
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    // Visible area for conversation content
-    // Reserve space for: header (workspace_margin_top), compose block, and status bar
-    let visible_top = layout.workspace_margin_top;
-    let visible_bottom = window_height - STATUS_BAR_HEIGHT - COMPOSE_BLOCK_MIN_HEIGHT;
-    let visible_height = (visible_bottom - visible_top).max(100.0); // Ensure positive
+    // Derive visible bounds from the DagView's actual computed layout.
+    // This respects the flex layout (North dock, ComposeBlock, South dock)
+    // instead of relying on hardcoded constants that drift out of sync.
+    let Ok((node, transform)) = dag_view.single() else {
+        warn!("apply_block_cell_positions: DagView (ConversationContainer) not found");
+        return;
+    };
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = node.content_box();
+    let visible_top = translation.y + content.min.y;
+    let visible_bottom = translation.y + content.max.y;
+    let base_width = content.width();
+    let visible_height = (visible_bottom - visible_top).max(100.0);
     let margin = layout.workspace_margin_left;
-    let base_width = window_width - (margin * 2.0);
 
     // Update scroll state with visible area
     // Note: smooth_scroll handles clamping, so we don't call clamp_target() here
@@ -2681,7 +3152,7 @@ pub fn update_block_edit_cursor(
     };
 
     // Position cursor relative to block cell's text area
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);
@@ -2709,6 +3180,7 @@ pub fn init_compose_block_buffer(
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
+        buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         // Initialize with placeholder text
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -2741,6 +3213,13 @@ pub fn handle_compose_block_input(
 
     // Only handle in INSERT mode (Chat or Shell)
     if !mode.0.accepts_input() {
+        return;
+    }
+
+    // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
+    // This prevents the mode-switch key from being inserted as text
+    // (Same guard as handle_cell_input)
+    if mode.is_changed() {
         return;
     }
 
@@ -3401,7 +3880,7 @@ pub fn update_bubble_cursor(
         .map(|pos| offset - pos - 1)
         .unwrap_or(offset);
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO;
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = config.left + (col as f32 * char_width);
     let y = config.top + (row as f32 * line_height);
