@@ -59,8 +59,7 @@ shellexpand = "3"
 
 # Bevy Remote Protocol (debugging)
 bevy_remote = "0.18"
-# Fork with send_keys text field fix
-bevy_brp_extras = { git = "https://github.com/tobert/bevy_brp", branch = "fix/send-keys-populate-text-field" }
+bevy_brp_extras = "0.18"
 
 # Text rendering
 cosmic-text = "0.16"
