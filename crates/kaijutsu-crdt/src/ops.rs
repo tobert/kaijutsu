@@ -4,15 +4,11 @@
 //! This module re-exports the relevant types for convenience.
 
 // Re-export key types from diamond_types_extended for sync operations
-pub use diamond_types_extended::{SerializedOps, SerializedOpsOwned, LV};
-
-/// Frontier type alias for clarity.
-/// A frontier represents a version vector - the set of latest operations seen.
-pub type Frontier = Vec<LV>;
+pub use diamond_types_extended::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
 #[cfg(test)]
 mod tests {
-    use diamond_types_extended::Document;
+    use diamond_types_extended::{Document, Frontier};
 
     #[test]
     fn test_ops_sync() {
@@ -29,7 +25,7 @@ mod tests {
         });
 
         // Sync to Bob - ops_since returns SerializedOps<'_> borrowed from doc_a
-        let ops = doc_a.ops_since(&[]).into();
+        let ops = doc_a.ops_since(&Frontier::root()).into();
         doc_b.merge_ops(ops).unwrap();
 
         // They should converge
@@ -44,7 +40,7 @@ mod tests {
         });
 
         // Sync back to Alice
-        let ops = doc_b.ops_since(&[]).into();
+        let ops = doc_b.ops_since(&Frontier::root()).into();
         doc_a.merge_ops(ops).unwrap();
 
         // Should still converge

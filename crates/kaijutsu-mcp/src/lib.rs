@@ -16,6 +16,8 @@
 //! - `tree`: DAG visualization as ASCII tree
 
 mod helpers;
+pub mod hook_listener;
+pub mod hook_types;
 mod models;
 mod tree;
 
@@ -48,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{BlockDocument, ConversationDAG};
+use kaijutsu_crdt::{ConversationDAG, Frontier};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -111,22 +113,21 @@ pub enum Backend {
 /// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
 /// types in a `spawn_local` task with auto-reconnect.
 ///
-/// Maintains a local `BlockDocument` kept in sync via a background event
-/// listener that applies `ServerEvent::BlockInserted` / `BlockTextOps`
-/// through `SyncManager`. The `store` is still populated for other tool
-/// reads (query, list, etc.).
+/// The `store` is the single source of truth for document state. A background
+/// event listener applies incoming `ServerEvent`s directly to the store's
+/// `BlockDocument` via `SyncManager`, keeping reads consistent across all
+/// MCP tools.
 #[derive(Clone)]
 pub struct RemoteState {
     /// The document ID from our seat
     pub document_id: String,
     /// Kernel ID we connected to
     pub kernel_id: String,
-    /// Local cache of synced state (with FlowBus for local event tracking)
+    /// Local cache of synced state (with FlowBus for local event tracking).
+    /// Single source of truth — background listener applies events here.
     pub store: SharedBlockStore,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
-    /// Local CRDT document kept in sync by the background event listener.
-    pub doc: Arc<Mutex<BlockDocument>>,
     /// Frontier-tracking sync state machine.
     pub sync: Arc<Mutex<SyncManager>>,
 }
@@ -236,9 +237,8 @@ impl KaijutsuMcp {
         // Sync document state from server
         let doc_state = kernel.get_document_state(&document_id).await?;
 
-        // Create the local BlockDocument from the server's oplog
-        let doc = if !doc_state.ops.is_empty() {
-            // Also populate the store (other MCP tools use it for reads)
+        // Populate the store — single source of truth for all MCP reads
+        let frontier = if !doc_state.ops.is_empty() {
             store.create_document_from_oplog(
                 doc_state.document_id.clone(),
                 DocumentKind::Conversation,
@@ -246,35 +246,35 @@ impl KaijutsuMcp {
                 &doc_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
 
-            BlockDocument::from_oplog(
-                doc_state.document_id.clone(),
-                "mcp-agent",
-                &doc_state.ops,
-            ).map_err(|e| anyhow::anyhow!("from_oplog: {e}"))?
+            // Extract frontier from the store's document
+            store.get(&doc_state.document_id)
+                .map(|entry| entry.doc.frontier())
+                .unwrap_or_default()
         } else {
-            // Empty document - create fresh in both store and local doc
             store.create_document(
                 doc_state.document_id.clone(),
                 DocumentKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
 
-            BlockDocument::new(&doc_state.document_id, "mcp-agent")
+            Frontier::root()
         };
 
-        let frontier = doc.frontier();
         let sync = SyncManager::with_state(
             Some(doc_state.document_id.clone()),
             Some(frontier),
         );
 
+        let block_count = store.get(&doc_state.document_id)
+            .map(|e| e.doc.block_count())
+            .unwrap_or(0);
+
         tracing::debug!(
             doc = %doc_state.document_id,
-            blocks = doc.block_count(),
+            blocks = block_count,
             "Initial sync complete, SyncManager initialized"
         );
 
-        let doc_arc = Arc::new(Mutex::new(doc));
         let sync_arc = Arc::new(Mutex::new(sync));
 
         // Spawn actor with the existing connection (no double-connect)
@@ -288,10 +288,10 @@ impl KaijutsuMcp {
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 
-        // Spawn background event listener to keep local doc in sync
+        // Spawn background event listener to keep store in sync
         {
             let mut event_rx = actor.subscribe_events();
-            let doc_bg = Arc::clone(&doc_arc);
+            let store_bg = Arc::clone(&store);
             let sync_bg = Arc::clone(&sync_arc);
             let doc_id_bg = document_id.clone();
 
@@ -299,13 +299,11 @@ impl KaijutsuMcp {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            apply_server_event(&doc_bg, &sync_bg, &doc_id_bg, event);
+                            apply_server_event(&store_bg, &sync_bg, &doc_id_bg, event);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Missed {n} events, forcing full resync");
-                            if let Ok(mut s) = sync_bg.lock() {
-                                s.reset();
-                            }
+                            sync_bg.lock().expect("sync mutex poisoned").reset();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -319,13 +317,17 @@ impl KaijutsuMcp {
                 kernel_id: kernel_id.to_string(),
                 store,
                 actor,
-                doc: doc_arc,
                 sync: sync_arc,
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
         })
+    }
+
+    /// Get the backend variant (for hook listener setup, etc.).
+    pub fn backend(&self) -> &Backend {
+        &self.backend
     }
 
     /// Get the underlying store for tool operations.
@@ -355,7 +357,7 @@ impl KaijutsuMcp {
         let frontier = {
             let sync = remote.sync.lock()
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            sync.frontier().map(|f| f.to_vec()).unwrap_or_default()
+            sync.frontier().cloned().unwrap_or_default()
         };
 
         let ops = remote.store.ops_since(&remote.document_id, &frontier)
@@ -1310,9 +1312,9 @@ impl KaijutsuMcp {
                 Ok(Ok(ServerEvent::BlockStatusChanged { block_id, status, .. })) => {
                     // Check if this status change is for a child of our command block
                     if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) {
-                        // Read the output from our local doc (kept in sync by background listener)
-                        if let Ok(doc) = remote.doc.lock() {
-                            if let Some(output) = doc.blocks_ordered().iter().find(|b| {
+                        // Read from store (single source of truth, kept in sync by background listener)
+                        if let Some(entry) = remote.store.get(doc_id) {
+                            if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
                                 b.parent_id.as_ref() == Some(&cmd_block_id)
                                     && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
                                     && b.id == block_id
@@ -1337,9 +1339,9 @@ impl KaijutsuMcp {
                     return "Error: event stream closed".to_string();
                 }
                 _ => {
-                    // Timeout or other event — fallback: check local doc state
-                    if let Ok(doc) = remote.doc.lock() {
-                        if let Some(output) = doc.blocks_ordered().iter().find(|b| {
+                    // Timeout or other event — fallback: check store state
+                    if let Some(entry) = remote.store.get(doc_id) {
+                        if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
                             b.parent_id.as_ref() == Some(&cmd_block_id)
                                 && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
                         }) {
@@ -1758,13 +1760,13 @@ impl KaijutsuMcp {
 // Background Event Listener
 // ============================================================================
 
-/// Apply a server event to the local BlockDocument via SyncManager.
+/// Apply a server event to the store's BlockDocument via SyncManager.
 ///
 /// Called by the background event listener spawned in `connect()`.
 /// Only handles CRDT-relevant events (BlockInserted, BlockTextOps, BlockStatusChanged).
-/// Lock scopes are kept short — never held across async boundaries.
+/// Uses the store as the single source of truth — all MCP tools read from the store.
 fn apply_server_event(
-    doc: &Arc<Mutex<BlockDocument>>,
+    store: &SharedBlockStore,
     sync: &Arc<Mutex<SyncManager>>,
     document_id: &str,
     event: ServerEvent,
@@ -1774,36 +1776,39 @@ fn apply_server_event(
             if event_doc_id != document_id {
                 return;
             }
-            let (mut d, mut s) = match (doc.lock(), sync.lock()) {
-                (Ok(d), Ok(s)) => (d, s),
-                _ => return,
-            };
-            match s.apply_block_inserted(&mut d, &event_doc_id, &block, &ops) {
-                Ok(_) => tracing::trace!(block = ?block.id, "Applied BlockInserted"),
-                Err(e) => tracing::warn!(block = ?block.id, "BlockInserted sync error: {e}"),
+            let mut s = sync.lock().expect("sync mutex poisoned");
+            if let Some(mut entry) = store.get_mut(document_id) {
+                match s.apply_block_inserted(&mut entry.doc, &event_doc_id, &block, &ops) {
+                    Ok(_) => {
+                        entry.touch("mcp-sync");
+                        tracing::trace!(block = ?block.id, "Applied BlockInserted");
+                    }
+                    Err(e) => tracing::warn!(block = ?block.id, "BlockInserted sync error: {e}"),
+                }
             }
         }
         ServerEvent::BlockTextOps { document_id: event_doc_id, ops, .. } => {
             if event_doc_id != document_id {
                 return;
             }
-            let (mut d, mut s) = match (doc.lock(), sync.lock()) {
-                (Ok(d), Ok(s)) => (d, s),
-                _ => return,
-            };
-            match s.apply_text_ops(&mut d, &event_doc_id, &ops) {
-                Ok(_) => tracing::trace!("Applied BlockTextOps"),
-                Err(e) => tracing::warn!("BlockTextOps sync error: {e}"),
+            let mut s = sync.lock().expect("sync mutex poisoned");
+            if let Some(mut entry) = store.get_mut(document_id) {
+                match s.apply_text_ops(&mut entry.doc, &event_doc_id, &ops) {
+                    Ok(_) => {
+                        entry.touch("mcp-sync");
+                        tracing::trace!("Applied BlockTextOps");
+                    }
+                    Err(e) => tracing::warn!("BlockTextOps sync error: {e}"),
+                }
             }
         }
         ServerEvent::BlockStatusChanged { document_id: event_doc_id, block_id, status } => {
             if event_doc_id != document_id {
                 return;
             }
-            // Status changes don't affect CRDT oplog, but we update the local doc
-            // so the shell tool can read final status without a server round-trip.
-            if let Ok(mut d) = doc.lock() {
-                let _ = d.set_status(&block_id, status);
+            // Use store's set_status — handles version bump and flow events
+            if let Err(e) = store.set_status(document_id, &block_id, status) {
+                tracing::warn!("BlockStatusChanged error: {e}");
             }
         }
         // Other event variants don't affect CRDT state
@@ -2621,5 +2626,392 @@ mod tests {
         }));
 
         assert!(result.contains("(no changes)"));
+    }
+
+    // =========================================================================
+    // apply_server_event tests — exercises the store-based sync path
+    // =========================================================================
+
+    use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, Role, Status};
+
+    /// Helper: create a store with an initial document populated from a server doc's oplog.
+    /// Returns (store, sync, server_doc) for further manipulation.
+    fn setup_synced_store(doc_id: &str) -> (SharedBlockStore, Arc<Mutex<SyncManager>>, BlockDocument) {
+        let mut server = BlockDocument::new(doc_id, "server");
+        server.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server", "server")
+            .expect("insert block");
+
+        let oplog = server.oplog_bytes();
+
+        let store = shared_block_store("test-mcp");
+        store.create_document_from_oplog(
+            doc_id.to_string(),
+            DocumentKind::Conversation,
+            None,
+            &oplog,
+        ).expect("create from oplog");
+
+        let frontier = store.get(doc_id)
+            .map(|e| e.doc.frontier())
+            .unwrap_or_default();
+
+        let sync = Arc::new(Mutex::new(
+            SyncManager::with_state(Some(doc_id.to_string()), Some(frontier)),
+        ));
+
+        (store, sync, server)
+    }
+
+    #[test]
+    fn test_apply_block_inserted_updates_store() {
+        let doc_id = "sync-test-1";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        // Server inserts a new block
+        let pre_frontier = server.frontier();
+        let block_id = server.insert_block(
+            None, None, Role::Model, BlockKind::Text, "New block from server", "server",
+        ).expect("insert");
+        let block = server.get_block_snapshot(&block_id).expect("snapshot");
+        let ops = server.ops_since(&pre_frontier);
+        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+
+        // Before applying: store should have 1 block
+        assert_eq!(
+            store.get(doc_id).unwrap().doc.block_count(), 1,
+            "Store should have 1 block before event"
+        );
+
+        // Apply the event through our function
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockInserted {
+                document_id: doc_id.to_string(),
+                block: Box::new(block),
+                ops: ops_bytes,
+            },
+        );
+
+        // After: store should have 2 blocks
+        let entry = store.get(doc_id).expect("doc exists");
+        assert_eq!(entry.doc.block_count(), 2, "Store should have 2 blocks after BlockInserted");
+        assert!(
+            entry.doc.full_text().contains("New block from server"),
+            "Store should contain the new block's content"
+        );
+    }
+
+    #[test]
+    fn test_apply_text_ops_updates_store() {
+        let doc_id = "sync-test-2";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        // Get the block ID of the existing block on the server
+        let block_id = server.blocks_ordered()[0].id.clone();
+
+        // Server edits the block's text
+        let pre_frontier = server.frontier();
+        server.edit_text(&block_id, 17, " — updated!", 0).expect("edit");
+        let ops = server.ops_since(&pre_frontier);
+        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+
+        // Before: store has original text
+        assert!(
+            store.get(doc_id).unwrap().doc.full_text().contains("Hello from server"),
+            "Store should have original text"
+        );
+
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockTextOps {
+                document_id: doc_id.to_string(),
+                block_id: block_id.clone(),
+                ops: ops_bytes,
+            },
+        );
+
+        // After: store should have updated text
+        let entry = store.get(doc_id).expect("doc exists");
+        assert!(
+            entry.doc.full_text().contains("— updated!"),
+            "Store should contain the edited text, got: {}",
+            entry.doc.full_text()
+        );
+    }
+
+    #[test]
+    fn test_apply_status_changed_updates_store() {
+        let doc_id = "sync-test-3";
+        let (store, sync, server) = setup_synced_store(doc_id);
+
+        let block_id = server.blocks_ordered()[0].id.clone();
+
+        // The block starts as Done (from BlockSnapshot::text constructor)
+        assert_eq!(
+            store.get(doc_id).unwrap().doc.get_block_snapshot(&block_id).unwrap().status,
+            Status::Done,
+        );
+
+        // Apply status change to Error
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockStatusChanged {
+                document_id: doc_id.to_string(),
+                block_id: block_id.clone(),
+                status: Status::Error,
+            },
+        );
+
+        // Store should reflect the new status
+        let entry = store.get(doc_id).expect("doc exists");
+        let snap = entry.doc.get_block_snapshot(&block_id).expect("block exists");
+        assert_eq!(snap.status, Status::Error, "Status should be Error after event");
+    }
+
+    #[test]
+    fn test_apply_event_wrong_document_ignored() {
+        let doc_id = "sync-test-4";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        // Server inserts a new block
+        let pre_frontier = server.frontier();
+        let block_id = server.insert_block(
+            None, None, Role::Model, BlockKind::Text, "Should not appear", "server",
+        ).expect("insert");
+        let block = server.get_block_snapshot(&block_id).expect("snapshot");
+        let ops = server.ops_since(&pre_frontier);
+        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+
+        // Apply with WRONG document_id — should be silently ignored
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockInserted {
+                document_id: "wrong-doc-id".to_string(),
+                block: Box::new(block),
+                ops: ops_bytes,
+            },
+        );
+
+        // Store should still have only 1 block
+        assert_eq!(
+            store.get(doc_id).unwrap().doc.block_count(), 1,
+            "Store should not be affected by events for other documents"
+        );
+    }
+
+    #[test]
+    fn test_apply_event_bumps_store_version() {
+        let doc_id = "sync-test-5";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        let version_before = store.get(doc_id).unwrap().version();
+
+        // Apply a block insert
+        let pre_frontier = server.frontier();
+        let block_id = server.insert_block(
+            None, None, Role::User, BlockKind::Text, "Version bump test", "server",
+        ).expect("insert");
+        let block = server.get_block_snapshot(&block_id).expect("snapshot");
+        let ops = server.ops_since(&pre_frontier);
+        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockInserted {
+                document_id: doc_id.to_string(),
+                block: Box::new(block),
+                ops: ops_bytes,
+            },
+        );
+
+        let version_after = store.get(doc_id).unwrap().version();
+        assert!(
+            version_after > version_before,
+            "Store version should increase after event: before={version_before}, after={version_after}"
+        );
+    }
+
+    #[test]
+    fn test_store_reads_consistent_after_multiple_events() {
+        let doc_id = "sync-test-6";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        // Simulate a burst of events: 3 block inserts + a text edit + a status change
+        for i in 0..3 {
+            let pre = server.frontier();
+            let bid = server.insert_block(
+                None, None, Role::Model, BlockKind::Text,
+                &format!("Block {i}"), "server",
+            ).expect("insert");
+            let block = server.get_block_snapshot(&bid).expect("snap");
+            let ops = serde_json::to_vec(&server.ops_since(&pre)).expect("ser");
+
+            apply_server_event(&store, &sync, doc_id, ServerEvent::BlockInserted {
+                document_id: doc_id.to_string(),
+                block: Box::new(block),
+                ops,
+            });
+        }
+
+        // Now edit the last-inserted block's text ("Block 2" → "Block 2 — edited")
+        let blocks = server.blocks_ordered();
+        let last_block_id = blocks.last().unwrap().id.clone();
+        let last_content_len = blocks.last().unwrap().content.len();
+        let pre = server.frontier();
+        server.edit_text(&last_block_id, last_content_len, " — edited", 0).expect("edit");
+        let ops = serde_json::to_vec(&server.ops_since(&pre)).expect("ser");
+
+        apply_server_event(&store, &sync, doc_id, ServerEvent::BlockTextOps {
+            document_id: doc_id.to_string(),
+            block_id: last_block_id.clone(),
+            ops,
+        });
+
+        // Status change on the first inserted block
+        let first_new_block = blocks[1].id.clone(); // blocks[0] is the original
+        apply_server_event(&store, &sync, doc_id, ServerEvent::BlockStatusChanged {
+            document_id: doc_id.to_string(),
+            block_id: first_new_block.clone(),
+            status: Status::Running,
+        });
+
+        // Verify everything is visible through store.get() — the path MCP tools use
+        let entry = store.get(doc_id).expect("doc exists");
+        let text = entry.doc.full_text();
+        let block_count = entry.doc.block_count();
+
+        assert_eq!(block_count, 4, "1 original + 3 inserted");
+        assert!(text.contains("Hello from server"), "Original content preserved, got: {text}");
+        assert!(text.contains("Block 0"), "First inserted block, got: {text}");
+        assert!(text.contains("Block 1"), "Second inserted block, got: {text}");
+        assert!(text.contains("— edited"), "Text edit applied, got: {text}");
+
+        let first_snap = entry.doc.get_block_snapshot(&first_new_block).expect("block exists");
+        assert_eq!(first_snap.status, Status::Running, "Status change applied");
+    }
+
+    #[test]
+    fn test_corrupted_ops_dont_corrupt_store() {
+        let doc_id = "sync-test-corrupt";
+        let (store, sync, server) = setup_synced_store(doc_id);
+
+        let original_block_count = store.get(doc_id).unwrap().doc.block_count();
+        let original_version = store.get(doc_id).unwrap().version();
+        let block_id = server.blocks_ordered()[0].id.clone();
+
+        // Apply BlockInserted with garbage ops
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockInserted {
+                document_id: doc_id.to_string(),
+                // This block already exists (idempotent skip), but let's also test garbage ops
+                // with a "new" block that doesn't exist yet
+                block: Box::new(BlockSnapshot::text(
+                    BlockId { document_id: doc_id.to_string(), agent_id: "evil".to_string(), seq: 99 },
+                    None, Role::User, "corrupted block", "evil",
+                )),
+                ops: vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF],
+            },
+        );
+
+        // Store should be unchanged — no corruption
+        {
+            let entry = store.get(doc_id).unwrap();
+            assert_eq!(entry.doc.block_count(), original_block_count, "Block count unchanged after corrupt ops");
+            assert_eq!(entry.version(), original_version, "Version unchanged — touch() not called on error");
+        } // Drop DashMap Ref before next event needs get_mut()
+
+        // Apply BlockTextOps with garbage ops
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockTextOps {
+                document_id: doc_id.to_string(),
+                block_id: block_id.clone(),
+                ops: vec![0xBA, 0xAD, 0xF0, 0x0D],
+            },
+        );
+
+        // Store content should be unchanged
+        let entry = store.get(doc_id).unwrap();
+        assert!(
+            entry.doc.full_text().contains("Hello from server"),
+            "Original content preserved after corrupt text ops"
+        );
+    }
+
+    #[test]
+    fn test_status_change_for_nonexistent_block() {
+        let doc_id = "sync-test-ghost";
+        let (store, sync, _server) = setup_synced_store(doc_id);
+
+        // Send status change for a block that doesn't exist
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockStatusChanged {
+                document_id: doc_id.to_string(),
+                block_id: BlockId {
+                    document_id: doc_id.to_string(),
+                    agent_id: "ghost".to_string(),
+                    seq: 999,
+                },
+                status: Status::Done,
+            },
+        );
+
+        // Store should not crash, version might or might not change depending on
+        // whether set_status errors before or after touch. The important thing
+        // is no panic and no corruption.
+        let entry = store.get(doc_id).unwrap();
+        assert_eq!(entry.doc.block_count(), 1, "Block count unchanged");
+        assert!(entry.doc.full_text().contains("Hello from server"), "Content unchanged");
+    }
+
+    #[test]
+    fn test_reset_then_incremental_event_preserves_blocks() {
+        let doc_id = "sync-test-reset";
+        let (store, sync, mut server) = setup_synced_store(doc_id);
+
+        // Verify initial state
+        assert_eq!(store.get(doc_id).unwrap().doc.block_count(), 1);
+
+        // Simulate Lagged — reset SyncManager (sets needs_full_sync = true)
+        sync.lock().unwrap().reset();
+
+        // Server adds a new block. Ops are incremental (not full oplog) —
+        // this is what would arrive after missing some events.
+        let pre_frontier = server.frontier();
+        let block_id = server.insert_block(
+            None, None, Role::Model, BlockKind::Text, "Post-reset block", "server",
+        ).expect("insert");
+        let block = server.get_block_snapshot(&block_id).expect("snapshot");
+        let ops = server.ops_since(&pre_frontier);
+        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+
+        apply_server_event(
+            &store, &sync, doc_id,
+            ServerEvent::BlockInserted {
+                document_id: doc_id.to_string(),
+                block: Box::new(block),
+                ops: ops_bytes,
+            },
+        );
+
+        // Critical check: do we still have BOTH blocks?
+        // SyncManager should try incremental merge first (doc is not empty).
+        // If incremental succeeds, both blocks are preserved.
+        // If it falls through to do_full_sync with incremental ops, we lose block 1.
+        let entry = store.get(doc_id).unwrap();
+        assert_eq!(
+            entry.doc.block_count(), 2,
+            "Both original and new block should be preserved after reset + incremental event"
+        );
+        assert!(
+            entry.doc.full_text().contains("Hello from server"),
+            "Original block content preserved after reset recovery"
+        );
+        assert!(
+            entry.doc.full_text().contains("Post-reset block"),
+            "New block content present after reset recovery"
+        );
     }
 }

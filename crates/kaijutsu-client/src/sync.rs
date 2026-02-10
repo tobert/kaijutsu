@@ -10,7 +10,7 @@
 //! - `frontier = Some(_)` and matching document_id -> incremental merge (merge_ops_owned)
 //! - On merge failure -> reset frontier, next event triggers full sync
 
-use kaijutsu_crdt::{BlockDocument, BlockSnapshot, SerializedOpsOwned, LV};
+use kaijutsu_crdt::{BlockDocument, BlockSnapshot, Frontier, SerializedOpsOwned};
 use thiserror::Error;
 use tracing::{error, info, trace, warn};
 
@@ -79,7 +79,7 @@ pub enum SyncError {
 #[derive(Debug, Clone, Default)]
 pub struct SyncManager {
     /// Current frontier (None = never synced or needs full sync).
-    frontier: Option<Vec<LV>>,
+    frontier: Option<Frontier>,
     /// Document ID we're synced to. Change triggers full sync.
     document_id: Option<String>,
     /// Version counter for change detection (bumped on every successful sync).
@@ -98,7 +98,7 @@ impl SyncManager {
     }
 
     /// Create a SyncManager with existing state (for testing/migration).
-    pub fn with_state(document_id: Option<String>, frontier: Option<Vec<LV>>) -> Self {
+    pub fn with_state(document_id: Option<String>, frontier: Option<Frontier>) -> Self {
         Self { frontier, document_id, version: 0 }
     }
 
@@ -112,8 +112,8 @@ impl SyncManager {
     }
 
     /// Get the current frontier (for testing/debugging).
-    pub fn frontier(&self) -> Option<&[LV]> {
-        self.frontier.as_deref()
+    pub fn frontier(&self) -> Option<&Frontier> {
+        self.frontier.as_ref()
     }
 
     /// Get the current document_id (for testing/debugging).
@@ -910,7 +910,7 @@ mod tests {
         // Use with_state() rather than direct field access
         let mut sync = SyncManager::with_state(
             Some("doc-1".to_string()),
-            Some(vec![]), // Empty frontier = "synced" state
+            Some(Frontier::root()), // Empty frontier = "synced" state
         );
 
         // Try to insert block with empty ops - should fail protocol validation

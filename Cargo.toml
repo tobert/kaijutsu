@@ -68,7 +68,7 @@ pulldown-cmark = "0.12"
 
 # CRDT + Persistence
 # Using diamond-types-extended - unified CRDT library forked from diamond-types (local source for development)
-diamond-types-extended = { path = "../diamond-types-extended", features = ["serde"] }
+diamond-types-extended = { path = "../diamond-types-extended" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
