@@ -2473,7 +2473,7 @@ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "diamond-types-extended"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bumpalo",
  "crc",
@@ -3094,7 +3094,6 @@ dependencies = [
  "libc",
  "lz4_flex",
  "num_enum",
- "rle",
  "serde",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
@@ -5298,9 +5297,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.180"
+version = "0.2.181"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
+checksum = "459427e2af2b9c839b132acb702a1c654d95e10f8c326bfc2ad11310e458b1c5"
 
 [[package]]
 name = "libcrux-intrinsics"
@@ -5556,9 +5555,9 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.5"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
+checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
 dependencies = [
  "twox-hash",
 ]
@@ -7484,13 +7483,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rle"
-version = "0.2.0"
-dependencies = [
- "smallvec 2.0.0-alpha.12",
 ]
 
 [[package]]
