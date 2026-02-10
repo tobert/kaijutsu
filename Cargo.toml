@@ -26,9 +26,9 @@ kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
 
 # Kaish (execution engine + client)
-kaish-kernel = { git = "https://github.com/tobert/kaish", branch = "main" }
-kaish-client = { git = "https://github.com/tobert/kaish", branch = "main" }
-kaish-glob = { path = "../kaish/crates/kaish-glob" }
+kaish-kernel = "0.1"
+kaish-client = "0.1"
+kaish-glob = "0.1"
 
 # Cap'n Proto
 capnp = "0.25"
@@ -67,8 +67,7 @@ cosmic-text = "0.16"
 pulldown-cmark = "0.12"
 
 # CRDT + Persistence
-# Using diamond-types-extended - unified CRDT library forked from diamond-types (local source for development)
-diamond-types-extended = { path = "../diamond-types-extended" }
+diamond-types-extended = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
@@ -77,5 +76,5 @@ rhai = "1.21"
 # LLM providers - unified via rig-core
 rig-core = "0.30"
 
-# MCP (Model Context Protocol) - using local source
-rmcp = { path = "../rmcp/crates/rmcp", features = ["client", "transport-child-process"] }
+# MCP (Model Context Protocol)
+rmcp = { version = "0.14", features = ["client", "transport-child-process"] }

@@ -11,7 +11,7 @@ kaijutsu-kernel = { path = "../kaijutsu-kernel" }
 
 # kaish (for syntax validation)
 kaish-kernel.workspace = true
-logos = "0.15"  # For Token::lexer trait
+logos = "0.16"  # For Token::lexer trait
 
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin

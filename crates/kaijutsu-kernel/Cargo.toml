@@ -46,7 +46,7 @@ rig-core.workspace = true
 kaish-glob = { workspace = true }
 
 # Git operations (libgit2)
-git2 = "0.19"
+git2 = "0.20"
 
 # Async streams
 futures = "0.3"
@@ -60,4 +60,4 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
-git2 = "0.19"
+git2 = "0.20"
