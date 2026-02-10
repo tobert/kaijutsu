@@ -53,9 +53,6 @@ impl Plugin for ConstellationPlugin {
                 (
                     track_seat_events,
                     track_agent_activity,
-                    handle_zoom_input,
-                    interpolate_zoom,
-                    sync_zoom_to_mode,
                     handle_mode_toggle,
                     handle_focus_navigation,
                     handle_node_click,
@@ -121,27 +118,6 @@ impl Default for ConstellationZoom {
     }
 }
 
-impl ConstellationZoom {
-    /// Zoom out by a step (toward constellation view)
-    pub fn zoom_out(&mut self, step: f32) {
-        self.target = (self.target + step).min(1.0);
-    }
-
-    /// Zoom in by a step (toward focused view)
-    pub fn zoom_in(&mut self, step: f32) {
-        self.target = (self.target - step).max(0.0);
-    }
-
-    /// Check if we're in "zoomed out" territory (should show constellation)
-    pub fn is_zoomed_out(&self) -> bool {
-        self.level > 0.3
-    }
-
-    /// Check if we're fully zoomed in
-    pub fn is_fully_focused(&self) -> bool {
-        self.level < 0.1
-    }
-}
 
 /// Constellation of contexts - the spatial navigation model
 #[derive(Resource, Default)]
@@ -389,86 +365,6 @@ fn track_agent_activity(
                 }
             }
         }
-    }
-}
-
-/// Handle mouse wheel zoom to reveal/hide constellation.
-///
-/// Scroll up = zoom out (reveal constellation nodes)
-/// Scroll down = zoom in (focus on current context)
-fn handle_zoom_input(
-    mut mouse_wheel: MessageReader<bevy::input::mouse::MouseWheel>,
-    screen: Res<State<crate::ui::state::AppScreen>>,
-    current_mode: Res<crate::cell::CurrentMode>,
-    modal_open: Res<ModalDialogOpen>,
-    mut zoom: ResMut<ConstellationZoom>,
-) {
-    // Skip when a modal dialog is open
-    if modal_open.0 {
-        return;
-    }
-
-    // Only in Conversation state and Normal mode
-    if *screen.get() != crate::ui::state::AppScreen::Conversation {
-        return;
-    }
-    if current_mode.0 != crate::cell::EditorMode::Normal {
-        return;
-    }
-
-    // Zoom step per scroll unit
-    const ZOOM_STEP: f32 = 0.15;
-
-    for event in mouse_wheel.read() {
-        // Positive y = scroll up = zoom out (show constellation)
-        // Negative y = scroll down = zoom in (hide constellation)
-        if event.y > 0.0 {
-            zoom.zoom_out(ZOOM_STEP);
-        } else if event.y < 0.0 {
-            zoom.zoom_in(ZOOM_STEP);
-        }
-    }
-}
-
-/// Smoothly interpolate zoom level toward target.
-fn interpolate_zoom(
-    time: Res<Time>,
-    mut zoom: ResMut<ConstellationZoom>,
-) {
-    // Skip if already at target
-    if (zoom.level - zoom.target).abs() < 0.001 {
-        if zoom.level != zoom.target {
-            zoom.level = zoom.target;
-        }
-        return;
-    }
-
-    // Lerp toward target
-    let dt = time.delta_secs();
-    zoom.level = zoom.level + (zoom.target - zoom.level) * zoom.speed * dt;
-}
-
-/// Sync constellation mode based on zoom level.
-///
-/// When zoom crosses thresholds, switch between Focused and Map modes.
-fn sync_zoom_to_mode(
-    zoom: Res<ConstellationZoom>,
-    mut constellation: ResMut<Constellation>,
-) {
-    if !zoom.is_changed() {
-        return;
-    }
-
-    // Threshold for mode switching (with hysteresis to prevent flicker)
-    let should_show_constellation = zoom.is_zoomed_out();
-    let is_in_focused = matches!(constellation.mode, ConstellationMode::Focused);
-
-    if should_show_constellation && is_in_focused {
-        constellation.mode = ConstellationMode::Map;
-        info!("Zoom: switched to Map mode (level: {:.2})", zoom.level);
-    } else if !should_show_constellation && !is_in_focused && zoom.is_fully_focused() {
-        constellation.mode = ConstellationMode::Focused;
-        info!("Zoom: switched to Focused mode (level: {:.2})", zoom.level);
     }
 }
 
