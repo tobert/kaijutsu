@@ -146,8 +146,8 @@ mod tests {
         let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block", "alice").unwrap();
         let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block", "bob").unwrap();
 
-        doc1.merge_ops_owned(doc2.ops_since(&[])).unwrap();
-        doc2.merge_ops_owned(doc1.ops_since(&[])).unwrap();
+        doc1.merge_ops_owned(doc2.ops_since(&Frontier::root())).unwrap();
+        doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
 
         assert_eq!(doc1.block_count(), 2);
         assert_eq!(doc2.block_count(), 2);
@@ -166,7 +166,7 @@ mod tests {
         let mut doc2 = BlockDocument::new("test-doc", "bob");
 
         let block_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "hello", "alice").unwrap();
-        doc2.merge_ops_owned(doc1.ops_since(&[])).unwrap();
+        doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
 
         doc1.edit_text(&block_id, 5, " alice", 0).unwrap();
         doc2.edit_text(&block_id, 5, " bob", 0).unwrap();

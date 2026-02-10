@@ -350,7 +350,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let frontier = {
         let sync = remote.sync.lock()
             .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
-        sync.frontier().map(|f| f.to_vec()).unwrap_or_default()
+        sync.frontier().cloned().unwrap_or_default()
     };
 
     let ops = remote.store.ops_since(&remote.document_id, &frontier)

@@ -3096,6 +3096,7 @@ dependencies = [
  "num_enum",
  "rle",
  "serde",
+ "serde_json",
  "smallvec 2.0.0-alpha.12",
  "smartstring",
  "str_indices",
@@ -5067,7 +5068,7 @@ dependencies = [
  "futures",
  "git2",
  "kaijutsu-crdt",
- "kaish-glob 0.1.5",
+ "kaish-glob 0.1.6",
  "notify 7.0.0",
  "parking_lot",
  "regex",
@@ -5175,7 +5176,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",

@@ -17,8 +17,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use kaijutsu_crdt::{
-    BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Role, SerializedOps,
-    SerializedOpsOwned, Status, LV,
+    BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Frontier, Role,
+    SerializedOps, SerializedOpsOwned, Status,
 };
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
@@ -846,7 +846,7 @@ impl BlockStore {
     // =========================================================================
 
     /// Get operations since a frontier for a document.
-    pub fn ops_since(&self, document_id: &str, frontier: &[LV]) -> Result<SerializedOpsOwned, String> {
+    pub fn ops_since(&self, document_id: &str, frontier: &Frontier) -> Result<SerializedOpsOwned, String> {
         let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.doc.ops_since(frontier))
     }
@@ -873,7 +873,7 @@ impl BlockStore {
     }
 
     /// Get the current frontier for a document.
-    pub fn frontier(&self, document_id: &str) -> Result<Vec<LV>, String> {
+    pub fn frontier(&self, document_id: &str) -> Result<Frontier, String> {
         let entry = self.get(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
         Ok(entry.doc.frontier())
     }

@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::ConversationDAG;
+use kaijutsu_crdt::{ConversationDAG, Frontier};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -257,7 +257,7 @@ impl KaijutsuMcp {
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
 
-            Vec::new()
+            Frontier::root()
         };
 
         let sync = SyncManager::with_state(
@@ -357,7 +357,7 @@ impl KaijutsuMcp {
         let frontier = {
             let sync = remote.sync.lock()
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            sync.frontier().map(|f| f.to_vec()).unwrap_or_default()
+            sync.frontier().cloned().unwrap_or_default()
         };
 
         let ops = remote.store.ops_since(&remote.document_id, &frontier)

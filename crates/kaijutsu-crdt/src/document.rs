@@ -10,7 +10,7 @@
 //! - Multiple children (parallel tool calls, multiple response blocks)
 //! - Role and status for conversation flow tracking
 
-use diamond_types_extended::{Document, AgentId, SerializedOps, SerializedOpsOwned, LV};
+use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned};
 
 use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
 
@@ -929,8 +929,8 @@ impl BlockDocument {
     // =========================================================================
 
     /// Get operations since a frontier for replication.
-    pub fn ops_since(&self, frontier: &[LV]) -> SerializedOpsOwned {
-        self.doc.ops_since(frontier).into()
+    pub fn ops_since(&self, frontier: &Frontier) -> SerializedOpsOwned {
+        self.doc.ops_since_owned(frontier)
     }
 
     /// Merge remote operations.
@@ -975,8 +975,8 @@ impl BlockDocument {
     }
 
     /// Get the current frontier (version) for sync.
-    pub fn frontier(&self) -> Vec<LV> {
-        self.doc.version().as_ref().to_vec()
+    pub fn frontier(&self) -> Frontier {
+        self.doc.version().clone()
     }
 
     // =========================================================================
@@ -1124,7 +1124,7 @@ impl BlockDocument {
     /// This is essential for proper sync - clients cannot merge incremental ops
     /// without having the oplog root operations.
     pub fn oplog_bytes(&self) -> Vec<u8> {
-        let ops = self.ops_since(&[]); // Full oplog from empty frontier
+        let ops = self.ops_since(&Frontier::root()); // Full oplog from empty frontier
         serde_json::to_vec(&ops).unwrap_or_default()
     }
 
@@ -1587,7 +1587,7 @@ mod tests {
         ).unwrap();
 
         // Server gets ops from EMPTY frontier (full oplog, including "blocks" Set creation)
-        let full_ops = server.ops_since(&[]);
+        let full_ops = server.ops_since(&Frontier::root());
 
         // === Client side ===
         // Client needs an empty document (no independent "blocks" Set)
@@ -1619,7 +1619,7 @@ mod tests {
 
         // === Initial full sync ===
         let mut server = BlockDocument::new("doc-1", "server-agent");
-        let full_ops = server.ops_since(&[]);
+        let full_ops = server.ops_since(&Frontier::root());
 
         // Client creates empty doc and merges full state
         let mut client_doc = Document::new();
@@ -1714,7 +1714,7 @@ mod tests {
         ).unwrap();
 
         // Full sync to client
-        let full_ops = server.ops_since(&[]);
+        let full_ops = server.ops_since(&Frontier::root());
         let mut client_doc = Document::new();
         client_doc.merge_ops(full_ops).expect("initial sync");
 
