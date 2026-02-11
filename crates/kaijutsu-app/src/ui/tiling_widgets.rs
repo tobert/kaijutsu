@@ -2,8 +2,8 @@
 //!
 //! These systems reactively update widget pane text content based on
 //! application state changes (mode, connection, drift contexts).
-//! Migrated from `ui/widget/mod.rs` to work with the tiling reconciler's
-//! `WidgetPaneText` marker instead of the old `WidgetText` / `Widget` types.
+//! Uses the tiling reconciler's `WidgetPaneText` marker to find and
+//! update MSDF text content in dock widget panes.
 
 use bevy::prelude::*;
 

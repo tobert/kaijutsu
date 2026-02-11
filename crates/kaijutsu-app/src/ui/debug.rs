@@ -58,7 +58,12 @@ pub fn handle_quit(
     mode: Res<CurrentMode>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if mode.0 == EditorMode::Normal && keys.just_pressed(KeyCode::KeyQ) {
+    // Don't quit when tiling modifier (Alt/Super) is held — that's Alt+q close pane
+    let tiling_mod = keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight)
+        || keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight);
+    if mode.0 == EditorMode::Normal && keys.just_pressed(KeyCode::KeyQ) && !tiling_mod {
         info!("👋 Quitting...");
         exit.write(AppExit::Success);
     }

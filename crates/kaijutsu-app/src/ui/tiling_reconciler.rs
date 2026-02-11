@@ -2,25 +2,30 @@
 //!
 //! ## Architecture
 //!
-//! `setup_ui` spawns the structural skeleton:
+//! `setup_ui` spawns the structural skeleton. The reconciler populates it:
 //! ```text
 //! TilingRoot (column)
 //!   [NorthDock — spawned by reconciler]
 //!   ContentArea (column, flex-grow: 1)
 //!     DashboardRoot (100%, toggled by AppScreen state)
 //!     ConversationRoot (100%, toggled by AppScreen state)
-//!       [ConversationContainer — spawned by reconciler]
-//!       [ComposeBlock — spawned by reconciler]
+//!       [Content tree — recursively spawned by reconciler]
 //!   [SouthDock — spawned by reconciler]
 //! ```
 //!
-//! The reconciler spawns:
-//! - North dock + widget children (as first child of TilingRoot)
-//! - South dock + widget children (as last child of TilingRoot)
-//! - Conversation content (into ConversationRoot)
+//! The content tree maps the TilingTree's Split/Leaf structure to Bevy
+//! flex containers. For a single pane, this is just:
+//!   `ConvGroup(Column) → [ConversationContainer, ComposeBlock]`
 //!
-//! This keeps Dashboard ↔ Conversation state toggling working unchanged
-//! while giving us tiling infrastructure for future multi-pane layouts.
+//! After Super+v split, it becomes:
+//! ```text
+//!   SplitContainer(Row)
+//!     ConvGroup1(Column) → [ConversationContainer1, ComposeBlock1]
+//!     ConvGroup2(Column) → [ConversationContainer2, ComposeBlock2]
+//! ```
+//!
+//! Focus is tracked via `PaneFocus` marker + accent border on the
+//! focused conversation container.
 
 use bevy::prelude::*;
 
@@ -152,98 +157,165 @@ fn spawn_docks(
     }
 }
 
-/// Spawn conversation container + compose block into ConversationRoot.
+/// Spawn conversation content into ConversationRoot.
+///
+/// Walks the TilingTree's root children, skipping Dock nodes (handled separately),
+/// and recursively builds the flex container tree for Split/Leaf content panes.
 fn spawn_conversation_content(
     commands: &mut Commands,
     tree: &TilingTree,
-    _theme: &Theme,
+    theme: &Theme,
     conv_root: Entity,
 ) {
-    // Find conversation and compose panes in the tree
-    let mut conv_pane_ids: Vec<PaneId> = Vec::new();
-    let mut compose_pane_ids: Vec<PaneId> = Vec::new();
-    collect_content_panes(&tree.root, &mut conv_pane_ids, &mut compose_pane_ids);
-
-    // Spawn conversation containers
-    for pane_id in &conv_pane_ids {
-        let entity = commands
-            .spawn((
-                PaneMarker {
-                    pane_id: *pane_id,
-                    content: PaneContent::Conversation {
-                        document_id: String::new(),
-                    },
-                },
-                *pane_id,
-                ConversationContainer,
-                Node {
-                    flex_grow: 1.0,
-                    flex_direction: FlexDirection::Column,
-                    overflow: Overflow::clip(),
-                    padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-            ))
-            .id();
-        commands.entity(conv_root).add_child(entity);
-    }
-
-    // Spawn compose blocks
-    for pane_id in &compose_pane_ids {
-        let entity = commands
-            .spawn((
-                PaneMarker {
-                    pane_id: *pane_id,
-                    content: PaneContent::Compose {
-                        target_pane: conv_pane_ids.first().copied().unwrap_or(*pane_id),
-                        writing_direction: WritingDirection::Horizontal,
-                    },
-                },
-                *pane_id,
-                ComposeBlock::default(),
-                MsdfText,
-                MsdfTextAreaConfig::default(),
-                Node {
-                    width: Val::Percent(100.0),
-                    min_height: Val::Px(60.0),
-                    padding: UiRect::all(Val::Px(12.0)),
-                    margin: UiRect::new(
-                        Val::Px(20.0),
-                        Val::Px(20.0),
-                        Val::Px(8.0),
-                        Val::Px(16.0),
-                    ),
-                    border: UiRect::all(Val::Px(1.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
-                BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
-            ))
-            .id();
-        commands.entity(conv_root).add_child(entity);
+    if let TileNode::Split { children, ratios, .. } = &tree.root {
+        for (i, child) in children.iter().enumerate() {
+            // Skip docks — they're handled by spawn_docks
+            if matches!(child, TileNode::Dock { .. }) {
+                continue;
+            }
+            let ratio = ratios.get(i).copied().unwrap_or(1.0);
+            spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
+        }
     }
 }
 
-/// Collect conversation and compose PaneIds from the tree.
-fn collect_content_panes(
+/// Recursively spawn a content subtree as Bevy flex entities.
+///
+/// - `Split` nodes → flex containers (Row or Column) with ratio-based sizing
+/// - `Conversation` leaves → ConversationContainer entities
+/// - `Compose` leaves → ComposeBlock entities
+/// - Other leaves → ignored (widgets are in docks)
+fn spawn_content_subtree(
+    commands: &mut Commands,
     node: &TileNode,
-    convs: &mut Vec<PaneId>,
-    composes: &mut Vec<PaneId>,
+    theme: &Theme,
+    parent: Entity,
+    tree: &TilingTree,
+    flex_grow: f32,
 ) {
     match node {
-        TileNode::Leaf { id, content } => match content {
-            PaneContent::Conversation { .. } => convs.push(*id),
-            PaneContent::Compose { .. } => composes.push(*id),
-            _ => {}
-        },
-        TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
-            for child in children {
-                collect_content_panes(child, convs, composes);
+        TileNode::Split {
+            id,
+            direction,
+            children,
+            ratios,
+        } => {
+            let flex_dir = match direction {
+                SplitDirection::Row => FlexDirection::Row,
+                SplitDirection::Column => FlexDirection::Column,
+            };
+
+            let entity = commands
+                .spawn((
+                    PaneMarker {
+                        pane_id: *id,
+                        content: PaneContent::Spacer, // Split containers don't have content
+                    },
+                    *id,
+                    Node {
+                        flex_grow: if flex_grow > 0.0 { flex_grow } else { 1.0 },
+                        flex_basis: if flex_grow > 0.0 {
+                            Val::Px(0.0)
+                        } else {
+                            Val::Auto
+                        },
+                        flex_direction: flex_dir,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                ))
+                .id();
+            commands.entity(parent).add_child(entity);
+
+            for (i, child) in children.iter().enumerate() {
+                let child_ratio = ratios.get(i).copied().unwrap_or(1.0);
+                spawn_content_subtree(commands, child, theme, entity, tree, child_ratio);
             }
         }
+
+        TileNode::Leaf {
+            id,
+            content: PaneContent::Conversation { document_id },
+        } => {
+            let is_focused = tree.focused == *id;
+            let border_color = if is_focused {
+                theme.accent
+            } else {
+                Color::NONE
+            };
+
+            let entity = commands
+                .spawn((
+                    PaneMarker {
+                        pane_id: *id,
+                        content: PaneContent::Conversation {
+                            document_id: document_id.clone(),
+                        },
+                    },
+                    *id,
+                    ConversationContainer,
+                    Node {
+                        flex_grow: if flex_grow > 0.0 { flex_grow } else { 1.0 },
+                        flex_basis: if flex_grow > 0.0 {
+                            Val::Px(0.0)
+                        } else {
+                            Val::Auto
+                        },
+                        flex_direction: FlexDirection::Column,
+                        overflow: Overflow::clip(),
+                        padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(border_color),
+                ))
+                .id();
+            commands.entity(parent).add_child(entity);
+        }
+
+        TileNode::Leaf {
+            id,
+            content:
+                PaneContent::Compose {
+                    target_pane,
+                    writing_direction,
+                },
+        } => {
+            let entity = commands
+                .spawn((
+                    PaneMarker {
+                        pane_id: *id,
+                        content: PaneContent::Compose {
+                            target_pane: *target_pane,
+                            writing_direction: *writing_direction,
+                        },
+                    },
+                    *id,
+                    ComposeBlock::default(),
+                    MsdfText,
+                    MsdfTextAreaConfig::default(),
+                    Node {
+                        width: Val::Percent(100.0),
+                        min_height: Val::Px(60.0),
+                        padding: UiRect::all(Val::Px(12.0)),
+                        margin: UiRect::new(
+                            Val::Px(20.0),
+                            Val::Px(20.0),
+                            Val::Px(8.0),
+                            Val::Px(16.0),
+                        ),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
+                    BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
+                ))
+                .id();
+            commands.entity(parent).add_child(entity);
+        }
+
+        _ => {} // Docks handled separately, other leaves ignored
     }
 }
 
@@ -420,13 +492,19 @@ fn spawn_widget_text(
 // FOCUS SYSTEM
 // ============================================================================
 
-/// System that maintains the `PaneFocus` marker.
+/// System that maintains the `PaneFocus` marker and updates focus borders.
 pub fn update_pane_focus(
     mut commands: Commands,
     tree: Res<TilingTree>,
+    theme: Res<Theme>,
     pane_markers: Query<(Entity, &PaneMarker)>,
     focused_panes: Query<Entity, With<PaneFocus>>,
+    mut conv_borders: Query<(&PaneMarker, &mut BorderColor), With<ConversationContainer>>,
 ) {
+    if !tree.is_changed() {
+        return;
+    }
+
     // Remove stale focus markers
     for entity in focused_panes.iter() {
         commands.entity(entity).remove::<PaneFocus>();
@@ -438,6 +516,17 @@ pub fn update_pane_focus(
             commands.entity(entity).insert(PaneFocus);
             break;
         }
+    }
+
+    // Update border colors on conversation containers (focus indicator)
+    let has_multiple = conv_borders.iter().count() > 1;
+    for (marker, mut border) in conv_borders.iter_mut() {
+        let is_focused = marker.pane_id == tree.focused;
+        *border = if is_focused && has_multiple {
+            BorderColor::all(theme.accent)
+        } else {
+            BorderColor::all(Color::NONE)
+        };
     }
 }
 

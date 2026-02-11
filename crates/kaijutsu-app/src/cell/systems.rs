@@ -111,6 +111,7 @@ pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
+    keys: Res<ButtonInput<KeyCode>>,
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     compose_blocks: Query<&ComposeBlock>,
     screen: Res<State<AppScreen>>,
@@ -128,6 +129,13 @@ pub fn handle_mode_switch(
     // Focus determines which cell receives text input, not mode switching.
     // This allows Space to summon the input from anywhere in the conversation.
 
+    // Skip mode switching when a tiling modifier is held (Alt/Super).
+    // These are tiling WM keybinds, not mode triggers.
+    let tiling_mod_held = keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight)
+        || keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight);
+
     for event in key_events.read() {
         if !event.state.is_pressed() {
             continue;
@@ -135,6 +143,11 @@ pub fn handle_mode_switch(
 
         // Skip keys already consumed by earlier systems (e.g., block editing)
         if consumed.0.contains(&event.key_code) {
+            continue;
+        }
+
+        // Skip when tiling modifier is held (Alt/Super+key → tiling WM)
+        if tiling_mod_held {
             continue;
         }
 
@@ -2720,7 +2733,7 @@ pub fn apply_block_cell_positions(
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    dag_view: Query<(&ComputedNode, &UiGlobalTransform), With<super::components::ConversationContainer>>,
+    dag_view: Query<(&ComputedNode, &UiGlobalTransform), (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
@@ -2740,7 +2753,8 @@ pub fn apply_block_cell_positions(
     // instead of relying on hardcoded constants that drift out of sync.
     // Computed BEFORE the early-return guard so bounds changes are always detected.
     let Ok((node, transform)) = dag_view.single() else {
-        warn!("apply_block_cell_positions: DagView (ConversationContainer) not found");
+        // No focused conversation container yet (normal during reconciler initialization)
+        debug!("apply_block_cell_positions: waiting for focused ConversationContainer");
         return;
     };
     let (_, _, translation) = transform.to_scale_angle_translation();

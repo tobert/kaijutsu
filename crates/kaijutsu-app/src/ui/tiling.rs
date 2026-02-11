@@ -11,6 +11,7 @@
 //! | Inputs    | Compose, Shell                     | Chat prompt, kaish input     |
 //! | Widgets   | Title, Mode, Connection, Contexts… | Status bar items             |
 
+use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 
 // ============================================================================
@@ -41,7 +42,7 @@ pub enum WritingDirection {
     #[default]
     Horizontal,
     /// Vertical right-to-left (日本語 tategaki)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Phase 4: vertical nihongo compose pane
     VerticalRl,
 }
 
@@ -53,8 +54,8 @@ pub enum PaneContent {
     Conversation { document_id: String },
     /// The kernel/context/seat dashboard.
     Dashboard,
-    /// A text file editor (future).
-    #[allow(dead_code)]
+    /// A text file editor.
+    #[allow(dead_code)] // Phase 4: tab containers for stacking views
     Editor { path: String },
 
     // ── Inputs ─────────────────────────────────────────────────────────
@@ -64,8 +65,8 @@ pub enum PaneContent {
         target_pane: PaneId,
         writing_direction: WritingDirection,
     },
-    /// Kaish shell input (future).
-    #[allow(dead_code)]
+    /// Kaish shell input.
+    #[allow(dead_code)] // Phase 4: shell pane content type
     Shell,
 
     // ── Widgets ────────────────────────────────────────────────────────
@@ -80,26 +81,17 @@ pub enum PaneContent {
     /// Context-sensitive key hints.
     Hints,
     /// Static or templated text.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Phase 4: custom widget text content
     Text { template: String },
     /// Flexible spacer — grows to fill remaining space.
     Spacer,
 }
 
-#[allow(dead_code)]
 impl PaneContent {
-    /// Whether this content type is a widget (lives in a dock, auto-sized).
-    pub fn is_widget(&self) -> bool {
-        matches!(
-            self,
-            PaneContent::Title
-                | PaneContent::Mode
-                | PaneContent::Connection
-                | PaneContent::Contexts
-                | PaneContent::Hints
-                | PaneContent::Text { .. }
-                | PaneContent::Spacer
-        )
+    /// Whether this content type is a conversation view.
+    #[allow(dead_code)] // used in tests + future per-pane dispatch
+    pub fn is_conversation(&self) -> bool {
+        matches!(self, PaneContent::Conversation { .. })
     }
 }
 
@@ -117,6 +109,30 @@ pub enum SplitDirection {
     Column,
 }
 
+/// Spatial direction for focus navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl FocusDirection {
+    /// Which split direction this focus movement aligns with.
+    fn split_axis(self) -> SplitDirection {
+        match self {
+            FocusDirection::Left | FocusDirection::Right => SplitDirection::Row,
+            FocusDirection::Up | FocusDirection::Down => SplitDirection::Column,
+        }
+    }
+
+    /// Whether this direction is forward (+1) or backward (-1) along its axis.
+    fn is_forward(self) -> bool {
+        matches!(self, FocusDirection::Right | FocusDirection::Down)
+    }
+}
+
 // ============================================================================
 // DOCK EDGE
 // ============================================================================
@@ -127,9 +143,9 @@ pub enum Edge {
     North,
     #[default]
     South,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Phase 4: dock/undock east/west
     East,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Phase 4: dock/undock east/west
     West,
 }
 
@@ -161,7 +177,6 @@ pub enum TileNode {
     },
 }
 
-#[allow(dead_code)]
 impl TileNode {
     /// Get the PaneId of this node.
     pub fn id(&self) -> PaneId {
@@ -173,6 +188,7 @@ impl TileNode {
     }
 
     /// Recursively collect all PaneIds in this subtree.
+    #[allow(dead_code)] // used in tests
     pub fn collect_ids(&self, out: &mut Vec<PaneId>) {
         out.push(self.id());
         match self {
@@ -247,6 +263,48 @@ impl TileNode {
         out
     }
 
+    /// Check if this subtree contains a pane with the given ID.
+    #[allow(dead_code)] // used in tests
+    pub fn contains_pane(&self, target: PaneId) -> bool {
+        if self.id() == target {
+            return true;
+        }
+        match self {
+            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+                children.iter().any(|c| c.contains_pane(target))
+            }
+            TileNode::Leaf { .. } => false,
+        }
+    }
+
+    /// Find the first conversation PaneId in this subtree (depth-first).
+    pub fn first_conversation(&self) -> Option<PaneId> {
+        match self {
+            TileNode::Leaf {
+                id,
+                content: PaneContent::Conversation { .. },
+            } => Some(*id),
+            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+                children.iter().find_map(|c| c.first_conversation())
+            }
+            TileNode::Leaf { .. } => None,
+        }
+    }
+
+    /// Find the last conversation PaneId in this subtree (depth-first, reverse).
+    pub fn last_conversation(&self) -> Option<PaneId> {
+        match self {
+            TileNode::Leaf {
+                id,
+                content: PaneContent::Conversation { .. },
+            } => Some(*id),
+            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+                children.iter().rev().find_map(|c| c.last_conversation())
+            }
+            TileNode::Leaf { .. } => None,
+        }
+    }
+
     fn collect_conversations<'a>(&'a self, out: &mut Vec<(PaneId, &'a str)>) {
         match self {
             TileNode::Leaf {
@@ -288,7 +346,6 @@ pub struct TilingTree {
     pub generation: u64,
 }
 
-#[allow(dead_code)]
 impl TilingTree {
     /// Allocate a new unique PaneId.
     pub fn next_pane_id(&mut self) -> PaneId {
@@ -405,48 +462,329 @@ impl TilingTree {
     // TREE OPERATIONS
     // ════════════════════════════════════════════════════════════════════
 
-    /// Split a pane, inserting a new pane beside it.
+    /// Split a conversation pane, inserting a new conversation beside it.
     ///
-    /// Phase 2 — requires careful borrow-checker-safe tree mutation.
-    #[allow(dead_code)]
+    /// Finds the conversation group (Column Split containing the target
+    /// conversation + its compose), then inserts a new conversation group
+    /// as a sibling. If the parent's direction matches, the new group is
+    /// inserted inline; otherwise a wrapper Split is created.
+    ///
+    /// Returns the PaneId of the new conversation pane.
     pub fn split(
         &mut self,
-        _target: PaneId,
-        _direction: SplitDirection,
-        _content: PaneContent,
+        target: PaneId,
+        direction: SplitDirection,
     ) -> Option<PaneId> {
-        // Phase 2 implementation
-        None
+        // Verify target is a conversation pane
+        if let Some(TileNode::Leaf { content, .. }) = self.root.find(target) {
+            if !matches!(content, PaneContent::Conversation { .. }) {
+                return None;
+            }
+        } else {
+            return None;
+        }
+
+        // Find the conversation group: the Split(Column) parent of the target
+        let (conv_group_id, _conv_idx) = self.root.find_parent(target)?;
+
+        // Find the grandparent that contains the conversation group
+        let (grandparent_id, group_idx) = self.root.find_parent(conv_group_id)?;
+
+        // Allocate all IDs upfront (before any mutable tree borrows)
+        let new_conv_id = self.next_pane_id();
+        let new_compose_id = self.next_pane_id();
+        let new_group_id = self.next_pane_id();
+        let wrapper_id = self.next_pane_id();
+
+        let new_group = TileNode::Split {
+            id: new_group_id,
+            direction: SplitDirection::Column,
+            children: vec![
+                TileNode::Leaf {
+                    id: new_conv_id,
+                    content: PaneContent::Conversation {
+                        document_id: String::new(),
+                    },
+                },
+                TileNode::Leaf {
+                    id: new_compose_id,
+                    content: PaneContent::Compose {
+                        target_pane: new_conv_id,
+                        writing_direction: WritingDirection::Horizontal,
+                    },
+                },
+            ],
+            ratios: vec![1.0, 0.0],
+        };
+
+        // Now mutate the grandparent
+        let grandparent = self.root.find_mut(grandparent_id)?;
+        if let TileNode::Split {
+            direction: gp_dir,
+            children,
+            ratios,
+            ..
+        } = grandparent
+        {
+            if *gp_dir == direction {
+                // Same direction: insert new group after the conversation group.
+                // Halve the target's ratio — preserves other panes' custom sizing.
+                let target_ratio = ratios.get(group_idx).copied().unwrap_or(0.5);
+                let half = target_ratio / 2.0;
+                if group_idx < ratios.len() {
+                    ratios[group_idx] = half;
+                }
+                children.insert(group_idx + 1, new_group);
+                ratios.insert(group_idx + 1, half);
+            } else {
+                // Different direction: wrap conv_group + new_group in a new Split
+                let old_child = children.remove(group_idx);
+                let old_ratio = if group_idx < ratios.len() {
+                    ratios.remove(group_idx)
+                } else {
+                    1.0
+                };
+                let wrapper = TileNode::Split {
+                    id: wrapper_id,
+                    direction,
+                    children: vec![old_child, new_group],
+                    ratios: vec![0.5, 0.5],
+                };
+                children.insert(group_idx, wrapper);
+                ratios.insert(group_idx, old_ratio);
+            }
+        } else {
+            return None;
+        }
+
+        self.bump();
+        Some(new_conv_id)
     }
 
-    /// Close a pane, removing it from the tree.
+    /// Close a conversation pane, removing its entire conversation group.
     ///
-    /// Phase 2 — requires careful borrow-checker-safe tree mutation.
-    #[allow(dead_code)]
-    pub fn close(&mut self, _target: PaneId) -> bool {
-        // Phase 2 implementation
+    /// If the group's parent becomes a single-child split, it collapses
+    /// (replaces the split with the lone child). Focus moves to a neighbor.
+    /// Returns false if the pane can't be closed (e.g. it's the last one).
+    pub fn close(&mut self, target: PaneId) -> bool {
+        // Don't close the last conversation
+        let convs = self.root.conversation_panes();
+        if convs.len() <= 1 {
+            return false;
+        }
+
+        // Find the conversation group
+        let Some((conv_group_id, _)) = self.root.find_parent(target) else {
+            return false;
+        };
+
+        // Find the grandparent
+        let Some((grandparent_id, group_idx)) = self.root.find_parent(conv_group_id) else {
+            return false;
+        };
+
+        // Determine new focus before mutating
+        let new_focus = self.find_close_target(target);
+
+        // Remove the conversation group from grandparent
+        let grandparent = match self.root.find_mut(grandparent_id) {
+            Some(gp) => gp,
+            None => return false,
+        };
+
+        if let TileNode::Split {
+            children, ratios, ..
+        } = grandparent
+        {
+            if group_idx < children.len() {
+                children.remove(group_idx);
+                if group_idx < ratios.len() {
+                    ratios.remove(group_idx);
+                }
+                // Redistribute space proportionally to remaining panes
+                normalize_ratios(ratios);
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Collapse single-child splits
+        self.collapse_single_child_splits();
+
+        // Update focus
+        if let Some(new_target) = new_focus {
+            self.focus(new_target);
+        }
+        self.bump();
+        true
+    }
+
+    /// Swap two conversation groups in the tree.
+    ///
+    /// PaneIds travel with content — the two groups exchange positions
+    /// in the tree while keeping their identities. Works for siblings
+    /// in the same split or groups in different splits.
+    #[allow(dead_code)] // Phase 2: Mod+Shift+hjkl will wire this up
+    pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
+        // Find both conversation groups
+        let Some((group_a_parent, idx_a)) = self.root.find_parent(a) else {
+            return false;
+        };
+        let Some((group_b_parent, idx_b)) = self.root.find_parent(b) else {
+            return false;
+        };
+
+        if group_a_parent == group_b_parent {
+            // Siblings: swap in place within the same children vec
+            let parent = match self.root.find_mut(group_a_parent) {
+                Some(p) => p,
+                None => return false,
+            };
+            if let TileNode::Split { children, ratios, .. } = parent {
+                if idx_a < children.len() && idx_b < children.len() {
+                    children.swap(idx_a, idx_b);
+                    ratios.swap(idx_a, idx_b);
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            // Different parents: clone both groups, then cross-assign
+            let group_a = self.root.find(a).cloned();
+            let group_b = self.root.find(b).cloned();
+            let (Some(ga), Some(gb)) = (group_a, group_b) else {
+                return false;
+            };
+
+            // Replace a's slot with b's content (keeping b's PaneId)
+            if let Some(slot_a) = self.root.find_mut(a) {
+                *slot_a = gb;
+            }
+            // Replace b's slot with a's content (keeping a's PaneId)
+            if let Some(slot_b) = self.root.find_mut(b) {
+                *slot_b = ga;
+            }
+        }
+
+        self.bump();
+        true
+    }
+
+    /// Move focus in a spatial direction.
+    ///
+    /// Walks up from the focused pane to find a Split with the matching
+    /// axis (Row for Left/Right, Column for Up/Down), then moves to the
+    /// adjacent sibling's first/last conversation pane.
+    pub fn focus_direction(&mut self, direction: FocusDirection) -> bool {
+        let axis = direction.split_axis();
+        let forward = direction.is_forward();
+
+        // Walk ancestors from the focused pane upward
+        let mut current = self.focused;
+        loop {
+            let Some((parent_id, child_idx)) = self.root.find_parent(current) else {
+                break;
+            };
+
+            // Check if parent is a Split with the right direction
+            if let Some(TileNode::Split {
+                direction: split_dir,
+                children,
+                ..
+            }) = self.root.find(parent_id)
+            {
+                if *split_dir == axis && children.len() > 1 {
+                    let target_idx = if forward {
+                        if child_idx + 1 < children.len() {
+                            Some(child_idx + 1)
+                        } else {
+                            None // Already at end
+                        }
+                    } else if child_idx > 0 {
+                        Some(child_idx - 1)
+                    } else {
+                        None // Already at start
+                    };
+
+                    if let Some(idx) = target_idx {
+                        // Find a conversation in the target child
+                        let target_conv = if forward {
+                            children[idx].first_conversation()
+                        } else {
+                            children[idx].last_conversation()
+                        };
+
+                        if let Some(conv_id) = target_conv {
+                            self.focus(conv_id);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            current = parent_id;
+        }
         false
     }
 
-    /// Swap two panes in the tree.
-    #[allow(dead_code)]
-    pub fn swap(&mut self, _a: PaneId, _b: PaneId) -> bool {
-        // Phase 2 implementation
-        false
-    }
+    /// Resize the split containing the focused pane.
+    ///
+    /// `delta` is a fraction to shift (positive = grow focused pane,
+    /// negative = shrink). Applies to the split that directly contains
+    /// the focused pane's conversation group.
+    pub fn resize(&mut self, target: PaneId, delta: f32) -> bool {
+        // Need at least 2 conversations for resize to make sense
+        if self.root.conversation_panes().len() < 2 {
+            return false;
+        }
 
-    /// Move focus in a direction (spatial neighbor finding).
-    #[allow(dead_code)]
-    pub fn focus_direction(&mut self, _direction: SplitDirection) -> bool {
-        // Phase 2 implementation
-        false
-    }
+        // Find the conversation group
+        let Some((conv_group_id, _)) = self.root.find_parent(target) else {
+            return false;
+        };
+        // Find the parent split
+        let Some((parent_id, group_idx)) = self.root.find_parent(conv_group_id) else {
+            return false;
+        };
 
-    /// Resize a split ratio.
-    #[allow(dead_code)]
-    pub fn resize(&mut self, _target: PaneId, _delta: f32) -> bool {
-        // Phase 2 implementation
-        false
+        let parent = match self.root.find_mut(parent_id) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        if let TileNode::Split { ratios, .. } = parent {
+            if ratios.len() < 2 {
+                return false;
+            }
+            // Find a neighbor to take/give space
+            let neighbor_idx = if group_idx + 1 < ratios.len() {
+                group_idx + 1
+            } else if group_idx > 0 {
+                group_idx - 1
+            } else {
+                return false;
+            };
+
+            let min_ratio = 0.1;
+            ratios[group_idx] = (ratios[group_idx] + delta).clamp(min_ratio, 1.0 - min_ratio);
+            ratios[neighbor_idx] = (ratios[neighbor_idx] - delta).clamp(min_ratio, 1.0 - min_ratio);
+
+            // Renormalize so they sum to the same total
+            let total: f32 = ratios.iter().sum();
+            if total > 0.0 {
+                for r in ratios.iter_mut() {
+                    *r /= total;
+                }
+            }
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     /// Focus a specific pane.
@@ -459,7 +797,6 @@ impl TilingTree {
     }
 
     /// Toggle focus between current and previous pane (Ctrl-^).
-    #[allow(dead_code)]
     pub fn toggle_focus(&mut self) {
         if let Some(prev) = self.previous_focused {
             let current = self.focused;
@@ -470,10 +807,47 @@ impl TilingTree {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Find the best conversation pane to focus after closing `target`.
+    fn find_close_target(&self, target: PaneId) -> Option<PaneId> {
+        // Try focus_direction right, then left, then first conversation
+        let convs = self.root.conversation_panes();
+        // Find a neighbor that isn't the target
+        convs
+            .iter()
+            .find(|(id, _)| *id != target)
+            .map(|(id, _)| *id)
+    }
+
+    /// Collapse Split nodes that have exactly one child.
+    ///
+    /// After closing a pane, a split might have only one child left.
+    /// Replace the split with its lone child to keep the tree clean.
+    fn collapse_single_child_splits(&mut self) {
+        fn collapse(node: &mut TileNode) {
+            // First recurse into children
+            if let TileNode::Split { children, .. } = node {
+                for child in children.iter_mut() {
+                    collapse(child);
+                }
+                // After recursion, check if we should collapse
+                if children.len() == 1 {
+                    let child = children.remove(0);
+                    *node = child;
+                }
+            }
+        }
+        collapse(&mut self.root);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // QUERIES
     // ════════════════════════════════════════════════════════════════════
 
     /// Find the first conversation pane (by tree order).
+    #[allow(dead_code)] // used in tests + Phase 3 preset loading
     pub fn first_conversation_pane(&self) -> Option<PaneId> {
         self.root
             .conversation_panes()
@@ -482,6 +856,7 @@ impl TilingTree {
     }
 
     /// Update the document_id for a conversation pane.
+    #[allow(dead_code)] // used in tests + context join wiring
     pub fn set_conversation_document(&mut self, pane: PaneId, document_id: &str) {
         if let Some(node) = self.root.find_mut(pane) {
             if let TileNode::Leaf {
@@ -496,6 +871,7 @@ impl TilingTree {
     }
 
     /// Get the document_id for the focused pane (if it's a Conversation).
+    #[allow(dead_code)] // used in tests + context join wiring
     pub fn focused_conversation_document(&self) -> Option<&str> {
         let node = self.root.find(self.focused)?;
         match node {
@@ -510,6 +886,28 @@ impl TilingTree {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// FREE FUNCTIONS — Tree manipulation helpers
+// ============================================================================
+
+/// Normalize ratios so content children (ratio > 0) sum to 1.0.
+///
+/// Children with 0.0 ratios (auto-sized like compose blocks and docks)
+/// are preserved. Remaining ratios are scaled proportionally, keeping
+/// any user-customized sizing intact.
+fn normalize_ratios(ratios: &mut [f32]) {
+    let content_sum: f32 = ratios.iter().filter(|r| **r > 0.0).sum();
+    if content_sum <= 0.0 {
+        return;
+    }
+    let scale = 1.0 / content_sum;
+    for r in ratios.iter_mut() {
+        if *r > 0.0 {
+            *r *= scale;
         }
     }
 }
@@ -553,7 +951,121 @@ impl Plugin for TilingPlugin {
             .register_type::<Edge>()
             .register_type::<WritingDirection>()
             .register_type::<PaneMarker>()
-            .register_type::<PaneFocus>();
+            .register_type::<PaneFocus>()
+            .add_systems(Update, handle_tiling_keys);
+    }
+}
+
+// ============================================================================
+// TILING KEY HANDLER — Super+key combinations for pane management
+// ============================================================================
+
+/// Handles Super+key (Mod) combinations in Normal mode for pane management.
+///
+/// | Key               | Action                          |
+/// |-------------------|---------------------------------|
+/// | `Super+h`         | Focus left                      |
+/// | `Super+j`         | Focus down                      |
+/// | `Super+k`         | Focus up                        |
+/// | `Super+l`         | Focus right                     |
+/// | `Super+Shift+H`   | Swap pane left (future)         |
+/// | `Super+v`         | Split vertical (new right)      |
+/// | `Super+s`         | Split horizontal (new below)    |
+/// | `Super+q`         | Close focused pane              |
+/// | `Super+[`         | Shrink focused pane             |
+/// | `Super+]`         | Grow focused pane               |
+/// | `Ctrl+^` (Ctrl+6) | Toggle previous focus           |
+pub fn handle_tiling_keys(
+    mut key_events: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<crate::cell::CurrentMode>,
+    mut tree: ResMut<TilingTree>,
+) {
+    // Only handle tiling keys in Normal mode
+    if mode.0 != crate::cell::EditorMode::Normal {
+        return;
+    }
+
+    // Use Super (Mod) or Alt as the tiling modifier.
+    // Super is often consumed by the window manager on Linux,
+    // so Alt serves as a portable fallback.
+    let mod_held = keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight)
+        || keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight);
+    let ctrl_held = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+
+    for event in key_events.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+
+        // Super+key: tiling operations
+        if mod_held {
+            match event.key_code {
+                // ── Focus navigation ──────────────────────────────
+                KeyCode::KeyH => {
+                    if tree.focus_direction(FocusDirection::Left) {
+                        info!("Tiling: focus left → {}", tree.focused);
+                    }
+                }
+                KeyCode::KeyJ => {
+                    if tree.focus_direction(FocusDirection::Down) {
+                        info!("Tiling: focus down → {}", tree.focused);
+                    }
+                }
+                KeyCode::KeyK => {
+                    if tree.focus_direction(FocusDirection::Up) {
+                        info!("Tiling: focus up → {}", tree.focused);
+                    }
+                }
+                KeyCode::KeyL => {
+                    if tree.focus_direction(FocusDirection::Right) {
+                        info!("Tiling: focus right → {}", tree.focused);
+                    }
+                }
+
+                // ── Split operations ──────────────────────────────
+                KeyCode::KeyV => {
+                    let target = tree.focused;
+                    if let Some(new_pane) = tree.split(target, SplitDirection::Row) {
+                        info!("Tiling: split vertical → new {}", new_pane);
+                    }
+                }
+                KeyCode::KeyS => {
+                    let target = tree.focused;
+                    if let Some(new_pane) = tree.split(target, SplitDirection::Column) {
+                        info!("Tiling: split horizontal → new {}", new_pane);
+                    }
+                }
+
+                // ── Close ─────────────────────────────────────────
+                KeyCode::KeyQ => {
+                    let target = tree.focused;
+                    if tree.close(target) {
+                        info!("Tiling: closed pane, now focused {}", tree.focused);
+                    }
+                }
+
+                // ── Resize ────────────────────────────────────────
+                KeyCode::BracketLeft => {
+                    let target = tree.focused;
+                    tree.resize(target, -0.05);
+                }
+                KeyCode::BracketRight => {
+                    let target = tree.focused;
+                    tree.resize(target, 0.05);
+                }
+
+                _ => {}
+            }
+        }
+
+        // Ctrl+^ (Ctrl+6): toggle focus between current and previous
+        if ctrl_held && event.key_code == KeyCode::Digit6 {
+            tree.toggle_focus();
+            info!("Tiling: toggle focus → {}", tree.focused);
+        }
     }
 }
 
@@ -596,5 +1108,174 @@ mod tests {
         let conv_id = tree.first_conversation_pane().unwrap();
         tree.set_conversation_document(conv_id, "doc_123");
         assert_eq!(tree.focused_conversation_document(), Some("doc_123"));
+    }
+
+    // ── Split tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn split_row_creates_two_conversations() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let gen_before = tree.generation;
+
+        let conv2 = tree.split(conv1, SplitDirection::Row);
+        assert!(conv2.is_some(), "Split should return new conversation PaneId");
+
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 2, "Should have two conversation panes after split");
+        assert!(tree.generation > gen_before, "Generation should bump");
+    }
+
+    #[test]
+    fn split_column_creates_two_conversations() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+
+        let conv2 = tree.split(conv1, SplitDirection::Column);
+        assert!(conv2.is_some());
+
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 2);
+    }
+
+    #[test]
+    fn split_same_direction_adds_sibling() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+
+        // First split creates a Row wrapper
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        // Second split in same direction adds inline (no extra nesting)
+        let conv3 = tree.split(conv1, SplitDirection::Row).unwrap();
+
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 3, "Should have three conversation panes");
+
+        // All three should be distinct
+        assert_ne!(conv1, conv2);
+        assert_ne!(conv2, conv3);
+        assert_ne!(conv1, conv3);
+    }
+
+    #[test]
+    fn split_invalid_target_returns_none() {
+        let mut tree = TilingTree::default_layout();
+        // Try to split a non-existent pane
+        let result = tree.split(PaneId(9999), SplitDirection::Row);
+        assert!(result.is_none());
+    }
+
+    // ── Close tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn close_last_pane_returns_false() {
+        let mut tree = TilingTree::default_layout();
+        let conv = tree.first_conversation_pane().unwrap();
+        assert!(!tree.close(conv), "Should not close the last conversation");
+    }
+
+    #[test]
+    fn close_removes_pane() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+
+        assert!(tree.close(conv2), "Should close the second pane");
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 1, "Should have one conversation after close");
+    }
+
+    #[test]
+    fn close_updates_focus() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        tree.focus(conv2);
+
+        assert!(tree.close(conv2));
+        // Focus should move to the remaining pane
+        assert_eq!(tree.focused, conv1);
+    }
+
+    // ── Focus direction tests ───────────────────────────────────────
+
+    #[test]
+    fn focus_direction_row() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        tree.focus(conv1);
+
+        // Focus right should go to conv2
+        assert!(tree.focus_direction(FocusDirection::Right));
+        assert_eq!(tree.focused, conv2);
+
+        // Focus left should go back to conv1
+        assert!(tree.focus_direction(FocusDirection::Left));
+        assert_eq!(tree.focused, conv1);
+
+        // Focus left at edge should return false
+        assert!(!tree.focus_direction(FocusDirection::Left));
+    }
+
+    #[test]
+    fn focus_direction_column() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Column).unwrap();
+        tree.focus(conv1);
+
+        assert!(tree.focus_direction(FocusDirection::Down));
+        assert_eq!(tree.focused, conv2);
+
+        assert!(tree.focus_direction(FocusDirection::Up));
+        assert_eq!(tree.focused, conv1);
+    }
+
+    // ── Resize tests ────────────────────────────────────────────────
+
+    #[test]
+    fn resize_adjusts_ratios() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let _conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+
+        let gen_before = tree.generation;
+        assert!(tree.resize(conv1, 0.1));
+        assert!(tree.generation > gen_before);
+    }
+
+    #[test]
+    fn resize_single_pane_returns_false() {
+        let mut tree = TilingTree::default_layout();
+        let conv = tree.first_conversation_pane().unwrap();
+        assert!(!tree.resize(conv, 0.1), "Can't resize with only one pane");
+    }
+
+    // ── Toggle focus test ───────────────────────────────────────────
+
+    #[test]
+    fn toggle_focus_swaps_between_panes() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+
+        tree.focus(conv2);
+        assert_eq!(tree.focused, conv2);
+        assert_eq!(tree.previous_focused, Some(conv1));
+
+        tree.toggle_focus();
+        assert_eq!(tree.focused, conv1);
+        assert_eq!(tree.previous_focused, Some(conv2));
+    }
+
+    // ── contains_pane tests ─────────────────────────────────────────
+
+    #[test]
+    fn contains_pane_finds_nested() {
+        let tree = TilingTree::default_layout();
+        let conv = tree.first_conversation_pane().unwrap();
+        assert!(tree.root.contains_pane(conv));
+        assert!(!tree.root.contains_pane(PaneId(9999)));
     }
 }
