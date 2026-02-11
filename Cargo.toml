@@ -7,6 +7,7 @@ members = [
     "crates/kaijutsu-server",
     "crates/kaijutsu-app",
     "crates/kaijutsu-mcp",
+    "crates/kaijutsu-telemetry",
 ]
 
 [workspace.package]
@@ -25,9 +26,9 @@ kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 # Kaijutsu RPC client
 kaijutsu-client = { path = "crates/kaijutsu-client" }
 
-# Kaish (execution engine + client) — path deps for latest unreleased changes
-kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
-kaish-glob = { path = "../kaish/crates/kaish-glob" }
+# Kaish (execution engine + client)
+kaish-kernel = "0.1.8"
+kaish-glob = "0.1.8"
 
 # Cap'n Proto
 capnp = "0.25"
@@ -76,3 +77,12 @@ rig-core = "0.30"
 
 # MCP (Model Context Protocol)
 rmcp = { version = "0.14", features = ["client", "transport-child-process"] }
+
+# Kaijutsu telemetry
+kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
+
+# OpenTelemetry
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["tonic"] }
+tracing-opentelemetry = "0.31"

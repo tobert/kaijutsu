@@ -565,6 +565,9 @@ impl world::Server for WorldImpl {
                     .mount("/home", LocalBackend::read_only(home))
                     .await;
 
+                // Mount /tmp for scratch/interop with external tools
+                kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
+
                 // Create block store with database persistence and shared FlowBus
                 let documents = create_block_store_with_db(&id, block_flows);
 
@@ -673,6 +676,9 @@ impl world::Server for WorldImpl {
             kernel
                 .mount("/home", LocalBackend::read_only(home))
                 .await;
+
+            // Mount /tmp for scratch/interop with external tools
+            kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
             // Create block store with database persistence and shared FlowBus
             let documents = create_block_store_with_db(&id, block_flows);
