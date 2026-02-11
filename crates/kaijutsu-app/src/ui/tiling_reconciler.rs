@@ -266,8 +266,7 @@ fn spawn_content_subtree(
                 Color::NONE
             };
 
-            let entity = commands
-                .spawn((
+            let mut entity_cmd = commands.spawn((
                     PaneMarker {
                         pane_id: *id,
                         content: PaneContent::Conversation {
@@ -294,8 +293,11 @@ fn spawn_content_subtree(
                         ..default()
                     },
                     BorderColor::all(border_color),
-                ))
-                .id();
+                ));
+            if is_focused {
+                entity_cmd.insert(PaneFocus);
+            }
+            let entity = entity_cmd.id();
             commands.entity(parent).add_child(entity);
         }
 
@@ -317,8 +319,8 @@ fn spawn_content_subtree(
                 ComposeBlock::default()
             };
 
-            let entity = commands
-                .spawn((
+            let is_compose_focused = tree.focused == *target_pane;
+            let mut entity_cmd = commands.spawn((
                     PaneMarker {
                         pane_id: *id,
                         content: PaneContent::Compose {
@@ -346,8 +348,11 @@ fn spawn_content_subtree(
                     },
                     BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
                     BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
-                ))
-                .id();
+                ));
+            if is_compose_focused {
+                entity_cmd.insert(PaneFocus);
+            }
+            let entity = entity_cmd.id();
             commands.entity(parent).add_child(entity);
         }
 
@@ -654,38 +659,36 @@ pub fn handle_pane_focus_change(
         return;
     };
 
-    // Only act when there are actually multiple panes
-    if tree.root.conversation_panes().len() < 2 {
-        return;
-    }
+    let single_pane = tree.root.conversation_panes().len() < 2;
 
-    // ── Save outgoing pane ────────────────────────────────────────────
-    // Find the compose block paired with the old focused pane
-    let old_compose = compose_blocks
-        .iter()
-        .find_map(|(marker, compose)| {
-            if let PaneContent::Compose { target_pane, .. } = &marker.content {
-                if *target_pane == old_pane_id {
-                    return Some((compose.text.clone(), compose.cursor));
+    // ── Save outgoing pane (only if it still exists) ─────────────────
+    if !single_pane {
+        let old_compose = compose_blocks
+            .iter()
+            .find_map(|(marker, compose)| {
+                if let PaneContent::Compose { target_pane, .. } = &marker.content {
+                    if *target_pane == old_pane_id {
+                        return Some((compose.text.clone(), compose.cursor));
+                    }
                 }
-            }
-            None
-        });
+                None
+            });
 
-    for (marker, mut saved) in saved_states.iter_mut() {
-        if marker.pane_id == old_pane_id {
-            saved.scroll_offset = scroll_state.offset;
-            saved.scroll_target = scroll_state.target_offset;
-            saved.following = scroll_state.following;
-            if let Some((text, cursor)) = &old_compose {
-                saved.compose_text = text.clone();
-                saved.compose_cursor = *cursor;
+        for (marker, mut saved) in saved_states.iter_mut() {
+            if marker.pane_id == old_pane_id {
+                saved.scroll_offset = scroll_state.offset;
+                saved.scroll_target = scroll_state.target_offset;
+                saved.following = scroll_state.following;
+                if let Some((text, cursor)) = &old_compose {
+                    saved.compose_text = text.clone();
+                    saved.compose_cursor = *cursor;
+                }
+                break;
             }
-            break;
         }
     }
 
-    // ── Restore incoming pane ─────────────────────────────────────────
+    // ── Restore incoming pane (always, even after 2→1 close) ─────────
     let mut incoming_doc_id = String::new();
     for (marker, saved) in saved_states.iter() {
         if marker.pane_id == current {
@@ -708,9 +711,8 @@ pub fn handle_pane_focus_change(
         }
     }
 
-    // ── Fire context switch if document differs ───────────────────────
-    if !incoming_doc_id.is_empty() {
-        // Check if the outgoing pane had a different document
+    // ── Fire context switch if document differs (multi-pane only) ────
+    if !single_pane && !incoming_doc_id.is_empty() {
         let outgoing_doc_id = saved_states
             .iter()
             .find_map(|(marker, saved)| {
@@ -723,16 +725,12 @@ pub fn handle_pane_focus_change(
             .unwrap_or_default();
 
         if incoming_doc_id != outgoing_doc_id {
-            // Look up context name from the TilingTree's conversation pane
-            // The document_id is stored in PaneContent::Conversation
             if let Some(TileNode::Leaf {
                 content: PaneContent::Conversation { document_id },
                 ..
             }) = tree.root.find(current)
             {
                 if !document_id.is_empty() {
-                    // ContextSwitchRequested uses context_name, which for now
-                    // is the document_id itself (the server uses kernel_id as context_name)
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: document_id.clone(),
                     });
@@ -919,24 +917,46 @@ pub fn assign_mru_to_empty_panes(
 // PLUGIN
 // ============================================================================
 
+/// System set phases for tiling reconciliation.
+///
+/// `Reconcile` runs the entity rebuild + ApplyDeferred so deferred commands
+/// (spawn/despawn) are flushed before `PostReconcile` systems query the world.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+enum TilingPhase {
+    Reconcile,
+    PostReconcile,
+}
+
 /// Plugin for the tiling reconciler.
 pub struct TilingReconcilerPlugin;
 
 impl Plugin for TilingReconcilerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ReconcilerState>()
+            .configure_sets(
+                Update,
+                TilingPhase::Reconcile.before(TilingPhase::PostReconcile),
+            )
             .add_systems(
                 Update,
                 (
                     reconcile_tiling_tree,
-                    update_pane_focus.after(reconcile_tiling_tree),
-                    sync_tiling_visuals.after(reconcile_tiling_tree),
+                    ApplyDeferred.after(reconcile_tiling_tree),
+                )
+                    .in_set(TilingPhase::Reconcile),
+            )
+            .add_systems(
+                Update,
+                (
+                    update_pane_focus,
+                    sync_tiling_visuals,
                     handle_pane_focus_change.after(update_pane_focus),
-                    assign_mru_to_empty_panes.after(reconcile_tiling_tree),
+                    assign_mru_to_empty_panes,
                     sync_unfocused_pane_summaries
                         .after(update_pane_focus)
                         .after(assign_mru_to_empty_panes),
-                ),
+                )
+                    .in_set(TilingPhase::PostReconcile),
             );
     }
 }
