@@ -1,8 +1,8 @@
-//! Embedded kaish executor using KaijutsuBackend.
+//! Embedded kaish executor using MountBackend + VFS adapters.
 //!
 //! Instead of spawning kaish as a subprocess, this module embeds the kaish
-//! interpreter directly, using `KaijutsuBackend` for file operations and
-//! tool dispatch.
+//! interpreter directly, routing I/O through the kaijutsu kernel's MountTable
+//! for real filesystem access and VFS adapters for CRDT blocks.
 //!
 //! # Architecture
 //!
@@ -13,16 +13,19 @@
 //!             │
 //!             ├── kaish::Kernel (in-process)
 //!             │       │
-//!             │       └── ExecContext.backend = KaijutsuBackend
+//!             │       ├── /v/docs → KaijutsuFilesystem (CRDT blocks)
+//!             │       ├── /v/g   → GitFilesystem (CRDT git)
+//!             │       ├── /v/jobs, /v/blobs → kaish builtins
+//!             │       └── everything else → MountBackend
 //!             │               │
-//!             │               ├── File ops → BlockStore (CRDT)
-//!             │               └── Tool calls → KaijutsuKernel
+//!             │               ├── File ops → MountTable → LocalBackend
+//!             │               └── Tool calls → KaijutsuBackend / GitCrdtBackend
 //!             │
 //!             └── Shared state with kaijutsu kernel
 //! ```
 //!
-//! This enables kaish scripts to read/write blocks as files and call
-//! kaijutsu tools directly, without IPC overhead.
+//! This enables kaish scripts to access both CRDT blocks and real files,
+//! with tool dispatch routed through the kernel's tool registry.
 
 use std::sync::Arc;
 
@@ -36,9 +39,11 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 
-use crate::composite_backend::CompositeBackend;
+use crate::docs_filesystem::KaijutsuFilesystem;
 use crate::git_backend::GitCrdtBackend;
+use crate::git_filesystem::GitFilesystem;
 use crate::kaish_backend::KaijutsuBackend;
+use crate::mount_backend::MountBackend;
 
 /// Embedded kaish executor backed by CRDT blocks.
 ///
@@ -60,7 +65,7 @@ impl EmbeddedKaish {
     ///
     /// * `name` - Name for this kaish kernel (for state persistence)
     /// * `blocks` - Shared block store for CRDT operations
-    /// * `kernel` - Kaijutsu kernel for tool dispatch
+    /// * `kernel` - Kaijutsu kernel for tool dispatch and VFS mounts
     ///
     /// # Example
     ///
@@ -75,17 +80,22 @@ impl EmbeddedKaish {
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
     ) -> Result<Self> {
-        // Create the CRDT-backed backend for file operations
-        let backend: Arc<dyn KernelBackend> = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
+        let mount_table = kernel.vfs().clone();
 
-        // Configure kaish kernel to start in /docs namespace
-        // Use isolated mode since all file ops go through the CRDT backend
+        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
+            mount_table, docs_backend.clone(), None,
+        ));
+
+        let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
+
+        // Start in /v/docs — the CRDT block namespace
         let config = KaishConfig::isolated()
-            .with_cwd(std::path::PathBuf::from("/docs"));
+            .with_cwd(std::path::PathBuf::from("/v/docs"));
 
-        // Create kaish kernel with our CRDT backend and /v/* virtual path support
-        // This enables /v/jobs for job observability (agents can monitor cargo builds)
-        let kaish_kernel = KaishKernel::with_backend_and_virtual_paths(backend, config)?;
+        let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
+            vfs.mount_arc("/v/docs", docs_fs);
+        })?;
 
         Ok(Self {
             kernel: kaish_kernel,
@@ -96,7 +106,7 @@ impl EmbeddedKaish {
 
     /// Create a new embedded kaish executor with git support.
     ///
-    /// This variant includes the `/g/` namespace for CRDT-backed git worktrees.
+    /// This variant includes the `/v/g` namespace for CRDT-backed git worktrees.
     /// Use `register_repo()` to add repositories.
     ///
     /// # Arguments
@@ -104,7 +114,7 @@ impl EmbeddedKaish {
     /// * `name` - Name for this kaish kernel
     /// * `blocks` - Shared block store for CRDT operations (docs)
     /// * `git_blocks` - Shared block store for git CRDT operations
-    /// * `kernel` - Kaijutsu kernel for tool dispatch
+    /// * `kernel` - Kaijutsu kernel for tool dispatch and VFS mounts
     ///
     /// # Example
     ///
@@ -121,24 +131,25 @@ impl EmbeddedKaish {
         git_blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
     ) -> Result<Self> {
-        // Create both backends
-        let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
         let git_backend = Arc::new(GitCrdtBackend::new(git_blocks));
+        let mount_table = kernel.vfs().clone();
 
-        // Create composite backend
-        let composite: Arc<dyn KernelBackend> = Arc::new(CompositeBackend::new(
-            docs_backend,
-            git_backend.clone(),
+        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
+            mount_table, docs_backend.clone(), Some(git_backend.clone()),
         ));
 
-        // Configure kaish kernel to start in /docs namespace
-        // Use isolated mode since all file ops go through the composite backend
-        let config = KaishConfig::isolated()
-            .with_cwd(std::path::PathBuf::from("/docs"));
+        let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
+        let git_fs = Arc::new(GitFilesystem::new(git_backend.clone()));
 
-        // Create kaish kernel with our composite backend and /v/* virtual path support
-        // This enables /v/jobs for job observability (agents can monitor cargo builds)
-        let kaish_kernel = KaishKernel::with_backend_and_virtual_paths(composite, config)?;
+        // Start in /v/docs — the CRDT block namespace
+        let config = KaishConfig::isolated()
+            .with_cwd(std::path::PathBuf::from("/v/docs"));
+
+        let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
+            vfs.mount_arc("/v/docs", docs_fs);
+            vfs.mount_arc("/v/g", git_fs);
+        })?;
 
         Ok(Self {
             kernel: kaish_kernel,
