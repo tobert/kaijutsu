@@ -1017,6 +1017,88 @@ impl KernelHandle {
         }
         Ok(result.get_success())
     }
+
+    // =========================================================================
+    // Shell Variable Introspection
+    // =========================================================================
+
+    /// Get a shell variable by name.
+    pub async fn get_shell_var(&self, name: &str) -> Result<(Option<ShellValue>, bool), RpcError> {
+        let mut request = self.kernel.get_shell_var_request();
+        request.get().set_name(name);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        let found = result.get_found();
+        if found {
+            let value = read_shell_value(result.get_value()?)?;
+            Ok((Some(value), true))
+        } else {
+            Ok((None, false))
+        }
+    }
+
+    /// Set a shell variable.
+    pub async fn set_shell_var(&self, name: &str, value: &ShellValue) -> Result<(), RpcError> {
+        let mut request = self.kernel.set_shell_var_request();
+        request.get().set_name(name);
+        write_shell_value(request.get().init_value(), value);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_success() {
+            let error = result.get_error()?.to_str()?;
+            if !error.is_empty() {
+                return Err(RpcError::ServerError(error.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// List all shell variables with their values.
+    pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, RpcError> {
+        let request = self.kernel.list_shell_vars_request();
+        let response = request.send().promise.await?;
+        let vars = response.get()?.get_vars()?;
+
+        let mut result = Vec::with_capacity(vars.len() as usize);
+        for var in vars.iter() {
+            let name = var.get_name()?.to_string()?;
+            let value = read_shell_value(var.get_value()?)?;
+            result.push((name, value));
+        }
+        Ok(result)
+    }
+}
+
+/// Read a `ShellValue` from a Cap'n Proto reader.
+fn read_shell_value(reader: crate::kaijutsu_capnp::shell_value::Reader<'_>) -> Result<ShellValue, RpcError> {
+    use crate::kaijutsu_capnp::shell_value;
+    match reader.which().map_err(|e| RpcError::Capnp(e.into()))? {
+        shell_value::Null(()) => Ok(ShellValue::Null),
+        shell_value::Bool(b) => Ok(ShellValue::Bool(b)),
+        shell_value::Int(i) => Ok(ShellValue::Int(i)),
+        shell_value::Float(f) => Ok(ShellValue::Float(f)),
+        shell_value::String(s) => Ok(ShellValue::String(s?.to_string()?)),
+        shell_value::Json(j) => {
+            let json_str = j?.to_str()?;
+            let parsed: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| RpcError::ServerError(format!("invalid JSON: {}", e)))?;
+            Ok(ShellValue::Json(parsed))
+        }
+        shell_value::Blob(b) => Ok(ShellValue::Blob(b?.to_string()?)),
+    }
+}
+
+/// Write a `ShellValue` into a Cap'n Proto builder.
+fn write_shell_value(mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_>, value: &ShellValue) {
+    match value {
+        ShellValue::Null => builder.set_null(()),
+        ShellValue::Bool(b) => builder.set_bool(*b),
+        ShellValue::Int(i) => builder.set_int(*i),
+        ShellValue::Float(f) => builder.set_float(*f),
+        ShellValue::String(s) => builder.set_string(s),
+        ShellValue::Json(j) => builder.set_json(&serde_json::to_string(j).unwrap_or_default()),
+        ShellValue::Blob(b) => builder.set_blob(b),
+    }
 }
 
 // ============================================================================
@@ -1404,6 +1486,20 @@ pub enum ClientToolFilter {
     AllowList(Vec<String>),
     /// All except these tools available
     DenyList(Vec<String>),
+}
+
+/// Shell variable value (mirrors kaish `ast::Value`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShellValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    /// JSON-serialized structured data.
+    Json(serde_json::Value),
+    /// Blob reference path.
+    Blob(String),
 }
 
 // ============================================================================

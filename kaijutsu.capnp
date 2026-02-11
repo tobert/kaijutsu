@@ -141,6 +141,25 @@ struct ShellExecResult {
   hint @5 :Text;            # JSON-encoded DisplayHint for tables/trees
 }
 
+# Shell variable value (mirrors kaish ast::Value)
+struct ShellValue {
+  union {
+    null @0 :Void;
+    bool @1 :Bool;
+    int @2 :Int64;
+    float @3 :Float64;
+    string @4 :Text;
+    json @5 :Text;       # serde_json::Value serialized
+    blob @6 :Text;       # BlobRef path
+  }
+}
+
+# Shell variable name + value pair
+struct ShellVar {
+  name @0 :Text;
+  value @1 :ShellValue;
+}
+
 # Reference to binary data in blob storage (/v/blobs/{id})
 struct BlobRef {
   id @0 :Text;              # Unique blob identifier
@@ -544,6 +563,19 @@ interface Kernel {
 
   # Set tool filter configuration
   setToolFilter @87 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
+
+  # ============================================================================
+  # Shell Variable Introspection (kaish scope)
+  # ============================================================================
+
+  # Get a shell variable by name
+  getShellVar @88 (name :Text) -> (value :ShellValue, found :Bool);
+
+  # Set a shell variable
+  setShellVar @89 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+
+  # List all shell variables
+  listShellVars @90 () -> (vars :List(ShellVar));
 }
 
 # ============================================================================

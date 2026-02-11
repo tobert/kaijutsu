@@ -25,10 +25,9 @@ kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 # Kaijutsu RPC client
 kaijutsu-client = { path = "crates/kaijutsu-client" }
 
-# Kaish (execution engine + client)
-kaish-kernel = "0.1"
-kaish-client = "0.1"
-kaish-glob = "0.1"
+# Kaish (execution engine + client) — path deps for latest unreleased changes
+kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
+kaish-glob = { path = "../kaish/crates/kaish-glob" }
 
 # Cap'n Proto
 capnp = "0.25"

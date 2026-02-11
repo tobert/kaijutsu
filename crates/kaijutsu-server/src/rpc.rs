@@ -4691,6 +4691,163 @@ impl kernel::Server for KernelImpl {
             Ok(())
         })
     }
+
+    // =========================================================================
+    // Shell Variable Introspection
+    // =========================================================================
+
+    fn get_shell_var(
+        self: Rc<Self>,
+        params: kernel::GetShellVarParams,
+        mut results: kernel::GetShellVarResults,
+    ) -> Promise<(), capnp::Error> {
+        let name = match params.get().and_then(|p| p.get_name()) {
+            Ok(n) => match n.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid name: {}", e))),
+            },
+            Err(e) => return Promise::err(capnp::Error::failed(format!("missing name: {}", e))),
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let value = kaish.get_var(&name).await;
+            let mut builder = results.get();
+            if let Some(val) = value {
+                builder.set_found(true);
+                value_to_shell_value(builder.init_value(), &val);
+            } else {
+                builder.set_found(false);
+            }
+            Ok(())
+        })
+    }
+
+    fn set_shell_var(
+        self: Rc<Self>,
+        params: kernel::SetShellVarParams,
+        mut results: kernel::SetShellVarResults,
+    ) -> Promise<(), capnp::Error> {
+        let reader = pry!(params.get());
+        let name = pry!(pry!(reader.get_name()).to_str()).to_owned();
+        let value_reader = pry!(reader.get_value());
+        let value = match shell_value_to_value(value_reader) {
+            Ok(v) => v,
+            Err(e) => {
+                return Promise::ok({
+                    results.get().set_success(false);
+                    results.get().set_error(&format!("invalid value: {}", e));
+                });
+            }
+        };
+
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            kaish.set_var(&name, value).await;
+            results.get().set_success(true);
+            results.get().set_error("");
+            Ok(())
+        })
+    }
+
+    fn list_shell_vars(
+        self: Rc<Self>,
+        _params: kernel::ListShellVarsParams,
+        mut results: kernel::ListShellVarsResults,
+    ) -> Promise<(), capnp::Error> {
+        let state = self.state.clone();
+        let kernel_id = self.kernel_id.clone();
+
+        Promise::from_future(async move {
+            let kaish = {
+                let state_ref = state.borrow();
+                let kernel = state_ref.kernels.get(&kernel_id)
+                    .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
+                kernel.kaish.clone()
+                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+            };
+
+            let var_names = kaish.list_vars().await;
+            let mut list_builder = results.get().init_vars(var_names.len() as u32);
+
+            for (i, name) in var_names.iter().enumerate() {
+                let mut entry = list_builder.reborrow().get(i as u32);
+                entry.set_name(name);
+
+                // Fetch each variable's value for the full listing
+                if let Some(val) = kaish.get_var(name).await {
+                    value_to_shell_value(entry.init_value(), &val);
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+// ============================================================================
+// Shell Value Conversion Helpers
+// ============================================================================
+
+/// Convert kaish `ast::Value` → Cap'n Proto `ShellValue` builder.
+fn value_to_shell_value(mut builder: shell_value::Builder<'_>, value: &kaish_kernel::ast::Value) {
+    use kaish_kernel::ast::Value;
+    match value {
+        Value::Null => builder.set_null(()),
+        Value::Bool(b) => builder.set_bool(*b),
+        Value::Int(i) => builder.set_int(*i),
+        Value::Float(f) => builder.set_float(*f),
+        Value::String(s) => builder.set_string(s),
+        Value::Json(j) => builder.set_json(&serde_json::to_string(j).unwrap_or_default()),
+        Value::Blob(b) => builder.set_blob(&b.id),
+    }
+}
+
+/// Convert Cap'n Proto `ShellValue` reader → kaish `ast::Value`.
+fn shell_value_to_value(reader: shell_value::Reader<'_>) -> Result<kaish_kernel::ast::Value, capnp::Error> {
+    use kaish_kernel::ast::Value;
+    match reader.which()? {
+        shell_value::Null(()) => Ok(Value::Null),
+        shell_value::Bool(b) => Ok(Value::Bool(b)),
+        shell_value::Int(i) => Ok(Value::Int(i)),
+        shell_value::Float(f) => Ok(Value::Float(f)),
+        shell_value::String(s) => Ok(Value::String(s?.to_str()?.to_owned())),
+        shell_value::Json(j) => {
+            let json_str = j?.to_str()?;
+            let parsed: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| capnp::Error::failed(format!("invalid JSON: {}", e)))?;
+            Ok(Value::Json(parsed))
+        }
+        shell_value::Blob(b) => {
+            let id = b?.to_str()?.to_owned();
+            Ok(Value::Blob(kaish_kernel::ast::BlobRef {
+                id,
+                size: 0,
+                content_type: String::new(),
+                hash: None,
+            }))
+        }
+    }
 }
 
 // ============================================================================

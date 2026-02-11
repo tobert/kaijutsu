@@ -8,7 +8,6 @@ pub mod constants;
 pub mod context_engine;
 pub mod embedded_kaish;
 pub mod git_backend;
-pub mod kaish;
 pub mod kaish_backend;
 pub mod rpc;
 pub mod ssh;
@@ -27,7 +26,6 @@ pub use git_backend::{
     GitCrdtBackend, RepoConfig, ChangeAttribution,
     FileChangeEvent, FileChangeKind, WatcherHandle,
 };
-pub use kaish::KaishProcess;
 pub use kaish_backend::KaijutsuBackend;
 pub use rpc::WorldImpl;
 pub use ssh::{KeySource, SshServer, SshServerConfig};

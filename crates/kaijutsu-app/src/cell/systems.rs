@@ -3320,9 +3320,13 @@ pub fn handle_compose_block_input(
 }
 
 /// Sync ComposeBlock text to its MsdfTextBuffer.
+///
+/// In shell mode, runs kaish syntax validation on each keystroke and tints
+/// text red for invalid syntax (but not for incomplete input like `if`).
 pub fn sync_compose_block_buffer(
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
+    mode: Res<CurrentMode>,
     mut compose_blocks: Query<(&ComposeBlock, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), Changed<ComposeBlock>>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -3342,6 +3346,13 @@ pub fn sync_compose_block_buffer(
         // Set glyph color from theme before shaping (color bakes into glyphs)
         let color = if compose.is_empty() {
             theme.fg_dim // Placeholder is dimmed
+        } else if matches!(mode.0, EditorMode::Input(InputKind::Shell)) {
+            let validation = crate::kaish::validate(&compose.text);
+            if !validation.valid && !validation.incomplete {
+                theme.block_tool_error // Red tint for syntax errors
+            } else {
+                theme.block_user
+            }
         } else {
             theme.block_user // User input color
         };
