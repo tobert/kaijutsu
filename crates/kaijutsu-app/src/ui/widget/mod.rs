@@ -240,7 +240,6 @@ impl Plugin for WidgetPlugin {
             .register_type::<Widget>()
             .register_type::<DockContainer>()
             .register_type::<WidgetConfig>()
-            .add_systems(Startup, setup_dock_containers)
             .add_systems(
                 Update,
                 (
@@ -258,57 +257,6 @@ impl Plugin for WidgetPlugin {
 // ============================================================================
 // SYSTEMS
 // ============================================================================
-
-/// Spawn dock containers for each edge.
-///
-/// Dock containers are flex containers that hold widgets for their edge.
-/// North/South use horizontal (Row) layout, East/West use vertical (Column).
-fn setup_dock_containers(mut commands: Commands, theme: Res<Theme>) {
-    // North dock - header area
-    commands.spawn((
-        DockContainer { edge: Edge::North },
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(0.0),
-            left: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Auto,
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-            border: UiRect::bottom(Val::Px(1.0)),
-            ..default()
-        },
-        BorderColor::all(theme.border),
-        ZIndex(crate::constants::ZLayer::HUD),
-    ));
-
-    // South dock - status bar area (now at bottom edge)
-    commands.spawn((
-        DockContainer { edge: Edge::South },
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(0.0),
-            left: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Auto,
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
-            border: UiRect::top(Val::Px(1.0)),
-            ..default()
-        },
-        BorderColor::all(theme.border),
-        ZIndex(crate::constants::ZLayer::HUD),
-    ));
-
-    // East dock - right sidebar (future)
-    // West dock - left sidebar (future)
-
-    info!("Spawned dock containers: North, South");
-}
 
 /// Spawn initial widgets from configuration.
 fn spawn_initial_widgets(

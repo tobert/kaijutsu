@@ -164,41 +164,53 @@ fn setup_ui(
     theme: Res<ui::theme::Theme>,
 ) {
     // Root container - fills window, flex column layout
+    // Docks are flex-flow children so content area naturally excludes them.
     commands
         .spawn((
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                // Padding for widget docks
-                padding: UiRect {
-                    top: Val::Px(constants::NORTH_DOCK_CLEARANCE),
-                    bottom: Val::Px(constants::SOUTH_DOCK_CLEARANCE),
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                },
                 ..default()
             },
         ))
         .with_children(|root| {
             // ═══════════════════════════════════════════════════════════════
-            // HEADER CONTAINER (minimal - just for seat selector attachment)
-            // Actual header content is in North dock widgets
+            // NORTH DOCK (flex-flow, natural height)
+            // Widget system populates via spawn_initial_widgets
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
-                HeaderContainer,
+                ui::widget::DockContainer { edge: ui::widget::Edge::North },
                 Node {
                     width: Val::Percent(100.0),
-                    height: Val::Px(0.0), // Zero height - just an attachment point
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(6.0),
-                    right: Val::Px(16.0),
+                    height: Val::Auto,
                     flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::FlexEnd,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
+                    border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
-                ZIndex(constants::ZLayer::HUD + 1), // Above North dock
-            ));
+                BorderColor::all(theme.border),
+                ZIndex(constants::ZLayer::HUD),
+            ))
+            .with_children(|north| {
+                // HEADER CONTAINER (minimal - just for seat selector attachment)
+                north.spawn((
+                    HeaderContainer,
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(0.0), // Zero height - just an attachment point
+                        position_type: PositionType::Absolute,
+                        top: Val::Px(6.0),
+                        right: Val::Px(16.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::FlexEnd,
+                        ..default()
+                    },
+                    ZIndex(constants::ZLayer::HUD + 1), // Above North dock
+                ));
+            });
 
             // ═══════════════════════════════════════════════════════════════
             // CONTENT AREA (state-driven, Z-LAYER 10)
@@ -247,6 +259,26 @@ fn setup_ui(
                     Visibility::Hidden, // Hidden by default (glyphon needs this too)
                 ));
             });
+
+            // ═══════════════════════════════════════════════════════════════
+            // SOUTH DOCK (flex-flow, natural height)
+            // Widget system populates via spawn_initial_widgets
+            // ═══════════════════════════════════════════════════════════════
+            root.spawn((
+                ui::widget::DockContainer { edge: ui::widget::Edge::South },
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Auto,
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
+                    border: UiRect::top(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor::all(theme.border),
+                ZIndex(constants::ZLayer::HUD),
+            ));
         });
 }
 

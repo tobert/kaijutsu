@@ -2724,6 +2724,8 @@ pub fn apply_block_cell_positions(
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
+    mut prev_visible_top: Local<f32>,
+    mut prev_visible_bottom: Local<f32>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -2733,24 +2735,10 @@ pub fn apply_block_cell_positions(
         return;
     };
 
-    // === Performance optimization: skip if nothing changed ===
-    let layout_changed = layout_gen.0 != *last_applied_gen;
-    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
-    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
-
-    if !layout_changed && !scroll_changed {
-        // Neither layout nor scroll changed - skip position updates
-        return;
-    }
-
-    // Record current state for next frame comparison
-    *last_applied_gen = layout_gen.0;
-    *prev_scroll = scroll_state.offset;
-    // === End performance optimization ===
-
     // Derive visible bounds from the DagView's actual computed layout.
     // This respects the flex layout (North dock, ComposeBlock, South dock)
     // instead of relying on hardcoded constants that drift out of sync.
+    // Computed BEFORE the early-return guard so bounds changes are always detected.
     let Ok((node, transform)) = dag_view.single() else {
         warn!("apply_block_cell_positions: DagView (ConversationContainer) not found");
         return;
@@ -2759,6 +2747,24 @@ pub fn apply_block_cell_positions(
     let content = node.content_box();
     let visible_top = translation.y + content.min.y;
     let visible_bottom = translation.y + content.max.y;
+
+    // === Performance optimization: skip if nothing changed ===
+    let layout_changed = layout_gen.0 != *last_applied_gen;
+    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
+    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
+    let bounds_changed = (visible_top - *prev_visible_top).abs() >= 1.0
+        || (visible_bottom - *prev_visible_bottom).abs() >= 1.0;
+
+    if !layout_changed && !scroll_changed && !bounds_changed {
+        return;
+    }
+
+    // Record current state for next frame comparison
+    *last_applied_gen = layout_gen.0;
+    *prev_scroll = scroll_state.offset;
+    *prev_visible_top = visible_top;
+    *prev_visible_bottom = visible_bottom;
+    // === End performance optimization ===
     let base_width = content.width();
     let visible_height = (visible_bottom - visible_top).max(100.0);
     let margin = layout.workspace_margin_left;

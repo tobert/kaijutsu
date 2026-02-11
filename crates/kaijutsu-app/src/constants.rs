@@ -10,11 +10,6 @@ pub const DEFAULT_KERNEL_ID: &str = "lobby";
 pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 
-/// Space reserved for the North dock (header bar).
-pub const NORTH_DOCK_CLEARANCE: f32 = 48.0;
-/// Space reserved for the South dock (status bar).
-pub const SOUTH_DOCK_CLEARANCE: f32 = 32.0;
-
 // ============================================================================
 // Z-INDEX LAYERS
 // ============================================================================
