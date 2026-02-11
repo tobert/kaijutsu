@@ -31,6 +31,7 @@ pub enum CellPhase {
     Layout,
 }
 
+use crate::ui::tiling_reconciler::TilingPhase;
 use super::components::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState, CurrentMode,
@@ -73,7 +74,8 @@ impl Plugin for CellPlugin {
         app.configure_sets(
             Update,
             (
-                CellPhase::Input,
+                // Cell systems run after tiling reconciler has spawned/updated entities
+                CellPhase::Input.after(TilingPhase::PostReconcile),
                 CellPhase::Sync.after(CellPhase::Input),
                 CellPhase::Spawn.after(CellPhase::Sync),
                 CellPhase::Buffer.after(CellPhase::Spawn),

@@ -94,14 +94,9 @@ pub fn reconcile_tiling_tree(
     let Ok(root_entity) = tiling_root.single() else {
         return;
     };
-    let Ok((conv_root_entity, conv_children)) = conversation_root.single() else {
+    let Ok((conv_root_entity, _conv_children)) = conversation_root.single() else {
         return;
     };
-
-    // Check if conversation root already has children (avoid double-spawn)
-    let conv_has_children = conv_children
-        .map(|c| !c.is_empty())
-        .unwrap_or(false);
 
     // ── Save compose state before despawn ─────────────────────────────
     let saved_compose: std::collections::HashMap<PaneId, (String, usize)> = if state.initialized {
@@ -131,9 +126,7 @@ pub fn reconcile_tiling_tree(
     // SPAWN CONVERSATION CONTENT from TilingTree
     // ════════════════════════════════════════════════════════════════════
 
-    if !conv_has_children || state.initialized {
-        spawn_conversation_content(&mut commands, &tree, &theme, conv_root_entity, &saved_compose);
-    }
+    spawn_conversation_content(&mut commands, &tree, &theme, conv_root_entity, &saved_compose);
 
     state.last_structural_gen = tree.structural_gen;
     state.last_visual_gen = tree.visual_gen;
@@ -231,7 +224,11 @@ fn spawn_content_subtree(
                 .spawn((
                     PaneMarker {
                         pane_id: *id,
-                        content: PaneContent::Spacer, // Split containers don't have content
+                        // Split containers use Spacer as a stand-in — they don't have
+                        // meaningful content of their own. No code queries by Spacer to
+                        // find splits specifically, so a dedicated SplitContainer variant
+                        // isn't worth the match-arm cost.
+                        content: PaneContent::Spacer,
                     },
                     *id,
                     Node {
@@ -922,7 +919,7 @@ pub fn assign_mru_to_empty_panes(
 /// `Reconcile` runs the entity rebuild + ApplyDeferred so deferred commands
 /// (spawn/despawn) are flushed before `PostReconcile` systems query the world.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
-enum TilingPhase {
+pub enum TilingPhase {
     Reconcile,
     PostReconcile,
 }

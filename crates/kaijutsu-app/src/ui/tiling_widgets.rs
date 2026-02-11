@@ -100,17 +100,27 @@ pub fn update_connection_widget(
     }
 }
 
+/// Marker for auxiliary badge strip entities (overflow "+N", staged count)
+/// that should be despawned on structural badge changes but aren't ContextBadges.
+#[derive(Component)]
+pub struct BadgeAuxiliary;
+
 /// Update contexts widget when DriftState or DocumentCache changes.
 ///
 /// Shows MRU context badges from DocumentCache as clickable children, with
 /// active context highlighted. Falls back to drift state for single-text.
+///
+/// Uses diff-based updates: when only the active highlight changes (same set
+/// of context names), updates text/color in-place to preserve Interaction state.
+/// Full respawn only happens when the badge set membership changes.
 pub fn update_contexts_widget(
     mut commands: Commands,
     drift_state: Res<DriftState>,
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     widget_panes: Query<(Entity, &WidgetPaneText, &Children)>,
-    existing_badges: Query<Entity, With<ContextBadge>>,
+    existing_badges: Query<(Entity, &ContextBadge, Option<&Children>)>,
+    aux_entities: Query<Entity, With<BadgeAuxiliary>>,
     mut texts: Query<&mut MsdfUiText>,
 ) {
     if !drift_state.is_changed() && !doc_cache.is_changed() {
@@ -127,7 +137,10 @@ pub fn update_contexts_widget(
 
     // If there's an active notification, show as single text (despawn badges)
     if let Some(ref notif) = drift_state.notification {
-        for entity in existing_badges.iter() {
+        for (entity, _, _) in existing_badges.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in aux_entities.iter() {
             commands.entity(entity).despawn();
         }
         for child in widget_children.iter() {
@@ -150,86 +163,144 @@ pub fn update_contexts_widget(
             }
         }
 
-        // Despawn old badges
-        for entity in existing_badges.iter() {
-            commands.entity(entity).despawn();
-        }
-
-        // Spawn new badges
         let max_display = 5;
-        for (i, doc_id) in mru_ids.iter().enumerate() {
-            if i >= max_display {
-                let remaining = mru_ids.len() - max_display;
-                let overflow = commands
-                    .spawn(Node {
-                        padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
-                        ..default()
-                    })
+
+        // Build desired badge list: (context_name, short_label, is_active)
+        let desired: Vec<(String, String, bool)> = mru_ids
+            .iter()
+            .take(max_display)
+            .map(|doc_id| {
+                let ctx_name = doc_cache
+                    .get(doc_id)
+                    .map(|c| c.context_name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                let is_active = active_doc_id == Some(doc_id.as_str());
+                let short = if ctx_name.len() > 12 {
+                    ctx_name[..12].to_string()
+                } else {
+                    ctx_name.clone()
+                };
+                (ctx_name, short, is_active)
+            })
+            .collect();
+
+        // Collect existing badge names for set comparison
+        let existing_names: std::collections::HashSet<&str> = existing_badges
+            .iter()
+            .map(|(_, badge, _)| badge.context_name.as_str())
+            .collect();
+        let desired_names: std::collections::HashSet<&str> = desired
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+
+        let same_membership = existing_names == desired_names
+            && existing_names.len() == desired.len();
+
+        if same_membership {
+            // Fast path: same set of contexts — update text/color in-place
+            for (_, badge, badge_children) in existing_badges.iter() {
+                let Some((_, short, is_active)) = desired.iter().find(|(name, _, _)| *name == badge.context_name) else {
+                    continue;
+                };
+                let label = if *is_active {
+                    format!("[{}]", short)
+                } else {
+                    short.clone()
+                };
+                let color = if *is_active { theme.accent } else { theme.fg_dim };
+
+                if let Some(children) = badge_children {
+                    for child in children.iter() {
+                        if let Ok(mut msdf_text) = texts.get_mut(child) {
+                            msdf_text.text = label.clone();
+                            msdf_text.color = bevy_to_rgba8(color);
+                        }
+                    }
+                }
+            }
+
+            // Update auxiliary entities (overflow, staged) — despawn and rebuild
+            for entity in aux_entities.iter() {
+                commands.entity(entity).despawn();
+            }
+        } else {
+            // Slow path: membership changed — full rebuild
+            for (entity, _, _) in existing_badges.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in aux_entities.iter() {
+                commands.entity(entity).despawn();
+            }
+
+            for (ctx_name, short, is_active) in &desired {
+                let label = if *is_active {
+                    format!("[{}]", short)
+                } else {
+                    short.clone()
+                };
+                let color = if *is_active { theme.accent } else { theme.fg_dim };
+
+                let badge = commands
+                    .spawn((
+                        ContextBadge {
+                            context_name: ctx_name.clone(),
+                        },
+                        Node {
+                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                            ..default()
+                        },
+                        Interaction::None,
+                    ))
                     .with_children(|parent| {
                         parent.spawn((
-                            MsdfUiText::new(&format!("+{}", remaining))
+                            MsdfUiText::new(&label)
                                 .with_font_size(11.0)
-                                .with_color(theme.fg_dim),
+                                .with_color(color),
                             UiTextPositionCache::default(),
                             Node::default(),
                         ));
                     })
                     .id();
-                commands.entity(widget_entity).add_child(overflow);
-                break;
+                commands.entity(widget_entity).add_child(badge);
             }
+        }
 
-            let ctx_name = doc_cache
-                .get(doc_id)
-                .map(|c| c.context_name.as_str())
-                .unwrap_or("?");
-
-            let short = if ctx_name.len() > 12 {
-                &ctx_name[..12]
-            } else {
-                ctx_name
-            };
-
-            let is_active = active_doc_id == Some(doc_id.as_str());
-            let label = if is_active {
-                format!("[{}]", short)
-            } else {
-                short.to_string()
-            };
-            let color = if is_active { theme.accent } else { theme.fg_dim };
-
-            let badge = commands
+        // Overflow indicator
+        if mru_ids.len() > max_display {
+            let remaining = mru_ids.len() - max_display;
+            let overflow = commands
                 .spawn((
-                    ContextBadge {
-                        context_name: ctx_name.to_string(),
-                    },
+                    BadgeAuxiliary,
                     Node {
-                        padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
                         ..default()
                     },
-                    Interaction::None,
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        MsdfUiText::new(&label)
+                        MsdfUiText::new(&format!("+{}", remaining))
                             .with_font_size(11.0)
-                            .with_color(color),
+                            .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),
                         Node::default(),
                     ));
                 })
                 .id();
-            commands.entity(widget_entity).add_child(badge);
+            commands.entity(widget_entity).add_child(overflow);
         }
 
-        // Append staged count
+        // Staged count
         let staged = drift_state.staged_count();
         if staged > 0 {
             let staged_text = commands
-                .spawn(Node {
-                    padding: UiRect::left(Val::Px(8.0)),
-                    ..default()
-                })
+                .spawn((
+                    BadgeAuxiliary,
+                    Node {
+                        padding: UiRect::left(Val::Px(8.0)),
+                        ..default()
+                    },
+                ))
                 .with_children(|parent| {
                     parent.spawn((
                         MsdfUiText::new(&format!("·{} staged", staged))
@@ -246,7 +317,10 @@ pub fn update_contexts_widget(
     }
 
     // No cached docs — despawn badges and fall back to single text
-    for entity in existing_badges.iter() {
+    for (entity, _, _) in existing_badges.iter() {
+        commands.entity(entity).despawn();
+    }
+    for entity in aux_entities.iter() {
         commands.entity(entity).despawn();
     }
 

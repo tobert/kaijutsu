@@ -221,126 +221,6 @@ pub fn handle_mode_switch(
     }
 }
 
-/// Handle keyboard input for the focused cell (CellEditor-based cells only).
-///
-/// Note: ComposeBlock has its own input handling in handle_compose_block_input.
-/// This system handles input for CellEditor-based entities like BlockCells in edit mode.
-pub fn handle_cell_input(
-    mut key_events: MessageReader<KeyboardInput>,
-    focus: Res<FocusTarget>,
-    mode: Res<CurrentMode>,
-    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
-    consumed: Res<ConsumedModeKeys>,
-    mut editors: Query<&mut CellEditor>,
-) {
-    // Skip when a modal dialog is open to prevent input leakage
-    if modal_open.is_some_and(|m| m.0) {
-        for _ in key_events.read() {} // Consume events
-        return;
-    }
-
-    let Some(focused_entity) = focus.entity else {
-        return;
-    };
-
-    let Ok(mut editor) = editors.get_mut(focused_entity) else {
-        return;
-    };
-
-    // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
-    // This prevents the mode-switch key from being inserted as text
-    if mode.is_changed() {
-        return;
-    }
-
-    // Only handle text input in Chat/Shell mode
-    if !mode.0.accepts_input() {
-        // In Normal mode, handle navigation with h/j/k/l
-        if mode.0 == EditorMode::Normal {
-            for event in key_events.read() {
-                if !event.state.is_pressed() {
-                    continue;
-                }
-                // Skip keys consumed by mode switching
-                if consumed.0.contains(&event.key_code) {
-                    continue;
-                }
-                match event.key_code {
-                    KeyCode::KeyH | KeyCode::ArrowLeft => editor.move_left(),
-                    KeyCode::KeyL | KeyCode::ArrowRight => editor.move_right(),
-                    KeyCode::Home | KeyCode::Digit0 => editor.move_home(),
-                    KeyCode::End | KeyCode::Digit4 if event.text.as_deref() == Some("$") => {
-                        editor.move_end()
-                    }
-                    _ => {}
-                }
-            }
-        }
-        return;
-    }
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Skip keys consumed by mode switching (e.g., 'i' to enter insert)
-        if consumed.0.contains(&event.key_code) {
-            continue;
-        }
-
-        // Handle special keys first (before text input)
-        // These may have text fields set but should be handled specially
-        match event.key_code {
-            KeyCode::Backspace => {
-                editor.backspace();
-                continue;
-            }
-            KeyCode::Delete => {
-                editor.delete();
-                continue;
-            }
-            KeyCode::Enter => {
-                // Enter inserts newline in CellEditor-based editing
-                editor.insert("\n");
-                continue;
-            }
-            KeyCode::Tab => {
-                editor.insert("    ");
-                continue;
-            }
-            KeyCode::ArrowLeft => {
-                editor.move_left();
-                continue;
-            }
-            KeyCode::ArrowRight => {
-                editor.move_right();
-                continue;
-            }
-            KeyCode::Home => {
-                editor.move_home();
-                continue;
-            }
-            KeyCode::End => {
-                editor.move_end();
-                continue;
-            }
-            _ => {}
-        }
-
-        // Handle text input via the text field
-        if let Some(ref text) = event.text {
-            for c in text.chars() {
-                // Skip control characters
-                if c.is_control() {
-                    continue;
-                }
-                editor.insert(&c.to_string());
-            }
-        }
-    }
-}
-
 /// Initialize MsdfTextBuffer for cells that don't have one yet.
 pub fn init_cell_buffers(
     mut commands: Commands,
@@ -3271,7 +3151,6 @@ pub fn handle_compose_block_input(
 
     // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
     // This prevents the mode-switch key from being inserted as text
-    // (Same guard as handle_cell_input)
     if mode.is_changed() {
         return;
     }

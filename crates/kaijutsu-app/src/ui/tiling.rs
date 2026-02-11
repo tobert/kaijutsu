@@ -575,6 +575,12 @@ impl TilingTree {
             return None;
         }
 
+        // Normalize ratios for the inline case (ensures content ratios sum to 1.0).
+        // Safe to call unconditionally — the wrapper case already has [0.5, 0.5].
+        if let Some(TileNode::Split { ratios, .. }) = self.root.find_mut(grandparent_id) {
+            normalize_ratios(ratios);
+        }
+
         self.bump_structural();
         Some(new_conv_id)
     }
@@ -631,9 +637,12 @@ impl TilingTree {
         // Collapse single-child splits
         self.collapse_single_child_splits();
 
-        // Update focus
-        if let Some(new_target) = new_focus {
-            self.focus(new_target);
+        // Update focus inline (avoids double visual_gen bump from self.focus())
+        if let Some(new_target) = new_focus
+            && self.focused != new_target
+        {
+            self.previous_focused = Some(self.focused);
+            self.focused = new_target;
         }
         self.bump_structural();
         true
@@ -646,17 +655,17 @@ impl TilingTree {
     /// in the same split or groups in different splits.
     #[allow(dead_code)] // Phase 2: Mod+Shift+hjkl will wire this up
     pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
-        // Find both conversation groups
-        let Some((group_a_parent, idx_a)) = self.root.find_parent(a) else {
+        // Find both nodes' parents
+        let Some((parent_a, idx_a)) = self.root.find_parent(a) else {
             return false;
         };
-        let Some((group_b_parent, idx_b)) = self.root.find_parent(b) else {
+        let Some((parent_b, idx_b)) = self.root.find_parent(b) else {
             return false;
         };
 
-        if group_a_parent == group_b_parent {
+        if parent_a == parent_b {
             // Siblings: swap in place within the same children vec
-            let parent = match self.root.find_mut(group_a_parent) {
+            let parent = match self.root.find_mut(parent_a) {
                 Some(p) => p,
                 None => return false,
             };
@@ -671,20 +680,39 @@ impl TilingTree {
                 return false;
             }
         } else {
-            // Different parents: clone both groups, then cross-assign
-            let group_a = self.root.find(a).cloned();
-            let group_b = self.root.find(b).cloned();
-            let (Some(ga), Some(gb)) = (group_a, group_b) else {
-                return false;
+            // Different parents: clone both nodes, then replace via parents.
+            // We must not use find_mut(b) after mutating a's slot, because
+            // find_mut does DFS and could match the node we just placed.
+            let node_a = match self.root.find(a) {
+                Some(n) => n.clone(),
+                None => return false,
+            };
+            let node_b = match self.root.find(b) {
+                Some(n) => n.clone(),
+                None => return false,
             };
 
-            // Replace a's slot with b's content (keeping b's PaneId)
-            if let Some(slot_a) = self.root.find_mut(a) {
-                *slot_a = gb;
+            // Replace a's slot with b's clone via parent_a
+            if let Some(TileNode::Split { children, .. }) = self.root.find_mut(parent_a) {
+                if idx_a < children.len() {
+                    children[idx_a] = node_b;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
             }
-            // Replace b's slot with a's content (keeping a's PaneId)
-            if let Some(slot_b) = self.root.find_mut(b) {
-                *slot_b = ga;
+
+            // Replace b's slot with a's clone via parent_b
+            // Safe: parent_a != parent_b, so the first mutation didn't affect parent_b's children
+            if let Some(TileNode::Split { children, .. }) = self.root.find_mut(parent_b) {
+                if idx_b < children.len() {
+                    children[idx_b] = node_a;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
             }
         }
 
@@ -829,11 +857,29 @@ impl TilingTree {
     // ════════════════════════════════════════════════════════════════════
 
     /// Find the best conversation pane to focus after closing `target`.
+    ///
+    /// Prefers a spatially adjacent pane (sibling in the same parent split),
+    /// trying the right neighbor first, then left. Falls back to the first
+    /// conversation in the tree if no sibling is found.
     fn find_close_target(&self, target: PaneId) -> Option<PaneId> {
-        // Try focus_direction right, then left, then first conversation
-        let convs = self.root.conversation_panes();
-        // Find a neighbor that isn't the target
-        convs
+        // Try neighbor in same parent split
+        if let Some((conv_group_id, _)) = self.root.find_parent(target)
+            && let Some((parent_id, group_idx)) = self.root.find_parent(conv_group_id)
+            && let Some(TileNode::Split { children, .. }) = self.root.find(parent_id)
+        {
+            // Try right neighbor, then left
+            let candidates = [group_idx.wrapping_add(1), group_idx.wrapping_sub(1)];
+            for idx in candidates {
+                if let Some(conv) = children.get(idx).and_then(|c| c.first_conversation()) {
+                    if conv != target {
+                        return Some(conv);
+                    }
+                }
+            }
+        }
+        // Fallback: any conversation that isn't the target
+        self.root
+            .conversation_panes()
             .iter()
             .find(|(id, _)| *id != target)
             .map(|(id, _)| *id)
@@ -1371,5 +1417,79 @@ mod tests {
 
         tree.close(conv2);
         assert!(tree.structural_gen > s_before, "close should bump structural_gen");
+    }
+
+    // ── Swap tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn swap_cross_parent() {
+        // Create a layout with 3 panes: split conv1 horizontally, then split conv2 vertically
+        // This gives us panes in different parent Splits.
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        let conv3 = tree.split(conv2, SplitDirection::Column).unwrap();
+
+        // conv2 and conv3 share a parent (Column split), conv1 is in a different parent (Row split)
+        // Swap conv1 and conv3 (cross-parent)
+        let gen_before = tree.structural_gen;
+        assert!(tree.swap(conv1, conv3), "Cross-parent swap should succeed");
+        assert!(tree.structural_gen > gen_before, "Swap should bump structural_gen");
+
+        // After swap, both panes should still be findable in the tree
+        assert!(tree.root.find(conv1).is_some(), "conv1 should still exist after swap");
+        assert!(tree.root.find(conv3).is_some(), "conv3 should still exist after swap");
+        assert!(tree.root.find(conv2).is_some(), "conv2 should be unaffected");
+
+        // All three conversations should still exist
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 3, "Should still have 3 conversations after swap");
+
+        // All IDs should be unique (no corruption from DFS collision)
+        let mut ids = Vec::new();
+        tree.root.collect_ids(&mut ids);
+        let deduped: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), deduped.len(), "All PaneIds should remain unique after swap");
+    }
+
+    #[test]
+    fn swap_siblings() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+
+        assert!(tree.swap(conv1, conv2), "Sibling swap should succeed");
+
+        let convs = tree.root.conversation_panes();
+        assert_eq!(convs.len(), 2, "Should still have 2 conversations after swap");
+    }
+
+    // ── Close focuses neighbor test ───────────────────────────────────
+
+    #[test]
+    fn close_focuses_neighbor() {
+        // Create 3 panes in a row: conv1 | conv2 | conv3
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        let conv3 = tree.split(conv2, SplitDirection::Row).unwrap();
+
+        // Focus conv2 (middle pane), then close it
+        tree.focus(conv2);
+        assert!(tree.close(conv2));
+
+        // Focus should go to a spatial neighbor (conv3 right, or conv1 left),
+        // not just the first conversation in tree order
+        assert!(
+            tree.focused == conv1 || tree.focused == conv3,
+            "After closing middle pane, focus should go to a neighbor, got {}",
+            tree.focused
+        );
+
+        // Specifically, our implementation tries right neighbor first (conv3)
+        assert_eq!(
+            tree.focused, conv3,
+            "Should prefer right neighbor after close"
+        );
     }
 }

@@ -195,9 +195,13 @@ impl CellEditor {
 
     // =========================================================================
     // TEXT MUTATION
+    // (Currently unused — block cell input uses handle_block_cell_input which
+    //  operates on BlockEditCursor + BlockDocument directly. Kept as building
+    //  blocks for future CellEditor-based editing scenarios.)
     // =========================================================================
 
     /// Insert text at cursor position.
+    #[allow(dead_code)]
     pub fn insert(&mut self, text: &str) {
         // Ensure we have a block to insert into
         if self.cursor.block_id.is_none() {
@@ -221,6 +225,7 @@ impl CellEditor {
     }
 
     /// Delete character before cursor (backspace).
+    #[allow(dead_code)]
     pub fn backspace(&mut self) {
         if self.cursor.offset == 0 {
             return; // At start, nothing to delete
@@ -248,6 +253,7 @@ impl CellEditor {
     }
 
     /// Delete character at cursor (delete key).
+    #[allow(dead_code)]
     pub fn delete(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
@@ -274,6 +280,7 @@ impl CellEditor {
     // =========================================================================
 
     /// Move cursor left.
+    #[allow(dead_code)]
     pub fn move_left(&mut self) {
         if self.cursor.offset > 0
             && let Some(ref block_id) = self.cursor.block_id
@@ -288,6 +295,7 @@ impl CellEditor {
     }
 
     /// Move cursor right.
+    #[allow(dead_code)]
     pub fn move_right(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
@@ -303,6 +311,7 @@ impl CellEditor {
     }
 
     /// Move cursor to start of current block.
+    #[allow(dead_code)]
     pub fn move_home(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
@@ -314,6 +323,7 @@ impl CellEditor {
     }
 
     /// Move cursor to end of current line.
+    #[allow(dead_code)]
     pub fn move_end(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
             && let Some(block) = self.doc.get_block_snapshot(block_id) {
