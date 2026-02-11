@@ -812,7 +812,7 @@ impl Default for WorkspaceLayout {
             max_cell_height: 400.0,
             workspace_margin_left: 20.0,
             workspace_margin_top: 70.0, // Space for compact header
-            line_height: 22.5, // Match TextMetrics.cell_line_height for cursor alignment
+            line_height: 24.0, // Must match TextMetrics.cell_line_height for correct block sizing
             prompt_min_height: 50.0,
         }
     }

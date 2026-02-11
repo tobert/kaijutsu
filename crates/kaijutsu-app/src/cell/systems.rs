@@ -2790,11 +2790,30 @@ pub fn apply_block_cell_positions(
         config.top = content_top;
         config.scale = 1.0;
 
-        // Clamp bounds to intersection of visible area and block area
-        // This prevents text from rendering outside its block when partially scrolled
+        // Clamp bounds to intersection of visible area and block area.
+        // Snap to full line boundaries so partial lines aren't rendered at edges.
         let block_bottom = content_top + block_layout.height;
-        let clamped_top = visible_top.max(content_top).max(0.0);
-        let clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
+        let mut clamped_top = visible_top.max(content_top).max(0.0);
+        let mut clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
+
+        let lh = layout.line_height;
+        // Bottom edge: snap UP to last full line boundary within the block
+        if block_bottom > visible_bottom && lh > 0.0 {
+            let full_lines = ((clamped_bottom - content_top) / lh).floor();
+            let snapped = content_top + full_lines * lh;
+            if snapped > clamped_top + 1.0 {
+                clamped_bottom = snapped;
+            }
+        }
+        // Top edge: snap DOWN to next full line boundary within the block
+        if content_top < visible_top && lh > 0.0 {
+            let hidden = (clamped_top - content_top) / lh;
+            let snapped = content_top + hidden.ceil() * lh;
+            if snapped < clamped_bottom - 1.0 {
+                clamped_top = snapped;
+            }
+        }
+
         config.bounds = crate::text::TextBounds {
             left: left as i32,
             top: clamped_top as i32,
@@ -2811,8 +2830,25 @@ pub fn apply_block_cell_positions(
 
         let content_top = visible_top + header_layout.y_offset - scroll_offset;
         let header_bottom = content_top + ROLE_HEADER_HEIGHT;
-        let clamped_top = visible_top.max(content_top).max(0.0);
-        let clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
+        let mut clamped_top = visible_top.max(content_top).max(0.0);
+        let mut clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
+
+        // Snap role headers to full line boundaries at edges (same as blocks)
+        let lh = layout.line_height;
+        if header_bottom > visible_bottom && lh > 0.0 {
+            let full_lines = ((clamped_bottom - content_top) / lh).floor();
+            let snapped = content_top + full_lines * lh;
+            if snapped > clamped_top + 1.0 {
+                clamped_bottom = snapped;
+            }
+        }
+        if content_top < visible_top && lh > 0.0 {
+            let hidden = (clamped_top - content_top) / lh;
+            let snapped = content_top + hidden.ceil() * lh;
+            if snapped < clamped_bottom - 1.0 {
+                clamped_top = snapped;
+            }
+        }
 
         config.left = margin;
         config.top = content_top;
