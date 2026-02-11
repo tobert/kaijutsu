@@ -332,6 +332,13 @@ impl TileNode {
 /// The reconciler reads this every frame and diffs against the Bevy entity tree.
 /// Tree operations (split, close, swap, etc.) mutate this resource and the
 /// reconciler handles the entity-level changes.
+///
+/// ## Two Generation Counters
+///
+/// - `structural_gen` — bumped on split/close (entity tree changes).
+///   The reconciler rebuilds entities only when this changes.
+/// - `visual_gen` — bumped on focus/resize (style-only changes).
+///   The focus/visual system updates borders + flex weights without rebuilding.
 #[derive(Resource, Reflect)]
 pub struct TilingTree {
     /// Root node of the layout tree.
@@ -342,8 +349,10 @@ pub struct TilingTree {
     pub focused: PaneId,
     /// Previously focused pane (for Ctrl-^ toggle).
     pub previous_focused: Option<PaneId>,
-    /// Generation counter — bumped on every mutation for change detection.
-    pub generation: u64,
+    /// Structural generation — bumped on split/close (entity tree changes).
+    pub structural_gen: u64,
+    /// Visual generation — bumped on focus/resize (style-only changes).
+    pub visual_gen: u64,
 }
 
 impl TilingTree {
@@ -449,13 +458,21 @@ impl TilingTree {
             next_id,
             focused: conv_id, // Start focused on conversation
             previous_focused: None,
-            generation: 0,
+            structural_gen: 0,
+            visual_gen: 0,
         }
     }
 
-    /// Bump generation counter (signals reconciler to re-diff).
-    fn bump(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    /// Bump structural generation (triggers entity rebuild in reconciler).
+    fn bump_structural(&mut self) {
+        self.structural_gen = self.structural_gen.wrapping_add(1);
+        // Visual also bumps — structural changes imply visual changes
+        self.visual_gen = self.visual_gen.wrapping_add(1);
+    }
+
+    /// Bump visual generation only (focus/resize — style updates, no rebuild).
+    fn bump_visual(&mut self) {
+        self.visual_gen = self.visual_gen.wrapping_add(1);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -557,7 +574,7 @@ impl TilingTree {
             return None;
         }
 
-        self.bump();
+        self.bump_structural();
         Some(new_conv_id)
     }
 
@@ -617,7 +634,7 @@ impl TilingTree {
         if let Some(new_target) = new_focus {
             self.focus(new_target);
         }
-        self.bump();
+        self.bump_structural();
         true
     }
 
@@ -670,7 +687,7 @@ impl TilingTree {
             }
         }
 
-        self.bump();
+        self.bump_structural();
         true
     }
 
@@ -780,7 +797,7 @@ impl TilingTree {
                     *r /= total;
                 }
             }
-            self.bump();
+            self.bump_visual();
             true
         } else {
             false
@@ -792,7 +809,7 @@ impl TilingTree {
         if self.focused != target {
             self.previous_focused = Some(self.focused);
             self.focused = target;
-            self.bump();
+            self.bump_visual();
         }
     }
 
@@ -802,7 +819,7 @@ impl TilingTree {
             let current = self.focused;
             self.focused = prev;
             self.previous_focused = Some(current);
-            self.bump();
+            self.bump_visual();
         }
     }
 
@@ -865,7 +882,7 @@ impl TilingTree {
             } = node
             {
                 *doc_id = document_id.to_string();
-                self.bump();
+                self.bump_visual();
             }
         }
     }
@@ -935,6 +952,28 @@ pub struct PaneMarker {
 #[reflect(Component)]
 pub struct PaneFocus;
 
+/// Per-pane saved state — attached to ConversationContainer entities.
+///
+/// When focus switches between panes, the outgoing pane's global state
+/// (scroll, compose text) is saved here, and the incoming pane's state
+/// is restored. This lets each pane remember where it was.
+#[derive(Component, Debug, Clone, Default, Reflect)]
+#[reflect(Component)]
+pub struct PaneSavedState {
+    /// Document this pane is viewing (empty = unassigned).
+    pub document_id: String,
+    /// Scroll offset (rendered position).
+    pub scroll_offset: f32,
+    /// Scroll target (smooth scroll destination).
+    pub scroll_target: f32,
+    /// Whether the pane was in follow (auto-scroll) mode.
+    pub following: bool,
+    /// Compose block text content.
+    pub compose_text: String,
+    /// Compose block cursor position.
+    pub compose_cursor: usize,
+}
+
 // ============================================================================
 // PLUGIN
 // ============================================================================
@@ -952,6 +991,7 @@ impl Plugin for TilingPlugin {
             .register_type::<WritingDirection>()
             .register_type::<PaneMarker>()
             .register_type::<PaneFocus>()
+            .register_type::<PaneSavedState>()
             .add_systems(Update, handle_tiling_keys);
     }
 }
@@ -1116,14 +1156,14 @@ mod tests {
     fn split_row_creates_two_conversations() {
         let mut tree = TilingTree::default_layout();
         let conv1 = tree.first_conversation_pane().unwrap();
-        let gen_before = tree.generation;
+        let gen_before = tree.structural_gen;
 
         let conv2 = tree.split(conv1, SplitDirection::Row);
         assert!(conv2.is_some(), "Split should return new conversation PaneId");
 
         let convs = tree.root.conversation_panes();
         assert_eq!(convs.len(), 2, "Should have two conversation panes after split");
-        assert!(tree.generation > gen_before, "Generation should bump");
+        assert!(tree.structural_gen > gen_before, "Structural generation should bump");
     }
 
     #[test]
@@ -1240,9 +1280,9 @@ mod tests {
         let conv1 = tree.first_conversation_pane().unwrap();
         let _conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
 
-        let gen_before = tree.generation;
+        let gen_before = tree.visual_gen;
         assert!(tree.resize(conv1, 0.1));
-        assert!(tree.generation > gen_before);
+        assert!(tree.visual_gen > gen_before);
     }
 
     #[test]
@@ -1277,5 +1317,56 @@ mod tests {
         let conv = tree.first_conversation_pane().unwrap();
         assert!(tree.root.contains_pane(conv));
         assert!(!tree.root.contains_pane(PaneId(9999)));
+    }
+
+    // ── Generation split tests ─────────────────────────────────────
+
+    #[test]
+    fn split_bumps_structural_gen() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let s_before = tree.structural_gen;
+        let v_before = tree.visual_gen;
+
+        tree.split(conv1, SplitDirection::Row);
+        assert!(tree.structural_gen > s_before, "split should bump structural_gen");
+        assert!(tree.visual_gen > v_before, "split should also bump visual_gen");
+    }
+
+    #[test]
+    fn focus_bumps_only_visual_gen() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        let s_before = tree.structural_gen;
+        let v_before = tree.visual_gen;
+
+        tree.focus(conv2);
+        assert_eq!(tree.structural_gen, s_before, "focus should NOT bump structural_gen");
+        assert!(tree.visual_gen > v_before, "focus should bump visual_gen");
+    }
+
+    #[test]
+    fn resize_bumps_only_visual_gen() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let _conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        let s_before = tree.structural_gen;
+        let v_before = tree.visual_gen;
+
+        tree.resize(conv1, 0.1);
+        assert_eq!(tree.structural_gen, s_before, "resize should NOT bump structural_gen");
+        assert!(tree.visual_gen > v_before, "resize should bump visual_gen");
+    }
+
+    #[test]
+    fn close_bumps_structural_gen() {
+        let mut tree = TilingTree::default_layout();
+        let conv1 = tree.first_conversation_pane().unwrap();
+        let conv2 = tree.split(conv1, SplitDirection::Row).unwrap();
+        let s_before = tree.structural_gen;
+
+        tree.close(conv2);
+        assert!(tree.structural_gen > s_before, "close should bump structural_gen");
     }
 }

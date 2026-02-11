@@ -3258,7 +3258,7 @@ pub fn handle_compose_block_input(
     mut keyboard: MessageReader<KeyboardInput>,
     mode: Res<CurrentMode>,
     screen: Res<State<AppScreen>>,
-    mut compose_blocks: Query<&mut ComposeBlock>,
+    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
     bubble_registry: Res<BubbleRegistry>,
 ) {
