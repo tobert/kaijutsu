@@ -111,6 +111,7 @@ pub fn handle_mode_switch(
     mut key_events: MessageReader<KeyboardInput>,
     mut mode: ResMut<CurrentMode>,
     mut consumed: ResMut<ConsumedModeKeys>,
+    keys: Res<ButtonInput<KeyCode>>,
     modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
     compose_blocks: Query<&ComposeBlock>,
     screen: Res<State<AppScreen>>,
@@ -128,6 +129,13 @@ pub fn handle_mode_switch(
     // Focus determines which cell receives text input, not mode switching.
     // This allows Space to summon the input from anywhere in the conversation.
 
+    // Skip mode switching when a tiling modifier is held (Alt/Super).
+    // These are tiling WM keybinds, not mode triggers.
+    let tiling_mod_held = keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight)
+        || keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight);
+
     for event in key_events.read() {
         if !event.state.is_pressed() {
             continue;
@@ -135,6 +143,11 @@ pub fn handle_mode_switch(
 
         // Skip keys already consumed by earlier systems (e.g., block editing)
         if consumed.0.contains(&event.key_code) {
+            continue;
+        }
+
+        // Skip when tiling modifier is held (Alt/Super+key → tiling WM)
+        if tiling_mod_held {
             continue;
         }
 
@@ -2720,10 +2733,12 @@ pub fn apply_block_cell_positions(
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    dag_view: Query<(&ComputedNode, &UiGlobalTransform), With<super::components::ConversationContainer>>,
+    dag_view: Query<(&ComputedNode, &UiGlobalTransform), (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_applied_gen: Local<u64>,
     mut prev_scroll: Local<f32>,
+    mut prev_visible_top: Local<f32>,
+    mut prev_visible_bottom: Local<f32>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -2733,32 +2748,37 @@ pub fn apply_block_cell_positions(
         return;
     };
 
-    // === Performance optimization: skip if nothing changed ===
-    let layout_changed = layout_gen.0 != *last_applied_gen;
-    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
-    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
-
-    if !layout_changed && !scroll_changed {
-        // Neither layout nor scroll changed - skip position updates
-        return;
-    }
-
-    // Record current state for next frame comparison
-    *last_applied_gen = layout_gen.0;
-    *prev_scroll = scroll_state.offset;
-    // === End performance optimization ===
-
     // Derive visible bounds from the DagView's actual computed layout.
     // This respects the flex layout (North dock, ComposeBlock, South dock)
     // instead of relying on hardcoded constants that drift out of sync.
+    // Computed BEFORE the early-return guard so bounds changes are always detected.
     let Ok((node, transform)) = dag_view.single() else {
-        warn!("apply_block_cell_positions: DagView (ConversationContainer) not found");
+        // No focused conversation container yet (normal during reconciler initialization)
+        debug!("apply_block_cell_positions: waiting for focused ConversationContainer");
         return;
     };
     let (_, _, translation) = transform.to_scale_angle_translation();
     let content = node.content_box();
     let visible_top = translation.y + content.min.y;
     let visible_bottom = translation.y + content.max.y;
+
+    // === Performance optimization: skip if nothing changed ===
+    let layout_changed = layout_gen.0 != *last_applied_gen;
+    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
+    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
+    let bounds_changed = (visible_top - *prev_visible_top).abs() >= 1.0
+        || (visible_bottom - *prev_visible_bottom).abs() >= 1.0;
+
+    if !layout_changed && !scroll_changed && !bounds_changed {
+        return;
+    }
+
+    // Record current state for next frame comparison
+    *last_applied_gen = layout_gen.0;
+    *prev_scroll = scroll_state.offset;
+    *prev_visible_top = visible_top;
+    *prev_visible_bottom = visible_bottom;
+    // === End performance optimization ===
     let base_width = content.width();
     let visible_height = (visible_bottom - visible_top).max(100.0);
     let margin = layout.workspace_margin_left;
@@ -2784,11 +2804,30 @@ pub fn apply_block_cell_positions(
         config.top = content_top;
         config.scale = 1.0;
 
-        // Clamp bounds to intersection of visible area and block area
-        // This prevents text from rendering outside its block when partially scrolled
+        // Clamp bounds to intersection of visible area and block area.
+        // Snap to full line boundaries so partial lines aren't rendered at edges.
         let block_bottom = content_top + block_layout.height;
-        let clamped_top = visible_top.max(content_top).max(0.0);
-        let clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
+        let mut clamped_top = visible_top.max(content_top).max(0.0);
+        let mut clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
+
+        let lh = layout.line_height;
+        // Bottom edge: snap UP to last full line boundary within the block
+        if block_bottom > visible_bottom && lh > 0.0 {
+            let full_lines = ((clamped_bottom - content_top) / lh).floor();
+            let snapped = content_top + full_lines * lh;
+            if snapped > clamped_top + 1.0 {
+                clamped_bottom = snapped;
+            }
+        }
+        // Top edge: snap DOWN to next full line boundary within the block
+        if content_top < visible_top && lh > 0.0 {
+            let hidden = (clamped_top - content_top) / lh;
+            let snapped = content_top + hidden.ceil() * lh;
+            if snapped < clamped_bottom - 1.0 {
+                clamped_top = snapped;
+            }
+        }
+
         config.bounds = crate::text::TextBounds {
             left: left as i32,
             top: clamped_top as i32,
@@ -2805,8 +2844,25 @@ pub fn apply_block_cell_positions(
 
         let content_top = visible_top + header_layout.y_offset - scroll_offset;
         let header_bottom = content_top + ROLE_HEADER_HEIGHT;
-        let clamped_top = visible_top.max(content_top).max(0.0);
-        let clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
+        let mut clamped_top = visible_top.max(content_top).max(0.0);
+        let mut clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
+
+        // Snap role headers to full line boundaries at edges (same as blocks)
+        let lh = layout.line_height;
+        if header_bottom > visible_bottom && lh > 0.0 {
+            let full_lines = ((clamped_bottom - content_top) / lh).floor();
+            let snapped = content_top + full_lines * lh;
+            if snapped > clamped_top + 1.0 {
+                clamped_bottom = snapped;
+            }
+        }
+        if content_top < visible_top && lh > 0.0 {
+            let hidden = (clamped_top - content_top) / lh;
+            let snapped = content_top + hidden.ceil() * lh;
+            if snapped < clamped_bottom - 1.0 {
+                clamped_top = snapped;
+            }
+        }
 
         config.left = margin;
         config.top = content_top;
@@ -3196,15 +3252,12 @@ pub fn init_compose_block_buffer(
 ///
 /// When in INSERT mode with ComposeBlock focused, process text input,
 /// cursor movement, and submit on Enter.
-///
-/// NOTE: If there's an active bubble, input goes there instead of here.
 pub fn handle_compose_block_input(
     mut keyboard: MessageReader<KeyboardInput>,
     mode: Res<CurrentMode>,
     screen: Res<State<AppScreen>>,
-    mut compose_blocks: Query<&mut ComposeBlock>,
+    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
-    bubble_registry: Res<BubbleRegistry>,
 ) {
     // Only handle in Conversation screen
     if *screen.get() != AppScreen::Conversation {
@@ -3220,13 +3273,6 @@ pub fn handle_compose_block_input(
     // This prevents the mode-switch key from being inserted as text
     // (Same guard as handle_cell_input)
     if mode.is_changed() {
-        return;
-    }
-
-    // If there's an active bubble, input goes there instead
-    if bubble_registry.active().is_some() {
-        // Consume events so they don't get processed by other systems
-        for _ in keyboard.read() {}
         return;
     }
 
@@ -3274,9 +3320,13 @@ pub fn handle_compose_block_input(
 }
 
 /// Sync ComposeBlock text to its MsdfTextBuffer.
+///
+/// In shell mode, runs kaish syntax validation on each keystroke and tints
+/// text red for invalid syntax (but not for incomplete input like `if`).
 pub fn sync_compose_block_buffer(
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
+    mode: Res<CurrentMode>,
     mut compose_blocks: Query<(&ComposeBlock, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), Changed<ComposeBlock>>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -3296,6 +3346,13 @@ pub fn sync_compose_block_buffer(
         // Set glyph color from theme before shaping (color bakes into glyphs)
         let color = if compose.is_empty() {
             theme.fg_dim // Placeholder is dimmed
+        } else if matches!(mode.0, EditorMode::Input(InputKind::Shell)) {
+            let validation = crate::kaish::validate(&compose.text);
+            if !validation.valid && !validation.incomplete {
+                theme.block_tool_error // Red tint for syntax errors
+            } else {
+                theme.block_user
+            }
         } else {
             theme.block_user // User input color
         };
@@ -3346,568 +3403,52 @@ pub fn position_compose_block(
     }
 }
 
-// ============================================================================
-// MOBILE INPUT BUBBLE SYSTEMS
-// ============================================================================
-//
-// ARCHITECTURE: Floating CRDT-backed input bubbles that can be stashed, recalled,
-// and positioned spatially. Multiple bubbles can exist simultaneously for
-// different draft contexts.
-//
-// State Machine:
-//   Normal Mode
-//       │
-//       ├─ Space → Spawn new Active bubble (stash previous active)
-//       │           └─ mode → Input(Chat)
-//       │
-//       └─ Tab → Recall stashed[0] (cycle through stashed)
-//
-//   Active Bubble
-//       │
-//       ├─ Esc → Stash bubble → Normal mode
-//       │
-//       ├─ Enter → Submit content via PromptSubmitted, despawn bubble
-//       │
-//       └─ Cmd+Backspace → Dismiss without submit
-
-use super::components::{
-    BubbleConfig, BubblePosition, BubbleRegistry,
-    BubbleSpawnContext, BubbleState, InputBubble,
-};
-
-/// Handle Space in Normal mode to spawn or recall a bubble.
+/// Position the cursor in the focused ComposeBlock during Input mode.
 ///
-/// - If no bubbles exist: spawn a new one
-/// - If bubbles are stashed: recall the most recent
-/// - If a bubble is active: spawn new (stash current)
-///
-/// Also handles Tab for cycling through stashed bubbles.
-pub fn handle_bubble_spawn(
-    mut commands: Commands,
-    mut keyboard: MessageReader<KeyboardInput>,
-    mut mode: ResMut<CurrentMode>,
-    mut consumed: ResMut<ConsumedModeKeys>,
-    screen: Res<State<AppScreen>>,
-    mut registry: ResMut<BubbleRegistry>,
-    config: Res<BubbleConfig>,
-    focus: Res<FocusTarget>,
-    current_conv: Res<CurrentConversation>,
-    mut bubble_query: Query<&mut InputBubble>,
-) {
-    // Only in Conversation screen
-    if *screen.get() != AppScreen::Conversation {
-        return;
-    }
-
-    // Only in Normal mode
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Skip already consumed keys
-        if consumed.0.contains(&event.key_code) {
-            continue;
-        }
-
-        match event.key_code {
-            KeyCode::Space => {
-                consumed.0.insert(KeyCode::Space);
-
-                // If there's an active bubble, stash it first
-                if registry.active().is_some() {
-                    registry.stash_active();
-                    info!("Stashed active bubble");
-                }
-
-                // Check max stashed limit
-                while registry.stashed().len() >= config.max_stashed {
-                    // Remove oldest stashed bubble
-                    if let Some(oldest_id) = registry.stashed().last().cloned() {
-                        if let Some(entity) = registry.get_entity(&oldest_id) {
-                            commands.entity(entity).despawn();
-                        }
-                        registry.unregister(&oldest_id);
-                        info!("Removed oldest stashed bubble (max limit)");
-                    }
-                }
-
-                // Spawn a new bubble
-                let bubble = InputBubble::new();
-                let id = bubble.id.clone();
-
-                // Capture spawn context
-                let context = BubbleSpawnContext {
-                    focused_block_id: focus.block_id.clone(),
-                    conversation_id: current_conv.id().map(|s| s.to_string()).unwrap_or_default(),
-                };
-
-                // Spawn bubble as a root-level entity with absolute positioning
-                // (no parent needed - uses ZIndex for layering)
-                let entity = commands
-                    .spawn((
-                        bubble,
-                        context,
-                        BubbleState::Active,
-                        BubblePosition::bottom_center(),
-                        MsdfText,
-                        MsdfTextAreaConfig::default(),
-                        ZIndex(crate::constants::ZLayer::BUBBLE_LAYER),
-                    ))
-                    .id();
-
-                registry.register(id.clone(), entity);
-                registry.set_active(id.clone());
-
-                // Enter Chat input mode
-                mode.0 = EditorMode::Input(InputKind::Chat);
-                info!("Spawned new bubble: {:?}, entered Chat mode", id);
-            }
-
-            KeyCode::Tab => {
-                // Cycle through stashed bubbles
-                if registry.stashed().is_empty() {
-                    continue;
-                }
-
-                consumed.0.insert(KeyCode::Tab);
-
-                if let Some(id) = registry.cycle() {
-                    // Update state of recalled bubble
-                    if let Some(entity) = registry.get_entity(&id) {
-                        if let Ok(mut _bubble) = bubble_query.get_mut(entity) {
-                            // Update any state needed on recall
-                        }
-                        // Update BubbleState component
-                        commands.entity(entity).insert(BubbleState::Active);
-                    }
-
-                    // Enter Chat input mode
-                    mode.0 = EditorMode::Input(InputKind::Chat);
-                    info!("Recalled bubble: {:?}", id);
-                }
-            }
-
-            _ => {}
-        }
-    }
-}
-
-/// Handle input to the active bubble.
-///
-/// Routes keyboard input to the active bubble's InputBubble methods.
-pub fn handle_bubble_input(
-    mut keyboard: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
-    consumed: Res<ConsumedModeKeys>,
-    registry: Res<BubbleRegistry>,
-    mut bubbles: Query<&mut InputBubble, With<BubbleState>>,
-) {
-    // Only in Input modes
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    // Get the active bubble
-    let Some(active_entity) = registry.active_entity() else {
-        return;
-    };
-
-    let Ok(mut bubble) = bubbles.get_mut(active_entity) else {
-        return;
-    };
-
-    // Skip on frame when mode changes
-    if mode.is_changed() {
-        for _ in keyboard.read() {} // Consume events
-        return;
-    }
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Skip consumed keys
-        if consumed.0.contains(&event.key_code) {
-            continue;
-        }
-
-        // Handle special keys
-        match event.key_code {
-            KeyCode::Backspace => {
-                bubble.backspace();
-                continue;
-            }
-            KeyCode::Delete => {
-                bubble.delete();
-                continue;
-            }
-            KeyCode::ArrowLeft => {
-                bubble.move_left();
-                continue;
-            }
-            KeyCode::ArrowRight => {
-                bubble.move_right();
-                continue;
-            }
-            KeyCode::Home => {
-                bubble.move_home();
-                continue;
-            }
-            KeyCode::End => {
-                bubble.move_end();
-                continue;
-            }
-            // Enter and Escape handled by separate systems
-            KeyCode::Enter | KeyCode::Escape => continue,
-            _ => {}
-        }
-
-        // Handle text input
-        if let Some(ref text) = event.text {
-            for c in text.chars() {
-                if c.is_control() {
-                    continue;
-                }
-                bubble.insert(&c.to_string());
-            }
-        }
-    }
-}
-
-/// Handle Enter to submit the active bubble's content.
-///
-/// Extracts text from the bubble, fires PromptSubmitted, and despawns.
-pub fn handle_bubble_submit(
-    mut commands: Commands,
-    mut keyboard: MessageReader<KeyboardInput>,
-    mut mode: ResMut<CurrentMode>,
-    mut registry: ResMut<BubbleRegistry>,
-    bubbles: Query<&InputBubble>,
-    mut submit_writer: MessageWriter<PromptSubmitted>,
-    keys: Res<ButtonInput<KeyCode>>,
-) {
-    // Only in Input modes
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    let Some(active_id) = registry.active().cloned() else {
-        return;
-    };
-
-    let Some(active_entity) = registry.active_entity() else {
-        return;
-    };
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        if event.key_code == KeyCode::Enter {
-            // Shift+Enter for newline (handled by handle_bubble_input via text)
-            let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-            if shift_held {
-                continue;
-            }
-
-            // Get bubble content
-            let Ok(bubble) = bubbles.get(active_entity) else {
-                continue;
-            };
-
-            let text = bubble.text().trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-
-            // Fire submit event
-            submit_writer.write(PromptSubmitted { text: text.clone() });
-            info!("Bubble submitted: {} chars", text.len());
-
-            // Despawn the bubble
-            commands.entity(active_entity).despawn();
-            registry.unregister(&active_id);
-
-            // Return to Normal mode
-            mode.0 = EditorMode::Normal;
-        }
-    }
-}
-
-/// Handle Esc to stash the active bubble, Cmd+Backspace to dismiss.
-pub fn handle_bubble_navigation(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut mode: ResMut<CurrentMode>,
-    mut consumed: ResMut<ConsumedModeKeys>,
-    mut registry: ResMut<BubbleRegistry>,
-    bubbles: Query<&InputBubble>,
-) {
-    // Only in Input modes with an active bubble
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    let Some(active_id) = registry.active().cloned() else {
-        return;
-    };
-
-    let Some(active_entity) = registry.active_entity() else {
-        return;
-    };
-
-    // Cmd+Backspace (or Ctrl+Backspace) to dismiss without submit
-    let cmd_held = keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight)
-        || keys.pressed(KeyCode::ControlLeft)
-        || keys.pressed(KeyCode::ControlRight);
-
-    if cmd_held && keys.just_pressed(KeyCode::Backspace) {
-        consumed.0.insert(KeyCode::Backspace);
-
-        // Despawn without submit
-        commands.entity(active_entity).despawn();
-        registry.unregister(&active_id);
-
-        // Return to Normal mode
-        mode.0 = EditorMode::Normal;
-        info!("Bubble dismissed (Cmd+Backspace)");
-        return;
-    }
-
-    // Esc to stash (if bubble has content) or dismiss (if empty)
-    if keys.just_pressed(KeyCode::Escape) {
-        consumed.0.insert(KeyCode::Escape);
-
-        let Ok(bubble) = bubbles.get(active_entity) else {
-            return;
-        };
-
-        if bubble.is_empty() {
-            // Empty bubble - just dismiss
-            commands.entity(active_entity).despawn();
-            registry.unregister(&active_id);
-            info!("Empty bubble dismissed on Esc");
-        } else {
-            // Has content - stash it
-            registry.stash_active();
-            commands.entity(active_entity).insert(BubbleState::Stashed);
-            info!("Bubble stashed on Esc");
-        }
-
-        // Return to Normal mode
-        mode.0 = EditorMode::Normal;
-    }
-}
-
-/// Initialize MsdfTextBuffer for InputBubble entities.
-pub fn init_bubble_buffers(
-    mut commands: Commands,
-    bubbles: Query<Entity, (With<InputBubble>, With<MsdfText>, Without<MsdfTextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
-    text_metrics: Res<TextMetrics>,
-) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for entity in bubbles.iter() {
-        let metrics = text_metrics.scaled_cell_metrics();
-        let buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        commands.entity(entity).try_insert(buffer);
-        info!("Initialized bubble buffer for {:?}", entity);
-    }
-}
-
-/// Sync InputBubble content to MsdfTextBuffer.
-///
-/// Runs when InputBubble changes OR when MsdfTextBuffer is first added (initial sync).
-pub fn sync_bubble_buffers(
-    font_system: Res<SharedFontSystem>,
-    theme: Res<Theme>,
-    mut bubbles: Query<
-        (&InputBubble, &BubbleState, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig),
-        Or<(Changed<InputBubble>, Added<MsdfTextBuffer>)>,
-    >,
-) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (bubble, state, mut buffer, mut config) in bubbles.iter_mut() {
-        let text = bubble.text();
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-
-        // Show placeholder when empty
-        let display_text = if text.is_empty() {
-            "Type here..."
-        } else {
-            &text
-        };
-
-        buffer.set_text(&mut font_system, display_text, attrs, cosmic_text::Shaping::Advanced);
-
-        // Color based on state
-        config.default_color = match state {
-            BubbleState::Active => {
-                if text.is_empty() {
-                    theme.fg_dim
-                } else {
-                    theme.block_user
-                }
-            }
-            BubbleState::Stashed => theme.fg_dim,
-        };
-    }
-}
-
-/// Layout and position active bubble based on BubblePosition.
-pub fn layout_bubble_position(
-    windows: Query<&Window>,
-    config: Res<BubbleConfig>,
-    registry: Res<BubbleRegistry>,
-    mut bubbles: Query<(&BubblePosition, &BubbleState, &mut MsdfTextAreaConfig), With<InputBubble>>,
-) {
-    let (win_width, win_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.width(), w.height()))
-        .unwrap_or((1280.0, 800.0));
-
-    for (position, state, mut text_config) in bubbles.iter_mut() {
-        // Only position active bubbles (stashed become pills)
-        if *state != BubbleState::Active {
-            continue;
-        }
-
-        // Calculate position from percentages
-        let width = config.default_width;
-        let height = config.default_height;
-        let x = (win_width * position.x_percent) - (width / 2.0);
-        let y = (win_height * position.y_percent) - (height / 2.0);
-
-        // Clamp to screen bounds
-        let x = x.max(10.0).min(win_width - width - 10.0);
-        let y = y.max(10.0).min(win_height - height - 10.0);
-
-        // Padding inside bubble
-        let padding = 16.0;
-        text_config.left = x + padding;
-        text_config.top = y + padding;
-        text_config.scale = 1.0;
-        text_config.bounds = crate::text::TextBounds {
-            left: (x + padding) as i32,
-            top: (y + padding) as i32,
-            right: (x + width - padding) as i32,
-            bottom: (y + height - padding) as i32,
-        };
-    }
-
-    // Position stashed pills in bottom-left corner
-    let mut pill_y = win_height - 40.0;
-    let pill_x = 20.0;
-
-    for stashed_id in registry.stashed() {
-        if let Some(entity) = registry.get_entity(stashed_id) {
-            if let Ok((_, state, mut text_config)) = bubbles.get_mut(entity) {
-                if *state == BubbleState::Stashed {
-                    text_config.left = pill_x;
-                    text_config.top = pill_y;
-                    text_config.bounds = crate::text::TextBounds {
-                        left: pill_x as i32,
-                        top: pill_y as i32,
-                        right: (pill_x + config.pill_width) as i32,
-                        bottom: (pill_y + config.pill_height) as i32,
-                    };
-                    pill_y -= config.pill_height + 8.0;
-                }
-            }
-        }
-    }
-}
-
-/// Update cursor position for active bubble.
-pub fn update_bubble_cursor(
-    registry: Res<BubbleRegistry>,
+/// When in Input mode with no active EditingBlockCell, the cursor beam
+/// should appear at the ComposeBlock's cursor offset. This replaces the
+/// old bubble cursor system.
+pub fn update_compose_cursor(
     mode: Res<CurrentMode>,
     entities: Res<EditorEntities>,
-    bubbles: Query<(&InputBubble, &MsdfTextAreaConfig), With<BubbleState>>,
-    mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
+    compose_blocks: Query<(&ComposeBlock, &MsdfTextAreaConfig), With<crate::ui::tiling::PaneFocus>>,
+    editing_blocks: Query<Entity, With<EditingBlockCell>>,
+    mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
+    mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
+    theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
 ) {
-    // Only when we have an active bubble in input mode
     if !mode.0.accepts_input() {
         return;
     }
-
-    let Some(active_entity) = registry.active_entity() else {
+    // Don't override if editing a block cell inline
+    if !editing_blocks.is_empty() {
         return;
-    };
+    }
 
-    let Some(cursor_ent) = entities.cursor else {
-        return;
-    };
+    let Some(cursor_ent) = entities.cursor else { return };
+    let Ok((compose, config)) = compose_blocks.single() else { return };
+    let Ok((mut node, mut visibility, material_node)) = cursor_query.get_mut(cursor_ent) else { return };
 
-    let Ok((bubble, config)) = bubbles.get(active_entity) else {
-        return;
-    };
-
-    let Ok((mut node, mut visibility)) = cursor_query.get_mut(cursor_ent) else {
-        return;
-    };
-
-    // Show cursor
     *visibility = Visibility::Inherited;
 
-    // Calculate cursor position within bubble text
-    let text = bubble.text();
-    let offset = bubble.cursor.offset.min(text.len());
-    let before_cursor = if offset > 0 && offset <= text.len() {
-        &text[..offset]
-    } else {
-        ""
-    };
-    let row = before_cursor.matches('\n').count();
-    let col = before_cursor
-        .rfind('\n')
-        .map(|pos| offset - pos - 1)
-        .unwrap_or(offset);
+    // Calculate position from ComposeBlock.cursor offset
+    let text = &compose.text;
+    let offset = compose.cursor.min(text.len());
+    let before = &text[..offset];
+    let row = before.matches('\n').count();
+    let col = before.rfind('\n').map(|p| offset - p - 1).unwrap_or(offset);
 
     let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = config.left + (col as f32 * char_width);
-    let y = config.top + (row as f32 * line_height);
 
-    node.left = Val::Px(x - 2.0);
-    node.top = Val::Px(y);
-}
+    node.left = Val::Px(config.left + (col as f32 * char_width) - 2.0);
+    node.top = Val::Px(config.top + (row as f32 * line_height));
 
-/// Sync bubble visibility based on state and mode.
-pub fn sync_bubble_visibility(
-    registry: Res<BubbleRegistry>,
-    mode: Res<CurrentMode>,
-    mut bubbles: Query<(&BubbleState, &mut Visibility), With<InputBubble>>,
-) {
-    for (state, mut vis) in bubbles.iter_mut() {
-        *vis = match state {
-            BubbleState::Active => {
-                if mode.0.accepts_input() || registry.active().is_some() {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                }
-            }
-            BubbleState::Stashed => {
-                // Stashed bubbles shown as small indicators
-                Visibility::Inherited
-            }
-        };
+    // Update material for Input mode appearance
+    if let Some(material) = cursor_materials.get_mut(&material_node.0) {
+        material.time.y = CursorMode::Beam as u8 as f32;
+        material.color = theme.cursor_insert;
+        material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
     }
 }

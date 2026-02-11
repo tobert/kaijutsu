@@ -296,48 +296,24 @@ pub fn on_view_change(
     registry: Res<PanelRegistry>,
     theme: Res<Theme>,
     existing: Query<(Entity, &LayoutManaged)>,
-    conversation_root: Query<Entity, With<super::state::ConversationRoot>>,
     dashboard_root: Query<Entity, With<crate::dashboard::DashboardRoot>>,
     children_query: Query<&Children>,
 ) {
-    // Helper to check if a root needs its initial layout
+    // NOTE: Conversation layout is now handled by the tiling reconciler
+    // (ui/tiling_reconciler.rs). This system only manages Dashboard.
+
+    let dash_root = dashboard_root.single().ok();
+
     let needs_layout = |root: Option<Entity>| -> bool {
         root.map(|e| children_query.get(e).map(|c| c.is_empty()).unwrap_or(true))
             .unwrap_or(false)
     };
 
-    let conv_root = conversation_root.single().ok();
-    let dash_root = dashboard_root.single().ok();
-
-    // Check if EITHER root needs initial layout (startup timing fix)
-    let conv_needs_layout = needs_layout(conv_root);
     let dash_needs_layout = needs_layout(dash_root);
-
-    let current_view = view_stack.current();
     let view_changed = view_stack.is_changed() || layouts.is_changed();
 
-    // Track what we've reconciled to avoid duplicates
-    let mut reconciled_conv = false;
     let mut reconciled_dash = false;
 
-    // Reconcile conversation root if it needs initial layout
-    if conv_needs_layout {
-        if let Some(root) = conv_root {
-            reconcile_layout(
-                &mut commands,
-                &layouts,
-                &presets,
-                &registry,
-                &theme,
-                &existing,
-                root,
-                "conversation",
-            );
-            reconciled_conv = true;
-        }
-    }
-
-    // Reconcile dashboard root if it needs initial layout
     if dash_needs_layout {
         if let Some(root) = dash_root {
             reconcile_layout(
@@ -354,20 +330,14 @@ pub fn on_view_change(
         }
     }
 
-    // For view changes, reconcile current view (if not already done above)
-    if view_changed {
-        let (root_entity, layout_name, already_done) = match current_view.root_container() {
-            super::state::ViewRootContainer::Conversation => {
-                (conv_root, "conversation", reconciled_conv)
-            }
-            super::state::ViewRootContainer::Dashboard => {
-                (dash_root, "dashboard", reconciled_dash)
-            }
-        };
-
-        if !already_done {
-            if let Some(root) = root_entity {
-                let layout_name = layouts.active.as_deref().unwrap_or(layout_name);
+    if view_changed && !reconciled_dash {
+        let current_view = view_stack.current();
+        if matches!(
+            current_view.root_container(),
+            super::state::ViewRootContainer::Dashboard
+        ) {
+            if let Some(root) = dash_root {
+                let layout_name = layouts.active.as_deref().unwrap_or("dashboard");
                 reconcile_layout(
                     &mut commands,
                     &layouts,

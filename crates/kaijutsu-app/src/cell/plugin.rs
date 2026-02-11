@@ -32,8 +32,7 @@ pub enum CellPhase {
 }
 
 use super::components::{
-    BlockCellContainer, BlockCellLayout, BubbleConfig, BubblePosition,
-    BubbleRegistry, BubbleSpawnContext, BubbleState, Cell, CellId, CellPosition, CellState,
+    BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState, CurrentMode,
     DocumentCache, DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
     PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
@@ -68,12 +67,7 @@ impl Plugin for CellPlugin {
             .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
-            .register_type::<RoleHeaderLayout>()
-            // Bubble types
-            .register_type::<BubbleState>()
-            .register_type::<BubblePosition>()
-            .register_type::<BubbleSpawnContext>()
-            .register_type::<BubbleConfig>();
+            .register_type::<RoleHeaderLayout>();
 
         // Configure SystemSet execution order
         app.configure_sets(
@@ -96,10 +90,7 @@ impl Plugin for CellPlugin {
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
             .init_resource::<systems::EditorEntities>()
-            .init_resource::<systems::ConsumedModeKeys>()
-            // Bubble system resources
-            .init_resource::<BubbleRegistry>()
-            .init_resource::<BubbleConfig>();
+            .init_resource::<systems::ConsumedModeKeys>();
 
         // ====================================================================
         // CellPhase::Input - Mode switching, key handling, click-to-focus
@@ -125,17 +116,6 @@ impl Plugin for CellPlugin {
                 systems::handle_collapse_toggle,
                 // Pop ViewStack with Esc (before mode switch handles Esc)
                 systems::handle_view_pop.before(systems::handle_mode_switch),
-                // Mobile bubble input systems
-                systems::handle_bubble_spawn
-                    .after(systems::clear_consumed_keys)
-                    .before(systems::handle_mode_switch),
-                systems::handle_bubble_navigation
-                    .after(systems::handle_bubble_spawn)
-                    .before(systems::handle_mode_switch),
-                systems::handle_bubble_input
-                    .after(systems::handle_mode_switch)
-                    .before(systems::handle_cell_input),
-                systems::handle_bubble_submit.after(systems::handle_bubble_input),
             )
                 .in_set(CellPhase::Input),
         );
@@ -215,9 +195,6 @@ impl Plugin for CellPlugin {
                 systems::sync_compose_block_buffer.after(systems::init_compose_block_buffer),
                 // Expanded block content sync
                 systems::sync_expanded_block_content,
-                // Bubble buffer init and sync
-                systems::init_bubble_buffers,
-                systems::sync_bubble_buffers.after(systems::init_bubble_buffers),
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
                 systems::highlight_focused_block.after(systems::sync_block_cell_buffers),
@@ -242,12 +219,10 @@ impl Plugin for CellPlugin {
                 // Cursor positioning
                 systems::update_cursor,
                 systems::update_block_edit_cursor.after(systems::update_cursor),
-                // Bubble layout and cursor
-                systems::layout_bubble_position,
-                systems::update_bubble_cursor
-                    .after(systems::layout_bubble_position)
-                    .after(systems::update_cursor),
-                systems::sync_bubble_visibility.after(systems::layout_bubble_position),
+                // Compose block cursor (Input mode, no inline edit active)
+                systems::update_compose_cursor
+                    .after(systems::update_cursor)
+                    .after(systems::position_compose_block),
                 // 9-slice frame layout
                 frame_assembly::spawn_nine_slice_frames,
                 frame_assembly::layout_nine_slice_frames,

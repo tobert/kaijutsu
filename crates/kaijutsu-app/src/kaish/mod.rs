@@ -7,9 +7,8 @@
 //!
 //! Uses kaish-kernel's lexer and parser directly without spawning a subprocess.
 //!
-//! Note: This module is awaiting integration with the shell input mode.
-
-#![allow(dead_code)]
+//! Integrated into the ComposeBlock: shell mode input is validated on each
+//! keystroke, tinting text red for syntax errors.
 
 use kaish_kernel::lexer::{Token, TokenCategory};
 use kaish_kernel::parser;
@@ -19,13 +18,15 @@ use kaish_kernel::parser;
 pub struct ValidationResult {
     /// Whether the input is syntactically valid.
     pub valid: bool,
-    /// Error messages if invalid.
+    /// Error messages if invalid (used for future error position highlighting).
+    #[allow(dead_code)]
     pub errors: Vec<SyntaxError>,
     /// Whether input is incomplete (could be valid with more input).
     pub incomplete: bool,
 }
 
 /// A syntax error with location information.
+#[allow(dead_code)] // Future: error position highlighting in ComposeBlock
 #[derive(Debug, Clone)]
 pub struct SyntaxError {
     /// Byte offset of the start of the error.
@@ -37,6 +38,7 @@ pub struct SyntaxError {
 }
 
 /// Token with span information for syntax highlighting.
+#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 #[derive(Debug, Clone)]
 pub struct SpannedToken {
     /// The token kind.
@@ -48,6 +50,7 @@ pub struct SpannedToken {
 }
 
 /// Simplified token kinds for syntax highlighting.
+#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     /// Command or identifier.
@@ -123,6 +126,7 @@ pub fn validate(input: &str) -> ValidationResult {
 /// Tokenize input for syntax highlighting.
 ///
 /// Returns a list of tokens with their spans and kinds.
+#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 pub fn tokenize(input: &str) -> Vec<SpannedToken> {
     use logos::Logos;
 
@@ -149,6 +153,7 @@ pub fn tokenize(input: &str) -> Vec<SpannedToken> {
 ///
 /// Uses kaish's `TokenCategory` for stable classification that doesn't break
 /// when new tokens are added to the lexer.
+#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 fn classify_token(token: &Token) -> TokenKind {
     match token.category() {
         TokenCategory::Keyword => TokenKind::Keyword,

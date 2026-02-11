@@ -9,7 +9,7 @@
 //! - `AppScreen::Dashboard` - Kernel/Context/Seat selection
 //! - `AppScreen::Conversation` - Active conversation view
 //!
-//! Chrome is handled by the widget system (North/South docks).
+//! Chrome is handled by the tiling WM system (North/South docks).
 //! Content area switches between views using `Display::None`.
 
 // Bevy ECS idioms that trigger these lints
@@ -93,8 +93,10 @@ fn main() {
         .add_plugins(commands::CommandsPlugin)
         // Constellation - context navigation as visual node graph
         .add_plugins(ui::constellation::ConstellationPlugin)
-        // Widget system - unified docked/floating UI primitives
-        .add_plugins(ui::widget::WidgetPlugin)
+        // Tiling WM — layout tree, reconciler, and widget update systems
+        .add_plugins(ui::tiling::TilingPlugin)
+        .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)
+        .add_plugins(ui::tiling_widgets::TilingWidgetsPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(ui::drift::DriftPlugin)
         // Layout system - RON-driven view layouts
@@ -135,74 +137,41 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     ));
 }
 
-/// Set up the main UI layout with state-driven screens.
+/// Set up the structural UI skeleton.
 ///
-/// ## Architecture
-///
-/// Chrome is handled by the widget system (North/South docks at ZLayer::HUD).
-/// This function spawns the content area structure only.
+/// The tiling reconciler populates docks and conversation content.
+/// This function spawns the fixed structure that the reconciler needs:
 ///
 /// ```text
-/// ┌─────────────────────────────────────────────────────┐
-/// │ [title widget]              [connection widget]     │ ← North dock (widgets)
-/// ├─────────────────────────────────────────────────────┤
-/// │                                                     │
-/// │   ┌─ AppScreen::Dashboard ────────────────────────┐ │
-/// │   │ KERNELS │ CONTEXTS │ YOUR SEATS               │ │
-/// │   └───────────────────────────────────────────────┘ │
-/// │                                                     │
-/// │   ┌─ AppScreen::Conversation ─────────────────────┐ │
-/// │   │ (scrollable conversation messages)            │ │
-/// │   └───────────────────────────────────────────────┘ │
-/// │                                                     │
-/// ├─────────────────────────────────────────────────────┤
-/// │ [mode widget]                      [hints widget]   │ ← South dock (widgets)
-/// └─────────────────────────────────────────────────────┘
+/// TilingRoot (column, 100%x100%)
+///   [NorthDock — spawned by tiling reconciler]
+///   ContentArea (column, flex-grow: 1)
+///     DashboardRoot (100%, toggled by AppScreen state)
+///     ConversationRoot (100%, toggled by AppScreen state)
+///       [ConversationContainer — spawned by tiling reconciler]
+///       [ComposeBlock — spawned by tiling reconciler]
+///   [SouthDock — spawned by tiling reconciler]
 /// ```
 fn setup_ui(
     mut commands: Commands,
     theme: Res<ui::theme::Theme>,
 ) {
-    // Root container - fills window, flex column layout
+    // Root container — marked with TilingRoot for the reconciler to find.
+    // Docks are inserted as children by the tiling reconciler.
     commands
         .spawn((
+            ui::tiling_reconciler::TilingRoot,
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                // Padding for widget docks
-                padding: UiRect {
-                    top: Val::Px(constants::NORTH_DOCK_CLEARANCE),
-                    bottom: Val::Px(constants::SOUTH_DOCK_CLEARANCE),
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                },
                 ..default()
             },
         ))
         .with_children(|root| {
             // ═══════════════════════════════════════════════════════════════
-            // HEADER CONTAINER (minimal - just for seat selector attachment)
-            // Actual header content is in North dock widgets
-            // ═══════════════════════════════════════════════════════════════
-            root.spawn((
-                HeaderContainer,
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(0.0), // Zero height - just an attachment point
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(6.0),
-                    right: Val::Px(16.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::FlexEnd,
-                    ..default()
-                },
-                ZIndex(constants::ZLayer::HUD + 1), // Above North dock
-            ));
-
-            // ═══════════════════════════════════════════════════════════════
-            // CONTENT AREA (state-driven, Z-LAYER 10)
-            // Contains both Dashboard and Conversation views
+            // CONTENT AREA (state-driven)
+            // Docks are inserted before/after this by the reconciler
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
                 ui::state::ContentArea,
@@ -214,45 +183,56 @@ fn setup_ui(
                 ZIndex(constants::ZLayer::CONTENT),
             ))
             .with_children(|content| {
-                // ───────────────────────────────────────────────────────────
                 // DASHBOARD VIEW (visible by default)
-                // Children (KernelList, ContextList, etc) spawned by layout system
-                // ───────────────────────────────────────────────────────────
                 content.spawn((
                     dashboard::DashboardRoot,
                     Node {
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        display: Display::Flex, // Visible by default (Dashboard is initial state)
+                        display: Display::Flex,
                         ..default()
                     },
                     BackgroundColor(theme.bg),
-                    Visibility::Inherited, // Visible by default
+                    Visibility::Inherited,
                 ));
 
-                // ───────────────────────────────────────────────────────────
-                // CONVERSATION VIEW (hidden when in Dashboard state)
-                // Children (DagView, ComposeBlock) spawned by layout system
-                // ───────────────────────────────────────────────────────────
+                // CONVERSATION VIEW (hidden until AppScreen::Conversation)
+                // The tiling reconciler spawns ConversationContainer + ComposeBlock inside
                 content.spawn((
                     ui::state::ConversationRoot,
                     Node {
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        display: Display::None, // Hidden by default, shown via state transition
+                        display: Display::None,
                         ..default()
                     },
-                    Visibility::Hidden, // Hidden by default (glyphon needs this too)
+                    Visibility::Hidden,
                 ));
             });
+
+            // HEADER CONTAINER (attachment point for seat selector dropdown)
+            root.spawn((
+                HeaderContainer,
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(0.0),
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(6.0),
+                    right: Val::Px(16.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::FlexEnd,
+                    ..default()
+                },
+                ZIndex(constants::ZLayer::HUD + 1),
+            ));
         });
 }
 
 /// Marker for the header container (used by dashboard to attach seat selector).
 ///
-/// The actual header content (title, connection status) is now in widget system.
+/// The actual header content (title, connection status) is now in the tiling system.
 /// This component exists only as an attachment point for the seat selector dropdown.
 #[derive(Component)]
 pub struct HeaderContainer;

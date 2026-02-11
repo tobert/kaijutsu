@@ -8,5 +8,7 @@ pub mod materials;
 pub mod state;
 pub mod theme;
 pub mod theme_loader;
+pub mod tiling;
+pub mod tiling_reconciler;
+pub mod tiling_widgets;
 pub mod timeline;
-pub mod widget;

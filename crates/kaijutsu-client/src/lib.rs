@@ -20,8 +20,8 @@ pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode, Context, ContextDocument,
     ContextInfo, DocumentState, HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpResourceContents, McpToolResult, MountSpec,
-    RpcClient, RpcError, SeatHandle, SeatId, SeatInfo, SeatStatus, StagedDriftInfo, ToolResult,
-    VersionSnapshot,
+    RpcClient, RpcError, SeatHandle, SeatId, SeatInfo, SeatStatus, ShellValue, StagedDriftInfo,
+    ToolResult, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};

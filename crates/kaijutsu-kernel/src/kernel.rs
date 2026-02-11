@@ -25,7 +25,7 @@ use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
 use crate::vfs::{
-    backends::MemoryBackend, DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult,
+    DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult,
 };
 
 /// The Kernel: fundamental primitive of kaijutsu.
@@ -74,14 +74,9 @@ const DEFAULT_FLOW_CAPACITY: usize = 1024;
 
 impl Kernel {
     /// Create a new kernel with the given name.
-    ///
-    /// Automatically mounts a MemoryBackend at `/scratch`.
     pub async fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
-
-        // Mount scratch space
-        vfs.mount("/scratch", MemoryBackend::new()).await;
 
         Self {
             vfs,
@@ -100,7 +95,6 @@ impl Kernel {
     pub async fn with_id(id: Uuid, name: impl Into<String>) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
-        vfs.mount("/scratch", MemoryBackend::new()).await;
 
         Self {
             vfs,
@@ -122,7 +116,6 @@ impl Kernel {
     pub async fn with_flows(name: impl Into<String>, block_flows: SharedBlockFlowBus) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
-        vfs.mount("/scratch", MemoryBackend::new()).await;
 
         Self {
             vfs,
@@ -498,10 +491,8 @@ impl Kernel {
         let new_name = new_name.into();
         let state = self.state.read().await.fork(&new_name);
 
-        // Create new VFS with same mounts (but independent backends would
-        // need to be cloned - for now, just create fresh scratch)
+        // Create new VFS (backends would need Clone impl for real mount copying)
         let vfs = Arc::new(MountTable::new());
-        vfs.mount("/scratch", MemoryBackend::new()).await;
 
         // Copy mount info (but not backends - they'd need Clone impl)
         // This is a limitation - real fork would need backend cloning
@@ -674,18 +665,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scratch_mount() {
-        let kernel = Kernel::new("test").await;
-
-        // Should be able to write to /scratch
-        kernel.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
-        kernel.write(Path::new("/scratch/test.txt"), 0, b"hello").await.unwrap();
-
-        let data = kernel.read(Path::new("/scratch/test.txt"), 0, 100).await.unwrap();
-        assert_eq!(data, b"hello");
-    }
-
-    #[tokio::test]
     async fn test_variables() {
         let kernel = Kernel::new("test").await;
 
@@ -725,17 +704,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_thread() {
+        use crate::vfs::backends::MemoryBackend;
+
         let kernel = Kernel::new("parent").await;
         kernel.set_var("FOO", "bar").await;
-        kernel.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
+        kernel.mount("/mem", MemoryBackend::new()).await;
+        kernel.create(Path::new("/mem/test.txt"), 0o644).await.unwrap();
 
         let threaded = kernel.thread("worker").await;
 
         // Should inherit vars
         assert_eq!(threaded.get_var("FOO").await, Some("bar".to_string()));
 
-        // Should share VFS (same scratch file visible)
-        let attr = threaded.getattr(Path::new("/scratch/test.txt")).await;
+        // Should share VFS (same mount visible)
+        let attr = threaded.getattr(Path::new("/mem/test.txt")).await;
         assert!(attr.is_ok());
     }
 
@@ -754,11 +736,8 @@ mod tests {
         let history = forked.recent_history(10).await;
         assert_eq!(history.len(), 1);
 
-        // But VFS is independent (new scratch)
-        let original_scratch = kernel.getattr(Path::new("/scratch")).await;
-        let forked_scratch = forked.getattr(Path::new("/scratch")).await;
-        assert!(original_scratch.is_ok());
-        assert!(forked_scratch.is_ok());
+        // VFS is independent (no shared mounts)
+        assert!(forked.list_mounts().await.is_empty());
     }
 
     #[tokio::test]

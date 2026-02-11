@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::rpc::{
     ClientToolFilter, Completion, Context, ContextInfo, DocumentState, HistoryEntry, Identity,
-    KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, StagedDriftInfo,
-    ToolResult, VersionSnapshot,
+    KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, ShellValue,
+    StagedDriftInfo, ToolResult, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
@@ -95,6 +95,11 @@ enum RpcCommand {
     Complete { partial: String, cursor: u32, reply: oneshot::Sender<Result<Vec<Completion>, ActorError>> },
     GetCommandHistory { limit: u32, reply: oneshot::Sender<Result<Vec<HistoryEntry>, ActorError>> },
 
+    // ── Shell Variables ──────────────────────────────────────────────────
+    GetShellVar { name: String, reply: oneshot::Sender<Result<(Option<ShellValue>, bool), ActorError>> },
+    SetShellVar { name: String, value: ShellValue, reply: oneshot::Sender<Result<(), ActorError>> },
+    ListShellVars { reply: oneshot::Sender<Result<Vec<(String, ShellValue)>, ActorError>> },
+
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool { tool: String, params: String, reply: oneshot::Sender<Result<ToolResult, ActorError>> },
     CallMcpTool { server: String, tool: String, arguments: serde_json::Value, reply: oneshot::Sender<Result<McpToolResult, ActorError>> },
@@ -150,6 +155,9 @@ impl RpcCommand {
             Self::Interrupt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Complete { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -349,6 +357,23 @@ impl ActorHandle {
     /// Get command history.
     pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, ActorError> {
         self.send(|reply| RpcCommand::GetCommandHistory { limit, reply }).await
+    }
+
+    // ── Shell Variables ─────────────────────────────────────────────────
+
+    /// Get a shell variable by name.
+    pub async fn get_shell_var(&self, name: &str) -> Result<(Option<ShellValue>, bool), ActorError> {
+        self.send(|reply| RpcCommand::GetShellVar { name: name.into(), reply }).await
+    }
+
+    /// Set a shell variable.
+    pub async fn set_shell_var(&self, name: &str, value: ShellValue) -> Result<(), ActorError> {
+        self.send(|reply| RpcCommand::SetShellVar { name: name.into(), value, reply }).await
+    }
+
+    /// List all shell variables with their values.
+    pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, ActorError> {
+        self.send(|reply| RpcCommand::ListShellVars { reply }).await
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -830,6 +855,17 @@ async fn dispatch_command(
         }
         RpcCommand::GetCommandHistory { limit, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_command_history(limit));
+        }
+
+        // ── Shell Variables ─────────────────────────────────────
+        RpcCommand::GetShellVar { name, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_shell_var(&name));
+        }
+        RpcCommand::SetShellVar { name, value, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.set_shell_var(&name, &value));
+        }
+        RpcCommand::ListShellVars { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.list_shell_vars());
         }
 
         // ── Tool Execution ───────────────────────────────────────
