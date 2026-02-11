@@ -340,6 +340,7 @@ impl TileNode {
 /// - `visual_gen` — bumped on focus/resize (style-only changes).
 ///   The focus/visual system updates borders + flex weights without rebuilding.
 #[derive(Resource, Reflect)]
+#[reflect(Resource)]
 pub struct TilingTree {
     /// Root node of the layout tree.
     pub root: TileNode,
@@ -984,6 +985,8 @@ pub struct TilingPlugin;
 impl Plugin for TilingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(TilingTree::default_layout())
+            .register_type::<TilingTree>()
+            .register_type::<TileNode>()
             .register_type::<PaneId>()
             .register_type::<PaneContent>()
             .register_type::<SplitDirection>()
