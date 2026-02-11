@@ -22,7 +22,6 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 /// - **Cursor** (20): Cursor overlay in focused document
 /// - **HUD** (50): Dock containers (North/South) and HUD panels
 /// - **Modal** (100): Input layer, dropdowns, command palette
-/// - **Bubble** (150): Floating input bubbles
 /// - **Dropdown** (200): Dropdown menus above modals
 /// - **Toast** (250): Notifications, transient messages
 ///
@@ -41,8 +40,6 @@ impl ZLayer {
     pub const HUD: i32 = 50;
     /// Modal overlays (input layer, command palette)
     pub const MODAL: i32 = 100;
-    /// Floating input bubbles (above modal but below dropdown)
-    pub const BUBBLE_LAYER: i32 = 150;
     /// Dropdown menus (above modals)
     pub const DROPDOWN: i32 = 200;
     /// Toast notifications
