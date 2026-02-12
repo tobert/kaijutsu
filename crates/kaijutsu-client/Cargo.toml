@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "Cap'n Proto RPC client library for kaijutsu"
 
+[features]
+default = []
+telemetry = ["kaijutsu-telemetry/telemetry"]
+
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true
@@ -17,6 +21,7 @@ thiserror.workspace = true
 whoami.workspace = true
 serde_json = "1"
 tracing = "0.1"
+kaijutsu-telemetry = { workspace = true }
 
 # Shared CRDT types
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }

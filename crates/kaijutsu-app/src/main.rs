@@ -42,11 +42,23 @@ fn main() {
     let file_appender = tracing_appender::rolling::never(&log_dir, "kaijutsu-app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(EnvFilter::new("warn,kaijutsu_app=debug,kaijutsu_client=debug"))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .init();
+        .with(fmt::layer().with_writer(std::io::stderr));
+
+    #[cfg(feature = "telemetry")]
+    let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
+        let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-app");
+        registry.with(otel_layer).init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    };
+
+    #[cfg(not(feature = "telemetry"))]
+    registry.init();
 
     info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
 

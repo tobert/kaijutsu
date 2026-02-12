@@ -23,6 +23,7 @@ use std::process::ExitCode;
 use kaijutsu_server::constants::DEFAULT_SSH_PORT;
 use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use russh::keys::ssh_key::{self, HashAlg};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn print_usage() {
     eprintln!(
@@ -66,7 +67,25 @@ DATABASE:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr));
+
+    #[cfg(feature = "telemetry")]
+    let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
+        let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-server");
+        registry.with(otel_layer).init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    };
+
+    #[cfg(not(feature = "telemetry"))]
+    registry.init();
 
     let args: Vec<String> = env::args().collect();
 
@@ -103,13 +122,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run_server(port: u16) -> ExitCode {
-    log::info!("Starting kaijutsu server on SSH port {}...", port);
+    tracing::info!("Starting kaijutsu server on SSH port {}...", port);
 
     let config = SshServerConfig::production(port);
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {
-        log::error!("Server error: {}", e);
+        tracing::error!("Server error: {}", e);
         return ExitCode::FAILURE;
     }
 

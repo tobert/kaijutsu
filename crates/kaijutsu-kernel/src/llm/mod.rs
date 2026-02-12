@@ -406,11 +406,13 @@ impl RigProvider {
     }
 
     /// Simple prompt helper - sends a single user message.
+    #[tracing::instrument(skip(self, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
         self.prompt_with_system(model, None, prompt).await
     }
 
     /// Prompt with an optional system preamble.
+    #[tracing::instrument(skip(self, system, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt_with_system(
         &self,
         model: &str,
@@ -479,6 +481,7 @@ impl RigProvider {
     ///
     /// Returns a [`RigStreamAdapter`] that converts rig's streaming events
     /// into provider-agnostic [`StreamEvent`]s.
+    #[tracing::instrument(skip(self, request), fields(llm.provider = self.name()))]
     pub async fn stream(&self, request: StreamRequest) -> LlmResult<RigStreamAdapter> {
         RigStreamAdapter::new(self.clone(), request).await
     }
@@ -618,6 +621,7 @@ impl LlmRegistry {
     }
 
     /// Quick prompt using default provider and model.
+    #[tracing::instrument(skip(self, prompt))]
     pub async fn prompt(&self, prompt: &str) -> LlmResult<String> {
         let provider = self
             .default_provider()

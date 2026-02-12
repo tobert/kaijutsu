@@ -432,6 +432,7 @@ impl ToolRegistry {
     }
 
     /// Execute code using the default engine.
+    #[tracing::instrument(skip(self, code))]
     pub async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
         match self.default_engine() {
             Some(engine) => engine.execute(code).await,

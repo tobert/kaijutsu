@@ -239,6 +239,7 @@ impl DriftRouter {
     /// Stage a drift operation for later flush.
     ///
     /// Returns the staged drift ID.
+    #[tracing::instrument(skip(self, content, source_model), fields(drift.source = %source_ctx, drift.target = %target_ctx))]
     pub fn stage(
         &mut self,
         source_ctx: &str,
@@ -637,6 +638,7 @@ impl ExecutionEngine for DriftPushEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "drift.push")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: DriftPushParams = match serde_json::from_str(params) {
             Ok(v) => v,
@@ -760,6 +762,7 @@ impl ExecutionEngine for DriftPullEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "drift.pull")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: DriftPullParams = match serde_json::from_str(params) {
             Ok(v) => v,
@@ -880,6 +883,7 @@ impl ExecutionEngine for DriftFlushEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, _params), name = "drift.flush")]
     async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
         let kernel = match drift_kernel(&self.kernel) {
             Ok(k) => k,
@@ -976,6 +980,7 @@ impl ExecutionEngine for DriftMergeEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "drift.merge")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: DriftMergeParams = match serde_json::from_str(params) {
             Ok(v) => v,

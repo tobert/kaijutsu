@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "Bevy GUI client for kaijutsu"
 
+[features]
+default = []
+telemetry = ["kaijutsu-telemetry/telemetry"]
+
 [dependencies]
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-client = { path = "../kaijutsu-client" }
@@ -34,10 +38,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ron = "0.8"
 
-# Logging
+# Logging + Telemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+kaijutsu-telemetry = { workspace = true }
 
 # Error handling
 thiserror.workspace = true

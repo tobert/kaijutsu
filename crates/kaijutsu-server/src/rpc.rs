@@ -46,6 +46,26 @@ use kaijutsu_kernel::{
 };
 use kaijutsu_crdt::{BlockKind, Role, Status};
 use serde_json;
+use tracing::Instrument;
+
+/// Extract W3C Trace Context from a Cap'n Proto `TraceContext` reader.
+///
+/// Returns a tracing span linked to the remote parent (or a root span if empty).
+/// Safe to call even when trace is not present — returns a detached span.
+fn extract_rpc_trace(trace: capnp::Result<trace_context::Reader<'_>>, name: &'static str) -> tracing::Span {
+    let (traceparent, tracestate) = match trace {
+        Ok(t) => {
+            let tp = t.get_traceparent().ok().and_then(|r| r.to_str().ok()).unwrap_or("");
+            let ts = t.get_tracestate().ok().and_then(|r| r.to_str().ok()).unwrap_or("");
+            (tp.to_string(), ts.to_string())
+        }
+        Err(_) => (String::new(), String::new()),
+    };
+    let span = kaijutsu_telemetry::extract_trace_context(&traceparent, &tracestate);
+    // Override the default "rpc.request" name with the actual method name
+    let named_span = tracing::info_span!(parent: &span, "rpc", method = name);
+    named_span
+}
 
 // ============================================================================
 // Server State
@@ -823,11 +843,14 @@ impl kernel::Server for KernelImpl {
         params: kernel::ExecuteParams,
         mut results: kernel::ExecuteResults,
     ) -> Promise<(), capnp::Error> {
-        let code = pry!(pry!(pry!(params.get()).get_code()).to_str()).to_owned();
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "execute");
+        let code = pry!(pry!(p.get_code()).to_str()).to_owned();
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
         // Use Promise::from_future for async execution
+
         Promise::from_future(async move {
             // Get or create embedded kaish executor
             let kaish = {
@@ -886,7 +909,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn interrupt(
@@ -1412,8 +1435,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::ExecuteToolParams,
         mut results: kernel::ExecuteToolResults,
     ) -> Promise<(), capnp::Error> {
-        let call = pry!(params.get());
-        let call = pry!(call.get_call());
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "execute_tool");
+        let call = pry!(p.get_call());
         let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
         let tool_params = pry!(pry!(call.get_params()).to_str()).to_owned();
         let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
@@ -1424,6 +1448,7 @@ impl kernel::Server for KernelImpl {
             None => return Promise::err(capnp::Error::failed("kernel not found".into())),
         };
         drop(state);
+
 
         Promise::from_future(async move {
             let mut result = results.get().init_result();
@@ -1460,7 +1485,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn get_tool_schemas(
@@ -1738,7 +1763,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetDocumentStateParams,
         mut results: kernel::GetDocumentStateResults,
     ) -> Promise<(), capnp::Error> {
-        let cell_id = pry!(pry!(pry!(params.get()).get_document_id()).to_str()).to_owned();
+        let p = pry!(params.get());
+        let _trace_span = extract_rpc_trace(p.get_trace(), "get_document_state");
+        let cell_id = pry!(pry!(p.get_document_id()).to_str()).to_owned();
 
         log::debug!("get_document_state called for cell {}", cell_id);
 
@@ -1800,6 +1827,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         log::debug!("prompt() called for kernel {}", self.kernel_id);
         let params = pry!(params.get());
+        let trace_span = extract_rpc_trace(params.get_trace(), "prompt");
         let request = pry!(params.get_request());
         let content = pry!(pry!(request.get_content()).to_str()).to_owned();
         log::info!("Received prompt request: cell_id={}, content_len={}",
@@ -1813,6 +1841,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
+
 
         Promise::from_future(async move {
             log::debug!("prompt future started for cell_id={}", cell_id);
@@ -1905,7 +1934,7 @@ impl kernel::Server for KernelImpl {
             results.get().set_prompt_id(&prompt_id);
             log::debug!("prompt() returning immediately with prompt_id={}", prompt_id);
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     // =========================================================================
@@ -2247,7 +2276,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::CallMcpToolParams,
         mut results: kernel::CallMcpToolResults,
     ) -> Promise<(), capnp::Error> {
-        let call_reader = pry!(pry!(params.get()).get_call());
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "call_mcp_tool");
+        let call_reader = pry!(p.get_call());
         let server = pry!(pry!(call_reader.get_server()).to_str()).to_owned();
         let tool = pry!(pry!(call_reader.get_tool()).to_str()).to_owned();
         let arguments_str = pry!(pry!(call_reader.get_arguments()).to_str()).to_owned();
@@ -2269,6 +2300,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
+
 
         Promise::from_future(async move {
             let mcp_result = mcp_pool.call_tool(&server, &tool, arguments).await;
@@ -2296,7 +2328,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     // =========================================================================
@@ -2310,12 +2342,14 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         log::debug!("shell_execute() called for kernel {}", self.kernel_id);
         let params = pry!(params.get());
+        let trace_span = extract_rpc_trace(params.get_trace(), "shell_execute");
         let code = pry!(pry!(params.get_code()).to_str()).to_owned();
         let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
         log::info!("Shell execute: cell_id={}, code={}", cell_id, code);
 
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
+
 
         Promise::from_future(async move {
             // Get or create embedded kaish executor (same pattern as execute RPC)
@@ -2448,7 +2482,7 @@ impl kernel::Server for KernelImpl {
 
             log::debug!("shell_execute() returning command_block_id={:?}", command_block_id);
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     // =========================================================================
@@ -2969,6 +3003,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::PushOpsResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
+        let _trace_span = extract_rpc_trace(params_reader.get_trace(), "push_ops");
         let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
         let ops_data = pry!(params_reader.get_ops()).to_vec();
 
@@ -4060,6 +4095,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::DriftPushResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
+        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_push");
         let target_ctx = pry!(pry!(params_reader.get_target_ctx()).to_str()).to_owned();
         let content = pry!(pry!(params_reader.get_content()).to_str()).to_owned();
         let summarize = params_reader.get_summarize();
@@ -4111,6 +4147,7 @@ impl kernel::Server for KernelImpl {
         }
 
         // Summarize path — async LLM call
+
         Promise::from_future(async move {
             // Get LLM provider from kernel's registry
             let provider = {
@@ -4162,14 +4199,15 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn drift_flush(
         self: Rc<Self>,
-        _params: kernel::DriftFlushParams,
+        params: kernel::DriftFlushParams,
         mut results: kernel::DriftFlushResults,
     ) -> Promise<(), capnp::Error> {
+        let _trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
         let mut state = self.state.borrow_mut();
 
         // Scope flush to items involving the calling kernel's context
@@ -4262,6 +4300,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::DriftPullResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
+        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_pull");
         let source_ctx_id = pry!(pry!(params_reader.get_source_ctx()).to_str()).to_owned();
         let directed_prompt = params_reader.get_prompt().ok()
             .and_then(|p| p.to_str().ok())
@@ -4270,6 +4309,7 @@ impl kernel::Server for KernelImpl {
 
         let kernel_id = self.kernel_id.clone();
         let state = self.state.clone();
+
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
@@ -4361,7 +4401,7 @@ impl kernel::Server for KernelImpl {
             result_block_id.set_seq(block_id.seq);
 
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn drift_merge(
@@ -4370,9 +4410,11 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::DriftMergeResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
+        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_merge");
         let source_ctx_id = pry!(pry!(params_reader.get_source_ctx()).to_str()).to_owned();
 
         let state = self.state.clone();
+
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
@@ -4468,7 +4510,7 @@ impl kernel::Server for KernelImpl {
             result_block_id.set_seq(block_id.seq);
 
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn list_all_contexts(

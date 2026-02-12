@@ -4438,6 +4438,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-timeout"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
+ "tower-service",
+]
+
+[[package]]
 name = "hyper-tls"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4951,6 +4964,7 @@ dependencies = [
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",
+ "kaijutsu-telemetry",
  "kaish-kernel",
  "log",
  "logos",
@@ -4983,6 +4997,7 @@ dependencies = [
  "env_logger",
  "futures",
  "kaijutsu-crdt",
+ "kaijutsu-telemetry",
  "log",
  "rand 0.8.5",
  "russh",
@@ -5050,6 +5065,7 @@ dependencies = [
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",
+ "kaijutsu-telemetry",
  "regex",
  "rmcp",
  "schemars",
@@ -5071,13 +5087,13 @@ dependencies = [
  "capnp-rpc",
  "capnpc",
  "dashmap",
- "env_logger",
  "futures",
  "git2",
  "hostname",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",
+ "kaijutsu-telemetry",
  "kaish-kernel",
  "log",
  "notify 8.2.0",
@@ -5093,6 +5109,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -6385,19 +6402,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-http"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50f6639e842a97dbea8886e3439710ae463120091e2e064518ba8e716e6ac36d"
-dependencies = [
- "async-trait",
- "bytes",
- "http",
- "opentelemetry",
- "reqwest",
-]
-
-[[package]]
 name = "opentelemetry-otlp"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6405,14 +6409,12 @@ checksum = "dbee664a43e07615731afc539ca60c6d9f1a9425e25ca09c57bc36c87c55852b"
 dependencies = [
  "http",
  "opentelemetry",
- "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -7394,7 +7396,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -8902,10 +8903,15 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
  "percent-encoding",
  "pin-project",
  "prost",
+ "tokio",
  "tokio-stream",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -8919,11 +8925,15 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap",
  "pin-project-lite",
+ "slab",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

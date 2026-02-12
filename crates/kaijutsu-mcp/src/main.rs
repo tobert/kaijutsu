@@ -23,7 +23,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use rmcp::{ServiceExt, transport::stdio};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_mcp::KaijutsuMcp;
 use kaijutsu_mcp::hook_listener::{HookListener, default_socket_path, send_hook_event, discover_sockets};
@@ -91,14 +91,24 @@ struct HookArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing to stderr (MCP uses stdio for protocol)
-    fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+    let filter = EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false));
+
+    #[cfg(feature = "telemetry")]
+    let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
+        let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-mcp");
+        registry.with(otel_layer).init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    };
+
+    #[cfg(not(feature = "telemetry"))]
+    registry.init();
 
     let cli = Cli::parse();
 

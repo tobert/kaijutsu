@@ -1100,6 +1100,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "List all registered drift contexts. Shows short IDs, names, providers, models, and lineage.")]
+    #[tracing::instrument(skip(self), name = "mcp.drift_ls")]
     async fn drift_ls(&self) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1128,6 +1129,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.drift_push")]
     async fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1192,6 +1194,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Flush all staged drifts, injecting content into target contexts.")]
+    #[tracing::instrument(skip(self), name = "mcp.drift_flush")]
     async fn drift_flush(&self) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1206,6 +1209,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.drift_pull")]
     async fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1223,6 +1227,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.drift_merge")]
     async fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1244,6 +1249,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Execute a tool through the kernel's tool registry. Available tools include git, drift, search, and any registered execution engines. Returns the tool's output synchronously. Requires --connect to kaijutsu-server.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.kaish_exec")]
     async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1263,6 +1269,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect to kaijutsu-server.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.shell")]
     async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         let remote = match self.remote() {
             Some(r) => r,

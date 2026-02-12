@@ -4,6 +4,19 @@
 # Cap'n Proto interface for kernel-based collaborative spaces
 
 # ============================================================================
+# Distributed Tracing (W3C Trace Context)
+# ============================================================================
+
+# W3C Trace Context for distributed tracing across SSH boundary.
+# See: https://www.w3.org/TR/trace-context/
+# Cap'n Proto schema evolution: old clients without this field still work —
+# the server sees default (empty) strings and creates a root span.
+struct TraceContext {
+  traceparent @0 :Text;   # e.g. "00-4bf92f3577b6a8141fea3e3b0aa7d3f5-00f067aa0ba902b7-01"
+  tracestate @1 :Text;    # vendor-specific key=value pairs (optional, may be empty)
+}
+
+# ============================================================================
 # Core Types
 # ============================================================================
 
@@ -327,7 +340,7 @@ interface World {
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
   # Attach to an existing kernel. seatId defaults to hostname if not provided.
-  attachKernel @2 (id :Text, seatId :Text) -> (kernel :Kernel);
+  attachKernel @2 (id :Text, seatId :Text, trace :TraceContext) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
 
   # Seat management (cross-kernel)
@@ -340,7 +353,7 @@ interface Kernel {
   getInfo @0 () -> (info :KernelInfo);
 
   # kaish execution
-  execute @1 (code :Text) -> (execId :UInt64);
+  execute @1 (code :Text, trace :TraceContext) -> (execId :UInt64);
   interrupt @2 (execId :UInt64);
   complete @3 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
   subscribeOutput @4 (callback :KernelOutput);
@@ -363,16 +376,16 @@ interface Kernel {
   unmount @15 (path :Text) -> (success :Bool);
 
   # Tool execution
-  executeTool @16 (call :ToolCall) -> (result :ToolResult);
+  executeTool @16 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
   getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
   # Block-based CRDT operations
   applyBlockOp @18 (documentId :Text, op :BlockDocOp) -> (newVersion :UInt64);
   subscribeBlocks @19 (callback :BlockEvents);
-  getDocumentState @20 (documentId :Text) -> (state :DocumentState);
+  getDocumentState @20 (documentId :Text, trace :TraceContext) -> (state :DocumentState);
 
   # LLM operations
-  prompt @21 (request :LlmRequest) -> (promptId :Text);
+  prompt @21 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
   # Context & seat management
   listContexts @22 () -> (contexts :List(Context));
@@ -385,11 +398,11 @@ interface Kernel {
   registerMcp @27 (config :McpServerConfig) -> (info :McpServerInfo);
   unregisterMcp @28 (name :Text);
   listMcpServers @29 () -> (servers :List(McpServerInfo));
-  callMcpTool @30 (call :McpToolCall) -> (result :McpToolResult);
+  callMcpTool @30 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
 
   # Shell execution (kaish REPL with block output)
   # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
-  shellExecute @31 (code :Text, documentId :Text) -> (commandBlockId :BlockId);
+  shellExecute @31 (code :Text, documentId :Text, trace :TraceContext) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
   getCwd @32 () -> (path :Text);
@@ -415,7 +428,7 @@ interface Kernel {
 
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
-  pushOps @47 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
+  pushOps @47 (documentId :Text, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
   listMcpResources @48 (server :Text) -> (resources :List(McpResource));
@@ -521,10 +534,10 @@ interface Kernel {
   configureLlm @75 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
-  driftPush @76 (targetCtx :Text, content :Text, summarize :Bool) -> (stagedId :UInt64);
+  driftPush @76 (targetCtx :Text, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
 
   # Flush all staged drifts (inject into target kernels)
-  driftFlush @77 () -> (count :UInt32);
+  driftFlush @77 (trace :TraceContext) -> (count :UInt32);
 
   # List staged drifts pending flush
   driftQueue @78 () -> (staged :List(StagedDriftInfo));
@@ -533,10 +546,10 @@ interface Kernel {
   driftCancel @79 (stagedId :UInt64) -> (success :Bool);
 
   # Pull summarized content from another context
-  driftPull @80 (sourceCtx :Text, prompt :Text) -> (blockId :BlockId);
+  driftPull @80 (sourceCtx :Text, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # Merge a forked context back into its parent
-  driftMerge @81 (sourceCtx :Text) -> (blockId :BlockId);
+  driftMerge @81 (sourceCtx :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # List all registered contexts across all kernels
   listAllContexts @82 () -> (contexts :List(ContextHandleInfo));

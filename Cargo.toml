@@ -84,5 +84,5 @@ kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 # OpenTelemetry
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30", features = ["tonic"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.31"

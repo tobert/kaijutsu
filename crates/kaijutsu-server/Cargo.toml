@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
+[features]
+default = []
+telemetry = ["kaijutsu-telemetry/telemetry"]
+
 [dependencies]
 # Kaijutsu kernel (VFS + state + control plane)
 kaijutsu-kernel.workspace = true
@@ -19,7 +23,6 @@ tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
 log.workspace = true
-env_logger.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -32,6 +35,8 @@ serde_json = "1"
 parking_lot = "0.12"
 dashmap = "6"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+kaijutsu-telemetry = { workspace = true }
 
 # File watching for external tool changes (cargo, clippy, etc.)
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }

@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "MCP server exposing kaijutsu CRDT kernel to Claude Code, Gemini CLI, and opencode"
 
+[features]
+default = []
+telemetry = ["kaijutsu-telemetry/telemetry"]
+
 [[bin]]
 name = "kaijutsu-mcp"
 path = "src/main.rs"
@@ -34,9 +38,10 @@ schemars = { version = "1.0", features = ["chrono04"] }
 # XDG paths
 dirs = "6"
 
-# Logging
+# Logging + Telemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+kaijutsu-telemetry = { workspace = true }
 
 # Regex for search
 regex = "1"

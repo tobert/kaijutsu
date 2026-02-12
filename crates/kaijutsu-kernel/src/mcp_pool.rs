@@ -1187,6 +1187,7 @@ impl McpServerPool {
     /// * `server_name` - Name of the MCP server
     /// * `tool_name` - Name of the tool to call
     /// * `arguments` - Tool arguments as a JSON object
+    #[tracing::instrument(skip(self, arguments), fields(mcp.server = %server_name, mcp.tool = %tool_name))]
     pub async fn call_tool(
         &self,
         server_name: &str,

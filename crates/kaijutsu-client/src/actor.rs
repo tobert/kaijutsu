@@ -230,6 +230,7 @@ impl ActorHandle {
     // ── Drift ────────────────────────────────────────────────────────────
 
     /// Stage a drift push to another context.
+    #[tracing::instrument(skip(self, content))]
     pub async fn drift_push(
         &self,
         target_ctx: &str,
@@ -242,6 +243,7 @@ impl ActorHandle {
     }
 
     /// Flush all staged drifts.
+    #[tracing::instrument(skip(self))]
     pub async fn drift_flush(&self) -> Result<u32, ActorError> {
         self.send(|reply| RpcCommand::DriftFlush { reply }).await
     }
@@ -257,6 +259,7 @@ impl ActorHandle {
     }
 
     /// Pull summarized content from another context.
+    #[tracing::instrument(skip(self, prompt))]
     pub async fn drift_pull(
         &self,
         source_ctx: &str,
@@ -268,6 +271,7 @@ impl ActorHandle {
     }
 
     /// Merge a forked context back into its parent.
+    #[tracing::instrument(skip(self))]
     pub async fn drift_merge(&self, source_ctx: &str) -> Result<BlockId, ActorError> {
         self.send(|reply| RpcCommand::DriftMerge { source_ctx: source_ctx.into(), reply }).await
     }
@@ -333,11 +337,13 @@ impl ActorHandle {
     // ── Shell / Execution ────────────────────────────────────────────────
 
     /// Execute code in the kernel's embedded kaish.
+    #[tracing::instrument(skip(self, code))]
     pub async fn execute(&self, code: &str) -> Result<u64, ActorError> {
         self.send(|reply| RpcCommand::Execute { code: code.into(), reply }).await
     }
 
     /// Execute shell command with block output (kaish REPL mode).
+    #[tracing::instrument(skip(self, code))]
     pub async fn shell_execute(&self, code: &str, cell_id: &str) -> Result<BlockId, ActorError> {
         self.send(|reply| RpcCommand::ShellExecute {
             code: code.into(), cell_id: cell_id.into(), reply,
@@ -379,6 +385,7 @@ impl ActorHandle {
     // ── Tool Execution ───────────────────────────────────────────────────
 
     /// Execute a tool on the server (git, etc).
+    #[tracing::instrument(skip(self, params))]
     pub async fn execute_tool(&self, tool: &str, params: &str) -> Result<ToolResult, ActorError> {
         self.send(|reply| RpcCommand::ExecuteTool {
             tool: tool.into(), params: params.into(), reply,
@@ -386,6 +393,7 @@ impl ActorHandle {
     }
 
     /// Call an MCP tool.
+    #[tracing::instrument(skip(self, arguments))]
     pub async fn call_mcp_tool(
         &self,
         server: &str,
@@ -418,6 +426,7 @@ impl ActorHandle {
     // ── LLM ──────────────────────────────────────────────────────────────
 
     /// Send a prompt to the server-side LLM.
+    #[tracing::instrument(skip(self, content))]
     pub async fn prompt(
         &self,
         content: &str,

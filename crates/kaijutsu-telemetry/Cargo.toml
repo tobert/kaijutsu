@@ -1,0 +1,26 @@
+[package]
+name = "kaijutsu-telemetry"
+version.workspace = true
+edition.workspace = true
+description = "OpenTelemetry integration for kaijutsu — tracing layer, W3C context propagation, and sampling"
+
+[features]
+default = []
+telemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
+[dependencies]
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"], optional = true }
+
+# OTel deps — only pulled with `telemetry` feature
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
