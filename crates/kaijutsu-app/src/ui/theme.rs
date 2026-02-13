@@ -306,89 +306,107 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Base UI - Tokyo Night inspired
-            bg: Color::srgb(0.05, 0.07, 0.09),
-            panel_bg: Color::srgba(0.05, 0.07, 0.09, 0.9),
-            fg: Color::srgb(0.9, 0.9, 0.9),
-            fg_dim: Color::srgb(0.5, 0.5, 0.5),
-            accent: Color::srgb(0.34, 0.65, 1.0),
-            accent2: Color::srgb(0.97, 0.47, 0.73),
-            border: Color::srgb(0.19, 0.21, 0.24),
-            selection_bg: Color::srgba(0.34, 0.65, 1.0, 0.2),
+            // Base UI - Neon Cyberpunk
+            bg: Color::srgb(0.04, 0.04, 0.06),                  // #0a0a0f near-black
+            panel_bg: Color::srgba(0.04, 0.04, 0.06, 0.95),     // Almost opaque
+            fg: Color::srgb(0.88, 0.94, 1.00),                  // #e0f0ff cool white
+            fg_dim: Color::srgb(0.38, 0.50, 0.63),              // #6080a0 muted cyan-gray
+            accent: Color::srgb(0.00, 1.00, 1.00),              // #00ffff electric cyan
+            accent2: Color::srgb(1.00, 0.00, 0.50),             // #ff0080 hot pink
+            border: Color::srgb(0.19, 0.13, 0.31),              // #302050 deep purple
+            selection_bg: Color::srgba(1.00, 0.00, 0.50, 0.25), // #ff0080 pink selection
 
             // Row type colors
-            row_tool: Color::srgb(0.83, 0.6, 0.13),    // Orange - tool calls
-            row_result: Color::srgb(0.25, 0.73, 0.31), // Green - tool results
+            row_tool: Color::srgb(1.00, 0.67, 0.00),            // #ffaa00 neon orange
+            row_result: Color::srgb(0.00, 1.00, 0.53),          // #00ff88 toxic green
 
-            // Block text colors - Tokyo Night inspired palette
-            block_user: Color::srgb(0.90, 0.90, 0.92),         // Soft white
-            block_assistant: Color::srgb(0.58, 0.74, 1.00),    // Light blue (#94bdff)
-            block_thinking: Color::srgb(0.45, 0.47, 0.55),     // Dim gray (de-emphasized)
-            block_tool_call: Color::srgb(0.89, 0.79, 0.49),    // Amber (ansi.yellow)
-            block_tool_result: Color::srgb(0.62, 0.81, 0.42),  // Green (ansi.green)
-            block_tool_error: Color::srgb(0.97, 0.38, 0.45),   // Red (ansi.red)
-            block_shell_cmd: Color::srgb(0.49, 0.85, 0.82),    // Cyan (ansi.cyan)
-            block_shell_output: Color::srgb(0.70, 0.72, 0.78), // Light gray
-            block_drift_push: Color::srgb(0.49, 0.85, 0.82),         // Cyan — conversational
-            block_drift_pull: Color::srgb(0.58, 0.74, 1.00),         // Blue — substantive
-            block_drift_merge: Color::srgb(0.73, 0.47, 0.91),        // Purple — structural
-            block_drift_commit: Color::srgb(0.62, 0.81, 0.42),       // Green — like git
+            // Block text colors — neon palette
+            block_user: Color::srgb(0.88, 0.94, 1.00),          // #e0f0ff cool white
+            block_assistant: Color::srgb(0.88, 0.94, 1.00),     // Same as fg
+            block_thinking: Color::srgb(0.38, 0.50, 0.63),      // #6080a0 muted
+            block_tool_call: Color::srgb(1.00, 0.67, 0.00),     // #ffaa00 amber
+            block_tool_result: Color::srgb(0.00, 1.00, 0.53),   // #00ff88 toxic green
+            block_tool_error: Color::srgb(1.00, 0.13, 0.38),    // #ff2060 neon red
+            block_shell_cmd: Color::srgb(0.00, 1.00, 1.00),     // #00ffff cyan
+            block_shell_output: Color::srgb(0.88, 0.94, 1.00),  // #e0f0ff cool white
+            block_drift_push: Color::srgb(0.00, 1.00, 1.00),    // #00ffff cyan
+            block_drift_pull: Color::srgb(0.00, 0.67, 1.00),    // #00aaff electric blue
+            block_drift_merge: Color::srgb(1.00, 0.00, 1.00),   // #ff00ff magenta
+            block_drift_commit: Color::srgb(0.00, 1.00, 0.53),  // #00ff88 toxic green
+
             // Semantic
-            error: Color::srgb(0.97, 0.38, 0.45),     // Red
-            warning: Color::srgb(0.89, 0.79, 0.49),   // Yellow
-            success: Color::srgb(0.62, 0.81, 0.42),   // Green
+            error: Color::srgb(1.00, 0.13, 0.38),               // #ff2060 neon red
+            warning: Color::srgb(1.00, 0.80, 0.00),             // #ffcc00 electric yellow
+            success: Color::srgb(0.00, 1.00, 0.53),             // #00ff88 matrix green
 
             // Mode colors (vim-style)
-            mode_normal: Color::srgb(0.5, 0.5, 0.5),  // Dim gray (matches fg_dim)
-            mode_chat: Color::srgb(0.4, 0.8, 0.4),    // Green (chat with LLM)
-            mode_shell: Color::srgb(0.3, 0.9, 0.7),   // Terminal green (kaish REPL)
-            mode_visual: Color::srgb(0.7, 0.4, 0.9),  // Purple
+            mode_normal: Color::srgb(0.50, 0.56, 0.69),         // #8090b0 cool slate
+            mode_chat: Color::srgb(0.00, 1.00, 0.53),           // #00ff88 toxic green
+            mode_shell: Color::srgb(1.00, 0.67, 0.00),          // #ffaa00 neon orange
+            mode_visual: Color::srgb(1.00, 0.00, 1.00),         // #ff00ff magenta
 
-            // Cursor colors - soft aesthetic terminal style
-            cursor_normal: Vec4::new(0.85, 0.92, 1.0, 0.85),  // Soft ice blue
-            cursor_insert: Vec4::new(1.0, 0.5, 0.75, 0.95),   // Hot pink
-            cursor_visual: Vec4::new(0.95, 0.85, 0.6, 0.9),   // Warm gold
+            // Cursor colors — maximum glow
+            cursor_normal: Vec4::new(0.00, 1.00, 1.00, 0.9),    // #00ffff cyan
+            cursor_insert: Vec4::new(1.00, 0.00, 0.50, 1.0),    // #ff0080 hot pink
+            cursor_visual: Vec4::new(1.00, 0.00, 1.00, 0.9),    // #ff00ff magenta
 
-            // ANSI palette
-            ansi: AnsiColors::default(),
+            // ANSI palette — neon
+            ansi: AnsiColors {
+                black: Color::srgb(0.04, 0.04, 0.06),           // #0a0a0f
+                red: Color::srgb(1.00, 0.13, 0.38),             // #ff2060
+                green: Color::srgb(0.00, 1.00, 0.53),           // #00ff88
+                yellow: Color::srgb(1.00, 0.80, 0.00),          // #ffcc00
+                blue: Color::srgb(0.00, 0.67, 1.00),            // #00aaff
+                magenta: Color::srgb(1.00, 0.00, 1.00),         // #ff00ff
+                cyan: Color::srgb(0.00, 1.00, 1.00),            // #00ffff
+                white: Color::srgb(0.88, 0.94, 1.00),           // #e0f0ff
+                bright_black: Color::srgb(0.25, 0.31, 0.44),    // #405070
+                bright_red: Color::srgb(1.00, 0.25, 0.50),      // #ff4080
+                bright_green: Color::srgb(0.25, 1.00, 0.67),    // #40ffaa
+                bright_yellow: Color::srgb(1.00, 0.93, 0.40),   // #ffee66
+                bright_blue: Color::srgb(0.25, 0.80, 1.00),     // #40ccff
+                bright_magenta: Color::srgb(1.00, 0.40, 1.00),  // #ff66ff
+                bright_cyan: Color::srgb(0.40, 1.00, 1.00),     // #66ffff
+                bright_white: Color::srgb(1.00, 1.00, 1.00),    // #ffffff
+            },
 
-            // Frame configuration - cyberpunk style defaults
-            frame_corner_size: 48.0,
-            frame_edge_thickness: 6.0,
-            frame_content_padding: 8.0,
+            // Frame configuration — chunky cyber frames
+            frame_corner_size: 56.0,
+            frame_edge_thickness: 8.0,
+            frame_content_padding: 10.0,
 
-            // Frame colors - soft purple base (Tokyo Night aesthetic)
-            frame_base: Color::srgb(0.73, 0.60, 0.97),      // #bb9af7 soft purple
-            frame_focused: Color::srgb(0.73, 0.60, 0.97),   // Same as base when focused
-            frame_insert: Color::srgb(0.62, 0.81, 0.42),    // #9ece6a green - input modes
-            frame_visual: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue - reuse accent
-            frame_unfocused: Color::srgba(0.34, 0.37, 0.54, 0.6), // #565f89 dimmed
-            frame_edge: Color::srgba(0.73, 0.60, 0.97, 0.5), // Dimmer purple
+            // Frame colors — neon glow
+            frame_base: Color::srgb(1.00, 0.00, 0.50),          // #ff0080 hot pink
+            frame_focused: Color::srgb(0.00, 1.00, 1.00),       // #00ffff cyan
+            frame_insert: Color::srgb(0.00, 1.00, 0.53),        // #00ff88 green
+            frame_visual: Color::srgb(1.00, 0.00, 1.00),        // #ff00ff magenta
+            frame_unfocused: Color::srgba(0.38, 0.25, 0.50, 0.5), // #604080 dim purple
+            frame_edge: Color::srgba(1.00, 0.00, 0.50, 0.6),    // #ff0080 pink edges
 
-            // Frame shader params: [glow_radius, intensity, pulse_speed, bracket_length]
-            frame_params_base: Vec4::new(0.15, 1.2, 1.5, 0.7),
-            frame_params_focused: Vec4::new(0.2, 1.5, 2.0, 0.7),
-            frame_params_unfocused: Vec4::new(0.1, 0.6, 0.8, 0.7),
+            // Frame shader params — cranked for maximum glow
+            frame_params_base: Vec4::new(0.25, 2.0, 2.5, 0.75),
+            frame_params_focused: Vec4::new(0.35, 2.5, 3.0, 0.8),
+            frame_params_unfocused: Vec4::new(0.15, 0.8, 1.0, 0.6),
 
-            // Edge dimming: [r_mult, g_mult, b_mult, a_mult]
-            frame_edge_dim_unfocused: Vec4::new(0.5, 0.5, 0.5, 0.6),
-            frame_edge_dim_focused: Vec4::new(0.7, 0.7, 0.7, 0.8),
+            // Edge dimming — less dim, more glow
+            frame_edge_dim_unfocused: Vec4::new(0.6, 0.5, 0.7, 0.7),
+            frame_edge_dim_focused: Vec4::new(0.9, 0.8, 1.0, 0.95),
 
-            // Shader effect parameters - cyberpunk defaults
-            effect_glow_radius: 0.3,
-            effect_glow_intensity: 0.5,
-            effect_glow_falloff: 2.5,
-            effect_sheen_speed: 0.15,
-            effect_sheen_sparkle_threshold: 0.92,
-            effect_breathe_speed: 1.9,
-            effect_breathe_amplitude: 0.1,
+            // Shader effect parameters — neon overdrive
+            effect_glow_radius: 0.45,
+            effect_glow_intensity: 1.2,
+            effect_glow_falloff: 1.8,
+            effect_sheen_speed: 0.25,
+            effect_sheen_sparkle_threshold: 0.88,
+            effect_breathe_speed: 2.5,
+            effect_breathe_amplitude: 0.18,
 
-            // Chasing border defaults
-            effect_chase_speed: 0.25,
+            // Chasing border — smooth neon rainbow
+            effect_chase_speed: 0.20,
             effect_chase_width: 0.10,
             effect_chase_glow_radius: 0.08,
             effect_chase_glow_intensity: 0.6,
-            effect_chase_color_cycle: 0.15, // Rainbow cycle speed
+            effect_chase_color_cycle: 0.12,
 
             // Input area defaults
             input_minimized_height: 6.0,
@@ -396,49 +414,49 @@ impl Default for Theme {
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
 
-            // Markdown rendering defaults (Tokyo Night palette)
-            md_heading_color: Color::srgb(0.73, 0.60, 0.97),    // #bb9af7 purple accent
-            md_code_fg: Color::srgb(0.62, 0.81, 0.42),          // #9ece6a green
-            md_code_block_fg: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7 blue
-            md_strong_color: None,                                // Inherit base block color
+            // Markdown rendering — neon palette
+            md_heading_color: Color::srgb(1.00, 0.00, 1.00),    // #ff00ff magenta
+            md_code_fg: Color::srgb(0.00, 1.00, 0.53),          // #00ff88 green
+            md_code_block_fg: Color::srgb(0.00, 0.67, 1.00),    // #00aaff blue
+            md_strong_color: None,
 
-            // Font rendering quality defaults
-            font_stem_darkening: 0.15,  // ClearType-like weight (cell boundary fade prevents bleed)
-            font_hint_amount: 0.8,      // Strong hinting for crisp stems
-            font_taa_enabled: true,     // Temporal AA for smoother edges
-            font_taa_convergence_frames: 8, // 8 frames to converge (~133ms at 60fps)
-            font_taa_initial_weight: 0.5,   // 50% current frame weight initially
-            font_taa_final_weight: 0.1,     // 10% current frame weight at convergence
-            font_horz_scale: 1.1,       // Wider AA for vertical strokes (cell boundary fade prevents bleed)
-            font_vert_scale: 0.6,       // Sharper AA for horizontal strokes
-            font_text_bias: 0.5,        // Standard SDF threshold
-            font_gamma_correction: 0.85, // Gamma-correct alpha for light-on-dark
+            // Font rendering quality
+            font_stem_darkening: 0.15,
+            font_hint_amount: 0.8,
+            font_taa_enabled: true,
+            font_taa_convergence_frames: 8,
+            font_taa_initial_weight: 0.5,
+            font_taa_final_weight: 0.1,
+            font_horz_scale: 1.1,
+            font_vert_scale: 0.6,
+            font_text_bias: 0.5,
+            font_gamma_correction: 0.85,
 
-            // Font effects defaults
-            font_glow_intensity: 0.0,   // Glow off by default
+            // Font effects
+            font_glow_intensity: 0.0,
             font_glow_spread: 2.0,
             font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
             font_rainbow: false,
 
-            // Constellation defaults - bioluminescent aesthetic, radial tree
+            // Constellation — bioluminescent neon
             constellation_base_radius: 120.0,
             constellation_ring_spacing: 160.0,
             constellation_node_size: 96.0,
             constellation_node_size_focused: 128.0,
             constellation_node_glow_idle: Color::srgba(0.3, 0.4, 0.5, 0.3),
-            constellation_node_glow_active: Color::srgba(0.34, 0.65, 1.0, 0.7),    // Cyan
-            constellation_node_glow_streaming: Color::srgba(0.4, 0.8, 0.4, 0.8),   // Green
-            constellation_node_glow_error: Color::srgba(0.97, 0.38, 0.45, 0.8),    // Red
+            constellation_node_glow_active: Color::srgba(0.00, 1.00, 1.00, 0.7),  // Cyan
+            constellation_node_glow_streaming: Color::srgba(0.00, 1.00, 0.53, 0.8), // Green
+            constellation_node_glow_error: Color::srgba(1.00, 0.13, 0.38, 0.8),   // Red
             constellation_connection_glow: 0.4,
-            constellation_connection_color: Color::srgba(0.49, 0.85, 0.82, 0.5),   // Cyan
+            constellation_connection_color: Color::srgba(0.00, 1.00, 1.00, 0.5),  // Cyan
             constellation_particle_budget: 500,
 
-            // Block border defaults — derive from block text colors
-            block_border_tool_call: Color::srgba(0.89, 0.79, 0.49, 0.7),   // Amber (dimmed)
-            block_border_tool_result: Color::srgba(0.62, 0.81, 0.42, 0.5), // Green (dimmed)
-            block_border_error: Color::srgba(0.97, 0.38, 0.45, 0.8),       // Red
-            block_border_thinking: Color::srgba(0.45, 0.47, 0.55, 0.4),    // Dim gray
-            block_border_drift: Color::srgba(0.58, 0.74, 1.00, 0.5),       // Blue
+            // Block borders — neon accents
+            block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber
+            block_border_tool_result: Color::srgba(0.00, 1.00, 0.53, 0.4), // #00ff88 green
+            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),       // #ff2060 neon red
+            block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),    // #6080a0 muted
+            block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),       // #00aaff blue
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 0.15,
