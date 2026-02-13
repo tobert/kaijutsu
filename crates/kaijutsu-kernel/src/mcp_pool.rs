@@ -1183,7 +1183,7 @@ impl McpServerPool {
 
     /// List all tools from all connected servers.
     ///
-    /// Returns tools with fully-qualified names like "git:status".
+    /// Returns tools with fully-qualified names like "git__status".
     pub async fn list_all_tools(&self) -> Vec<(String, McpToolInfo)> {
         let mut all_tools = Vec::new();
 
@@ -1193,7 +1193,7 @@ impl McpServerPool {
             if let Some(server_arc) = self.servers.read().get(&name).cloned() {
                 let server = server_arc.lock().await;
                 for tool in &server.tools {
-                    let qualified_name = format!("{}:{}", name, tool.name);
+                    let qualified_name = format!("{}__{}", name, tool.name);
                     all_tools.push((qualified_name, tool.clone()));
                 }
             }
@@ -1251,13 +1251,13 @@ impl McpServerPool {
         Ok(result)
     }
 
-    /// Call a tool using a fully-qualified name like "git:status".
+    /// Call a tool using a fully-qualified name like "git__status".
     pub async fn call_tool_qualified(
         &self,
         qualified_name: &str,
         arguments: JsonValue,
     ) -> Result<CallToolResult, McpPoolError> {
-        let (server_name, tool_name) = qualified_name.split_once(':').ok_or_else(|| {
+        let (server_name, tool_name) = qualified_name.split_once("__").ok_or_else(|| {
             McpPoolError::ToolNotFound {
                 server: "".to_string(),
                 tool: qualified_name.to_string(),
@@ -1704,7 +1704,7 @@ use crate::tools::{ExecResult, ExecutionEngine};
 
 /// An execution engine that forwards tool calls to an MCP server.
 ///
-/// Each instance represents a single MCP tool (e.g., "git:status").
+/// Each instance represents a single MCP tool (e.g., "git__status").
 /// When `execute()` is called, it parses the input as JSON parameters
 /// and forwards the call to the appropriate MCP server.
 pub struct McpToolEngine {
@@ -1714,7 +1714,7 @@ pub struct McpToolEngine {
     server_name: String,
     /// Tool name on the server (e.g., "status").
     tool_name: String,
-    /// Fully qualified name for display (e.g., "git:status").
+    /// Fully qualified name for display (e.g., "git__status").
     qualified_name: String,
     /// Tool description.
     description: String,
@@ -1741,7 +1741,7 @@ impl McpToolEngine {
     ) -> Self {
         let server_name = server_name.into();
         let tool_name = tool_name.into();
-        let qualified_name = format!("{}:{}", server_name, tool_name);
+        let qualified_name = format!("{}__{}", server_name, tool_name);
         Self {
             pool,
             server_name,
@@ -1763,7 +1763,7 @@ impl McpToolEngine {
         tools
             .iter()
             .map(|tool| {
-                let qualified_name = format!("{}:{}", server_name, tool.name);
+                let qualified_name = format!("{}__{}", server_name, tool.name);
                 let engine = Arc::new(Self::new(
                     pool.clone(),
                     server_name,
@@ -1871,10 +1871,10 @@ mod tests {
         let pool = McpServerPool::new();
 
         // Should fail because server doesn't exist, but parsing should work
-        let result = pool.call_tool_qualified("git:status", serde_json::json!({})).await;
+        let result = pool.call_tool_qualified("git__status", serde_json::json!({})).await;
         assert!(matches!(result, Err(McpPoolError::ServerNotFound(_))));
 
-        // Invalid format (no colon)
+        // Invalid format (no double-underscore separator)
         let result = pool.call_tool_qualified("invalid_name", serde_json::json!({})).await;
         assert!(matches!(result, Err(McpPoolError::ToolNotFound { .. })));
     }

@@ -42,7 +42,7 @@ Cap'n Proto method params. A tool call from kaijutsu-app produces a connected tr
 ```
 client::actor::execute_tool (kaijutsu-app)
   └── rpc.execute_tool (kaijutsu-server, linked via traceparent)
-        └── engine.execute (tool=git:status)
+        └── engine.execute (tool=git__status)
 ```
 
 ### Instrumented RPC methods

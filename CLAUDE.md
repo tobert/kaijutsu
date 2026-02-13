@@ -262,7 +262,7 @@ Dynamic MCP server registration via RPC:
 - `listMcpServers()` — list connected servers and their tools
 - `callMcpTool(server, tool, args)` — invoke MCP tool
 
-MCP tools are automatically registered as ExecutionEngines with qualified names like `git:status`.
+MCP tools are automatically registered as ExecutionEngines with qualified names like `git__status`.
 
 ### kaish Integration
 
