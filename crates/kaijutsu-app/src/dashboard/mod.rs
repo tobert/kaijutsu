@@ -18,7 +18,7 @@
 pub mod seat_selector;
 
 use bevy::prelude::*;
-use kaijutsu_client::{Context, KernelInfo, SeatInfo};
+use kaijutsu_client::{Context, ContextMembership, KernelInfo};
 
 use crate::connection::{
     BootstrapChannel, BootstrapCommand, ConnectionStatusMessage, RpcActor, RpcResultChannel,
@@ -91,10 +91,10 @@ pub struct DashboardState {
     pub contexts: Vec<Context>,
     /// Currently selected context index
     pub selected_context: Option<usize>,
-    /// User's active seats across all kernels
-    pub my_seats: Vec<SeatInfo>,
-    /// Current seat (if any)
-    pub current_seat: Option<SeatInfo>,
+    /// User's active context memberships
+    pub my_contexts: Vec<ContextMembership>,
+    /// Current context membership (if any)
+    pub current_context: Option<ContextMembership>,
 }
 
 impl DashboardState {
@@ -203,8 +203,8 @@ fn handle_dashboard_events(
             kaijutsu_client::ConnectionStatus::Disconnected => {
                 state.kernels.clear();
                 state.contexts.clear();
-                state.my_seats.clear();
-                state.current_seat = None;
+                state.my_contexts.clear();
+                state.current_context = None;
                 next_screen.set(AppScreen::Dashboard);
             }
             _ => {}
@@ -229,11 +229,11 @@ fn handle_dashboard_events(
                     state.selected_context = None;
                 }
             }
-            RpcResultMessage::MySeatsList { seats, generation } if *generation == current_gen => {
-                state.my_seats = seats.clone();
+            RpcResultMessage::MyContextsList { memberships, generation } if *generation == current_gen => {
+                state.my_contexts = memberships.clone();
             }
-            RpcResultMessage::ContextJoined { seat, document_id, .. } => {
-                state.current_seat = Some(seat.clone());
+            RpcResultMessage::ContextJoined { membership, document_id, .. } => {
+                state.current_context = Some(membership.clone());
 
                 // Create conversation metadata if it doesn't exist (idempotent)
                 if registry.get(document_id).is_none() {
@@ -246,7 +246,7 @@ fn handle_dashboard_events(
                 next_screen.set(AppScreen::Conversation);
             }
             RpcResultMessage::ContextLeft => {
-                state.current_seat = None;
+                state.current_context = None;
                 next_screen.set(AppScreen::Dashboard);
             }
             _ => {}
@@ -586,7 +586,7 @@ fn rebuild_seats_list(
     };
 
     commands.entity(list_entity).with_children(|parent| {
-        for seat in state.my_seats.iter() {
+        for ctx in state.my_contexts.iter() {
             parent
                 .spawn((
                     SeatListItem,
@@ -602,7 +602,7 @@ fn rebuild_seats_list(
                 ))
                 .with_children(|item| {
                     // Nick and instance
-                    let nick_text = format!("@{}:{}", seat.id.nick, seat.id.instance);
+                    let nick_text = format!("@{}:{}", ctx.nick, ctx.instance);
                     item.spawn((
                         MsdfUiText::new(&nick_text)
                             .with_font_size(14.0)
@@ -616,7 +616,7 @@ fn rebuild_seats_list(
                     ));
 
                     // Context and kernel
-                    let context_text = format!("  :{}@{}", seat.id.context, seat.id.kernel);
+                    let context_text = format!("  :{}@{}", ctx.context_name, ctx.kernel_id);
                     item.spawn((
                         MsdfUiText::new(&context_text)
                             .with_font_size(12.0)

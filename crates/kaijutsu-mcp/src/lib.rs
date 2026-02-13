@@ -215,11 +215,7 @@ impl KaijutsuMcp {
 
         let client = connect_ssh(config.clone()).await?;
         let kernel = client.attach_kernel(kernel_id).await?;
-        let seat_handle = kernel.join_context(context_name, "mcp-server").await?;
-        let seat_info = seat_handle.get_state().await?;
-
-        // Derive document_id from kernel and context
-        let document_id = format!("{}@{}", seat_info.id.kernel, seat_info.id.context);
+        let document_id = kernel.join_context(context_name, "mcp-server").await?;
 
         tracing::info!(
             kernel = %kernel_id,

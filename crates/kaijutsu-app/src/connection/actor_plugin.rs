@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use bevy::prelude::*;
-use kaijutsu_client::{ActorHandle, Identity, KernelInfo, SshConfig};
+use kaijutsu_client::{ActorHandle, ContextMembership, Identity, KernelInfo, SshConfig};
 use tokio::sync::{broadcast, mpsc};
 
 use super::bootstrap::{self, BootstrapChannel, BootstrapCommand};
@@ -114,9 +114,9 @@ pub enum RpcResultMessage {
     KernelAttached(Result<KernelInfo, String>),
     /// Identity received.
     IdentityReceived(Identity),
-    /// Context joined — includes seat info and initial document state.
+    /// Context joined — includes membership info and initial document state.
     ContextJoined {
-        seat: kaijutsu_client::SeatInfo,
+        membership: ContextMembership,
         document_id: String,
         initial_state: Option<kaijutsu_client::DocumentState>,
     },
@@ -140,8 +140,8 @@ pub enum RpcResultMessage {
     KernelList { kernels: Vec<KernelInfo>, generation: u64 },
     /// Context list received (for dashboard).
     ContextList { contexts: Vec<kaijutsu_client::Context>, generation: u64 },
-    /// Seats list received (for dashboard).
-    MySeatsList { seats: Vec<kaijutsu_client::SeatInfo>, generation: u64 },
+    /// Context memberships received (for dashboard).
+    MyContextsList { memberships: Vec<ContextMembership>, generation: u64 },
     /// Drift contexts list received (from periodic polling).
     DriftContextsReceived {
         contexts: Vec<kaijutsu_client::ContextInfo>,
@@ -286,18 +286,17 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 3. Construct SeatInfo from what we know
+                        // 3. Construct ContextMembership from what we know
                         let nick = identity.map(|id| id.username).unwrap_or_default();
-                        let seat = kaijutsu_client::SeatInfo {
-                            id: kaijutsu_client::SeatId::new(&nick, "bevy-client", &kid, &ctx),
-                            owner: nick,
-                            status: kaijutsu_client::SeatStatus::Active,
-                            last_activity: 0,
-                            cursor_block: None,
+                        let membership = ContextMembership {
+                            context_name: ctx.clone(),
+                            kernel_id: kid.clone(),
+                            nick,
+                            instance: "bevy-client".to_string(),
                         };
 
                         let _ = tx.send(RpcResultMessage::ContextJoined {
-                            seat,
+                            membership,
                             document_id,
                             initial_state,
                         });

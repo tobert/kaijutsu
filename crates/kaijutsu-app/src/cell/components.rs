@@ -665,8 +665,6 @@ pub struct CachedDocument {
     pub last_accessed: std::time::Instant,
     /// Saved scroll offset (restored on switch-back).
     pub scroll_offset: f32,
-    /// Seat info from server (for constellation display).
-    pub seat_info: Option<kaijutsu_client::SeatInfo>,
 }
 
 /// Multi-context document cache.

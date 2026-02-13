@@ -242,7 +242,7 @@ fn spawn_context_nodes(
             ))
             .with_children(|parent| {
                 // Inner label showing context name (truncated)
-                let label = truncate_context_name(&node.seat_info.id.context, 12);
+                let label = truncate_context_name(&node.context_id, 12);
                 parent
                     .spawn((
                         Node {

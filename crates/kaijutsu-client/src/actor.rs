@@ -685,8 +685,8 @@ impl RpcActor {
                 ActorError::Rpc(msg)
             })?;
 
-        // Join context to register our presence
-        let _seat = kernel.join_context(&self.context_name, &self.instance)
+        // Join context to register our presence (returns document_id)
+        let _document_id = kernel.join_context(&self.context_name, &self.instance)
             .await
             .map_err(|e| {
                 let msg = format!("join_context: {e}");

@@ -23,7 +23,7 @@ pub mod model_picker;
 mod render;
 
 use bevy::prelude::*;
-use kaijutsu_client::SeatInfo;
+use kaijutsu_client::ContextMembership;
 
 use crate::agents::AgentActivityMessage;
 
@@ -143,36 +143,64 @@ impl Constellation {
     }
 
     /// Get node by context ID
-    fn node_by_id(&self, id: &str) -> Option<&ContextNode> {
+    pub fn node_by_id(&self, id: &str) -> Option<&ContextNode> {
         self.nodes.iter().find(|n| n.context_id == id)
     }
 
-    /// Add a new context node
-    pub fn add_node(&mut self, seat_info: SeatInfo) {
-        // Use context name as the unique identifier (not document_id which may be shared)
-        let context_id = seat_info.id.context.clone();
+    /// Add a node for a context we've actively joined (have an actor connection).
+    pub fn add_node(&mut self, membership: &ContextMembership) {
+        let context_id = &membership.context_name;
 
-        // Check if node already exists
-        if self.node_by_id(&context_id).is_some() {
-            info!("Constellation: Node for context {} already exists, skipping", context_id);
+        // If node already exists (e.g. from DriftState), mark it as joined
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.context_id == *context_id) {
+            if !node.joined {
+                info!("Constellation: Marking existing node {} as joined", context_id);
+                node.joined = true;
+            }
             return;
         }
 
         let node = ContextNode {
             context_id: context_id.clone(),
-            seat_info,
             parent_id: None, // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
             entity: None,
             model: None,
+            joined: true,
         };
 
         self.nodes.push(node);
 
         // If no focus, set this as focus
         if self.focus_id.is_none() {
-            self.focus_id = Some(context_id);
+            self.focus_id = Some(context_id.clone());
+        }
+    }
+
+    /// Add a placeholder node from DriftState context info (not yet joined).
+    pub fn add_node_from_context_info(&mut self, ctx_info: &kaijutsu_client::ContextInfo) {
+        let context_id = &ctx_info.name;
+
+        if self.node_by_id(context_id).is_some() {
+            return;
+        }
+
+        let node = ContextNode {
+            context_id: context_id.clone(),
+            parent_id: ctx_info.parent_id.clone(),
+            position: Vec2::ZERO,
+            activity: ActivityState::Idle,
+            entity: None,
+            model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
+            joined: false,
+        };
+
+        self.nodes.push(node);
+
+        // If no focus, set this as focus
+        if self.focus_id.is_none() {
+            self.focus_id = Some(context_id.clone());
         }
     }
 
@@ -226,10 +254,8 @@ impl Constellation {
 /// A node in the constellation representing a context
 #[derive(Clone)]
 pub struct ContextNode {
-    /// Unique context identifier (document_id from seat)
+    /// Unique context identifier (context name)
     pub context_id: String,
-    /// Full seat information from server
-    pub seat_info: SeatInfo,
     /// Parent context ID (from drift router, for tree layout)
     pub parent_id: Option<String>,
     /// Position in constellation space (calculated by layout)
@@ -240,6 +266,8 @@ pub struct ContextNode {
     pub entity: Option<Entity>,
     /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
     pub model: Option<String>,
+    /// Whether we have an active actor connection to this context
+    pub joined: bool,
 }
 
 /// Activity state of a context node
@@ -280,7 +308,7 @@ impl ActivityState {
 // SYSTEMS
 // ============================================================================
 
-/// Track seat events to add/remove constellation nodes.
+/// Track context join events to add/update constellation nodes.
 fn track_seat_events(
     mut constellation: ResMut<Constellation>,
     mut events: MessageReader<crate::connection::RpcResultMessage>,
@@ -289,9 +317,9 @@ fn track_seat_events(
 
     for event in events.read() {
         match event {
-            RpcResultMessage::ContextJoined { seat, .. } => {
-                info!("Constellation: Adding node for context '{}' (kernel: {})", seat.id.context, seat.id.kernel);
-                constellation.add_node(seat.clone());
+            RpcResultMessage::ContextJoined { membership, .. } => {
+                info!("Constellation: Adding node for context '{}' (kernel: {})", membership.context_name, membership.kernel_id);
+                constellation.add_node(membership);
             }
             RpcResultMessage::ContextLeft => {
                 // We don't remove nodes on ContextLeft - contexts persist

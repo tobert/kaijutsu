@@ -146,7 +146,7 @@ fn spawn_mini_render_ui(
     ctx_node: &ContextNode,
     theme: &Theme,
 ) -> Entity {
-    let context_name = &ctx_node.seat_info.id.context;
+    let context_name = &ctx_node.context_id;
     let activity_color = activity_to_mini_color(ctx_node.activity, theme);
 
     commands
@@ -199,19 +199,21 @@ fn spawn_mini_render_ui(
                 TextColor(theme.fg_dim),
             ));
 
-            // Owner info
-            parent.spawn((
-                Text::new(format!("@{}", truncate_name(&ctx_node.seat_info.id.nick, 10))),
-                TextFont {
-                    font_size: 9.0,
-                    ..default()
-                },
-                TextColor(theme.fg_dim.with_alpha(0.7)),
-                Node {
-                    margin: UiRect::top(Val::Px(4.0)),
-                    ..default()
-                },
-            ));
+            // Joined indicator (replaces owner nick badge)
+            if ctx_node.joined {
+                parent.spawn((
+                    Text::new("joined"),
+                    TextFont {
+                        font_size: 9.0,
+                        ..default()
+                    },
+                    TextColor(theme.fg_dim.with_alpha(0.7)),
+                    Node {
+                        margin: UiRect::top(Val::Px(4.0)),
+                        ..default()
+                    },
+                ));
+            }
         })
         .id()
 }

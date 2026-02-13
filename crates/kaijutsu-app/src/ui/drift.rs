@@ -178,11 +178,11 @@ fn update_drift_state(
             RpcResultMessage::DriftQueueReceived { staged } => {
                 drift_state.staged = staged.clone();
             }
-            RpcResultMessage::ContextJoined { seat, .. } => {
-                // Store context name from seat — will be resolved to short_id
+            RpcResultMessage::ContextJoined { membership, .. } => {
+                // Store context name — will be resolved to short_id
                 // when contexts arrive from the next poll.
-                drift_state.local_context_name = Some(seat.id.context.clone());
-                log::info!("DriftState: joined context = {}", seat.id.context);
+                drift_state.local_context_name = Some(membership.context_name.clone());
+                log::info!("DriftState: joined context = {}", membership.context_name);
             }
             _ => {}
         }
@@ -259,6 +259,10 @@ fn sync_model_info_to_constellation(
             if node.parent_id != ctx_info.parent_id {
                 node.parent_id = ctx_info.parent_id.clone();
             }
+        } else {
+            // Create placeholder node for server-known contexts not yet in constellation.
+            // This makes all contexts visible in the constellation, not just joined ones.
+            constellation.add_node_from_context_info(ctx_info);
         }
     }
 }

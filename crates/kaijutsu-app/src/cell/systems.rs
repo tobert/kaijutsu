@@ -1636,8 +1636,8 @@ pub fn handle_block_events(
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
-        if let RpcResultMessage::ContextJoined { seat, document_id, initial_state } = result {
-            let context_name = seat.id.context.clone();
+        if let RpcResultMessage::ContextJoined { membership, document_id, initial_state } = result {
+            let context_name = membership.context_name.clone();
 
             // Create or update cache entry
             if !doc_cache.contains(document_id) {
@@ -1648,7 +1648,6 @@ pub fn handle_block_events(
                     synced_at_generation: 0,
                     last_accessed: std::time::Instant::now(),
                     scroll_offset: 0.0,
-                    seat_info: Some(seat.clone()),
                 };
 
                 // Apply initial state if provided

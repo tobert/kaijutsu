@@ -2,7 +2,7 @@
 //!
 //! Provides the `context` command for creating and switching contexts from
 //! the shell interface. This bridges the kaish tool dispatch with the server's
-//! context/seat management.
+//! context management.
 //!
 //! # Usage
 //!
@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 
 use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
 
-use crate::rpc::{ContextState, SeatId, SeatInfo, SeatStatus};
+use crate::rpc::ContextState;
 
 // ============================================================================
 // Context Manager - Thread-safe state for context operations
@@ -33,14 +33,16 @@ use crate::rpc::{ContextState, SeatId, SeatInfo, SeatStatus};
 
 /// Thread-safe context state shared between RPC handlers and ContextEngine.
 ///
-/// This provides a unified view of contexts and seats that can be safely
-/// accessed from async ExecutionEngine implementations.
+/// Tracks which contexts exist and which one is currently active for this
+/// connection. The seat abstraction has been removed — this is now just
+/// lightweight context membership tracking.
 #[derive(Debug)]
 pub struct ContextManager {
     inner: RwLock<ContextManagerInner>,
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)] // nick/kernel_id/instance used by constructor, useful for future presence
 struct ContextManagerInner {
     /// All contexts in the kernel
     contexts: HashMap<String, ContextState>,
@@ -50,10 +52,8 @@ struct ContextManagerInner {
     kernel_id: String,
     /// Current instance ID for this connection
     instance: String,
-    /// Current active seat
-    current_seat: Option<SeatId>,
-    /// All seats owned by this user
-    my_seats: HashMap<String, SeatInfo>,
+    /// Currently active context name
+    current_context: Option<String>,
 }
 
 impl ContextManager {
@@ -69,69 +69,34 @@ impl ContextManager {
                 nick,
                 kernel_id,
                 instance,
-                current_seat: None,
-                my_seats: HashMap::new(),
+                current_context: None,
             }),
         }
     }
 
-    /// Join or create a context, returning the seat info.
-    pub fn join_context(&self, context_name: &str) -> SeatInfo {
+    /// Join or create a context, returning the context name.
+    pub fn join_context(&self, context_name: &str) -> String {
         let mut inner = self.inner.write();
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_millis() as u64;
-
-        let seat_id = SeatId {
-            nick: inner.nick.clone(),
-            instance: inner.instance.clone(),
-            kernel: inner.kernel_id.clone(),
-            context: context_name.to_string(),
-        };
-
-        let seat_info = SeatInfo {
-            id: seat_id.clone(),
-            owner: inner.nick.clone(),
-            status: SeatStatus::Active,
-            last_activity: now,
-            cursor_block: None,
-        };
 
         // Ensure context exists
         inner.contexts
             .entry(context_name.to_string())
-            .or_insert_with(|| ContextState::new(context_name.to_string()))
-            .seats.push(seat_id.clone());
+            .or_insert_with(|| ContextState::new(context_name.to_string()));
 
-        // Track in user's seats
-        inner.my_seats.insert(seat_id.key(), seat_info.clone());
-        inner.current_seat = Some(seat_id);
+        inner.current_context = Some(context_name.to_string());
 
-        seat_info
+        context_name.to_string()
     }
 
-    /// Leave the current seat.
-    pub fn leave_seat(&self) -> Option<SeatId> {
+    /// Leave the current context.
+    pub fn leave_context(&self) -> Option<String> {
         let mut inner = self.inner.write();
-
-        if let Some(seat_id) = inner.current_seat.take() {
-            // Remove from context's seats
-            if let Some(context) = inner.contexts.get_mut(&seat_id.context) {
-                context.seats.retain(|s| s != &seat_id);
-            }
-            // Remove from user's seats
-            inner.my_seats.remove(&seat_id.key());
-            Some(seat_id)
-        } else {
-            None
-        }
+        inner.current_context.take()
     }
 
     /// Get the current context name.
     pub fn current_context(&self) -> Option<String> {
-        self.inner.read().current_seat.as_ref().map(|s| s.context.clone())
+        self.inner.read().current_context.clone()
     }
 
     /// List all context names.
@@ -176,31 +141,9 @@ impl ContextManager {
         inner.contexts = contexts;
     }
 
-    /// Sync current seat from RPC layer.
-    pub fn sync_current_seat(&self, seat: Option<SeatId>) {
-        let mut inner = self.inner.write();
-        inner.current_seat = seat;
-    }
-
-    /// Sync my_seats from RPC layer.
-    pub fn sync_my_seats(&self, seats: HashMap<String, SeatInfo>) {
-        let mut inner = self.inner.write();
-        inner.my_seats = seats;
-    }
-
     /// Get contexts map (for RPC sync back).
     pub fn contexts(&self) -> HashMap<String, ContextState> {
         self.inner.read().contexts.clone()
-    }
-
-    /// Get current seat (for RPC sync back).
-    pub fn current_seat(&self) -> Option<SeatId> {
-        self.inner.read().current_seat.clone()
-    }
-
-    /// Get my_seats (for RPC sync back).
-    pub fn my_seats(&self) -> HashMap<String, SeatInfo> {
-        self.inner.read().my_seats.clone()
     }
 }
 
@@ -236,9 +179,8 @@ impl ContextEngine {
                     return Err("Usage: context new <name>".to_string());
                 }
                 let name = &args[1];
-                let seat = self.manager.join_context(name);
-                Ok(format!("Joined context '{}' as @{}:{}",
-                    seat.id.context, seat.id.nick, seat.id.instance))
+                let ctx = self.manager.join_context(name);
+                Ok(format!("Joined context '{}'", ctx))
             }
             "list" | "ls" => {
                 let contexts = self.manager.list_contexts();
@@ -261,8 +203,8 @@ impl ContextEngine {
                 }
             }
             "leave" => {
-                match self.manager.leave_seat() {
-                    Some(seat) => Ok(format!("Left context '{}'", seat.context)),
+                match self.manager.leave_context() {
+                    Some(ctx) => Ok(format!("Left context '{}'", ctx)),
                     None => Ok("No active context to leave".to_string()),
                 }
             }
@@ -364,8 +306,8 @@ mod tests {
         assert!(manager.list_contexts().contains(&"default".to_string()));
 
         // Join a new context
-        let seat = manager.join_context("planning");
-        assert_eq!(seat.id.context, "planning");
+        let ctx = manager.join_context("planning");
+        assert_eq!(ctx, "planning");
         assert_eq!(manager.current_context(), Some("planning".to_string()));
 
         // List should include both

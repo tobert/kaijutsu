@@ -178,19 +178,18 @@ pub fn update_seat_selector(
 
     // Update current seat text
     for mut text in current_text.iter_mut() {
-        if let Some(seat) = &state.current_seat {
-            // Format: @nick:instance • context
-            text.text = format!("@{}:{} • {}", seat.id.nick, seat.id.instance, seat.id.context);
+        if let Some(ctx) = &state.current_context {
+            text.text = format!("@{}:{} • {}", ctx.nick, ctx.instance, ctx.context_name);
             text.color = crate::text::bevy_to_rgba8(theme.accent);
         } else {
-            text.text = "No seat".into();
+            text.text = "No context".into();
             text.color = crate::text::bevy_to_rgba8(theme.fg_dim);
         }
     }
 
-    // Update seat count badge
+    // Update context count badge
     for (mut text, mut node) in count_text.iter_mut() {
-        let count = state.my_seats.len();
+        let count = state.my_contexts.len();
         if count > 1 {
             text.text = format!("{}", count);
             node.display = Display::Flex;
@@ -232,7 +231,7 @@ pub fn handle_dashboard_click(
 ) {
     for interaction in interaction.iter() {
         if *interaction == Interaction::Pressed {
-            if state.current_seat.is_some() {
+            if state.current_context.is_some() {
                 // Respawn actor in lobby (leaves current context)
                 let kernel_id = conn_state.current_kernel
                     .as_ref()
@@ -268,14 +267,14 @@ pub fn handle_seat_option_click(
 ) {
     for (interaction, option) in interaction.iter() {
         if *interaction == Interaction::Pressed
-            && let Some(seat_info) = state.my_seats.get(option.index)
+            && let Some(ctx) = state.my_contexts.get(option.index)
         {
-            // Respawn actor targeting the seat's kernel + context
+            // Respawn actor targeting the context's kernel + context
             let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
                 config: conn_state.ssh_config.clone(),
-                kernel_id: seat_info.id.kernel.clone(),
-                context_name: seat_info.id.context.clone(),
-                instance: seat_info.id.instance.clone(),
+                kernel_id: ctx.kernel_id.clone(),
+                context_name: ctx.context_name.clone(),
+                instance: ctx.instance.clone(),
             });
 
             for mut node in dropdown.iter_mut() {
@@ -329,10 +328,11 @@ pub fn rebuild_seat_options(
     // Add new seat options to dropdown
     for dropdown_entity in dropdown.iter() {
         commands.entity(dropdown_entity).with_children(|dropdown| {
-            for (i, seat) in state.my_seats.iter().enumerate() {
-                // Skip current seat
-                if let Some(current) = &state.current_seat
-                    && seat.id == current.id
+            for (i, ctx) in state.my_contexts.iter().enumerate() {
+                // Skip current context
+                if let Some(current) = &state.current_context
+                    && ctx.context_name == current.context_name
+                    && ctx.kernel_id == current.kernel_id
                 {
                     continue;
                 }
@@ -352,7 +352,7 @@ pub fn rebuild_seat_options(
                         btn.spawn((
                             MsdfUiText::new(format!(
                                 "@{}:{} • {}",
-                                seat.id.nick, seat.id.instance, seat.id.context
+                                ctx.nick, ctx.instance, ctx.context_name
                             ))
                             .with_font_size(12.0)
                             .with_color(theme.fg_dim),

@@ -18,10 +18,10 @@ pub mod kaijutsu_capnp {
 pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode, Context, ContextDocument,
-    ContextInfo, DocumentState, HistoryEntry, Identity, KernelConfig, KernelHandle, KernelInfo,
-    LlmConfigInfo, LlmProviderInfo, McpResource, McpResourceContents, McpToolResult, MountSpec,
-    RpcClient, RpcError, SeatHandle, SeatId, SeatInfo, SeatStatus, ShellValue, StagedDriftInfo,
-    ToolResult, VersionSnapshot,
+    ContextInfo, ContextMembership, DocumentState, HistoryEntry, Identity, KernelConfig,
+    KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource, McpResourceContents,
+    McpToolResult, MountSpec, RpcClient, RpcError, ShellValue, StagedDriftInfo, ToolResult,
+    VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};

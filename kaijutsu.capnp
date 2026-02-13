@@ -343,9 +343,9 @@ interface World {
   attachKernel @2 (id :Text, seatId :Text, trace :TraceContext) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
 
-  # Seat management (cross-kernel)
-  takeSeat @4 (seat :SeatId) -> (handle :SeatHandle);
-  listMySeats @5 () -> (seats :List(SeatInfo));
+  # Seat management (removed — ordinals preserved for schema evolution)
+  takeSeatDeprecated @4 () -> ();
+  listMySeatsDeprecated @5 () -> ();
 }
 
 interface Kernel {
@@ -390,7 +390,7 @@ interface Kernel {
   # Context & seat management
   listContexts @22 () -> (contexts :List(Context));
   createContext @23 (name :Text) -> (context :Context);
-  joinContext @24 (contextName :Text, instance :Text) -> (seat :SeatHandle);
+  joinContext @24 (contextName :Text, instance :Text) -> (documentId :Text);
   attachDocument @25 (contextName :Text, documentId :Text);
   detachDocument @26 (contextName :Text, documentId :Text);
 
@@ -649,20 +649,9 @@ struct ToolFilterConfig {
   }
 }
 
-# Capability for interacting with a seat
-interface SeatHandle {
-  # Get current seat state
-  getState @0 () -> (info :SeatInfo);
-
-  # Update cursor position (which block we're focused on)
-  updateCursor @1 (blockId :Text);
-
-  # Set our status
-  setStatus @2 (status :SeatStatus);
-
-  # Leave the seat ("get up from the meeting")
-  leave @3 ();
-}
+# SeatHandle interface removed — seat abstraction replaced by ContextMembership.
+# Struct definitions (SeatId, SeatStatus, SeatInfo) preserved above for schema
+# evolution compatibility with older binaries that may reference the ordinals.
 
 # ============================================================================
 # Block-Based CRDT Types (DAG Architecture)
