@@ -20,13 +20,14 @@ pub struct ActionFired(pub Action);
 #[derive(Message, Clone, Debug, Reflect)]
 pub struct TextInputReceived(pub String);
 
-/// Analog input state from gamepad sticks (Phase 6).
+/// Analog input state from gamepad sticks.
 ///
 /// Updated each frame by the dispatcher's gamepad polling.
 /// Domain systems can read this for smooth scrolling/panning.
+///
+/// BRP-queryable: `world_get_resources("kaijutsu_app::input::events::AnalogInput")`
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
-#[allow(dead_code)] // Phase 6: gamepad analog input
 pub struct AnalogInput {
     /// Left stick X (-1.0 to 1.0)
     pub left_stick_x: f32,

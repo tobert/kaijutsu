@@ -137,6 +137,8 @@ pub fn handle_unfocus(
                 }
                 *focus = FocusArea::Conversation;
             }
+            // Dialog handles its own close — don't interfere
+            FocusArea::Dialog => {}
             _ => {}
         }
     }
@@ -653,6 +655,53 @@ pub fn handle_constellation_nav(
                         context_name: focus_id.clone(),
                     });
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
+// TIMELINE NAVIGATION
+// ============================================================================
+
+use crate::ui::timeline::{ForkRequest, TimelineState};
+
+/// Handle timeline navigation actions.
+///
+/// Replaces the old `handle_timeline_keys` and `toggle_timeline_visibility` systems.
+pub fn handle_timeline(
+    mut actions: MessageReader<ActionFired>,
+    mut timeline: ResMut<TimelineState>,
+    mut fork_writer: MessageWriter<ForkRequest>,
+) {
+    for ActionFired(action) in actions.read() {
+        match action {
+            Action::TimelineStepBack => {
+                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
+                let new_pos = (timeline.target_position - step).max(0.0);
+                timeline.begin_scrub(new_pos);
+                timeline.end_scrub();
+            }
+            Action::TimelineStepForward => {
+                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
+                let new_pos = (timeline.target_position + step).min(1.0);
+                timeline.begin_scrub(new_pos);
+                timeline.end_scrub();
+            }
+            Action::TimelineJumpToLive => {
+                timeline.jump_to_live();
+            }
+            Action::TimelineFork => {
+                if timeline.is_historical() {
+                    fork_writer.write(ForkRequest {
+                        from_version: timeline.viewing_version,
+                        name: None,
+                    });
+                }
+            }
+            Action::TimelineToggle => {
+                timeline.expanded = !timeline.expanded;
             }
             _ => {}
         }

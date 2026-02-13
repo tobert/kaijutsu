@@ -29,14 +29,12 @@ impl Plugin for TimelinePlugin {
             .add_message::<CherryPickResult>();
 
         // Core systems (only run in Conversation state)
+        // Note: Timeline keyboard navigation moved to input::systems::handle_timeline
         app.add_systems(
             Update,
             (
                 // Version sync first
                 systems::sync_timeline_version,
-                // Input handling
-                systems::handle_timeline_keys,
-                systems::toggle_timeline_visibility,
                 // Block visibility updates
                 systems::update_block_visibility,
                 // Request processing

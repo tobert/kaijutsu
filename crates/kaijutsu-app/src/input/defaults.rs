@@ -8,12 +8,11 @@ use bevy::prelude::*;
 use super::action::Action;
 use super::binding::{Binding, Modifiers};
 use super::context::InputContext;
+use bevy::input::gamepad::GamepadButton;
 
-/// Build the default binding table for keyboard input.
-///
-/// Gamepad bindings are Phase 6 — added here when implemented.
+/// Build the default binding table for keyboard + gamepad input.
 pub fn default_bindings() -> Vec<Binding> {
-    let mut b = Vec::with_capacity(80);
+    let mut b = Vec::with_capacity(100);
 
     // ====================================================================
     // Global (always active, regardless of focus)
@@ -78,6 +77,13 @@ pub fn default_bindings() -> Vec<Binding> {
 
     // Backtick toggles constellation
     b.push(Binding::key(KeyCode::Backquote, InputContext::Navigation, Action::ToggleConstellation, "Toggle constellation"));
+
+    // Timeline navigation
+    b.push(Binding::key(KeyCode::BracketLeft, InputContext::Navigation, Action::TimelineStepBack, "Timeline step back"));
+    b.push(Binding::key(KeyCode::BracketRight, InputContext::Navigation, Action::TimelineStepForward, "Timeline step forward"));
+    b.push(Binding::key(KeyCode::Backslash, InputContext::Navigation, Action::TimelineJumpToLive, "Jump to live"));
+    b.push(Binding::key_mod(KeyCode::KeyF, Modifiers::CTRL, InputContext::Navigation, Action::TimelineFork, "Fork from timeline"));
+    b.push(Binding::key(KeyCode::KeyT, InputContext::Navigation, Action::TimelineToggle, "Toggle timeline"));
 
     // Sequences: g→t, g→T (Shift+T), g→g
     b.push(Binding::key_seq(KeyCode::KeyG, KeyCode::KeyT, InputContext::Navigation, Action::NextContext, "Next context"));
@@ -168,12 +174,53 @@ pub fn default_bindings() -> Vec<Binding> {
 
     b.push(Binding::key(KeyCode::Escape, InputContext::Dialog, Action::Unfocus, "Cancel dialog"));
     b.push(Binding::key(KeyCode::Enter, InputContext::Dialog, Action::Activate, "Confirm dialog"));
+    b.push(Binding::key(KeyCode::KeyJ, InputContext::Dialog, Action::FocusNextBlock, "Next item"));
+    b.push(Binding::key(KeyCode::KeyK, InputContext::Dialog, Action::FocusPrevBlock, "Previous item"));
+    b.push(Binding::key(KeyCode::ArrowDown, InputContext::Dialog, Action::FocusNextBlock, "Next item"));
+    b.push(Binding::key(KeyCode::ArrowUp, InputContext::Dialog, Action::FocusPrevBlock, "Previous item"));
+    b.push(Binding::key(KeyCode::Backspace, InputContext::Dialog, Action::Backspace, "Backspace"));
 
     // ====================================================================
     // Dashboard
     // ====================================================================
 
     b.push(Binding::key(KeyCode::Enter, InputContext::Dashboard, Action::Activate, "Select"));
+
+    // ====================================================================
+    // Gamepad bindings
+    // ====================================================================
+
+    // South (A/X) — context-dependent activate
+    b.push(Binding::gamepad(GamepadButton::South, InputContext::Navigation, Action::Activate, "Activate"));
+    b.push(Binding::gamepad(GamepadButton::South, InputContext::Constellation, Action::Activate, "Switch to context"));
+    b.push(Binding::gamepad(GamepadButton::South, InputContext::Dialog, Action::Activate, "Confirm"));
+    b.push(Binding::gamepad(GamepadButton::South, InputContext::Dashboard, Action::Activate, "Select"));
+
+    // East (B/O) — go back / cancel
+    b.push(Binding::gamepad(GamepadButton::East, InputContext::Global, Action::Unfocus, "Back / Cancel"));
+
+    // DPad — block navigation + constellation spatial nav
+    b.push(Binding::gamepad(GamepadButton::DPadUp, InputContext::Navigation, Action::FocusPrevBlock, "Previous block"));
+    b.push(Binding::gamepad(GamepadButton::DPadDown, InputContext::Navigation, Action::FocusNextBlock, "Next block"));
+    b.push(Binding::gamepad(GamepadButton::DPadLeft, InputContext::Constellation, Action::SpatialNav(Vec2::new(-1.0, 0.0)), "Navigate left"));
+    b.push(Binding::gamepad(GamepadButton::DPadRight, InputContext::Constellation, Action::SpatialNav(Vec2::new(1.0, 0.0)), "Navigate right"));
+    b.push(Binding::gamepad(GamepadButton::DPadUp, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, -1.0)), "Navigate up"));
+    b.push(Binding::gamepad(GamepadButton::DPadDown, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, 1.0)), "Navigate down"));
+    b.push(Binding::gamepad(GamepadButton::DPadUp, InputContext::Dialog, Action::FocusPrevBlock, "Previous item"));
+    b.push(Binding::gamepad(GamepadButton::DPadDown, InputContext::Dialog, Action::FocusNextBlock, "Next item"));
+
+    // Triggers — page scroll
+    b.push(Binding::gamepad(GamepadButton::LeftTrigger, InputContext::Navigation, Action::HalfPageUp, "Page up"));
+    b.push(Binding::gamepad(GamepadButton::RightTrigger, InputContext::Navigation, Action::HalfPageDown, "Page down"));
+
+    // Start — toggle constellation
+    b.push(Binding::gamepad(GamepadButton::Start, InputContext::Global, Action::ToggleConstellation, "Toggle constellation"));
+
+    // North (Y/△) — cycle focus
+    b.push(Binding::gamepad(GamepadButton::North, InputContext::Navigation, Action::CycleFocusForward, "Cycle focus"));
+
+    // West (X/□) — expand block
+    b.push(Binding::gamepad(GamepadButton::West, InputContext::Navigation, Action::ExpandBlock, "Expand block"));
 
     b
 }

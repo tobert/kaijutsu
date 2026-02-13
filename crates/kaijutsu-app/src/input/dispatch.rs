@@ -7,16 +7,18 @@
 //! 4. If no match AND in TextInput context → emit TextInputReceived
 //!
 //! Mouse wheel → ScrollDelta action.
-//! Gamepad → Phase 6.
+//! Gamepad buttons → direct binding match.
+//! Gamepad analog sticks → AnalogInput resource + continuous actions.
 
+use bevy::input::gamepad::Gamepad;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::action::Action;
-use super::binding::InputSource;
+use super::binding::{InputSource, Modifiers};
 use super::context::{ActiveInputContexts, InputContext};
-use super::events::{ActionFired, TextInputReceived};
+use super::events::{ActionFired, AnalogInput, TextInputReceived};
 use super::map::InputMap;
 use super::sequence::SequenceState;
 
@@ -29,11 +31,13 @@ pub fn dispatch_input(
     mut keyboard: MessageReader<KeyboardInput>,
     mut mouse_wheel: MessageReader<MouseWheel>,
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
     mut sequence: ResMut<SequenceState>,
     mut action_writer: MessageWriter<ActionFired>,
     mut text_writer: MessageWriter<TextInputReceived>,
+    mut analog_input: ResMut<AnalogInput>,
 ) {
     // Clear expired sequences
     if sequence.pending.is_some() && sequence.is_expired(input_map.sequence_timeout_ms) {
@@ -96,6 +100,56 @@ pub fn dispatch_input(
             if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
                 text_writer.write(TextInputReceived(s.to_string()));
             }
+        }
+    }
+
+    // --- Gamepad buttons ---
+    // Use first connected gamepad (single-player). Multi-gamepad later.
+    if let Some(gamepad) = gamepads.iter().next() {
+        for binding in &input_map.bindings {
+            if let InputSource::GamepadButton(btn) = &binding.source {
+                if gamepad.just_pressed(*btn)
+                    && binding.modifiers == Modifiers::NONE
+                    && active_contexts.contains(binding.context)
+                {
+                    action_writer.write(ActionFired(binding.action.clone()));
+                }
+            }
+        }
+
+        // --- Analog stick → AnalogInput resource ---
+        let left = gamepad.left_stick();
+        let right = gamepad.right_stick();
+        analog_input.left_stick_x = left.x;
+        analog_input.left_stick_y = left.y;
+        analog_input.right_stick_x = right.x;
+        analog_input.right_stick_y = right.y;
+
+        // --- Analog stick → continuous actions ---
+        const THRESHOLD: f32 = 0.2;
+
+        // Left stick → scroll (Navigation context)
+        if active_contexts.contains(InputContext::Navigation)
+            && left.y.abs() > THRESHOLD
+        {
+            let scroll_speed = -left.y * 8.0; // Invert: stick up = scroll up
+            action_writer.write(ActionFired(Action::ScrollDelta(scroll_speed)));
+        }
+
+        // Left stick → pan (Constellation context)
+        if active_contexts.contains(InputContext::Constellation)
+            && left.length() > THRESHOLD
+        {
+            action_writer.write(ActionFired(Action::Pan(left)));
+        }
+    } else {
+        // No gamepad connected — zero out
+        if analog_input.left_stick_x != 0.0
+            || analog_input.left_stick_y != 0.0
+            || analog_input.right_stick_x != 0.0
+            || analog_input.right_stick_y != 0.0
+        {
+            *analog_input = AnalogInput::default();
         }
     }
 }

@@ -36,7 +36,7 @@ pub enum FocusArea {
 
 impl FocusArea {
     /// Create an EditingBlock focus with a block ID.
-    #[allow(dead_code)] // Phase 6: used when inline block editing is wired up
+    #[allow(dead_code)] // Used when inline block editing is wired up
     pub fn editing(block_id: BlockId) -> Self {
         FocusArea::EditingBlock {
             block_id: Some(block_id),
@@ -49,13 +49,13 @@ impl FocusArea {
     }
 
     /// Check if focus is on navigation (Conversation blocks).
-    #[allow(dead_code)] // Phase 6: useful for domain guards
+    #[allow(dead_code)] // Useful for domain guards
     pub fn is_navigation(&self) -> bool {
         matches!(self, FocusArea::Conversation)
     }
 
     /// Get the block ID if editing a block.
-    #[allow(dead_code)] // Phase 6: used when inline block editing is wired up
+    #[allow(dead_code)] // Used when inline block editing is wired up
     pub fn editing_block_id(&self) -> Option<&BlockId> {
         match self {
             FocusArea::EditingBlock { block_id } => block_id.as_ref(),

@@ -155,6 +155,20 @@ pub enum Action {
     InsertNewline,
 
     // ========================================================================
+    // Timeline (Navigation context)
+    // ========================================================================
+    /// [ — step back in history
+    TimelineStepBack,
+    /// ] — step forward in history
+    TimelineStepForward,
+    /// \ — jump to live/now
+    TimelineJumpToLive,
+    /// Ctrl+F (when historical) — fork from current timeline position
+    TimelineFork,
+    /// t — toggle timeline visibility
+    TimelineToggle,
+
+    // ========================================================================
     // App (Global)
     // ========================================================================
     /// q (in Navigation) or platform quit

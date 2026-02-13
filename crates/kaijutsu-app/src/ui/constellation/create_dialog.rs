@@ -2,12 +2,17 @@
 //!
 //! Provides a modal dialog for creating new contexts (clicking "+") or
 //! forking existing contexts (pressing `f` on a focused node).
+//!
+//! Dialog input is dispatched via `ActionFired`/`TextInputReceived` messages
+//! from the focus-based input system (FocusArea::Dialog context).
 
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use uuid::Uuid;
 
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor};
+use crate::input::action::Action;
+use crate::input::events::{ActionFired, TextInputReceived};
+use crate::input::focus::FocusArea;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -93,7 +98,6 @@ pub fn setup_create_dialog_systems(app: &mut App) {
                 handle_open_dialog_message,
                 handle_dialog_input,
                 handle_dialog_buttons,
-                handle_dialog_escape,
             ),
         );
 }
@@ -193,6 +197,7 @@ fn handle_create_node_click(
     mut commands: Commands,
     theme: Res<Theme>,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     create_nodes: Query<&Interaction, (Changed<Interaction>, With<CreateContextNode>)>,
     existing_dialog: Query<Entity, With<CreateContextDialog>>,
 ) {
@@ -204,6 +209,7 @@ fn handle_create_node_click(
         if *interaction == Interaction::Pressed {
             info!("Create context node clicked - spawning dialog");
             modal_state.0 = true;
+            *focus = FocusArea::Dialog;
             spawn_context_dialog(&mut commands, &theme, DialogMode::CreateContext);
         }
     }
@@ -214,6 +220,7 @@ fn handle_open_dialog_message(
     mut commands: Commands,
     theme: Res<Theme>,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     mut events: MessageReader<OpenContextDialog>,
     existing_dialog: Query<Entity, With<CreateContextDialog>>,
 ) {
@@ -224,6 +231,7 @@ fn handle_open_dialog_message(
     for OpenContextDialog(mode) in events.read() {
         info!("Opening context dialog: {:?}", mode);
         modal_state.0 = true;
+        *focus = FocusArea::Dialog;
         spawn_context_dialog(&mut commands, &theme, mode.clone());
     }
 }
@@ -374,11 +382,13 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
     info!("Spawned context dialog");
 }
 
-/// Handle keyboard input in the dialog
+/// Handle input in the dialog via ActionFired / TextInputReceived.
 fn handle_dialog_input(
     mut commands: Commands,
-    mut keyboard: MessageReader<KeyboardInput>,
+    mut actions: MessageReader<ActionFired>,
+    mut text_events: MessageReader<TextInputReceived>,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     mut input_query: Query<&mut ContextNameInput>,
     mut text_query: Query<&mut MsdfUiText, With<InputTextDisplay>>,
     dialog_query: Query<(Entity, &CreateContextDialog)>,
@@ -393,32 +403,35 @@ fn handle_dialog_input(
 
     let mut text_changed = false;
 
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
+    // Handle text input (alphanumeric + dashes/underscores only)
+    for TextInputReceived(text) in text_events.read() {
+        for c in text.chars() {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                input.text.push(c);
+                text_changed = true;
+            }
         }
+    }
 
-        match (&event.logical_key, &event.text) {
-            (Key::Backspace, _) => {
+    // Handle actions
+    for ActionFired(action) in actions.read() {
+        match action {
+            Action::Backspace => {
                 input.text.pop();
                 text_changed = true;
             }
-            (Key::Enter, _) => {
+            Action::Activate => {
                 if !input.text.is_empty()
                     && let Ok((dialog_entity, dialog)) = dialog_query.single()
                 {
                     submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
-                    modal_state.0 = false;
-                    commands.entity(dialog_entity).despawn();
+                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
                 }
             }
-            (Key::Escape, _) => {}
-            (_, Some(text)) => {
-                for c in text.chars() {
-                    if c.is_alphanumeric() || c == '-' || c == '_' {
-                        input.text.push(c);
-                        text_changed = true;
-                    }
+            Action::Unfocus => {
+                if let Ok((dialog_entity, _)) = dialog_query.single() {
+                    info!("Dialog cancelled (Escape)");
+                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
                 }
             }
             _ => {}
@@ -448,10 +461,23 @@ fn handle_dialog_input(
     }
 }
 
+/// Close the dialog and restore focus.
+fn close_dialog(
+    commands: &mut Commands,
+    dialog_entity: Entity,
+    modal_state: &mut ModalDialogOpen,
+    focus: &mut FocusArea,
+) {
+    modal_state.0 = false;
+    *focus = FocusArea::Constellation; // Dialogs open from constellation context
+    commands.entity(dialog_entity).despawn();
+}
+
 /// Handle button clicks (submit/cancel)
 fn handle_dialog_buttons(
     mut commands: Commands,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     submit_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextSubmit>)>,
     cancel_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextCancel>)>,
     input_query: Query<&ContextNameInput>,
@@ -470,33 +496,15 @@ fn handle_dialog_buttons(
             && !input.text.is_empty()
         {
             submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
-            modal_state.0 = false;
-            commands.entity(dialog_entity).despawn();
+            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
         }
     }
 
     for interaction in cancel_query.iter() {
         if *interaction == Interaction::Pressed {
             info!("Dialog cancelled");
-            modal_state.0 = false;
-            commands.entity(dialog_entity).despawn();
+            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
         }
-    }
-}
-
-/// Handle Escape key to close the dialog
-fn handle_dialog_escape(
-    mut commands: Commands,
-    mut modal_state: ResMut<ModalDialogOpen>,
-    keys: Res<ButtonInput<KeyCode>>,
-    dialog_query: Query<Entity, With<CreateContextDialog>>,
-) {
-    if keys.just_pressed(KeyCode::Escape)
-        && let Ok(dialog_entity) = dialog_query.single()
-    {
-        info!("Dialog cancelled (Escape)");
-        modal_state.0 = false;
-        commands.entity(dialog_entity).despawn();
     }
 }
 

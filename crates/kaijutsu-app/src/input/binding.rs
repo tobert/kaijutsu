@@ -12,8 +12,7 @@ pub enum InputSource {
     Key(KeyCode),
     /// A gamepad button
     GamepadButton(GamepadButton),
-    // Phase 6: GamepadAxis with threshold
-    // Phase 6+: MidiCC, Touch
+    // Future: GamepadAxis with threshold, MidiCC, Touch
 }
 
 /// Modifier key state required for a binding to match.
@@ -155,6 +154,23 @@ impl Binding {
             action,
             description: desc.into(),
             sequence_prefix: Some(InputSource::Key(prefix)),
+        }
+    }
+
+    /// Create a gamepad button binding.
+    pub fn gamepad(
+        button: GamepadButton,
+        context: InputContext,
+        action: Action,
+        desc: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: InputSource::GamepadButton(button),
+            modifiers: Modifiers::NONE,
+            context,
+            action,
+            description: desc.into(),
+            sequence_prefix: None,
         }
     }
 }

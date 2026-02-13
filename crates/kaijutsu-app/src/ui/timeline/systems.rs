@@ -1,11 +1,9 @@
 //! Timeline systems for temporal navigation.
 
 use bevy::prelude::*;
-use bevy::input::keyboard::{Key, KeyboardInput};
 
 use super::components::*;
 use crate::cell::{CellEditor, MainCell, ViewingConversation};
-use crate::input::FocusArea;
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 
 // ============================================================================
@@ -25,64 +23,6 @@ pub fn sync_timeline_version(
         let doc_version = editor.version();
         if doc_version != timeline.current_version {
             timeline.sync_version(doc_version);
-        }
-    }
-}
-
-// ============================================================================
-// KEYBOARD NAVIGATION
-// ============================================================================
-
-/// Handle keyboard shortcuts for timeline navigation.
-///
-/// - `[` - Step back in history
-/// - `]` - Step forward in history
-/// - `\` - Jump to live/now
-/// - `Ctrl+F` - Fork from current position (when viewing history)
-pub fn handle_timeline_keys(
-    mut keyboard: MessageReader<KeyboardInput>,
-    focus_area: Res<FocusArea>,
-    mut timeline: ResMut<TimelineState>,
-    mut fork_writer: MessageWriter<ForkRequest>,
-) {
-    // Only when not typing text
-    if focus_area.is_text_input() {
-        return;
-    }
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        match &event.logical_key {
-            Key::Character(c) if c == "[" => {
-                // Step back
-                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
-                let new_pos = (timeline.target_position - step).max(0.0);
-                timeline.begin_scrub(new_pos);
-                timeline.end_scrub();
-            }
-            Key::Character(c) if c == "]" => {
-                // Step forward
-                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
-                let new_pos = (timeline.target_position + step).min(1.0);
-                timeline.begin_scrub(new_pos);
-                timeline.end_scrub();
-            }
-            Key::Character(c) if c == "\\" => {
-                // Jump to now
-                timeline.jump_to_live();
-            }
-            Key::Character(c) if c == "f" && timeline.is_historical() => {
-                // Fork from current viewing position
-                // TODO: Check for Ctrl modifier when we have proper modifier tracking
-                fork_writer.write(ForkRequest {
-                    from_version: timeline.viewing_version,
-                    name: None,
-                });
-            }
-            _ => {}
         }
     }
 }
@@ -265,30 +205,5 @@ pub fn handle_cherry_pick_complete(
     }
 }
 
-// ============================================================================
-// TOGGLE VISIBILITY
-// ============================================================================
-
-/// Toggle timeline visibility with `t` key.
-pub fn toggle_timeline_visibility(
-    mut keyboard: MessageReader<KeyboardInput>,
-    focus_area: Res<FocusArea>,
-    mut timeline: ResMut<TimelineState>,
-) {
-    // Only when not typing text
-    if focus_area.is_text_input() {
-        return;
-    }
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        if let Key::Character(c) = &event.logical_key {
-            if c == "t" {
-                timeline.expanded = !timeline.expanded;
-            }
-        }
-    }
-}
+// Timeline keyboard navigation has moved to input::systems::handle_timeline.
+// Toggle visibility is now via the TimelineToggle action (bound to 't').

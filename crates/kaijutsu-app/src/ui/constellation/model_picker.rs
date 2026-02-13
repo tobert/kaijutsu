@@ -3,12 +3,17 @@
 //! Pressing `m` on a focused constellation node opens a modal dialog
 //! showing available LLM providers/models from `get_llm_config()`.
 //! Select with j/k + Enter to call `set_default_model()`.
+//!
+//! Input is dispatched via `ActionFired` messages from the focus-based
+//! input system (FocusArea::Dialog context).
 
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use std::sync::{Arc, Mutex};
 
 use crate::connection::RpcActor;
+use crate::input::action::Action;
+use crate::input::events::ActionFired;
+use crate::input::focus::FocusArea;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
@@ -93,6 +98,7 @@ fn handle_open_model_picker(
     mut commands: Commands,
     mut events: MessageReader<OpenModelPicker>,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     existing: Query<Entity, With<ModelPickerDialog>>,
     theme: Res<Theme>,
     actor: Option<Res<RpcActor>>,
@@ -109,6 +115,7 @@ fn handle_open_model_picker(
         };
 
         modal_state.0 = true;
+        *focus = FocusArea::Dialog;
 
         // Clear any stale result
         *result_slot.0.lock().unwrap() = None;
@@ -310,11 +317,12 @@ fn poll_model_picker_result(
     commands.entity(dialog_entity).add_child(hint);
 }
 
-/// Handle keyboard input in the model picker (j/k/Enter/Escape).
+/// Handle actions in the model picker (j/k/Enter/Escape via ActionFired).
 fn handle_model_picker_input(
     mut commands: Commands,
-    mut keyboard: MessageReader<KeyboardInput>,
+    mut actions: MessageReader<ActionFired>,
     mut modal_state: ResMut<ModalDialogOpen>,
+    mut focus: ResMut<FocusArea>,
     mut dialogs: Query<(Entity, &ModelPickerDialog, Option<&mut ModelPickerSelection>)>,
     mut items: Query<(&ModelPickerItem, &mut BackgroundColor, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
@@ -326,28 +334,22 @@ fn handle_model_picker_input(
     };
 
     let Some(mut selection) = selection else {
-        // Still loading — only handle Escape
-        for event in keyboard.read() {
-            if event.state.is_pressed() && event.logical_key == Key::Escape {
-                modal_state.0 = false;
-                commands.entity(dialog_entity).despawn();
+        // Still loading — only handle Escape/Unfocus
+        for ActionFired(action) in actions.read() {
+            if matches!(action, Action::Unfocus) {
+                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
             }
         }
         return;
     };
 
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        match &event.logical_key {
-            Key::Escape => {
-                modal_state.0 = false;
-                commands.entity(dialog_entity).despawn();
+    for ActionFired(action) in actions.read() {
+        match action {
+            Action::Unfocus => {
+                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
                 return;
             }
-            Key::Enter => {
+            Action::Activate => {
                 let (provider, model) = &selection.items[selection.selected];
                 info!("Model selected: {}/{}", provider, model);
 
@@ -367,47 +369,70 @@ fn handle_model_picker_input(
                         .detach();
                 }
 
-                modal_state.0 = false;
-                commands.entity(dialog_entity).despawn();
+                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
                 return;
             }
-            key => {
-                let text_char = event.text.as_deref().unwrap_or("");
-
+            Action::FocusNextBlock => {
                 let old_selected = selection.selected;
-                let go_down = text_char == "j" || *key == Key::ArrowDown;
-                let go_up = text_char == "k" || *key == Key::ArrowUp;
-                if go_down && selection.selected < selection.items.len() - 1 {
+                if selection.selected < selection.items.len() - 1 {
                     selection.selected += 1;
-                } else if go_up && selection.selected > 0 {
+                }
+                if old_selected != selection.selected {
+                    update_picker_visuals(&selection, &mut items, &mut texts, &theme);
+                }
+            }
+            Action::FocusPrevBlock => {
+                let old_selected = selection.selected;
+                if selection.selected > 0 {
                     selection.selected -= 1;
                 }
-
-                // Update visual selection
                 if old_selected != selection.selected {
-                    for (item, mut bg, children) in items.iter_mut() {
-                        let is_selected = item.index == selection.selected;
-                        *bg = BackgroundColor(if is_selected {
-                            theme.accent.with_alpha(0.15)
-                        } else {
-                            Color::NONE
-                        });
-
-                        for child in children.iter() {
-                            if let Ok(mut text) = texts.get_mut(child) {
-                                let (provider, model) = &selection.items[item.index];
-                                let prefix = if is_selected { "▸ " } else { "  " };
-                                text.text = format!("{}{}/{}", prefix, provider, model);
-                                text.color = bevy_to_rgba8(if is_selected {
-                                    theme.accent
-                                } else {
-                                    theme.fg
-                                });
-                            }
-                        }
-                    }
+                    update_picker_visuals(&selection, &mut items, &mut texts, &theme);
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Update visual selection in the model picker list.
+fn update_picker_visuals(
+    selection: &ModelPickerSelection,
+    items: &mut Query<(&ModelPickerItem, &mut BackgroundColor, &Children)>,
+    texts: &mut Query<&mut MsdfUiText>,
+    theme: &Theme,
+) {
+    for (item, mut bg, children) in items.iter_mut() {
+        let is_selected = item.index == selection.selected;
+        *bg = BackgroundColor(if is_selected {
+            theme.accent.with_alpha(0.15)
+        } else {
+            Color::NONE
+        });
+
+        for child in children.iter() {
+            if let Ok(mut text) = texts.get_mut(child) {
+                let (provider, model) = &selection.items[item.index];
+                let prefix = if is_selected { "▸ " } else { "  " };
+                text.text = format!("{}{}/{}", prefix, provider, model);
+                text.color = bevy_to_rgba8(if is_selected {
+                    theme.accent
+                } else {
+                    theme.fg
+                });
             }
         }
     }
+}
+
+/// Close the model picker and restore focus.
+fn close_model_picker(
+    commands: &mut Commands,
+    dialog_entity: Entity,
+    modal_state: &mut ModalDialogOpen,
+    focus: &mut FocusArea,
+) {
+    modal_state.0 = false;
+    *focus = FocusArea::Constellation;
+    commands.entity(dialog_entity).despawn();
 }

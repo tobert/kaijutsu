@@ -70,6 +70,10 @@ pub enum InputPhase {
 }
 
 /// Plugin that registers the focus-based input dispatch system.
+///
+/// Handles keyboard, mouse wheel, and gamepad input. All raw input flows
+/// through `dispatch_input` which emits `ActionFired` / `TextInputReceived`
+/// messages for domain systems to consume.
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
@@ -146,6 +150,8 @@ impl Plugin for InputPlugin {
                 systems::handle_view_pop,
                 // Tiling pane management
                 systems::handle_tiling,
+                // Timeline navigation
+                systems::handle_timeline,
                 // Constellation spatial nav
                 systems::handle_constellation_nav,
                 // Text input (compose + inline block editing)
