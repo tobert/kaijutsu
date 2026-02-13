@@ -44,6 +44,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_connection_lines,
             attach_mini_renders,
             update_node_visuals,
+            update_create_node_visual,
             update_model_labels,
             update_connection_visuals,
             despawn_removed_nodes,
@@ -102,9 +103,13 @@ fn spawn_constellation_container(
 /// Sync constellation visibility: toggle Display on constellation and conversation panes.
 ///
 /// When constellation shows, conversation panes get `Display::None`.
-/// When it hides, they get `Display::Flex` again.
+/// When it hides, they get `Display::Flex` again and constellation child
+/// entities (nodes, connections, create-node) are despawned so MSDF text
+/// doesn't bleed through. Spawn systems recreate them when shown.
 fn sync_constellation_visibility(
+    mut commands: Commands,
     visible: Res<ConstellationVisible>,
+    mut constellation: ResMut<Constellation>,
     mut constellation_containers: Query<
         &mut Node,
         (With<ConstellationContainer>, Without<crate::cell::ConversationContainer>, Without<crate::cell::ComposeBlock>),
@@ -117,6 +122,9 @@ fn sync_constellation_visibility(
         &mut Node,
         (With<crate::cell::ComposeBlock>, Without<ConstellationContainer>, Without<crate::cell::ConversationContainer>),
     >,
+    con_nodes: Query<Entity, With<ConstellationNode>>,
+    con_connections: Query<Entity, With<ConstellationConnection>>,
+    create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
     if !visible.is_changed() {
         return;
@@ -136,6 +144,25 @@ fn sync_constellation_visibility(
     for mut node in compose_blocks.iter_mut() {
         node.display = conversation_display;
     }
+
+    // When hiding: despawn constellation child entities so MSDF text stops rendering.
+    // Display::None on the container doesn't prevent absolute-positioned MSDF text
+    // from bleeding through. Spawn systems recreate everything when shown again.
+    if !visible.0 {
+        for entity in con_nodes.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in con_connections.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in create_nodes.iter() {
+            commands.entity(entity).despawn();
+        }
+        // Clear entity references so spawn systems know to recreate
+        for node in &mut constellation.nodes {
+            node.entity = None;
+        }
+    }
 }
 
 /// Get dynamic center point from the constellation container's computed size.
@@ -149,14 +176,23 @@ fn spawn_context_nodes(
     mut commands: Commands,
     mut constellation: ResMut<Constellation>,
     camera: Res<ConstellationCamera>,
+    visible: Res<ConstellationVisible>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_nodes: Query<&ConstellationNode>,
 ) {
+    if !visible.0 {
+        return;
+    }
     let Ok((container_entity, computed)) = container.single() else {
         return;
     };
+
+    // Skip first frame after visibility toggle when layout hasn't computed yet
+    if computed.size() == Vec2::ZERO {
+        return;
+    }
 
     let center = container_center(computed);
 
@@ -270,11 +306,15 @@ fn spawn_context_nodes(
 /// Spawn the "+" create context node (runs once per container)
 fn spawn_create_node(
     mut commands: Commands,
+    visible: Res<ConstellationVisible>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     container: Query<Entity, With<ConstellationContainer>>,
     existing_create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
+    if !visible.0 {
+        return;
+    }
     if !existing_create_nodes.is_empty() {
         return;
     }
@@ -354,6 +394,9 @@ fn update_node_visuals(
     let Ok(computed) = container_q.single() else {
         return;
     };
+    if computed.size() == Vec2::ZERO {
+        return;
+    }
     let center = container_center(computed);
 
     let node_size = theme.constellation_node_size;
@@ -427,15 +470,23 @@ fn spawn_connection_lines(
     mut commands: Commands,
     constellation: Res<Constellation>,
     camera: Res<ConstellationCamera>,
+    visible: Res<ConstellationVisible>,
     drift_state: Res<DriftState>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_connections: Query<&ConstellationConnection>,
 ) {
+    if !visible.0 {
+        return;
+    }
     let Ok((container_entity, computed)) = container.single() else {
         return;
     };
+
+    if computed.size() == Vec2::ZERO {
+        return;
+    }
 
     if constellation.nodes.len() < 2 {
         return;
@@ -495,31 +546,16 @@ fn spawn_connection_lines(
         let to_px = center.x + to_node.position.x * camera.zoom + camera.offset.x;
         let to_py = center.y + to_node.position.y * camera.zoom + camera.offset.y;
 
-        let min_x = from_px.min(to_px);
-        let max_x = from_px.max(to_px);
-        let min_y = from_py.min(to_py);
-        let max_y = from_py.max(to_py);
-
-        let width = (max_x - min_x).max(padding);
-        let height = (max_y - min_y).max(padding);
-
-        let rel_from_x = (from_px - min_x + padding / 2.0) / (width + padding);
-        let rel_from_y = (from_py - min_y + padding / 2.0) / (height + padding);
-        let rel_to_x = (to_px - min_x + padding / 2.0) / (width + padding);
-        let rel_to_y = (to_py - min_y + padding / 2.0) / (height + padding);
-
+        let cb = compute_connection_box(from_px, from_py, to_px, to_py, padding);
         let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
-
-        let mat_width = width + padding;
-        let mat_height = height + padding;
-        let aspect = mat_width / mat_height.max(1.0);
+        let aspect = cb.width / cb.height.max(1.0);
 
         let material = connection_materials.add(ConnectionLineMaterial {
             color: color_to_vec4(color),
             params: Vec4::new(0.08, intensity, flow_speed, 0.0),
             time: Vec4::new(0.0, activity, 0.0, 0.0),
-            endpoints: Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y),
-            dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0),
+            endpoints: Vec4::new(cb.rel_from_x, cb.rel_from_y, cb.rel_to_x, cb.rel_to_y),
+            dimensions: Vec4::new(cb.width, cb.height, aspect, 4.0),
         });
 
         let connection_entity = commands
@@ -531,10 +567,10 @@ fn spawn_connection_lines(
                 },
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(min_x - padding / 2.0),
-                    top: Val::Px(min_y - padding / 2.0),
-                    width: Val::Px(width + padding),
-                    height: Val::Px(height + padding),
+                    left: Val::Px(cb.left),
+                    top: Val::Px(cb.top),
+                    width: Val::Px(cb.width),
+                    height: Val::Px(cb.height),
                     ..default()
                 },
                 MaterialNode(material),
@@ -569,6 +605,9 @@ fn update_connection_visuals(
     let Ok(computed) = container_q.single() else {
         return;
     };
+    if computed.size() == Vec2::ZERO {
+        return;
+    }
     let center = container_center(computed);
     let padding = theme.constellation_node_size;
 
@@ -582,18 +621,12 @@ fn update_connection_visuals(
             let to_px = center.x + to.position.x * camera.zoom + camera.offset.x;
             let to_py = center.y + to.position.y * camera.zoom + camera.offset.y;
 
-            let min_x = from_px.min(to_px);
-            let max_x = from_px.max(to_px);
-            let min_y = from_py.min(to_py);
-            let max_y = from_py.max(to_py);
+            let cb = compute_connection_box(from_px, from_py, to_px, to_py, padding);
 
-            let width = (max_x - min_x).max(padding);
-            let height = (max_y - min_y).max(padding);
-
-            node_style.left = Val::Px(min_x - padding / 2.0);
-            node_style.top = Val::Px(min_y - padding / 2.0);
-            node_style.width = Val::Px(width + padding);
-            node_style.height = Val::Px(height + padding);
+            node_style.left = Val::Px(cb.left);
+            node_style.top = Val::Px(cb.top);
+            node_style.width = Val::Px(cb.width);
+            node_style.height = Val::Px(cb.height);
 
             if let Some(mat) = connection_materials.get_mut(material_node.0.id()) {
                 let activity =
@@ -601,16 +634,10 @@ fn update_connection_visuals(
                 mat.time.y = activity;
                 mat.params.y = theme.constellation_connection_glow * (0.5 + activity * 0.5);
 
-                let mat_width = width + padding;
-                let mat_height = height + padding;
-                let rel_from_x = (from_px - min_x + padding / 2.0) / mat_width;
-                let rel_from_y = (from_py - min_y + padding / 2.0) / mat_height;
-                let rel_to_x = (to_px - min_x + padding / 2.0) / mat_width;
-                let rel_to_y = (to_py - min_y + padding / 2.0) / mat_height;
-                mat.endpoints = Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y);
+                mat.endpoints = Vec4::new(cb.rel_from_x, cb.rel_from_y, cb.rel_to_x, cb.rel_to_y);
 
-                let aspect = mat_width / mat_height.max(1.0);
-                mat.dimensions = Vec4::new(mat_width, mat_height, aspect, 4.0);
+                let aspect = cb.width / cb.height.max(1.0);
+                mat.dimensions = Vec4::new(cb.width, cb.height, aspect, 4.0);
             }
         }
     }
@@ -632,6 +659,18 @@ fn despawn_removed_connections(
             continue;
         }
 
+        // Verify ancestry relationship is still valid (parent_id may change)
+        if marker.kind == DriftConnectionKind::Ancestry {
+            let still_valid = drift_state.contexts.iter().any(|ctx| {
+                ctx.parent_id.as_deref() == Some(&marker.from) && ctx.short_id == marker.to
+            });
+            if !still_valid {
+                commands.entity(entity).despawn();
+                info!("Despawned stale ancestry line: {} -> {}", marker.from, marker.to);
+                continue;
+            }
+        }
+
         if marker.kind == DriftConnectionKind::StagedDrift {
             let still_staged = drift_state.staged.iter().any(|s| {
                 s.source_ctx == marker.from && s.target_ctx == marker.to
@@ -644,9 +683,120 @@ fn despawn_removed_connections(
     }
 }
 
+/// Reposition the "+" create-context node with camera transforms.
+///
+/// Places it at `outer_radius * 1.1` at angle 0 (3 o'clock), outside the tree.
+fn update_create_node_visual(
+    constellation: Res<Constellation>,
+    camera: Res<ConstellationCamera>,
+    visible: Res<ConstellationVisible>,
+    theme: Res<Theme>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
+    mut create_nodes: Query<&mut Node, With<CreateContextNode>>,
+) {
+    let needs_update = constellation.is_changed() || camera.is_changed() || visible.is_changed();
+    if !needs_update {
+        return;
+    }
+
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    if computed.size() == Vec2::ZERO {
+        return;
+    }
+    let center = container_center(computed);
+
+    // Compute outer radius from max tree depth
+    let max_depth = compute_max_depth(&constellation);
+    let outer_radius = theme.constellation_base_radius
+        + max_depth as f32 * theme.constellation_ring_spacing;
+
+    let node_size = theme.constellation_node_size * 0.8;
+    let half_size = node_size / 2.0;
+
+    // Position at angle 0 (right side), outside the outermost ring
+    let x_pos = outer_radius * 1.1;
+    let y_pos = 0.0;
+
+    let px = center.x + x_pos * camera.zoom + camera.offset.x - half_size;
+    let py = center.y + y_pos * camera.zoom + camera.offset.y - half_size;
+
+    for mut node_style in create_nodes.iter_mut() {
+        node_style.left = Val::Px(px);
+        node_style.top = Val::Px(py);
+    }
+}
+
+/// Compute the maximum tree depth from constellation node parent_id chains.
+fn compute_max_depth(constellation: &Constellation) -> usize {
+    let mut max_depth = 0_usize;
+    for node in &constellation.nodes {
+        let mut depth = 0;
+        let mut current_id = node.parent_id.as_deref();
+        while let Some(pid) = current_id {
+            depth += 1;
+            current_id = constellation
+                .node_by_id(pid)
+                .and_then(|n| n.parent_id.as_deref());
+            // Safety: break if we've exceeded node count (cycle protection)
+            if depth > constellation.nodes.len() {
+                break;
+            }
+        }
+        max_depth = max_depth.max(depth);
+    }
+    max_depth
+}
+
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+/// Bounding box and relative endpoint coordinates for a connection line.
+struct ConnectionBox {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    rel_from_x: f32,
+    rel_from_y: f32,
+    rel_to_x: f32,
+    rel_to_y: f32,
+}
+
+/// Compute a centered connection box between two screen-space points.
+///
+/// Centers the box on the midpoint, with `padding` added to the span so
+/// endpoints always land at `padding / (2 * total)` from the edge —
+/// fixing the previous bug where axis-aligned lines had endpoints at 0.25
+/// instead of 0.5.
+fn compute_connection_box(
+    from_px: f32, from_py: f32,
+    to_px: f32, to_py: f32,
+    padding: f32,
+) -> ConnectionBox {
+    let mid_x = (from_px + to_px) / 2.0;
+    let mid_y = (from_py + to_py) / 2.0;
+    let span_x = (from_px - to_px).abs();
+    let span_y = (from_py - to_py).abs();
+
+    let width = span_x + padding;
+    let height = span_y + padding;
+    let left = mid_x - width / 2.0;
+    let top = mid_y - height / 2.0;
+
+    ConnectionBox {
+        left,
+        top,
+        width,
+        height,
+        rel_from_x: (from_px - left) / width,
+        rel_from_y: (from_py - top) / height,
+        rel_to_x: (to_px - left) / width,
+        rel_to_y: (to_py - top) / height,
+    }
+}
 
 /// Create a PulseRingMaterial for a constellation node based on activity state
 fn create_node_material(activity: ActivityState, theme: &Theme) -> PulseRingMaterial {

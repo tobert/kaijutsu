@@ -627,14 +627,11 @@ fn update_node_positions(
         roots = (0..node_count).collect();
     }
 
-    // Count descendants (including self) for angular sector sizing
-    fn count_descendants(idx: usize, children: &[Vec<usize>]) -> usize {
-        let mut count = 1; // self
-        for &child in &children[idx] {
-            count += count_descendants(child, children);
-        }
-        count
+    // Stable sort: children by context_id so tree layout is deterministic
+    for ch in &mut children {
+        ch.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
     }
+    roots.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
 
     // BFS layout: assign positions
     let mut positions: Vec<Vec2> = vec![Vec2::ZERO; node_count];
@@ -645,10 +642,10 @@ fn update_node_positions(
         layout_children(roots[0], 0.0, std::f32::consts::TAU, 1, base_radius, ring_spacing, &children, &mut positions);
     } else {
         // Multiple roots: distribute around center at ring 0 (or small offset)
-        let total_desc: usize = roots.iter().map(|&r| count_descendants(r, &children)).sum();
+        let total_desc: usize = roots.iter().map(|&r| count_tree_descendants(r, &children)).sum();
         let mut angle_start = -std::f32::consts::FRAC_PI_2;
         for &root_idx in &roots {
-            let desc = count_descendants(root_idx, &children);
+            let desc = count_tree_descendants(root_idx, &children);
             let sector = std::f32::consts::TAU * (desc as f32 / total_desc.max(1) as f32);
             let mid_angle = angle_start + sector / 2.0;
 
@@ -665,6 +662,15 @@ fn update_node_positions(
     for (i, node) in constellation.nodes.iter_mut().enumerate() {
         node.position = positions[i];
     }
+}
+
+/// Count descendants (including self) for angular sector sizing.
+fn count_tree_descendants(idx: usize, children: &[Vec<usize>]) -> usize {
+    let mut count = 1; // self
+    for &child in &children[idx] {
+        count += count_tree_descendants(child, children);
+    }
+    count
 }
 
 /// Recursively layout children in angular sectors at increasing ring depths.
@@ -685,20 +691,11 @@ fn layout_children(
 
     let radius = base_radius + depth as f32 * ring_spacing;
 
-    // Count descendants for each child to proportionally divide the sector
-    fn count_desc(idx: usize, children: &[Vec<usize>]) -> usize {
-        let mut c = 1;
-        for &child in &children[idx] {
-            c += count_desc(child, children);
-        }
-        c
-    }
-
-    let total_desc: usize = child_indices.iter().map(|&c| count_desc(c, children)).sum();
+    let total_desc: usize = child_indices.iter().map(|&c| count_tree_descendants(c, children)).sum();
     let mut current_angle = angle_start;
 
     for &child_idx in child_indices {
-        let desc = count_desc(child_idx, children);
+        let desc = count_tree_descendants(child_idx, children);
         let child_sector = sector * (desc as f32 / total_desc.max(1) as f32);
         let mid_angle = current_angle + child_sector / 2.0;
 

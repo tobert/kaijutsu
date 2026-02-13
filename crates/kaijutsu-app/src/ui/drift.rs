@@ -98,7 +98,7 @@ impl Plugin for DriftPlugin {
 /// send results via `RpcResultChannel`.
 fn poll_drift_state(
     actor: Option<Res<RpcActor>>,
-    drift_state: Res<DriftState>,
+    mut drift_state: ResMut<DriftState>,
     conn_state: Res<crate::connection::RpcConnectionState>,
     time: Res<Time>,
     result_channel: Res<RpcResultChannel>,
@@ -116,6 +116,9 @@ fn poll_drift_state(
     if elapsed - drift_state.last_poll < DRIFT_POLL_INTERVAL {
         return;
     }
+
+    // Set last_poll immediately to prevent stacking concurrent requests
+    drift_state.last_poll = elapsed;
 
     // Spawn async task to fetch both context list and drift queue
     let handle = actor.handle.clone();
@@ -153,14 +156,12 @@ fn poll_drift_state(
 fn update_drift_state(
     mut drift_state: ResMut<DriftState>,
     mut events: MessageReader<RpcResultMessage>,
-    time: Res<Time>,
 ) {
     for event in events.read() {
         match event {
             RpcResultMessage::DriftContextsReceived { contexts } => {
                 drift_state.contexts = contexts.clone();
                 drift_state.loaded = true;
-                drift_state.last_poll = time.elapsed_secs_f64();
 
                 // Resolve local_context_id to short_id now that we have context data.
                 // local_context_name is the seat's context name (e.g. kernel_id);

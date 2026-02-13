@@ -185,86 +185,45 @@ pub fn update_contexts_widget(
             })
             .collect();
 
-        // Collect existing badge names for set comparison
-        let existing_names: std::collections::HashSet<&str> = existing_badges
-            .iter()
-            .map(|(_, badge, _)| badge.context_name.as_str())
-            .collect();
-        let desired_names: std::collections::HashSet<&str> = desired
-            .iter()
-            .map(|(name, _, _)| name.as_str())
-            .collect();
+        // Full rebuild: despawn existing badges and recreate in MRU order.
+        // Badge count is <=5; always rebuilding ensures correct visual ordering.
+        for (entity, _, _) in existing_badges.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in aux_entities.iter() {
+            commands.entity(entity).despawn();
+        }
 
-        let same_membership = existing_names == desired_names
-            && existing_names.len() == desired.len();
+        for (ctx_name, short, is_active) in &desired {
+            let label = if *is_active {
+                format!("[{}]", short)
+            } else {
+                short.clone()
+            };
+            let color = if *is_active { theme.accent } else { theme.fg_dim };
 
-        if same_membership {
-            // Fast path: same set of contexts — update text/color in-place
-            for (_, badge, badge_children) in existing_badges.iter() {
-                let Some((_, short, is_active)) = desired.iter().find(|(name, _, _)| *name == badge.context_name) else {
-                    continue;
-                };
-                let label = if *is_active {
-                    format!("[{}]", short)
-                } else {
-                    short.clone()
-                };
-                let color = if *is_active { theme.accent } else { theme.fg_dim };
-
-                if let Some(children) = badge_children {
-                    for child in children.iter() {
-                        if let Ok(mut msdf_text) = texts.get_mut(child) {
-                            msdf_text.text = label.clone();
-                            msdf_text.color = bevy_to_rgba8(color);
-                        }
-                    }
-                }
-            }
-
-            // Update auxiliary entities (overflow, staged) — despawn and rebuild
-            for entity in aux_entities.iter() {
-                commands.entity(entity).despawn();
-            }
-        } else {
-            // Slow path: membership changed — full rebuild
-            for (entity, _, _) in existing_badges.iter() {
-                commands.entity(entity).despawn();
-            }
-            for entity in aux_entities.iter() {
-                commands.entity(entity).despawn();
-            }
-
-            for (ctx_name, short, is_active) in &desired {
-                let label = if *is_active {
-                    format!("[{}]", short)
-                } else {
-                    short.clone()
-                };
-                let color = if *is_active { theme.accent } else { theme.fg_dim };
-
-                let badge = commands
-                    .spawn((
-                        ContextBadge {
-                            context_name: ctx_name.clone(),
-                        },
-                        Node {
-                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                            ..default()
-                        },
-                        Interaction::None,
-                    ))
-                    .with_children(|parent| {
-                        parent.spawn((
-                            MsdfUiText::new(&label)
-                                .with_font_size(11.0)
-                                .with_color(color),
-                            UiTextPositionCache::default(),
-                            Node::default(),
-                        ));
-                    })
-                    .id();
-                commands.entity(widget_entity).add_child(badge);
-            }
+            let badge = commands
+                .spawn((
+                    ContextBadge {
+                        context_name: ctx_name.clone(),
+                    },
+                    Node {
+                        padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                        ..default()
+                    },
+                    Interaction::None,
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
+                        MsdfUiText::new(&label)
+                            .with_font_size(11.0)
+                            .with_color(color),
+                        UiTextPositionCache::default(),
+                        Node::default(),
+                    ));
+                })
+                .id();
+            commands.entity(widget_entity).add_child(badge);
         }
 
         // Overflow indicator

@@ -108,20 +108,12 @@ pub fn spawn_create_context_node(
     use crate::shaders::PulseRingMaterial;
     use crate::ui::theme::color_to_vec4;
 
-    // Position the "+" node outside the outermost ring
-    // Use base_radius + ring_spacing as approximate outer ring, then add margin
-    let outer_radius = theme.constellation_base_radius + theme.constellation_ring_spacing;
     let node_size = theme.constellation_node_size * 0.8; // Slightly smaller
-    let half_size = node_size / 2.0;
 
-    // Position at 3 o'clock (right side), outside the tree
-    let x_pos = outer_radius * 1.1;
-    let y_pos = 0.0;
-    // Container uses dynamic center now — position relative to (0,0) in constellation space
-    // These will be updated by update_node_visuals via camera transform
-    // For initial spawn, approximate at a fixed position
-    let initial_x = 400.0 + x_pos - half_size;
-    let initial_y = 300.0 + y_pos - half_size;
+    // Initial position at origin — update_create_node_visual repositions
+    // with camera transform on the next frame.
+    let initial_x = 0.0;
+    let initial_y = 0.0;
 
     // Create a distinct material for the + node (dimmer, using fg_dim color)
     let material = pulse_materials.add(PulseRingMaterial {

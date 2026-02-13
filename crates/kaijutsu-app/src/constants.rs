@@ -18,7 +18,6 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 ///
 /// The UI is organized into layers from back to front:
 /// - **Content** (10): Main content area (dashboard, conversation)
-/// - **Constellation** (15): Context node graph overlay (Map/Orbital modes)
 /// - **Cursor** (20): Cursor overlay in focused document
 /// - **HUD** (50): Dock containers (North/South) and HUD panels
 /// - **Modal** (100): Input layer, dropdowns, command palette
@@ -32,10 +31,7 @@ pub struct ZLayer;
 impl ZLayer {
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
-    /// Constellation overlay (unused since full-takeover tile conversion)
-    #[allow(dead_code)]
-    pub const CONSTELLATION: i32 = 15;
-    /// Cursor overlay (above constellation, in focused document)
+    /// Cursor overlay (in focused document)
     pub const CURSOR: i32 = 20;
     /// HUD panels (agent status, keybinds, etc.)
     pub const HUD: i32 = 50;
