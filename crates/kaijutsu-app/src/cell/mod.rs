@@ -23,9 +23,11 @@ mod systems;
 // Re-export public API
 #[allow(unused_imports)]
 pub use components::{
-    Cell, CellEditor, ComposeBlock, ContextSwitchRequested, ConversationContainer,
-    ConversationScrollState, CurrentMode, DocumentCache, EditorMode, FocusTarget,
-    FocusedBlockCell, InputKind, MainCell, ViewingConversation,
+    BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
+    CellState, ComposeBlock, ContextSwitchRequested, ConversationContainer,
+    ConversationScrollState, CurrentMode, DocumentCache, EditingBlockCell, EditorMode,
+    FocusTarget, FocusedBlockCell, InputKind, MainCell, PromptSubmitted, ViewingConversation,
 };
 pub use plugin::CellPlugin;
+pub use systems::EditorEntities;
 // CellPhase is pub in plugin.rs but not re-exported - use cell::plugin::CellPhase if needed

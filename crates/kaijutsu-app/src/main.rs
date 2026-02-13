@@ -27,6 +27,7 @@ mod connection;
 mod constants;
 mod conversation;
 mod dashboard;
+mod input;
 mod kaish;
 mod shaders;
 mod text;
@@ -87,6 +88,8 @@ fn main() {
         .add_plugins(BrpExtrasPlugin)
         // Text rendering (glyphon + cosmic-text)
         .add_plugins(text::TextRenderPlugin)
+        // Focus-based input dispatch (Phase 1: emits alongside old handlers)
+        .add_plugins(input::InputPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
         // Agent attachment and collaboration
@@ -130,11 +133,8 @@ fn main() {
             ui::debug::setup_debug_overlay,
         ).chain())
         // Update
-        .add_systems(Update, (
-            ui::debug::handle_debug_toggle,
-            ui::debug::handle_screenshot,
-            ui::debug::handle_quit,
-        ))
+        // NOTE: handle_debug_toggle, handle_screenshot, handle_quit
+        // migrated to input::systems — they consume ActionFired now
         .run();
 }
 

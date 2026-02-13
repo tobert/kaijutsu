@@ -768,7 +768,7 @@ fn interpolate_camera(
 ///
 /// Filters nodes to the correct half-plane (dot product with direction > 0),
 /// then scores by `distance / cos_angle` to prefer closer, more on-axis nodes.
-fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<String> {
+pub fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<String> {
     let focus_pos = constellation.focus_id.as_ref()
         .and_then(|id| constellation.node_by_id(id))
         .map(|n| n.position)?;

@@ -19,6 +19,8 @@ pub fn setup_debug_overlay(mut debug_options: ResMut<UiDebugOptions>) {
 }
 
 /// F1 toggles debug overlay
+/// Phase 5: delete — migrated to input::systems::handle_debug_toggle
+#[allow(dead_code)]
 pub fn handle_debug_toggle(
     keys: Res<ButtonInput<KeyCode>>,
     mut debug_options: ResMut<UiDebugOptions>,
@@ -33,6 +35,8 @@ pub fn handle_debug_toggle(
 }
 
 /// F12 saves a screenshot
+/// Phase 5: delete — migrated to input::systems::handle_screenshot
+#[allow(dead_code)]
 pub fn handle_screenshot(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
     if keys.just_pressed(KeyCode::F12) {
         // Create timestamped filename
@@ -53,6 +57,8 @@ pub fn handle_screenshot(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>
 }
 
 /// q quits (only in Normal mode)
+/// Phase 5: delete — migrated to input::systems::handle_quit
+#[allow(dead_code)]
 pub fn handle_quit(
     keys: Res<ButtonInput<KeyCode>>,
     mode: Res<CurrentMode>,
