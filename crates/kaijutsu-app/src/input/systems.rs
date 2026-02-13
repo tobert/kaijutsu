@@ -243,10 +243,13 @@ enum NavigationDirection {
 
 /// Handle block navigation actions (j/k, Home/End, G).
 ///
-/// Replaces the old `navigate_blocks` system — reads ActionFired instead of raw keys.
+/// Only active when Conversation has focus. Without this guard,
+/// FocusNextBlock/FocusPrevBlock (shared with Dialog j/k) would
+/// move block focus in the background while a dialog is open.
 pub fn handle_navigate_blocks(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
@@ -255,6 +258,10 @@ pub fn handle_navigate_blocks(
     mut scroll_state: ResMut<ConversationScrollState>,
     focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
+    if !matches!(*focus_area, FocusArea::Conversation) {
+        return;
+    }
+
     let mut direction: Option<NavigationDirection> = None;
 
     for ActionFired(action) in actions.read() {
@@ -361,11 +368,20 @@ fn scroll_to_block_visible(
 
 /// Handle scroll actions (ScrollDelta, HalfPageUp/Down, ScrollToEnd/Top).
 ///
-/// Replaces the old `handle_scroll_input` system.
+/// Only active in Conversation or Compose focus (scrolling the conversation).
+/// Prevents gamepad scroll leaking into dialogs or constellation.
 pub fn handle_scroll(
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
+    if !matches!(
+        *focus_area,
+        FocusArea::Conversation | FocusArea::Compose | FocusArea::EditingBlock { .. }
+    ) {
+        return;
+    }
+
     for ActionFired(action) in actions.read() {
         match action {
             Action::ScrollDelta(delta) => {
@@ -397,11 +413,17 @@ pub fn handle_scroll(
 // ============================================================================
 
 /// Handle ExpandBlock action (f key on focused block → full-screen reader).
+///
+/// Guarded to Conversation focus — ExpandBlock is Navigation-only.
 pub fn handle_expand_block(
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     focus: Res<FocusTarget>,
     mut view_stack: ResMut<crate::ui::state::ViewStack>,
 ) {
+    if !matches!(*focus_area, FocusArea::Conversation) {
+        return;
+    }
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::ExpandBlock) {
             continue;
@@ -417,11 +439,17 @@ pub fn handle_expand_block(
 }
 
 /// Handle CollapseToggle action (toggle thinking block collapse).
+///
+/// Guarded to Conversation focus — CollapseToggle is Navigation-only.
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     focus: Res<FocusTarget>,
     mut cells: Query<(&mut CellEditor, &mut CellState)>,
 ) {
+    if !matches!(*focus_area, FocusArea::Conversation) {
+        return;
+    }
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::CollapseToggle) {
             continue;
@@ -563,19 +591,19 @@ use crate::ui::constellation::{
 
 /// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
 ///
-/// Replaces the old `handle_focus_navigation` system — much simpler since
-/// the dispatcher handles mode guards, modifiers, and sequences.
+/// Guarded to FocusArea::Constellation — prevents Activate/Pan/etc from
+/// leaking when a Dialog overlays the (still-visible) constellation.
 pub fn handle_constellation_nav(
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
-    visible: Res<ConstellationVisible>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
     doc_cache: Res<crate::cell::DocumentCache>,
 ) {
-    if !visible.0 {
+    if !matches!(*focus_area, FocusArea::Constellation) {
         return;
     }
 
@@ -669,12 +697,16 @@ use crate::ui::timeline::{ForkRequest, TimelineState};
 
 /// Handle timeline navigation actions.
 ///
-/// Replaces the old `handle_timeline_keys` and `toggle_timeline_visibility` systems.
+/// Guarded to Conversation focus — timeline keys are Navigation-only.
 pub fn handle_timeline(
     mut actions: MessageReader<ActionFired>,
+    focus_area: Res<FocusArea>,
     mut timeline: ResMut<TimelineState>,
     mut fork_writer: MessageWriter<ForkRequest>,
 ) {
+    if !matches!(*focus_area, FocusArea::Conversation) {
+        return;
+    }
     for ActionFired(action) in actions.read() {
         match action {
             Action::TimelineStepBack => {

@@ -462,6 +462,10 @@ fn handle_dialog_input(
 }
 
 /// Close the dialog and restore focus.
+///
+/// Known limitation: hardcoded return to Constellation. If dialogs are ever
+/// opened from non-constellation contexts (e.g. global settings), this should
+/// save the previous FocusArea on open and restore it here.
 fn close_dialog(
     commands: &mut Commands,
     dialog_entity: Entity,
@@ -469,7 +473,7 @@ fn close_dialog(
     focus: &mut FocusArea,
 ) {
     modal_state.0 = false;
-    *focus = FocusArea::Constellation; // Dialogs open from constellation context
+    *focus = FocusArea::Constellation;
     commands.entity(dialog_entity).despawn();
 }
 

@@ -24,14 +24,21 @@ use super::sequence::SequenceState;
 
 /// The main input dispatch system.
 ///
-/// Runs every frame. Reads raw keyboard events + mouse wheel and emits
-/// `ActionFired` or `TextInputReceived` messages. Domain systems consume
-/// those messages instead of reading raw input directly.
+/// Runs every frame. Reads raw keyboard events, mouse wheel, and gamepad
+/// input, then emits `ActionFired` or `TextInputReceived` messages.
+/// Domain systems consume those messages instead of reading raw input.
+///
+/// Known limitation: keyboard key repeat is not implemented. Holding keys
+/// like Backspace or arrows won't auto-repeat — only the initial press
+/// fires. Bevy delivers repeat events via `KeyboardInput` with
+/// `state.is_pressed()`, but OS repeat rate varies. A dedicated repeat
+/// timer system would provide consistent behavior.
 pub fn dispatch_input(
     mut keyboard: MessageReader<KeyboardInput>,
     mut mouse_wheel: MessageReader<MouseWheel>,
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
+    time: Res<Time>,
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
     mut sequence: ResMut<SequenceState>,
@@ -126,21 +133,26 @@ pub fn dispatch_input(
         analog_input.right_stick_y = right.y;
 
         // --- Analog stick → continuous actions ---
+        // Scale by delta_secs so speed is frame-rate independent.
+        // At 60fps: dt≈0.016, at 144fps: dt≈0.007 — same pixels/second.
         const THRESHOLD: f32 = 0.2;
+        let dt = time.delta_secs();
 
         // Left stick → scroll (Navigation context)
+        // 500 px/s at full deflection
         if active_contexts.contains(InputContext::Navigation)
             && left.y.abs() > THRESHOLD
         {
-            let scroll_speed = -left.y * 8.0; // Invert: stick up = scroll up
+            let scroll_speed = -left.y * 500.0 * dt;
             action_writer.write(ActionFired(Action::ScrollDelta(scroll_speed)));
         }
 
         // Left stick → pan (Constellation context)
+        // Scale pan direction by dt so constellation camera moves consistently.
         if active_contexts.contains(InputContext::Constellation)
             && left.length() > THRESHOLD
         {
-            action_writer.write(ActionFired(Action::Pan(left)));
+            action_writer.write(ActionFired(Action::Pan(left * dt * 60.0)));
         }
     } else {
         // No gamepad connected — zero out

@@ -426,6 +426,8 @@ fn update_picker_visuals(
 }
 
 /// Close the model picker and restore focus.
+///
+/// Known limitation: hardcoded return to Constellation (see create_dialog::close_dialog).
 fn close_model_picker(
     commands: &mut Commands,
     dialog_entity: Entity,
