@@ -4,7 +4,7 @@
 //! - Glowing orb nodes for each context (using PulseRingMaterial)
 //! - Connection lines between related contexts
 //! - Camera-aware positioning with pan/zoom support
-//! - Tab toggles Display::Flex / Display::None
+//! - Tab toggles Display + Visibility::Hidden (prevents MSDF text bleed-through)
 
 use bevy::prelude::*;
 
@@ -91,6 +91,7 @@ fn spawn_constellation_container(
                 display: Display::None, // Start hidden
                 ..default()
             },
+            Visibility::Hidden, // Hidden for rendering too — prevents MSDF bleed-through
             BackgroundColor(Color::NONE),
         ))
         .id();
@@ -100,31 +101,26 @@ fn spawn_constellation_container(
     info!("Spawned constellation container (full-takeover tile)");
 }
 
-/// Sync constellation visibility: toggle Display on constellation and conversation panes.
+/// Sync constellation visibility: toggle Display and Visibility on constellation
+/// and conversation panes.
 ///
-/// When constellation shows, conversation panes get `Display::None`.
-/// When it hides, they get `Display::Flex` again and constellation child
-/// entities (nodes, connections, create-node) are despawned so MSDF text
-/// doesn't bleed through. Spawn systems recreate them when shown.
+/// `Display` controls layout (flex space allocation). `Visibility::Hidden` propagates
+/// through `InheritedVisibility` to all descendants, which the MSDF extract phase
+/// checks — preventing text bleed-through between views.
 fn sync_constellation_visibility(
-    mut commands: Commands,
     visible: Res<ConstellationVisible>,
-    mut constellation: ResMut<Constellation>,
     mut constellation_containers: Query<
-        &mut Node,
+        (&mut Node, &mut Visibility),
         (With<ConstellationContainer>, Without<crate::cell::ConversationContainer>, Without<crate::cell::ComposeBlock>),
     >,
     mut conv_containers: Query<
-        &mut Node,
+        (&mut Node, &mut Visibility),
         (With<crate::cell::ConversationContainer>, Without<ConstellationContainer>, Without<crate::cell::ComposeBlock>),
     >,
     mut compose_blocks: Query<
-        &mut Node,
+        (&mut Node, &mut Visibility),
         (With<crate::cell::ComposeBlock>, Without<ConstellationContainer>, Without<crate::cell::ConversationContainer>),
     >,
-    con_nodes: Query<Entity, With<ConstellationNode>>,
-    con_connections: Query<Entity, With<ConstellationConnection>>,
-    create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
     if !visible.is_changed() {
         return;
@@ -133,35 +129,24 @@ fn sync_constellation_visibility(
     let constellation_display = if visible.0 { Display::Flex } else { Display::None };
     let conversation_display = if visible.0 { Display::None } else { Display::Flex };
 
-    for mut node in constellation_containers.iter_mut() {
+    // Visibility::Hidden propagates to all descendants via InheritedVisibility,
+    // which the MSDF extract phase checks before rendering text.
+    let constellation_vis = if visible.0 { Visibility::Inherited } else { Visibility::Hidden };
+    let conversation_vis = if visible.0 { Visibility::Hidden } else { Visibility::Inherited };
+
+    for (mut node, mut vis) in constellation_containers.iter_mut() {
         node.display = constellation_display;
+        *vis = constellation_vis;
     }
 
-    for mut node in conv_containers.iter_mut() {
+    for (mut node, mut vis) in conv_containers.iter_mut() {
         node.display = conversation_display;
+        *vis = conversation_vis;
     }
 
-    for mut node in compose_blocks.iter_mut() {
+    for (mut node, mut vis) in compose_blocks.iter_mut() {
         node.display = conversation_display;
-    }
-
-    // When hiding: despawn constellation child entities so MSDF text stops rendering.
-    // Display::None on the container doesn't prevent absolute-positioned MSDF text
-    // from bleeding through. Spawn systems recreate everything when shown again.
-    if !visible.0 {
-        for entity in con_nodes.iter() {
-            commands.entity(entity).despawn();
-        }
-        for entity in con_connections.iter() {
-            commands.entity(entity).despawn();
-        }
-        for entity in create_nodes.iter() {
-            commands.entity(entity).despawn();
-        }
-        // Clear entity references so spawn systems know to recreate
-        for node in &mut constellation.nodes {
-            node.entity = None;
-        }
+        *vis = conversation_vis;
     }
 }
 
@@ -176,15 +161,11 @@ fn spawn_context_nodes(
     mut commands: Commands,
     mut constellation: ResMut<Constellation>,
     camera: Res<ConstellationCamera>,
-    visible: Res<ConstellationVisible>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_nodes: Query<&ConstellationNode>,
 ) {
-    if !visible.0 {
-        return;
-    }
     let Ok((container_entity, computed)) = container.single() else {
         return;
     };
@@ -306,15 +287,11 @@ fn spawn_context_nodes(
 /// Spawn the "+" create context node (runs once per container)
 fn spawn_create_node(
     mut commands: Commands,
-    visible: Res<ConstellationVisible>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
     container: Query<Entity, With<ConstellationContainer>>,
     existing_create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
-    if !visible.0 {
-        return;
-    }
     if !existing_create_nodes.is_empty() {
         return;
     }
@@ -470,16 +447,12 @@ fn spawn_connection_lines(
     mut commands: Commands,
     constellation: Res<Constellation>,
     camera: Res<ConstellationCamera>,
-    visible: Res<ConstellationVisible>,
     drift_state: Res<DriftState>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_connections: Query<&ConstellationConnection>,
 ) {
-    if !visible.0 {
-        return;
-    }
     let Ok((container_entity, computed)) = container.single() else {
         return;
     };
@@ -689,12 +662,11 @@ fn despawn_removed_connections(
 fn update_create_node_visual(
     constellation: Res<Constellation>,
     camera: Res<ConstellationCamera>,
-    visible: Res<ConstellationVisible>,
     theme: Res<Theme>,
     container_q: Query<&ComputedNode, With<ConstellationContainer>>,
     mut create_nodes: Query<&mut Node, With<CreateContextNode>>,
 ) {
-    let needs_update = constellation.is_changed() || camera.is_changed() || visible.is_changed();
+    let needs_update = constellation.is_changed() || camera.is_changed();
     if !needs_update {
         return;
     }
