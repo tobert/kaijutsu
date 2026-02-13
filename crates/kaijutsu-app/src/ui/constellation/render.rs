@@ -102,24 +102,24 @@ fn spawn_constellation_container(
 }
 
 /// Sync constellation visibility: toggle Display and Visibility on constellation
-/// and conversation panes.
+/// and ConversationRoot.
 ///
 /// `Display` controls layout (flex space allocation). `Visibility::Hidden` propagates
 /// through `InheritedVisibility` to all descendants, which the MSDF extract phase
 /// checks — preventing text bleed-through between views.
+///
+/// Targets `ConversationRoot` (the stable parent of all pane entities) rather than
+/// individual `ConversationContainer`/`ComposeBlock` entities, which may not exist
+/// if the tiling reconciler hasn't spawned them yet.
 fn sync_constellation_visibility(
     visible: Res<ConstellationVisible>,
     mut constellation_containers: Query<
         (&mut Node, &mut Visibility),
-        (With<ConstellationContainer>, Without<crate::cell::ConversationContainer>, Without<crate::cell::ComposeBlock>),
+        (With<ConstellationContainer>, Without<crate::ui::state::ConversationRoot>),
     >,
-    mut conv_containers: Query<
+    mut conv_root: Query<
         (&mut Node, &mut Visibility),
-        (With<crate::cell::ConversationContainer>, Without<ConstellationContainer>, Without<crate::cell::ComposeBlock>),
-    >,
-    mut compose_blocks: Query<
-        (&mut Node, &mut Visibility),
-        (With<crate::cell::ComposeBlock>, Without<ConstellationContainer>, Without<crate::cell::ConversationContainer>),
+        (With<crate::ui::state::ConversationRoot>, Without<ConstellationContainer>),
     >,
 ) {
     if !visible.is_changed() {
@@ -139,12 +139,7 @@ fn sync_constellation_visibility(
         *vis = constellation_vis;
     }
 
-    for (mut node, mut vis) in conv_containers.iter_mut() {
-        node.display = conversation_display;
-        *vis = conversation_vis;
-    }
-
-    for (mut node, mut vis) in compose_blocks.iter_mut() {
+    for (mut node, mut vis) in conv_root.iter_mut() {
         node.display = conversation_display;
         *vis = conversation_vis;
     }
