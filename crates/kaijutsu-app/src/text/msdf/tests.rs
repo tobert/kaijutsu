@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bevy::app::ScheduleRunnerPlugin;
@@ -36,6 +36,8 @@ use bevy::winit::WinitPlugin;
 use crossbeam_channel::{Receiver, Sender};
 
 use super::{GlowConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, SdfTextEffects};
+use super::atlas::MsdfAtlas;
+use super::generator::MsdfGenerator;
 use crate::text::plugin::TextRenderPlugin;
 use crate::text::resources::{MsdfRenderConfig, SharedFontSystem};
 
@@ -47,9 +49,16 @@ use crate::text::resources::{MsdfRenderConfig, SharedFontSystem};
 const DEFAULT_WIDTH: u32 = 400;
 const DEFAULT_HEIGHT: u32 = 100;
 
-/// Number of frames to pre-roll before capturing.
-/// Allows the render pipeline to fully initialize and MSDF glyphs to generate.
-const PRE_ROLL_FRAMES: u32 = 60;
+/// Minimum frames before checking atlas readiness.
+/// Lets the MSDF text system run and request glyphs from layout.
+const MIN_WARMUP_FRAMES: u32 = 3;
+
+/// Frames to render after atlas is ready before capturing.
+/// Lets the render pipeline settle (extract → prepare → render).
+const POST_READY_FRAMES: u32 = 3;
+
+/// Maximum total frames before we panic (safety timeout, ~5s at 60fps).
+const MAX_TOTAL_FRAMES: u32 = 300;
 
 // ============================================================================
 // HEADLESS RENDER INFRASTRUCTURE
@@ -103,10 +112,14 @@ struct TestConfig {
     alternating_colors: Option<([u8; 4], [u8; 4])>,
     /// Optional debug mode to force.
     debug_mode: Option<super::DebugOverlayMode>,
-    /// Frames remaining before capture.
+    /// Total frames rendered (for timeout detection).
+    total_frames: u32,
+    /// Frames remaining after atlas is ready, before capture.
     frames_remaining: u32,
     /// Whether we've received and processed the image.
     done: Arc<AtomicBool>,
+    /// Shared storage for captured pixel data (fixes channel race).
+    captured_pixels: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl TestConfig {
@@ -128,8 +141,10 @@ impl TestConfig {
             glow: false,
             alternating_colors: None,
             debug_mode: None,
-            frames_remaining: PRE_ROLL_FRAMES,
+            total_frames: 0,
+            frames_remaining: POST_READY_FRAMES,
             done: Arc::new(AtomicBool::new(false)),
+            captured_pixels: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -575,6 +590,7 @@ fn render_with_config(mut config: TestConfig) -> TestOutput {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let done = Arc::new(AtomicBool::new(false));
     config.done = done.clone();
+    let captured_pixels = config.captured_pixels.clone();
 
     // Find the workspace root for asset path
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -630,10 +646,12 @@ fn render_with_config(mut config: TestConfig) -> TestOutput {
         .add_systems(PostUpdate, process_captured_image)
         .run();
 
-    // Get the captured pixels
-    let pixels = receiver
-        .recv_timeout(Duration::from_secs(5))
-        .expect("Timeout waiting for rendered pixels");
+    // Get the captured pixels from the shared Arc (written by process_captured_image)
+    let pixels = captured_pixels
+        .lock()
+        .unwrap()
+        .take()
+        .expect("No pixels captured — process_captured_image never stored data");
 
     TestOutput {
         pixels,
@@ -731,25 +749,57 @@ fn setup_test_scene(
 }
 
 /// Process captured image and exit when done.
+///
+/// Four-phase capture pipeline:
+/// 0. Warmup: let MSDF text systems run and request glyphs
+/// 1. Wait for atlas readiness (all glyphs generated, no pending tasks)
+/// 2. Let the render pipeline settle for POST_READY_FRAMES
+/// 3. Capture pixel data into the shared Arc and exit
 fn process_captured_image(
     receiver: Res<MainWorldReceiver>,
     mut config: ResMut<TestConfig>,
     mut exit: MessageWriter<AppExit>,
+    atlas: Res<MsdfAtlas>,
+    generator: Res<MsdfGenerator>,
 ) {
     if config.done.load(Ordering::Relaxed) {
         return;
     }
 
+    // Safety timeout
+    config.total_frames += 1;
+    if config.total_frames > MAX_TOTAL_FRAMES {
+        panic!(
+            "MSDF test timeout: atlas never became ready after {} frames \
+             (pending={}, generator_pending={})",
+            MAX_TOTAL_FRAMES,
+            atlas.pending.len(),
+            generator.has_pending(),
+        );
+    }
+
+    // Phase 0: Warmup — let MSDF systems run and request glyphs from layout
+    if config.total_frames <= MIN_WARMUP_FRAMES {
+        while receiver.0.try_recv().is_ok() {}
+        return;
+    }
+
+    // Phase 1: Wait for atlas readiness — all glyphs generated and inserted
+    if !atlas.pending.is_empty() || generator.has_pending() {
+        while receiver.0.try_recv().is_ok() {}
+        return;
+    }
+
+    // Phase 2: Let the render pipeline settle (extract → prepare → render)
     if config.frames_remaining > 0 {
-        // Drain any early frames
         while receiver.0.try_recv().is_ok() {}
         config.frames_remaining -= 1;
         return;
     }
 
-    // Try to receive the image
-    if let Ok(_data) = receiver.0.try_recv() {
-        // Data will be received by the outer receiver in render_text_headless
+    // Phase 3: Capture — store pixel data in the shared Arc
+    if let Ok(data) = receiver.0.try_recv() {
+        *config.captured_pixels.lock().unwrap() = Some(data);
         config.done.store(true, Ordering::Relaxed);
         exit.write(AppExit::Success);
     }

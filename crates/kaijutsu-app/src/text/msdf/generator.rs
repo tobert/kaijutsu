@@ -9,7 +9,7 @@ use cosmic_text::fontdb::ID as FontId;
 use cosmic_text::FontSystem;
 use msdfgen::{Bitmap, FillRule, FontExt, MsdfGeneratorConfig, Range, Rgba};
 use owned_ttf_parser::{Face, GlyphId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use swash::FontRef;
 
@@ -153,6 +153,8 @@ pub struct GeneratedGlyph {
 pub struct MsdfGenerator {
     /// Pending generation tasks.
     tasks: Vec<Task<GeneratedGlyph>>,
+    /// Glyphs with in-flight async tasks (prevents duplicate spawns).
+    queued: HashSet<GlyphKey>,
     /// MSDF range in pixels.
     pub msdf_range: f64,
     /// Pixels per em for generation.
@@ -170,6 +172,7 @@ impl MsdfGenerator {
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            queued: HashSet::new(),
             msdf_range: 4.0,
             px_per_em: 64.0,
             angle_threshold: 3.0,
@@ -180,6 +183,7 @@ impl MsdfGenerator {
     pub fn with_settings(msdf_range: f64, px_per_em: f64) -> Self {
         Self {
             tasks: Vec::new(),
+            queued: HashSet::new(),
             msdf_range,
             px_per_em,
             angle_threshold: 3.0,
@@ -187,10 +191,17 @@ impl MsdfGenerator {
     }
 
     /// Queue glyph generation for pending glyphs in the atlas.
+    ///
+    /// Skips glyphs that already have in-flight tasks to prevent duplicate work.
     pub fn queue_pending(&mut self, atlas: &MsdfAtlas, font_system: &FontSystem) {
         let pool = AsyncComputeTaskPool::get();
 
         for &key in &atlas.pending {
+            // Skip glyphs that already have an in-flight task
+            if self.queued.contains(&key) {
+                continue;
+            }
+
             // Get font data from cosmic-text's font database
             let Some(font_data) = get_font_data_vec(font_system, key.font_id) else {
                 warn!("Font data not found for font_id {:?}", key.font_id);
@@ -216,33 +227,41 @@ impl MsdfGenerator {
                 )
             });
 
+            self.queued.insert(key);
             self.tasks.push(task);
         }
     }
 
     /// Poll for completed generation tasks and insert into atlas.
+    ///
+    /// Collects completed glyphs first to avoid double-mutable-borrow of self,
+    /// then removes them from the queued set and inserts into the atlas.
     pub fn poll_completed(&mut self, atlas: &mut MsdfAtlas) {
+        let mut completed = Vec::new();
         self.tasks.retain_mut(|task| {
             if task.is_finished() {
-                // Use block_on to get the result from the finished task
-                let glyph = block_on(async { task.await });
-                if glyph.is_placeholder {
-                    atlas.insert_placeholder(glyph.key);
-                } else {
-                    atlas.insert(
-                        glyph.key,
-                        glyph.width,
-                        glyph.height,
-                        glyph.anchor_x,
-                        glyph.anchor_y,
-                        &glyph.data,
-                    );
-                }
-                false // Remove completed task
+                completed.push(block_on(async { task.await }));
+                false
             } else {
-                true // Keep pending task
+                true
             }
         });
+
+        for glyph in completed {
+            self.queued.remove(&glyph.key);
+            if glyph.is_placeholder {
+                atlas.insert_placeholder(glyph.key);
+            } else {
+                atlas.insert(
+                    glyph.key,
+                    glyph.width,
+                    glyph.height,
+                    glyph.anchor_x,
+                    glyph.anchor_y,
+                    &glyph.data,
+                );
+            }
+        }
     }
 
     /// Pre-generate common ASCII glyphs for a font.
