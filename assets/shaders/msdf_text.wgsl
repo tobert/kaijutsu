@@ -331,8 +331,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // === GLOW LAYER ===
     // Render glow first (behind text) if enabled
     if uniforms.glow_intensity > 0.0 {
-        // Sample at expanded distance for glow (relative to text_bias)
-        let glow_bias = uniforms.text_bias - uniforms.glow_spread * 0.05;
+        let px_range = screen_px_range(in.uv);
+        // Convert pixel spread to SDF bias shift: N pixels / (px_range * 2.0)
+        let glow_bias = uniforms.text_bias - uniforms.glow_spread / (px_range * 2.0);
         let glow_alpha = msdf_alpha_at(in.uv, glow_bias) * uniforms.glow_intensity;
         output = blend_over_premultiplied(output, uniforms.glow_color.rgb, glow_alpha * uniforms.glow_color.a);
     }

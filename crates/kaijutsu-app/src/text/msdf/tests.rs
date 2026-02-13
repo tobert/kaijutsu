@@ -1101,9 +1101,7 @@ fn colored_text_renders() {
 /// Test 10: Glow effect expands the visible area.
 ///
 /// Text with glow should have more visible pixels than without.
-/// Currently ignored: SdfTextEffects.glow is not yet wired into the shader pipeline.
 #[test]
-#[ignore = "glow not yet implemented in shader — SdfTextEffects component is defined but unread"]
 fn glow_effect_expands_bounds() {
     let normal = render_text_headless("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
 

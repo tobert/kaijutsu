@@ -42,10 +42,9 @@ use cosmic_text::{Family, Metrics};
 
 use crate::text::resources::bevy_to_rgba8;
 
-/// Text effects that can be applied to MSDF-rendered text.
+/// Text effects applied to MSDF-rendered text.
 ///
-/// These are defined but not yet wired into the rendering pipeline.
-/// They'll be used when rainbow/glow shaders are implemented.
+/// Rainbow and glow effects are wired through MsdfUniforms to the msdf_text.wgsl shader.
 #[derive(Component, Default, Clone)]
 pub struct SdfTextEffects {
     /// Enable rainbow color cycling effect.
