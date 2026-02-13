@@ -2077,22 +2077,28 @@ impl kernel::Server for KernelImpl {
                 let doc_id = format!("{}@{}", kernel_id2, context_name2);
 
                 // Kernel-level drift router (used by push/pull/flush/merge RPCs)
-                let already_registered = {
+                {
                     let mut drift = kernel.drift().write().await;
                     let exists = drift.list_contexts().iter()
                         .any(|c| c.context_name == context_name2);
                     if !exists {
                         drift.register(&context_name2, &doc_id, None);
                     }
-                    exists
-                };
+                }
 
                 // Server-level drift router (used by listAllContexts)
-                if !already_registered {
+                // Always ensure registered regardless of kernel-level state —
+                // a context may already exist in the kernel router (from a prior
+                // fork/join) but not yet in the server router.
+                {
                     let mut state_ref = state2.borrow_mut();
-                    let short_id = state_ref.drift_router.register(&context_name2, &doc_id, None);
-                    log::info!("Registered context '{}' (doc: {}, short_id: {}) in DriftRouter",
-                        context_name2, doc_id, short_id);
+                    let already_in_server = state_ref.drift_router.list_contexts().iter()
+                        .any(|c| c.context_name == context_name2);
+                    if !already_in_server {
+                        let short_id = state_ref.drift_router.register(&context_name2, &doc_id, None);
+                        log::info!("Registered context '{}' (doc: {}, short_id: {}) in server DriftRouter",
+                            context_name2, doc_id, short_id);
+                    }
                 }
             }
 

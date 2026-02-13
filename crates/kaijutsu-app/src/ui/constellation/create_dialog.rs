@@ -108,15 +108,20 @@ pub fn spawn_create_context_node(
     use crate::shaders::PulseRingMaterial;
     use crate::ui::theme::color_to_vec4;
 
-    // Position the "+" node at the right edge of the constellation, not in orbital rotation
-    let container_center =
-        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
+    // Position the "+" node outside the outermost ring
+    // Use base_radius + ring_spacing as approximate outer ring, then add margin
+    let outer_radius = theme.constellation_base_radius + theme.constellation_ring_spacing;
     let node_size = theme.constellation_node_size * 0.8; // Slightly smaller
     let half_size = node_size / 2.0;
 
-    // Position at 3 o'clock (right side), slightly outside the main orbit
-    let x_pos = theme.constellation_layout_radius * 1.3;
+    // Position at 3 o'clock (right side), outside the tree
+    let x_pos = outer_radius * 1.1;
     let y_pos = 0.0;
+    // Container uses dynamic center now — position relative to (0,0) in constellation space
+    // These will be updated by update_node_visuals via camera transform
+    // For initial spawn, approximate at a fixed position
+    let initial_x = 400.0 + x_pos - half_size;
+    let initial_y = 300.0 + y_pos - half_size;
 
     // Create a distinct material for the + node (dimmer, using fg_dim color)
     let material = pulse_materials.add(PulseRingMaterial {
@@ -130,8 +135,8 @@ pub fn spawn_create_context_node(
             CreateContextNode,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(container_center + x_pos - half_size),
-                top: Val::Px(container_center + y_pos - half_size),
+                left: Val::Px(initial_x),
+                top: Val::Px(initial_y),
                 width: Val::Px(node_size),
                 height: Val::Px(node_size),
                 ..default()

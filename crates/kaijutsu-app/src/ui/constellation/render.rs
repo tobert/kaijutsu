@@ -1,19 +1,18 @@
 //! Constellation rendering - visual representation of context nodes
 //!
-//! Renders the constellation as:
+//! Renders the constellation as a full-takeover flex child of ContentArea:
 //! - Glowing orb nodes for each context (using PulseRingMaterial)
 //! - Connection lines between related contexts
-//! - Activity-based particle effects
-//! - Mode-dependent layouts (Focused/Map/Orbital)
+//! - Camera-aware positioning with pan/zoom support
+//! - Tab toggles Display::Flex / Display::None
 
 use bevy::prelude::*;
 
 use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
     mini::MiniRenderRegistry,
-    ActivityState, Constellation, ConstellationConnection, ConstellationContainer,
-    ConstellationMode, ConstellationNode, ConstellationZoom, DriftConnectionKind,
-    OrbitalAnimation,
+    ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
+    ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
 use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
 use crate::ui::drift::DriftState;
@@ -55,11 +54,11 @@ pub fn setup_constellation_rendering(app: &mut App) {
     );
 }
 
-/// Spawn the constellation container (runs once when entering Conversation)
+/// Spawn the constellation container as a full-size flex child of ContentArea.
+///
+/// Starts with `Display::None` — toggled by `sync_constellation_visibility`.
 fn spawn_constellation_container(
     mut commands: Commands,
-    constellation: Res<Constellation>,
-    theme: Res<Theme>,
     existing: Query<Entity, With<ConstellationContainer>>,
     content_area: Query<Entity, With<crate::ui::state::ContentArea>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
@@ -79,81 +78,87 @@ fn spawn_constellation_container(
         return;
     };
 
-    // Calculate container size to encompass the constellation
-    // (layout radius * 2 + node size for padding)
-    let container_size = theme.constellation_layout_radius * 2.0 + theme.constellation_node_size_focused;
-
-    // Spawn the container - positioned at center of ContentArea
-    // The container holds all constellation nodes and connections
+    // Full-size flex child — takes over content area when visible
     let constellation_entity = commands
         .spawn((
             ConstellationContainer,
             Node {
-                position_type: PositionType::Absolute,
-                // Center the container (offset by half its size)
-                left: Val::Percent(50.0),
-                top: Val::Percent(50.0),
-                margin: UiRect {
-                    left: Val::Px(-container_size / 2.0),
-                    top: Val::Px(-container_size / 2.0),
-                    ..default()
-                },
-                width: Val::Px(container_size),
-                height: Val::Px(container_size),
-                // Allow children to render - don't clip
-                overflow: Overflow::visible(),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_grow: 1.0,
+                overflow: Overflow::clip(),
+                display: Display::None, // Start hidden
                 ..default()
             },
-            // Transparent background (don't block content behind)
             BackgroundColor(Color::NONE),
-            // Start hidden in Focused mode
-            Visibility::Hidden,
-            ZIndex(crate::constants::ZLayer::CONSTELLATION),
         ))
         .id();
 
-    // Add as child of ContentArea (required for UI visibility)
     commands.entity(content_entity).add_child(constellation_entity);
 
-    info!(
-        "Spawned constellation container (mode: {:?}, {} nodes)",
-        constellation.mode,
-        constellation.nodes.len()
-    );
+    info!("Spawned constellation container (full-takeover tile)");
 }
 
-/// Sync constellation container visibility based on mode
+/// Sync constellation visibility: toggle Display on constellation and conversation panes.
+///
+/// When constellation shows, conversation panes get `Display::None`.
+/// When it hides, they get `Display::Flex` again.
 fn sync_constellation_visibility(
-    constellation: Res<Constellation>,
-    mut containers: Query<&mut Visibility, With<ConstellationContainer>>,
+    visible: Res<ConstellationVisible>,
+    mut constellation_containers: Query<
+        &mut Node,
+        (With<ConstellationContainer>, Without<crate::cell::ConversationContainer>, Without<crate::cell::ComposeBlock>),
+    >,
+    mut conv_containers: Query<
+        &mut Node,
+        (With<crate::cell::ConversationContainer>, Without<ConstellationContainer>, Without<crate::cell::ComposeBlock>),
+    >,
+    mut compose_blocks: Query<
+        &mut Node,
+        (With<crate::cell::ComposeBlock>, Without<ConstellationContainer>, Without<crate::cell::ConversationContainer>),
+    >,
 ) {
-    if !constellation.is_changed() {
+    if !visible.is_changed() {
         return;
     }
 
-    let should_show = !matches!(constellation.mode, ConstellationMode::Focused);
+    let constellation_display = if visible.0 { Display::Flex } else { Display::None };
+    let conversation_display = if visible.0 { Display::None } else { Display::Flex };
 
-    for mut vis in containers.iter_mut() {
-        *vis = if should_show {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+    for mut node in constellation_containers.iter_mut() {
+        node.display = constellation_display;
     }
+
+    for mut node in conv_containers.iter_mut() {
+        node.display = conversation_display;
+    }
+
+    for mut node in compose_blocks.iter_mut() {
+        node.display = conversation_display;
+    }
+}
+
+/// Get dynamic center point from the constellation container's computed size.
+fn container_center(container: &ComputedNode) -> Vec2 {
+    let size = container.size();
+    Vec2::new(size.x / 2.0, size.y / 2.0)
 }
 
 /// Spawn entities for new constellation nodes
 fn spawn_context_nodes(
     mut commands: Commands,
     mut constellation: ResMut<Constellation>,
+    camera: Res<ConstellationCamera>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
-    container: Query<Entity, With<ConstellationContainer>>,
+    container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_nodes: Query<&ConstellationNode>,
 ) {
-    let Ok(container_entity) = container.single() else {
+    let Ok((container_entity, computed)) = container.single() else {
         return;
     };
+
+    let center = container_center(computed);
 
     // Collect existing node IDs
     let existing_ids: Vec<String> = existing_nodes
@@ -167,18 +172,16 @@ fn spawn_context_nodes(
             continue;
         }
 
-        // Use theme values for node sizing
         let node_size = theme.constellation_node_size;
         let half_size = node_size / 2.0;
-
-        // Container center offset (container is centered, so nodes position from its center)
-        let container_center = theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
 
         // Create pulse ring material based on activity state
         let material = pulse_materials.add(create_node_material(node.activity, &theme));
 
-        // Spawn the node entity as a child of the container
-        // Note: mini-render textures are attached by attach_mini_renders system
+        // Camera-aware position
+        let px = center.x + node.position.x * camera.zoom + camera.offset.x - half_size;
+        let py = center.y + node.position.y * camera.zoom + camera.offset.y - half_size;
+
         let node_entity = commands
             .spawn((
                 ConstellationNode {
@@ -186,16 +189,13 @@ fn spawn_context_nodes(
                 },
                 Node {
                     position_type: PositionType::Absolute,
-                    // Position relative to container's top-left, offset to center
-                    left: Val::Px(container_center + node.position.x - half_size),
-                    top: Val::Px(container_center + node.position.y - half_size),
+                    left: Val::Px(px),
+                    top: Val::Px(py),
                     width: Val::Px(node_size),
                     height: Val::Px(node_size),
                     ..default()
                 },
-                // Use PulseRingMaterial for glowing orb effect
                 MaterialNode(material),
-                // Enable interaction for click-to-focus
                 Interaction::None,
             ))
             .with_children(|parent| {
@@ -205,9 +205,9 @@ fn spawn_context_nodes(
                     .spawn((
                         Node {
                             position_type: PositionType::Absolute,
-                            bottom: Val::Px(-24.0), // Below the orb
+                            bottom: Val::Px(-24.0),
                             left: Val::Percent(50.0),
-                            margin: UiRect::left(Val::Px(-60.0)), // Center the label
+                            margin: UiRect::left(Val::Px(-60.0)),
                             width: Val::Px(120.0),
                             min_height: Val::Px(20.0),
                             justify_content: JustifyContent::Center,
@@ -228,14 +228,14 @@ fn spawn_context_nodes(
                         ));
                     });
 
-                // Model badge below context label (initially empty, filled by update_model_labels)
+                // Model badge below context label
                 let model_text = node.model.as_deref().map(truncate_model_name).unwrap_or_default();
                 parent
                     .spawn((
                         ModelLabel { context_id: node.context_id.clone() },
                         Node {
                             position_type: PositionType::Absolute,
-                            bottom: Val::Px(-40.0), // Below context label
+                            bottom: Val::Px(-40.0),
                             left: Val::Percent(50.0),
                             margin: UiRect::left(Val::Px(-50.0)),
                             width: Val::Px(100.0),
@@ -257,10 +257,7 @@ fn spawn_context_nodes(
             })
             .id();
 
-        // Parent to container
         commands.entity(container_entity).add_child(node_entity);
-
-        // Store entity reference in constellation node
         node.entity = Some(node_entity);
 
         info!(
@@ -278,7 +275,6 @@ fn spawn_create_node(
     container: Query<Entity, With<ConstellationContainer>>,
     existing_create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
-    // Don't spawn if already exists
     if !existing_create_nodes.is_empty() {
         return;
     }
@@ -302,19 +298,16 @@ fn attach_mini_renders(
     nodes: Query<(Entity, &ConstellationNode), Without<HasMiniRender>>,
 ) {
     for (entity, node) in nodes.iter() {
-        // Find mini-render for this context
         if let Some(entry) = mini_registry
             .renders
             .iter()
             .find(|r| r.context_id == node.context_id)
         {
-            // Add mini-render image as child of the node
             let mini_child = commands
                 .spawn((
                     ImageNode::new(entry.image.clone()),
                     Node {
                         position_type: PositionType::Absolute,
-                        // Center the preview inside the orb
                         left: Val::Percent(10.0),
                         top: Val::Percent(10.0),
                         width: Val::Percent(80.0),
@@ -337,95 +330,57 @@ fn attach_mini_renders(
     }
 }
 
-/// Update visual properties of existing nodes based on state changes.
-///
-/// Implements 2.5D depth effect:
-/// - Focused node: full size, full opacity (z=0)
-/// - Adjacent nodes: 80% size, 70% opacity (z=-1)
-/// - Distant nodes: 60% size, 50% opacity (z=-2+)
+/// Update visual properties of existing nodes — camera-aware positioning.
 fn update_node_visuals(
     constellation: Res<Constellation>,
-    orbital: Res<OrbitalAnimation>,
-    zoom: Res<ConstellationZoom>,
+    camera: Res<ConstellationCamera>,
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
     mut nodes: Query<(
         &ConstellationNode,
         &mut Node,
         &MaterialNode<PulseRingMaterial>,
     )>,
 ) {
-    // Update when constellation, zoom, doc_cache, or orbital animation changes
     let needs_update = constellation.is_changed()
-        || zoom.is_changed()
-        || doc_cache.is_changed()
-        || (orbital.active && orbital.is_changed());
+        || camera.is_changed()
+        || doc_cache.is_changed();
     if !needs_update {
         return;
     }
 
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    let center = container_center(computed);
+
     let node_size = theme.constellation_node_size;
     let focused_size = theme.constellation_node_size_focused;
-    let container_center = theme.constellation_layout_radius + focused_size / 2.0;
-
-    // Find focused node index for depth calculation
-    let focused_idx = constellation.focus_id.as_ref().and_then(|id| {
-        constellation.nodes.iter().position(|n| &n.context_id == id)
-    });
-    let node_count = constellation.nodes.len();
 
     for (marker, mut node_style, material_node) in nodes.iter_mut() {
         if let Some(ctx_node) = constellation.node_by_id(&marker.context_id) {
             let is_focused = constellation.focus_id.as_deref() == Some(&ctx_node.context_id);
 
-            // Calculate depth based on distance from focused node in circular arrangement
-            let depth = if let Some(focus_idx) = focused_idx {
-                let node_idx = constellation.nodes.iter()
-                    .position(|n| n.context_id == ctx_node.context_id)
-                    .unwrap_or(0);
-
-                // Circular distance (shortest path in either direction)
-                let dist = if node_count > 0 {
-                    let forward = (node_idx as i32 - focus_idx as i32).unsigned_abs() as usize;
-                    let backward = node_count - forward;
-                    forward.min(backward)
-                } else {
-                    0
-                };
-                dist
-            } else {
-                0
-            };
-
-            // Depth affects scale and opacity (blend based on zoom level)
-            // At zoom 0 (focused), all nodes equal; at zoom 1 (map), depth applies
-            let depth_factor = match depth {
-                0 => 1.0,   // Focused: full size
-                1 => 0.85,  // Adjacent: slightly smaller
-                _ => 0.70,  // Distant: noticeably smaller
-            };
-
-            // Blend depth effect with zoom level (more pronounced when zoomed out)
-            let effective_depth_factor = 1.0 - (1.0 - depth_factor) * zoom.level;
-
-            // Calculate size with depth scaling
+            // Size based on focus state
             let base_size = if is_focused { focused_size } else { node_size };
-            let size = base_size * effective_depth_factor;
-            let half_size = size / 2.0;
+            let half_size = base_size / 2.0;
 
-            // Update position and size (relative to container center)
-            node_style.left = Val::Px(container_center + ctx_node.position.x - half_size);
-            node_style.top = Val::Px(container_center + ctx_node.position.y - half_size);
-            node_style.width = Val::Px(size);
-            node_style.height = Val::Px(size);
+            // Camera-aware position
+            let px = center.x + ctx_node.position.x * camera.zoom + camera.offset.x - half_size;
+            let py = center.y + ctx_node.position.y * camera.zoom + camera.offset.y - half_size;
 
-            // Update material properties based on activity and depth
+            node_style.left = Val::Px(px);
+            node_style.top = Val::Px(py);
+            node_style.width = Val::Px(base_size);
+            node_style.height = Val::Px(base_size);
+
+            // Update material properties based on activity
             if let Some(mat) = pulse_materials.get_mut(material_node.0.id()) {
                 let color = activity_to_color(ctx_node.activity, &theme);
                 mat.color = color_to_vec4(color);
 
-                // Adjust animation speed based on activity
                 mat.params.z = match ctx_node.activity {
                     ActivityState::Idle => 0.3,
                     ActivityState::Active => 0.6,
@@ -435,30 +390,18 @@ fn update_node_visuals(
                     ActivityState::Completed => 0.5,
                 };
 
-                // Opacity based on focus state and depth
-                let depth_opacity = match depth {
-                    0 => 0.9,   // Focused: fully visible
-                    1 => 0.75,  // Adjacent: slightly faded
-                    _ => 0.55,  // Distant: noticeably faded
-                };
-
-                // MRU boost: nodes in the document cache get extra brightness
+                // MRU boost for cached contexts
                 let is_in_cache = doc_cache
                     .document_id_for_context(&ctx_node.context_id)
                     .is_some();
                 let mru_boost = if is_in_cache { 0.1 } else { 0.0 };
 
-                // Blend depth opacity with zoom level
-                let base_opacity = if is_focused { 0.9 } else { 0.7 };
-                let effective_opacity = (base_opacity - (base_opacity - depth_opacity) * zoom.level + mru_boost).min(1.0);
-
-                // Increase intensity for focused node
                 if is_focused {
-                    mat.params.y = 0.08; // thicker rings
-                    mat.color.w = effective_opacity;
+                    mat.params.y = 0.08; // thicker rings for focus
+                    mat.color.w = (0.9_f32 + mru_boost).min(1.0);
                 } else {
                     mat.params.y = if is_in_cache { 0.06 } else { 0.05 };
-                    mat.color.w = effective_opacity;
+                    mat.color.w = (0.7_f32 + mru_boost).min(1.0);
                 }
             }
         }
@@ -471,7 +414,6 @@ fn despawn_removed_nodes(
     constellation: Res<Constellation>,
     nodes: Query<(Entity, &ConstellationNode)>,
 ) {
-    // Find nodes that exist as entities but not in constellation
     for (entity, marker) in nodes.iter() {
         if constellation.node_by_id(&marker.context_id).is_none() {
             commands.entity(entity).despawn();
@@ -481,22 +423,17 @@ fn despawn_removed_nodes(
 }
 
 /// Spawn drift-aware connection lines between constellation nodes.
-///
-/// Three connection types:
-/// - **Ancestry**: parent→child lines from fork/thread (thin, dim, slow flow)
-/// - **Staged drift**: pulsing accent-color lines for pending drift operations
-///
-/// Replaces the old circular-ring adjacency connections.
 fn spawn_connection_lines(
     mut commands: Commands,
     constellation: Res<Constellation>,
+    camera: Res<ConstellationCamera>,
     drift_state: Res<DriftState>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
-    container: Query<Entity, With<ConstellationContainer>>,
+    container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_connections: Query<&ConstellationConnection>,
 ) {
-    let Ok(container_entity) = container.single() else {
+    let Ok((container_entity, computed)) = container.single() else {
         return;
     };
 
@@ -504,25 +441,25 @@ fn spawn_connection_lines(
         return;
     }
 
-    // Build set of existing connections (from, to, kind)
+    let center = container_center(computed);
+    let padding = theme.constellation_node_size;
+
+    // Build set of existing connections
     let existing: Vec<(String, String, DriftConnectionKind)> = existing_connections
         .iter()
         .map(|c| (c.from.clone(), c.to.clone(), c.kind))
         .collect();
 
-    // Collect connections to spawn: (from_id, to_id, kind)
     let mut wanted: Vec<(String, String, DriftConnectionKind)> = Vec::new();
 
     // 1. Ancestry lines from DriftState.contexts (parent_id → child)
     for ctx in &drift_state.contexts {
         if let Some(ref parent_id) = ctx.parent_id {
-            // Find the parent context's short_id to match constellation nodes
-            // The parent_id from ContextInfo is a short_id
             wanted.push((parent_id.clone(), ctx.short_id.clone(), DriftConnectionKind::Ancestry));
         }
     }
 
-    // 2. Staged drift lines (source → target)
+    // 2. Staged drift lines
     for staged in &drift_state.staged {
         wanted.push((
             staged.source_ctx.clone(),
@@ -531,48 +468,45 @@ fn spawn_connection_lines(
         ));
     }
 
-    // Spawn missing connections
-    let padding = theme.constellation_node_size;
-    let container_center =
-        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
-
     for (from_id, to_id, kind) in &wanted {
-        // Skip if already exists
         if existing.iter().any(|(f, t, k)| f == from_id && t == to_id && k == kind) {
             continue;
         }
 
-        // Both nodes must exist in the constellation
         let Some(from_node) = constellation.node_by_id(from_id) else { continue };
         let Some(to_node) = constellation.node_by_id(to_id) else { continue };
 
-        // Material params vary by connection kind
         let (color, intensity, flow_speed) = match kind {
             DriftConnectionKind::Ancestry => (
                 theme.constellation_connection_color,
-                0.2,  // dim
-                0.1,  // slow flow
+                0.2,
+                0.1,
             ),
             DriftConnectionKind::StagedDrift => (
-                Color::srgba(0.49, 0.85, 0.82, 0.8), // bright cyan
-                0.6,  // medium bright
-                0.5,  // moderate flow
+                Color::srgba(0.49, 0.85, 0.82, 0.8),
+                0.6,
+                0.5,
             ),
         };
 
-        // Calculate bounding box
-        let min_x = from_node.position.x.min(to_node.position.x);
-        let max_x = from_node.position.x.max(to_node.position.x);
-        let min_y = from_node.position.y.min(to_node.position.y);
-        let max_y = from_node.position.y.max(to_node.position.y);
+        // Camera-aware positions
+        let from_px = center.x + from_node.position.x * camera.zoom + camera.offset.x;
+        let from_py = center.y + from_node.position.y * camera.zoom + camera.offset.y;
+        let to_px = center.x + to_node.position.x * camera.zoom + camera.offset.x;
+        let to_py = center.y + to_node.position.y * camera.zoom + camera.offset.y;
+
+        let min_x = from_px.min(to_px);
+        let max_x = from_px.max(to_px);
+        let min_y = from_py.min(to_py);
+        let max_y = from_py.max(to_py);
 
         let width = (max_x - min_x).max(padding);
         let height = (max_y - min_y).max(padding);
 
-        let rel_from_x = (from_node.position.x - min_x + padding / 2.0) / (width + padding);
-        let rel_from_y = (from_node.position.y - min_y + padding / 2.0) / (height + padding);
-        let rel_to_x = (to_node.position.x - min_x + padding / 2.0) / (width + padding);
-        let rel_to_y = (to_node.position.y - min_y + padding / 2.0) / (height + padding);
+        let rel_from_x = (from_px - min_x + padding / 2.0) / (width + padding);
+        let rel_from_y = (from_py - min_y + padding / 2.0) / (height + padding);
+        let rel_to_x = (to_px - min_x + padding / 2.0) / (width + padding);
+        let rel_to_y = (to_py - min_y + padding / 2.0) / (height + padding);
 
         let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
 
@@ -582,12 +516,7 @@ fn spawn_connection_lines(
 
         let material = connection_materials.add(ConnectionLineMaterial {
             color: color_to_vec4(color),
-            params: Vec4::new(
-                0.08,        // glow_width
-                intensity,   // intensity (kind-specific)
-                flow_speed,  // flow_speed (kind-specific)
-                0.0,         // unused
-            ),
+            params: Vec4::new(0.08, intensity, flow_speed, 0.0),
             time: Vec4::new(0.0, activity, 0.0, 0.0),
             endpoints: Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y),
             dimensions: Vec4::new(mat_width, mat_height, aspect, 4.0),
@@ -602,8 +531,8 @@ fn spawn_connection_lines(
                 },
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(container_center + min_x - padding / 2.0),
-                    top: Val::Px(container_center + min_y - padding / 2.0),
+                    left: Val::Px(min_x - padding / 2.0),
+                    top: Val::Px(min_y - padding / 2.0),
                     width: Val::Px(width + padding),
                     height: Val::Px(height + padding),
                     ..default()
@@ -615,74 +544,71 @@ fn spawn_connection_lines(
 
         commands.entity(container_entity).add_child(connection_entity);
 
-        info!(
-            "Spawned {:?} connection: {} -> {}",
-            kind, from_id, to_id
-        );
+        info!("Spawned {:?} connection: {} -> {}", kind, from_id, to_id);
     }
 }
 
-/// Update connection line visuals based on node activity and positions
+/// Update connection line visuals based on node activity and camera
 fn update_connection_visuals(
     constellation: Res<Constellation>,
-    orbital: Res<OrbitalAnimation>,
+    camera: Res<ConstellationCamera>,
     theme: Res<Theme>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
     mut connections: Query<(
         &ConstellationConnection,
         &mut Node,
         &MaterialNode<ConnectionLineMaterial>,
     )>,
 ) {
-    // Update when constellation changes OR orbital animation is active and changed
-    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
+    let needs_update = constellation.is_changed() || camera.is_changed();
     if !needs_update {
         return;
     }
 
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    let center = container_center(computed);
     let padding = theme.constellation_node_size;
-    let container_center =
-        theme.constellation_layout_radius + theme.constellation_node_size_focused / 2.0;
 
     for (marker, mut node_style, material_node) in connections.iter_mut() {
         let from_node = constellation.node_by_id(&marker.from);
         let to_node = constellation.node_by_id(&marker.to);
 
         if let (Some(from), Some(to)) = (from_node, to_node) {
-            // Recalculate bounding box (positions may have changed in orbital mode)
-            let min_x = from.position.x.min(to.position.x);
-            let max_x = from.position.x.max(to.position.x);
-            let min_y = from.position.y.min(to.position.y);
-            let max_y = from.position.y.max(to.position.y);
+            let from_px = center.x + from.position.x * camera.zoom + camera.offset.x;
+            let from_py = center.y + from.position.y * camera.zoom + camera.offset.y;
+            let to_px = center.x + to.position.x * camera.zoom + camera.offset.x;
+            let to_py = center.y + to.position.y * camera.zoom + camera.offset.y;
+
+            let min_x = from_px.min(to_px);
+            let max_x = from_px.max(to_px);
+            let min_y = from_py.min(to_py);
+            let max_y = from_py.max(to_py);
 
             let width = (max_x - min_x).max(padding);
             let height = (max_y - min_y).max(padding);
 
-            // Update node position
-            node_style.left = Val::Px(container_center + min_x - padding / 2.0);
-            node_style.top = Val::Px(container_center + min_y - padding / 2.0);
+            node_style.left = Val::Px(min_x - padding / 2.0);
+            node_style.top = Val::Px(min_y - padding / 2.0);
             node_style.width = Val::Px(width + padding);
             node_style.height = Val::Px(height + padding);
 
             if let Some(mat) = connection_materials.get_mut(material_node.0.id()) {
-                // Update activity level
                 let activity =
                     (from.activity.glow_intensity() + to.activity.glow_intensity()) / 2.0;
                 mat.time.y = activity;
-
-                // Update color intensity based on activity
                 mat.params.y = theme.constellation_connection_glow * (0.5 + activity * 0.5);
 
-                // Update endpoint positions relative to bounding box
                 let mat_width = width + padding;
                 let mat_height = height + padding;
-                let rel_from_x = (from.position.x - min_x + padding / 2.0) / mat_width;
-                let rel_from_y = (from.position.y - min_y + padding / 2.0) / mat_height;
-                let rel_to_x = (to.position.x - min_x + padding / 2.0) / mat_width;
-                let rel_to_y = (to.position.y - min_y + padding / 2.0) / mat_height;
+                let rel_from_x = (from_px - min_x + padding / 2.0) / mat_width;
+                let rel_from_y = (from_py - min_y + padding / 2.0) / mat_height;
+                let rel_to_x = (to_px - min_x + padding / 2.0) / mat_width;
+                let rel_to_y = (to_py - min_y + padding / 2.0) / mat_height;
                 mat.endpoints = Vec4::new(rel_from_x, rel_from_y, rel_to_x, rel_to_y);
 
-                // Update dimensions for aspect ratio correction
                 let aspect = mat_width / mat_height.max(1.0);
                 mat.dimensions = Vec4::new(mat_width, mat_height, aspect, 4.0);
             }
@@ -701,13 +627,11 @@ fn despawn_removed_connections(
         let from_exists = constellation.node_by_id(&marker.from).is_some();
         let to_exists = constellation.node_by_id(&marker.to).is_some();
 
-        // Despawn if either node is gone
         if !from_exists || !to_exists {
             commands.entity(entity).despawn();
             continue;
         }
 
-        // For staged drift lines, despawn if the staged item is gone (flushed/cancelled)
         if marker.kind == DriftConnectionKind::StagedDrift {
             let still_staged = drift_state.staged.iter().any(|s| {
                 s.source_ctx == marker.from && s.target_ctx == marker.to
@@ -728,7 +652,6 @@ fn despawn_removed_connections(
 fn create_node_material(activity: ActivityState, theme: &Theme) -> PulseRingMaterial {
     let color = activity_to_color(activity, theme);
 
-    // Animation speed based on activity
     let speed = match activity {
         ActivityState::Idle => 0.3,
         ActivityState::Active => 0.6,
@@ -740,13 +663,12 @@ fn create_node_material(activity: ActivityState, theme: &Theme) -> PulseRingMate
 
     PulseRingMaterial {
         color: color_to_vec4(color),
-        // params: x=ring_count, y=ring_width, z=speed, w=max_radius
         params: Vec4::new(3.0, 0.05, speed, 1.0),
         time: Vec4::ZERO,
     }
 }
 
-/// Get node color based on activity state (uses theme constellation colors)
+/// Get node color based on activity state
 fn activity_to_color(activity: ActivityState, theme: &Theme) -> Color {
     match activity {
         ActivityState::Idle => theme.constellation_node_glow_idle,
@@ -768,8 +690,6 @@ fn truncate_context_name(name: &str, max_len: usize) -> String {
 }
 
 /// Strip provider prefix from model name for compact display.
-///
-/// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`
 fn truncate_model_name(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
 }
@@ -785,7 +705,6 @@ fn update_model_labels(
     }
 
     for (label, children) in model_labels.iter_mut() {
-        // Find the matching constellation node
         let model_text = constellation
             .nodes
             .iter()
@@ -794,7 +713,6 @@ fn update_model_labels(
             .map(truncate_model_name)
             .unwrap_or_default();
 
-        // Update the child MsdfUiText
         for child in children.iter() {
             if let Ok(mut msdf_text) = msdf_texts.get_mut(child)
                 && msdf_text.text != model_text

@@ -253,6 +253,11 @@ fn sync_model_info_to_constellation(
             if node.model != new_model {
                 node.model = new_model;
             }
+
+            // Sync parent_id for radial tree layout
+            if node.parent_id != ctx_info.parent_id {
+                node.parent_id = ctx_info.parent_id.clone();
+            }
         }
     }
 }

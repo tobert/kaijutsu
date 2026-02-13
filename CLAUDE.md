@@ -158,6 +158,32 @@ The main UI area manages cognitive load, not just chat history.
 - Navigate with `j/k`
 - Scale to 5-10 concurrent agents
 
+### Constellation (Context Navigation)
+
+Full-screen radial tree graph toggled by Tab. Takes over the content area
+(conversation panes hidden), docks stay visible with context-sensitive hints.
+
+**Architecture:** `ConstellationVisible(bool)` resource toggles `Display::Flex`/`None`.
+`ConstellationCamera` handles pan offset + zoom with smooth interpolation.
+Radial tree layout: root at center, children in concentric rings with proportional sectors.
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Toggle constellation / conversation |
+| `h/j/k/l` | Spatial navigation between nodes |
+| `Shift+h/j/k/l` | Pan the camera |
+| `Enter` | Switch to focused context, return to conversation |
+| `f` | Fork focused context |
+| `m` | Open model picker for focused context |
+| `+`/`-` | Zoom in/out |
+| `0` | Reset camera to default view |
+
+Key data types:
+- `Constellation` — nodes, focus_id, alternate_id
+- `ContextNode` — context_id, parent_id, position, activity, model
+- `ConstellationCamera` — offset, zoom, target_offset, target_zoom
+- `ConstellationVisible` — simple bool resource
+
 ### Mode System (vim-style)
 
 | Mode | Purpose | Enter | Exit |

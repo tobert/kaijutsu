@@ -1,14 +1,14 @@
-//! Constellation - Context navigation as a visual node graph
+//! Constellation - Context navigation as a full-screen radial tree graph
 //!
 //! The constellation replaces linear context navigation with a spatial model
-//! inspired by 4X strategy games and skill trees. Contexts form nodes around
-//! a central focus, with glowing connections showing relationships.
+//! inspired by 4X strategy games and skill trees. Contexts form nodes in a
+//! radial tree layout, with the root at center and children radiating outward.
 //!
-//! ## View Modes
+//! ## Activation
 //!
-//! - **Focused**: Just the center document, constellation hidden
-//! - **Map**: Full constellation visible, center shrinks to ~60%
-//! - **Orbital**: Contexts as animated orbiting rings
+//! Tab toggles between conversation view and full-screen constellation.
+//! The constellation takes over the content area, hiding conversation panes.
+//! Enter on a focused node switches context and returns to conversation.
 //!
 //! ## Visual Design
 //!
@@ -39,15 +39,15 @@ pub struct ConstellationPlugin;
 impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Constellation>()
-            .init_resource::<OrbitalAnimation>()
-            .init_resource::<ConstellationZoom>()
-            .register_type::<ConstellationMode>()
+            .init_resource::<ConstellationVisible>()
+            .init_resource::<ConstellationCamera>()
+            .register_type::<ConstellationVisible>()
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()
             .register_type::<ConstellationConnection>()
             .register_type::<DriftConnectionKind>()
-            .register_type::<ConstellationZoom>()
+            .register_type::<ConstellationCamera>()
             .add_systems(
                 Update,
                 (
@@ -56,8 +56,8 @@ impl Plugin for ConstellationPlugin {
                     handle_mode_toggle,
                     handle_focus_navigation,
                     handle_node_click,
-                    update_orbital_animation,
                     update_node_positions,
+                    interpolate_camera,
                 )
                     .chain(),
             );
@@ -80,41 +80,46 @@ impl Plugin for ConstellationPlugin {
 // CORE DATA MODEL
 // ============================================================================
 
-/// Orbital animation state - decoupled from Constellation to avoid triggering
-/// change detection on all Constellation readers every frame during orbital mode.
-#[derive(Resource, Default)]
-pub struct OrbitalAnimation {
-    /// Current rotation angle in radians (accumulates over time)
-    pub angle: f32,
-    /// Whether orbital mode is active (cached to avoid reading Constellation)
-    pub active: bool,
-}
+/// Whether the constellation view is visible (full-takeover of content area).
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct ConstellationVisible(pub bool);
 
-/// Zoom state for constellation navigation.
+/// Camera for constellation pan/zoom.
 ///
-/// Zoom level controls the transition between focused and constellation views:
-/// - 0.0 = Fully zoomed in (Focused mode, single context visible)
-/// - 1.0 = Fully zoomed out (Map mode, all contexts visible)
-///
-/// The zoom level smoothly interpolates for visual effect.
+/// Offset and zoom are smoothly interpolated toward their targets each frame.
 #[derive(Resource, Reflect)]
 #[reflect(Resource)]
-pub struct ConstellationZoom {
-    /// Current zoom level (0.0 = focused, 1.0 = map)
-    pub level: f32,
+pub struct ConstellationCamera {
+    /// Current pan offset in pixels
+    pub offset: Vec2,
+    /// Current zoom level (1.0 = normal)
+    pub zoom: f32,
+    /// Target pan offset for smooth interpolation
+    pub target_offset: Vec2,
     /// Target zoom level for smooth interpolation
-    pub target: f32,
+    pub target_zoom: f32,
     /// Interpolation speed (higher = snappier)
     pub speed: f32,
 }
 
-impl Default for ConstellationZoom {
+impl Default for ConstellationCamera {
     fn default() -> Self {
         Self {
-            level: 0.0,
-            target: 0.0,
-            speed: 8.0, // Smooth but responsive
+            offset: Vec2::ZERO,
+            zoom: 1.0,
+            target_offset: Vec2::ZERO,
+            target_zoom: 1.0,
+            speed: 8.0,
         }
+    }
+}
+
+impl ConstellationCamera {
+    /// Reset camera to default view
+    pub fn reset(&mut self) {
+        self.target_offset = Vec2::ZERO;
+        self.target_zoom = 1.0;
     }
 }
 
@@ -126,8 +131,6 @@ pub struct Constellation {
     pub nodes: Vec<ContextNode>,
     /// Currently focused context ID (center of constellation)
     pub focus_id: Option<String>,
-    /// Current view mode
-    pub mode: ConstellationMode,
     /// Alternate context ID (for Ctrl-^ switching)
     pub alternate_id: Option<String>,
 }
@@ -158,6 +161,7 @@ impl Constellation {
         let node = ContextNode {
             context_id: context_id.clone(),
             seat_info,
+            parent_id: None, // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
             entity: None,
@@ -226,6 +230,8 @@ pub struct ContextNode {
     pub context_id: String,
     /// Full seat information from server
     pub seat_info: SeatInfo,
+    /// Parent context ID (from drift router, for tree layout)
+    pub parent_id: Option<String>,
     /// Position in constellation space (calculated by layout)
     pub position: Vec2,
     /// Current activity state (affects visual rendering)
@@ -268,28 +274,6 @@ impl ActivityState {
     }
 }
 
-/// View mode for the constellation
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
-pub enum ConstellationMode {
-    /// Just the focus document, constellation hidden
-    #[default]
-    Focused,
-    /// Full constellation visible, center shrinks to ~60%
-    Map,
-    /// Contexts as animated orbiting rings
-    Orbital,
-}
-
-impl ConstellationMode {
-    /// Cycle to the next mode
-    pub fn next(&self) -> Self {
-        match self {
-            Self::Focused => Self::Map,
-            Self::Map => Self::Orbital,
-            Self::Orbital => Self::Focused,
-        }
-    }
-}
 
 
 // ============================================================================
@@ -390,13 +374,13 @@ fn handle_node_click(
     }
 }
 
-/// Handle Tab/Space to cycle constellation mode
+/// Handle Tab to toggle constellation visibility
 fn handle_mode_toggle(
     keys: Res<ButtonInput<KeyCode>>,
     screen: Res<State<crate::ui::state::AppScreen>>,
     current_mode: Res<crate::cell::CurrentMode>,
     modal_open: Res<ModalDialogOpen>,
-    mut constellation: ResMut<Constellation>,
+    mut visible: ResMut<ConstellationVisible>,
 ) {
     // Skip when a modal dialog is open
     if modal_open.0 {
@@ -411,14 +395,14 @@ fn handle_mode_toggle(
         return;
     }
 
-    // Tab toggles constellation mode
+    // Tab toggles constellation visibility
     if keys.just_pressed(KeyCode::Tab) {
-        constellation.mode = constellation.mode.next();
-        info!("Constellation mode: {:?}", constellation.mode);
+        visible.0 = !visible.0;
+        info!("Constellation visible: {}", visible.0);
     }
 }
 
-/// Handle gt/gT and Ctrl-^ for context navigation.
+/// Handle gt/gT, Ctrl-^, Enter, f, m, hjkl for context navigation.
 ///
 /// After updating constellation focus, emits `ContextSwitchRequested` to trigger
 /// the actual document swap in the cell system.
@@ -428,6 +412,8 @@ fn handle_focus_navigation(
     current_mode: Res<crate::cell::CurrentMode>,
     modal_open: Res<ModalDialogOpen>,
     mut constellation: ResMut<Constellation>,
+    mut visible: ResMut<ConstellationVisible>,
+    mut camera: ResMut<ConstellationCamera>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<model_picker::OpenModelPicker>,
@@ -501,9 +487,68 @@ fn handle_focus_navigation(
         }
     }
 
+    // --- Constellation-visible-only keybindings ---
+    if visible.0 {
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+        // Enter on focused node: switch context and close constellation
+        if !*pending_g && keys.just_pressed(KeyCode::Enter) {
+            if let Some(ref focus_id) = constellation.focus_id {
+                info!("Enter on constellation node: switching to {}", focus_id);
+                switch_writer.write(crate::cell::ContextSwitchRequested {
+                    context_name: focus_id.clone(),
+                });
+                visible.0 = false;
+            }
+            return;
+        }
+
+        // hjkl spatial navigation (without Shift = navigate, with Shift = pan)
+        if !*pending_g {
+            let direction = if keys.just_pressed(KeyCode::KeyH) { Some(Vec2::new(-1.0, 0.0)) }
+                else if keys.just_pressed(KeyCode::KeyJ) { Some(Vec2::new(0.0, 1.0)) }
+                else if keys.just_pressed(KeyCode::KeyK) { Some(Vec2::new(0.0, -1.0)) }
+                else if keys.just_pressed(KeyCode::KeyL) { Some(Vec2::new(1.0, 0.0)) }
+                else { None };
+
+            if let Some(dir) = direction {
+                if shift {
+                    // Shift+hjkl = pan camera
+                    camera.target_offset += dir * 80.0;
+                } else {
+                    // hjkl = spatial navigation
+                    if let Some(target_id) = find_nearest_in_direction(&constellation, dir) {
+                        constellation.focus(&target_id);
+                        // Auto-center camera on focused node
+                        if let Some(node) = constellation.node_by_id(&target_id) {
+                            camera.target_offset = -node.position * camera.zoom;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Zoom controls
+        if !*pending_g {
+            if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+                camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
+                return;
+            }
+            if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+                camera.target_zoom = (camera.target_zoom * 0.8).max(0.25);
+                return;
+            }
+            if keys.just_pressed(KeyCode::Digit0) {
+                camera.reset();
+                return;
+            }
+        }
+    }
+
     // `f` key on focused constellation node = fork that context
     if !*pending_g && keys.just_pressed(KeyCode::KeyF) {
-        if constellation.mode != ConstellationMode::Focused {
+        if visible.0 {
             if let Some(ref focus_id) = constellation.focus_id {
                 if let Some(doc_id) = doc_cache.document_id_for_context(focus_id) {
                     info!("Fork requested for context '{}' (doc: {})", focus_id, doc_id);
@@ -520,7 +565,7 @@ fn handle_focus_navigation(
 
     // `m` key on focused constellation node = open model picker
     if !*pending_g && keys.just_pressed(KeyCode::KeyM) {
-        if constellation.mode != ConstellationMode::Focused {
+        if visible.0 {
             if let Some(ref focus_id) = constellation.focus_id {
                 info!("Model picker requested for context '{}'", focus_id);
                 model_writer.write(model_picker::OpenModelPicker {
@@ -531,36 +576,12 @@ fn handle_focus_navigation(
     }
 }
 
-/// Update orbital animation state (runs every frame in orbital mode, but doesn't
-/// trigger change detection on Constellation)
-fn update_orbital_animation(
-    constellation: Res<Constellation>,
-    time: Res<Time>,
-    theme: Res<crate::ui::theme::Theme>,
-    mut orbital: ResMut<OrbitalAnimation>,
-) {
-    let is_orbital = constellation.mode == ConstellationMode::Orbital;
-
-    // Track mode changes
-    if orbital.active != is_orbital {
-        orbital.active = is_orbital;
-    }
-
-    // Accumulate angle in orbital mode
-    if is_orbital {
-        orbital.angle += time.delta_secs() * theme.constellation_orbital_speed;
-        // Wrap to prevent float precision issues over long sessions
-        if orbital.angle > std::f32::consts::TAU {
-            orbital.angle -= std::f32::consts::TAU;
-        }
-    }
-}
-
-/// Update node positions using circular layout
-/// Only mutates Constellation when layout actually changes (not every frame in orbital)
+/// Update node positions using radial tree layout.
+///
+/// Root nodes (no parent) are placed at center. Children radiate outward in
+/// concentric rings, with angular sectors proportional to descendant count.
 fn update_node_positions(
     mut constellation: ResMut<Constellation>,
-    orbital: Res<OrbitalAnimation>,
     theme: Res<crate::ui::theme::Theme>,
 ) {
     let node_count = constellation.nodes.len();
@@ -568,25 +589,191 @@ fn update_node_positions(
         return;
     }
 
-    // Only recalculate positions when:
-    // - Constellation data changed (new node, focus change, etc.)
-    // - Orbital animation is active AND orbital angle changed
-    let needs_update = constellation.is_changed() || (orbital.active && orbital.is_changed());
-    if !needs_update {
+    if !constellation.is_changed() {
         return;
     }
 
-    let orbital_offset = if orbital.active { orbital.angle } else { 0.0 };
+    let base_radius = theme.constellation_base_radius;
+    let ring_spacing = theme.constellation_ring_spacing;
 
-    // Position nodes in a circle around center
-    let radius = theme.constellation_layout_radius;
-    let angle_step = std::f32::consts::TAU / node_count as f32;
+    // Build parent→children adjacency and identify roots
+    let ids: Vec<String> = constellation.nodes.iter().map(|n| n.context_id.clone()).collect();
+    let parents: Vec<Option<String>> = constellation.nodes.iter().map(|n| n.parent_id.clone()).collect();
 
-    for (i, node) in constellation.nodes.iter_mut().enumerate() {
-        let base_angle = angle_step * i as f32 - std::f32::consts::FRAC_PI_2; // Start at top
-        let angle = base_angle + orbital_offset;
-        node.position = Vec2::new(angle.cos() * radius, angle.sin() * radius);
+    // Map context_id → index
+    let id_to_idx: std::collections::HashMap<&str, usize> = ids.iter().enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+
+    // Build children lists
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (i, parent) in parents.iter().enumerate() {
+        if let Some(pid) = parent {
+            if let Some(&parent_idx) = id_to_idx.get(pid.as_str()) {
+                children[parent_idx].push(i);
+            } else {
+                // Parent not in constellation — treat as root
+                roots.push(i);
+            }
+        } else {
+            roots.push(i);
+        }
     }
+
+    // If no roots found (shouldn't happen), treat all as roots
+    if roots.is_empty() {
+        roots = (0..node_count).collect();
+    }
+
+    // Count descendants (including self) for angular sector sizing
+    fn count_descendants(idx: usize, children: &[Vec<usize>]) -> usize {
+        let mut count = 1; // self
+        for &child in &children[idx] {
+            count += count_descendants(child, children);
+        }
+        count
+    }
+
+    // BFS layout: assign positions
+    let mut positions: Vec<Vec2> = vec![Vec2::ZERO; node_count];
+
+    if roots.len() == 1 {
+        // Single root at center
+        positions[roots[0]] = Vec2::ZERO;
+        layout_children(roots[0], 0.0, std::f32::consts::TAU, 1, base_radius, ring_spacing, &children, &mut positions);
+    } else {
+        // Multiple roots: distribute around center at ring 0 (or small offset)
+        let total_desc: usize = roots.iter().map(|&r| count_descendants(r, &children)).sum();
+        let mut angle_start = -std::f32::consts::FRAC_PI_2;
+        for &root_idx in &roots {
+            let desc = count_descendants(root_idx, &children);
+            let sector = std::f32::consts::TAU * (desc as f32 / total_desc.max(1) as f32);
+            let mid_angle = angle_start + sector / 2.0;
+
+            // Place root at a small radius to separate them
+            let root_radius = if roots.len() > 1 { base_radius * 0.5 } else { 0.0 };
+            positions[root_idx] = Vec2::new(mid_angle.cos() * root_radius, mid_angle.sin() * root_radius);
+
+            layout_children(root_idx, angle_start, sector, 1, base_radius, ring_spacing, &children, &mut positions);
+            angle_start += sector;
+        }
+    }
+
+    // Apply positions back to nodes
+    for (i, node) in constellation.nodes.iter_mut().enumerate() {
+        node.position = positions[i];
+    }
+}
+
+/// Recursively layout children in angular sectors at increasing ring depths.
+fn layout_children(
+    parent_idx: usize,
+    angle_start: f32,
+    sector: f32,
+    depth: usize,
+    base_radius: f32,
+    ring_spacing: f32,
+    children: &[Vec<usize>],
+    positions: &mut [Vec2],
+) {
+    let child_indices = &children[parent_idx];
+    if child_indices.is_empty() {
+        return;
+    }
+
+    let radius = base_radius + depth as f32 * ring_spacing;
+
+    // Count descendants for each child to proportionally divide the sector
+    fn count_desc(idx: usize, children: &[Vec<usize>]) -> usize {
+        let mut c = 1;
+        for &child in &children[idx] {
+            c += count_desc(child, children);
+        }
+        c
+    }
+
+    let total_desc: usize = child_indices.iter().map(|&c| count_desc(c, children)).sum();
+    let mut current_angle = angle_start;
+
+    for &child_idx in child_indices {
+        let desc = count_desc(child_idx, children);
+        let child_sector = sector * (desc as f32 / total_desc.max(1) as f32);
+        let mid_angle = current_angle + child_sector / 2.0;
+
+        positions[child_idx] = Vec2::new(mid_angle.cos() * radius, mid_angle.sin() * radius);
+
+        // Recurse for grandchildren
+        layout_children(child_idx, current_angle, child_sector, depth + 1, base_radius, ring_spacing, children, positions);
+
+        current_angle += child_sector;
+    }
+}
+
+/// Smoothly interpolate camera offset and zoom toward targets.
+fn interpolate_camera(
+    mut camera: ResMut<ConstellationCamera>,
+    visible: Res<ConstellationVisible>,
+    time: Res<Time>,
+) {
+    if !visible.0 {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    let t = (camera.speed * dt).min(1.0);
+
+    let offset_diff = camera.target_offset - camera.offset;
+    if offset_diff.length() > 0.1 {
+        camera.offset += offset_diff * t;
+    } else {
+        camera.offset = camera.target_offset;
+    }
+
+    let zoom_diff = camera.target_zoom - camera.zoom;
+    if zoom_diff.abs() > 0.001 {
+        camera.zoom += zoom_diff * t;
+    } else {
+        camera.zoom = camera.target_zoom;
+    }
+}
+
+/// Find the nearest constellation node in a given direction from the focused node.
+///
+/// Filters nodes to the correct half-plane (dot product with direction > 0),
+/// then scores by `distance / cos_angle` to prefer closer, more on-axis nodes.
+fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<String> {
+    let focus_pos = constellation.focus_id.as_ref()
+        .and_then(|id| constellation.node_by_id(id))
+        .map(|n| n.position)?;
+
+    let mut best: Option<(f32, &str)> = None;
+
+    for node in &constellation.nodes {
+        if constellation.focus_id.as_deref() == Some(&node.context_id) {
+            continue;
+        }
+
+        let delta = node.position - focus_pos;
+        let dist = delta.length();
+        if dist < 0.001 {
+            continue;
+        }
+
+        let cos_angle = delta.dot(direction) / dist;
+        if cos_angle <= 0.0 {
+            continue; // Wrong half-plane
+        }
+
+        let score = dist / cos_angle.max(0.01);
+
+        if best.is_none() || score < best.unwrap().0 {
+            best = Some((score, &node.context_id));
+        }
+    }
+
+    best.map(|(_, id)| id.to_string())
 }
 
 // ============================================================================

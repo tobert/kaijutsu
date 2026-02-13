@@ -484,8 +484,11 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     // ═══════════════════════════════════════════════════════════════════════
     // Constellation configuration
     // ═══════════════════════════════════════════════════════════════════════
-    if let Some(v) = get_float(&scope, "constellation_layout_radius") {
-        theme.constellation_layout_radius = v;
+    if let Some(v) = get_float(&scope, "constellation_base_radius") {
+        theme.constellation_base_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "constellation_ring_spacing") {
+        theme.constellation_ring_spacing = v;
     }
     if let Some(v) = get_float(&scope, "constellation_node_size") {
         theme.constellation_node_size = v;
@@ -514,9 +517,7 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     if let Some(v) = get_int(&scope, "constellation_particle_budget") {
         theme.constellation_particle_budget = v;
     }
-    if let Some(v) = get_float(&scope, "constellation_orbital_speed") {
-        theme.constellation_orbital_speed = v;
-    }
+
 
     Ok(theme)
 }

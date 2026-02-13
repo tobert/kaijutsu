@@ -260,8 +260,10 @@ pub struct Theme {
     // Constellation Configuration
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Base radius for circular node layout (pixels)
-    pub constellation_layout_radius: f32,
+    /// Base radius for radial tree root ring (pixels)
+    pub constellation_base_radius: f32,
+    /// Spacing between concentric rings in radial tree (pixels)
+    pub constellation_ring_spacing: f32,
     /// Node orb size when idle (pixels)
     pub constellation_node_size: f32,
     /// Node orb size when focused (pixels)
@@ -280,8 +282,6 @@ pub struct Theme {
     pub constellation_connection_color: Color,
     /// Max particles per context for streaming effects
     pub constellation_particle_budget: u32,
-    /// Animation speed for orbital mode (radians/sec)
-    pub constellation_orbital_speed: f32,
 
 }
 
@@ -405,8 +405,9 @@ impl Default for Theme {
             font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
             font_rainbow: false,
 
-            // Constellation defaults - bioluminescent aesthetic
-            constellation_layout_radius: 250.0,
+            // Constellation defaults - bioluminescent aesthetic, radial tree
+            constellation_base_radius: 120.0,
+            constellation_ring_spacing: 160.0,
             constellation_node_size: 96.0,
             constellation_node_size_focused: 128.0,
             constellation_node_glow_idle: Color::srgba(0.3, 0.4, 0.5, 0.3),
@@ -416,7 +417,6 @@ impl Default for Theme {
             constellation_connection_glow: 0.4,
             constellation_connection_color: Color::srgba(0.49, 0.85, 0.82, 0.5),   // Cyan
             constellation_particle_budget: 500,
-            constellation_orbital_speed: 0.1,
 
         }
     }

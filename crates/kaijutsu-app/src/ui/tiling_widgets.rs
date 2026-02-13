@@ -12,6 +12,7 @@ use super::tiling_reconciler::WidgetPaneText;
 use crate::cell::{CurrentMode, EditorMode, InputKind, ContextSwitchRequested};
 use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::ui::constellation::ConstellationVisible;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
@@ -362,6 +363,45 @@ pub fn update_contexts_widget(
     }
 }
 
+/// Update hints widget to show context-sensitive key hints.
+///
+/// When constellation is visible, shows constellation navigation hints.
+/// Otherwise shows the default input hints.
+pub fn update_hints_widget(
+    visible: Res<ConstellationVisible>,
+    mode: Res<CurrentMode>,
+    widget_panes: Query<(&WidgetPaneText, &Children)>,
+    mut texts: Query<&mut MsdfUiText>,
+) {
+    if !visible.is_changed() && !mode.is_changed() {
+        return;
+    }
+
+    let hints = if visible.0 {
+        "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: back │ +/-: zoom │ 0: reset"
+    } else {
+        match mode.0 {
+            EditorMode::Normal => "i: chat │ `: shell │ v: visual │ Tab: constellation │ j/k: navigate",
+            EditorMode::Input(InputKind::Chat) => "Enter: submit │ Shift+Enter: newline │ Esc: normal",
+            EditorMode::Input(InputKind::Shell) => "Enter: execute │ Esc: normal",
+            EditorMode::Visual => "Esc: normal",
+        }
+    };
+
+    for (widget, children) in widget_panes.iter() {
+        if !matches!(widget.widget_type, PaneContent::Hints) {
+            continue;
+        }
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = texts.get_mut(child) {
+                if msdf_text.text != hints {
+                    msdf_text.text = hints.to_string();
+                }
+            }
+        }
+    }
+}
+
 /// Handle clicks on context badges in the South dock strip.
 pub fn handle_context_badge_click(
     badges: Query<(&Interaction, &ContextBadge), Changed<Interaction>>,
@@ -392,6 +432,7 @@ impl Plugin for TilingWidgetsPlugin {
                 update_mode_widget,
                 update_connection_widget,
                 update_contexts_widget,
+                update_hints_widget,
                 handle_context_badge_click,
             )
                 .chain(),

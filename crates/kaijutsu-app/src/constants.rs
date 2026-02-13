@@ -32,7 +32,8 @@ pub struct ZLayer;
 impl ZLayer {
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
-    /// Constellation overlay (context nodes, connections)
+    /// Constellation overlay (unused since full-takeover tile conversion)
+    #[allow(dead_code)]
     pub const CONSTELLATION: i32 = 15;
     /// Cursor overlay (above constellation, in focused document)
     pub const CURSOR: i32 = 20;
