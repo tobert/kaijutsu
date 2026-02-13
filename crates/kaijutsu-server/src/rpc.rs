@@ -446,14 +446,15 @@ async fn initialize_kernel_mcp(
 
     log::info!("Registering {} MCP servers from mcp.rhai", config.servers.len());
 
-    // Launch all servers concurrently
+    // Launch all servers concurrently with per-server timeout
+    let timeout = std::time::Duration::from_secs(5);
     let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
         let pool = mcp_pool.clone();
         let kernel = kernel.clone();
         let name = server_config.name.clone();
         async move {
-            match pool.register(server_config).await {
-                Ok(info) => {
+            match tokio::time::timeout(timeout, pool.register(server_config)).await {
+                Ok(Ok(info)) => {
                     let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
                     for (qualified_name, engine) in tools {
                         let desc = engine.description().to_string();
@@ -464,8 +465,11 @@ async fn initialize_kernel_mcp(
                     }
                     log::info!("MCP server '{}' registered ({} tools)", name, info.tools.len());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::warn!("MCP server '{}' failed to register: {}", name, e);
+                }
+                Err(_) => {
+                    log::warn!("MCP server '{}' timed out during registration ({}s)", name, timeout.as_secs());
                 }
             }
         }
@@ -2116,8 +2120,13 @@ impl kernel::Server for KernelImpl {
         // Get transport type (default: stdio)
         let transport = if config_reader.has_transport() {
             match pry!(config_reader.get_transport()).to_str() {
+                Ok("stdio") | Ok("") => McpTransport::Stdio,
                 Ok("streamable_http") => McpTransport::StreamableHttp,
-                _ => McpTransport::Stdio,
+                Ok(other) => {
+                    log::warn!("Unknown MCP transport '{}' for '{}', defaulting to stdio", other, name);
+                    McpTransport::Stdio
+                }
+                Err(_) => McpTransport::Stdio,
             }
         } else {
             McpTransport::Stdio
