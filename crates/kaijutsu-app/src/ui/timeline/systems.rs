@@ -4,7 +4,8 @@ use bevy::prelude::*;
 use bevy::input::keyboard::{Key, KeyboardInput};
 
 use super::components::*;
-use crate::cell::{CellEditor, CurrentMode, MainCell, ViewingConversation};
+use crate::cell::{CellEditor, MainCell, ViewingConversation};
+use crate::input::FocusArea;
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 
 // ============================================================================
@@ -40,12 +41,12 @@ pub fn sync_timeline_version(
 /// - `Ctrl+F` - Fork from current position (when viewing history)
 pub fn handle_timeline_keys(
     mut keyboard: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     mut timeline: ResMut<TimelineState>,
     mut fork_writer: MessageWriter<ForkRequest>,
 ) {
-    // Only in Normal mode
-    if mode.0.accepts_input() {
+    // Only when not typing text
+    if focus_area.is_text_input() {
         return;
     }
 
@@ -271,11 +272,11 @@ pub fn handle_cherry_pick_complete(
 /// Toggle timeline visibility with `t` key.
 pub fn toggle_timeline_visibility(
     mut keyboard: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     mut timeline: ResMut<TimelineState>,
 ) {
-    // Only in Normal mode
-    if mode.0.accepts_input() {
+    // Only when not typing text
+    if focus_area.is_text_input() {
         return;
     }
 

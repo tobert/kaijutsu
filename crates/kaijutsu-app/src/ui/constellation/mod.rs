@@ -27,8 +27,7 @@ use kaijutsu_client::ContextMembership;
 
 use crate::agents::AgentActivityMessage;
 
-// Re-export ModalDialogOpen for use by other systems (e.g., prompt input)
-pub use create_dialog::{DialogMode, ModalDialogOpen, OpenContextDialog};
+pub use create_dialog::{DialogMode, OpenContextDialog};
 
 // Render module provides visual systems (used by the plugin internally)
 // Mini module provides render-to-texture previews for constellation nodes
@@ -53,8 +52,7 @@ impl Plugin for ConstellationPlugin {
                 (
                     track_seat_events,
                     track_agent_activity,
-                    handle_mode_toggle,
-                    handle_focus_navigation,
+                    // Input handling in input::systems (toggle_constellation + constellation_nav)
                     handle_node_click,
                     update_node_positions,
                     interpolate_camera,
@@ -218,6 +216,7 @@ impl Constellation {
     }
 
     /// Switch to alternate context (Ctrl-^)
+    #[allow(dead_code)]
     pub fn toggle_alternate(&mut self) {
         if let Some(alt) = self.alternate_id.take() {
             let current = self.focus_id.take();
@@ -402,207 +401,7 @@ fn handle_node_click(
     }
 }
 
-/// Handle Tab to toggle constellation visibility
-fn handle_mode_toggle(
-    keys: Res<ButtonInput<KeyCode>>,
-    screen: Res<State<crate::ui::state::AppScreen>>,
-    current_mode: Res<crate::cell::CurrentMode>,
-    modal_open: Res<ModalDialogOpen>,
-    mut visible: ResMut<ConstellationVisible>,
-) {
-    // Skip when a modal dialog is open
-    if modal_open.0 {
-        return;
-    }
-
-    // Only in Conversation state and Normal mode
-    if *screen.get() != crate::ui::state::AppScreen::Conversation {
-        return;
-    }
-    if current_mode.0 != crate::cell::EditorMode::Normal {
-        return;
-    }
-
-    // Tab toggles constellation visibility
-    if keys.just_pressed(KeyCode::Tab) {
-        visible.0 = !visible.0;
-        info!("Constellation visible: {}", visible.0);
-    }
-}
-
-/// Handle gt/gT, Ctrl-^, Enter, f, m, hjkl for context navigation.
-///
-/// After updating constellation focus, emits `ContextSwitchRequested` to trigger
-/// the actual document swap in the cell system.
-fn handle_focus_navigation(
-    keys: Res<ButtonInput<KeyCode>>,
-    screen: Res<State<crate::ui::state::AppScreen>>,
-    current_mode: Res<crate::cell::CurrentMode>,
-    modal_open: Res<ModalDialogOpen>,
-    mut constellation: ResMut<Constellation>,
-    mut visible: ResMut<ConstellationVisible>,
-    mut camera: ResMut<ConstellationCamera>,
-    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    mut dialog_writer: MessageWriter<OpenContextDialog>,
-    mut model_writer: MessageWriter<model_picker::OpenModelPicker>,
-    doc_cache: Res<crate::cell::DocumentCache>,
-    mut pending_g: Local<bool>,
-) {
-    // Skip when a modal dialog is open
-    if modal_open.0 {
-        return;
-    }
-
-    // Only in Conversation state and Normal mode
-    if *screen.get() != crate::ui::state::AppScreen::Conversation {
-        return;
-    }
-    if current_mode.0 != crate::cell::EditorMode::Normal {
-        return;
-    }
-
-    // Ctrl-^ (Ctrl-6) for alternate
-    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-        if keys.just_pressed(KeyCode::Digit6) {
-            constellation.toggle_alternate();
-            if let Some(ref focus_id) = constellation.focus_id {
-                info!("Switched to alternate context: {}", focus_id);
-                switch_writer.write(crate::cell::ContextSwitchRequested {
-                    context_name: focus_id.clone(),
-                });
-            }
-            return;
-        }
-    }
-
-    // gt/gT navigation (g then t or T)
-    if keys.just_pressed(KeyCode::KeyG) {
-        *pending_g = true;
-        return;
-    }
-
-    if *pending_g {
-        if keys.just_pressed(KeyCode::KeyT) {
-            *pending_g = false;
-            let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-            if shift {
-                // gT = previous
-                if let Some(id) = constellation.prev_context_id().map(|s| s.to_string()) {
-                    constellation.focus(&id);
-                    info!("Focus: previous context {}", id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: id,
-                    });
-                }
-            } else {
-                // gt = next
-                if let Some(id) = constellation.next_context_id().map(|s| s.to_string()) {
-                    constellation.focus(&id);
-                    info!("Focus: next context {}", id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: id,
-                    });
-                }
-            }
-        } else if keys.any_just_pressed([
-            KeyCode::Escape,
-            KeyCode::KeyA,
-            KeyCode::KeyB,
-            KeyCode::KeyC,
-        ]) {
-            // Cancel g prefix on other keys
-            *pending_g = false;
-        }
-    }
-
-    // --- Constellation-visible-only keybindings ---
-    if visible.0 {
-        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-
-        // Enter on focused node: switch context and close constellation
-        if !*pending_g && keys.just_pressed(KeyCode::Enter) {
-            if let Some(ref focus_id) = constellation.focus_id {
-                info!("Enter on constellation node: switching to {}", focus_id);
-                switch_writer.write(crate::cell::ContextSwitchRequested {
-                    context_name: focus_id.clone(),
-                });
-                visible.0 = false;
-            }
-            return;
-        }
-
-        // hjkl spatial navigation (without Shift = navigate, with Shift = pan)
-        if !*pending_g {
-            let direction = if keys.just_pressed(KeyCode::KeyH) { Some(Vec2::new(-1.0, 0.0)) }
-                else if keys.just_pressed(KeyCode::KeyJ) { Some(Vec2::new(0.0, 1.0)) }
-                else if keys.just_pressed(KeyCode::KeyK) { Some(Vec2::new(0.0, -1.0)) }
-                else if keys.just_pressed(KeyCode::KeyL) { Some(Vec2::new(1.0, 0.0)) }
-                else { None };
-
-            if let Some(dir) = direction {
-                if shift {
-                    // Shift+hjkl = pan camera
-                    camera.target_offset += dir * 80.0;
-                } else {
-                    // hjkl = spatial navigation
-                    if let Some(target_id) = find_nearest_in_direction(&constellation, dir) {
-                        constellation.focus(&target_id);
-                        // Auto-center camera on focused node
-                        if let Some(node) = constellation.node_by_id(&target_id) {
-                            camera.target_offset = -node.position * camera.zoom;
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Zoom controls
-        if !*pending_g {
-            if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
-                camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
-                return;
-            }
-            if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
-                camera.target_zoom = (camera.target_zoom * 0.8).max(0.25);
-                return;
-            }
-            if keys.just_pressed(KeyCode::Digit0) {
-                camera.reset();
-                return;
-            }
-        }
-    }
-
-    // `f` key on focused constellation node = fork that context
-    if !*pending_g && keys.just_pressed(KeyCode::KeyF) {
-        if visible.0 {
-            if let Some(ref focus_id) = constellation.focus_id {
-                if let Some(doc_id) = doc_cache.document_id_for_context(focus_id) {
-                    info!("Fork requested for context '{}' (doc: {})", focus_id, doc_id);
-                    dialog_writer.write(OpenContextDialog(DialogMode::ForkContext {
-                        source_context: focus_id.clone(),
-                        source_document_id: doc_id.to_string(),
-                    }));
-                } else {
-                    warn!("Cannot fork '{}': not in document cache", focus_id);
-                }
-            }
-        }
-    }
-
-    // `m` key on focused constellation node = open model picker
-    if !*pending_g && keys.just_pressed(KeyCode::KeyM) {
-        if visible.0 {
-            if let Some(ref focus_id) = constellation.focus_id {
-                info!("Model picker requested for context '{}'", focus_id);
-                model_writer.write(model_picker::OpenModelPicker {
-                    context_name: focus_id.clone(),
-                });
-            }
-        }
-    }
-}
+// Input handling in input::systems (toggle_constellation + constellation_nav)
 
 /// Update node positions using radial tree layout.
 ///

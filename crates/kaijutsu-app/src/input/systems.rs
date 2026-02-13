@@ -1,7 +1,7 @@
 //! Input action handlers — systems that consume ActionFired messages.
 //!
-//! Phase 2: Focus management + simple consumers (debug, quit, screenshot).
-//! Phase 3+: Navigation, constellation, tiling, text input handlers migrate here.
+//! All domain input handlers live here. They read `ActionFired` or
+//! `TextInputReceived` messages instead of raw keyboard events.
 
 use bevy::prelude::*;
 
@@ -223,7 +223,7 @@ pub fn handle_toggle_constellation(
 }
 
 // ============================================================================
-// PHASE 3: NAVIGATION HANDLERS
+// BLOCK NAVIGATION
 // ============================================================================
 
 use crate::cell::{
@@ -354,7 +354,7 @@ fn scroll_to_block_visible(
 }
 
 // ============================================================================
-// PHASE 3: SCROLL HANDLERS
+// SCROLLING
 // ============================================================================
 
 /// Handle scroll actions (ScrollDelta, HalfPageUp/Down, ScrollToEnd/Top).
@@ -391,7 +391,7 @@ pub fn handle_scroll(
 }
 
 // ============================================================================
-// PHASE 3: EXPAND / COLLAPSE / VIEW POP
+// EXPAND / COLLAPSE / VIEW POP
 // ============================================================================
 
 /// Handle ExpandBlock action (f key on focused block → full-screen reader).
@@ -478,7 +478,7 @@ pub fn handle_view_pop(
 }
 
 // ============================================================================
-// PHASE 3: TILING HANDLERS
+// TILING PANE MANAGEMENT
 // ============================================================================
 
 use crate::ui::tiling::{FocusDirection, SplitDirection, TilingTree};
@@ -548,7 +548,7 @@ pub fn handle_tiling(
 }
 
 // ============================================================================
-// PHASE 3: CONSTELLATION HANDLERS
+// CONSTELLATION NAVIGATION
 // ============================================================================
 
 use crate::cell::{
@@ -660,7 +660,7 @@ pub fn handle_constellation_nav(
 }
 
 // ============================================================================
-// PHASE 4: TEXT INPUT HANDLERS
+// TEXT INPUT (COMPOSE + INLINE BLOCK EDITING)
 // ============================================================================
 
 /// Handle text input in Compose area.
@@ -775,21 +775,21 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::Backspace => {
-                if cursor.offset > 0 {
-                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                        let text = &block.content;
-                        let mut new_offset = cursor.offset.saturating_sub(1);
-                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                            new_offset -= 1;
-                        }
-                        let delete_len = cursor.offset - new_offset;
-                        if editor
-                            .doc
-                            .edit_text(&block_cell.block_id, new_offset, "", delete_len)
-                            .is_ok()
-                        {
-                            cursor.offset = new_offset;
-                        }
+                if cursor.offset > 0
+                    && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
+                {
+                    let text = &block.content;
+                    let mut new_offset = cursor.offset.saturating_sub(1);
+                    while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                        new_offset -= 1;
+                    }
+                    let delete_len = cursor.offset - new_offset;
+                    if editor
+                        .doc
+                        .edit_text(&block_cell.block_id, new_offset, "", delete_len)
+                        .is_ok()
+                    {
+                        cursor.offset = new_offset;
                     }
                 }
             }
@@ -809,15 +809,15 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::CursorLeft => {
-                if cursor.offset > 0 {
-                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                        let text = &block.content;
-                        let mut new_offset = cursor.offset - 1;
-                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                            new_offset -= 1;
-                        }
-                        cursor.offset = new_offset;
+                if cursor.offset > 0
+                    && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
+                {
+                    let text = &block.content;
+                    let mut new_offset = cursor.offset - 1;
+                    while new_offset > 0 && !text.is_char_boundary(new_offset) {
+                        new_offset -= 1;
                     }
+                    cursor.offset = new_offset;
                 }
             }
             Action::CursorRight => {

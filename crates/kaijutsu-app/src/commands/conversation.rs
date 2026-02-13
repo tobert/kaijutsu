@@ -7,18 +7,18 @@
 
 use bevy::prelude::*;
 
-use crate::cell::EditorMode;
+use crate::input::FocusArea;
 use crate::conversation::{ConversationRegistry, CurrentConversation};
 
 /// Handle conversation quick-switch shortcuts (Ctrl+1/2/3).
 pub fn handle_conversation_shortcuts(
     keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<crate::cell::CurrentMode>,
+    focus_area: Res<FocusArea>,
     mut registry: ResMut<ConversationRegistry>,
     mut current: ResMut<CurrentConversation>,
 ) {
-    // Only in Normal mode
-    if mode.0 != EditorMode::Normal {
+    // Only when navigating (not typing text)
+    if focus_area.is_text_input() {
         return;
     }
 

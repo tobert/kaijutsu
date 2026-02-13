@@ -12,7 +12,7 @@ use kaijutsu_crdt::BlockId;
 /// Domain systems check `FocusArea` to know whether they should act.
 ///
 /// BRP-queryable: `world_get_resources("kaijutsu_app::input::focus::FocusArea")`
-#[derive(Resource, Clone, PartialEq, Debug, Reflect)]
+#[derive(Resource, Clone, Default, PartialEq, Debug, Reflect)]
 #[reflect(Resource)]
 pub enum FocusArea {
     /// Compose text input area. Typing inserts text. Enter submits.
@@ -29,21 +29,14 @@ pub enum FocusArea {
     Constellation,
     /// Modal dialog. Captures all input. Enter confirms, Escape cancels.
     Dialog,
-    /// Dashboard screen. Enter selects.
+    /// Dashboard screen. Enter selects. Default focus on startup.
+    #[default]
     Dashboard,
 }
 
-impl Default for FocusArea {
-    fn default() -> Self {
-        // Start on Dashboard until a conversation is joined
-        FocusArea::Dashboard
-    }
-}
-
-// Phase 2+: these methods are consumed by domain systems migrating to FocusArea
-#[allow(dead_code)]
 impl FocusArea {
     /// Create an EditingBlock focus with a block ID.
+    #[allow(dead_code)] // Phase 6: used when inline block editing is wired up
     pub fn editing(block_id: BlockId) -> Self {
         FocusArea::EditingBlock {
             block_id: Some(block_id),
@@ -56,11 +49,13 @@ impl FocusArea {
     }
 
     /// Check if focus is on navigation (Conversation blocks).
+    #[allow(dead_code)] // Phase 6: useful for domain guards
     pub fn is_navigation(&self) -> bool {
         matches!(self, FocusArea::Conversation)
     }
 
     /// Get the block ID if editing a block.
+    #[allow(dead_code)] // Phase 6: used when inline block editing is wired up
     pub fn editing_block_id(&self) -> Option<&BlockId> {
         match self {
             FocusArea::EditingBlock { block_id } => block_id.as_ref(),

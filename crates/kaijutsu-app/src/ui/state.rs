@@ -213,17 +213,16 @@ impl Plugin for AppScreenPlugin {
 // Note: We set both Display and Visibility because glyphon text rendering
 // doesn't respect Display::None - it only respects Visibility::Hidden.
 
-/// Show the dashboard view when entering Dashboard state
+/// Show the dashboard view when entering Dashboard state.
+///
+/// Focus is automatically set to FocusArea::Dashboard by sync_focus_from_screen.
 fn show_dashboard(
     mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
-    mut mode: ResMut<crate::cell::CurrentMode>,
 ) {
     for (mut node, mut vis) in query.iter_mut() {
         node.display = Display::Flex;
         *vis = Visibility::Inherited;
     }
-    // Reset mode to Normal (Chat/Shell make no sense on Dashboard)
-    mode.0 = crate::cell::EditorMode::Normal;
 }
 
 /// Hide the dashboard view when leaving Dashboard state

@@ -9,10 +9,10 @@ use bevy::prelude::*;
 
 use super::tiling::PaneContent;
 use super::tiling_reconciler::WidgetPaneText;
-use crate::cell::{CurrentMode, EditorMode, InputKind, ContextSwitchRequested};
+use crate::cell::ContextSwitchRequested;
+use crate::input::FocusArea;
 use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
-use crate::ui::constellation::ConstellationVisible;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
@@ -30,22 +30,27 @@ pub struct ContextBadge {
 // WIDGET UPDATE SYSTEMS
 // ============================================================================
 
-/// Update mode widget text when CurrentMode changes.
+/// Update mode widget text when FocusArea changes.
+///
+/// Displays the current focus area name (COMPOSE, NAVIGATE, EDITING, etc.)
+/// with appropriate color from the theme.
 pub fn update_mode_widget(
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
 ) {
-    if !mode.is_changed() {
+    if !focus_area.is_changed() {
         return;
     }
 
-    let color = match mode.0 {
-        EditorMode::Normal => theme.mode_normal,
-        EditorMode::Input(InputKind::Chat) => theme.mode_chat,
-        EditorMode::Input(InputKind::Shell) => theme.mode_shell,
-        EditorMode::Visual => theme.mode_visual,
+    let color = match focus_area.as_ref() {
+        FocusArea::Compose => theme.mode_chat,
+        FocusArea::Conversation => theme.mode_normal,
+        FocusArea::EditingBlock { .. } => theme.mode_chat,
+        FocusArea::Constellation => theme.mode_visual,
+        FocusArea::Dialog => theme.mode_shell,
+        FocusArea::Dashboard => theme.mode_normal,
     };
 
     for (widget, children) in widget_panes.iter() {
@@ -54,7 +59,7 @@ pub fn update_mode_widget(
         }
         for child in children.iter() {
             if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = mode.0.name().to_string();
+                msdf_text.text = focus_area.name().to_string();
                 msdf_text.color = bevy_to_rgba8(color);
             }
         }
@@ -322,29 +327,25 @@ pub fn update_contexts_widget(
     }
 }
 
-/// Update hints widget to show context-sensitive key hints.
+/// Update hints widget to show context-sensitive key hints based on FocusArea.
 ///
-/// When constellation is visible, shows constellation navigation hints.
-/// Otherwise shows the default input hints.
+/// Hints change based on what has focus — compose, navigation, constellation, etc.
 pub fn update_hints_widget(
-    visible: Res<ConstellationVisible>,
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
 ) {
-    if !visible.is_changed() && !mode.is_changed() {
+    if !focus_area.is_changed() {
         return;
     }
 
-    let hints = if visible.0 {
-        "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: back │ +/-: zoom │ 0: reset"
-    } else {
-        match mode.0 {
-            EditorMode::Normal => "i: chat │ `: shell │ v: visual │ Tab: constellation │ j/k: navigate",
-            EditorMode::Input(InputKind::Chat) => "Enter: submit │ Shift+Enter: newline │ Esc: normal",
-            EditorMode::Input(InputKind::Shell) => "Enter: execute │ Esc: normal",
-            EditorMode::Visual => "Esc: normal",
-        }
+    let hints = match focus_area.as_ref() {
+        FocusArea::Compose => "Enter: submit │ Shift+Enter: newline │ Tab: navigate │ Esc: back │ :/`: shell prefix",
+        FocusArea::Conversation => "j/k: navigate │ Tab: compose │ f: expand │ i: compose │ `: constellation │ Alt+hjkl: pane",
+        FocusArea::EditingBlock { .. } => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
+        FocusArea::Constellation => "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: compose │ +/-: zoom │ 0: reset",
+        FocusArea::Dialog => "Enter: confirm │ Esc: cancel │ j/k: navigate",
+        FocusArea::Dashboard => "Enter: select │ j/k: navigate",
     };
 
     for (widget, children) in widget_panes.iter() {

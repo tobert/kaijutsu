@@ -25,8 +25,8 @@ mod systems;
 pub use components::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
     CellState, ComposeBlock, ContextSwitchRequested, ConversationContainer,
-    ConversationScrollState, CurrentMode, DocumentCache, EditingBlockCell, EditorMode,
-    FocusTarget, FocusedBlockCell, InputKind, MainCell, PromptSubmitted, ViewingConversation,
+    ConversationScrollState, DocumentCache, EditingBlockCell,
+    FocusTarget, FocusedBlockCell, MainCell, PromptSubmitted, ViewingConversation,
 };
 pub use plugin::CellPlugin;
 pub use systems::EditorEntities;

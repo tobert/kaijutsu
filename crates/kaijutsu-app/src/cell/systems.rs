@@ -1,15 +1,14 @@
 //! Cell systems for input handling and rendering.
 
-use bevy::input::keyboard::KeyboardInput;
-use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 use super::components::{
     BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
-    CellState, ComposeBlock, ConversationScrollState, CurrentMode, DriftKind, EditingBlockCell,
-    EditorMode, FocusTarget, InputKind, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
+    CellState, ComposeBlock, ConversationScrollState, DriftKind, EditingBlockCell,
+    FocusTarget, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
 };
+use crate::input::FocusArea;
 use crate::conversation::CurrentConversation;
 use crate::text::{
     bevy_to_cosmic_color, FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig,
@@ -17,7 +16,6 @@ use crate::text::{
 };
 use crate::text::markdown::{self, MarkdownColors};
 use crate::ui::format::format_for_display;
-use crate::ui::state::AppScreen;
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -85,141 +83,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
     }
 }
 
-/// Keys consumed by mode switching this frame (cleared each frame).
-#[derive(Resource, Default)]
-pub struct ConsumedModeKeys(pub std::collections::HashSet<KeyCode>);
-
-/// Clear consumed keys at the start of each frame.
-///
-/// This must run before any system that reads or writes to ConsumedModeKeys.
-pub fn clear_consumed_keys(mut consumed: ResMut<ConsumedModeKeys>) {
-    consumed.0.clear();
-}
-
-/// Handle vim-style mode switching with input presence transitions.
-///
-/// Key bindings:
-/// - `i` in Normal → Chat mode + Docked presence (expand from minimized)
-/// - `Space` in Normal → Chat mode + Overlay presence (summon floating)
-/// - `Backtick` in Normal → Shell mode + Docked presence
-/// - `Escape` in Insert → Normal mode + Minimized presence (collapse)
-/// - `:` in Normal → Command mode (no presence change)
-///
-/// Note: Chat/Shell modes only allowed in Conversation screen.
-/// Note: Keys already in ConsumedModeKeys are skipped (e.g., `i` consumed by block editing)
-pub fn handle_mode_switch(
-    mut key_events: MessageReader<KeyboardInput>,
-    mut mode: ResMut<CurrentMode>,
-    mut consumed: ResMut<ConsumedModeKeys>,
-    keys: Res<ButtonInput<KeyCode>>,
-    modal_open: Option<Res<crate::ui::constellation::ModalDialogOpen>>,
-    compose_blocks: Query<&ComposeBlock>,
-    screen: Res<State<AppScreen>>,
-) {
-    // Note: consumed.0.clear() happens in clear_consumed_keys system
-    // which runs at the start of each frame, before block editing and mode switching
-
-    // Skip when a modal dialog is open to prevent mode changes during dialog input
-    if modal_open.is_some_and(|m| m.0) {
-        for _ in key_events.read() {} // Consume events
-        return;
-    }
-
-    // Mode switching works globally - no focus required.
-    // Focus determines which cell receives text input, not mode switching.
-    // This allows Space to summon the input from anywhere in the conversation.
-
-    // Skip mode switching when a tiling modifier is held (Alt/Super).
-    // These are tiling WM keybinds, not mode triggers.
-    let tiling_mod_held = keys.pressed(KeyCode::AltLeft)
-        || keys.pressed(KeyCode::AltRight)
-        || keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight);
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Skip keys already consumed by earlier systems (e.g., block editing)
-        if consumed.0.contains(&event.key_code) {
-            continue;
-        }
-
-        // Skip when tiling modifier is held (Alt/Super+key → tiling WM)
-        if tiling_mod_held {
-            continue;
-        }
-
-        match mode.0 {
-            EditorMode::Normal => {
-                // Input modes only make sense in Conversation screen
-                // (Dashboard has no input field to route to)
-                if *screen.get() != AppScreen::Conversation {
-                    continue;
-                }
-
-                // In normal mode:
-                // - i enters Chat (docked) - unless consumed by block editing
-                // - Space enters Chat (overlay)
-                // - ` (backtick) enters Shell
-                // - : also enters Shell (kaish handles commands natively)
-                // - v enters Visual
-                match event.key_code {
-                    KeyCode::KeyI => {
-                        mode.0 = EditorMode::Input(InputKind::Chat);
-                        // InputPresence no longer used with ComposeBlock
-                        info!("Mode: CHAT");
-                    }
-                    KeyCode::Space => {
-                        // Space enters chat mode
-                        mode.0 = EditorMode::Input(InputKind::Chat);
-                        consumed.0.insert(KeyCode::Space);
-                        info!("Mode: CHAT (via Space)");
-                    }
-                    KeyCode::Backquote => {
-                        // Backtick enters shell mode (kaish REPL)
-                        mode.0 = EditorMode::Input(InputKind::Shell);
-                        consumed.0.insert(KeyCode::Backquote);
-                        info!("Mode: SHELL");
-                    }
-                    KeyCode::Semicolon if event.text.as_deref() == Some(":") => {
-                        // Colon also enters Shell - kaish handles : commands natively
-                        mode.0 = EditorMode::Input(InputKind::Shell);
-                        consumed.0.insert(KeyCode::Semicolon);
-                        info!("Mode: SHELL (command)");
-                    }
-                    KeyCode::KeyV => {
-                        mode.0 = EditorMode::Visual;
-                        consumed.0.insert(KeyCode::KeyV);
-                        info!("Mode: VISUAL");
-                    }
-                    _ => {}
-                }
-            }
-            EditorMode::Input(_) | EditorMode::Visual => {
-                // Escape returns to normal mode
-                if event.key_code == KeyCode::Escape {
-                    mode.0 = EditorMode::Normal;
-                    consumed.0.insert(KeyCode::Escape);
-
-                    // Check if ComposeBlock has draft content
-                    let compose_empty = compose_blocks
-                        .iter()
-                        .next()
-                        .map(|compose| compose.is_empty())
-                        .unwrap_or(true);
-
-                    if compose_empty {
-                        info!("Mode: NORMAL");
-                    } else {
-                        info!("Mode: NORMAL (draft preserved in ComposeBlock)");
-                    }
-                }
-            }
-        }
-    }
-}
+// Input handling moved to input/ module (focus-based dispatch).
 
 /// Initialize MsdfTextBuffer for cells that don't have one yet.
 pub fn init_cell_buffers(
@@ -566,71 +430,8 @@ pub fn click_to_focus(
 /// Behavior:
 /// - If the cell has thinking blocks, Tab toggles the first thinking block's collapse state
 /// - Otherwise, Tab toggles the whole cell's collapse state
-pub fn handle_collapse_toggle(
-    mut key_events: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
-    focus: Res<FocusTarget>,
-    mut cells: Query<(&mut CellEditor, &mut CellState)>,
-) {
-    // Only in Normal mode
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    let Some(focused_entity) = focus.entity else {
-        return;
-    };
-
-    let Ok((mut editor, mut cell_state)) = cells.get_mut(focused_entity) else {
-        return;
-    };
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Tab toggles collapse
-        if event.key_code == KeyCode::Tab {
-            // Find thinking blocks to toggle
-            let thinking_blocks: Vec<_> = editor
-                .blocks()
-                .iter()
-                .filter(|b| matches!(b.kind, BlockKind::Thinking))
-                .map(|b| b.id.clone())
-                .collect();
-
-            if !thinking_blocks.is_empty() {
-                // Toggle all thinking blocks via the editor
-                for block_id in &thinking_blocks {
-                    editor.toggle_block_collapse(block_id);
-                }
-                // Get the current collapsed state for logging
-                let collapsed = editor
-                    .blocks()
-                    .iter()
-                    .find(|b| matches!(b.kind, BlockKind::Thinking))
-                    .map(|b| b.collapsed)
-                    .unwrap_or(false);
-                info!(
-                    "Thinking blocks: {}",
-                    if collapsed { "collapsed" } else { "expanded" }
-                );
-            } else {
-                // Toggle whole cell collapse
-                cell_state.collapsed = !cell_state.collapsed;
-                info!(
-                    "Cell collapse: {}",
-                    if cell_state.collapsed {
-                        "collapsed"
-                    } else {
-                        "expanded"
-                    }
-                );
-            }
-        }
-    }
-}
+// handle_collapse_toggle — DELETED (Phase 5)
+// Migrated to input::systems::handle_collapse_toggle
 
 use bevy::math::Vec4;
 
@@ -711,10 +512,10 @@ pub fn spawn_cursor(
     info!("Spawned cursor entity");
 }
 
-/// Update cursor position and visibility based on focused cell and mode.
+/// Update cursor position and visibility based on focused cell and focus area.
 pub fn update_cursor(
     focus: Res<FocusTarget>,
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
     mut cells: Query<(&mut CellEditor, &MsdfTextAreaConfig)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
@@ -756,29 +557,18 @@ pub fn update_cursor(
     node.left = Val::Px(x - 2.0); // Slight offset for beam alignment
     node.top = Val::Px(y);
 
-    // Update cursor mode and wandering orb params
+    // Update cursor mode and wandering orb params based on focus area
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {
-        let cursor_mode = match mode.0 {
-            EditorMode::Input(_) => CursorMode::Beam,
-            EditorMode::Normal => CursorMode::Block,
-            EditorMode::Visual => CursorMode::Block,
+        let (cursor_mode, color, params) = if focus_area.is_text_input() {
+            // Text input (compose or block editing): beam cursor
+            (CursorMode::Beam, theme.cursor_insert, Vec4::new(0.25, 1.2, 2.0, 0.0))
+        } else {
+            // Navigation: block cursor
+            (CursorMode::Block, theme.cursor_normal, Vec4::new(0.2, 1.0, 1.5, 0.6))
         };
         material.time.y = cursor_mode as u8 as f32;
-
-        // Cursor colors from theme
-        let color = match mode.0 {
-            EditorMode::Normal => theme.cursor_normal,
-            EditorMode::Input(_) => theme.cursor_insert,
-            EditorMode::Visual => theme.cursor_visual,
-        };
         material.color = color;
-
-        // params: x=orb_size, y=intensity, z=wander_speed, w=blink_rate
-        material.params = match mode.0 {
-            EditorMode::Input(_) => Vec4::new(0.25, 1.2, 2.0, 0.0),  // Larger orb, faster wander, no blink
-            EditorMode::Normal => Vec4::new(0.2, 1.0, 1.5, 0.6),    // Medium orb, gentle blink
-            EditorMode::Visual => Vec4::new(0.22, 1.1, 1.8, 0.0),   // Slightly larger, no blink
-        };
+        material.params = params;
     }
 }
 
@@ -857,9 +647,25 @@ fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
 ///
 /// Note: We don't add messages locally - the server adds them and broadcasts
 /// back to us. This avoids duplicate messages.
+/// Detect whether submitted text is a shell command based on prefix.
+///
+/// Text starting with `:` or `` ` `` is routed to kaish (shell execution).
+/// Everything else is routed to the LLM (chat prompt).
+fn is_shell_command(text: &str) -> bool {
+    text.starts_with(':') || text.starts_with('`')
+}
+
+/// Strip the shell prefix from a command before execution.
+fn strip_shell_prefix(text: &str) -> &str {
+    if text.starts_with(':') || text.starts_with('`') {
+        &text[1..]
+    } else {
+        text
+    }
+}
+
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
-    mode: Res<CurrentMode>,
     current_conv: Res<CurrentConversation>,
     sync_state: Res<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -888,45 +694,41 @@ pub fn handle_prompt_submitted(
     for event in submit_events.read() {
         if let Some(ref actor) = actor {
             let handle = actor.handle.clone();
-            let text = event.text.clone();
             let cell_id = doc_cell_id.clone();
             let conv = conv_id.to_string();
-
             let tx = channel.sender();
-            match mode.0 {
-                EditorMode::Input(InputKind::Shell) => {
-                    // Shell mode: fire-and-forget, results via ServerEvent broadcast
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.shell_execute(&text, &cell_id).await {
-                                log::error!("shell_execute failed: {e}");
-                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
-                                    operation: "shell_execute".into(),
-                                    error: e.to_string(),
-                                });
-                            }
-                        })
-                        .detach();
-                    info!("Sent shell command to server (conv={}, cell_id={})", conv, doc_cell_id);
-                }
-                EditorMode::Input(InputKind::Chat) => {
-                    // Chat mode: fire-and-forget, results via ServerEvent broadcast
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.prompt(&text, None, &cell_id).await {
-                                log::error!("prompt failed: {e}");
-                                let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
-                                    operation: "prompt".into(),
-                                    error: e.to_string(),
-                                });
-                            }
-                        })
-                        .detach();
-                    info!("Sent prompt to server (conv={}, cell_id={})", conv, doc_cell_id);
-                }
-                _ => {
-                    warn!("Unexpected prompt submission in {:?} mode", mode.0);
-                }
+
+            // Auto-detect shell vs chat from text prefix
+            if is_shell_command(&event.text) {
+                let text = strip_shell_prefix(&event.text).to_string();
+                // Shell: fire-and-forget, results via ServerEvent broadcast
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        if let Err(e) = handle.shell_execute(&text, &cell_id).await {
+                            log::error!("shell_execute failed: {e}");
+                            let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                operation: "shell_execute".into(),
+                                error: e.to_string(),
+                            });
+                        }
+                    })
+                    .detach();
+                info!("Sent shell command to server (conv={}, cell_id={})", conv, doc_cell_id);
+            } else {
+                let text = event.text.clone();
+                // Chat: fire-and-forget, results via ServerEvent broadcast
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        if let Err(e) = handle.prompt(&text, None, &cell_id).await {
+                            log::error!("prompt failed: {e}");
+                            let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
+                                operation: "prompt".into(),
+                                error: e.to_string(),
+                            });
+                        }
+                    })
+                    .detach();
+                info!("Sent prompt to server (conv={}, cell_id={})", conv, doc_cell_id);
             }
             // Enable follow mode to smoothly track streaming response
             scroll_state.start_following();
@@ -982,214 +784,13 @@ pub fn smooth_scroll(
     };
 }
 
-/// Handle mouse wheel scrolling for the conversation area.
-pub fn handle_scroll_input(
-    mut scroll_state: ResMut<ConversationScrollState>,
-    mut mouse_wheel: MessageReader<MouseWheel>,
-    mode: Res<CurrentMode>,
-    keys: Res<ButtonInput<KeyCode>>,
-) {
-    // Scroll speed multipliers - tuned for responsive feel
-    // Line units (discrete mouse wheel clicks): ~3 lines per click
-    const LINE_SCROLL_SPEED: f32 = 60.0;
-    // Pixel units (touchpad, smooth scroll): direct 1:1 feels natural
-    const PIXEL_SCROLL_SPEED: f32 = 1.5;
+// handle_scroll_input — DELETED (Phase 5)
+// Mouse wheel handled by input::dispatch, Ctrl+D/U by input::systems::handle_scroll
 
-    // Handle mouse wheel - accumulate all events this frame
-    for event in mouse_wheel.read() {
-        // Scroll up = negative delta = decrease offset (show earlier content)
-        // Scroll down = positive delta = increase offset (show later content)
-        let multiplier = match event.unit {
-            bevy::input::mouse::MouseScrollUnit::Line => LINE_SCROLL_SPEED,
-            bevy::input::mouse::MouseScrollUnit::Pixel => PIXEL_SCROLL_SPEED,
-        };
-        let delta = -event.y * multiplier;
-        scroll_state.scroll_by(delta);
-    }
-
-    // Note: j/k now handled by navigate_blocks for block-level navigation
-    // This system keeps page navigation and Shift+G
-
-    // Page down/up with Ctrl+d/u in Normal mode
-    if mode.0 == EditorMode::Normal {
-        // Page down/up with Ctrl+d/u
-        if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-            let half_page = scroll_state.visible_height * 0.5;
-            if keys.just_pressed(KeyCode::KeyD) {
-                scroll_state.scroll_by(half_page);
-            }
-            if keys.just_pressed(KeyCode::KeyU) {
-                scroll_state.scroll_by(-half_page);
-            }
-        }
-        // G to go to bottom, gg to go to top
-        if keys.just_pressed(KeyCode::KeyG)
-            && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)) {
-                // Shift+G = go to bottom
-                scroll_state.scroll_to_end();
-            }
-            // Note: gg (double tap) would need state tracking, skip for now
-    }
-}
-
-// ============================================================================
-// BLOCK FOCUS NAVIGATION (Phase 2)
-// ============================================================================
+// navigate_blocks + NavigationDirection + scroll_to_block_visible — DELETED (Phase 5)
+// Migrated to input::systems::handle_navigate_blocks
 
 use super::components::FocusedBlockCell;
-
-/// Navigate between blocks with j/k in Normal mode.
-///
-/// This is the core Phase 2 feature: j/k moves focus between blocks rather
-/// than just scrolling. The focused block gets visual highlighting and
-/// scroll-to-view behavior.
-///
-/// Key bindings (Normal mode only):
-/// - `j` → Focus next block
-/// - `k` → Focus previous block
-/// - `G` (Shift+G) → Focus last block
-/// - `g` then `g` → Focus first block (TODO: needs double-tap state)
-/// - `Home` → Focus first block
-/// - `End` → Focus last block
-pub fn navigate_blocks(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<CurrentMode>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
-    block_cells: Query<(Entity, &BlockCell, &BlockCellLayout)>,
-    mut focus: ResMut<FocusTarget>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-    focused_markers: Query<Entity, With<FocusedBlockCell>>,
-) {
-    // Only in Normal mode
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-
-    let Ok(editor) = main_cells.get(main_ent) else {
-        return;
-    };
-
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
-
-    // Get ordered block IDs from the document
-    let blocks = editor.blocks();
-    if blocks.is_empty() {
-        return;
-    }
-
-    // Determine navigation direction
-    let nav = if keys.just_pressed(KeyCode::KeyJ) {
-        Some(NavigationDirection::Next)
-    } else if keys.just_pressed(KeyCode::KeyK) {
-        Some(NavigationDirection::Previous)
-    } else if keys.just_pressed(KeyCode::Home) {
-        Some(NavigationDirection::First)
-    } else if keys.just_pressed(KeyCode::End)
-        || (keys.just_pressed(KeyCode::KeyG)
-            && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)))
-    {
-        Some(NavigationDirection::Last)
-    } else {
-        None
-    };
-
-    let Some(direction) = nav else {
-        return;
-    };
-
-    // Find current focus index
-    let current_idx = focus
-        .block_id
-        .as_ref()
-        .and_then(|id| blocks.iter().position(|b| &b.id == id));
-
-    // Calculate new index based on direction
-    let new_idx = match direction {
-        NavigationDirection::Next => match current_idx {
-            Some(i) if i + 1 < blocks.len() => i + 1,
-            Some(i) => i, // Stay at end
-            None => 0,    // Start at first
-        },
-        NavigationDirection::Previous => match current_idx {
-            Some(i) if i > 0 => i - 1,
-            Some(i) => i,                // Stay at start
-            None => blocks.len() - 1,    // Start at last
-        },
-        NavigationDirection::First => 0,
-        NavigationDirection::Last => blocks.len() - 1,
-    };
-
-    let new_block = &blocks[new_idx];
-
-    // Update focus resource
-    focus.focus_block(new_block.id.clone());
-
-    // Remove old FocusedBlockCell markers
-    for entity in focused_markers.iter() {
-        commands.entity(entity).remove::<FocusedBlockCell>();
-    }
-
-    // Add FocusedBlockCell marker to the new focused entity
-    if let Some(entity) = container.get_entity(&new_block.id) {
-        commands.entity(entity).insert(FocusedBlockCell);
-
-        // Scroll to keep focused block visible
-        if let Ok((_, _, layout)) = block_cells.get(entity) {
-            scroll_to_block_visible(&mut scroll_state, layout);
-        }
-    }
-
-    debug!("Block focus: {:?} (index {})", new_block.id, new_idx);
-}
-
-/// Navigation direction for block focus.
-#[derive(Debug, Clone, Copy)]
-enum NavigationDirection {
-    Next,
-    Previous,
-    First,
-    Last,
-}
-
-/// Scroll to keep a block visible in the viewport.
-///
-/// If the block is above the viewport, scroll up to show its top.
-/// If below, scroll down to show its bottom.
-fn scroll_to_block_visible(
-    scroll_state: &mut ConversationScrollState,
-    layout: &BlockCellLayout,
-) {
-    let block_top = layout.y_offset;
-    let block_bottom = layout.y_offset + layout.height;
-    let view_top = scroll_state.offset;
-    let view_bottom = scroll_state.offset + scroll_state.visible_height;
-
-    // Margin to keep around the block (so it's not right at the edge)
-    const MARGIN: f32 = 20.0;
-
-    if block_top < view_top + MARGIN {
-        // Block is above viewport - scroll up
-        scroll_state.target_offset = (block_top - MARGIN).max(0.0);
-        scroll_state.offset = scroll_state.target_offset;
-        scroll_state.following = false; // User navigated, disable auto-follow
-    } else if block_bottom > view_bottom - MARGIN {
-        // Block is below viewport - scroll down
-        let target = block_bottom - scroll_state.visible_height + MARGIN;
-        scroll_state.target_offset = target.min(scroll_state.max_offset());
-        scroll_state.offset = scroll_state.target_offset;
-        // If we scrolled to the very bottom, enable following
-        scroll_state.following = scroll_state.is_at_bottom();
-    }
-}
 
 /// Highlight the focused block cell with a visual indicator.
 ///
@@ -1245,55 +846,8 @@ pub fn highlight_focused_block(
     // override takes precedence.
 }
 
-/// Handle `f` keybinding to expand the focused block to full screen.
-///
-/// In Normal mode with a focused block:
-/// - `f` pushes ExpandedBlock view onto ViewStack
-/// - The block content is shown full-screen for easier reading/editing
-pub fn handle_expand_block(
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<CurrentMode>,
-    focus: Res<FocusTarget>,
-    mut view_stack: ResMut<crate::ui::state::ViewStack>,
-) {
-    // Only in Normal mode with a focused block
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    let Some(ref block_id) = focus.block_id else {
-        return;
-    };
-
-    // `f` expands the focused block
-    if keys.just_pressed(KeyCode::KeyF) {
-        view_stack.push(crate::ui::state::View::ExpandedBlock {
-            block_id: block_id.clone(),
-        });
-        info!("Expanded block: {:?}", block_id);
-    }
-}
-
-/// Handle Esc to pop ViewStack when in an overlay view.
-///
-/// In Normal mode with an overlay view (like ExpandedBlock):
-/// - Esc pops the view stack, returning to the previous view
-/// - At root view, Esc is handled by mode switching instead
-pub fn handle_view_pop(
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<CurrentMode>,
-    mut view_stack: ResMut<crate::ui::state::ViewStack>,
-) {
-    // Only in Normal mode
-    if mode.0 != EditorMode::Normal {
-        return;
-    }
-
-    // Only when Esc is pressed and we're not at root
-    if keys.just_pressed(KeyCode::Escape) && !view_stack.is_at_root() {
-        view_stack.pop();
-    }
-}
+// handle_expand_block + handle_view_pop — DELETED (Phase 5)
+// Migrated to input::systems::handle_expand_block + handle_view_pop
 
 // ============================================================================
 // EXPANDED BLOCK VIEW (Phase 4)
@@ -2783,254 +2337,9 @@ pub fn apply_block_cell_positions(
 // 3. Keyboard input goes to that block via CRDT operations
 // 4. User presses Escape to exit edit mode
 
-/// Handle entering/exiting edit mode on a focused BlockCell.
-///
-/// Key bindings:
-/// - `i` in Normal mode with FocusedBlockCell → Enter edit mode on that block
-/// - `Escape` in edit mode → Exit edit mode, return to Normal
-///
-/// This system modifies mode_switch behavior:
-/// - When a BlockCell is focused, `i` edits that block instead of ComposeBlock
-/// - When no BlockCell is focused, `i` still routes to ComposeBlock for new input
-pub fn handle_block_edit_mode(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut mode: ResMut<CurrentMode>,
-    mut consumed: ResMut<ConsumedModeKeys>,
-    screen: Res<State<AppScreen>>,
-    focus: Res<FocusTarget>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    _containers: Query<&BlockCellContainer>,
-    focused_block_cells: Query<Entity, With<FocusedBlockCell>>,
-    editing_block_cells: Query<Entity, With<EditingBlockCell>>,
-) {
-    // Only in Conversation screen
-    if *screen.get() != AppScreen::Conversation {
-        return;
-    }
-
-    // Handle `i` to enter edit mode on focused BlockCell
-    if mode.0 == EditorMode::Normal && keys.just_pressed(KeyCode::KeyI) {
-        // Check if there's a focused BlockCell to edit
-        if let Ok(focused_entity) = focused_block_cells.single() {
-            // Get the block info to validate it's editable
-            if let Some(ref block_id) = focus.block_id {
-                // Check if this block exists and is editable
-                // For now, only User and Text blocks are editable
-                if let Some(main_ent) = entities.main_cell {
-                    if let Ok(editor) = main_cells.get(main_ent) {
-                        let blocks = editor.blocks();
-                        if let Some(block) = blocks.iter().find(|b| &b.id == block_id) {
-                            // Only allow editing User role Text blocks for now
-                            // (extending to other types is future work)
-                            if block.role == kaijutsu_crdt::Role::User
-                                && block.kind == BlockKind::Text
-                            {
-                                // Enter edit mode on this block
-                                let content_len = block.content.len();
-                                commands.entity(focused_entity).insert((
-                                    EditingBlockCell,
-                                    BlockEditCursor { offset: content_len },
-                                ));
-
-                                // Set mode to Input (Chat) - this enables cursor rendering
-                                mode.0 = EditorMode::Input(InputKind::Chat);
-                                consumed.0.insert(KeyCode::KeyI);
-                                info!(
-                                    "Entered edit mode on block {:?} (User Text, {} chars)",
-                                    block_id, content_len
-                                );
-                                return;
-                            } else {
-                                info!(
-                                    "Block {:?} is {:?}/{:?} - not editable (only User Text)",
-                                    block_id, block.role, block.kind
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // No focused block or not editable - fall through to default `i` behavior
-        // (which is handled by handle_mode_switch)
-    }
-
-    // Handle Escape to exit edit mode
-    if mode.0.accepts_input() && keys.just_pressed(KeyCode::Escape) {
-        // Check if we're editing a BlockCell
-        for entity in editing_block_cells.iter() {
-            // Remove edit markers
-            commands
-                .entity(entity)
-                .remove::<EditingBlockCell>()
-                .remove::<BlockEditCursor>();
-            info!("Exited edit mode on block cell {:?}", entity);
-        }
-        // Note: mode.0 will be set to Normal by handle_mode_switch
-    }
-}
-
-/// Handle keyboard input for editing BlockCells.
-///
-/// Routes text input to the editing block via CRDT operations on the MainCell's
-/// BlockDocument. This ensures all edits are properly tracked and synced.
-pub fn handle_block_cell_input(
-    mut key_events: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
-    consumed: Res<ConsumedModeKeys>,
-    entities: Res<EditorEntities>,
-    mut main_cells: Query<&mut CellEditor, With<MainCell>>,
-    mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
-) {
-    // Only process input in Input modes
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    // Get the editing block cell (if any)
-    let Ok((block_cell, mut cursor)) = editing_cells.single_mut() else {
-        return; // No block being edited
-    };
-
-    // Get the main cell editor for CRDT operations
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-    let Ok(mut editor) = main_cells.get_mut(main_ent) else {
-        return;
-    };
-
-    // Skip on frame when mode changes
-    if mode.is_changed() {
-        for _ in key_events.read() {} // Consume events
-        return;
-    }
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Skip keys consumed by mode switching
-        if consumed.0.contains(&event.key_code) {
-            continue;
-        }
-
-        // Handle special keys
-        match event.key_code {
-            KeyCode::Backspace => {
-                if cursor.offset > 0 {
-                    // Find previous character boundary
-                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                        let text = &block.content;
-                        let mut new_offset = cursor.offset.saturating_sub(1);
-                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                            new_offset -= 1;
-                        }
-                        let delete_len = cursor.offset - new_offset;
-                        if editor
-                            .doc
-                            .edit_text(&block_cell.block_id, new_offset, "", delete_len)
-                            .is_ok()
-                        {
-                            cursor.offset = new_offset;
-                        }
-                    }
-                }
-                continue;
-            }
-            KeyCode::Delete => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    if cursor.offset < text.len() {
-                        let mut end = cursor.offset + 1;
-                        while end < text.len() && !text.is_char_boundary(end) {
-                            end += 1;
-                        }
-                        let delete_len = end - cursor.offset;
-                        let _ = editor
-                            .doc
-                            .edit_text(&block_cell.block_id, cursor.offset, "", delete_len);
-                    }
-                }
-                continue;
-            }
-            KeyCode::Enter => {
-                // Insert newline in block content
-                if editor
-                    .doc
-                    .edit_text(&block_cell.block_id, cursor.offset, "\n", 0)
-                    .is_ok()
-                {
-                    cursor.offset += 1;
-                }
-                continue;
-            }
-            KeyCode::ArrowLeft => {
-                if cursor.offset > 0 {
-                    if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                        let text = &block.content;
-                        let mut new_offset = cursor.offset - 1;
-                        while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                            new_offset -= 1;
-                        }
-                        cursor.offset = new_offset;
-                    }
-                }
-                continue;
-            }
-            KeyCode::ArrowRight => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    if cursor.offset < text.len() {
-                        let mut new_offset = cursor.offset + 1;
-                        while new_offset < text.len() && !text.is_char_boundary(new_offset) {
-                            new_offset += 1;
-                        }
-                        cursor.offset = new_offset;
-                    }
-                }
-                continue;
-            }
-            KeyCode::Home => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    let before_cursor = &text[..cursor.offset];
-                    cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                }
-                continue;
-            }
-            KeyCode::End => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    let after_cursor = &text[cursor.offset..];
-                    cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // Handle text input
-        if let Some(ref text) = event.text {
-            for c in text.chars() {
-                if c.is_control() {
-                    continue;
-                }
-                let s = c.to_string();
-                if editor
-                    .doc
-                    .edit_text(&block_cell.block_id, cursor.offset, &s, 0)
-                    .is_ok()
-                {
-                    cursor.offset += s.len();
-                }
-            }
-        }
-    }
-}
+// handle_block_edit_mode + handle_block_cell_input — DELETED (Phase 5)
+// Block editing enter/exit now handled by input::systems::handle_unfocus + Activate action
+// Block cell text input migrated to input::systems::handle_block_edit_input
 
 /// Update cursor rendering to show cursor in editing BlockCell.
 ///
@@ -3039,7 +2348,7 @@ pub fn handle_block_cell_input(
 pub fn update_block_edit_cursor(
     editing_cells: Query<(&BlockCell, &BlockEditCursor, &BlockCellLayout, &MsdfTextAreaConfig), With<EditingBlockCell>>,
     entities: Res<EditorEntities>,
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     text_metrics: Res<TextMetrics>,
@@ -3079,8 +2388,8 @@ pub fn update_block_edit_cursor(
         .map(|pos| offset - pos - 1)
         .unwrap_or(offset);
 
-    // Show cursor in edit mode
-    *visibility = if mode.0.accepts_input() {
+    // Show cursor when editing a block
+    *visibility = if focus_area.is_text_input() {
         Visibility::Inherited
     } else {
         Visibility::Hidden
@@ -3127,75 +2436,8 @@ pub fn init_compose_block_buffer(
     }
 }
 
-/// Handle keyboard input for ComposeBlock.
-///
-/// When in INSERT mode with ComposeBlock focused, process text input,
-/// cursor movement, and submit on Enter.
-pub fn handle_compose_block_input(
-    mut keyboard: MessageReader<KeyboardInput>,
-    mode: Res<CurrentMode>,
-    screen: Res<State<AppScreen>>,
-    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
-    mut submit_writer: MessageWriter<PromptSubmitted>,
-) {
-    // Only handle in Conversation screen
-    if *screen.get() != AppScreen::Conversation {
-        return;
-    }
-
-    // Only handle in INSERT mode (Chat or Shell)
-    if !mode.0.accepts_input() {
-        return;
-    }
-
-    // Skip text input on the frame when mode changes (e.g., 'i' to enter insert)
-    // This prevents the mode-switch key from being inserted as text
-    if mode.is_changed() {
-        return;
-    }
-
-    let Ok(mut compose) = compose_blocks.single_mut() else {
-        return;
-    };
-
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        use bevy::input::keyboard::Key;
-        match (&event.logical_key, &event.text) {
-            // Enter submits (without Shift)
-            (Key::Enter, _) => {
-                if !compose.is_empty() {
-                    let text = compose.take();
-                    info!("ComposeBlock submitted: {} chars", text.len());
-                    submit_writer.write(PromptSubmitted { text });
-                }
-            }
-            // Backspace
-            (Key::Backspace, _) => {
-                compose.backspace();
-            }
-            // Delete
-            (Key::Delete, _) => {
-                compose.delete();
-            }
-            // Arrow keys
-            (Key::ArrowLeft, _) => {
-                compose.move_left();
-            }
-            (Key::ArrowRight, _) => {
-                compose.move_right();
-            }
-            // Text input
-            (_, Some(text)) => {
-                compose.insert(text);
-            }
-            _ => {}
-        }
-    }
-}
+// handle_compose_block_input — DELETED (Phase 5)
+// Migrated to input::systems::handle_compose_input
 
 /// Sync ComposeBlock text to its MsdfTextBuffer.
 ///
@@ -3204,7 +2446,6 @@ pub fn handle_compose_block_input(
 pub fn sync_compose_block_buffer(
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
-    mode: Res<CurrentMode>,
     mut compose_blocks: Query<(&ComposeBlock, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), Changed<ComposeBlock>>,
 ) {
     let Ok(mut font_system) = font_system.0.lock() else {
@@ -3222,10 +2463,11 @@ pub fn sync_compose_block_buffer(
         };
 
         // Set glyph color from theme before shaping (color bakes into glyphs)
+        // Auto-detect shell mode from text prefix (: or `)
         let color = if compose.is_empty() {
             theme.fg_dim // Placeholder is dimmed
-        } else if matches!(mode.0, EditorMode::Input(InputKind::Shell)) {
-            let validation = crate::kaish::validate(&compose.text);
+        } else if is_shell_command(&compose.text) {
+            let validation = crate::kaish::validate(strip_shell_prefix(&compose.text));
             if !validation.valid && !validation.incomplete {
                 theme.block_tool_error // Red tint for syntax errors
             } else {
@@ -3287,7 +2529,7 @@ pub fn position_compose_block(
 /// should appear at the ComposeBlock's cursor offset. This replaces the
 /// old bubble cursor system.
 pub fn update_compose_cursor(
-    mode: Res<CurrentMode>,
+    focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
     compose_blocks: Query<(&ComposeBlock, &MsdfTextAreaConfig), With<crate::ui::tiling::PaneFocus>>,
     editing_blocks: Query<Entity, With<EditingBlockCell>>,
@@ -3296,7 +2538,8 @@ pub fn update_compose_cursor(
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
 ) {
-    if !mode.0.accepts_input() {
+    // Only show compose cursor when compose area is focused
+    if !matches!(*focus_area, FocusArea::Compose) {
         return;
     }
     // Don't override if editing a block cell inline

@@ -77,7 +77,7 @@ pub fn dispatch_input(
         }
 
         // 2. Check if this key starts a sequence
-        if is_sequence_prefix(key, &input_map, &active_contexts) && Modifiers_none(&keys) {
+        if is_sequence_prefix(key, &input_map, &active_contexts) && no_modifiers_held(&keys) {
             sequence.start(InputSource::Key(key));
             continue;
         }
@@ -89,21 +89,19 @@ pub fn dispatch_input(
         }
 
         // 4. No match in TextInput context → emit text
-        if active_contexts.contains(InputContext::TextInput) {
-            if let Some(ref text) = event.text {
-                let s = text.as_str();
-                // Don't emit text for control characters (except what we handle above)
-                if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                    text_writer.write(TextInputReceived(s.to_string()));
-                }
+        if active_contexts.contains(InputContext::TextInput)
+            && let Some(ref text) = event.text
+        {
+            let s = text.as_str();
+            if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
+                text_writer.write(TextInputReceived(s.to_string()));
             }
         }
     }
 }
 
 /// Check if no modifiers are held (for sequence prefix detection).
-#[allow(non_snake_case)]
-fn Modifiers_none(keys: &ButtonInput<KeyCode>) -> bool {
+fn no_modifiers_held(keys: &ButtonInput<KeyCode>) -> bool {
     !(keys.pressed(KeyCode::ControlLeft)
         || keys.pressed(KeyCode::ControlRight)
         || keys.pressed(KeyCode::ShiftLeft)
@@ -147,13 +145,12 @@ fn find_sequence_match(
         }
 
         // Second key + modifiers must match
-        if let InputSource::Key(bind_key) = &binding.source {
-            if *bind_key == key
-                && binding.modifiers.matches(keys)
-                && active_contexts.contains(binding.context)
-            {
-                return Some(binding.action.clone());
-            }
+        if let InputSource::Key(bind_key) = &binding.source
+            && *bind_key == key
+            && binding.modifiers.matches(keys)
+            && active_contexts.contains(binding.context)
+        {
+            return Some(binding.action.clone());
         }
     }
     None
@@ -170,7 +167,7 @@ fn find_direct_match(
     // This ensures TextInput Enter → Submit beats Global Enter (if any)
     let mut best_match: Option<(usize, &super::binding::Binding)> = None;
 
-    for (_i, binding) in input_map.bindings.iter().enumerate() {
+    for binding in &input_map.bindings {
         // Skip sequence bindings (handled separately)
         if binding.sequence_prefix.is_some() {
             continue;

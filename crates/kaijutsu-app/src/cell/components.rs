@@ -376,82 +376,8 @@ pub struct CellState {
 }
 
 
-/// Input routing kind for text entry modes.
-///
-/// Determines where submitted text goes:
-/// - **Chat**: Routes to LLM for AI conversation
-/// - **Shell**: Routes to kaish REPL (handles both shell commands and `:` commands)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
-pub enum InputKind {
-    /// Prompts go to LLM
-    Chat,
-    /// Prompts go to kaish REPL
-    Shell,
-}
-
-impl InputKind {
-    pub fn name(&self) -> &'static str {
-        match self {
-            InputKind::Chat => "CHAT",
-            InputKind::Shell => "SHELL",
-        }
-    }
-}
-
-/// Vim-style editor mode (simplified from 5 to 3 modes).
-///
-/// The old Command mode is folded into Shell - kaish handles `:` commands natively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
-pub enum EditorMode {
-    /// Navigation mode (h/j/k/l, block focus)
-    #[default]
-    Normal,
-    /// Text input mode with routing to Chat or Shell
-    Input(InputKind),
-    /// Visual selection mode
-    Visual,
-}
-
-impl EditorMode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            EditorMode::Normal => "NORMAL",
-            EditorMode::Input(kind) => kind.name(),
-            EditorMode::Visual => "VISUAL",
-        }
-    }
-
-    /// Check if this mode accepts text input.
-    pub fn accepts_input(&self) -> bool {
-        matches!(self, EditorMode::Input(_))
-    }
-
-    /// Get the input kind if in Input mode.
-    #[allow(dead_code)]
-    pub fn input_kind(&self) -> Option<InputKind> {
-        match self {
-            EditorMode::Input(kind) => Some(*kind),
-            _ => None,
-        }
-    }
-
-    /// Check if this is Chat input mode.
-    #[allow(dead_code)]
-    pub fn is_chat(&self) -> bool {
-        matches!(self, EditorMode::Input(InputKind::Chat))
-    }
-
-    /// Check if this is Shell input mode.
-    #[allow(dead_code)]
-    pub fn is_shell(&self) -> bool {
-        matches!(self, EditorMode::Input(InputKind::Shell))
-    }
-}
-
-/// Resource tracking the current editor mode.
-#[derive(Resource, Default, Reflect)]
-#[reflect(Resource)]
-pub struct CurrentMode(pub EditorMode);
+// EditorMode / CurrentMode replaced by input::FocusArea.
+// Shell vs Chat auto-detected from compose text prefix.
 
 // ============================================================================
 // UNIFIED FOCUS RESOURCE

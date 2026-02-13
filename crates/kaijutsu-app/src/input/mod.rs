@@ -43,15 +43,16 @@ pub mod map;
 pub mod sequence;
 pub mod systems;
 
-// Re-export core types for ergonomic use
+// Re-export core types for ergonomic use.
+// FocusArea is consumed by cell, tiling_widgets, timeline, conversation, frame_assembly.
+// Others are pub API for future external consumers.
+pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use action::Action;
 #[allow(unused_imports)]
 pub use context::InputContext;
 #[allow(unused_imports)]
 pub use events::{ActionFired, TextInputReceived};
-#[allow(unused_imports)]
-pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use map::InputMap;
 
@@ -69,9 +70,6 @@ pub enum InputPhase {
 }
 
 /// Plugin that registers the focus-based input dispatch system.
-///
-/// Phase 1: Emits ActionFired/TextInputReceived alongside old handlers.
-/// Phase 2: Focus management + debug handlers consume ActionFired.
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
@@ -131,26 +129,26 @@ impl Plugin for InputPlugin {
         app.add_systems(
             Update,
             (
-                // Focus management (Phase 2)
+                // Focus management
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
                 systems::handle_unfocus,
                 systems::handle_toggle_constellation,
-                // Debug / app (Phase 2)
+                // App-level actions
                 systems::handle_quit,
                 systems::handle_debug_toggle,
                 systems::handle_screenshot,
-                // Navigation (Phase 3)
+                // Block navigation + scroll
                 systems::handle_navigate_blocks,
                 systems::handle_scroll,
                 systems::handle_expand_block,
                 systems::handle_collapse_toggle,
                 systems::handle_view_pop,
-                // Tiling (Phase 3)
+                // Tiling pane management
                 systems::handle_tiling,
-                // Constellation (Phase 3)
+                // Constellation spatial nav
                 systems::handle_constellation_nav,
-                // Text input (Phase 4)
+                // Text input (compose + inline block editing)
                 systems::handle_compose_input,
                 systems::handle_block_edit_input,
             )

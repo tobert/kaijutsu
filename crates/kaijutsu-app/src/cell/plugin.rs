@@ -34,8 +34,8 @@ pub enum CellPhase {
 use crate::ui::tiling_reconciler::TilingPhase;
 use super::components::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
-    ContextSwitchRequested, ConversationContainer, ConversationScrollState, CurrentMode,
-    DocumentCache, DocumentSyncState, EditorMode, FocusTarget, LayoutGeneration, MainCell,
+    ContextSwitchRequested, ConversationContainer, ConversationScrollState,
+    DocumentCache, DocumentSyncState, FocusTarget, LayoutGeneration, MainCell,
     PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
 use super::frame_assembly;
@@ -52,9 +52,7 @@ impl Plugin for CellPlugin {
             .add_message::<ContextSwitchRequested>();
 
         // Register types for BRP reflection
-        app.register_type::<EditorMode>()
-            .register_type::<CurrentMode>()
-            .register_type::<ConversationScrollState>()
+        app.register_type::<ConversationScrollState>()
             .register_type::<ConversationContainer>()
             .register_type::<MainCell>()
             .register_type::<PromptSubmitted>()
@@ -84,40 +82,22 @@ impl Plugin for CellPlugin {
         );
 
         app.init_resource::<FocusTarget>()
-            .init_resource::<CurrentMode>()
             .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
             .init_resource::<LayoutGeneration>()
             .init_resource::<DocumentSyncState>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
-            .init_resource::<systems::EditorEntities>()
-            .init_resource::<systems::ConsumedModeKeys>();
+            .init_resource::<systems::EditorEntities>();
 
         // ====================================================================
-        // CellPhase::Input - Mode switching, key handling, click-to-focus
+        // CellPhase::Input — click-to-focus only
+        // All keyboard input now handled by InputPlugin (input/ module).
         // ====================================================================
         app.add_systems(
             Update,
             (
-                // Clear consumed keys at start of frame before any input handling
-                systems::clear_consumed_keys,
-                // Block edit mode must run BEFORE mode_switch to intercept `i`
-                // when a BlockCell is focused
-                systems::handle_block_edit_mode
-                    .after(systems::clear_consumed_keys)
-                    .before(systems::handle_mode_switch),
-                systems::handle_mode_switch.after(systems::clear_consumed_keys),
-                // Block cell input runs after block edit mode
-                systems::handle_block_cell_input.after(systems::handle_block_edit_mode),
-                // Compose block input runs after mode switch
-                systems::handle_compose_block_input.after(systems::handle_mode_switch),
-                // Click to focus
                 systems::click_to_focus,
-                // Collapse/expand for thinking blocks (Tab in Normal mode)
-                systems::handle_collapse_toggle,
-                // Pop ViewStack with Esc (before mode switch handles Esc)
-                systems::handle_view_pop.before(systems::handle_mode_switch),
             )
                 .in_set(CellPhase::Input),
         );
@@ -144,12 +124,7 @@ impl Plugin for CellPlugin {
                 systems::check_cache_staleness
                     .after(systems::handle_block_events)
                     .after(systems::handle_context_switch),
-                // Block navigation (j/k) after sync
-                systems::navigate_blocks.after(systems::sync_main_cell_to_conversation),
-                // Expand block with `f` key
-                systems::handle_expand_block.after(systems::navigate_blocks),
-                // Scroll input after navigation
-                systems::handle_scroll_input.after(systems::navigate_blocks),
+                // Block navigation, expand, scroll handled by InputPlugin
             )
                 .in_set(CellPhase::Sync),
         );

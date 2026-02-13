@@ -11,7 +11,6 @@
 //! | Inputs    | Compose, Shell                     | Chat prompt, kaish input     |
 //! | Widgets   | Title, Mode, Connection, Contexts… | Status bar items             |
 
-use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 
 // ============================================================================
@@ -1041,120 +1040,8 @@ impl Plugin for TilingPlugin {
             .register_type::<PaneMarker>()
             .register_type::<PaneFocus>()
             .register_type::<PaneSavedState>()
-            .add_systems(Update, handle_tiling_keys);
-    }
-}
-
-// ============================================================================
-// TILING KEY HANDLER — Super+key combinations for pane management
-// ============================================================================
-
-/// Handles Super+key (Mod) combinations in Normal mode for pane management.
-///
-/// | Key               | Action                          |
-/// |-------------------|---------------------------------|
-/// | `Super+h`         | Focus left                      |
-/// | `Super+j`         | Focus down                      |
-/// | `Super+k`         | Focus up                        |
-/// | `Super+l`         | Focus right                     |
-/// | `Super+Shift+H`   | Swap pane left (future)         |
-/// | `Super+v`         | Split vertical (new right)      |
-/// | `Super+s`         | Split horizontal (new below)    |
-/// | `Super+q`         | Close focused pane              |
-/// | `Super+[`         | Shrink focused pane             |
-/// | `Super+]`         | Grow focused pane               |
-/// | `Ctrl+^` (Ctrl+6) | Toggle previous focus           |
-pub fn handle_tiling_keys(
-    mut key_events: MessageReader<KeyboardInput>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<crate::cell::CurrentMode>,
-    mut tree: ResMut<TilingTree>,
-) {
-    // Only handle tiling keys in Normal mode
-    if mode.0 != crate::cell::EditorMode::Normal {
-        return;
-    }
-
-    // Use Super (Mod) or Alt as the tiling modifier.
-    // Super is often consumed by the window manager on Linux,
-    // so Alt serves as a portable fallback.
-    let mod_held = keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight)
-        || keys.pressed(KeyCode::AltLeft)
-        || keys.pressed(KeyCode::AltRight);
-    let ctrl_held = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-
-    for event in key_events.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
-
-        // Super+key: tiling operations
-        if mod_held {
-            match event.key_code {
-                // ── Focus navigation ──────────────────────────────
-                KeyCode::KeyH => {
-                    if tree.focus_direction(FocusDirection::Left) {
-                        info!("Tiling: focus left → {}", tree.focused);
-                    }
-                }
-                KeyCode::KeyJ => {
-                    if tree.focus_direction(FocusDirection::Down) {
-                        info!("Tiling: focus down → {}", tree.focused);
-                    }
-                }
-                KeyCode::KeyK => {
-                    if tree.focus_direction(FocusDirection::Up) {
-                        info!("Tiling: focus up → {}", tree.focused);
-                    }
-                }
-                KeyCode::KeyL => {
-                    if tree.focus_direction(FocusDirection::Right) {
-                        info!("Tiling: focus right → {}", tree.focused);
-                    }
-                }
-
-                // ── Split operations ──────────────────────────────
-                KeyCode::KeyV => {
-                    let target = tree.focused;
-                    if let Some(new_pane) = tree.split(target, SplitDirection::Row) {
-                        info!("Tiling: split vertical → new {}", new_pane);
-                    }
-                }
-                KeyCode::KeyS => {
-                    let target = tree.focused;
-                    if let Some(new_pane) = tree.split(target, SplitDirection::Column) {
-                        info!("Tiling: split horizontal → new {}", new_pane);
-                    }
-                }
-
-                // ── Close ─────────────────────────────────────────
-                KeyCode::KeyQ => {
-                    let target = tree.focused;
-                    if tree.close(target) {
-                        info!("Tiling: closed pane, now focused {}", tree.focused);
-                    }
-                }
-
-                // ── Resize ────────────────────────────────────────
-                KeyCode::BracketLeft => {
-                    let target = tree.focused;
-                    tree.resize(target, -0.05);
-                }
-                KeyCode::BracketRight => {
-                    let target = tree.focused;
-                    tree.resize(target, 0.05);
-                }
-
-                _ => {}
-            }
-        }
-
-        // Ctrl+^ (Ctrl+6): toggle focus between current and previous
-        if ctrl_held && event.key_code == KeyCode::Digit6 {
-            tree.toggle_focus();
-            info!("Tiling: toggle focus → {}", tree.focused);
-        }
+            // Tiling key handling in input::systems::handle_tiling
+            ;
     }
 }
 

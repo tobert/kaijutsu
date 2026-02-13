@@ -20,7 +20,6 @@ impl Plugin for AgentsPlugin {
         app.add_systems(
             Update,
             (
-                systems::handle_processing_chain_triggers,
                 systems::handle_agent_activity,
                 systems::sync_agent_badges,
             ),
