@@ -1,7 +1,7 @@
 //! Theme system for Kaijutsu
 //!
-//! Provides a scriptable theming system via Rhai, inspired by the
-//! Tokyo-midnight palette from nvim/wezterm configurations.
+//! Provides a scriptable theming system via Rhai. The built-in default
+//! is the Kaijutsu theme; users can override any field via `theme.rhai`.
 
 use bevy::math::Vec4;
 use bevy::prelude::*;
@@ -306,7 +306,7 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Base UI - Neon Cyberpunk
+            // Base UI
             bg: Color::srgb(0.04, 0.04, 0.06),                  // #0a0a0f near-black
             panel_bg: Color::srgba(0.04, 0.04, 0.06, 0.95),     // Almost opaque
             fg: Color::srgb(0.88, 0.94, 1.00),                  // #e0f0ff cool white
@@ -317,16 +317,16 @@ impl Default for Theme {
             selection_bg: Color::srgba(1.00, 0.00, 0.50, 0.25), // #ff0080 pink selection
 
             // Row type colors
-            row_tool: Color::srgb(1.00, 0.67, 0.00),            // #ffaa00 neon orange
+            row_tool: Color::srgb(1.00, 0.67, 0.00),            // #ffaa00 orange
             row_result: Color::srgb(0.00, 1.00, 0.53),          // #00ff88 toxic green
 
-            // Block text colors — neon palette
+            // Block text colors
             block_user: Color::srgb(0.88, 0.94, 1.00),          // #e0f0ff cool white
             block_assistant: Color::srgb(0.88, 0.94, 1.00),     // Same as fg
             block_thinking: Color::srgb(0.38, 0.50, 0.63),      // #6080a0 muted
             block_tool_call: Color::srgb(1.00, 0.67, 0.00),     // #ffaa00 amber
             block_tool_result: Color::srgb(0.00, 1.00, 0.53),   // #00ff88 toxic green
-            block_tool_error: Color::srgb(1.00, 0.13, 0.38),    // #ff2060 neon red
+            block_tool_error: Color::srgb(1.00, 0.13, 0.38),    // #ff2060 red
             block_shell_cmd: Color::srgb(0.00, 1.00, 1.00),     // #00ffff cyan
             block_shell_output: Color::srgb(0.88, 0.94, 1.00),  // #e0f0ff cool white
             block_drift_push: Color::srgb(0.00, 1.00, 1.00),    // #00ffff cyan
@@ -335,14 +335,14 @@ impl Default for Theme {
             block_drift_commit: Color::srgb(0.00, 1.00, 0.53),  // #00ff88 toxic green
 
             // Semantic
-            error: Color::srgb(1.00, 0.13, 0.38),               // #ff2060 neon red
+            error: Color::srgb(1.00, 0.13, 0.38),               // #ff2060 red
             warning: Color::srgb(1.00, 0.80, 0.00),             // #ffcc00 electric yellow
             success: Color::srgb(0.00, 1.00, 0.53),             // #00ff88 matrix green
 
             // Mode colors (vim-style)
             mode_normal: Color::srgb(0.50, 0.56, 0.69),         // #8090b0 cool slate
             mode_chat: Color::srgb(0.00, 1.00, 0.53),           // #00ff88 toxic green
-            mode_shell: Color::srgb(1.00, 0.67, 0.00),          // #ffaa00 neon orange
+            mode_shell: Color::srgb(1.00, 0.67, 0.00),          // #ffaa00 orange
             mode_visual: Color::srgb(1.00, 0.00, 1.00),         // #ff00ff magenta
 
             // Cursor colors — maximum glow
@@ -350,7 +350,7 @@ impl Default for Theme {
             cursor_insert: Vec4::new(1.00, 0.00, 0.50, 1.0),    // #ff0080 hot pink
             cursor_visual: Vec4::new(1.00, 0.00, 1.00, 0.9),    // #ff00ff magenta
 
-            // ANSI palette — neon
+            // ANSI palette
             ansi: AnsiColors {
                 black: Color::srgb(0.04, 0.04, 0.06),           // #0a0a0f
                 red: Color::srgb(1.00, 0.13, 0.38),             // #ff2060
@@ -375,7 +375,7 @@ impl Default for Theme {
             frame_edge_thickness: 8.0,
             frame_content_padding: 10.0,
 
-            // Frame colors — neon glow
+            // Frame colors
             frame_base: Color::srgb(1.00, 0.00, 0.50),          // #ff0080 hot pink
             frame_focused: Color::srgb(0.00, 1.00, 1.00),       // #00ffff cyan
             frame_insert: Color::srgb(0.00, 1.00, 0.53),        // #00ff88 green
@@ -392,7 +392,7 @@ impl Default for Theme {
             frame_edge_dim_unfocused: Vec4::new(0.6, 0.5, 0.7, 0.7),
             frame_edge_dim_focused: Vec4::new(0.9, 0.8, 1.0, 0.95),
 
-            // Shader effect parameters — neon overdrive
+            // Shader effect parameters
             effect_glow_radius: 0.45,
             effect_glow_intensity: 1.2,
             effect_glow_falloff: 1.8,
@@ -401,7 +401,7 @@ impl Default for Theme {
             effect_breathe_speed: 2.5,
             effect_breathe_amplitude: 0.18,
 
-            // Chasing border — smooth neon rainbow
+            // Chasing border
             effect_chase_speed: 0.20,
             effect_chase_width: 0.10,
             effect_chase_glow_radius: 0.08,
@@ -414,7 +414,7 @@ impl Default for Theme {
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.0, 0.0, 0.0, 0.4),
 
-            // Markdown rendering — neon palette
+            // Markdown rendering
             md_heading_color: Color::srgb(1.00, 0.00, 1.00),    // #ff00ff magenta
             md_code_fg: Color::srgb(0.00, 1.00, 0.53),          // #00ff88 green
             md_code_block_fg: Color::srgb(0.00, 0.67, 1.00),    // #00aaff blue
@@ -438,7 +438,7 @@ impl Default for Theme {
             font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
             font_rainbow: false,
 
-            // Constellation — bioluminescent neon
+            // Constellation
             constellation_base_radius: 120.0,
             constellation_ring_spacing: 160.0,
             constellation_node_size: 96.0,
@@ -451,10 +451,10 @@ impl Default for Theme {
             constellation_connection_color: Color::srgba(0.00, 1.00, 1.00, 0.5),  // Cyan
             constellation_particle_budget: 500,
 
-            // Block borders — neon accents
+            // Block borders
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber
             block_border_tool_result: Color::srgba(0.00, 1.00, 0.53, 0.4), // #00ff88 green
-            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),       // #ff2060 neon red
+            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),       // #ff2060 red
             block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),    // #6080a0 muted
             block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),       // #00aaff blue
             block_border_thickness: 1.5,
