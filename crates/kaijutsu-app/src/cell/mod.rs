@@ -15,6 +15,7 @@
 //! for ornate cyberpunk borders. Frame configuration (colors, sizes, shader params)
 //! comes from the Theme resource, loaded from ~/.config/kaijutsu/theme.rhai.
 
+pub mod block_border;
 mod components;
 pub mod frame_assembly;
 pub mod plugin;

@@ -276,6 +276,31 @@ pub struct Theme {
     /// Max particles per context for streaming effects
     pub constellation_particle_budget: u32,
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Block Border Configuration (shader-rendered per-block borders)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Tool call border color (amber, default from block_tool_call)
+    pub block_border_tool_call: Color,
+    /// Tool result border color (green, default from block_tool_result)
+    pub block_border_tool_result: Color,
+    /// Error border color (red, default from block_tool_error)
+    pub block_border_error: Color,
+    /// Thinking border color (dim gray, default from block_thinking)
+    pub block_border_thinking: Color,
+    /// Drift border color (blue, default from block_drift_pull)
+    pub block_border_drift: Color,
+    /// Border thickness in pixels
+    pub block_border_thickness: f32,
+    /// Corner radius in pixels
+    pub block_border_corner_radius: f32,
+    /// Glow spread radius (0.0-1.0)
+    pub block_border_glow_radius: f32,
+    /// Glow intensity (0.0-1.0)
+    pub block_border_glow_intensity: f32,
+    /// Base padding inside borders (pixels)
+    pub block_border_padding: f32,
+
 }
 
 impl Default for Theme {
@@ -407,6 +432,18 @@ impl Default for Theme {
             constellation_connection_glow: 0.4,
             constellation_connection_color: Color::srgba(0.49, 0.85, 0.82, 0.5),   // Cyan
             constellation_particle_budget: 500,
+
+            // Block border defaults — derive from block text colors
+            block_border_tool_call: Color::srgba(0.89, 0.79, 0.49, 0.7),   // Amber (dimmed)
+            block_border_tool_result: Color::srgba(0.62, 0.81, 0.42, 0.5), // Green (dimmed)
+            block_border_error: Color::srgba(0.97, 0.38, 0.45, 0.8),       // Red
+            block_border_thinking: Color::srgba(0.45, 0.47, 0.55, 0.4),    // Dim gray
+            block_border_drift: Color::srgba(0.58, 0.74, 1.00, 0.5),       // Blue
+            block_border_thickness: 1.5,
+            block_border_corner_radius: 4.0,
+            block_border_glow_radius: 0.15,
+            block_border_glow_intensity: 0.6,
+            block_border_padding: 8.0,
 
         }
     }

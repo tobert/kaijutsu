@@ -24,7 +24,7 @@ use crate::ui::timeline::TimelineVisibility;
 // ============================================================================
 
 /// Horizontal indentation per nesting level (for nested tool results, etc.)
-const INDENT_WIDTH: f32 = 24.0;
+pub(crate) const INDENT_WIDTH: f32 = 24.0;
 
 /// Vertical spacing between blocks.
 const BLOCK_SPACING: f32 = 8.0;
@@ -149,6 +149,7 @@ fn truncate_model(model: &str) -> &str {
 /// │ content line 2             │
 /// └────────────────────────────┘
 /// ```
+#[allow(dead_code)] // Kept for non-GPU display paths (MCP text output, fallback)
 fn draw_box(header: &str, content: &str, width: usize) -> String {
     let inner = width.saturating_sub(4); // account for "│ " and " │"
     let header_pad = inner.saturating_sub(header.chars().count() + 2);
@@ -200,32 +201,30 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String 
     let ctx = block.source_context.as_deref().unwrap_or("?");
     let model = block.source_model.as_deref().map(truncate_model).unwrap_or("unknown");
     let ctx_label = format!("@{}", ctx);
-    let width = 72;
 
     // Determine direction arrow: → if we sent it, ← if we received it
     let arrow = match local_ctx {
-        Some(local) if ctx == local => "→",
-        _ => "←",
+        Some(local) if ctx == local => "\u{2192}",
+        _ => "\u{2190}",
     };
 
     match block.drift_kind {
         Some(DriftKind::Push) => {
             let preview = block.content.lines().next().unwrap_or("");
-            format!("{} {} ({})  {}\n", arrow, ctx_label, model, preview)
+            format!("{} {} ({})  {}", arrow, ctx_label, model, preview)
         }
         Some(DriftKind::Pull) | Some(DriftKind::Distill) => {
-            let header = format!("pulled from {} ({})", ctx_label, model);
-            draw_box(&header, &block.content, width)
+            // Shader border handles visual framing; emit plain header + content
+            format!("pulled from {} ({})\n{}", ctx_label, model, block.content)
         }
         Some(DriftKind::Merge) => {
-            let header = format!("⇄ merged from {} ({})", ctx_label, model);
-            draw_box(&header, &block.content, width)
+            format!("\u{21c4} merged from {} ({})\n{}", ctx_label, model, block.content)
         }
         Some(DriftKind::Commit) => {
-            format!("# {}  {}\n", ctx_label, block.content.lines().next().unwrap_or(""))
+            format!("# {}  {}", ctx_label, block.content.lines().next().unwrap_or(""))
         }
         None => {
-            format!("~ {} ({})  {}\n", ctx_label, model, block.content.lines().next().unwrap_or(""))
+            format!("~ {} ({})  {}", ctx_label, model, block.content.lines().next().unwrap_or(""))
         }
     }
 }
@@ -1634,17 +1633,12 @@ fn format_tool_args(value: &serde_json::Value) -> String {
 /// Returns the formatted text for one block, including visual markers.
 /// `local_ctx`: optional local context ID for drift push direction.
 pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
-    let width = 72;
-
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
-                "─── Thinking [collapsed] ───".to_string()
+                "Thinking [collapsed]".to_string()
             } else {
-                format!(
-                    "─── Thinking ───\n{}\n───────────────────",
-                    block.content
-                )
+                format!("Thinking\n{}", block.content)
             }
         }
         BlockKind::Text => block.content.clone(),
@@ -1655,36 +1649,34 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
                 kaijutsu_crdt::Status::Pending => " [pending]",
                 _ => "",
             };
-            let header = format!("{}{}", name, status_tag);
-
-            match &block.tool_input {
-                Some(input) if !input.is_null() => {
+            let mut output = format!("{}{}", name, status_tag);
+            if let Some(ref input) = block.tool_input {
+                if !input.is_null() {
                     let args = format_tool_args(input);
-                    if args.is_empty() {
-                        format!("─── {} ───", header)
-                    } else {
-                        draw_box(&header, &args, width)
+                    if !args.is_empty() {
+                        output.push('\n');
+                        output.push_str(&args);
                     }
                 }
-                _ => format!("─── {} ───", header),
             }
+            output
         }
         BlockKind::ToolResult => {
             let content = block.content.trim();
             if block.is_error {
                 if content.is_empty() {
-                    "─── error ✗ ───".to_string()
+                    "error".to_string()
                 } else {
-                    draw_box("error ✗", content, width)
+                    format!("error \u{2717}\n{}", content)
                 }
             } else if content.is_empty() {
-                "─── done ───".to_string()
+                "done".to_string()
             } else {
                 let line_count = content.lines().count();
                 if line_count <= 3 {
-                    format!("─── done ───\n{}", content)
+                    format!("done\n{}", content)
                 } else {
-                    draw_box("result", content, width)
+                    format!("result\n{}", content)
                 }
             }
         }
@@ -2053,7 +2045,7 @@ pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer, Option<&super::block_border::BlockBorderStyle>)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2133,7 +2125,7 @@ pub fn layout_block_cells(
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
 
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, mut buffer)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout, mut buffer, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2164,16 +2156,22 @@ pub fn layout_block_cells(
             0
         };
 
-        // Calculate wrap width accounting for indentation
+        // Calculate wrap width accounting for indentation and border padding
         let indent = indent_level as f32 * INDENT_WIDTH;
-        let wrap_width = base_width - indent;
+        let border_h_padding = border_style
+            .map(|s| s.padding.left + s.padding.right)
+            .unwrap_or(0.0);
+        let wrap_width = base_width - indent - border_h_padding;
 
         // Compute height from visual line count (after text wrapping)
         // This shapes the buffer if needed and returns accurate wrapped line count
         // Pixel alignment via metrics_cache helps small text render crisply
         let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
         // Tight height: just the lines, minimal padding for future chrome
-        let height = (line_count as f32) * layout.line_height + 4.0;
+        let border_v_padding = border_style
+            .map(|s| s.padding.vertical())
+            .unwrap_or(0.0);
+        let height = (line_count as f32) * layout.line_height + 4.0 + border_v_padding;
 
         block_layout.y_offset = y_offset;
         block_layout.height = height;
@@ -2195,7 +2193,7 @@ pub fn layout_block_cells(
 pub fn apply_block_cell_positions(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut MsdfTextAreaConfig), With<BlockCell>>,
+    mut block_cells: Query<(&BlockCellLayout, &mut MsdfTextAreaConfig, Option<&super::block_border::BlockBorderStyle>), With<BlockCell>>,
     mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2256,7 +2254,7 @@ pub fn apply_block_cell_positions(
     let scroll_offset = scroll_state.offset;
 
     for entity in &container.block_cells {
-        let Ok((block_layout, mut config)) = block_cells.get_mut(*entity) else {
+        let Ok((block_layout, mut config, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2266,38 +2264,43 @@ pub fn apply_block_cell_positions(
         let width = base_width - indent;
         let content_top = visible_top + block_layout.y_offset - scroll_offset;
 
-        config.left = left;
-        config.top = content_top;
+        // Inset text when a shader border is present
+        let pad_left = border_style.map(|s| s.padding.left).unwrap_or(0.0);
+        let pad_top = border_style.map(|s| s.padding.top).unwrap_or(0.0);
+        let pad_right = border_style.map(|s| s.padding.right).unwrap_or(0.0);
+
+        config.left = left + pad_left;
+        config.top = content_top + pad_top;
         config.scale = 1.0;
 
         // Clamp bounds to intersection of visible area and block area.
         // Snap to full line boundaries so partial lines aren't rendered at edges.
         let block_bottom = content_top + block_layout.height;
-        let mut clamped_top = visible_top.max(content_top).max(0.0);
+        let mut clamped_top = visible_top.max(content_top + pad_top).max(0.0);
         let mut clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
 
         let lh = layout.line_height;
         // Bottom edge: snap UP to last full line boundary within the block
         if block_bottom > visible_bottom && lh > 0.0 {
-            let full_lines = ((clamped_bottom - content_top) / lh).floor();
-            let snapped = content_top + full_lines * lh;
+            let full_lines = ((clamped_bottom - (content_top + pad_top)) / lh).floor();
+            let snapped = content_top + pad_top + full_lines * lh;
             if snapped > clamped_top + 1.0 {
                 clamped_bottom = snapped;
             }
         }
         // Top edge: snap DOWN to next full line boundary within the block
-        if content_top < visible_top && lh > 0.0 {
-            let hidden = (clamped_top - content_top) / lh;
-            let snapped = content_top + hidden.ceil() * lh;
+        if (content_top + pad_top) < visible_top && lh > 0.0 {
+            let hidden = (clamped_top - (content_top + pad_top)) / lh;
+            let snapped = content_top + pad_top + hidden.ceil() * lh;
             if snapped < clamped_bottom - 1.0 {
                 clamped_top = snapped;
             }
         }
 
         config.bounds = crate::text::TextBounds {
-            left: left as i32,
+            left: (left + pad_left) as i32,
             top: clamped_top as i32,
-            right: (left + width) as i32,
+            right: (left + width - pad_right) as i32,
             bottom: clamped_bottom as i32,
         };
     }
@@ -2675,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_call_box_drawing() {
+    fn test_tool_call_plain_text() {
         let block = BlockSnapshot::tool_call(
             test_block_id(),
             None,
@@ -2684,9 +2687,9 @@ mod tests {
             "test",
         );
         let result = format_single_block(&block, None);
-        // Should use box-drawing characters
-        assert!(result.contains('┌'));
-        assert!(result.contains('└'));
+        // Shader borders handle visual framing — text is plain
+        assert!(!result.contains('┌'));
+        assert!(!result.contains('└'));
         assert!(result.contains("read_file"));
         assert!(result.contains("path: /etc/hosts"));
         // Running status tag (tool_call constructor sets Running)
@@ -2704,8 +2707,7 @@ mod tests {
         );
         block.status = Status::Done;
         let result = format_single_block(&block, None);
-        assert!(result.contains("─── list_all ───"));
-        assert!(!result.contains('┌')); // No box for empty args
+        assert_eq!(result, "list_all");
     }
 
     #[test]
@@ -2719,7 +2721,7 @@ mod tests {
             "test",
         );
         let result = format_single_block(&result_block, None);
-        assert_eq!(result, "─── done ───");
+        assert_eq!(result, "done");
     }
 
     #[test]
@@ -2733,7 +2735,7 @@ mod tests {
             "test",
         );
         let result = format_single_block(&result_block, None);
-        assert!(result.starts_with("─── done ───\n"));
+        assert!(result.starts_with("done\n"));
         assert!(result.contains("file contents here"));
     }
 
@@ -2749,8 +2751,8 @@ mod tests {
             "test",
         );
         let result = format_single_block(&result_block, None);
-        assert!(result.contains('┌'));
-        assert!(result.contains("result"));
+        assert!(!result.contains('┌'));
+        assert!(result.starts_with("result\n"));
     }
 
     #[test]
@@ -2764,7 +2766,7 @@ mod tests {
             "test",
         );
         let result = format_single_block(&result_block, None);
-        assert!(result.contains("error ✗"));
+        assert!(result.contains("error \u{2717}"));
         assert!(result.contains("permission denied"));
     }
 
@@ -2779,7 +2781,7 @@ mod tests {
             "test",
         );
         let result = format_single_block(&result_block, None);
-        assert_eq!(result, "─── error ✗ ───");
+        assert_eq!(result, "error");
     }
 
     #[test]
@@ -2787,7 +2789,7 @@ mod tests {
         let block = BlockSnapshot::thinking(test_block_id(), None, "reasoning here", "test");
         let result = format_single_block(&block, None);
         assert!(!result.contains('💭'));
-        assert!(result.contains("─── Thinking ───"));
+        assert!(result.starts_with("Thinking\n"));
         assert!(result.contains("reasoning here"));
     }
 
@@ -2797,7 +2799,7 @@ mod tests {
         block.collapsed = true;
         let result = format_single_block(&block, None);
         assert!(!result.contains('💭'));
-        assert!(result.contains("─── Thinking [collapsed] ───"));
+        assert_eq!(result, "Thinking [collapsed]");
     }
 
     #[test]

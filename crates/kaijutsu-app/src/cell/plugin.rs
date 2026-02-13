@@ -38,6 +38,7 @@ use super::components::{
     DocumentCache, DocumentSyncState, FocusTarget, LayoutGeneration, MainCell,
     PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
 };
+use super::block_border;
 use super::frame_assembly;
 use super::systems;
 use crate::dashboard::DashboardEventHandling;
@@ -66,7 +67,8 @@ impl Plugin for CellPlugin {
             .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
-            .register_type::<RoleHeaderLayout>();
+            .register_type::<RoleHeaderLayout>()
+            .register_type::<block_border::BlockBorderStyle>();
 
         // Configure SystemSet execution order
         app.configure_sets(
@@ -175,6 +177,9 @@ impl Plugin for CellPlugin {
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
                 systems::highlight_focused_block.after(systems::sync_block_cell_buffers),
+                // Block border style determination (after buffer sync)
+                block_border::determine_block_border_style
+                    .after(systems::sync_block_cell_buffers),
             )
                 .in_set(CellPhase::Buffer),
         );
@@ -200,6 +205,14 @@ impl Plugin for CellPlugin {
                 systems::update_compose_cursor
                     .after(systems::update_cursor)
                     .after(systems::position_compose_block),
+                // Block border systems
+                block_border::spawn_block_borders
+                    .after(systems::apply_block_cell_positions),
+                block_border::layout_block_borders
+                    .after(block_border::spawn_block_borders),
+                block_border::update_block_border_state
+                    .after(block_border::spawn_block_borders),
+                block_border::cleanup_block_borders,
                 // 9-slice frame layout
                 frame_assembly::spawn_nine_slice_frames,
                 frame_assembly::layout_nine_slice_frames,
