@@ -15,6 +15,7 @@ use super::{
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
 use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
+use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::{color_to_vec4, Theme};
 
@@ -39,6 +40,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
         (
             spawn_constellation_container,
             sync_constellation_visibility,
+            sync_cell_text_visibility,
             spawn_context_nodes,
             spawn_create_node,
             spawn_connection_lines,
@@ -142,6 +144,34 @@ fn sync_constellation_visibility(
     for (mut node, mut vis) in conv_root.iter_mut() {
         node.display = conversation_display;
         *vis = conversation_vis;
+    }
+}
+
+/// Hide orphaned cell-text entities when constellation is showing.
+///
+/// Block cells and role headers are spawned as root-level entities (no parent)
+/// with screen-space coordinates via `MsdfTextAreaConfig`. Since they're not
+/// descendants of `ConversationRoot`, `Visibility::Hidden` doesn't propagate
+/// to them. This system directly sets their `Visibility` based on constellation
+/// state. Targets `MsdfText` entities without `Node` (UI text has `Node` and
+/// inherits visibility through the UI hierarchy).
+fn sync_cell_text_visibility(
+    visible: Res<ConstellationVisible>,
+    mut cell_texts: Query<&mut Visibility, (With<MsdfText>, Without<Node>)>,
+    new_texts: Query<(), (Added<MsdfText>, Without<Node>)>,
+) {
+    if !visible.is_changed() && new_texts.is_empty() {
+        return;
+    }
+
+    let target = if visible.0 {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+
+    for mut vis in cell_texts.iter_mut() {
+        *vis = target;
     }
 }
 
