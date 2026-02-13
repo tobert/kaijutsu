@@ -518,6 +518,39 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         theme.constellation_particle_budget = v;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Block border configuration
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_tool_call") {
+        theme.block_border_tool_call = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_tool_result") {
+        theme.block_border_tool_result = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_error") {
+        theme.block_border_error = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_thinking") {
+        theme.block_border_thinking = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_drift") {
+        theme.block_border_drift = c;
+    }
+    if let Some(v) = get_float(&scope, "block_border_thickness") {
+        theme.block_border_thickness = v;
+    }
+    if let Some(v) = get_float(&scope, "block_border_corner_radius") {
+        theme.block_border_corner_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "block_border_glow_radius") {
+        theme.block_border_glow_radius = v;
+    }
+    if let Some(v) = get_float(&scope, "block_border_glow_intensity") {
+        theme.block_border_glow_intensity = v;
+    }
+    if let Some(v) = get_float(&scope, "block_border_padding") {
+        theme.block_border_padding = v;
+    }
 
     Ok(theme)
 }

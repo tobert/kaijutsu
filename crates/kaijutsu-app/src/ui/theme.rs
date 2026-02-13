@@ -443,7 +443,7 @@ impl Default for Theme {
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 0.15,
             block_border_glow_intensity: 0.6,
-            block_border_padding: 8.0,
+            block_border_padding: 2.0,
 
         }
     }
