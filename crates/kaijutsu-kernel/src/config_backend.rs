@@ -61,6 +61,9 @@ pub const DEFAULT_LLM_CONFIG: &str = include_str!("../../../assets/defaults/llm.
 /// Embedded example seat config.
 pub const EXAMPLE_SEAT: &str = include_str!("../../../assets/defaults/seats/example.rhai");
 
+/// Embedded default MCP server configuration.
+pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.rhai");
+
 /// Tracks dirty config files that need flushing to disk.
 struct DirtyTracker {
     /// Files marked dirty, with timestamp of last modification.
@@ -322,6 +325,7 @@ impl ConfigCrdtBackend {
         match path {
             "theme.rhai" => Some(DEFAULT_THEME.to_string()),
             "llm.rhai" => Some(DEFAULT_LLM_CONFIG.to_string()),
+            "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
             p if p.starts_with("seats/") && p.ends_with(".rhai") => {
                 // Generate seat-specific default from template
                 Some(EXAMPLE_SEAT.to_string())

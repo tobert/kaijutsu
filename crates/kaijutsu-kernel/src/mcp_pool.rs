@@ -64,7 +64,7 @@ use rmcp::model::{
     Reference, Root, RootsCapabilities, SetLevelRequestParams, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, ErrorData, Peer, RoleClient};
 use tokio::sync::oneshot;
 
@@ -96,21 +96,37 @@ pub enum McpPoolError {
     Disconnected(String),
 }
 
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// Spawn subprocess, communicate via stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect to a running server via streamable HTTP.
+    StreamableHttp,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// Unique name for this server (e.g., "git", "exa").
     pub name: String,
-    /// Command to run (e.g., "uvx", "npx", "/path/to/server").
+    /// Command to run (stdio transport only).
     pub command: String,
-    /// Arguments for the command.
+    /// Arguments for the command (stdio transport only).
     #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables to set.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Working directory for the server.
+    /// Working directory for the server (stdio transport only).
     pub cwd: Option<String>,
+    /// Transport type (default: Stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// Server URL (streamable HTTP transport only).
+    pub url: Option<String>,
 }
 
 impl Default for McpServerConfig {
@@ -121,6 +137,8 @@ impl Default for McpServerConfig {
             args: Vec::new(),
             env: HashMap::new(),
             cwd: None,
+            transport: McpTransport::Stdio,
+            url: None,
         }
     }
 }
@@ -1023,25 +1041,7 @@ impl McpServerPool {
             return Err(McpPoolError::ServerAlreadyExists(name));
         }
 
-        info!(name = %name, command = %config.command, "Registering MCP server");
-
-        // Build the command
-        let mut cmd = Command::new(&config.command);
-        cmd.args(&config.args);
-
-        // Set environment variables
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
-
-        // Set working directory if specified
-        if let Some(cwd) = &config.cwd {
-            cmd.current_dir(cwd);
-        }
-
-        // Spawn the process with stdio transport
-        let transport = TokioChildProcess::new(cmd.configure(|_| {}))
-            .map_err(|e| McpPoolError::SpawnError(e.to_string()))?;
+        info!(name = %name, transport = ?config.transport, "Registering MCP server");
 
         // Create a handler for this specific server with cache and flow access
         let handler = KaijutsuClientHandler::new(
@@ -1054,10 +1054,32 @@ impl McpServerPool {
             self.roots.clone(),
         );
 
-        // Connect and perform handshake
-        let service = rmcp::serve_client(handler, transport)
-            .await
-            .map_err(|e| McpPoolError::InitError(e.to_string()))?;
+        // Connect based on transport type
+        let service = match config.transport {
+            McpTransport::Stdio => {
+                let mut cmd = Command::new(&config.command);
+                cmd.args(&config.args);
+                for (key, value) in &config.env {
+                    cmd.env(key, value);
+                }
+                if let Some(cwd) = &config.cwd {
+                    cmd.current_dir(cwd);
+                }
+                let transport = TokioChildProcess::new(cmd.configure(|_| {}))
+                    .map_err(|e| McpPoolError::SpawnError(e.to_string()))?;
+                rmcp::serve_client(handler, transport).await
+                    .map_err(|e| McpPoolError::InitError(e.to_string()))?
+            }
+            McpTransport::StreamableHttp => {
+                let url = config.url.as_deref()
+                    .ok_or_else(|| McpPoolError::InitError(
+                        "StreamableHttp transport requires url".into(),
+                    ))?;
+                let transport = StreamableHttpClientTransport::from_uri(url);
+                rmcp::serve_client(handler, transport).await
+                    .map_err(|e| McpPoolError::InitError(e.to_string()))?
+            }
+        };
 
         // Get server info
         let peer_info = service.peer().peer_info();
@@ -1827,6 +1849,8 @@ mod tests {
         let config = McpServerConfig::default();
         assert!(config.name.is_empty());
         assert!(config.args.is_empty());
+        assert_eq!(config.transport, McpTransport::Stdio);
+        assert!(config.url.is_none());
     }
 
     #[test]

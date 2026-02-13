@@ -26,6 +26,7 @@ pub mod git_engine;
 pub mod git_ops;
 pub mod kernel;
 pub mod llm;
+pub mod mcp_config;
 pub mod mcp_pool;
 pub mod rhai_engine;
 pub mod state;
@@ -74,13 +75,15 @@ pub use vfs::{
 };
 pub use mcp_pool::{
     McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo,
+    McpTransport,
     // Resource types
     CachedResource, McpResourceInfo, ResourceCache,
 };
+pub use mcp_config::{McpConfig, load_mcp_config};
 pub use config_backend::{
     ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
     ConfigWatcherHandle, ValidationResult,
-    DEFAULT_THEME, DEFAULT_LLM_CONFIG, EXAMPLE_SEAT,
+    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MCP_CONFIG, EXAMPLE_SEAT,
 };
 
 pub use drift::{

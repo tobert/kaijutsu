@@ -809,10 +809,12 @@ interface BlockEvents {
 
 struct McpServerConfig {
   name @0 :Text;              # Unique name for this server (e.g., "git", "exa")
-  command @1 :Text;           # Command to run (e.g., "uvx", "npx")
-  args @2 :List(Text);        # Arguments for the command
+  command @1 :Text;           # Command to run (e.g., "uvx", "npx") — stdio only
+  args @2 :List(Text);        # Arguments for the command — stdio only
   env @3 :List(EnvVar);       # Environment variables
-  cwd @4 :Text;               # Working directory (optional)
+  cwd @4 :Text;               # Working directory (optional) — stdio only
+  transport @5 :Text;         # "stdio" (default) or "streamable_http"
+  url @6 :Text;               # Server URL — streamable_http only
 }
 
 struct EnvVar {

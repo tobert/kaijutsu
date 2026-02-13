@@ -32,7 +32,7 @@ use kaijutsu_kernel::{
     // File tools
     FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
     // MCP
-    McpServerPool, McpServerConfig, McpToolEngine,
+    McpServerPool, McpServerConfig, McpTransport, McpToolEngine,
     // FlowBus
     BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
     SharedConfigFlowBus, shared_config_flow_bus,
@@ -411,6 +411,69 @@ async fn initialize_kernel_llm(
     }
 }
 
+/// Initialize MCP servers from kernel's `mcp.rhai` config.
+///
+/// Loads `mcp.rhai` from the config CRDT, parses server definitions,
+/// and registers them concurrently in the MCP pool.
+async fn initialize_kernel_mcp(
+    kernel: &Arc<Kernel>,
+    config_backend: &Arc<ConfigCrdtBackend>,
+    mcp_pool: &Arc<McpServerPool>,
+) {
+    if let Err(e) = config_backend.ensure_config("mcp.rhai").await {
+        log::warn!("Failed to load mcp.rhai: {}", e);
+        return;
+    }
+    let script = match config_backend.get_content("mcp.rhai") {
+        Ok(content) => content,
+        Err(e) => {
+            log::warn!("Failed to read mcp.rhai content: {}", e);
+            return;
+        }
+    };
+
+    let config = match kaijutsu_kernel::load_mcp_config(&script) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to parse mcp.rhai: {}", e);
+            return;
+        }
+    };
+
+    if config.servers.is_empty() {
+        return;
+    }
+
+    log::info!("Registering {} MCP servers from mcp.rhai", config.servers.len());
+
+    // Launch all servers concurrently
+    let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
+        let pool = mcp_pool.clone();
+        let kernel = kernel.clone();
+        let name = server_config.name.clone();
+        async move {
+            match pool.register(server_config).await {
+                Ok(info) => {
+                    let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
+                    for (qualified_name, engine) in tools {
+                        let desc = engine.description().to_string();
+                        kernel.register_tool_with_engine(
+                            ToolInfo::new(&qualified_name, &desc, "mcp"),
+                            engine,
+                        ).await;
+                    }
+                    log::info!("MCP server '{}' registered ({} tools)", name, info.tools.len());
+                }
+                Err(e) => {
+                    log::warn!("MCP server '{}' failed to register: {}", name, e);
+                }
+            }
+        }
+    }).collect();
+
+    futures::future::join_all(futs).await;
+}
+
 pub struct KernelState {
     pub id: String,
     pub name: String,
@@ -586,6 +649,10 @@ impl world::Server for WorldImpl {
                 // Initialize LLM registry from llm.rhai config
                 initialize_kernel_llm(&kernel_arc, &config_backend).await;
 
+                // Initialize MCP servers from mcp.rhai config
+                let mcp_pool = state.borrow().mcp_pool.clone();
+                initialize_kernel_mcp(&kernel_arc, &config_backend, &mcp_pool).await;
+
                 // Create default context
                 let mut contexts = HashMap::new();
                 contexts.insert("default".to_string(), ContextState::new("default".to_string()));
@@ -692,6 +759,10 @@ impl world::Server for WorldImpl {
 
             // Initialize LLM registry from llm.rhai config
             initialize_kernel_llm(&kernel_arc, &config_backend).await;
+
+            // Initialize MCP servers from mcp.rhai config
+            let mcp_pool = state.borrow().mcp_pool.clone();
+            initialize_kernel_mcp(&kernel_arc, &config_backend, &mcp_pool).await;
 
             // Create default context
             let mut contexts = HashMap::new();
@@ -2042,12 +2113,36 @@ impl kernel::Server for KernelImpl {
             None
         };
 
+        // Get transport type (default: stdio)
+        let transport = if config_reader.has_transport() {
+            match pry!(config_reader.get_transport()).to_str() {
+                Ok("streamable_http") => McpTransport::StreamableHttp,
+                _ => McpTransport::Stdio,
+            }
+        } else {
+            McpTransport::Stdio
+        };
+
+        // Get URL (for streamable HTTP transport)
+        let url = if config_reader.has_url() {
+            let url_reader = pry!(config_reader.get_url());
+            if let Ok(url_str) = url_reader.to_str() {
+                if url_str.is_empty() { None } else { Some(url_str.to_owned()) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let config = McpServerConfig {
             name: name.clone(),
             command,
             args,
             env,
             cwd,
+            transport,
+            url,
         };
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
