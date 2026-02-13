@@ -120,70 +120,17 @@ pub fn init_cell_buffers(
 
 /// Format content blocks for display.
 ///
-/// This produces a text representation with visual markers for different block types.
-/// Collapsed thinking blocks are shown as a single line.
+/// Delegates to `format_single_block` for each block, joining with blank lines.
 fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
     if blocks.is_empty() {
         return String::new();
     }
 
-    let mut output = String::new();
-
-    for (i, block) in blocks.iter().enumerate() {
-        if i > 0 {
-            output.push_str("\n\n");
-        }
-
-        match block.kind {
-            BlockKind::Thinking => {
-                if block.collapsed {
-                    // Collapsed: show indicator
-                    output.push_str("💭 [Thinking collapsed - Tab to expand]");
-                } else {
-                    // Expanded: show with dimmed header
-                    output.push_str("💭 ─── Thinking ───\n");
-                    output.push_str(&block.content);
-                    output.push_str("\n───────────────────");
-                }
-            }
-            BlockKind::Text => {
-                output.push_str(&block.content);
-            }
-            BlockKind::ToolCall => {
-                output.push_str("🔧 Tool: ");
-                if let Some(ref name) = block.tool_name {
-                    output.push_str(name);
-                }
-                output.push('\n');
-                // Pretty-print JSON input with real newlines in string values
-                if let Some(ref input) = block.tool_input {
-                    output.push_str(&display_json_value(input, 0));
-                }
-            }
-            BlockKind::ToolResult => {
-                if block.is_error {
-                    output.push_str("❌ Error:\n");
-                } else {
-                    output.push_str("📤 Result:\n");
-                }
-                output.push_str(&block.content);
-            }
-            BlockKind::ShellCommand => {
-                output.push_str("$ ");
-                output.push_str(&block.content);
-            }
-            BlockKind::ShellOutput => {
-                // Use display hint for richer formatting (tables, trees)
-                let formatted = format_for_display(&block.content, block.display_hint.as_deref());
-                output.push_str(&formatted.text);
-            }
-            BlockKind::Drift => {
-                output.push_str(&format_drift_block(block, None));
-            }
-        }
-    }
-
-    output
+    blocks
+        .iter()
+        .map(|b| format_single_block(b, None))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Strip provider prefix from model name for compact display.
@@ -275,10 +222,10 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String 
             draw_box(&header, &block.content, width)
         }
         Some(DriftKind::Commit) => {
-            format!("📝 {}  {}\n", ctx_label, block.content.lines().next().unwrap_or(""))
+            format!("# {}  {}\n", ctx_label, block.content.lines().next().unwrap_or(""))
         }
         None => {
-            format!("🌊 {} ({})  {}\n", ctx_label, model, block.content.lines().next().unwrap_or(""))
+            format!("~ {} ({})  {}\n", ctx_label, model, block.content.lines().next().unwrap_or(""))
         }
     }
 }
@@ -1623,18 +1570,79 @@ fn display_json_value(value: &serde_json::Value, indent: usize) -> String {
     }
 }
 
+/// Format tool call arguments as compact key: value lines.
+///
+/// Flat JSON objects render as `key: value` per line (unquoted strings).
+/// Multiline string values show first line + `(N lines)` suffix.
+/// Values > 60 chars are truncated. Total > 5 lines shows first 4 + count.
+/// Non-object inputs fall through to `display_json_value`.
+fn format_tool_args(value: &serde_json::Value) -> String {
+    let obj = match value.as_object() {
+        Some(o) if !o.is_empty() => o,
+        _ => return display_json_value(value, 0),
+    };
+
+    let max_lines = 5;
+    let max_value_len = 60;
+    let mut lines: Vec<String> = Vec::new();
+
+    for (key, val) in obj {
+        let formatted = match val {
+            serde_json::Value::String(s) => {
+                let first_line = s.lines().next().unwrap_or("");
+                let line_count = s.lines().count();
+                if line_count > 1 {
+                    let truncated = if first_line.len() > max_value_len {
+                        format!("{}...", &first_line[..max_value_len])
+                    } else {
+                        first_line.to_string()
+                    };
+                    format!("{} ({} lines)", truncated, line_count)
+                } else if s.len() > max_value_len {
+                    format!("{}...", &s[..max_value_len])
+                } else {
+                    s.clone()
+                }
+            }
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            // Nested objects/arrays: compact single-line JSON
+            other => {
+                let json = serde_json::to_string(other).unwrap_or_default();
+                if json.len() > max_value_len {
+                    format!("{}...", &json[..max_value_len])
+                } else {
+                    json
+                }
+            }
+        };
+        lines.push(format!("{}: {}", key, formatted));
+    }
+
+    if lines.len() > max_lines {
+        let remaining = lines.len() - (max_lines - 1);
+        lines.truncate(max_lines - 1);
+        lines.push(format!("... ({} more)", remaining));
+    }
+
+    lines.join("\n")
+}
+
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
 /// `local_ctx`: optional local context ID for drift push direction.
 pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
+    let width = 72;
+
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
-                "💭 [Thinking collapsed - Tab to expand]".to_string()
+                "─── Thinking [collapsed] ───".to_string()
             } else {
                 format!(
-                    "💭 ─── Thinking ───\n{}\n───────────────────",
+                    "─── Thinking ───\n{}\n───────────────────",
                     block.content
                 )
             }
@@ -1642,17 +1650,42 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
         BlockKind::Text => block.content.clone(),
         BlockKind::ToolCall => {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
-            let mut output = format!("🔧 Tool: {}\n", name);
-            if let Some(ref input) = block.tool_input {
-                output.push_str(&display_json_value(input, 0));
+            let status_tag = match block.status {
+                kaijutsu_crdt::Status::Running => " [running]",
+                kaijutsu_crdt::Status::Pending => " [pending]",
+                _ => "",
+            };
+            let header = format!("{}{}", name, status_tag);
+
+            match &block.tool_input {
+                Some(input) if !input.is_null() => {
+                    let args = format_tool_args(input);
+                    if args.is_empty() {
+                        format!("─── {} ───", header)
+                    } else {
+                        draw_box(&header, &args, width)
+                    }
+                }
+                _ => format!("─── {} ───", header),
             }
-            output
         }
         BlockKind::ToolResult => {
+            let content = block.content.trim();
             if block.is_error {
-                format!("❌ Error:\n{}", block.content)
+                if content.is_empty() {
+                    "─── error ✗ ───".to_string()
+                } else {
+                    draw_box("error ✗", content, width)
+                }
+            } else if content.is_empty() {
+                "─── done ───".to_string()
             } else {
-                format!("📤 Result:\n{}", block.content)
+                let line_count = content.lines().count();
+                if line_count <= 3 {
+                    format!("─── done ───\n{}", content)
+                } else {
+                    draw_box("result", content, width)
+                }
             }
         }
         BlockKind::ShellCommand => {
@@ -2571,5 +2604,257 @@ pub fn update_compose_cursor(
         material.time.y = CursorMode::Beam as u8 as f32;
         material.color = theme.cursor_insert;
         material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_crdt::{BlockId, Role, Status};
+
+    fn test_block_id() -> BlockId {
+        BlockId {
+            document_id: "test-doc".to_string(),
+            agent_id: "test-agent".to_string(),
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn test_format_tool_args_flat_object() {
+        let input = serde_json::json!({
+            "path": "/etc/hosts",
+            "limit": 10
+        });
+        let result = format_tool_args(&input);
+        assert!(result.contains("path: /etc/hosts"));
+        assert!(result.contains("limit: 10"));
+    }
+
+    #[test]
+    fn test_format_tool_args_truncates_long_values() {
+        let long_val = "x".repeat(80);
+        let input = serde_json::json!({ "data": long_val });
+        let result = format_tool_args(&input);
+        assert!(result.contains("..."));
+        assert!(result.len() < 80);
+    }
+
+    #[test]
+    fn test_format_tool_args_multiline_string() {
+        let input = serde_json::json!({
+            "content": "line1\nline2\nline3\nline4"
+        });
+        let result = format_tool_args(&input);
+        assert!(result.contains("line1"));
+        assert!(result.contains("(4 lines)"));
+    }
+
+    #[test]
+    fn test_format_tool_args_many_keys_truncated() {
+        let input = serde_json::json!({
+            "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6
+        });
+        let result = format_tool_args(&input);
+        assert!(result.contains("... ("));
+        assert!(result.contains("more)"));
+    }
+
+    #[test]
+    fn test_format_tool_args_empty_object() {
+        let input = serde_json::json!({});
+        let result = format_tool_args(&input);
+        assert_eq!(result, "{}");
+    }
+
+    #[test]
+    fn test_format_tool_args_non_object() {
+        let input = serde_json::json!("just a string");
+        let result = format_tool_args(&input);
+        assert!(result.contains("just a string"));
+    }
+
+    #[test]
+    fn test_tool_call_box_drawing() {
+        let block = BlockSnapshot::tool_call(
+            test_block_id(),
+            None,
+            "read_file",
+            serde_json::json!({"path": "/etc/hosts"}),
+            "test",
+        );
+        let result = format_single_block(&block, None);
+        // Should use box-drawing characters
+        assert!(result.contains('┌'));
+        assert!(result.contains('└'));
+        assert!(result.contains("read_file"));
+        assert!(result.contains("path: /etc/hosts"));
+        // Running status tag (tool_call constructor sets Running)
+        assert!(result.contains("[running]"));
+    }
+
+    #[test]
+    fn test_tool_call_empty_args() {
+        let mut block = BlockSnapshot::tool_call(
+            test_block_id(),
+            None,
+            "list_all",
+            serde_json::json!(null),
+            "test",
+        );
+        block.status = Status::Done;
+        let result = format_single_block(&block, None);
+        assert!(result.contains("─── list_all ───"));
+        assert!(!result.contains('┌')); // No box for empty args
+    }
+
+    #[test]
+    fn test_tool_result_success_empty() {
+        let result_block = BlockSnapshot::tool_result(
+            test_block_id(),
+            test_block_id(),
+            "",
+            false,
+            Some(0),
+            "test",
+        );
+        let result = format_single_block(&result_block, None);
+        assert_eq!(result, "─── done ───");
+    }
+
+    #[test]
+    fn test_tool_result_success_short() {
+        let result_block = BlockSnapshot::tool_result(
+            test_block_id(),
+            test_block_id(),
+            "file contents here",
+            false,
+            Some(0),
+            "test",
+        );
+        let result = format_single_block(&result_block, None);
+        assert!(result.starts_with("─── done ───\n"));
+        assert!(result.contains("file contents here"));
+    }
+
+    #[test]
+    fn test_tool_result_success_long() {
+        let content = "line1\nline2\nline3\nline4\nline5";
+        let result_block = BlockSnapshot::tool_result(
+            test_block_id(),
+            test_block_id(),
+            content,
+            false,
+            Some(0),
+            "test",
+        );
+        let result = format_single_block(&result_block, None);
+        assert!(result.contains('┌'));
+        assert!(result.contains("result"));
+    }
+
+    #[test]
+    fn test_tool_result_error() {
+        let result_block = BlockSnapshot::tool_result(
+            test_block_id(),
+            test_block_id(),
+            "permission denied",
+            true,
+            Some(1),
+            "test",
+        );
+        let result = format_single_block(&result_block, None);
+        assert!(result.contains("error ✗"));
+        assert!(result.contains("permission denied"));
+    }
+
+    #[test]
+    fn test_tool_result_error_empty() {
+        let result_block = BlockSnapshot::tool_result(
+            test_block_id(),
+            test_block_id(),
+            "",
+            true,
+            Some(1),
+            "test",
+        );
+        let result = format_single_block(&result_block, None);
+        assert_eq!(result, "─── error ✗ ───");
+    }
+
+    #[test]
+    fn test_thinking_no_emoji() {
+        let block = BlockSnapshot::thinking(test_block_id(), None, "reasoning here", "test");
+        let result = format_single_block(&block, None);
+        assert!(!result.contains('💭'));
+        assert!(result.contains("─── Thinking ───"));
+        assert!(result.contains("reasoning here"));
+    }
+
+    #[test]
+    fn test_thinking_collapsed_no_emoji() {
+        let mut block = BlockSnapshot::thinking(test_block_id(), None, "reasoning", "test");
+        block.collapsed = true;
+        let result = format_single_block(&block, None);
+        assert!(!result.contains('💭'));
+        assert!(result.contains("─── Thinking [collapsed] ───"));
+    }
+
+    #[test]
+    fn test_format_blocks_delegates_to_format_single_block() {
+        let blocks = vec![
+            BlockSnapshot::text(test_block_id(), None, Role::User, "hello", "test"),
+            BlockSnapshot::text(test_block_id(), None, Role::Model, "world", "test"),
+        ];
+        let result = format_blocks_for_display(&blocks);
+        assert_eq!(result, "hello\n\nworld");
+    }
+
+    #[test]
+    fn test_format_blocks_empty() {
+        assert_eq!(format_blocks_for_display(&[]), "");
+    }
+
+    #[test]
+    fn test_drift_commit_no_emoji() {
+        let block = BlockSnapshot::drift(
+            test_block_id(),
+            None,
+            "checkpoint summary",
+            "test",
+            "ctx-abc",
+            None,
+            DriftKind::Commit,
+        );
+        let result = format_single_block(&block, None);
+        assert!(!result.contains('📝'));
+        assert!(result.starts_with("# @ctx-abc"));
+    }
+
+    #[test]
+    fn test_drift_none_no_emoji() {
+        let mut block = BlockSnapshot::drift(
+            test_block_id(),
+            None,
+            "some drift content",
+            "test",
+            "ctx-xyz",
+            Some("claude".to_string()),
+            DriftKind::Push, // We'll override drift_kind
+        );
+        block.drift_kind = None;
+        let result = format_single_block(&block, None);
+        assert!(!result.contains('🌊'));
+        assert!(result.starts_with("~ @ctx-xyz"));
+    }
+
+    #[test]
+    fn test_draw_box_basic() {
+        let result = draw_box("header", "content", 40);
+        assert!(result.contains("┌─ header"));
+        assert!(result.contains("│ content"));
+        assert!(result.contains('└'));
+        assert!(result.contains('┐'));
+        assert!(result.contains('┘'));
     }
 }

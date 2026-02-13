@@ -81,6 +81,7 @@ impl SharedFontSystem {
         let font_paths = [
             "assets/fonts/NotoMono-Regular.ttf",
             "assets/fonts/NotoSerif-Regular.ttf",
+            "assets/fonts/NotoEmoji-Regular.ttf",
             // Fallback to test location if fonts haven't been moved yet
             "assets/test/fonts/NotoMono-Regular.ttf",
             "assets/test/fonts/NotoSerif-Regular.ttf",
