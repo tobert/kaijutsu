@@ -1258,4 +1258,57 @@ mod tests {
             sync.pending_ops_count()
         );
     }
+
+    /// Test 4d: Sync buffer overflow test.
+    ///
+    /// Validates that when pending_ops reaches MAX_PENDING_OPS, the next buffer
+    /// operation triggers a reset() instead of dropping ops. This ensures the
+    /// buffer cap acts as a circuit breaker rather than a silent failure mode.
+    #[test]
+    fn test_sync_buffer_overflow_triggers_reset() {
+        let mut sync = SyncManager::new();
+
+        // Fill pending_ops to exactly MAX_PENDING_OPS
+        for i in 0..MAX_PENDING_OPS {
+            let fake_ops = format!("ops-{}", i).into_bytes();
+            sync.buffer_failed_ops(None, &fake_ops);
+        }
+
+        assert_eq!(sync.pending_ops_count(), MAX_PENDING_OPS);
+
+        // Buffer one more — should trigger reset()
+        let overflow_ops = b"overflow-ops";
+        sync.buffer_failed_ops(None, overflow_ops);
+
+        // Verify reset() was called:
+        // - frontier becomes None
+        // - pending_ops is cleared
+        assert!(sync.frontier().is_none(), "Frontier should be None after overflow");
+        assert_eq!(sync.pending_ops_count(), 0, "Pending ops should be cleared after overflow");
+    }
+
+    /// Test 4d: Verify buffer_failed_ops behavior at cap.
+    ///
+    /// Directly tests the buffer_failed_ops method's overflow logic.
+    #[test]
+    fn test_buffer_failed_ops_at_cap() {
+        let mut sync = SyncManager::with_state(
+            Some("doc-1".to_string()),
+            Some(Frontier::root()), // Start with a valid frontier
+        );
+
+        // Fill to exactly MAX_PENDING_OPS
+        for i in 0..MAX_PENDING_OPS {
+            sync.buffer_failed_ops(None, &format!("ops-{}", i).into_bytes());
+        }
+
+        let initial_count = sync.pending_ops_count();
+        assert_eq!(initial_count, MAX_PENDING_OPS);
+
+        // Next buffer_failed_ops call should clear everything and reset
+        sync.buffer_failed_ops(None, b"trigger-overflow");
+
+        assert_eq!(sync.pending_ops_count(), 0, "Buffer should be cleared");
+        assert!(sync.frontier().is_none(), "Frontier should be reset");
+    }
 }

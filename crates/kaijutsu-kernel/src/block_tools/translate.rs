@@ -65,28 +65,6 @@ pub fn line_to_byte_offset(content: &str, line: u32) -> Result<usize> {
     }
 }
 
-/// Get the byte offset at the end of a line (start of next line or EOF).
-///
-/// # Arguments
-///
-/// * `content` - The text content
-/// * `line` - 0-indexed line number
-///
-/// # Returns
-///
-/// The byte offset at the end of the specified line (after the newline, or EOF).
-pub fn line_end_byte_offset(content: &str, line: u32) -> Result<usize> {
-    let lines: Vec<&str> = content.lines().collect();
-    let line_count = lines.len() as u32;
-
-    if line >= line_count {
-        return Ok(content.len());
-    }
-
-    // Get the start of line + 1
-    line_to_byte_offset(content, line + 1)
-}
-
 /// Get the byte range for a line range (exclusive end).
 ///
 /// # Arguments

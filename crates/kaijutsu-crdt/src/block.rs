@@ -805,4 +805,33 @@ mod tests {
         let parsed: DriftKind = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, DriftKind::Distill);
     }
+
+    // Part 4a: BlockId path security tests
+
+    #[test]
+    #[should_panic(expected = "document_id must not contain '/'")]
+    fn test_block_id_rejects_slash_in_document_id() {
+        BlockId::new("doc/evil", "agent", 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "agent_id must not contain '/'")]
+    fn test_block_id_rejects_slash_in_agent_id() {
+        BlockId::new("doc", "agent/evil", 1);
+    }
+
+    #[test]
+    fn test_block_id_accepts_valid_ids() {
+        let id = BlockId::new("doc", "agent", 1);
+        assert_eq!(id.document_id, "doc");
+        assert_eq!(id.agent_id, "agent");
+        assert_eq!(id.seq, 1);
+    }
+
+    #[test]
+    fn test_block_id_from_key_rejects_extra_slashes() {
+        // from_key uses splitn(3, '/'), so "a/b/c/d" splits into ["a", "b", "c/d"]
+        // The third part "c/d" will fail to parse as u64, returning None
+        assert_eq!(BlockId::from_key("a/b/c/d"), None);
+    }
 }

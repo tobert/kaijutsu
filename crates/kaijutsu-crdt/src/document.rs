@@ -1877,6 +1877,102 @@ mod tests {
         assert_eq!(blocks[0].kind, BlockKind::Drift);
     }
 
+    /// Test 4b: CRDT ordering stress test — 100 bisections between same siblings.
+    ///
+    /// This test demonstrates the precision limits of the current f64-based ordering.
+    /// After ~40 bisections, floating point precision loss causes order values to
+    /// collide when round-tripped through i64 storage (scaled by 1e12).
+    ///
+    /// This validates the TODO comment in calc_order_index about migrating to
+    /// string-based fractional indexing for unlimited precision.
+    #[test]
+    fn test_crdt_ordering_stress_100_bisections() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+
+        // Create two sentinel blocks to bisect between
+        let first = doc.insert_block(
+            None, None,
+            Role::User, BlockKind::Text,
+            "First", "alice"
+        ).unwrap();
+
+        let _last = doc.insert_block(
+            None, Some(&first),
+            Role::User, BlockKind::Text,
+            "Last", "alice"
+        ).unwrap();
+
+        // Insert 100 blocks between first and last (repeated bisection)
+        let mut middle_ids = Vec::new();
+        for i in 0..100 {
+            let id = doc.insert_block(
+                None, Some(&first), // Always insert after 'first'
+                Role::User, BlockKind::Text,
+                &format!("Middle-{}", i), "alice"
+            ).unwrap();
+            middle_ids.push(id);
+        }
+
+        // All blocks should exist in document
+        let blocks = doc.blocks_ordered();
+        assert_eq!(blocks.len(), 102, "All 102 blocks should be in the document");
+
+        // Collect order values and check precision loss
+        let mut order_values = Vec::new();
+        for block in &blocks {
+            let order_val = doc.get_block_order(&block.id, 0.0);
+            order_values.push(order_val);
+        }
+
+        // Check uniqueness after round-trip through i64 (demonstrates precision loss)
+        let scaled: Vec<i64> = order_values.iter()
+            .map(|&v| (v * 1_000_000_000_000.0) as i64)
+            .collect();
+
+        let unique_count = scaled.iter().collect::<std::collections::HashSet<_>>().len();
+
+        // EXPECTED BEHAVIOR: Precision loss after ~40 bisections
+        // This documents the current limitation and validates the need for
+        // string-based fractional indexing (see TODO in calc_order_index)
+        assert!(
+            unique_count < 102,
+            "Precision loss demonstrated: only {} unique values after 100 bisections (expected < 102)",
+            unique_count
+        );
+
+        // Typically we see ~40-45 unique values before collisions start
+        assert!(
+            unique_count >= 40,
+            "Should maintain uniqueness for at least ~40 bisections, got {}",
+            unique_count
+        );
+
+        // The f64 values ARE strictly ordered (blocks_ordered() uses them to sort)
+        // but repeated bisection causes such small deltas that they're below f64::EPSILON
+        // This demonstrates that even the f64 representation is hitting precision limits
+        // after many bisections, not just the i64 storage format.
+
+        // The key insight: blocks_ordered() still works correctly (uses partial_cmp
+        // which handles tiny deltas), but the ordering becomes fragile.
+
+        // Verify that blocks_ordered maintains insertion order despite tiny deltas
+        // (this is what matters for correctness — the blocks don't randomly shuffle)
+        let block_ids: Vec<_> = blocks.iter().map(|b| &b.id).collect();
+
+        // First should be the first sentinel
+        assert_eq!(block_ids[0], &first, "First block should remain first");
+
+        // The middle blocks should appear in some stable order between the sentinels
+        // (we don't guarantee they're in insertion order after precision loss,
+        // just that they don't corrupt the document structure)
+        for id in &middle_ids {
+            assert!(
+                block_ids.contains(&id),
+                "All inserted blocks should still be present in blocks_ordered()"
+            );
+        }
+    }
+
     /// Test that drift blocks survive fork (metadata preserved with new IDs).
     #[test]
     fn test_fork_preserves_drift_metadata() {

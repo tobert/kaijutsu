@@ -27,18 +27,21 @@ pub fn sync_focus_from_screen(
         return;
     }
 
-    match screen.get() {
-        AppScreen::Dashboard => {
-            *focus = FocusArea::Dashboard;
-        }
+    let target = match screen.get() {
+        AppScreen::Dashboard => FocusArea::Dashboard,
         AppScreen::Conversation => {
-            // Default to Conversation (block navigation) when entering conversation
             // Only change if we're coming from Dashboard — preserve existing focus
             // if already in conversation (e.g. switching between compose/nav)
             if *focus == FocusArea::Dashboard {
-                *focus = FocusArea::Conversation;
+                FocusArea::Conversation
+            } else {
+                return; // already in a conversation-related focus, don't overwrite
             }
         }
+    };
+
+    if *focus != target {
+        *focus = target;
     }
 }
 

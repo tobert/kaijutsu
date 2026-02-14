@@ -1311,4 +1311,42 @@ mod tests {
         assert_eq!(backend.doc_id("kaijutsu", "main"), "kaijutsu:main");
         assert_eq!(backend.doc_id("myrepo", "feat/foo"), "myrepo:feat/foo");
     }
+
+    // Part 4a: Path security tests
+
+    #[test]
+    fn test_resolve_path_rejects_parent_dir() {
+        let blocks = shared_block_store("test");
+        let backend = GitCrdtBackend::new(blocks);
+
+        // Path with .. should be rejected as Outside
+        let result = backend.resolve_path(Path::new("/g/b/../etc/passwd"));
+        assert!(matches!(result, PathResolution::Outside));
+
+        // Path with .. in the middle
+        let result = backend.resolve_path(Path::new("/g/b/repo/../../../etc/passwd"));
+        assert!(matches!(result, PathResolution::Outside));
+
+        // Just .. alone
+        let result = backend.resolve_path(Path::new(".."));
+        assert!(matches!(result, PathResolution::Outside));
+    }
+
+    #[test]
+    fn test_resolve_path_normal_paths_work() {
+        let blocks = shared_block_store("test");
+        let backend = GitCrdtBackend::new(blocks);
+
+        // Normal paths should resolve correctly
+        assert!(matches!(backend.resolve_path(Path::new("/g")), PathResolution::GitRoot));
+        assert!(matches!(backend.resolve_path(Path::new("/g/b")), PathResolution::BareRoot));
+        assert!(matches!(
+            backend.resolve_path(Path::new("/g/b/myrepo")),
+            PathResolution::BareRepo(ref r) if r == "myrepo"
+        ));
+        assert!(matches!(
+            backend.resolve_path(Path::new("/g/b/myrepo/src/main.rs")),
+            PathResolution::BareRepoPath(ref r, ref p) if r == "myrepo" && p == "src/main.rs"
+        ));
+    }
 }

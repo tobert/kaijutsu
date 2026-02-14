@@ -128,8 +128,6 @@ fn main() {
             setup_camera,
             ui::materials::setup_material_cache,
             setup_ui,
-            // NOTE: Legacy InputLayer disabled - ComposeBlock is the new inline input
-            // setup_input_layer,
             ui::debug::setup_debug_overlay,
         ).chain())
         // Update

@@ -39,9 +39,9 @@ pub struct ModelPickerResult(pub Arc<Mutex<Option<FetchedLlmConfig>>>);
 
 /// Fetched LLM config data.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct FetchedLlmConfig {
     pub current_provider: String,
+    #[allow(dead_code)] // read when model picker UI is wired up
     pub current_model: String,
     /// (provider_name, default_model, available)
     pub models: Vec<(String, String, bool)>,
@@ -53,8 +53,8 @@ pub struct FetchedLlmConfig {
 
 /// Marker for the model picker dialog overlay.
 #[derive(Component)]
-#[allow(dead_code)]
 pub struct ModelPickerDialog {
+    #[allow(dead_code)] // read when model picker UI is wired up
     pub context_name: String,
 }
 

@@ -860,7 +860,7 @@ fn short_id(id: &str) -> String {
 pub fn assign_mru_to_empty_panes(
     mut tree: ResMut<TilingTree>,
     doc_cache: Res<crate::cell::DocumentCache>,
-    mut saved_states: Query<(&PaneMarker, &mut PaneSavedState), With<ConversationContainer>>,
+    mut saved_states: Query<(&mut PaneMarker, &mut PaneSavedState), With<ConversationContainer>>,
 ) {
     // Collect panes with empty document_id
     let conv_panes = tree.root.conversation_panes();
@@ -894,9 +894,10 @@ pub fn assign_mru_to_empty_panes(
             // Update the tiling tree
             tree.set_conversation_document(*pane_id, doc_id);
 
-            // Update PaneSavedState
-            for (marker, mut saved) in saved_states.iter_mut() {
+            // Update PaneMarker.content and PaneSavedState
+            for (mut marker, mut saved) in saved_states.iter_mut() {
                 if marker.pane_id == *pane_id {
+                    marker.content = PaneContent::Conversation { document_id: doc_id.to_string() };
                     saved.document_id = doc_id.to_string();
                     break;
                 }

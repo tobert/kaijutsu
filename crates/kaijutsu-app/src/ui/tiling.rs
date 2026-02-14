@@ -80,7 +80,6 @@ pub enum PaneContent {
     /// Context-sensitive key hints.
     Hints,
     /// Static or templated text.
-    #[allow(dead_code)] // Phase 4: custom widget text content
     Text { template: String },
     /// Flexible spacer — grows to fill remaining space.
     Spacer,
@@ -142,9 +141,7 @@ pub enum Edge {
     North,
     #[default]
     South,
-    #[allow(dead_code)] // Phase 4: dock/undock east/west
     East,
-    #[allow(dead_code)] // Phase 4: dock/undock east/west
     West,
 }
 
@@ -815,10 +812,27 @@ impl TilingTree {
             };
 
             let min_ratio = 0.1;
-            ratios[group_idx] = (ratios[group_idx] + delta).clamp(min_ratio, 1.0 - min_ratio);
-            ratios[neighbor_idx] = (ratios[neighbor_idx] - delta).clamp(min_ratio, 1.0 - min_ratio);
 
-            // Renormalize so they sum to the same total
+            // Apply delta first, then normalize, then clamp, then re-normalize.
+            // Clamping before normalization can distort other ratios.
+            ratios[group_idx] += delta;
+            ratios[neighbor_idx] -= delta;
+
+            // First normalize pass
+            let total: f32 = ratios.iter().sum();
+            if total > 0.0 {
+                for r in ratios.iter_mut() {
+                    *r /= total;
+                }
+            }
+
+            // Clamp all ratios
+            let max_ratio = 1.0 - min_ratio * (ratios.len() - 1) as f32;
+            for r in ratios.iter_mut() {
+                *r = r.clamp(min_ratio, max_ratio);
+            }
+
+            // Re-normalize after clamping
             let total: f32 = ratios.iter().sum();
             if total > 0.0 {
                 for r in ratios.iter_mut() {

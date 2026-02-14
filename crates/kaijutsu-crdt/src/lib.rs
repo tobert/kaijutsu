@@ -132,22 +132,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Multi-client sync requires shared initial state - handled by BlockStore in Phase 2"]
+    #[ignore = "diamond-types-extended panics in causalgraph merge — needs upstream fix"]
     fn test_concurrent_block_insertion() {
-        // NOTE: This test requires documents to share a common initial OpLog state.
-        // Independent documents create different CRDT IDs for their "blocks" Sets.
-        // The BlockStore in Phase 2 will handle proper multi-client sync by:
-        // 1. Having a single canonical OpLog per document
-        // 2. Syncing deltas via SerializedOps
-        // 3. Ensuring all clients operate on the same CRDT structure
+        // Both clients start from doc1's initial state (empty doc with "blocks" Set created).
+        // Doc2 merges doc1's initial ops to share the same CRDT structure.
         let mut doc1 = BlockDocument::new("test-doc", "alice");
         let mut doc2 = BlockDocument::new("test-doc", "bob");
+
+        // Share initial state so both operate on the same CRDT structure
+        doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
 
         let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block", "alice").unwrap();
         let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block", "bob").unwrap();
 
-        doc1.merge_ops_owned(doc2.ops_since(&Frontier::root())).unwrap();
-        doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
+        let doc1_frontier = doc1.frontier();
+        let doc2_frontier = doc2.frontier();
+        doc1.merge_ops_owned(doc2.ops_since(&doc1_frontier)).unwrap();
+        doc2.merge_ops_owned(doc1.ops_since(&doc2_frontier)).unwrap();
 
         assert_eq!(doc1.block_count(), 2);
         assert_eq!(doc2.block_count(), 2);
@@ -158,10 +159,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Multi-client sync requires shared initial state - handled by BlockStore in Phase 2"]
+    #[ignore = "diamond-types-extended panics in causalgraph merge — needs upstream fix"]
     fn test_concurrent_text_editing() {
-        // NOTE: Same issue as above - independent documents have different CRDT structures.
-        // For proper convergence, clients must start from the same OpLog state.
         let mut doc1 = BlockDocument::new("test-doc", "alice");
         let mut doc2 = BlockDocument::new("test-doc", "bob");
 

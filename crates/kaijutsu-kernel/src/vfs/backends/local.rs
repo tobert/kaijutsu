@@ -624,4 +624,44 @@ mod tests {
         let result = backend.real_path(Path::new("nonexistent.txt")).await;
         assert!(result.is_err());
     }
+
+    // Part 4a: Path security tests
+
+    #[tokio::test]
+    async fn test_path_with_parent_dir_rejected() {
+        let (backend, _dir) = setup().await;
+
+        // Create a test file to ensure parent exists (for clearer error)
+        backend.create(Path::new("test.txt"), 0o644).await.unwrap();
+
+        // Attempt to escape via ..
+        let result = backend.read(Path::new("../secret.txt"), 0, 100).await;
+        assert!(result.is_err());
+
+        // Verify the error is PathEscapesRoot
+        match result {
+            Err(VfsError::PathEscapesRoot(_)) => {}, // Expected
+            other => panic!("Expected PathEscapesRoot, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_normal_paths_succeed() {
+        let (backend, _dir) = setup().await;
+
+        // Create nested directory structure
+        backend.mkdir(Path::new("subdir/nested"), 0o755).await.unwrap();
+        backend.create(Path::new("subdir/nested/file.txt"), 0o644).await.unwrap();
+        backend.write(Path::new("subdir/nested/file.txt"), 0, b"content").await.unwrap();
+
+        // Normal paths should work fine
+        let data = backend.read(Path::new("subdir/nested/file.txt"), 0, 100).await.unwrap();
+        assert_eq!(data, b"content");
+
+        // Root-level file
+        backend.create(Path::new("root.txt"), 0o644).await.unwrap();
+        backend.write(Path::new("root.txt"), 0, b"root").await.unwrap();
+        let data = backend.read(Path::new("root.txt"), 0, 100).await.unwrap();
+        assert_eq!(data, b"root");
+    }
 }

@@ -27,6 +27,10 @@ use crate::ui::theme::Theme;
 #[derive(Resource, Default)]
 pub struct ModalDialogOpen(pub bool);
 
+/// Saves the FocusArea before a dialog opens so it can be restored on close.
+#[derive(Resource, Default)]
+pub struct DialogPreviousFocus(pub Option<FocusArea>);
+
 // ============================================================================
 // DIALOG MODE
 // ============================================================================
@@ -89,6 +93,7 @@ pub struct InputTextDisplay;
 /// Setup the create dialog systems
 pub fn setup_create_dialog_systems(app: &mut App) {
     app.init_resource::<ModalDialogOpen>()
+        .init_resource::<DialogPreviousFocus>()
         .register_type::<CreateContextNode>()
         .add_message::<OpenContextDialog>()
         .add_systems(
@@ -198,6 +203,7 @@ fn handle_create_node_click(
     theme: Res<Theme>,
     mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut prev_focus: ResMut<DialogPreviousFocus>,
     create_nodes: Query<&Interaction, (Changed<Interaction>, With<CreateContextNode>)>,
     existing_dialog: Query<Entity, With<CreateContextDialog>>,
 ) {
@@ -209,6 +215,7 @@ fn handle_create_node_click(
         if *interaction == Interaction::Pressed {
             info!("Create context node clicked - spawning dialog");
             modal_state.0 = true;
+            prev_focus.0 = Some(focus.clone());
             *focus = FocusArea::Dialog;
             spawn_context_dialog(&mut commands, &theme, DialogMode::CreateContext);
         }
@@ -221,6 +228,7 @@ fn handle_open_dialog_message(
     theme: Res<Theme>,
     mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut prev_focus: ResMut<DialogPreviousFocus>,
     mut events: MessageReader<OpenContextDialog>,
     existing_dialog: Query<Entity, With<CreateContextDialog>>,
 ) {
@@ -231,6 +239,7 @@ fn handle_open_dialog_message(
     for OpenContextDialog(mode) in events.read() {
         info!("Opening context dialog: {:?}", mode);
         modal_state.0 = true;
+        prev_focus.0 = Some(focus.clone());
         *focus = FocusArea::Dialog;
         spawn_context_dialog(&mut commands, &theme, mode.clone());
     }
@@ -389,6 +398,7 @@ fn handle_dialog_input(
     mut text_events: MessageReader<TextInputReceived>,
     mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut prev_focus: ResMut<DialogPreviousFocus>,
     mut input_query: Query<&mut ContextNameInput>,
     mut text_query: Query<&mut MsdfUiText, With<InputTextDisplay>>,
     dialog_query: Query<(Entity, &CreateContextDialog)>,
@@ -425,13 +435,13 @@ fn handle_dialog_input(
                     && let Ok((dialog_entity, dialog)) = dialog_query.single()
                 {
                     submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
-                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus, &mut prev_focus);
                 }
             }
             Action::Unfocus => {
                 if let Ok((dialog_entity, _)) = dialog_query.single() {
                     info!("Dialog cancelled (Escape)");
-                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+                    close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus, &mut prev_focus);
                 }
             }
             _ => {}
@@ -461,19 +471,16 @@ fn handle_dialog_input(
     }
 }
 
-/// Close the dialog and restore focus.
-///
-/// Known limitation: hardcoded return to Constellation. If dialogs are ever
-/// opened from non-constellation contexts (e.g. global settings), this should
-/// save the previous FocusArea on open and restore it here.
+/// Close the dialog and restore focus to what it was before the dialog opened.
 fn close_dialog(
     commands: &mut Commands,
     dialog_entity: Entity,
     modal_state: &mut ModalDialogOpen,
     focus: &mut FocusArea,
+    prev_focus: &mut DialogPreviousFocus,
 ) {
     modal_state.0 = false;
-    *focus = FocusArea::Constellation;
+    *focus = prev_focus.0.take().unwrap_or(FocusArea::Constellation);
     commands.entity(dialog_entity).despawn();
 }
 
@@ -482,6 +489,7 @@ fn handle_dialog_buttons(
     mut commands: Commands,
     mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut prev_focus: ResMut<DialogPreviousFocus>,
     submit_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextSubmit>)>,
     cancel_query: Query<&Interaction, (Changed<Interaction>, With<CreateContextCancel>)>,
     input_query: Query<&ContextNameInput>,
@@ -500,14 +508,14 @@ fn handle_dialog_buttons(
             && !input.text.is_empty()
         {
             submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
-            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus, &mut prev_focus);
         }
     }
 
     for interaction in cancel_query.iter() {
         if *interaction == Interaction::Pressed {
             info!("Dialog cancelled");
-            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+            close_dialog(&mut commands, dialog_entity, &mut modal_state, &mut focus, &mut prev_focus);
         }
     }
 }

@@ -294,6 +294,7 @@ pub fn compute_cell_heights(
         // For MainCell, don't cap height - we need full content height for scrolling
         let content_height = if main_cell.is_some() {
             // Full height without max cap, tight padding
+            // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
             (line_count as f32) * layout.line_height + 4.0
         } else {
             // Other cells use capped height
@@ -2171,6 +2172,7 @@ pub fn layout_block_cells(
         let border_v_padding = border_style
             .map(|s| s.padding.vertical())
             .unwrap_or(0.0);
+        // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
         let height = (line_count as f32) * layout.line_height + 4.0 + border_v_padding;
 
         block_layout.y_offset = y_offset;

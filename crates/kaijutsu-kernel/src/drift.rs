@@ -1491,4 +1491,73 @@ mod tests {
         };
         assert!(parent_sees_child);
     }
+
+    /// Test 4c: Drift flush re-queue test.
+    ///
+    /// When flush encounters a nonexistent target context, the drift items should
+    /// be re-queued rather than lost. This test verifies that failed flushes preserve
+    /// staged drifts for future delivery.
+    #[test]
+    fn test_drift_flush_requeue_on_missing_target() {
+        let mut router = DriftRouter::new();
+        let src = router.register("source", "doc-src", None);
+        let tgt = router.register("target", "doc-tgt", None);
+
+        // Stage a drift to target
+        let staged_id = router
+            .stage(&src, &tgt, "test content".into(), None, DriftKind::Push)
+            .unwrap();
+
+        // Verify it's in the queue
+        assert_eq!(router.queue().len(), 1);
+        assert_eq!(router.queue()[0].id, staged_id);
+
+        // Unregister target (simulating context shutdown)
+        router.unregister(&tgt);
+
+        // Manually drain and attempt to deliver (simulating flush logic)
+        let staged = router.drain(None);
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].id, staged_id);
+
+        // Target is missing — would fail in actual flush. Re-queue via requeue()
+        router.requeue(staged);
+
+        // Verify staging queue still contains the failed item
+        assert_eq!(router.queue().len(), 1);
+        assert_eq!(router.queue()[0].id, staged_id);
+        assert_eq!(router.queue()[0].content, "test content");
+    }
+
+    /// Test 4c: Direct requeue() method test.
+    ///
+    /// Verifies that the requeue() method correctly restores items to the staging queue.
+    #[test]
+    fn test_requeue_method() {
+        let mut router = DriftRouter::new();
+        let src = router.register("source", "doc-src", None);
+        let tgt = router.register("target", "doc-tgt", None);
+
+        // Stage multiple drifts
+        let id1 = router
+            .stage(&src, &tgt, "first".into(), None, DriftKind::Push)
+            .unwrap();
+        let id2 = router
+            .stage(&src, &tgt, "second".into(), None, DriftKind::Push)
+            .unwrap();
+
+        // Drain all
+        let drained = router.drain(None);
+        assert_eq!(drained.len(), 2);
+        assert!(router.queue().is_empty());
+
+        // Re-queue them
+        router.requeue(drained);
+
+        // Both should be back in the queue
+        assert_eq!(router.queue().len(), 2);
+        let ids: Vec<_> = router.queue().iter().map(|s| s.id).collect();
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+    }
 }

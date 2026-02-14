@@ -828,6 +828,7 @@ fn activity_to_color(activity: ActivityState, theme: &Theme) -> Color {
 }
 
 /// Truncate context name for display in node
+// TODO(dedup): identical to mini.rs truncate_name — extract shared helper
 fn truncate_context_name(name: &str, max_len: usize) -> String {
     if name.len() <= max_len {
         name.to_string()

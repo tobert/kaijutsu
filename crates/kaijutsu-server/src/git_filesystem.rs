@@ -30,6 +30,7 @@ impl GitFilesystem {
 }
 
 /// Convert a `BackendError` to an `io::Error`.
+// TODO(dedup): identical to docs_filesystem.rs backend_to_io — extract shared helper
 fn backend_to_io(err: BackendError) -> io::Error {
     match err {
         BackendError::NotFound(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
@@ -50,6 +51,7 @@ fn backend_to_io(err: BackendError) -> io::Error {
 }
 
 /// Convert a kaish-kernel `EntryInfo` to a kaish `DirEntry`.
+// TODO(dedup): identical to mount_backend.rs entry_info_to_dir_entry — extract shared helper
 fn entry_info_to_dir_entry(info: &kaish_kernel::EntryInfo) -> DirEntry {
     let entry_type = if info.is_dir {
         EntryType::Directory

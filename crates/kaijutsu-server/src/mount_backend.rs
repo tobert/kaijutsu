@@ -58,6 +58,7 @@ impl MountBackend {
     }
 }
 
+// TODO(dedup): entry_info_to_dir_entry below is identical to git_filesystem.rs — extract shared helper
 /// Convert a `VfsError` to a `BackendError`.
 fn vfs_to_backend(err: VfsError) -> BackendError {
     match err {
