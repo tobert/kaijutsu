@@ -270,15 +270,19 @@ fn update_mini_render_content(
     }
 }
 
-/// Handle clicking on constellation nodes to focus them
+/// Handle clicking on constellation nodes to focus them and switch context.
 fn handle_mini_render_click(
     mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     node_query: Query<(&ConstellationNode, &Interaction), Changed<Interaction>>,
 ) {
     for (node, interaction) in node_query.iter() {
         if *interaction == Interaction::Pressed {
             info!("Mini-render clicked: {}", node.context_id);
             constellation.focus(&node.context_id);
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_name: node.context_id.clone(),
+            });
         }
     }
 }

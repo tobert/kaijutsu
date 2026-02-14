@@ -341,6 +341,11 @@ impl GitCrdtBackend {
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Reject path traversal attempts
+        if components.iter().any(|c| *c == "..") {
+            return PathResolution::Outside;
+        }
+
         match components.as_slice() {
             // Root: /g
             [] | ["g"] => PathResolution::GitRoot,

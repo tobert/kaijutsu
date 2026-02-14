@@ -492,10 +492,19 @@ fn update_node_positions(
 }
 
 /// Count descendants (including self) for angular sector sizing.
+/// Depth-limited to prevent stack overflow from malformed cyclic parentage data.
 fn count_tree_descendants(idx: usize, children: &[Vec<usize>]) -> usize {
+    count_tree_descendants_inner(idx, children, 0)
+}
+
+fn count_tree_descendants_inner(idx: usize, children: &[Vec<usize>], depth: usize) -> usize {
+    const MAX_DEPTH: usize = 64;
+    if depth >= MAX_DEPTH {
+        return 1;
+    }
     let mut count = 1; // self
     for &child in &children[idx] {
-        count += count_tree_descendants(child, children);
+        count += count_tree_descendants_inner(child, children, depth + 1);
     }
     count
 }

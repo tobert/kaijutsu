@@ -34,8 +34,12 @@ pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub async fn connect_ssh(config: SshConfig) -> Result<RpcClient, ConnectError> {
     let mut ssh = SshClient::new(config);
     let channels = ssh.connect().await?;
+    // Retain control/events channels — dropping them sends SSH_MSG_CHANNEL_CLOSE
+    let control = channels.control;
+    let events = channels.events;
     let rpc_stream = channels.rpc.into_stream();
-    let client = RpcClient::new(rpc_stream).await?;
+    let mut client = RpcClient::new(rpc_stream).await?;
+    client.retain_ssh_channels(control, events);
     Ok(client)
 }
 

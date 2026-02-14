@@ -159,12 +159,13 @@ impl SyncManager {
     /// (e.g., when the BlockInserted event finally arrives).
     fn buffer_failed_ops(&mut self, block_id: Option<&BlockId>, ops: &[u8]) {
         if self.pending_ops.len() >= MAX_PENDING_OPS {
-            let drop_count = self.pending_ops.len() - MAX_PENDING_OPS + 1;
             warn!(
-                "Pending ops buffer full ({}/{}), dropping {} oldest entries",
-                self.pending_ops.len(), MAX_PENDING_OPS, drop_count
+                "Pending ops buffer full ({}/{}), triggering full resync instead of dropping ops",
+                self.pending_ops.len(), MAX_PENDING_OPS
             );
-            self.pending_ops.drain(..drop_count);
+            self.pending_ops.clear();
+            self.reset();
+            return;
         }
         info!(
             "Buffering failed ops for block {:?} ({} bytes, {} pending total)",

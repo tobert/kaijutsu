@@ -4247,13 +4247,15 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_string());
         let staged = state.drift_router.drain(caller_ctx.as_deref());
         let count = staged.len() as u32;
+        let mut failed: Vec<kaijutsu_kernel::StagedDrift> = Vec::new();
 
-        for drift in &staged {
+        for drift in staged {
             // Look up target kernel's documents
             let target_kernel_id = match state.drift_router.get(&drift.target_ctx) {
                 Some(h) => h.context_name.clone(),
                 None => {
-                    log::warn!("Drift flush: target context {} not found, skipping", drift.target_ctx);
+                    log::warn!("Drift flush: target context {} not found, re-queuing", drift.target_ctx);
+                    failed.push(drift);
                     continue;
                 }
             };
@@ -4261,14 +4263,15 @@ impl kernel::Server for KernelImpl {
             let (documents, main_doc_id) = match state.kernels.get(&target_kernel_id) {
                 Some(ks) => (ks.documents.clone(), ks.main_document_id.clone()),
                 None => {
-                    log::warn!("Drift flush: kernel {} not found, skipping", target_kernel_id);
+                    log::warn!("Drift flush: kernel {} not found, re-queuing", target_kernel_id);
+                    failed.push(drift);
                     continue;
                 }
             };
 
             // Build drift block snapshot
             let author = format!("drift:{}", drift.source_ctx);
-            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(drift, &author);
+            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&drift, &author);
 
             // Get last block in target document for ordering
             let after = documents.last_block_id(&main_doc_id);
@@ -4282,9 +4285,16 @@ impl kernel::Server for KernelImpl {
                     );
                 }
                 Err(e) => {
-                    log::error!("Drift flush failed for {} → {}: {}", drift.source_ctx, drift.target_ctx, e);
+                    log::error!("Drift flush failed for {} → {}: {}, re-queuing", drift.source_ctx, drift.target_ctx, e);
+                    failed.push(drift);
                 }
             }
+        }
+
+        // Re-queue any failed items so they aren't lost
+        if !failed.is_empty() {
+            log::warn!("Re-queued {} failed drift items", failed.len());
+            state.drift_router.requeue(failed);
         }
 
         results.get().set_count(count);

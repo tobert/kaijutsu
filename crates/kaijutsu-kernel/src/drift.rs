@@ -290,6 +290,7 @@ impl DriftRouter {
     /// matches the given context. Otherwise drains everything.
     ///
     /// The caller is responsible for injecting blocks into target documents.
+    /// Failed items should be returned via [`requeue`](Self::requeue).
     pub fn drain(&mut self, for_context: Option<&str>) -> Vec<StagedDrift> {
         match for_context {
             None => std::mem::take(&mut self.staging),
@@ -302,6 +303,11 @@ impl DriftRouter {
                 matched
             }
         }
+    }
+
+    /// Re-queue staged drifts that failed to deliver.
+    pub fn requeue(&mut self, items: Vec<StagedDrift>) {
+        self.staging.extend(items);
     }
 
     /// Build a BlockSnapshot for a staged drift, ready for insertion.
@@ -902,21 +908,23 @@ impl ExecutionEngine for DriftFlushEngine {
 
         let count = staged.len();
         let mut injected = 0;
+        let mut failed: Vec<StagedDrift> = Vec::new();
 
-        for drift in &staged {
+        for drift in staged {
             let target_doc_id = {
                 let router = kernel.drift().read().await;
                 match router.get(&drift.target_ctx) {
                     Some(h) => h.document_id.clone(),
                     None => {
-                        tracing::warn!("Drift flush: target context {} not found, skipping", drift.target_ctx);
+                        tracing::warn!("Drift flush: target context {} not found, re-queuing", drift.target_ctx);
+                        failed.push(drift);
                         continue;
                     }
                 }
             };
 
             let author = format!("drift:{}", drift.source_ctx);
-            let snapshot = DriftRouter::build_drift_block(drift, &author);
+            let snapshot = DriftRouter::build_drift_block(&drift, &author);
             let after = self.documents.last_block_id(&target_doc_id);
 
             match self.documents.insert_from_snapshot(&target_doc_id, snapshot, after.as_ref()) {
@@ -925,9 +933,18 @@ impl ExecutionEngine for DriftFlushEngine {
                     injected += 1;
                 }
                 Err(e) => {
-                    tracing::error!("Drift flush failed for {} → {}: {}", drift.source_ctx, drift.target_ctx, e);
+                    tracing::error!("Drift flush failed for {} → {}: {}, re-queuing", drift.source_ctx, drift.target_ctx, e);
+                    failed.push(drift);
                 }
             }
+        }
+
+        // Re-queue any failed items so they aren't lost
+        if !failed.is_empty() {
+            let requeued = failed.len();
+            let mut router = kernel.drift().write().await;
+            router.requeue(failed);
+            tracing::warn!("Re-queued {} failed drift items", requeued);
         }
 
         Ok(ExecResult::success(format!("Flushed {} drifts ({} injected)", count, injected)))

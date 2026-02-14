@@ -161,7 +161,7 @@ impl BlockDocument {
                 // Get order value from root map
                 let order_val = self.doc.root().get(&order_key)
                     .and_then(|v| v.as_int())
-                    .map(|n| n as f64 / 1_000_000.0)
+                    .map(|n| n as f64 / 1_000_000_000_000.0)
                     .unwrap_or(0.0);
 
                 Some((order_val, block_id))
@@ -347,6 +347,10 @@ impl BlockDocument {
     }
 
     /// Calculate fractional index for insertion.
+    ///
+    /// Order values are stored as `(f64 * 1e12) as i64`, giving ~40 bisections
+    /// before precision loss. TODO: migrate to string-based fractional indexing
+    /// for unlimited precision.
     fn calc_order_index(&self, after: Option<&BlockId>) -> f64 {
         let ordered = self.block_ids_ordered();
 
@@ -361,7 +365,7 @@ impl BlockDocument {
                     let order_key = format!("order:{}", first_key);
                     let first_order = self.doc.root().get(&order_key)
                         .and_then(|v| v.as_int())
-                        .map(|n| n as f64 / 1_000_000.0)
+                        .map(|n| n as f64 / 1_000_000_000_000.0)
                         .unwrap_or(1.0);
                     first_order / 2.0
                 }
@@ -375,7 +379,7 @@ impl BlockDocument {
                         let order_key = format!("order:{}", after_key);
                         let after_order = self.doc.root().get(&order_key)
                             .and_then(|v| v.as_int())
-                            .map(|n| n as f64 / 1_000_000.0)
+                            .map(|n| n as f64 / 1_000_000_000_000.0)
                             .unwrap_or(1.0);
 
                         if idx + 1 < ordered.len() {
@@ -384,7 +388,7 @@ impl BlockDocument {
                             let next_order_key = format!("order:{}", next_key);
                             let next_order = self.doc.root().get(&next_order_key)
                                 .and_then(|v| v.as_int())
-                                .map(|n| n as f64 / 1_000_000.0)
+                                .map(|n| n as f64 / 1_000_000_000_000.0)
                                 .unwrap_or(after_order + 2.0);
                             (after_order + next_order) / 2.0
                         } else {
@@ -399,7 +403,7 @@ impl BlockDocument {
                             let order_key = format!("order:{}", last_key);
                             let last_order = self.doc.root().get(&order_key)
                                 .and_then(|v| v.as_int())
-                                .map(|n| n as f64 / 1_000_000.0)
+                                .map(|n| n as f64 / 1_000_000_000_000.0)
                                 .unwrap_or(1.0);
                             last_order + 1.0
                         } else {
@@ -655,7 +659,7 @@ impl BlockDocument {
             }
 
             // Store order index (as i64 scaled by 1M for precision)
-            tx.root().set(&order_key, (order_index * 1_000_000.0) as i64);
+            tx.root().set(&order_key, (order_index * 1_000_000_000_000.0) as i64);
 
             // Create block map and collect text IDs to fill later
             // (We need to do this in two phases to satisfy the borrow checker)
@@ -917,7 +921,7 @@ impl BlockDocument {
         // Update order key
         let order_key = format!("order:{}", block_key);
         self.doc.transact(self.agent, |tx| {
-            tx.root().set(&order_key, (order_index * 1_000_000.0) as i64);
+            tx.root().set(&order_key, (order_index * 1_000_000_000_000.0) as i64);
         });
 
         self.version += 1;

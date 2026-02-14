@@ -27,10 +27,17 @@ pub struct BlockId {
 
 impl BlockId {
     /// Create a new block ID.
+    ///
+    /// # Panics
+    /// Panics if `document_id` or `agent_id` contain `/` (used as key separator).
     pub fn new(document_id: impl Into<String>, agent_id: impl Into<String>, seq: u64) -> Self {
+        let document_id = document_id.into();
+        let agent_id = agent_id.into();
+        assert!(!document_id.contains('/'), "document_id must not contain '/'");
+        assert!(!agent_id.contains('/'), "agent_id must not contain '/'");
         Self {
-            document_id: document_id.into(),
-            agent_id: agent_id.into(),
+            document_id,
+            agent_id,
             seq,
         }
     }

@@ -20,6 +20,10 @@ use crate::kaijutsu_capnp::world;
 #[derive(Clone)]
 pub struct RpcClient {
     world: world::Client,
+    /// Retained SSH channels to prevent SSH_MSG_CHANNEL_CLOSE on drop.
+    /// These are unused but must stay alive for the connection's lifetime.
+    #[allow(dead_code)]
+    retained_channels: Option<std::sync::Arc<(russh::Channel<Msg>, russh::Channel<Msg>)>>,
 }
 
 impl RpcClient {
@@ -53,7 +57,16 @@ impl RpcClient {
         // Spawn the RPC system to run in the background (requires LocalSet)
         tokio::task::spawn_local(rpc_system);
 
-        Ok(Self { world })
+        Ok(Self { world, retained_channels: None })
+    }
+
+    /// Retain SSH channels to prevent them from being dropped (which closes them).
+    pub fn retain_ssh_channels(
+        &mut self,
+        control: russh::Channel<Msg>,
+        events: russh::Channel<Msg>,
+    ) {
+        self.retained_channels = Some(std::sync::Arc::new((control, events)));
     }
 
     /// Get current identity from the server

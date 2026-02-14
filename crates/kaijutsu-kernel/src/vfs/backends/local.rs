@@ -27,17 +27,24 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     /// Create a new local filesystem rooted at the given path.
+    ///
+    /// The root is canonicalized at construction time to handle symlinks
+    /// (e.g. macOS `/tmp` → `/private/tmp`).
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root: PathBuf = root.into();
+        let root = root.canonicalize().unwrap_or(root);
         Self {
-            root: root.into(),
+            root,
             read_only: false,
         }
     }
 
     /// Create a read-only local filesystem.
     pub fn read_only(root: impl Into<PathBuf>) -> Self {
+        let root: PathBuf = root.into();
+        let root = root.canonicalize().unwrap_or(root);
         Self {
-            root: root.into(),
+            root,
             read_only: true,
         }
     }
