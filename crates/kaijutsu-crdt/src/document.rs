@@ -346,6 +346,15 @@ impl BlockDocument {
         id
     }
 
+    /// Read the stored order value for a block, scaled back from i64 to f64.
+    fn get_block_order(&self, block_id: &BlockId, default: f64) -> f64 {
+        let order_key = format!("order:{}", block_id.to_key());
+        self.doc.root().get(&order_key)
+            .and_then(|v| v.as_int())
+            .map(|n| n as f64 / 1_000_000_000_000.0)
+            .unwrap_or(default)
+    }
+
     /// Calculate fractional index for insertion.
     ///
     /// Order values are stored as `(f64 * 1e12) as i64`, giving ~40 bisections
@@ -360,13 +369,7 @@ impl BlockDocument {
                 if ordered.is_empty() {
                     1.0
                 } else {
-                    // Get order of first block and go before it
-                    let first_key = ordered[0].to_key();
-                    let order_key = format!("order:{}", first_key);
-                    let first_order = self.doc.root().get(&order_key)
-                        .and_then(|v| v.as_int())
-                        .map(|n| n as f64 / 1_000_000_000_000.0)
-                        .unwrap_or(1.0);
+                    let first_order = self.get_block_order(&ordered[0], 1.0);
                     first_order / 2.0
                 }
             }
@@ -375,37 +378,18 @@ impl BlockDocument {
                 let after_idx = ordered.iter().position(|id| id == after_id);
                 match after_idx {
                     Some(idx) => {
-                        let after_key = ordered[idx].to_key();
-                        let order_key = format!("order:{}", after_key);
-                        let after_order = self.doc.root().get(&order_key)
-                            .and_then(|v| v.as_int())
-                            .map(|n| n as f64 / 1_000_000_000_000.0)
-                            .unwrap_or(1.0);
+                        let after_order = self.get_block_order(&ordered[idx], 1.0);
 
                         if idx + 1 < ordered.len() {
-                            // There's a next block
-                            let next_key = ordered[idx + 1].to_key();
-                            let next_order_key = format!("order:{}", next_key);
-                            let next_order = self.doc.root().get(&next_order_key)
-                                .and_then(|v| v.as_int())
-                                .map(|n| n as f64 / 1_000_000_000_000.0)
-                                .unwrap_or(after_order + 2.0);
+                            let next_order = self.get_block_order(&ordered[idx + 1], after_order + 2.0);
                             (after_order + next_order) / 2.0
                         } else {
-                            // Insert at end
                             after_order + 1.0
                         }
                     }
                     None => {
-                        // after_id not found, insert at end
                         if let Some(last) = ordered.last() {
-                            let last_key = last.to_key();
-                            let order_key = format!("order:{}", last_key);
-                            let last_order = self.doc.root().get(&order_key)
-                                .and_then(|v| v.as_int())
-                                .map(|n| n as f64 / 1_000_000_000_000.0)
-                                .unwrap_or(1.0);
-                            last_order + 1.0
+                            self.get_block_order(last, 1.0) + 1.0
                         } else {
                             1.0
                         }
