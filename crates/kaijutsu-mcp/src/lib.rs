@@ -22,6 +22,16 @@ mod models;
 mod tree;
 
 use regex::Regex;
+
+/// Wrapper that aborts a tokio task when the last reference is dropped.
+#[derive(Clone)]
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, router::prompt::PromptRouter, wrapper::Parameters},
@@ -161,6 +171,8 @@ pub struct KaijutsuMcp {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     server_state: McpServerState,
+    /// Handle to abort the background event listener when all clones are dropped.
+    _bg_task: Option<Arc<AbortOnDrop>>,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -184,6 +196,7 @@ impl KaijutsuMcp {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
+            _bg_task: None,
         }
     }
 
@@ -285,13 +298,13 @@ impl KaijutsuMcp {
         tracing::info!("RPC actor spawned, persistent connection ready");
 
         // Spawn background event listener to keep store in sync
-        {
+        let bg_abort = {
             let mut event_rx = actor.subscribe_events();
             let store_bg = Arc::clone(&store);
             let sync_bg = Arc::clone(&sync_arc);
             let doc_id_bg = document_id.clone();
 
-            tokio::spawn(async move {
+            let bg_handle = tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
@@ -305,7 +318,8 @@ impl KaijutsuMcp {
                     }
                 }
             });
-        }
+            bg_handle.abort_handle()
+        };
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
@@ -318,6 +332,7 @@ impl KaijutsuMcp {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
+            _bg_task: Some(Arc::new(AbortOnDrop(bg_abort))),
         })
     }
 

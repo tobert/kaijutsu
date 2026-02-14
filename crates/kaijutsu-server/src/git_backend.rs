@@ -516,8 +516,12 @@ impl GitCrdtBackend {
     }
 
     /// Flush all dirty files to disk.
+    ///
+    /// Attempts to flush every dirty file. Collects errors and returns them
+    /// after flushing all remaining files (does not abort on first failure).
     pub async fn flush_all(&self) -> BackendResult<()> {
         let flushable = self.dirty.get_flushable();
+        let mut errors: Vec<String> = Vec::new();
 
         for (doc_id, file_path) in flushable {
             // Parse doc_id to get repo
@@ -525,11 +529,16 @@ impl GitCrdtBackend {
             if let [repo, _branch] = parts.as_slice() {
                 if let Err(e) = self.flush_file_to_disk(repo, &file_path).await {
                     tracing::warn!(repo = %repo, file = %file_path, error = %e, "failed to flush file");
+                    errors.push(format!("{}:{}: {}", repo, file_path, e));
                 }
             }
         }
 
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::Io(format!("flush_all: {} files failed: {}", errors.len(), errors.join("; "))))
+        }
     }
 
     /// Check if a file is text (not binary).

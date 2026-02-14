@@ -547,7 +547,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -589,7 +589,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -632,7 +632,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -674,7 +674,7 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).unwrap_or_default();
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, final_snapshot, ops_bytes)
         };
@@ -738,7 +738,7 @@ impl BlockStore {
             entry.touch(&agent_id);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).unwrap_or_default()
+            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text edits (high frequency during streaming)
 
@@ -785,7 +785,7 @@ impl BlockStore {
             entry.touch(&agent_id);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).unwrap_or_default()
+            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
@@ -940,12 +940,12 @@ impl BlockStore {
                             DocumentEntry::from_snapshot(doc_snapshot, meta.kind, meta.language.clone(), &agent_id)
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 document_id = %meta.id,
                                 error = %e,
-                                "Failed to deserialize snapshot, starting empty"
+                                "Failed to deserialize snapshot, skipping corrupted document"
                             );
-                            DocumentEntry::new(&meta.id, meta.kind, meta.language.clone(), &agent_id)
+                            continue;
                         }
                     }
                 } else {

@@ -210,6 +210,9 @@ impl FileDocumentCache {
         };
 
         let mut flushed = 0;
+        let mut errors: Vec<String> = Vec::new();
+        let mut succeeded_doc_ids: Vec<String> = Vec::new();
+
         for (path, doc_id, block_id) in &dirty_paths {
             let content = self
                 .block_store
@@ -223,25 +226,35 @@ impl FileDocumentCache {
                 })
                 .unwrap_or_default();
 
-            self.vfs
+            match self.vfs
                 .write_all(std::path::Path::new(path), content.as_bytes())
                 .await
-                .map_err(|e| format!("failed to flush {}: {}", path, e))?;
-
-            flushed += 1;
+            {
+                Ok(()) => {
+                    flushed += 1;
+                    succeeded_doc_ids.push(doc_id.clone());
+                }
+                Err(e) => {
+                    errors.push(format!("failed to flush {}: {}", path, e));
+                }
+            }
         }
 
-        // Clear dirty flags
+        // Only clear dirty flags for files that were successfully flushed
         {
             let mut cache = self.cache.write();
-            for (_, doc_id, _) in &dirty_paths {
+            for doc_id in &succeeded_doc_ids {
                 if let Some(entry) = cache.get_mut(doc_id) {
                     entry.dirty = false;
                 }
             }
         }
 
-        Ok(flushed)
+        if errors.is_empty() {
+            Ok(flushed)
+        } else {
+            Err(format!("flush_dirty: {}/{} failed: {}", errors.len(), dirty_paths.len(), errors.join("; ")))
+        }
     }
 
     /// Flush a single file back to the VFS.
