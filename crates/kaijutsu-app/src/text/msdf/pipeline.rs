@@ -1231,8 +1231,9 @@ pub fn init_msdf_taa_resources(
             entry_point: Some("fragment".into()),
             targets: vec![Some(ColorTargetState {
                 format, // Use same format as MSDF pipeline (from swap chain)
-                // Alpha blending to composite text on top of scene
-                blend: Some(BlendState::ALPHA_BLENDING),
+                // Premultiplied alpha: MSDF pipeline outputs premultiplied RGB,
+                // so blit must use src*One (not src*SrcAlpha) to avoid alpha^2
+                blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: ColorWrites::ALL,
             })],
         }),
