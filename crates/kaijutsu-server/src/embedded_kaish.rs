@@ -27,6 +27,7 @@
 //! This enables kaish scripts to access both CRDT blocks and real files,
 //! with tool dispatch routed through the kernel's tool registry.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -72,13 +73,14 @@ impl EmbeddedKaish {
     /// ```ignore
     /// let blocks = shared_block_store("agent-1");
     /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
-    /// let kaish = EmbeddedKaish::new("my-kernel", blocks, kernel)?;
+    /// let kaish = EmbeddedKaish::new("my-kernel", blocks, kernel, None)?;
     /// let result = kaish.execute("echo hello").await?;
     /// ```
     pub fn new(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
     ) -> Result<Self> {
         let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
         let mount_table = kernel.vfs().clone();
@@ -89,9 +91,18 @@ impl EmbeddedKaish {
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
 
-        // Start in /v/docs — the CRDT block namespace
-        let config = KaishConfig::isolated()
-            .with_cwd(std::path::PathBuf::from("/v/docs"));
+        // KaishConfig primarily sets the cwd and kernel name. The VFS mode
+        // in the config is secondary to kaijutsu's MountTable — real filesystem
+        // access is routed through MountBackend → MountTable → LocalBackend,
+        // not through kaish's own VFS modes.
+        //
+        // `project_root` sets the cwd to a specific project directory (used by
+        // MCP sessions that operate on a particular repo). When None, cwd
+        // defaults to $HOME via `KaishConfig::named()`.
+        let config = match project_root {
+            Some(root) => KaishConfig::mcp_with_root(root),
+            None => KaishConfig::named(name),
+        };
 
         let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
             vfs.mount_arc("/v/docs", docs_fs);
@@ -122,7 +133,7 @@ impl EmbeddedKaish {
     /// let blocks = shared_block_store("agent-1");
     /// let git_blocks = shared_block_store("agent-1-git");
     /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
-    /// let kaish = EmbeddedKaish::with_git("my-kernel", blocks, git_blocks, kernel)?;
+    /// let kaish = EmbeddedKaish::with_git("my-kernel", blocks, git_blocks, kernel, None)?;
     /// kaish.register_repo("myproject", "/home/user/src/myproject")?;
     /// ```
     pub fn with_git(
@@ -130,6 +141,7 @@ impl EmbeddedKaish {
         blocks: SharedBlockStore,
         git_blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
     ) -> Result<Self> {
         let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
         let git_backend = Arc::new(GitCrdtBackend::new(git_blocks));
@@ -142,9 +154,11 @@ impl EmbeddedKaish {
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
         let git_fs = Arc::new(GitFilesystem::new(git_backend.clone()));
 
-        // Start in /v/docs — the CRDT block namespace
-        let config = KaishConfig::isolated()
-            .with_cwd(std::path::PathBuf::from("/v/docs"));
+        // See comment in `new()` — config sets cwd/name, MountTable handles VFS
+        let config = match project_root {
+            Some(root) => KaishConfig::mcp_with_root(root),
+            None => KaishConfig::named(name),
+        };
 
         let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
             vfs.mount_arc("/v/docs", docs_fs);
@@ -482,7 +496,7 @@ mod tests {
         let blocks = shared_block_store("test-agent");
         let kernel = Arc::new(KaijutsuKernel::new("test-agent").await);
 
-        let kaish = EmbeddedKaish::new("test-kernel", blocks, kernel);
+        let kaish = EmbeddedKaish::new("test-kernel", blocks, kernel, None);
         assert!(kaish.is_ok());
 
         let kaish = kaish.unwrap();
@@ -494,7 +508,7 @@ mod tests {
     async fn test_embedded_kaish_variables() {
         let blocks = shared_block_store("test-vars");
         let kernel = Arc::new(KaijutsuKernel::new("test-vars").await);
-        let kaish = EmbeddedKaish::new("test-vars", blocks, kernel).unwrap();
+        let kaish = EmbeddedKaish::new("test-vars", blocks, kernel, None).unwrap();
 
         // Set and get a variable
         kaish.set_var("X", kaish_kernel::ast::Value::String("hello".into())).await;
@@ -505,5 +519,37 @@ mod tests {
             kaish_kernel::ast::Value::String(s) => assert_eq!(s, "hello"),
             _ => panic!("Expected String value"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_named_config_cwd_is_home() {
+        let blocks = shared_block_store("test-cwd-home");
+        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-home").await);
+        let kaish = EmbeddedKaish::new("test-cwd-home", blocks, kernel, None).unwrap();
+
+        let cwd = kaish.cwd().await;
+        // KaishConfig::named() sets cwd to home_dir(). We can't control HOME
+        // in parallel tests, so just verify it's a real existing directory.
+        assert!(cwd.is_dir(), "cwd should be an existing directory, got {:?}", cwd);
+        assert!(cwd.is_absolute(), "cwd should be absolute, got {:?}", cwd);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_config_cwd_is_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocks = shared_block_store("test-cwd-project");
+        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-project").await);
+        let kaish = EmbeddedKaish::new(
+            "test-cwd-project",
+            blocks,
+            kernel,
+            Some(tmp.path().to_path_buf()),
+        ).unwrap();
+
+        let cwd = kaish.cwd().await;
+        // Canonicalize both to handle symlinks (e.g., /tmp → /private/tmp on macOS)
+        let expected = tmp.path().canonicalize().unwrap_or_else(|_| tmp.path().to_path_buf());
+        let actual = cwd.canonicalize().unwrap_or(cwd.clone());
+        assert_eq!(actual, expected, "cwd should be project root");
     }
 }

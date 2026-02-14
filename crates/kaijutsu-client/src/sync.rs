@@ -10,9 +10,15 @@
 //! - `frontier = Some(_)` and matching document_id -> incremental merge (merge_ops_owned)
 //! - On merge failure -> reset frontier, next event triggers full sync
 
-use kaijutsu_crdt::{BlockDocument, BlockSnapshot, Frontier, SerializedOpsOwned};
+use kaijutsu_crdt::{BlockDocument, BlockId, BlockSnapshot, Frontier, SerializedOpsOwned};
 use thiserror::Error;
 use tracing::{error, info, trace, warn};
+
+/// Maximum number of pending ops to buffer before dropping oldest entries.
+/// Sized for text streaming bursts during network reordering — each text
+/// chunk is one entry, so 200 covers ~200 characters of streaming output
+/// arriving before their BlockInserted event.
+const MAX_PENDING_OPS: usize = 200;
 
 /// Result of a sync operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +90,10 @@ pub struct SyncManager {
     document_id: Option<String>,
     /// Version counter for change detection (bumped on every successful sync).
     version: u64,
+    /// Ops that failed to merge (both incremental and full sync failed).
+    /// These are retried after the next successful sync event.
+    /// Capped at MAX_PENDING_OPS to prevent unbounded growth.
+    pending_ops: Vec<(Option<BlockId>, Vec<u8>)>,
 }
 
 #[allow(dead_code)]
@@ -94,12 +104,13 @@ impl SyncManager {
             frontier: None,
             document_id: None,
             version: 0,
+            pending_ops: Vec::new(),
         }
     }
 
     /// Create a SyncManager with existing state (for testing/migration).
     pub fn with_state(document_id: Option<String>, frontier: Option<Frontier>) -> Self {
-        Self { frontier, document_id, version: 0 }
+        Self { frontier, document_id, version: 0, pending_ops: Vec::new() }
     }
 
     /// Check if we need a full sync for the given document.
@@ -133,6 +144,74 @@ impl SyncManager {
     pub fn reset(&mut self) {
         self.frontier = None;
         // Keep document_id - if it changes we'll detect that too
+        // Keep pending_ops - they should be retried after next successful sync
+    }
+
+    /// Number of ops currently buffered for replay.
+    pub fn pending_ops_count(&self) -> usize {
+        self.pending_ops.len()
+    }
+
+    /// Buffer failed ops for later replay.
+    ///
+    /// Called when both incremental merge and full sync fail. The ops are
+    /// retained so they can be replayed after the next successful sync
+    /// (e.g., when the BlockInserted event finally arrives).
+    fn buffer_failed_ops(&mut self, block_id: Option<&BlockId>, ops: &[u8]) {
+        if self.pending_ops.len() >= MAX_PENDING_OPS {
+            let drop_count = self.pending_ops.len() - MAX_PENDING_OPS + 1;
+            warn!(
+                "Pending ops buffer full ({}/{}), dropping {} oldest entries",
+                self.pending_ops.len(), MAX_PENDING_OPS, drop_count
+            );
+            self.pending_ops.drain(..drop_count);
+        }
+        info!(
+            "Buffering failed ops for block {:?} ({} bytes, {} pending total)",
+            block_id, ops.len(), self.pending_ops.len() + 1
+        );
+        self.pending_ops.push((block_id.cloned(), ops.to_vec()));
+    }
+
+    /// Replay buffered pending ops after a successful sync.
+    ///
+    /// Ops that succeed are consumed; ops that still fail go back into the buffer.
+    fn replay_pending_ops(&mut self, doc: &mut BlockDocument) {
+        if self.pending_ops.is_empty() {
+            return;
+        }
+
+        let ops_to_replay: Vec<_> = self.pending_ops.drain(..).collect();
+        let count = ops_to_replay.len();
+        info!("Replaying {} buffered pending ops", count);
+
+        let mut still_pending = Vec::new();
+        for (block_id, ops) in ops_to_replay {
+            match self.do_incremental_merge(doc, &ops, block_id.as_ref()) {
+                Ok(_) => {
+                    trace!("Replayed buffered ops for block {:?} successfully", block_id);
+                }
+                Err(SyncError::Merge(ref msg)) => {
+                    // CRDT DataMissing — might succeed later when more ops arrive
+                    warn!("Replay merge still failing for block {:?}: {}", block_id, msg);
+                    still_pending.push((block_id, ops));
+                }
+                Err(SyncError::Deserialize(ref msg)) => {
+                    // Corrupt data won't improve on retry — drop to avoid a
+                    // "death spiral" where each replay resets the frontier and
+                    // forces a full sync on every subsequent event.
+                    error!("Dropping corrupt buffered ops for block {:?}: {}", block_id, msg);
+                }
+                Err(e) => {
+                    error!("Dropping buffered ops for block {:?} due to unrecoverable error: {}", block_id, e);
+                }
+            }
+        }
+
+        if !still_pending.is_empty() {
+            info!("{} ops still pending after replay", still_pending.len());
+        }
+        self.pending_ops = still_pending;
     }
 
     /// Apply initial state from server (BlockCellInitialState event).
@@ -172,6 +251,9 @@ impl SyncManager {
                     "Initial sync complete for document_id='{}' - {} blocks, frontier={:?}",
                     document_id, block_count, self.frontier
                 );
+
+                // Replay any buffered ops now that we have a valid document
+                self.replay_pending_ops(doc);
 
                 Ok(SyncResult::FullSync { block_count })
             }
@@ -244,23 +326,45 @@ impl SyncManager {
         // a full oplog), so from_oplog destroys the existing document and fails.
         // The existing document already has the base state; incremental merge
         // should succeed because the new ops build on that state.
-        if self.needs_full_sync(document_id) {
+        let result = if self.needs_full_sync(document_id) {
             if !doc.is_empty() {
                 // Try incremental merge first — preserves existing document
                 match self.do_incremental_merge(doc, ops, Some(&block.id)) {
-                    Ok(result) => return Ok(result),
+                    Ok(result) => Ok(result),
                     Err(e) => {
                         warn!(
                             "Recovery: incremental merge failed for {:?}, falling back to full sync: {}",
                             block.id, e
                         );
+                        match self.do_full_sync(doc, document_id, ops, Some(&block.id)) {
+                            Ok(result) => Ok(result),
+                            Err(e) => {
+                                // Both paths failed — buffer for later replay
+                                self.buffer_failed_ops(Some(&block.id), ops);
+                                Err(e)
+                            }
+                        }
+                    }
+                }
+            } else {
+                match self.do_full_sync(doc, document_id, ops, Some(&block.id)) {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        self.buffer_failed_ops(Some(&block.id), ops);
+                        Err(e)
                     }
                 }
             }
-            self.do_full_sync(doc, document_id, ops, Some(&block.id))
         } else {
             self.do_incremental_merge(doc, ops, Some(&block.id))
+        };
+
+        // On any successful sync, replay buffered pending ops
+        if result.is_ok() {
+            self.replay_pending_ops(doc);
         }
+
+        result
     }
 
     /// Apply text ops event (BlockTextOps).
@@ -308,7 +412,18 @@ impl SyncManager {
             });
         }
 
-        self.do_incremental_merge(doc, ops, None)
+        let result = self.do_incremental_merge(doc, ops, None);
+
+        // On success, replay any buffered pending ops
+        if result.is_ok() {
+            self.replay_pending_ops(doc);
+        } else if let Err(SyncError::Merge(_)) = &result {
+            // CRDT merge failure (likely DataMissing) — buffer for replay.
+            // Don't buffer deserialization failures (corrupt data won't improve).
+            self.buffer_failed_ops(None, ops);
+        }
+
+        result
     }
 
     // =========================================================================
@@ -947,5 +1062,199 @@ mod tests {
         assert_eq!(sync.document_id(), Some("doc-1"));
         // But we still need full sync
         assert!(sync.needs_full_sync("doc-1"));
+    }
+
+    // =========================================================================
+    // Pending Ops Buffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pending_ops_buffered_on_double_failure() {
+        // Client and server have divergent oplogs — both incremental and full sync fail.
+        // To trigger the double-failure path, needs_full_sync must be true AND
+        // the document must be non-empty (so incremental merge is tried first,
+        // then full sync as fallback — both fail on divergent incremental ops).
+        let mut server = create_server_doc("doc-1");
+
+        // Client has its own independent content (non-empty, divergent oplog)
+        let mut client = create_client_doc("doc-1");
+        client.insert_block(None, None, Role::User, BlockKind::Text, "Client content", "client")
+            .expect("insert client block");
+
+        // No frontier → needs_full_sync is true, AND doc is non-empty
+        // This triggers: incremental merge (fails on divergent ops) →
+        //                full sync (fails because incremental ops aren't a complete oplog) →
+        //                buffer the ops
+        let mut sync = SyncManager::new();
+
+        // Server adds a new block — get INCREMENTAL ops only
+        let server_frontier_before = server.frontier();
+        let new_block_id = server
+            .insert_block(None, None, Role::Model, BlockKind::Text, "New content", "server")
+            .expect("insert block");
+        let new_block = server.get_block_snapshot(&new_block_id).expect("block exists");
+
+        let incremental_ops = server.ops_since(&server_frontier_before);
+        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
+
+        // Try to apply — both paths should fail, ops should be buffered
+        let result = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
+        assert!(result.is_err(), "Expected failure, got {:?}", result);
+
+        // Ops should be buffered, not lost
+        assert_eq!(sync.pending_ops_count(), 1, "Expected 1 pending op");
+    }
+
+    #[test]
+    fn test_pending_ops_replayed_after_successful_sync() {
+        // Same setup as double_failure — divergent oplogs trigger buffering
+        let mut server = create_server_doc("doc-1");
+        let mut client = create_client_doc("doc-1");
+        client.insert_block(None, None, Role::User, BlockKind::Text, "Client content", "client")
+            .expect("insert client block");
+
+        let mut sync = SyncManager::new();
+
+        // Create incremental ops that will fail (double failure → buffer)
+        let server_frontier_before = server.frontier();
+        let new_block_id = server
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Buffered content", "server")
+            .expect("insert block");
+        let new_block = server.get_block_snapshot(&new_block_id).expect("block exists");
+        let incremental_ops = server.ops_since(&server_frontier_before);
+        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
+
+        // This fails and buffers
+        let _ = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
+        assert_eq!(sync.pending_ops_count(), 1);
+
+        // Now send a full oplog — this should succeed AND replay buffered ops
+        let full_oplog = server.oplog_bytes();
+        let result = sync
+            .apply_initial_state(&mut client, "doc-1", &full_oplog)
+            .expect("full sync should succeed");
+
+        assert!(matches!(result, SyncResult::FullSync { .. }));
+        // Pending ops should have been drained (replayed — they may or may not
+        // succeed but they should be attempted and removed from buffer)
+        assert_eq!(sync.pending_ops_count(), 0, "Pending ops should be drained after replay");
+        // The full oplog already contains the "Buffered content" block
+        assert!(client.full_text().contains("Buffered content"));
+    }
+
+    #[test]
+    fn test_pending_ops_text_before_block_inserted() {
+        // The exact race condition: text ops arrive before BlockInserted
+        let mut server = create_server_doc("doc-1");
+        let initial_oplog = server.oplog_bytes();
+
+        let mut client = create_client_doc("doc-1");
+        let mut sync = SyncManager::new();
+
+        // Initial sync
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
+            .expect("initial sync");
+
+        // Server creates a new block and appends text
+        let server_frontier_before = server.frontier();
+        let block_id = server
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", "server")
+            .expect("insert block");
+        let block_frontier = server.frontier();
+
+        server.append_text(&block_id, "Hello from shell").expect("append");
+        let text_ops = serde_json::to_vec(&server.ops_since(&block_frontier)).unwrap();
+
+        // Text ops arrive FIRST (before BlockInserted) — should fail with Merge error
+        let result = sync.apply_text_ops(&mut client, "doc-1", &text_ops);
+        assert!(result.is_err(), "Text ops should fail before block exists");
+        assert_eq!(sync.pending_ops_count(), 1, "Text ops should be buffered");
+
+        // Now BlockInserted arrives with full ops
+        let block = server.get_block_snapshot(&block_id).expect("block exists");
+        let block_ops = serde_json::to_vec(&server.ops_since(&server_frontier_before)).unwrap();
+        let result = sync
+            .apply_block_inserted(&mut client, "doc-1", &block, &block_ops)
+            .expect("block insert should succeed");
+
+        assert!(matches!(result, SyncResult::IncrementalMerge));
+        // Buffered text ops should have been replayed
+        // (They may or may not succeed depending on CRDT state, but they should be attempted)
+        // The block itself should exist
+        assert!(client.get_block_snapshot(&block_id).is_some());
+    }
+
+    #[test]
+    fn test_pending_ops_cap_drops_oldest() {
+        let mut sync = SyncManager::new();
+
+        // Fill pending_ops beyond the cap by directly calling buffer_failed_ops
+        for i in 0..(MAX_PENDING_OPS + 10) {
+            let fake_ops = format!("fake-ops-{}", i).into_bytes();
+            sync.buffer_failed_ops(None, &fake_ops);
+        }
+
+        assert!(
+            sync.pending_ops_count() <= MAX_PENDING_OPS,
+            "Expected <= {} pending ops, got {}",
+            MAX_PENDING_OPS,
+            sync.pending_ops_count()
+        );
+
+        // Verify newest entries are retained (not oldest)
+        let last_ops = &sync.pending_ops.last().unwrap().1;
+        let last_str = String::from_utf8_lossy(last_ops);
+        assert!(
+            last_str.contains(&format!("{}", MAX_PENDING_OPS + 9)),
+            "Expected newest entry, got: {}",
+            last_str
+        );
+    }
+
+    #[test]
+    fn test_pending_ops_replay_partial_failure() {
+        // Verify that replay attempts all buffered ops: successes are consumed,
+        // failures go back to the buffer.
+        let mut server = create_server_doc("doc-1");
+        let initial_oplog = server.oplog_bytes();
+
+        let mut client = create_client_doc("doc-1");
+        let mut sync = SyncManager::new();
+
+        sync.apply_initial_state(&mut client, "doc-1", &initial_oplog)
+            .expect("initial sync");
+
+        // Create valid incremental ops (block insert) and then text ops
+        // in order so the CRDT frontier stays linear
+        let frontier_before = server.frontier();
+        let block_id = server
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Valid block", "server")
+            .expect("insert block");
+        let valid_block_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+
+        let frontier_before = server.frontier();
+        server.append_text(&block_id, " extra").expect("append");
+        let valid_text_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+
+        // Buffer: valid block ops, then corrupt, then valid text ops
+        // The block ops must be replayed first for the text ops to succeed
+        sync.pending_ops.push((None, valid_block_ops));
+        sync.pending_ops.push((None, b"not-valid-json".to_vec()));
+        sync.pending_ops.push((None, valid_text_ops));
+        assert_eq!(sync.pending_ops_count(), 3);
+
+        // Trigger replay directly
+        sync.replay_pending_ops(&mut client);
+
+        // Valid block ops (1st) should succeed → consumed
+        // Corrupt ops (2nd) should fail deserialization → DROPPED (not re-buffered,
+        //   to avoid a death spiral where each replay resets the frontier)
+        // Valid text ops (3rd) depends on whether the corrupt op's frontier
+        //   reset affected it — may succeed or be re-buffered as a Merge error
+        assert!(
+            sync.pending_ops_count() < 3,
+            "Expected replay to consume/drop some ops, got {}",
+            sync.pending_ops_count()
+        );
     }
 }

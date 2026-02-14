@@ -2444,6 +2444,12 @@ impl kernel::Server for KernelImpl {
             let documents_clone = documents.clone();
 
             tokio::task::spawn_local(async move {
+                // Yield to let the event loop flush BlockInserted events to clients
+                // before we start producing text ops. Without this, fast commands
+                // (like `ls`) can emit edit_text before the client has processed the
+                // BlockInserted, causing DataMissing errors on the client side.
+                tokio::task::yield_now().await;
+
                 // Execute via embedded kaish (routes through CRDT backend)
                 log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
                 match kaish.execute(&code).await {
