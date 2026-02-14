@@ -146,13 +146,13 @@ let font_hint_amount = 0.8;                 // Hinting strength (shader hinting 
 let font_taa_enabled = true;                // Temporal AA
 let font_horz_scale = 1.1;                  // Wider AA for vertical strokes (cell boundary fade prevents bleed)
 let font_vert_scale = 0.6;                  // Sharper AA for horizontal strokes (crossbars)
-let font_text_bias = 0.5;                   // SDF threshold bias
-let font_gamma_correction = 0.85;           // Gamma-correct alpha (< 1.0 widens light-on-dark edges)
+let font_text_bias = 0.47;                  // SDF threshold — lower = thicker/brighter strokes
+let font_gamma_correction = 0.78;           // Gamma-correct alpha (< 1.0 widens light-on-dark edges)
 
-// Font effects
-let font_glow_intensity = 0.0;              // Glow disabled by default
-let font_glow_spread = 2.0;
-let font_glow_color = rgba(0.48, 0.64, 0.97, 0.5);
+// Font effects — neon glow
+let font_glow_intensity = 0.2;              // Glow strength (0.0-1.0)
+let font_glow_spread = 2.5;                 // Pixels of halo around glyphs
+let font_glow_color = rgba(0.0, 1.0, 1.0, 0.15);  // #00ffff electric cyan
 let font_rainbow = false;                   // Rainbow text effect
 
 // ============================================================================
