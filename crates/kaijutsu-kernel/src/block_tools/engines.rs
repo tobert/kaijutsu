@@ -491,10 +491,22 @@ impl BlockEditEngine {
     fn execute_inner(&self, params: BlockEditParams) -> Result<serde_json::Value> {
         let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
-        // Apply operations atomically
-        // Note: For true atomicity, we'd need to validate all operations first
-        // then apply them. For now, we apply one by one but the design doc
-        // specifies atomic semantics.
+        // Pre-validate CAS checks before applying any operations.
+        // This prevents partial application when a later CAS check would fail.
+        {
+            let content = self.documents.get(&document_id)
+                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|s| s.content.clone()))
+                .unwrap_or_default();
+
+            for (idx, op) in params.operations.iter().enumerate() {
+                if let EditOp::Replace { start_line, end_line, expected_text: Some(expected), .. } = op {
+                    validate_expected_text(&content, *start_line, *end_line, expected)
+                        .map_err(|e| e.in_batch(idx))?;
+                }
+            }
+        }
+
+        // Apply operations sequentially (offsets depend on prior edits).
         for (idx, op) in params.operations.into_iter().enumerate() {
             self.apply_op(&document_id, &block_id, op)
                 .map_err(|e| e.in_batch(idx))?;

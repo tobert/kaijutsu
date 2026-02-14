@@ -62,7 +62,7 @@ pub use error::{EditError, Result};
 
 // Re-export translation utilities
 pub use translate::{
-    content_with_line_numbers, extract_lines_with_numbers, line_count, line_end_byte_offset,
+    content_with_line_numbers, extract_lines_with_numbers, line_count,
     line_range_to_byte_range, line_to_byte_offset, validate_expected_text,
 };
 
