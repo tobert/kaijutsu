@@ -41,7 +41,7 @@ use kaish_kernel::{
     BackendError, BackendResult, EntryInfo, KernelBackend, PatchOp, ReadRange, ToolInfo,
     ToolResult, WriteMode,
 };
-use kaish_kernel::tools::{ExecContext, ToolArgs, ToolSchema};
+use kaish_kernel::tools::{ExecContext, ParamSchema, ToolArgs, ToolSchema};
 use kaish_kernel::vfs::MountInfo;
 
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
@@ -99,9 +99,58 @@ impl KaijutsuBackend {
     }
 
     /// Convert kaijutsu ToolInfo to kaish ToolInfo format.
-    fn convert_tool_info(info: &KaijutsuToolInfo) -> ToolInfo {
-        // Build a basic schema - engines don't expose full JSON schemas
-        let schema = ToolSchema::new(&info.name, &info.description);
+    ///
+    /// When a JSON Schema is provided (from the engine), converts its properties
+    /// to kaish `ParamSchema` entries so that positional→named mapping works.
+    fn convert_tool_info(info: &KaijutsuToolInfo, json_schema: Option<serde_json::Value>) -> ToolInfo {
+        let mut schema = ToolSchema::new(&info.name, &info.description);
+
+        if let Some(js) = json_schema {
+            if let Some(props) = js.get("properties").and_then(|p| p.as_object()) {
+                let required: Vec<&str> = js
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+
+                // Add required params first (in `required` array order) so positional
+                // mapping assigns args to the right params regardless of JSON key order.
+                for &req_name in &required {
+                    if let Some(prop) = props.get(req_name) {
+                        let param_type = prop
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("string");
+                        let desc = prop
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("");
+                        schema = schema.param(ParamSchema::required(req_name, param_type, desc));
+                    }
+                }
+
+                // Then optional params
+                for (name, prop) in props {
+                    if required.contains(&name.as_str()) {
+                        continue; // Already added above
+                    }
+                    let param_type = prop
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("string");
+                    let desc = prop
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    let default = prop
+                        .get("default")
+                        .cloned()
+                        .map(json_to_kaish_value)
+                        .unwrap_or(kaish_kernel::ast::Value::Null);
+                    schema = schema.param(ParamSchema::optional(name, param_type, default, desc));
+                }
+            }
+        }
 
         ToolInfo {
             name: info.name.clone(),
@@ -553,16 +602,31 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolInfo>> {
         let tools = self.kernel.list_with_engines().await;
-        let infos: Vec<ToolInfo> = tools
-            .iter()
-            .map(|t| Self::convert_tool_info(t))
-            .collect();
+        let mut infos = Vec::with_capacity(tools.len());
+        for t in &tools {
+            let engine_schema = self
+                .kernel
+                .get_engine(&t.name)
+                .await
+                .and_then(|e| e.schema());
+            infos.push(Self::convert_tool_info(t, engine_schema));
+        }
         Ok(infos)
     }
 
     async fn get_tool(&self, name: &str) -> BackendResult<Option<ToolInfo>> {
         let tool = self.kernel.get_tool(name).await;
-        Ok(tool.map(|t| Self::convert_tool_info(&t)))
+        match tool {
+            Some(t) => {
+                let engine_schema = self
+                    .kernel
+                    .get_engine(name)
+                    .await
+                    .and_then(|e| e.schema());
+                Ok(Some(Self::convert_tool_info(&t, engine_schema)))
+            }
+            None => Ok(None),
+        }
     }
 
     // =========================================================================
@@ -815,6 +879,24 @@ pub fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
             "size": blob_ref.size,
             "content_type": blob_ref.content_type,
         }),
+    }
+}
+
+/// Convert a JSON value to a kaish Value (for schema defaults).
+fn json_to_kaish_value(json: JsonValue) -> kaish_kernel::ast::Value {
+    use kaish_kernel::ast::Value;
+    match json {
+        JsonValue::String(s) => Value::String(s),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else {
+                Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        JsonValue::Bool(b) => Value::Bool(b),
+        JsonValue::Null => Value::Null,
+        other => Value::Json(other),
     }
 }
 

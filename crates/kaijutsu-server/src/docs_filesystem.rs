@@ -83,8 +83,17 @@ fn entry_info_to_metadata(info: &kaish_kernel::EntryInfo) -> Metadata {
 ///
 /// The backend expects paths like `/docs/{doc_id}/{block_key}`, but the
 /// filesystem adapter receives paths relative to its mount point.
+/// Normalizes `.` and `..` components before joining.
 fn docs_path(path: &Path) -> PathBuf {
-    PathBuf::from("/docs").join(path)
+    let normalized: PathBuf = path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .collect();
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from("/docs")
+    } else {
+        PathBuf::from("/docs").join(normalized)
+    }
 }
 
 #[async_trait]

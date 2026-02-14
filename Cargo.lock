@@ -5128,9 +5128,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9849573880c8ea90e9ee5bb3f97fb0c9dddcf4ac68bf8b19c35535501a4571a4"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5138,9 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13e9399badfd3ea29537090907a6077100c656df2722cef1d6c11c177e1fe957"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5172,9 +5168,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-schema"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28c732f70e057ad9828e706f7b6d3a373cc3bf2290e583916e4554798ab1e251"
+version = "0.2.1"
 dependencies = [
  "capnp",
 ]
