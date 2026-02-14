@@ -3,7 +3,8 @@
 // Multi-channel Signed Distance Field text rendering with support for:
 // - Smooth anti-aliased edges at any scale
 // - Rainbow color cycling effect
-// - Glow/outline effects
+//
+// Glow is handled by the post-process bloom node (msdf_bloom.wgsl).
 //
 // The MSDF technique stores distance information in RGB channels,
 // enabling sharp rendering of text at any zoom level.
@@ -13,11 +14,8 @@ struct Uniforms {
     msdf_range: f32,
     time: f32,
     rainbow: u32,
-    glow_intensity: f32,
-    glow_spread: f32,
     // Debug mode: 0=off, 1=dots only, 2=dots+quads
     debug_mode: u32,
-    glow_color: vec4<f32>,
     // SDF texel size (1/atlas_width, 1/atlas_height) for gradient sampling
     sdf_texel: vec2<f32>,
     // Hinting strength (0.0 = off, 1.0 = full)
@@ -327,16 +325,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var output = vec4<f32>(0.0);
-
-    // === GLOW LAYER ===
-    // Render glow first (behind text) if enabled
-    if uniforms.glow_intensity > 0.0 {
-        let px_range = screen_px_range(in.uv);
-        // Convert pixel spread to SDF bias shift: N pixels / (px_range * 2.0)
-        let glow_bias = uniforms.text_bias - uniforms.glow_spread / (px_range * 2.0);
-        let glow_alpha = msdf_alpha_at(in.uv, glow_bias) * uniforms.glow_intensity;
-        output = blend_over_premultiplied(output, uniforms.glow_color.rgb, glow_alpha * uniforms.glow_color.a);
-    }
 
     // === MAIN TEXT ===
     // Use hinted alpha for main text to improve small text quality

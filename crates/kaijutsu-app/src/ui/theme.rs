@@ -429,13 +429,13 @@ impl Default for Theme {
             font_taa_final_weight: 0.1,
             font_horz_scale: 1.1,
             font_vert_scale: 0.6,
-            font_text_bias: 0.5,
-            font_gamma_correction: 0.85,
+            font_text_bias: 0.47,
+            font_gamma_correction: 0.78,
 
-            // Font effects
-            font_glow_intensity: 0.0,
-            font_glow_spread: 2.0,
-            font_glow_color: Color::srgba(0.4, 0.6, 1.0, 0.5),
+            // Font effects — post-process bloom glow
+            font_glow_intensity: 0.5,
+            font_glow_spread: 4.0,
+            font_glow_color: Color::srgba(0.0, 1.0, 1.0, 0.35),
             font_rainbow: false,
 
             // Constellation

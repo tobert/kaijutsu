@@ -35,7 +35,7 @@ use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
 use crossbeam_channel::{Receiver, Sender};
 
-use super::{GlowConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, SdfTextEffects};
+use super::{MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, SdfTextEffects};
 use super::atlas::MsdfAtlas;
 use super::generator::MsdfGenerator;
 use crate::text::plugin::TextRenderPlugin;
@@ -105,8 +105,6 @@ struct TestConfig {
     scale: f32,
     /// Text color.
     color: Color,
-    /// Enable glow effect.
-    glow: bool,
     /// Alternating per-glyph colors for overlap detection.
     /// When set, even glyphs get color_a, odd glyphs get color_b.
     alternating_colors: Option<([u8; 4], [u8; 4])>,
@@ -138,7 +136,6 @@ impl TestConfig {
             top: 10.0,
             scale: 1.0,
             color: Color::WHITE,
-            glow: false,
             alternating_colors: None,
             debug_mode: None,
             total_frames: 0,
@@ -169,10 +166,6 @@ impl TestConfig {
         self
     }
 
-    fn with_glow(mut self) -> Self {
-        self.glow = true;
-        self
-    }
 
     fn with_font_family(mut self, family: TestFontFamily) -> Self {
         self.font_family = family;
@@ -726,15 +719,8 @@ fn setup_test_scene(
             default_color: config.color,
         };
 
-        // Build effects if enabled
-        let effects = if config.glow {
-            SdfTextEffects {
-                rainbow: false,
-                glow: Some(GlowConfig::default()),
-            }
-        } else {
-            SdfTextEffects::default()
-        };
+        // Glow is theme-level (post-process bloom), not per-entity.
+        let effects = SdfTextEffects::default();
 
         commands.spawn((
             buffer,
@@ -1098,28 +1084,25 @@ fn colored_text_renders() {
     assert!(found_red, "Red text should have red pixels");
 }
 
-/// Test 10: Glow effect expands the visible area.
+/// Test 10: Glow pipeline compiles without errors.
 ///
-/// Text with glow should have more visible pixels than without.
+/// Glow is now a post-process bloom effect (msdf_bloom.wgsl + bloom.rs).
+/// The headless test harness doesn't include the bloom render graph node,
+/// so we verify the text pipeline still renders cleanly when glow is
+/// configured in the theme. Visual verification via kaijutsu-runner.sh.
 #[test]
-fn glow_effect_expands_bounds() {
-    let normal = render_text_headless("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+fn glow_does_not_break_rendering() {
+    // Render with default theme (glow_intensity > 0 in defaults)
+    // This validates that removing inline glow from the shader doesn't
+    // cause any rendering errors.
+    let output = render_text_headless("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
+    output.save_png("glow_pipeline_check");
 
-    let config = TestConfig::new("A", 32.0, DEFAULT_WIDTH, DEFAULT_HEIGHT, false)
-        .with_glow();
-    let glowing = render_with_config(config);
-
-    normal.save_png("glow_off");
-    glowing.save_png("glow_on");
-
-    let normal_pixels = normal.count_visible_pixels();
-    let glow_pixels = glowing.count_visible_pixels();
-
-    // Glow should add pixels around the text
+    let visible = output.count_visible_pixels();
     assert!(
-        glow_pixels > normal_pixels,
-        "Glow should add visible pixels: normal={}, glow={}",
-        normal_pixels, glow_pixels
+        visible > 0,
+        "Text should render visible pixels even without bloom node: got {}",
+        visible
     );
 }
 

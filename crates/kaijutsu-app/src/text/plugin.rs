@@ -12,8 +12,10 @@ use bevy::window::PrimaryWindow;
 
 use super::msdf::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
-    init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
-    ExtractedCameraMotion, FontMetricsCache, MsdfAtlas, MsdfCameraMotion, MsdfGenerator,
+    init_bloom_resources, init_msdf_resources, init_msdf_taa_resources,
+    prepare_bloom, prepare_msdf_texts,
+    ExtractedCameraMotion, FontMetricsCache, MsdfAtlas, MsdfBloomNode, MsdfBloomPipeline,
+    MsdfBloomResources, MsdfCameraMotion, MsdfGenerator,
     MsdfTaaConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
     MsdfTextRenderNode, MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources,
     MsdfTextTaaState, MsdfUiText, UiTextPositionCache,
@@ -86,21 +88,26 @@ impl Plugin for TextRenderPlugin {
             .add_systems(Render, prepare_msdf_texts.run_if(resource_exists::<super::msdf::MsdfTextResources>));
 
         // Add render nodes to the graph - after Upscaling (final post-processing step)
-        // MSDF renders text, then TAA blends with history
+        // MSDF renders text → bloom adds glow → TAA blends with history → blit to ViewTarget
         use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
         render_app
             .add_render_graph_node::<ViewNodeRunner<MsdfTextRenderNode>>(
                 Core2d,
                 MsdfTextRenderNode::NAME,
             )
+            .add_render_graph_node::<ViewNodeRunner<MsdfBloomNode>>(
+                Core2d,
+                MsdfBloomNode::NAME,
+            )
             .add_render_graph_node::<ViewNodeRunner<MsdfTextTaaNode>>(
                 Core2d,
                 MsdfTextTaaNode::NAME,
             )
-            // Order: Upscaling → MSDF → TAA
+            // Order: Upscaling → MSDF → Bloom → TAA
             .add_render_graph_edges(Core2d, (
                 Node2d::Upscaling,
                 MsdfTextRenderNode::NAME,
+                MsdfBloomNode::NAME,
                 MsdfTextTaaNode::NAME,
             ));
     }
@@ -125,6 +132,7 @@ impl Plugin for TextRenderPlugin {
         // Initialize render world resources
         render_app.init_resource::<MsdfTextPipeline>();
         render_app.init_resource::<MsdfTextTaaPipeline>();
+        render_app.init_resource::<MsdfBloomPipeline>();
         render_app.init_resource::<MsdfTextTaaState>();
         render_app.insert_resource(font_system);
 
@@ -145,6 +153,25 @@ impl Plugin for TextRenderPlugin {
                 .in_set(RenderSystems::Prepare)
                 .run_if(resource_exists::<super::msdf::MsdfTextResources>)
                 .run_if(not(resource_exists::<MsdfTextTaaResources>)),
+        );
+
+        // Schedule init_bloom_resources to run after main resources exist
+        // Creates half-res glow textures and bloom pipelines
+        render_app.add_systems(
+            Render,
+            init_bloom_resources
+                .in_set(RenderSystems::Prepare)
+                .run_if(resource_exists::<super::msdf::MsdfTextResources>)
+                .run_if(not(resource_exists::<MsdfBloomResources>)),
+        );
+
+        // Schedule prepare_bloom AFTER prepare_msdf_texts (needs intermediate texture)
+        render_app.add_systems(
+            Render,
+            prepare_bloom
+                .after(prepare_msdf_texts)
+                .run_if(resource_exists::<MsdfBloomResources>)
+                .run_if(resource_exists::<super::msdf::MsdfTextResources>),
         );
     }
 }

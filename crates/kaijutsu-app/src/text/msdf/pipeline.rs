@@ -158,6 +158,8 @@ pub struct MsdfVertex {
 }
 
 /// GPU uniform for MSDF rendering.
+///
+/// Glow is handled by the post-process bloom node (bloom.rs / msdf_bloom.wgsl).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, ShaderType)]
 pub struct MsdfUniforms {
@@ -169,14 +171,8 @@ pub struct MsdfUniforms {
     pub time: f32,
     /// Rainbow effect (0 = off, 1 = on).
     pub rainbow: u32,
-    /// Glow intensity (0 = off).
-    pub glow_intensity: f32,
-    /// Glow spread in pixels.
-    pub glow_spread: f32,
     /// Debug mode: 0=off, 1=dots, 2=dots+quads.
     pub debug_mode: u32,
-    /// Glow color.
-    pub glow_color: [f32; 4],
     /// SDF texel size (1.0 / atlas_width, 1.0 / atlas_height) for neighbor sampling.
     /// Used by shader-based hinting to detect stroke direction via gradient.
     pub sdf_texel: [f32; 2],
@@ -218,10 +214,7 @@ impl Default for MsdfUniforms {
             msdf_range: 4.0, // Must match MsdfAtlas::DEFAULT_RANGE
             time: 0.0,
             rainbow: 0,
-            glow_intensity: 0.0,
-            glow_spread: 2.0,
             debug_mode: 0,
-            glow_color: [0.4, 0.6, 1.0, 0.5],
             sdf_texel: [1.0 / 1024.0, 1.0 / 1024.0], // Default atlas size
             hint_amount: 0.8, // Enable hinting by default (80% strength)
             // Stem darkening: 0.15 = ClearType-like weight for 12-16px text
@@ -826,19 +819,11 @@ impl ViewNode for MsdfTextRenderNode {
             return Ok(());
         };
 
-        // Check if TAA is enabled - if so, render to intermediate texture
-        let taa_state = world.get_resource::<MsdfTextTaaState>();
-        let taa_enabled = taa_state.map(|s| s.enabled).unwrap_or(false);
-
-        // Choose render target: intermediate texture for TAA, ViewTarget otherwise
-        // During warmup, intermediate texture may not exist yet - fall back gracefully
-        let (render_target, load_op) = if taa_enabled {
-            if let Some(intermediate_view) = &resources.intermediate_texture_view {
-                // Clear intermediate to transparent black
-                (intermediate_view as &TextureView, LoadOp::Clear(Default::default()))
-            } else {
-                (view_target.out_texture(), LoadOp::Load)
-            }
+        // Always render to intermediate texture (bloom and TAA read from it).
+        // During warmup, intermediate texture may not exist yet - fall back to ViewTarget.
+        let (render_target, load_op) = if let Some(intermediate_view) = &resources.intermediate_texture_view {
+            // Clear intermediate to transparent black
+            (intermediate_view as &TextureView, LoadOp::Clear(Default::default()))
         } else {
             (view_target.out_texture(), LoadOp::Load)
         };
@@ -943,15 +928,10 @@ impl ViewNode for MsdfTextTaaNode {
             }
         }
 
-        // Check if TAA is enabled
+        // Get TAA state
         let Some(taa_state) = world.get_resource::<MsdfTextTaaState>() else {
             return Ok(());
         };
-
-        if !taa_state.enabled {
-            // TAA disabled - MSDF already rendered directly to ViewTarget
-            return Ok(());
-        }
 
         // Get required resources - early returns are expected during warmup
         let Some(taa_resources) = world.get_resource::<MsdfTextTaaResources>() else {
@@ -962,13 +942,8 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(());
         };
 
-        // Need intermediate texture for TAA to work
+        // Need intermediate texture — text always renders there now
         let Some(intermediate_view) = &msdf_resources.intermediate_texture_view else {
-            return Ok(());
-        };
-
-        // Need the bind group
-        let Some(bind_group) = &taa_resources.bind_group else {
             return Ok(());
         };
 
@@ -982,43 +957,47 @@ impl ViewNode for MsdfTextTaaNode {
             return Ok(()); // Pipeline not yet compiled
         };
 
-        // Need the blit bind group for second pass
+        // Need the blit bind group (always needed for final output)
         let Some(blit_bind_group) = &taa_resources.blit_bind_group else {
             return Ok(());
         };
 
-        // === PASS 1: TAA Blend ===
-        // Blend intermediate (current jittered frame) + history_read → history_write
-        // This accumulates the temporal information in the history texture
-        {
-            let mut render_pass = render_context.command_encoder().begin_render_pass(
-                &RenderPassDescriptor {
-                    label: Some("msdf_taa_blend_pass"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: taa_resources.write_view(),
-                        resolve_target: None,
-                        ops: Operations {
-                            // Clear history_write before blending
-                            load: LoadOp::Clear(Default::default()),
-                            store: StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                },
-            );
+        if taa_state.enabled {
+            // === PASS 1: TAA Blend ===
+            // Blend intermediate (current jittered frame) + history_read → history_write
+            let Some(bind_group) = &taa_resources.bind_group else {
+                return Ok(());
+            };
 
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, bind_group, &[]);
-            // Draw fullscreen triangle (3 vertices, shader generates positions)
-            render_pass.draw(0..3, 0..1);
+            {
+                let mut render_pass = render_context.command_encoder().begin_render_pass(
+                    &RenderPassDescriptor {
+                        label: Some("msdf_taa_blend_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: taa_resources.write_view(),
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Default::default()),
+                                store: StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    },
+                );
+
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
         }
 
-        // === PASS 2: Blit to ViewTarget ===
-        // Copy history_write → ViewTarget
-        // Uses TAA shader with taa_enabled=0 for passthrough (handles format conversion)
+        // === Blit to ViewTarget ===
+        // Always needed: copies intermediate (or TAA history) → ViewTarget.
+        // When TAA is enabled, blit_bind_group reads from history_write.
+        // When TAA is disabled, blit_bind_group reads from intermediate directly.
         {
             let out_texture = view_target.out_texture();
             let mut render_pass = render_context.command_encoder().begin_render_pass(
@@ -1028,7 +1007,6 @@ impl ViewNode for MsdfTextTaaNode {
                         view: out_texture,
                         resolve_target: None,
                         ops: Operations {
-                            // Load existing scene content, blend text on top
                             load: LoadOp::Load,
                             store: StoreOp::Store,
                         },
@@ -1045,7 +1023,6 @@ impl ViewNode for MsdfTextTaaNode {
             render_pass.draw(0..3, 0..1);
         }
 
-        // Note: History swap happens in prepare_msdf_texts next frame
         let _ = intermediate_view; // Used in bind_group creation
 
         Ok(())
@@ -1157,7 +1134,8 @@ pub fn extract_msdf_render_config(
     // Detect if resolution changed this frame - bounds may be stale
     let resize_in_progress = config.resolution != config.prev_resolution;
 
-    let glow_srgba = theme.font_glow_color.to_srgba();
+    // Use linear color for glow — shader math and blending happen in linear space
+    let glow_linear = theme.font_glow_color.to_linear();
     commands.insert_resource(ExtractedMsdfRenderConfig {
         resolution: config.resolution,
         format: config.format,
@@ -1174,7 +1152,7 @@ pub fn extract_msdf_render_config(
         gamma_correction: theme.font_gamma_correction,
         glow_intensity: theme.font_glow_intensity,
         glow_spread: theme.font_glow_spread,
-        glow_color: [glow_srgba.red, glow_srgba.green, glow_srgba.blue, glow_srgba.alpha],
+        glow_color: [glow_linear.red, glow_linear.green, glow_linear.blue, glow_linear.alpha],
         rainbow: theme.font_rainbow,
         // TAA convergence parameters
         taa_convergence_frames: theme.font_taa_convergence_frames,
@@ -1318,25 +1296,10 @@ pub fn prepare_msdf_texts(
     // Get viewport resolution from extracted config
     let resolution = render_config.resolution;
 
-    // Determine effects from first text (simplified - could be per-text)
-    // Per-entity effects override theme defaults when set
+    // Determine rainbow effect from first entity or theme
     let effects = extracted.texts.first().map(|t| &t.effects);
     let entity_rainbow = effects.map(|e| e.rainbow).unwrap_or(false);
-    let entity_glow = effects.and_then(|e| e.glow.as_ref());
-
-    // Use entity effects if set, otherwise fall back to theme defaults
     let rainbow = entity_rainbow || render_config.rainbow;
-    let (glow_intensity, glow_spread, glow_color) = match entity_glow {
-        Some(g) => {
-            let c = g.color.to_linear();
-            (g.intensity, g.spread, [c.red, c.green, c.blue, c.alpha])
-        }
-        None if render_config.glow_intensity > 0.0 => {
-            // Use theme glow settings
-            (render_config.glow_intensity, render_config.glow_spread, render_config.glow_color)
-        }
-        None => (0.0, 2.0, [0.4, 0.6, 1.0, 0.5]),
-    };
 
     // Get debug mode from extracted resource
     #[cfg(debug_assertions)]
@@ -1371,10 +1334,7 @@ pub fn prepare_msdf_texts(
         msdf_range: atlas.msdf_range,
         time: time.elapsed_secs(),
         rainbow: if rainbow { 1 } else { 0 },
-        glow_intensity,
-        glow_spread,
         debug_mode: debug_mode_value,
-        glow_color,
         sdf_texel,
         // Use theme values for rendering quality parameters
         hint_amount: render_config.hint_amount,
@@ -1588,11 +1548,10 @@ pub fn prepare_msdf_texts(
         resources.intermediate_texture_view = None;
     }
 
-    // Create intermediate texture for TAA if needed.
-    // This must be checked every frame because TAA can be toggled and resources
-    // may be initialized after the texture size is already tracked.
-    if taa_state.enabled
-        && resources.intermediate_texture_view.is_none()
+    // Create intermediate texture unconditionally — both bloom and TAA read from it.
+    // This must be checked every frame because resources may be initialized after
+    // the texture size is already tracked.
+    if resources.intermediate_texture_view.is_none()
         && width > 0
         && height > 0
     {
@@ -1629,82 +1588,105 @@ pub fn prepare_msdf_texts(
         ));
     }
 
-    // Update TAA bind group if we have TAA resources and intermediate texture
+    // Update TAA bind groups — always needed since text renders to intermediate.
     if let Some(intermediate_view) = &resources.intermediate_texture_view {
         if let Some(taa_res) = &mut taa_resources {
-            // Swap history textures FIRST (applies last frame's render result)
-            // This must happen BEFORE creating the bind group so read_view() is correct
-            // On first frame, frames_accumulated is 0 so this is a no-op
-            if taa_res.frames_accumulated > 0 {
-                taa_res.swap();
-            }
+            if taa_state.enabled {
+                // === TAA ENABLED ===
+                // Swap history textures FIRST (applies last frame's render result)
+                if taa_res.frames_accumulated > 0 {
+                    taa_res.swap();
+                }
 
-            // Get camera motion for reprojection (or zero if not available)
-            let motion = camera_motion.as_ref().map(|m| m.motion_uv).unwrap_or([0.0, 0.0]);
+                // Get camera motion for reprojection
+                let motion = camera_motion.as_ref().map(|m| m.motion_uv).unwrap_or([0.0, 0.0]);
 
-            // Reset accumulation on significant camera motion (prevents ghosting)
-            let motion_magnitude = (motion[0] * motion[0] + motion[1] * motion[1]).sqrt();
-            if motion_magnitude > 0.001 {
-                // Camera moved - reset accumulation to avoid ghosting
+                // Reset accumulation on significant camera motion (prevents ghosting)
+                let motion_magnitude = (motion[0] * motion[0] + motion[1] * motion[1]).sqrt();
+                if motion_magnitude > 0.001 {
+                    taa_res.frames_accumulated = 0;
+                }
+
+                // TAA blend uniforms
+                let taa_uniforms = TaaUniforms {
+                    resolution,
+                    frames_accumulated: taa_res.frames_accumulated,
+                    taa_enabled: 1,
+                    camera_motion: motion,
+                    convergence_frames: render_config.taa_convergence_frames as f32,
+                    initial_weight: render_config.taa_initial_weight,
+                    final_weight: render_config.taa_final_weight,
+                    _padding: 0.0,
+                };
+                queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
+
+                // TAA blend bind group: intermediate + history_read → history_write
+                taa_res.bind_group = Some(device.create_bind_group(
+                    "msdf_taa_bind_group",
+                    &taa_pipeline.bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        taa_pipeline.uniform_buffer.as_entire_binding(),
+                        intermediate_view,
+                        taa_res.read_view(),
+                        &taa_res.history_sampler,
+                    )),
+                ));
+
+                // Blit bind group: history_write → ViewTarget (passthrough)
+                let blit_uniforms = TaaUniforms {
+                    resolution,
+                    frames_accumulated: 0,
+                    taa_enabled: 0,
+                    camera_motion: [0.0, 0.0],
+                    convergence_frames: 8.0,
+                    initial_weight: 0.5,
+                    final_weight: 0.1,
+                    _padding: 0.0,
+                };
+                queue.write_buffer(&taa_pipeline.blit_uniform_buffer, 0, bytemuck::bytes_of(&blit_uniforms));
+
+                taa_res.blit_bind_group = Some(device.create_bind_group(
+                    "msdf_taa_blit_bind_group",
+                    &taa_pipeline.bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        taa_pipeline.blit_uniform_buffer.as_entire_binding(),
+                        taa_res.write_view(),
+                        taa_res.read_view(), // Dummy — passthrough ignores history
+                        &taa_res.history_sampler,
+                    )),
+                ));
+
+                taa_res.frames_accumulated = taa_res.frames_accumulated.saturating_add(1);
+            } else {
+                // === TAA DISABLED ===
+                // Still need blit from intermediate → ViewTarget
+                taa_res.bind_group = None; // No TAA blend pass
                 taa_res.frames_accumulated = 0;
+
+                let blit_uniforms = TaaUniforms {
+                    resolution,
+                    frames_accumulated: 0,
+                    taa_enabled: 0,
+                    camera_motion: [0.0, 0.0],
+                    convergence_frames: 8.0,
+                    initial_weight: 0.5,
+                    final_weight: 0.1,
+                    _padding: 0.0,
+                };
+                queue.write_buffer(&taa_pipeline.blit_uniform_buffer, 0, bytemuck::bytes_of(&blit_uniforms));
+
+                // Blit reads from intermediate directly (not history)
+                taa_res.blit_bind_group = Some(device.create_bind_group(
+                    "msdf_taa_blit_bind_group",
+                    &taa_pipeline.bind_group_layout,
+                    &BindGroupEntries::sequential((
+                        taa_pipeline.blit_uniform_buffer.as_entire_binding(),
+                        intermediate_view,          // Read intermediate directly
+                        intermediate_view,          // Dummy — passthrough ignores history
+                        &taa_res.history_sampler,
+                    )),
+                ));
             }
-
-            // Update TAA uniforms with configurable convergence parameters
-            let taa_uniforms = TaaUniforms {
-                resolution,
-                frames_accumulated: taa_res.frames_accumulated,
-                taa_enabled: if taa_state.enabled { 1 } else { 0 },
-                camera_motion: motion,
-                convergence_frames: render_config.taa_convergence_frames as f32,
-                initial_weight: render_config.taa_initial_weight,
-                final_weight: render_config.taa_final_weight,
-                _padding: 0.0,
-            };
-            queue.write_buffer(&taa_pipeline.uniform_buffer, 0, bytemuck::bytes_of(&taa_uniforms));
-
-            // Create TAA blend bind group: uniforms, intermediate, history_read, sampler
-            // read_view() returns the texture with accumulated history to sample from
-            // write_view() will be the render target in the TAA blend pass
-            taa_res.bind_group = Some(device.create_bind_group(
-                "msdf_taa_bind_group",
-                &taa_pipeline.bind_group_layout,
-                &BindGroupEntries::sequential((
-                    taa_pipeline.uniform_buffer.as_entire_binding(),
-                    intermediate_view,
-                    taa_res.read_view(),
-                    &taa_res.history_sampler,
-                )),
-            ));
-
-            // Write blit uniforms (passthrough mode: taa_enabled=0)
-            let blit_uniforms = TaaUniforms {
-                resolution,
-                frames_accumulated: 0, // Not used in passthrough
-                taa_enabled: 0,        // Passthrough mode - just sample current texture
-                camera_motion: [0.0, 0.0],
-                // Values don't matter for passthrough, use defaults
-                convergence_frames: 8.0,
-                initial_weight: 0.5,
-                final_weight: 0.1,
-                _padding: 0.0,
-            };
-            queue.write_buffer(&taa_pipeline.blit_uniform_buffer, 0, bytemuck::bytes_of(&blit_uniforms));
-
-            // Create blit bind group: uniforms, write_view (blended result), dummy history, sampler
-            // The shader in passthrough mode ignores history and just outputs current_texture
-            taa_res.blit_bind_group = Some(device.create_bind_group(
-                "msdf_taa_blit_bind_group",
-                &taa_pipeline.bind_group_layout,
-                &BindGroupEntries::sequential((
-                    taa_pipeline.blit_uniform_buffer.as_entire_binding(),
-                    taa_res.write_view(), // The blended result to output to ViewTarget
-                    taa_res.read_view(),  // Dummy - not used in passthrough mode
-                    &taa_res.history_sampler,
-                )),
-            ));
-
-            // Increment accumulation counter (swap already happened above)
-            taa_res.frames_accumulated = taa_res.frames_accumulated.saturating_add(1);
         }
     }
 }

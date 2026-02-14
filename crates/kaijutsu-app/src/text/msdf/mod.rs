@@ -16,6 +16,7 @@
 //! ```
 
 pub mod atlas;
+pub mod bloom;
 pub mod buffer;
 pub mod generator;
 pub mod pipeline;
@@ -29,6 +30,9 @@ pub use generator::MsdfGenerator;
 // Font metrics infrastructure for future pixel-alignment work
 #[allow(unused_imports)]
 pub use generator::{FontMetricsCache, HintingMetrics};
+pub use bloom::{
+    init_bloom_resources, prepare_bloom, MsdfBloomNode, MsdfBloomPipeline, MsdfBloomResources,
+};
 pub use pipeline::{
     extract_msdf_render_config, extract_msdf_taa_config, extract_msdf_texts,
     init_msdf_resources, init_msdf_taa_resources, prepare_msdf_texts,
@@ -44,34 +48,12 @@ use crate::text::resources::bevy_to_rgba8;
 
 /// Text effects applied to MSDF-rendered text.
 ///
-/// Rainbow and glow effects are wired through MsdfUniforms to the msdf_text.wgsl shader.
+/// Rainbow effect is wired through MsdfUniforms to the msdf_text.wgsl shader.
+/// Glow is handled by the post-process bloom node (bloom.rs).
 #[derive(Component, Default, Clone)]
 pub struct SdfTextEffects {
     /// Enable rainbow color cycling effect.
     pub rainbow: bool,
-    /// Optional glow effect configuration.
-    pub glow: Option<GlowConfig>,
-}
-
-/// Configuration for text glow effect.
-#[derive(Clone, Debug)]
-pub struct GlowConfig {
-    /// Glow color.
-    pub color: Color,
-    /// Glow intensity (0.0 - 1.0).
-    pub intensity: f32,
-    /// Glow spread in pixels.
-    pub spread: f32,
-}
-
-impl Default for GlowConfig {
-    fn default() -> Self {
-        Self {
-            color: Color::srgba(0.4, 0.6, 1.0, 0.5),
-            intensity: 0.5,
-            spread: 2.0,
-        }
-    }
 }
 
 /// Marker component for entities using MSDF text rendering.
