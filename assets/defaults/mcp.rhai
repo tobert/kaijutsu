@@ -11,28 +11,9 @@
 //   env        - Environment variables map
 //   cwd        - Working directory (stdio only)
 //   url        - Server URL (streamable_http only)
+//
+// Example:
+//   kaish: #{ command: "kaish-mcp" },
+//   my_tool: #{ command: "/path/to/tool", args: ["--stdio"] },
 
-let servers = #{
-
-    kaish: #{
-        command: "/home/atobey/bin/kaish-mcp",
-    },
-
-    gpal: #{
-        command: "/home/atobey/.local/bin/gpal",
-    },
-
-    cpal: #{
-        command: "/home/atobey/.local/bin/cpal",
-    },
-
-    otlp: #{
-        command: "/home/atobey/bin/otlp-mcp",
-    },
-
-    holler: #{
-        transport: "streamable_http",
-        url: "http://localhost:8080",
-    },
-
-};
+let servers = #{};

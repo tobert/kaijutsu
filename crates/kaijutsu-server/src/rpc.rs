@@ -226,10 +226,18 @@ pub struct ServerState {
     pub mcp_pool: Arc<McpServerPool>,
     /// Cross-context drift router (context registry + staging queue)
     pub drift_router: kaijutsu_kernel::DriftRouter,
+    /// Config directory override. None = use XDG default (~/.config/kaijutsu).
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Data directory override. None = use XDG default (~/.local/share/kaijutsu).
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl ServerState {
-    pub fn new(username: String) -> Self {
+    pub fn new(username: String, config_dir: Option<std::path::PathBuf>) -> Self {
+        // If config_dir is overridden (test mode), also use a tempdir for data
+        // to avoid loading stale config from the persistent database.
+        let data_dir = config_dir.as_ref().map(|c| c.join("data"));
+
         Self {
             identity: Identity {
                 username: username.clone(),
@@ -240,6 +248,8 @@ impl ServerState {
             next_exec_id: AtomicU64::new(1),
             mcp_pool: Arc::new(McpServerPool::new()),
             drift_router: kaijutsu_kernel::DriftRouter::new(),
+            config_dir,
+            data_dir,
         }
     }
 
@@ -273,8 +283,21 @@ fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
 }
 
 /// Open or create a BlockStore with database persistence for a kernel.
-fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus) -> SharedBlockStore {
-    let db_path = kernel_data_dir(kernel_id).join("data.db");
+///
+/// If `data_dir_override` is set, uses that directory for the database.
+/// Otherwise uses the XDG default (~/.local/share/kaijutsu/kernels/{kernel_id}/).
+fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
+    let db_dir = match data_dir_override {
+        Some(dir) => {
+            let d = dir.join(kernel_id);
+            if let Err(e) = std::fs::create_dir_all(&d) {
+                log::warn!("Failed to create data dir {:?}: {}", d, e);
+            }
+            d
+        }
+        None => kernel_data_dir(kernel_id),
+    };
+    let db_path = db_dir.join("data.db");
     match DocumentDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened document database at {:?}", db_path);
@@ -346,8 +369,11 @@ fn get_default_seat_id() -> String {
 async fn create_config_backend(
     documents: SharedBlockStore,
     config_flows: SharedConfigFlowBus,
+    config_path_override: Option<&Path>,
 ) -> (Arc<ConfigCrdtBackend>, Option<ConfigWatcherHandle>) {
-    let config_path = config_dir();
+    let config_path = config_path_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(config_dir);
 
     let backend = Arc::new(ConfigCrdtBackend::with_flows(
         documents,
@@ -530,7 +556,7 @@ impl WorldImpl {
 
     /// Create a new World capability for use in RPC
     pub fn new_client(username: String) -> world::Client {
-        let state = Rc::new(RefCell::new(ServerState::new(username)));
+        let state = Rc::new(RefCell::new(ServerState::new(username, None)));
         capnp_rpc::new_client(WorldImpl::new(state))
     }
 }
@@ -617,14 +643,14 @@ impl world::Server for WorldImpl {
                 kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
                 // Create block store with database persistence and shared FlowBus
-                let documents = create_block_store_with_db(&id, block_flows);
+                let documents = create_block_store_with_db(&id, block_flows, state.borrow().data_dir.as_deref());
 
                 // Ensure main document exists (convention ID)
                 let main_document_id = ensure_main_document(&documents, &id)?;
 
                 // Create config backend and ensure seat config exists
                 let (config_backend, config_watcher) =
-                    create_config_backend(documents.clone(), config_flows).await;
+                    create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
                 // Ensure seat-specific config exists
                 if let Err(e) = config_backend.ensure_seat_config(&seat_id).await {
@@ -737,14 +763,14 @@ impl world::Server for WorldImpl {
             kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
             // Create block store with database persistence and shared FlowBus
-            let documents = create_block_store_with_db(&id, block_flows);
+            let documents = create_block_store_with_db(&id, block_flows, state.borrow().data_dir.as_deref());
 
             // Ensure main document exists (convention ID)
             let main_document_id = ensure_main_document(&documents, &id)?;
 
             // Create config backend
             let (config_backend, config_watcher) =
-                create_config_backend(documents.clone(), config_flows).await;
+                create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
             // Get identity for context manager
             let nick = {
@@ -1113,14 +1139,14 @@ impl kernel::Server for KernelImpl {
             let config_flows = shared_config_flow_bus(256);
 
             // Create block store with database persistence
-            let documents = create_block_store_with_db(&id, block_flows);
+            let documents = create_block_store_with_db(&id, block_flows, state.borrow().data_dir.as_deref());
 
             // Ensure main document exists
             let main_document_id = ensure_main_document(&documents, &id)?;
 
             // Create config backend
             let (config_backend, config_watcher) =
-                create_config_backend(documents.clone(), config_flows).await;
+                create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
             // Get identity for context manager
             let nick = {

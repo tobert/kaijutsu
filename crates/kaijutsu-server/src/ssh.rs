@@ -106,6 +106,8 @@ pub struct SshServerConfig {
     /// Allow anonymous connections (auto-register unknown keys).
     /// Only for testing - production should always be false.
     pub allow_anonymous: bool,
+    /// Config directory override. None = use XDG default (~/.config/kaijutsu).
+    pub config_dir: Option<PathBuf>,
 }
 
 impl SshServerConfig {
@@ -113,11 +115,21 @@ impl SshServerConfig {
     ///
     /// Uses in-memory auth database and allows anonymous connections.
     pub fn ephemeral(port: u16) -> Self {
+        // Use a fresh tempdir so no real configs (mcp.rhai etc.) are loaded.
+        // Include PID + timestamp to avoid stale data from PID reuse.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let config_dir = std::env::temp_dir().join(format!("kaijutsu-test-{}-{}", std::process::id(), stamp));
+        std::fs::create_dir_all(&config_dir).ok();
+
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
             key_source: KeySource::Ephemeral,
             auth_db_path: None,
             allow_anonymous: true, // Tests need to accept any key
+            config_dir: Some(config_dir),
         }
     }
 
@@ -128,6 +140,7 @@ impl SshServerConfig {
             key_source: KeySource::Persistent(KeySource::default_path()),
             auth_db_path: Some(AuthDb::default_path()),
             allow_anonymous: false,
+            config_dir: None, // Use XDG default
         }
     }
 
@@ -206,6 +219,7 @@ impl SshServer {
         let mut server = Server {
             auth_db: Arc::new(Mutex::new(auth_db)),
             allow_anonymous,
+            config_dir: self.config.config_dir.clone(),
         };
         let socket = TcpListener::bind(self.config.bind_addr).await?;
 
@@ -220,13 +234,14 @@ impl SshServer {
 struct Server {
     auth_db: Arc<Mutex<AuthDb>>,
     allow_anonymous: bool,
+    config_dir: Option<PathBuf>,
 }
 
 impl server::Server for Server {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        ConnectionHandler::new(self.auth_db.clone(), peer_addr, self.allow_anonymous)
+        ConnectionHandler::new(self.auth_db.clone(), peer_addr, self.allow_anonymous, self.config_dir.clone())
     }
 
     fn handle_session_error(&mut self, error: <Self::Handler as server::Handler>::Error) {
@@ -248,26 +263,28 @@ struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     allow_anonymous: bool,
     identity: Option<Identity>,
+    config_dir: Option<PathBuf>,
 }
 
 impl ConnectionHandler {
-    fn new(auth_db: Arc<Mutex<AuthDb>>, peer_addr: Option<SocketAddr>, allow_anonymous: bool) -> Self {
+    fn new(auth_db: Arc<Mutex<AuthDb>>, peer_addr: Option<SocketAddr>, allow_anonymous: bool, config_dir: Option<PathBuf>) -> Self {
         Self {
             auth_db,
             peer_addr,
             allow_anonymous,
             identity: None,
+            config_dir,
         }
     }
 }
 
 /// Run Cap'n Proto RPC over an SSH channel stream
-async fn run_rpc(stream: russh::ChannelStream<Msg>, identity: Identity) {
+async fn run_rpc(stream: russh::ChannelStream<Msg>, identity: Identity, config_dir: Option<PathBuf>) {
     let stream = stream.compat();
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
     // Use nick as the username for RPC state
-    let state = Rc::new(RefCell::new(ServerState::new(identity.nick.clone())));
+    let state = Rc::new(RefCell::new(ServerState::new(identity.nick.clone(), config_dir)));
     let world = WorldImpl::new(state);
     let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
 
@@ -325,6 +342,7 @@ impl server::Handler for ConnectionHandler {
         );
 
         let stream = channel.into_stream();
+        let config_dir = self.config_dir.clone();
 
         // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet)
         std::thread::spawn(move || {
@@ -334,7 +352,7 @@ impl server::Handler for ConnectionHandler {
                 .expect("Failed to create tokio runtime for RPC");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                run_rpc(stream, identity).await;
+                run_rpc(stream, identity, config_dir).await;
             });
         });
 
