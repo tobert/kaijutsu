@@ -603,13 +603,17 @@ impl world::Server for WorldImpl {
                 // Create the kaijutsu kernel with shared FlowBus
                 let kernel = Kernel::with_flows(&id, block_flows.clone()).await;
 
-                // Mount user's home directory at /home (read-only for now)
+                // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
+                kernel.mount("/", LocalBackend::read_only("/")).await;
+
+                // Read-write ~/src (longest-prefix wins over /)
                 let home = kaish_kernel::home_dir();
+                let src_dir = home.join("src");
                 kernel
-                    .mount("/home", LocalBackend::read_only(home))
+                    .mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir))
                     .await;
 
-                // Mount /tmp for scratch/interop with external tools
+                // Read-write /tmp for scratch/interop with external tools
                 kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
                 // Create block store with database persistence and shared FlowBus
@@ -719,13 +723,17 @@ impl world::Server for WorldImpl {
             // Create the kaijutsu kernel with shared FlowBus
             let kernel = Kernel::with_flows(&name, block_flows.clone()).await;
 
-            // Mount user's home directory at /home (read-only for now)
+            // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
+            kernel.mount("/", LocalBackend::read_only("/")).await;
+
+            // Read-write ~/src (longest-prefix wins over /)
             let home = kaish_kernel::home_dir();
+            let src_dir = home.join("src");
             kernel
-                .mount("/home", LocalBackend::read_only(home))
+                .mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir))
                 .await;
 
-            // Mount /tmp for scratch/interop with external tools
+            // Read-write /tmp for scratch/interop with external tools
             kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
             // Create block store with database persistence and shared FlowBus
@@ -872,6 +880,7 @@ impl kernel::Server for KernelImpl {
                         &kernel_id,
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
+                        None,
                     ) {
                         Ok(kaish) => {
                             kernel.kaish = Some(Rc::new(kaish));
@@ -2357,6 +2366,7 @@ impl kernel::Server for KernelImpl {
                         &kernel_id,
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
+                        None,
                     ) {
                         Ok(kaish) => {
                             kernel.kaish = Some(Rc::new(kaish));
