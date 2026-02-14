@@ -115,7 +115,9 @@ impl Plugin for TextRenderPlugin {
     fn finish(&self, app: &mut App) {
         // Initialize the MSDF atlas in main world
         let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let atlas = MsdfAtlas::new(&mut images, 1024, 1024);
+        // Start at 2048x2048 to reduce likelihood of atlas growth (which has
+        // a packer desync bug). At 64px/glyph this fits ~1024 unique glyphs.
+        let atlas = MsdfAtlas::new(&mut images, 2048, 2048);
         app.insert_resource(atlas);
 
         // Initialize MSDF generator

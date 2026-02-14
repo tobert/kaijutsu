@@ -255,10 +255,36 @@ impl MsdfAtlas {
         };
         self.packer = Packer::new(packer_config);
 
-        // Re-pack existing regions by marking their space as used
-        // Note: The old pixel data is preserved, we just need to update the packer
-        for region in self.regions.values() {
-            let _ = self.packer.pack(region.width as i32, region.height as i32, false);
+        // Re-pack existing regions: the packer assigns new positions, so we must
+        // copy pixel data from old positions to new positions and update regions.
+        let old_regions: Vec<(GlyphKey, AtlasRegion)> = self.regions.drain().collect();
+        for (key, old_region) in old_regions {
+            if let Some(new_rect) = self.packer.pack(old_region.width as i32, old_region.height as i32, false) {
+                let new_x = new_rect.x as u32;
+                let new_y = new_rect.y as u32;
+
+                // Copy pixel data from old position to new position if they differ
+                if new_x != old_region.x || new_y != old_region.y {
+                    for row in 0..old_region.height {
+                        let src_offset = ((old_region.y + row) * new_width * 4 + old_region.x * 4) as usize;
+                        let dst_offset = ((new_y + row) * new_width * 4 + new_x * 4) as usize;
+                        let row_bytes = (old_region.width * 4) as usize;
+                        // Use copy_within since src and dst are in the same buffer
+                        self.pixels.copy_within(src_offset..src_offset + row_bytes, dst_offset);
+                    }
+                }
+
+                self.regions.insert(key, AtlasRegion {
+                    x: new_x,
+                    y: new_y,
+                    width: old_region.width,
+                    height: old_region.height,
+                    anchor_x: old_region.anchor_x,
+                    anchor_y: old_region.anchor_y,
+                });
+            } else {
+                warn!("Failed to re-pack glyph during atlas growth — glyph lost");
+            }
         }
 
         // Update the texture
