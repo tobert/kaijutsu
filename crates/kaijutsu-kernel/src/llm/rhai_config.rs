@@ -98,11 +98,17 @@ fn extract_providers(scope: &rhai::Scope) -> Vec<ProviderConfig> {
                 .and_then(|v| v.clone().into_string().ok())
                 .map(|s| s.to_string());
 
+            let max_output_tokens = map
+                .get("max_output_tokens")
+                .and_then(|v| v.as_int().ok())
+                .map(|i| i as u64);
+
             let mut config = ProviderConfig::new(&name);
             config.enabled = enabled;
             config.api_key_env = api_key_env;
             config.base_url = base_url;
             config.default_model = default_model;
+            config.max_output_tokens = max_output_tokens;
 
             configs.push(config);
         }
@@ -202,6 +208,9 @@ pub fn initialize_llm_registry(config: &LlmConfig) -> LlmRegistry {
 
     // Set model aliases
     registry.set_model_aliases(config.model_aliases.clone());
+
+    // Store provider configs for max_output_tokens lookup
+    registry.set_provider_configs(config.providers.clone());
 
     registry
 }

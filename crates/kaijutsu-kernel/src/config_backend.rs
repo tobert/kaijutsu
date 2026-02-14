@@ -64,6 +64,9 @@ pub const EXAMPLE_SEAT: &str = include_str!("../../../assets/defaults/seats/exam
 /// Embedded default MCP server configuration.
 pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.rhai");
 
+/// Embedded default system prompt.
+pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
+
 /// Tracks dirty config files that need flushing to disk.
 struct DirtyTracker {
     /// Files marked dirty, with timestamp of last modification.
@@ -326,6 +329,7 @@ impl ConfigCrdtBackend {
             "theme.rhai" => Some(DEFAULT_THEME.to_string()),
             "llm.rhai" => Some(DEFAULT_LLM_CONFIG.to_string()),
             "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
+            "system.md" => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             p if p.starts_with("seats/") && p.ends_with(".rhai") => {
                 // Generate seat-specific default from template
                 Some(EXAMPLE_SEAT.to_string())

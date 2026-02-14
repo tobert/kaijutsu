@@ -32,6 +32,10 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
 
+    /// Maximum output tokens for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+
     /// Default tool filter for this provider.
     #[serde(default)]
     pub default_tools: ToolFilter,
@@ -51,6 +55,7 @@ impl ProviderConfig {
             api_key_env: None,
             base_url: None,
             default_model: None,
+            max_output_tokens: None,
             default_tools: ToolFilter::All,
         }
     }

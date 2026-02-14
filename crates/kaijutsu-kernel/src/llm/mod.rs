@@ -513,6 +513,7 @@ pub struct LlmRegistry {
     default_provider: Option<String>,
     default_model: Option<String>,
     model_aliases: HashMap<String, rhai_config::ModelAlias>,
+    provider_configs: Option<Vec<ProviderConfig>>,
 }
 
 impl std::fmt::Debug for LlmRegistry {
@@ -574,6 +575,23 @@ impl LlmRegistry {
         self.default_model.as_deref()
     }
 
+    /// Get max_output_tokens for the default provider, falling back to 16384.
+    pub fn max_output_tokens(&self) -> u64 {
+        self.provider_configs
+            .as_ref()
+            .and_then(|configs| {
+                let default = self.default_provider.as_deref()?;
+                configs.iter().find(|c| c.provider_type == default)
+            })
+            .and_then(|c| c.max_output_tokens)
+            .unwrap_or(16384)
+    }
+
+    /// Store provider configs for runtime queries (e.g. max_output_tokens).
+    pub fn set_provider_configs(&mut self, configs: Vec<ProviderConfig>) {
+        self.provider_configs = Some(configs);
+    }
+
     /// Set model aliases.
     pub fn set_model_aliases(&mut self, aliases: HashMap<String, rhai_config::ModelAlias>) {
         self.model_aliases = aliases;
@@ -619,6 +637,7 @@ impl LlmRegistry {
             default_provider: self.default_provider.clone(),
             default_model: self.default_model.clone(),
             model_aliases: self.model_aliases.clone(),
+            provider_configs: self.provider_configs.clone(),
         }
     }
 

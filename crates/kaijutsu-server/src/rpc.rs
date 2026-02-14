@@ -1890,7 +1890,7 @@ impl kernel::Server for KernelImpl {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
             // Get LLM provider and kernel references from the kernel's own registry
-            let (documents, kernel_arc) = {
+            let (documents, kernel_arc, config_backend) = {
                 let state_ref = state.borrow();
                 let kernel_state = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| {
@@ -1899,24 +1899,34 @@ impl kernel::Server for KernelImpl {
                     })?;
                 log::debug!("Got kernel state");
 
-                (kernel_state.documents.clone(), kernel_state.kernel.clone())
+                (kernel_state.documents.clone(), kernel_state.kernel.clone(), kernel_state.config_backend.clone())
+            };
+
+            // Load system prompt from config
+            let system_prompt = {
+                if let Err(e) = config_backend.ensure_config("system.md").await {
+                    log::warn!("Failed to ensure system.md config: {}", e);
+                }
+                config_backend.get_content("system.md")
+                    .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
             };
 
             // Resolve provider from kernel's LLM registry
-            let (provider, model_name) = {
+            let (provider, model_name, max_output_tokens) = {
                 let registry = kernel_arc.llm().read().await;
                 let requested_model = model.as_deref();
+                let max_tokens = registry.max_output_tokens();
 
                 // Try alias resolution first, then default
                 if let Some(name) = requested_model {
                     if let Some((p, m)) = registry.resolve_model(name) {
-                        (p, m)
+                        (p, m, max_tokens)
                     } else {
                         let p = registry.default_provider().ok_or_else(|| {
                             log::error!("No LLM provider configured");
                             capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
                         })?;
-                        (p, name.to_string())
+                        (p, name.to_string(), max_tokens)
                     }
                 } else {
                     let p = registry.default_provider().ok_or_else(|| {
@@ -1926,7 +1936,7 @@ impl kernel::Server for KernelImpl {
                     let m = registry.default_model()
                         .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
                         .to_string();
-                    (p, m)
+                    (p, m, max_tokens)
                 }
             };
 
@@ -1971,6 +1981,8 @@ impl kernel::Server for KernelImpl {
                 kernel_arc,
                 tools,
                 user_block_id, // last_block_id - streaming blocks appear after this
+                system_prompt,
+                max_output_tokens,
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -5059,6 +5071,8 @@ async fn process_llm_stream(
     kernel: Arc<Kernel>,
     tools: Vec<ToolDefinition>,
     after_block_id: kaijutsu_crdt::BlockId,
+    system_prompt: String,
+    max_output_tokens: u64,
 ) {
     // Build initial conversation messages
     let mut messages: Vec<LlmMessage> = vec![LlmMessage::user(&content)];
@@ -5083,8 +5097,8 @@ async fn process_llm_stream(
 
         // Create streaming request with tools
         let stream_request = StreamRequest::new(&model_name, messages.clone())
-            .with_system("You are a helpful AI assistant in a collaborative coding environment called Kaijutsu. You have access to tools for manipulating blocks of content. Be concise and helpful.")
-            .with_max_tokens(4096)
+            .with_system(&system_prompt)
+            .with_max_tokens(max_output_tokens)
             .with_tools(tools.clone());
 
         // Start streaming

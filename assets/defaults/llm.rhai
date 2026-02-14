@@ -32,6 +32,7 @@ let providers = #{
         enabled: true,
         api_key_env: "ANTHROPIC_API_KEY",
         default_model: "claude-haiku-4-5-20251001",
+        max_output_tokens: 8192,
         default_tools: #{ type: "all" },
     },
 
@@ -41,6 +42,7 @@ let providers = #{
         enabled: false,
         api_key_env: "GEMINI_API_KEY",
         default_model: "gemini-2.0-flash",
+        max_output_tokens: 16384,
         default_tools: #{ type: "all" },
     },
 
@@ -50,6 +52,7 @@ let providers = #{
         enabled: false,
         api_key_env: "OPENAI_API_KEY",
         default_model: "gpt-4o",
+        max_output_tokens: 16384,
         default_tools: #{ type: "all" },
     },
 

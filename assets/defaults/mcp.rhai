@@ -16,4 +16,8 @@
 //   kaish: #{ command: "kaish-mcp" },
 //   my_tool: #{ command: "/path/to/tool", args: ["--stdio"] },
 
-let servers = #{};
+let servers = #{
+    bevy_brp: #{
+        command: "bevy_brp_mcp",
+    },
+};
