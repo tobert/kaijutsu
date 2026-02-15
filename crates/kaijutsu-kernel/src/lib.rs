@@ -75,7 +75,7 @@ pub use vfs::{
 };
 pub use mcp_pool::{
     McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo,
-    McpTransport,
+    McpTransport, McpForkMode, McpRegistration, extract_tool_result_text,
     // Resource types
     CachedResource, McpResourceInfo, ResourceCache,
 };

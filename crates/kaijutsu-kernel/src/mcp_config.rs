@@ -3,7 +3,7 @@
 //! Evaluates `mcp.rhai` scripts to extract server definitions.
 //! Converts the Rhai scope into `Vec<McpServerConfig>` for pool registration.
 
-use crate::mcp_pool::{McpServerConfig, McpTransport};
+use crate::mcp_pool::{McpForkMode, McpServerConfig, McpTransport};
 use std::collections::HashMap;
 
 /// Parsed MCP configuration containing server definitions.
@@ -111,6 +111,18 @@ fn extract_servers(scope: &rhai::Scope) -> Vec<McpServerConfig> {
             })
             .unwrap_or_default();
 
+        let fork_mode_str = map
+            .get("fork")
+            .and_then(|v| v.clone().into_string().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "share".to_string());
+
+        let fork_mode = match fork_mode_str.as_str() {
+            "instance" => McpForkMode::Instance,
+            "exclude" => McpForkMode::Exclude,
+            _ => McpForkMode::Share,
+        };
+
         configs.push(McpServerConfig {
             name,
             command,
@@ -119,6 +131,7 @@ fn extract_servers(scope: &rhai::Scope) -> Vec<McpServerConfig> {
             cwd,
             transport,
             url,
+            fork_mode,
         });
     }
     configs
@@ -239,5 +252,24 @@ mod tests {
         assert!(names.contains(&"gpal"));
         assert!(names.contains(&"holler"));
         assert!(!names.contains(&"disabled"));
+    }
+
+    #[test]
+    fn test_fork_mode_parsing() {
+        let script = r#"
+            let servers = #{
+                brp: #{ command: "/bin/brp", fork: "share" },
+                kaish: #{ command: "/bin/kaish", fork: "instance" },
+                debug: #{ command: "/bin/debug", fork: "exclude" },
+                default: #{ command: "/bin/default" },
+            };
+        "#;
+        let config = load_mcp_config(script).unwrap();
+        let find = |name: &str| config.servers.iter().find(|s| s.name == name).unwrap();
+
+        assert_eq!(find("brp").fork_mode, McpForkMode::Share);
+        assert_eq!(find("kaish").fork_mode, McpForkMode::Instance);
+        assert_eq!(find("debug").fork_mode, McpForkMode::Exclude);
+        assert_eq!(find("default").fork_mode, McpForkMode::Share); // default
     }
 }

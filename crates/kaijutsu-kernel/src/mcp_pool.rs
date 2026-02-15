@@ -107,6 +107,32 @@ pub enum McpTransport {
     StreamableHttp,
 }
 
+/// How an MCP server should behave when a kernel forks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpForkMode {
+    /// Share the parent's connection (stateless servers like BRP, gpal).
+    #[default]
+    Share,
+    /// Launch a new instance (stateful servers like kaish).
+    Instance,
+    /// Don't include in forked kernel.
+    Exclude,
+}
+
+/// Record of an MCP server registered on a kernel, for fork inheritance.
+#[derive(Debug, Clone)]
+pub struct McpRegistration {
+    /// Server name in the pool.
+    pub server_name: String,
+    /// How this server should behave on fork.
+    pub fork_mode: McpForkMode,
+    /// Tool names registered from this server.
+    pub tool_names: Vec<String>,
+    /// Original config for Instance mode re-launch.
+    pub config: McpServerConfig,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -127,6 +153,9 @@ pub struct McpServerConfig {
     pub transport: McpTransport,
     /// Server URL (streamable HTTP transport only).
     pub url: Option<String>,
+    /// How this server should behave when a kernel forks.
+    #[serde(default)]
+    pub fork_mode: McpForkMode,
 }
 
 impl Default for McpServerConfig {
@@ -139,6 +168,7 @@ impl Default for McpServerConfig {
             cwd: None,
             transport: McpTransport::Stdio,
             url: None,
+            fork_mode: McpForkMode::Share,
         }
     }
 }
@@ -1712,6 +1742,30 @@ impl McpServerPool {
 
 use crate::tools::{ExecResult, ExecutionEngine};
 
+/// Convert a `CallToolResult` into a string representation.
+///
+/// Priority: structured_content (pretty JSON) > text content > serialized non-text.
+/// Multiple text content items are joined with newlines.
+pub fn extract_tool_result_text(result: &CallToolResult) -> String {
+    if let Some(ref structured) = result.structured_content {
+        serde_json::to_string_pretty(structured).unwrap_or_default()
+    } else {
+        let parts: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|c| {
+                if let Some(text) = c.as_text() {
+                    Some(text.text.clone())
+                } else {
+                    // Serialize non-text content (images, resources) as JSON
+                    serde_json::to_string(c).ok()
+                }
+            })
+            .collect();
+        parts.join("\n")
+    }
+}
+
 /// An execution engine that forwards tool calls to an MCP server.
 ///
 /// Each instance represents a single MCP tool (e.g., "git__status").
@@ -1826,25 +1880,7 @@ impl ExecutionEngine for McpToolEngine {
             .await
         {
             Ok(result) => {
-                // Convert MCP result to ExecResult
-                // Try structured_content first (richer JSON), then text content, then serialize non-text
-                let output = if let Some(ref structured) = result.structured_content {
-                    serde_json::to_string_pretty(structured).unwrap_or_default()
-                } else {
-                    let parts: Vec<String> = result
-                        .content
-                        .iter()
-                        .filter_map(|c| {
-                            if let Some(text) = c.as_text() {
-                                Some(text.text.clone())
-                            } else {
-                                // Serialize non-text content (images, resources) as JSON
-                                serde_json::to_string(c).ok()
-                            }
-                        })
-                        .collect();
-                    parts.join("\n")
-                };
+                let output = extract_tool_result_text(&result);
 
                 if result.is_error.unwrap_or(false) {
                     Ok(ExecResult::failure(1, output))
@@ -1865,6 +1901,54 @@ impl ExecutionEngine for McpToolEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rmcp::model::{CallToolResult, Content};
+
+    #[test]
+    fn test_extract_text_content() {
+        let result = CallToolResult::success(vec![Content::text("hello")]);
+        assert_eq!(extract_tool_result_text(&result), "hello");
+    }
+
+    #[test]
+    fn test_extract_structured_content() {
+        let result = CallToolResult::structured(serde_json::json!({"key": "val"}));
+        let text = extract_tool_result_text(&result);
+        assert!(text.contains("\"key\""));
+        assert!(text.contains("\"val\""));
+    }
+
+    #[test]
+    fn test_extract_mixed_text() {
+        let result = CallToolResult::success(vec![
+            Content::text("line1"),
+            Content::text("line2"),
+        ]);
+        assert_eq!(extract_tool_result_text(&result), "line1\nline2");
+    }
+
+    #[test]
+    fn test_extract_empty_content() {
+        let result = CallToolResult::success(vec![]);
+        assert_eq!(extract_tool_result_text(&result), "");
+    }
+
+    #[test]
+    fn test_extract_structured_takes_priority() {
+        let mut result = CallToolResult::structured(serde_json::json!({"structured": true}));
+        // Also add text content — structured should win
+        result.content.push(Content::text("text fallback"));
+        let text = extract_tool_result_text(&result);
+        assert!(text.contains("\"structured\""));
+        assert!(!text.contains("text fallback"));
+    }
+
+    #[test]
+    fn test_extract_error_result() {
+        let result = CallToolResult::error(vec![Content::text("fail")]);
+        assert_eq!(extract_tool_result_text(&result), "fail");
+        assert_eq!(result.is_error, Some(true));
+    }
 
     #[test]
     fn test_mcp_server_config_default() {

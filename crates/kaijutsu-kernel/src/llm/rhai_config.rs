@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::ProviderConfig;
+use super::config::{ProviderConfig, ToolFilter};
 use super::{LlmError, LlmRegistry, LlmResult, RigProvider};
 
 /// Structured LLM configuration extracted from a Rhai script.
@@ -103,18 +103,60 @@ fn extract_providers(scope: &rhai::Scope) -> Vec<ProviderConfig> {
                 .and_then(|v| v.as_int().ok())
                 .map(|i| i as u64);
 
+            let default_tools = map
+                .get("default_tools")
+                .and_then(|v| v.clone().try_cast::<rhai::Map>())
+                .map(|m| parse_tool_filter(&m))
+                .unwrap_or(ToolFilter::All);
+
             let mut config = ProviderConfig::new(&name);
             config.enabled = enabled;
             config.api_key_env = api_key_env;
             config.base_url = base_url;
             config.default_model = default_model;
             config.max_output_tokens = max_output_tokens;
+            config.default_tools = default_tools;
 
             configs.push(config);
         }
     }
 
     configs
+}
+
+/// Parse a Rhai map into a `ToolFilter`.
+///
+/// Expected format: `#{ type: "all" | "allow" | "deny", tools: ["tool1", "tool2"] }`
+fn parse_tool_filter(map: &rhai::Map) -> ToolFilter {
+    let filter_type = map
+        .get("type")
+        .and_then(|v| v.clone().into_string().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "all".to_string());
+
+    match filter_type.as_str() {
+        "allow" => {
+            let tools = extract_string_list(map, "tools");
+            ToolFilter::allow(tools)
+        }
+        "deny" => {
+            let tools = extract_string_list(map, "tools");
+            ToolFilter::deny(tools)
+        }
+        _ => ToolFilter::All,
+    }
+}
+
+/// Extract a list of strings from a Rhai map key.
+fn extract_string_list(map: &rhai::Map, key: &str) -> Vec<String> {
+    map.get(key)
+        .and_then(|v| v.clone().try_cast::<rhai::Array>())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|v| v.into_string().ok().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Extract model aliases from the Rhai scope.
@@ -265,6 +307,58 @@ let model_aliases = #{
         let fast = &config.model_aliases["fast"];
         assert_eq!(fast.provider, "anthropic");
         assert_eq!(fast.model, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_parse_tool_filter_from_rhai() {
+        let script = r#"
+let default_provider = "anthropic";
+
+let providers = #{
+    anthropic: #{
+        enabled: true,
+        api_key_env: "ANTHROPIC_API_KEY",
+        default_model: "claude-haiku-4-5-20251001",
+    },
+    ollama: #{
+        enabled: false,
+        base_url: "http://localhost:11434",
+        default_model: "qwen2.5-coder:7b",
+        default_tools: #{
+            type: "deny",
+            tools: ["shell", "bash"],
+        },
+    },
+};
+
+let model_aliases = #{};
+"#;
+        let config = load_llm_config(script).unwrap();
+        let ollama = config.providers.iter().find(|p| p.provider_type == "ollama").unwrap();
+        assert_eq!(ollama.default_tools, ToolFilter::deny(["shell", "bash"]));
+
+        let anthropic = config.providers.iter().find(|p| p.provider_type == "anthropic").unwrap();
+        assert_eq!(anthropic.default_tools, ToolFilter::All);
+    }
+
+    #[test]
+    fn test_parse_tool_filter_allow_list() {
+        let script = r#"
+let default_provider = "test";
+let providers = #{
+    test: #{
+        enabled: false,
+        default_tools: #{
+            type: "allow",
+            tools: ["read", "write"],
+        },
+    },
+};
+let model_aliases = #{};
+"#;
+        let config = load_llm_config(script).unwrap();
+        let test = config.providers.iter().find(|p| p.provider_type == "test").unwrap();
+        assert_eq!(test.default_tools, ToolFilter::allow(["read", "write"]));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //   env        - Environment variables map
 //   cwd        - Working directory (stdio only)
 //   url        - Server URL (streamable_http only)
+//   fork       - Fork behavior: "share" (default), "instance", or "exclude"
 //
 // Example:
 //   kaish: #{ command: "kaish-mcp" },

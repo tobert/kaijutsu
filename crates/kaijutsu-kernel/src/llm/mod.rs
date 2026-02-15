@@ -587,6 +587,13 @@ impl LlmRegistry {
             .unwrap_or(16384)
     }
 
+    /// Get a provider's config by name.
+    pub fn provider_config(&self, name: &str) -> Option<&ProviderConfig> {
+        self.provider_configs
+            .as_ref()
+            .and_then(|configs| configs.iter().find(|c| c.provider_type == name))
+    }
+
     /// Store provider configs for runtime queries (e.g. max_output_tokens).
     pub fn set_provider_configs(&mut self, configs: Vec<ProviderConfig>) {
         self.provider_configs = Some(configs);
