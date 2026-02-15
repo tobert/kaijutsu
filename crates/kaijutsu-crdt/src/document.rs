@@ -33,6 +33,54 @@ pub(crate) fn agent_uuid(agent_id: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
+/// Lexicographically ordered: '0' < '9' < 'A' < 'Z' < 'a' < 'z'.
+const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Get the index of a character in the BASE62 charset.
+fn base62_index(c: u8) -> usize {
+    BASE62.iter().position(|&b| b == c).unwrap_or(0)
+}
+
+/// Compute a lexicographic midpoint between two base-62 strings.
+///
+/// Empty string `""` sorts before everything. Both `a` and `b` must satisfy `a < b`
+/// lexicographically. The result is guaranteed to satisfy `a < result < b`.
+fn order_midpoint(a: &str, b: &str) -> String {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let max_len = a_bytes.len().max(b_bytes.len());
+
+    let mut result = Vec::new();
+
+    for i in 0..=max_len {
+        let a_val = if i < a_bytes.len() { base62_index(a_bytes[i]) } else { 0 };
+        let b_val = if i < b_bytes.len() { base62_index(b_bytes[i]) } else { 62 };
+
+        if a_val + 1 < b_val {
+            // There's room between a and b at this position
+            let mid = (a_val + b_val) / 2;
+            result.push(BASE62[mid]);
+            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
+        } else if a_val == b_val {
+            // Same character — carry it and continue to next position
+            result.push(BASE62[a_val]);
+        } else {
+            // a_val + 1 == b_val (adjacent): carry a_val and find midpoint in next position
+            result.push(BASE62[a_val]);
+            // Now we need midpoint between a[i+1..] and "z" (end of range)
+            let a_next = if i + 1 < a_bytes.len() { base62_index(a_bytes[i + 1]) } else { 0 };
+            let mid = (a_next + 62) / 2;
+            result.push(BASE62[mid]);
+            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
+        }
+    }
+
+    // Fallback: append midpoint character
+    result.push(BASE62[31]); // 'V'
+    String::from_utf8(result).unwrap_or_else(|_| "V".to_string())
+}
+
 /// Block document backed by diamond-types-extended Document.
 ///
 /// # Document Structure
@@ -180,23 +228,31 @@ impl BlockDocument {
         drop(blocks_set);
 
         // Now safe to query root map for order values
-        let mut ordered: Vec<(f64, BlockId)> = keys
+        let mut ordered: Vec<(String, BlockId)> = keys
             .into_iter()
             .filter_map(|key| {
                 let block_id = BlockId::from_key(&key)?;
                 let order_key = format!("order:{}", key);
 
                 let order_val = self.doc.root().get(&order_key)
-                    .and_then(|v| v.as_int())
-                    .map(|n| n as f64 / 1_000_000_000_000.0)
-                    .unwrap_or(0.0);
+                    .and_then(|v| {
+                        // Try string first (new format), fall back to i64 (legacy)
+                        if let Some(s) = v.as_str() {
+                            return Some(s.to_string());
+                        }
+                        if let Some(n) = v.as_int() {
+                            return Some(format!("{:020}", n));
+                        }
+                        None
+                    })
+                    .unwrap_or_default();
 
                 Some((order_val, block_id))
             })
             .collect();
 
-        // Sort by order value
-        ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by string order key (lexicographic)
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
 
         ordered.into_iter().map(|(_, id)| id).collect()
     }
@@ -216,14 +272,36 @@ impl BlockDocument {
 
         // Extract fields from the block map
         let kind_str = block_map.get("kind")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "text".to_string());
-        let kind = BlockKind::from_str(&kind_str).unwrap_or_default();
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let kind = match &kind_str {
+            Some(s) => match BlockKind::from_str(s) {
+                Some(k) => k,
+                None => {
+                    tracing::warn!("block {} has unparseable kind {:?}, skipping", id.to_key(), s);
+                    return None;
+                }
+            },
+            None => {
+                tracing::warn!("block {} missing 'kind' field, skipping", id.to_key());
+                return None;
+            }
+        };
 
         let role_str = block_map.get("role")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "human".to_string());
-        let role = Role::from_str(&role_str).unwrap_or_default();
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let role = match &role_str {
+            Some(s) => match Role::from_str(s) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!("block {} has unparseable role {:?}, skipping", id.to_key(), s);
+                    return None;
+                }
+            },
+            None => {
+                tracing::warn!("block {} missing 'role' field, skipping", id.to_key());
+                return None;
+            }
+        };
 
         let status_str = block_map.get("status")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -373,52 +451,62 @@ impl BlockDocument {
         id
     }
 
-    /// Read the stored order value for a block, scaled back from i64 to f64.
-    fn get_block_order(&self, block_id: &BlockId, default: f64) -> f64 {
+    /// Read the stored order key for a block as a string.
+    ///
+    /// Supports both new string format (as_str) and legacy i64 format (as_int,
+    /// converted to zero-padded string for backward compatibility).
+    fn get_block_order_key(&self, block_id: &BlockId, default: &str) -> String {
         let order_key = format!("order:{}", block_id.to_key());
         self.doc.root().get(&order_key)
-            .and_then(|v| v.as_int())
-            .map(|n| n as f64 / 1_000_000_000_000.0)
-            .unwrap_or(default)
+            .and_then(|v| {
+                // Try string first (new format)
+                if let Some(s) = v.as_str() {
+                    return Some(s.to_string());
+                }
+                // Fall back to i64 (legacy format) — convert to zero-padded string
+                if let Some(n) = v.as_int() {
+                    return Some(format!("{:020}", n));
+                }
+                None
+            })
+            .unwrap_or_else(|| default.to_string())
     }
 
-    /// Calculate fractional index for insertion.
+    /// Calculate a string-based fractional index for insertion.
     ///
-    /// Order values are stored as `(f64 * 1e12) as i64`, giving ~40 bisections
-    /// before precision loss. TODO: migrate to string-based fractional indexing
-    /// for unlimited precision.
-    fn calc_order_index(&self, after: Option<&BlockId>) -> f64 {
+    /// Uses base-62 lexicographic midpoint for unlimited precision.
+    fn calc_order_key(&self, after: Option<&BlockId>) -> String {
         let ordered = self.block_ids_ordered();
 
         match after {
             None => {
                 // Insert at beginning
                 if ordered.is_empty() {
-                    1.0
+                    "V".to_string() // midpoint of base-62 range
                 } else {
-                    let first_order = self.get_block_order(&ordered[0], 1.0);
-                    first_order / 2.0
+                    let first_order = self.get_block_order_key(&ordered[0], "V");
+                    order_midpoint("", &first_order)
                 }
             }
             Some(after_id) => {
-                // Find position of after_id
                 let after_idx = ordered.iter().position(|id| id == after_id);
                 match after_idx {
                     Some(idx) => {
-                        let after_order = self.get_block_order(&ordered[idx], 1.0);
-
+                        let after_order = self.get_block_order_key(&ordered[idx], "V");
                         if idx + 1 < ordered.len() {
-                            let next_order = self.get_block_order(&ordered[idx + 1], after_order + 2.0);
-                            (after_order + next_order) / 2.0
+                            let next_order = self.get_block_order_key(&ordered[idx + 1], &format!("{}~", after_order));
+                            order_midpoint(&after_order, &next_order)
                         } else {
-                            after_order + 1.0
+                            // Append after last — just add a suffix
+                            format!("{}V", after_order)
                         }
                     }
                     None => {
                         if let Some(last) = ordered.last() {
-                            self.get_block_order(last, 1.0) + 1.0
+                            let last_order = self.get_block_order_key(last, "V");
+                            format!("{}V", last_order)
                         } else {
-                            1.0
+                            "V".to_string()
                         }
                     }
                 }
@@ -495,7 +583,8 @@ impl BlockDocument {
         author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
-        let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
+        let input_json = serde_json::to_string_pretty(&tool_input)
+            .map_err(|e| CrdtError::Serialization(e.to_string()))?;
 
         self.insert_block_with_id(
             id.clone(),
@@ -650,8 +739,8 @@ impl BlockDocument {
             }
         }
 
-        // Calculate order index
-        let order_index = self.calc_order_index(after);
+        // Calculate order key (string-based fractional index)
+        let order_val = self.calc_order_key(after);
 
         // Get timestamp
         let created_at = std::time::SystemTime::now()
@@ -669,8 +758,8 @@ impl BlockDocument {
                 blocks_set.add_str(&block_key);
             }
 
-            // Store order index (as i64 scaled by 1M for precision)
-            tx.root().set(&order_key, (order_index * 1_000_000_000_000.0) as i64);
+            // Store order as string for unlimited precision
+            tx.root().set(&order_key, order_val.as_str());
 
             // Create block map and collect text IDs to fill later
             // (We need to do this in two phases to satisfy the borrow checker)
@@ -744,7 +833,8 @@ impl BlockDocument {
 
             if let Some(ref input) = tool_input {
                 if let Some(input_id) = tool_input_id {
-                    let input_json = serde_json::to_string(input).unwrap_or_default();
+                    // Note: unwrap is safe here because serde_json::Value always serializes
+                    let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     if !input_json.is_empty() {
                         if let Some(mut input_text) = tx.text_by_id(input_id) {
                             input_text.insert(0, &input_json);
@@ -926,13 +1016,13 @@ impl BlockDocument {
             }
         }
 
-        // Calculate new order index
-        let order_index = self.calc_order_index(after);
+        // Calculate new order key
+        let order_val = self.calc_order_key(after);
 
         // Update order key
         let order_key = format!("order:{}", block_key);
         self.doc.transact(self.agent, |tx| {
-            tx.root().set(&order_key, (order_index * 1_000_000_000_000.0) as i64);
+            tx.root().set(&order_key, order_val.as_str());
         });
 
         self.version += 1;
@@ -951,36 +1041,58 @@ impl BlockDocument {
     /// Merge remote operations.
     ///
     /// Use `ops_since()` to get operations, and pass them directly here.
+    /// Wraps the merge in catch_unwind to handle DTE causalgraph panics gracefully.
     pub fn merge_ops(&mut self, ops: SerializedOps<'_>) -> Result<()> {
-        self.doc.merge_ops_borrowed(ops)
-            .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
-
-        self.refresh_after_merge();
-        Ok(())
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.doc.merge_ops_borrowed(ops)
+        }));
+        match result {
+            Ok(Ok(())) => {
+                self.refresh_after_merge();
+                Ok(())
+            }
+            Ok(Err(e)) => Err(CrdtError::Internal(format!("merge error: {:?}", e))),
+            Err(_) => Err(CrdtError::Internal(
+                "CRDT merge panicked — likely concurrent causalgraph bug in DTE".into(),
+            )),
+        }
     }
 
     /// Merge remote operations (owned version for cross-thread/network use).
     ///
     /// Use this when receiving serialized ops that have been deserialized
     /// into the owned form (e.g., from network RPC).
+    /// Wraps the merge in catch_unwind to handle DTE causalgraph panics gracefully.
     pub fn merge_ops_owned(&mut self, ops: SerializedOpsOwned) -> Result<()> {
-        self.doc.merge_ops(ops)
-            .map_err(|e| CrdtError::Internal(format!("merge error: {:?}", e)))?;
-
-        self.refresh_after_merge();
-        Ok(())
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.doc.merge_ops(ops)
+        }));
+        match result {
+            Ok(Ok(())) => {
+                self.refresh_after_merge();
+                Ok(())
+            }
+            Ok(Err(e)) => Err(CrdtError::Internal(format!("merge error: {:?}", e))),
+            Err(_) => Err(CrdtError::Internal(
+                "CRDT merge panicked — likely concurrent causalgraph bug in DTE".into(),
+            )),
+        }
     }
 
     /// Refresh internal state after merging operations.
     fn refresh_after_merge(&mut self) {
-        // Update next_seq if needed
+        // Collect keys first, then drop the Set iterator before any further queries.
+        // Same defensive pattern as block_ids_ordered() — avoids re-entrant lock.
         if let Some(blocks_set) = self.doc.get_set(&["blocks"]) {
-            for v in blocks_set.iter() {
-                if let Some(key) = v.as_str() {
-                    if let Some(block_id) = BlockId::from_key(key) {
-                        if block_id.agent_id == self.agent_id_str {
-                            self.next_seq = self.next_seq.max(block_id.seq + 1);
-                        }
+            let keys: Vec<String> = blocks_set
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            drop(blocks_set);
+            for key in keys {
+                if let Some(block_id) = BlockId::from_key(&key) {
+                    if block_id.agent_id == self.agent_id_str {
+                        self.next_seq = self.next_seq.max(block_id.seq + 1);
                     }
                 }
             }
@@ -1138,9 +1250,10 @@ impl BlockDocument {
     /// to receive the full CRDT history including the root "blocks" Set creation.
     /// This is essential for proper sync - clients cannot merge incremental ops
     /// without having the oplog root operations.
-    pub fn oplog_bytes(&self) -> Vec<u8> {
-        let ops = self.ops_since(&Frontier::root()); // Full oplog from empty frontier
-        serde_json::to_vec(&ops).unwrap_or_default()
+    pub fn oplog_bytes(&self) -> Result<Vec<u8>> {
+        let ops = self.ops_since(&Frontier::root());
+        serde_json::to_vec(&ops)
+            .map_err(|e| CrdtError::Serialization(e.to_string()))
     }
 
     /// Create document from serialized oplog (client-side sync).
@@ -1185,15 +1298,19 @@ impl BlockDocument {
 
         let agent = doc.create_agent(agent_uuid(&agent_id_str));
 
-        // Calculate next_seq from existing blocks (avoid ID collisions)
+        // Calculate next_seq from existing blocks (avoid ID collisions).
+        // Collect keys first, then drop — same defensive pattern as block_ids_ordered().
         let mut next_seq = 0u64;
         if let Some(blocks_set) = doc.get_set(&["blocks"]) {
-            for v in blocks_set.iter() {
-                if let Some(key) = v.as_str() {
-                    if let Some(block_id) = BlockId::from_key(key) {
-                        if block_id.agent_id == agent_id_str {
-                            next_seq = next_seq.max(block_id.seq + 1);
-                        }
+            let keys: Vec<String> = blocks_set
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            drop(blocks_set);
+            for key in keys {
+                if let Some(block_id) = BlockId::from_key(&key) {
+                    if block_id.agent_id == agent_id_str {
+                        next_seq = next_seq.max(block_id.seq + 1);
                     }
                 }
             }
@@ -1682,7 +1799,7 @@ mod tests {
         ).unwrap();
 
         // Server sends full oplog to client (the fix!)
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         // === Client: receives full oplog ===
         // Fixed: from_oplog merges server's oplog → shared history
@@ -1910,7 +2027,7 @@ mod tests {
     /// After ~40 bisections, floating point precision loss causes order values to
     /// collide when round-tripped through i64 storage (scaled by 1e12).
     ///
-    /// This validates the TODO comment in calc_order_index about migrating to
+    /// This validates the TODO comment in calc_order_key about migrating to
     /// string-based fractional indexing for unlimited precision.
     #[test]
     fn test_crdt_ordering_stress_100_bisections() {
@@ -1944,54 +2061,37 @@ mod tests {
         let blocks = doc.blocks_ordered();
         assert_eq!(blocks.len(), 102, "All 102 blocks should be in the document");
 
-        // Collect order values and check precision loss
-        let mut order_values = Vec::new();
+        // Collect order keys and verify ALL are unique (string-based = unlimited precision)
+        let mut order_keys = Vec::new();
         for block in &blocks {
-            let order_val = doc.get_block_order(&block.id, 0.0);
-            order_values.push(order_val);
+            let order_key = doc.get_block_order_key(&block.id, "");
+            order_keys.push(order_key);
         }
 
-        // Check uniqueness after round-trip through i64 (demonstrates precision loss)
-        let scaled: Vec<i64> = order_values.iter()
-            .map(|&v| (v * 1_000_000_000_000.0) as i64)
-            .collect();
+        let unique_count = order_keys.iter().collect::<std::collections::HashSet<_>>().len();
 
-        let unique_count = scaled.iter().collect::<std::collections::HashSet<_>>().len();
-
-        // EXPECTED BEHAVIOR: Precision loss after ~40 bisections
-        // This documents the current limitation and validates the need for
-        // string-based fractional indexing (see TODO in calc_order_index)
-        assert!(
-            unique_count < 102,
-            "Precision loss demonstrated: only {} unique values after 100 bisections (expected < 102)",
+        // String-based fractional indexing guarantees all 102 values are unique
+        assert_eq!(
+            unique_count, 102,
+            "All 102 order keys should be unique with string-based indexing, got {}",
             unique_count
         );
 
-        // Typically we see ~40-45 unique values before collisions start
-        assert!(
-            unique_count >= 40,
-            "Should maintain uniqueness for at least ~40 bisections, got {}",
-            unique_count
-        );
+        // Verify ordering is strictly sorted
+        for i in 1..order_keys.len() {
+            assert!(
+                order_keys[i - 1] < order_keys[i],
+                "Order keys should be strictly sorted: {:?} >= {:?} at index {}",
+                order_keys[i - 1], order_keys[i], i
+            );
+        }
 
-        // The f64 values ARE strictly ordered (blocks_ordered() uses them to sort)
-        // but repeated bisection causes such small deltas that they're below f64::EPSILON
-        // This demonstrates that even the f64 representation is hitting precision limits
-        // after many bisections, not just the i64 storage format.
-
-        // The key insight: blocks_ordered() still works correctly (uses partial_cmp
-        // which handles tiny deltas), but the ordering becomes fragile.
-
-        // Verify that blocks_ordered maintains insertion order despite tiny deltas
-        // (this is what matters for correctness — the blocks don't randomly shuffle)
         let block_ids: Vec<_> = blocks.iter().map(|b| &b.id).collect();
 
         // First should be the first sentinel
         assert_eq!(block_ids[0], &first, "First block should remain first");
 
-        // The middle blocks should appear in some stable order between the sentinels
-        // (we don't guarantee they're in insertion order after precision loss,
-        // just that they don't corrupt the document structure)
+        // All inserted blocks should be present
         for id in &middle_ids {
             assert!(
                 block_ids.contains(&id),
@@ -2037,5 +2137,87 @@ mod tests {
         assert_eq!(drift_block.source_model, Some("gemini-2.0-flash".to_string()));
         assert_eq!(drift_block.drift_kind, Some(DriftKind::Distill));
         assert_eq!(drift_block.content, "Summary from gemini context");
+    }
+
+    /// Test that get_block_snapshot returns None for blocks missing 'kind' field.
+    #[test]
+    fn test_get_block_snapshot_missing_kind() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+
+        // Insert a block via raw transaction, skipping "kind"
+        let block_key = "doc-1/alice/0";
+        doc.doc.transact(doc.agent, |tx| {
+            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+                blocks_set.add_str(block_key);
+            }
+            tx.root().set(&format!("order:{}", block_key), "V");
+            let map_id = tx.root().create_map(&format!("block:{}", block_key));
+            let mut block_map = tx.map_by_id(map_id);
+            // Set role but NOT kind
+            block_map.set("role", "human");
+            block_map.set("status", "done");
+            block_map.set("author", "test");
+            block_map.create_text("content");
+        });
+        doc.next_seq = 1;
+
+        let block_id = BlockId::from_key(block_key).unwrap();
+        assert!(doc.get_block_snapshot(&block_id).is_none(),
+            "Block missing 'kind' should return None");
+
+        // blocks_ordered should also skip it
+        assert_eq!(doc.blocks_ordered().len(), 0);
+    }
+
+    /// Test that get_block_snapshot returns None for blocks missing 'role' field.
+    #[test]
+    fn test_get_block_snapshot_missing_role() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+
+        let block_key = "doc-1/alice/0";
+        doc.doc.transact(doc.agent, |tx| {
+            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+                blocks_set.add_str(block_key);
+            }
+            tx.root().set(&format!("order:{}", block_key), "V");
+            let map_id = tx.root().create_map(&format!("block:{}", block_key));
+            let mut block_map = tx.map_by_id(map_id);
+            // Set kind but NOT role
+            block_map.set("kind", "text");
+            block_map.set("status", "done");
+            block_map.set("author", "test");
+            block_map.create_text("content");
+        });
+        doc.next_seq = 1;
+
+        let block_id = BlockId::from_key(block_key).unwrap();
+        assert!(doc.get_block_snapshot(&block_id).is_none(),
+            "Block missing 'role' should return None");
+    }
+
+    /// Test that order_midpoint produces correct lexicographic midpoints.
+    #[test]
+    fn test_order_midpoint_basic() {
+        let mid = order_midpoint("A", "Z");
+        assert!(mid > "A".to_string() && mid < "Z".to_string(),
+            "midpoint {} should be between A and Z", mid);
+
+        let mid2 = order_midpoint("", "V");
+        assert!(mid2 < "V".to_string(),
+            "midpoint {} should be before V", mid2);
+
+        // Adjacent characters
+        let mid3 = order_midpoint("A", "B");
+        assert!(mid3 > "A".to_string() && mid3 < "B".to_string(),
+            "midpoint {} should be between A and B", mid3);
+    }
+
+    /// Test oplog_bytes returns Result.
+    #[test]
+    fn test_oplog_bytes_returns_result() {
+        let doc = BlockDocument::new("doc-1", "alice");
+        let bytes = doc.oplog_bytes();
+        assert!(bytes.is_ok(), "oplog_bytes should succeed for valid document");
+        assert!(!bytes.unwrap().is_empty());
     }
 }

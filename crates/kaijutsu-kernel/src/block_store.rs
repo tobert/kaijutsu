@@ -1355,7 +1355,7 @@ mod tests {
         // Get full oplog for client initial sync (simulates get_block_cell_state)
         let full_oplog = {
             let entry = store.get("sync-test").unwrap();
-            entry.doc.oplog_bytes()
+            entry.doc.oplog_bytes().unwrap()
         };
 
         // Client creates document from full oplog (initial sync)
@@ -1404,7 +1404,7 @@ mod tests {
         store.create_document("tool-test".into(), DocumentKind::Conversation, None).unwrap();
 
         // Full sync
-        let full_oplog = store.get("tool-test").unwrap().doc.oplog_bytes();
+        let full_oplog = store.get("tool-test").unwrap().doc.oplog_bytes().unwrap();
         let mut client = BlockDocument::from_oplog("tool-test", "client-agent", &full_oplog)
             .expect("initial sync");
 
@@ -1456,7 +1456,7 @@ mod tests {
         let _ = sub.try_recv(); // drain tool call event
 
         // Full sync (after tool call exists)
-        let full_oplog = store.get("result-test").unwrap().doc.oplog_bytes();
+        let full_oplog = store.get("result-test").unwrap().doc.oplog_bytes().unwrap();
         let mut client = BlockDocument::from_oplog("result-test", "client-agent", &full_oplog)
             .expect("initial sync");
         assert_eq!(client.block_count(), 1, "should have tool call");
@@ -1502,7 +1502,7 @@ mod tests {
         store.create_document("multi-test".into(), DocumentKind::Conversation, None).unwrap();
 
         // Initial sync
-        let full_oplog = store.get("multi-test").unwrap().doc.oplog_bytes();
+        let full_oplog = store.get("multi-test").unwrap().doc.oplog_bytes().unwrap();
         let mut client = BlockDocument::from_oplog("multi-test", "client-agent", &full_oplog)
             .expect("initial sync");
 
@@ -1562,7 +1562,7 @@ mod tests {
         let _ = sub.try_recv(); // drain insert event
 
         // Full sync after block created
-        let full_oplog = store.get("stream-test").unwrap().doc.oplog_bytes();
+        let full_oplog = store.get("stream-test").unwrap().doc.oplog_bytes().unwrap();
         let mut client = BlockDocument::from_oplog("stream-test", "client-agent", &full_oplog)
             .expect("initial sync");
 

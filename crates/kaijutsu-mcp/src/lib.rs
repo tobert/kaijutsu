@@ -2659,7 +2659,7 @@ mod tests {
         server.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server", "server")
             .expect("insert block");
 
-        let oplog = server.oplog_bytes();
+        let oplog = server.oplog_bytes().unwrap();
 
         let store = shared_block_store("test-mcp");
         store.create_document_from_oplog(

@@ -1425,7 +1425,7 @@ pub fn handle_context_switch(
             let agent_id = format!("user:{}", whoami::username());
 
             // Rebuild DocumentSyncState from cached document's oplog
-            let oplog_bytes = cached.doc.oplog_bytes();
+            let oplog_bytes = cached.doc.oplog_bytes().unwrap_or_default();
             sync_state.reset();
             match sync_state.apply_initial_state(&target_doc_id, &agent_id, &oplog_bytes) {
                 Ok(_) => {

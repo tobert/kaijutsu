@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn test_initial_sync() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -578,7 +578,7 @@ mod tests {
     fn test_incremental_after_full_sync() {
         // Initial sync
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn test_document_id_mismatch_skips() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -622,7 +622,7 @@ mod tests {
         // Try to apply block for different document
         let other_server = create_server_doc("doc-2");
         let other_block = other_server.blocks_ordered()[0].clone();
-        let other_ops = other_server.oplog_bytes();
+        let other_ops = other_server.oplog_bytes().unwrap();
 
         let result = sync
             .apply_block_inserted(&mut client, "doc-2", &other_block, &other_ops)
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn test_idempotent_block_insert() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
         let block = server.blocks_ordered()[0].clone();
 
         let mut client = create_client_doc("doc-1");
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn test_merge_failure_resets_frontier_deserialization() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -740,7 +740,7 @@ mod tests {
         assert!(sync.frontier().is_none());
 
         // Now simulate recovery: server sends full oplog
-        let full_oplog = server.oplog_bytes();
+        let full_oplog = server.oplog_bytes().unwrap();
         let result = sync
             .apply_block_inserted(&mut client, "doc-1", &new_block, &full_oplog)
             .expect("recovery should succeed");
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn test_recovery_after_merge_failure() {
         let mut server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -772,7 +772,7 @@ mod tests {
         let new_block_id = server
             .insert_block(None, None, Role::Model, BlockKind::Text, "Recovery content", "server")
             .expect("insert block");
-        let full_oplog = server.oplog_bytes();
+        let full_oplog = server.oplog_bytes().unwrap();
         let new_block = server.get_block_snapshot(&new_block_id).expect("new block exists");
 
         // Apply block inserted - recovery tries incremental merge first since
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn test_frontier_none_triggers_full_sync() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
         let block = server.blocks_ordered()[0].clone();
 
         let mut client = create_client_doc("doc-1");
@@ -816,7 +816,7 @@ mod tests {
     fn test_document_id_change_triggers_full_sync() {
         // Sync to doc-1
         let server1 = create_server_doc("doc-1");
-        let oplog1 = server1.oplog_bytes();
+        let oplog1 = server1.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -830,7 +830,7 @@ mod tests {
 
         // Create server for doc-2
         let server2 = create_server_doc("doc-2");
-        let oplog2 = server2.oplog_bytes();
+        let oplog2 = server2.oplog_bytes().unwrap();
 
         // Apply initial state for doc-2
         let result = sync
@@ -850,7 +850,7 @@ mod tests {
     fn test_text_streaming_multiple_chunks() {
         // Setup: server with initial block
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -892,7 +892,7 @@ mod tests {
     fn test_text_streaming_with_mid_stream_error() {
         // Setup
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -931,7 +931,7 @@ mod tests {
     fn test_text_streaming_recovery_after_error() {
         // Setup
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -948,7 +948,7 @@ mod tests {
         let new_block_id = server
             .insert_block(None, None, Role::Model, BlockKind::Text, "After error", "server")
             .expect("insert block");
-        let full_oplog = server.oplog_bytes();
+        let full_oplog = server.oplog_bytes().unwrap();
         let new_block = server.get_block_snapshot(&new_block_id).expect("new block exists");
 
         // Recovery — tries incremental merge first since document has content,
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn test_empty_ops_skips_text_ops() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn test_reset_clears_frontier_but_keeps_document_id() {
         let server = create_server_doc("doc-1");
-        let oplog_bytes = server.oplog_bytes();
+        let oplog_bytes = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(sync.pending_ops_count(), 1);
 
         // Now send a full oplog — this should succeed AND replay buffered ops
-        let full_oplog = server.oplog_bytes();
+        let full_oplog = server.oplog_bytes().unwrap();
         let result = sync
             .apply_initial_state(&mut client, "doc-1", &full_oplog)
             .expect("full sync should succeed");
@@ -1147,7 +1147,7 @@ mod tests {
     fn test_pending_ops_text_before_block_inserted() {
         // The exact race condition: text ops arrive before BlockInserted
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();
@@ -1217,7 +1217,7 @@ mod tests {
         // Verify that replay attempts all buffered ops: successes are consumed,
         // failures go back to the buffer.
         let mut server = create_server_doc("doc-1");
-        let initial_oplog = server.oplog_bytes();
+        let initial_oplog = server.oplog_bytes().unwrap();
 
         let mut client = create_client_doc("doc-1");
         let mut sync = SyncManager::new();

@@ -32,7 +32,7 @@ use kaijutsu_kernel::{
     // File tools
     FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
     // MCP
-    McpServerPool, McpServerConfig, McpTransport, McpToolEngine,
+    McpServerPool, McpServerConfig, McpTransport, McpToolEngine, extract_tool_result_text,
     // FlowBus
     BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
     SharedConfigFlowBus, shared_config_flow_bus,
@@ -1847,7 +1847,7 @@ impl kernel::Server for KernelImpl {
 
         // Send full oplog for proper CRDT sync
         // This enables clients to merge subsequent incremental ops
-        let oplog_bytes = doc.doc.oplog_bytes();
+        let oplog_bytes = doc.doc.oplog_bytes().unwrap_or_default();
         cell_state.set_ops(&oplog_bytes);
         log::debug!(
             "Sending DocumentState for cell {} with {} blocks, {} bytes oplog",
@@ -2199,6 +2199,7 @@ impl kernel::Server for KernelImpl {
             cwd,
             transport,
             url,
+            fork_mode: Default::default(),
         };
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
@@ -2349,22 +2350,7 @@ impl kernel::Server for KernelImpl {
                     result_builder.set_success(!is_error);
                     result_builder.set_is_error(is_error);
 
-                    // Collect content — prefer structured_content, then text, then serialize
-                    let content = if let Some(ref structured) = r.structured_content {
-                        serde_json::to_string_pretty(structured).unwrap_or_default()
-                    } else {
-                        r.content
-                            .iter()
-                            .filter_map(|c| {
-                                if let Some(text) = c.as_text() {
-                                    Some(text.text.clone())
-                                } else {
-                                    serde_json::to_string(c).ok()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
+                    let content = extract_tool_result_text(&r);
                     result_builder.set_content(&content);
                 }
                 Err(e) => {

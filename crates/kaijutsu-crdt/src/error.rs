@@ -36,4 +36,8 @@ pub enum CrdtError {
     /// Internal CRDT consistency error.
     #[error("internal CRDT error: {0}")]
     Internal(String),
+
+    /// Schema corruption detected (missing required fields).
+    #[error("schema corruption: {0}")]
+    SchemaCorruption(String),
 }
