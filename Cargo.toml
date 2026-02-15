@@ -76,7 +76,7 @@ rhai = "1.21"
 rig-core = "0.30"
 
 # MCP (Model Context Protocol)
-rmcp = { version = "0.14", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # Kaijutsu telemetry
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }

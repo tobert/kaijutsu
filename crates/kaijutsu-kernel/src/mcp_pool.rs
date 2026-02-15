@@ -812,10 +812,20 @@ impl ClientHandler for KaijutsuClientHandler {
             // Generate a unique request ID
             let request_id = uuid::Uuid::new_v4().to_string();
 
+            // Extract message and schema from the elicitation request variant
+            let (message, schema) = match &request {
+                rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+                    message, requested_schema, ..
+                } => (message.clone(), serde_json::to_value(requested_schema).ok()),
+                rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+                    message, url, ..
+                } => (message.clone(), Some(serde_json::json!({ "url": url }))),
+            };
+
             info!(
                 server = %server_name,
                 request_id = %request_id,
-                message = %request.message,
+                message = %message,
                 "MCP elicitation request received"
             );
 
@@ -832,8 +842,8 @@ impl ClientHandler for KaijutsuClientHandler {
             elicitation_flows.publish(ElicitationFlow::Request {
                 request_id: request_id.clone(),
                 server: server_name.clone(),
-                message: request.message,
-                schema: serde_json::to_value(&request.requested_schema).ok(),
+                message,
+                schema,
             });
 
             // Wait for response with timeout (5 minutes)
@@ -1817,12 +1827,24 @@ impl ExecutionEngine for McpToolEngine {
         {
             Ok(result) => {
                 // Convert MCP result to ExecResult
-                let output = result
-                    .content
-                    .iter()
-                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                // Try structured_content first (richer JSON), then text content, then serialize non-text
+                let output = if let Some(ref structured) = result.structured_content {
+                    serde_json::to_string_pretty(structured).unwrap_or_default()
+                } else {
+                    let parts: Vec<String> = result
+                        .content
+                        .iter()
+                        .filter_map(|c| {
+                            if let Some(text) = c.as_text() {
+                                Some(text.text.clone())
+                            } else {
+                                // Serialize non-text content (images, resources) as JSON
+                                serde_json::to_string(c).ok()
+                            }
+                        })
+                        .collect();
+                    parts.join("\n")
+                };
 
                 if result.is_error.unwrap_or(false) {
                     Ok(ExecResult::failure(1, output))

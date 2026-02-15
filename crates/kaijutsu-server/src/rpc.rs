@@ -2349,12 +2349,22 @@ impl kernel::Server for KernelImpl {
                     result_builder.set_success(!is_error);
                     result_builder.set_is_error(is_error);
 
-                    // Collect text content from the result
-                    let content: String = r.content
-                        .iter()
-                        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    // Collect content — prefer structured_content, then text, then serialize
+                    let content = if let Some(ref structured) = r.structured_content {
+                        serde_json::to_string_pretty(structured).unwrap_or_default()
+                    } else {
+                        r.content
+                            .iter()
+                            .filter_map(|c| {
+                                if let Some(text) = c.as_text() {
+                                    Some(text.text.clone())
+                                } else {
+                                    serde_json::to_string(c).ok()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
                     result_builder.set_content(&content);
                 }
                 Err(e) => {
