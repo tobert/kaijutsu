@@ -10,9 +10,28 @@
 //! - Multiple children (parallel tool calls, multiple response blocks)
 //! - Role and status for conversation flow tracking
 
-use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned};
+use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned, Uuid};
 
 use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
+
+/// Convert a string agent ID to a deterministic UUID.
+///
+/// Uses a simple hash-to-bytes approach so the same agent string always
+/// produces the same UUID. This is needed because diamond-types-extended
+/// v0.2 changed `create_agent` to take `Uuid` instead of `&str`.
+pub(crate) fn agent_uuid(agent_id: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    agent_id.hash(&mut hasher);
+    let h1 = hasher.finish();
+    // Hash again for the second 8 bytes
+    h1.hash(&mut hasher);
+    let h2 = hasher.finish();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&h1.to_le_bytes());
+    bytes[8..].copy_from_slice(&h2.to_le_bytes());
+    Uuid::from_bytes(bytes)
+}
 
 /// Block document backed by diamond-types-extended Document.
 ///
@@ -74,7 +93,7 @@ impl BlockDocument {
         let agent_id_str = agent_id.into();
 
         let mut doc = Document::new();
-        let agent = doc.get_or_create_agent(&agent_id_str);
+        let agent = doc.create_agent(agent_uuid(&agent_id_str));
 
         // Create the blocks Set at ROOT["blocks"]
         doc.transact(agent, |tx| {
@@ -100,7 +119,7 @@ impl BlockDocument {
         let agent_id_str = agent_id.into();
 
         let mut doc = Document::new();
-        let agent = doc.get_or_create_agent(&agent_id_str);
+        let agent = doc.create_agent(agent_uuid(&agent_id_str));
 
         Self {
             document_id,
@@ -1156,7 +1175,7 @@ impl BlockDocument {
             ));
         }
 
-        let agent = doc.get_or_create_agent(&agent_id_str);
+        let agent = doc.create_agent(agent_uuid(&agent_id_str));
 
         // Calculate next_seq from existing blocks (avoid ID collisions)
         let mut next_seq = 0u64;

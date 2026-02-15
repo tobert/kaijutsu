@@ -16,8 +16,8 @@ mod tests {
         let mut doc_a = Document::new();
         let mut doc_b = Document::new();
 
-        let alice = doc_a.get_or_create_agent("alice");
-        let bob = doc_b.get_or_create_agent("bob");
+        let alice = doc_a.create_agent(crate::document::agent_uuid("alice"));
+        let bob = doc_b.create_agent(crate::document::agent_uuid("bob"));
 
         // Alice makes changes
         doc_a.transact(alice, |tx| {

@@ -66,7 +66,7 @@ cosmic-text = "0.16"
 pulldown-cmark = "0.12"
 
 # CRDT + Persistence
-diamond-types-extended = "0.1"
+diamond-types-extended = { path = "../diamond-types-extended" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
