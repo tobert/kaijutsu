@@ -169,15 +169,23 @@ impl BlockDocument {
             return Vec::new();
         };
 
-        // Collect (order_value, block_id) pairs
-        let mut ordered: Vec<(f64, BlockId)> = blocks_set
+        // Collect keys first, then drop the Set iterator before querying root.
+        // The Set iterator borrows internal document state; querying root().get()
+        // needs the same state — holding both causes a re-entrant lock deadlock
+        // with DTE v0.2's interior mutability.
+        let keys: Vec<String> = blocks_set
             .iter()
-            .filter_map(|v| {
-                let key = v.as_str()?;
-                let block_id = BlockId::from_key(key)?;
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        drop(blocks_set);
+
+        // Now safe to query root map for order values
+        let mut ordered: Vec<(f64, BlockId)> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let block_id = BlockId::from_key(&key)?;
                 let order_key = format!("order:{}", key);
 
-                // Get order value from root map
                 let order_val = self.doc.root().get(&order_key)
                     .and_then(|v| v.as_int())
                     .map(|n| n as f64 / 1_000_000_000_000.0)

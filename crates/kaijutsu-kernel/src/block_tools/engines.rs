@@ -1634,4 +1634,56 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert!(!matches[0]["before"].as_array().unwrap().is_empty() || !matches[0]["after"].as_array().unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn test_batch_edit_cas_pre_validation_rejects_whole_batch() {
+        let store = setup_test_store();
+        let block_id = store
+            .insert_block("test-doc", None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n")
+            .unwrap();
+        let engine = BlockEditEngine::new(store.clone(), "test-agent");
+
+        // Batch: first op is valid replace, second has wrong CAS expected_text.
+        // Pre-validation should reject the entire batch — no ops applied.
+        let params = format!(
+            r#"{{
+                "block_id": "{}",
+                "operations": [
+                    {{"op": "replace", "start_line": 0, "end_line": 1, "content": "AAA", "expected_text": "aaa"}},
+                    {{"op": "replace", "start_line": 1, "end_line": 2, "content": "BBB", "expected_text": "WRONG"}}
+                ]
+            }}"#,
+            block_id.to_key()
+        );
+        let result = engine.execute(&params).await.unwrap();
+        assert!(!result.success, "batch should fail due to CAS mismatch in op[1]");
+        assert!(result.stderr.contains("content mismatch"), "error: {}", result.stderr);
+
+        // Verify no operations were applied — content unchanged
+        {
+            let entry = store.get("test-doc").unwrap();
+            let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
+            assert_eq!(snapshot.content, "aaa\nbbb\nccc\n", "content must be unchanged after rejected batch");
+        } // drop DashMap Ref before next execute (avoids read/write deadlock)
+
+        // Now submit a fully valid batch — both ops should apply
+        let params = format!(
+            r#"{{
+                "block_id": "{}",
+                "operations": [
+                    {{"op": "replace", "start_line": 0, "end_line": 1, "content": "AAA", "expected_text": "aaa"}},
+                    {{"op": "replace", "start_line": 1, "end_line": 2, "content": "BBB", "expected_text": "bbb"}}
+                ]
+            }}"#,
+            block_id.to_key()
+        );
+        let result = engine.execute(&params).await.unwrap();
+        assert!(result.success, "valid batch should succeed: {}", result.stderr);
+
+        let entry = store.get("test-doc").unwrap();
+        let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
+        // After replacing line 0 with "AAA" and line 1 with "BBB":
+        assert!(snapshot.content.contains("AAA"), "first replace should be applied");
+        assert!(snapshot.content.contains("BBB"), "second replace should be applied");
+    }
 }
