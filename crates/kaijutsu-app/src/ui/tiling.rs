@@ -51,8 +51,7 @@ pub enum PaneContent {
     // ── Views ──────────────────────────────────────────────────────────
     /// A CRDT conversation view bound to a document.
     Conversation { document_id: String },
-    /// The kernel/context/seat dashboard.
-    Dashboard,
+    // Dashboard variant removed — app starts directly in conversation view.
     /// A text file editor.
     #[allow(dead_code)] // Phase 4: tab containers for stacking views
     Editor { path: String },

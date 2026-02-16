@@ -129,7 +129,7 @@ pub enum Backend {
 /// MCP tools.
 #[derive(Clone)]
 pub struct RemoteState {
-    /// The document ID from our seat
+    /// The document ID for our context
     pub document_id: String,
     /// Kernel ID we connected to
     pub kernel_id: String,

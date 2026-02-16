@@ -30,7 +30,7 @@ pub struct DriftState {
     pub staged: Vec<StagedDriftInfo>,
     /// Our own context short ID (for determining push direction).
     pub local_context_id: Option<String>,
-    /// The context name from our seat (used to resolve local_context_id).
+    /// The context name from our membership (used to resolve local_context_id).
     pub local_context_name: Option<String>,
     /// Last poll timestamp (from `Time::elapsed_secs_f64()`).
     pub last_poll: f64,
@@ -164,7 +164,7 @@ fn update_drift_state(
                 drift_state.loaded = true;
 
                 // Resolve local_context_id to short_id now that we have context data.
-                // local_context_name is the seat's context name (e.g. kernel_id);
+                // local_context_name is the membership's context name (e.g. kernel_id);
                 // we need the short_id that drift blocks use in source_context.
                 if let Some(ref name) = drift_state.local_context_name {
                     if let Some(ctx) = contexts.iter().find(|c| c.name == *name || c.short_id == *name) {

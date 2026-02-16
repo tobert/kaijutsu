@@ -34,8 +34,7 @@ use crate::rpc::ContextState;
 /// Thread-safe context state shared between RPC handlers and ContextEngine.
 ///
 /// Tracks which contexts exist and which one is currently active for this
-/// connection. The seat abstraction has been removed — this is now just
-/// lightweight context membership tracking.
+/// connection. Lightweight context membership tracking.
 #[derive(Debug)]
 pub struct ContextManager {
     inner: RwLock<ContextManagerInner>,

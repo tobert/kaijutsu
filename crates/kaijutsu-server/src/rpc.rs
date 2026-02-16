@@ -494,7 +494,7 @@ pub struct KernelState {
     pub documents: SharedBlockStore,
     /// Main document ID for this kernel (convention: {kernel_id}@main)
     pub main_document_id: String,
-    /// Contexts within this kernel (for seat management)
+    /// Contexts within this kernel
     pub contexts: HashMap<String, ContextState>,
     /// Thread-safe context manager for shell access
     pub context_manager: Arc<ContextManager>,
@@ -613,7 +613,7 @@ impl world::Server for WorldImpl {
                 // Ensure main document exists (convention ID)
                 let main_document_id = ensure_main_document(&documents, &id)?;
 
-                // Create config backend and ensure seat config exists
+                // Create config backend
                 let (config_backend, config_watcher) =
                     create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
@@ -1953,7 +1953,7 @@ impl kernel::Server for KernelImpl {
     }
 
     // =========================================================================
-    // Context & Seat operations
+    // Context operations
     // =========================================================================
 
     fn list_contexts(
@@ -5464,8 +5464,7 @@ fn parse_block_snapshot(
     })
 }
 
-// SeatHandle interface removed — seat abstraction replaced by ContextMembership.
-// See commit message for rationale.
+// SeatHandle interface removed — replaced by ContextMembership.
 
 // ============================================================================
 // VFS Implementation

@@ -21,7 +21,7 @@
 | Fork/Thread (kernel) | ✅ Implemented (`kernel.rs:497-571`) |
 | Fork/Thread (RPC) | ✅ Implemented (`rpc.rs:988-1218`) |
 | Block tools | ✅ Extensive (9 tools, 104KB implementation) |
-| Seat/Context | ✅ Implemented (4-tuple SeatId model) |
+| Context membership | ✅ ContextMembership (context_name, kernel_id, nick, instance) |
 | LLM integration | ✅ Per-kernel LLM via `llm.rhai` config (Anthropic, OpenAI, Gemini) |
 | FlowBus | ✅ Pub/sub for block, resource, config, progress, elicitation events |
 | Drift | ✅ Cross-context communication with LLM distillation |
@@ -457,26 +457,17 @@ how human teams work (briefings, not sitting in every meeting).
 
 See [drift.md](drift.md) for the full design document.
 
-## Seat & Context Model
+## Context Membership
 
-Seats provide presence tracking for multi-participant collaboration.
+When a client joins a context, it gets a `ContextMembership` — a lightweight
+4-tuple tracking who joined what:
 
-**SeatId** is a 4-tuple:
 ```
-(nick, instance, kernel, context)
-("amy", "laptop", "kaijutsu-dev", "planning")
+(context_name, kernel_id, nick, instance)
+("planning", "kaijutsu-dev", "amy", "laptop")
 ```
 
-| Field | Purpose |
-|-------|---------|
-| `nick` | Display name ("amy", "refactor-bot") |
-| `instance` | Device or model ("laptop", "haiku") |
-| `kernel` | Which kernel |
-| `context` | Sub-context within kernel |
-
-**SeatStatus**: `active`, `idle`, `away`
-
-RPC methods: `listContexts`, `joinContext`, `leaveSeat`, `listMySeats` (on World)
+RPC methods: `listContexts`, `joinContext` (on Kernel), `listKernels` (on World)
 
 ## Cap'n Proto Interface
 
@@ -488,7 +479,6 @@ interface World {
   listKernels @1 () -> (kernels :List(KernelInfo));
   attachKernel @2 (id :Text) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
-  listMySeats @4 () -> (seats :List(SeatInfo));
 }
 
 interface Kernel {
@@ -608,7 +598,7 @@ Think of a kernel like a development environment that:
 - Added Drift section documenting cross-context communication
 - Updated Implementation Status (88 RPC methods, fork/thread implemented, agents, git, tool filtering)
 - Updated Cap'n Proto schema to show drift, LLM config, tool filter, agents
-- Fixed stale references: removed "lease" (use seats), removed "equip/unequip" (use ToolConfig)
+- Fixed stale references: removed "lease", removed "equip/unequip" (use ToolConfig)
 - Updated ownership table with drift, agents, per-kernel LLM
 - Added drift.md and context/git/drift to block tools table
 - Updated Open Questions for drift era
@@ -620,9 +610,9 @@ Think of a kernel like a development environment that:
 - Updated architecture diagram to show both execution modes and MCP
 
 **2026-01-23**
-- Updated Implementation Status to reflect actual state (checkpoint, block tools, seats all implemented)
+- Updated Implementation Status to reflect actual state (checkpoint, block tools, contexts all implemented)
 - Added Block Tools section documenting the 9 CRDT-native tools
-- Added Seat & Context Model section with SeatId 4-tuple
+- Added Context Membership section
 - Rewrote Cap'n Proto Interface to match actual schema (25 methods)
 - Noted fork/thread kernel implementation is complete, only RPC layer is stubbed
 - **Architecture rewrite**: kaijutsu-kernel owns VFS, state, tools, LLM; kaish is subprocess for shell only

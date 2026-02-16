@@ -156,13 +156,12 @@ pub struct KernelInfo {
 }
 
 // ============================================================================
-// Context Membership (replaces Seat types)
+// Context Membership
 // ============================================================================
 
-/// Lightweight context membership — replaces the heavyweight SeatInfo/SeatHandle
-/// abstraction. Tracks what context we joined and as whom.
+/// Lightweight context membership — tracks what context we joined and as whom.
 ///
-/// If multi-user presence is needed later, reintroduce a thinner presence protocol.
+/// A 4-tuple: (context_name, kernel_id, nick, instance).
 #[derive(Debug, Clone)]
 pub struct ContextMembership {
     pub context_name: String,

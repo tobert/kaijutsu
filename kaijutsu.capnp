@@ -35,10 +35,11 @@ struct KernelInfo {
 }
 
 # ============================================================================
-# Seat and Context Types (Lobby Experience)
+# Vestigial Seat Types — kept for wire compatibility / schema evolution.
+# The seat abstraction has been removed. See ContextMembership in client code.
 # ============================================================================
 
-# Seat identifier - the 4-tuple that identifies a seat
+# Seat identifier (vestigial)
 struct SeatId {
   nick @0 :Text;          # Display name, user-chosen: "amy", "refactor-bot"
   instance @1 :Text;      # Device/model variant: "laptop", "haiku"
