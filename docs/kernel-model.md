@@ -1,6 +1,6 @@
 # Kaijutsu Kernel Model
 
-*Last updated: 2026-02-06*
+*Last updated: 2026-02-16*
 
 > **This is the authoritative design document for Kaijutsu's kernel model.**
 
@@ -9,7 +9,7 @@
 | Component | Status |
 |-----------|--------|
 | Kernel concept | ✅ Implemented (`kaijutsu-kernel/src/kernel.rs`) |
-| Cap'n Proto schema | ✅ Complete (88 Kernel methods, 6 World methods) |
+| Cap'n Proto schema | ✅ Complete (87 Kernel methods, 4 World methods) |
 | Server (kaijutsu-server) | ✅ Functional |
 | Client (kaijutsu-client) | ✅ RPC client + ActorHandle (Send+Sync concurrent dispatch) |
 | Client (kaijutsu-app) | 🚧 Bevy UI (block rendering, editing, navigation) |
@@ -40,9 +40,9 @@
 │                      kaijutsu-server                            │
 │                                                                 │
 │  kaijutsu.capnp::World                                          │
-│  └── listKernels, attachKernel, createKernel, listMySeats       │
+│  └── whoami, listKernels, attachKernel, createKernel             │
 │                                                                 │
-│  kaijutsu.capnp::Kernel (88 methods)                             │
+│  kaijutsu.capnp::Kernel (87 methods)                             │
 │  ├── VFS: mount, unmount, listMounts, vfs()                     │
 │  ├── State: checkpoints, history, variables                     │
 │  ├── Tools: block_*, kernel_search, executeTool                 │
@@ -51,7 +51,7 @@
 │  ├── Drift: push, flush, pull, merge, queue, cancel             │
 │  ├── Agents: attach, detach, list, capabilities, events         │
 │  ├── Git: registerRepo, branches, flush, attribution            │
-│  ├── Seats: joinContext, leaveSeat, listContexts                │
+│  ├── Contexts: joinContext, listContexts                        │
 │  ├── Lifecycle: fork, thread, detach                            │
 │  │                                                              │
 │  │  execute() / shellExecute() ──────────────────────┐          │
@@ -146,7 +146,8 @@ A kernel is a state holder that:
 - Can mount other VFS (worktrees, repos, other kernels)
 - Has a consent mode (collaborative vs autonomous)
 - Can checkpoint (distill history into summaries)
-- Can be forked (heavy copy) or threaded (light, shared VFS)
+- Can fork contexts (deep copy, isolated) or thread them (shared VFS)
+- Shares a drift router across all its contexts for cross-context communication
 
 ## Kernel Structure
 
@@ -222,38 +223,44 @@ kaish attach kernel://project-kaijutsu
 When attached:
 - User gets UI view into the kernel
 - AI gets context payload from the kernel
-- Both can see each other's presence via seats
+- Both can see each other's presence via context membership
 
 ### Fork / Thread
 
-Create new kernels from existing ones.
+Fork and thread create new contexts from an existing one. At the RPC level,
+calling `fork` or `thread` on a `Kernel` capability returns a *new* `Kernel`
+capability — the new context gets its own kernel ID, block store, and
+conversation document. Both parent and child share the same `DriftRouter`
+(via `Arc`), so they can immediately drift to each other.
 
-| Op | State | VFS | Isolation |
-|----|-------|-----|-----------|
-| `fork` | Deep copy | Snapshot | Full — changes don't propagate |
-| `thread` | New, linked | Shared refs | None — changes visible to both |
+| Op | State | VFS | FlowBus | Drift | Use case |
+|----|-------|-----|---------|-------|----------|
+| `fork` | Deep copy | New (empty) | Independent | Shared | Isolated exploration |
+| `thread` | New, linked | Shared (`Arc::clone`) | Shared | Shared | Parallel work on same codebase |
 
-```bash
-# Fork: isolated exploration
-kaish fork --name=experiment
-# Now in new kernel with copied state, snapshot of mounts
+Both inherit the parent's tool config and LLM registry (provider Arcs shared,
+settings independent). Agents are *not* copied — new contexts start fresh.
 
-# Thread: parallel view
-kaish thread --name=parallel-work
-# Now in new kernel, but VFS changes propagate to/from parent
+**What's shared vs independent:**
+
+```
+Parent context                    Forked context
+├── VFS (MountTable)              ├── VFS (new, empty)
+├── ToolRegistry                  ├── ToolRegistry (new, re-registered)
+├── ToolConfig ──── copied ────►  ├── ToolConfig (independent copy)
+├── LlmRegistry ── cloned ────►  ├── LlmRegistry (shared providers, own settings)
+├── FlowBus                       ├── FlowBus (new, independent)
+├── DriftRouter ── Arc::clone ─►  ├── DriftRouter (SAME router)
+└── AgentRegistry                 └── AgentRegistry (new, empty)
 ```
 
-**Fork** is like Unix fork — heavy, isolated, for branching explorations.
-**Thread** is like pthread — light, shared memory, for parallel work on same codebase.
+For `thread`, VFS and FlowBus are `Arc::clone` instead of new — file changes
+and block events are visible to both parent and child immediately.
 
-**Thread details:**
-- The "linked" relationship means the child kernel holds references to the parent's VFS mounts, not copies
-- Changes to files in `/mnt/project/` are visible to both parent and child immediately
-- Each kernel still has its own `state/` (history, checkpoints) — only VFS is shared
-- If the parent kernel is archived/killed, threads become orphaned and must either:
-  - Adopt the VFS mounts as their own (copy-on-orphan)
-  - Be killed along with the parent (cascade delete, configurable)
-- Threads are useful for: "I want Claude to explore this while I work on something else in the same repo"
+**Why fork a context?** To let an agent explore a hypothesis without polluting
+the main conversation. When it finds something useful, it drifts the finding
+back to the parent. The constellation UI shows fork lineage and lets you
+switch between contexts.
 
 ### Checkpoint
 
@@ -337,7 +344,7 @@ kaish mount /mnt/research kernel://research-session
 # Now can read:
 ls /mnt/research/root/          # Their VFS
 cat /mnt/research/checkpoints/  # Their summaries
-cat /mnt/research/state/seats   # Who's active there
+cat /mnt/research/state/members  # Who's active there
 ```
 
 Every kernel exposes itself as a mountable filesystem. This enables:
@@ -355,7 +362,6 @@ kaish attach kernel://shared-session --mode=participant
 
 When attached bidirectionally:
 - Both kernels aware of each other's presence
-- Lease coordination spans both
 - Checkpoint events can propagate
 - Like joining a shared document
 
@@ -477,26 +483,26 @@ The actual schema lives in `kaijutsu.capnp`. Key interfaces:
 interface World {
   whoami @0 () -> (identity :Identity);
   listKernels @1 () -> (kernels :List(KernelInfo));
-  attachKernel @2 (id :Text) -> (kernel :Kernel);
+  attachKernel @2 (id :Text, trace :TraceContext) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
 }
 
 interface Kernel {
-  # 88 methods (@0-@87) — key categories shown below.
+  # 87 methods (@0-@86) — key categories shown below.
   # Full schema lives in kaijutsu.capnp.
 
   # kaish execution
-  execute @1 (code :Text) -> (execId :UInt64);
+  execute @1 (code :Text, trace :TraceContext) -> (execId :UInt64);
   shellExecute @25 (code :Text, cellId :Text) -> (blockId :BlockId);
 
   # Tools
   executeTool @16 (call :ToolCall) -> (result :ToolResult);
   getToolSchemas @17 () -> (schemas :List(ToolSchema));
 
-  # Lifecycle
-  fork @9 (name :Text) -> (kernel :Kernel);
-  thread @10 (name :Text) -> (kernel :Kernel);
-  detach @11 ();
+  # Lifecycle — fork/thread create new contexts (new Kernel capability)
+  fork @6 (name :Text) -> (kernel :Kernel);
+  thread @7 (name :Text) -> (kernel :Kernel);
+  detach @8 ();
 
   # Block CRDT sync
   pushOps @34 (documentId :Text, ops :Data) -> (ackVersion :UInt64);
@@ -524,12 +530,10 @@ interface Kernel {
 
   # Tool filtering
   getToolFilter @86 () -> (filter :ToolFilter);
-  setToolFilter @87 (filter :ToolFilter);
 }
 ```
 
-**Note:** Only a representative subset shown. `complete()` remains a stub.
-See `kaijutsu.capnp` for the full schema.
+**Note:** Only a representative subset shown. See `kaijutsu.capnp` for the full schema.
 
 ## Storage & Persistence
 
@@ -563,7 +567,8 @@ There is no persistent "Claude process" — each interaction is a fresh emergenc
 Think of a kernel like a development environment that:
 - Has a filesystem (the VFS with mounts)
 - Has memory (history, checkpoints)
-- Can be cloned (fork) or viewed in parallel (thread)
+- Hosts multiple contexts — each with its own conversation document
+- Can fork contexts for isolated exploration, with drift back to parent
 - Can be summarized (checkpoint) or archived
 
 ### Key Design Decisions
@@ -572,7 +577,7 @@ Think of a kernel like a development environment that:
 |----------|-----------|
 | Kernel owns `/` | Unix philosophy. Everything is a file. Kernels expose themselves as VFS. |
 | Context is generated, not stored | Fresh context on each interaction. Mounts shape what's visible. Enables pruning. |
-| Fork vs Thread | Maps to how users think about branching (isolated experiment) vs parallel work (same codebase). |
+| Fork vs Thread | Fork = isolated context (own VFS, own events). Thread = parallel context (shared VFS and events). Both share drift router. |
 | Checkpoint = distillation | Compress without forgetting. Summaries carry forward. Raw history can be archived. |
 | Consent modes | Collaborative work needs user approval. Autonomous agents need freedom. |
 
@@ -582,7 +587,7 @@ Think of a kernel like a development environment that:
 2. **Kernel discovery:** How do you find kernels? Tags? Search? Hierarchy?
 3. **Garbage collection:** When is it safe to delete archived history?
 4. **Drift policies:** When should contexts auto-push findings? On checkpoint? On significant tool results?
-5. **kaijutsu-mcp:** How do external agents (Claude Code, opencode, Gemini CLI) participate as drift contexts?
+5. **kaijutsu-mcp:** ✅ Implemented — 25 MCP tools, each MCP session joins as a drift context with `whoami` identity
 
 ## References
 
@@ -593,6 +598,14 @@ Think of a kernel like a development environment that:
 ---
 
 ## Changelog
+
+**2026-02-16**
+- Clarified fork/thread: these create new *contexts*, not new servers. Added shared-vs-independent diagram
+- Fixed method counts: 87 Kernel + 4 World (was 88+6)
+- Fixed capnp ordinals: fork @6, thread @7, detach @8 (were wrong)
+- Removed "seats" and "lease" references (replaced with context membership)
+- Removed setToolFilter @87 (not in schema)
+- Updated open question #5: kaijutsu-mcp is implemented
 
 **2026-02-06**
 - Added Drift section documenting cross-context communication

@@ -118,12 +118,15 @@ See [docs/kernel-model.md](docs/kernel-model.md) for full details.
 
 Context isn't stored, it's *generated*. When a context payload is needed (for Claude, for export), kaish walks the kernel state and mounted VFS to emit a fresh payload. Mounts determine what's visible.
 
-### Fork vs Thread
+### Fork vs Thread (Context Operations)
 
-| Op | State | VFS | Use case |
-|----|-------|-----|----------|
-| `fork` | Deep copy | Snapshot | Isolated exploration |
-| `thread` | New, linked | Shared refs | Parallel work on same codebase |
+Fork and thread create new contexts (new `Kernel` RPC capabilities). Both share the
+drift router via `Arc`, so parent and child can immediately drift to each other.
+
+| Op | State | VFS | FlowBus | Use case |
+|----|-------|-----|---------|----------|
+| `fork` | Deep copy | New (empty) | Independent | Isolated exploration |
+| `thread` | New, linked | Shared (`Arc`) | Shared | Parallel work on same codebase |
 
 ### Drift (Cross-Context Communication)
 
