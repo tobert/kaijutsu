@@ -16,6 +16,7 @@ use crate::ui::theme::Theme;
 #[derive(Resource)]
 pub struct MaterialCache {
     /// Standard chasing border for dashboard columns
+    #[allow(dead_code)]
     pub chasing_border: Handle<ChasingBorderMaterial>,
 }
 

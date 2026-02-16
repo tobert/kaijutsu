@@ -8,7 +8,7 @@ pub mod actor_plugin;
 pub mod bootstrap;
 
 pub use actor_plugin::{
-    ActorPlugin, ConnectionStatusMessage, RpcActor, RpcConnectionState, RpcResultChannel,
-    RpcResultMessage, ServerEventMessage,
+    ActorPlugin, RpcActor, RpcConnectionState, RpcResultChannel, RpcResultMessage,
+    ServerEventMessage,
 };
 pub use bootstrap::{BootstrapChannel, BootstrapCommand};

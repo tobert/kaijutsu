@@ -38,6 +38,7 @@ impl ZLayer {
     /// Modal overlays (input layer, command palette)
     pub const MODAL: i32 = 100;
     /// Dropdown menus (above modals)
+    #[allow(dead_code)]
     pub const DROPDOWN: i32 = 200;
     /// Toast notifications
     #[allow(dead_code)]

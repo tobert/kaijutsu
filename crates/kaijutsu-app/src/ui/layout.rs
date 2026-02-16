@@ -169,6 +169,7 @@ impl PanelRegistry {
     }
 
     /// Check if a panel has a builder registered.
+    #[allow(dead_code)] // Used by layout_reconciler (not yet wired)
     pub fn has_builder(&self, id: PanelTypeId) -> bool {
         self.builders.contains_key(&id)
     }
@@ -176,6 +177,7 @@ impl PanelRegistry {
     /// Spawn a panel using its registered builder.
     ///
     /// Returns None if the panel has no builder registered.
+    #[allow(dead_code)] // Used by layout_reconciler (not yet wired)
     pub fn spawn(
         &self,
         id: PanelTypeId,
