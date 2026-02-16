@@ -4,11 +4,17 @@
 
 Kaijutsu is an agentic interface and kernel that offers a crdt-all-the-things
 approach to collaborative editing with multiple models and users participating
-in real time. The 会術 ui is built on Bevy 0.18 with custom MSDF text rendering.
-The kernel relies on [a fork of diamond-types][dt-fork] that completes and
-extends map and register types. We will upstream that when we have a moment.
+in real time. The 会術 UI is built on Bevy 0.18 with custom MSDF text rendering.
+The kernel relies on [diamond-types-extended][dte], our fork of diamond-types
+that completes Map, Set, and Register types alongside the existing Text CRDT.
 
-[dt-fork]: https://github.com/tobert/diamond-types/tree/feat/maps-and-uuids
+**Context forking and drift** are central to the workflow. Any context can be
+[forked](docs/kernel-model.md) for isolated exploration. [Drift](docs/drift.md)
+is how contexts share knowledge without sharing conversation history — multiple
+agents (Claude, Gemini, local models, humans) work in parallel contexts on the
+same kernel, drifting findings between each other with optional LLM distillation.
+
+[dte]: https://github.com/tobert/diamond-types-extended
 
 ## Status
 
@@ -31,13 +37,16 @@ Claude Code, Gemini CLI, and other MCP clients collaborate on shared documents.
 cargo run -p kaijutsu-mcp
 ```
 
-### Tools
+### Tools (25)
 
 | Category | Tools |
 |----------|-------|
-| **Documents** | `doc_create`, `doc_list`, `doc_delete`, `doc_tree` |
-| **Blocks** | `block_create`, `block_read`, `block_append`, `block_edit`, `block_list`, `block_status` |
+| **Documents** | `doc_create`, `doc_list`, `doc_delete`, `doc_tree`, `doc_preview` |
+| **Blocks** | `block_create`, `block_read`, `block_append`, `block_edit`, `block_list`, `block_status`, `block_diff` |
 | **Debug** | `block_inspect`, `block_history`, `kernel_search` |
+| **Drift** | `drift_ls`, `drift_push`, `drift_queue`, `drift_cancel`, `drift_flush`, `drift_pull`, `drift_merge` |
+| **Execution** | `tool_call`, `shell` |
+| **Identity** | `whoami` |
 
 ### Example: Visualize Conversation DAG
 
@@ -56,14 +65,9 @@ Tool calls collapse to a single line by default. See [crates/kaijutsu-mcp/README
 
 ## Forked Dependencies
 
-We maintain forks of several dependencies with fixes or extensions we need. These will be upstreamed once proven out:
-
-| Fork | Branch | Why |
-|------|--------|-----|
-| [diamond-types](https://github.com/tobert/diamond-types) | `feat/maps-and-uuids` | Completes Map/Set/Register types |
-| [glyphon](https://github.com/tobert/glyphon) | `bevy-0.18-compat` | cosmic-text 0.16 for Bevy 0.18 |
-| [bevy_brp](https://github.com/tobert/bevy_brp) | `fix/send-keys-populate-text-field` | send_keys populates text field correctly |
-| [anthropic-api](https://github.com/tobert/anthropic-api) | `add-tooluse-to-request-content-block` | ToolUse in request content blocks |
+| Fork | Why |
+|------|-----|
+| [diamond-types-extended](https://github.com/tobert/diamond-types-extended) | Completes Map/Set/Register types alongside Text CRDT |
 
 ## Text Rendering
 

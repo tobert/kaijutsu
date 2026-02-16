@@ -4,9 +4,9 @@
 
 An agentic coding system for teams with two parts: a Bevy 0.18 client, and a Cap'n Proto over SSH server.
 
-**The way of Kaijutsu:** Everyone editing shared state via CRDT tools. Rhai and kaish use the crdts. Claude does. Gemini
-does. Users do via the builtin editor. We share operations via the kernel and reap the collaborative benefits of leaning
-into the distributed algorithm to equalize access and handle different networks.
+**The way of Kaijutsu:** Everyone editing shared state via CRDT tools (powered by [diamond-types-extended](docs/diamond-types-fork.md), our fork of diamond-types with Map/Set/Register/Text). Rhai and kaish use the CRDTs. Claude does. Gemini does. Users do via the builtin editor. We share operations via the kernel and reap the collaborative benefits of leaning into the distributed algorithm to equalize access and handle different networks.
+
+**Context forking and drift** are central to the workflow. Any context can be forked for isolated exploration or threaded for parallel work on the same codebase. [Drift](docs/drift.md) is how contexts share knowledge without sharing conversation history — when one agent finds something useful, it drifts the finding to another, optionally distilled by an LLM into a concise briefing. Multiple agents (Claude, Gemini, local models, humans) work in parallel contexts on the same kernel.
 
 ## Quick Start
 
@@ -45,9 +45,8 @@ kaijutsu-server set-nick old-nick new-nick
 ### Identity
 
 Each key maps to a user with:
-- **nick**: Short identifier used in RPC (e.g., "amy", "claude")
+- **username**: Short identifier used in RPC (e.g., "amy", "claude") — `nick` in CLI commands
 - **display_name**: Full name (defaults to key comment)
-- **is_admin**: Admin privileges flag
 
 Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to rename.
 
@@ -72,18 +71,18 @@ Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to
 │  │ EmbeddedKaish → KaijutsuBackend → BlockStore (CRDT)         │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                          │                                          │
-│                   SSH + Cap'n Proto (88 methods)                    │
+│                   SSH + Cap'n Proto (87 Kernel + 4 World methods)   │
 └──────────────────────────┼──────────────────────────────────────────┘
                            │
           ┌────────────────┼────────────────┐
           │                │                │
 ┌─────────┴──────┐ ┌──────┴───────┐ ┌──────┴───────┐
 │ kaijutsu-app   │ │ kaijutsu-mcp │ │ External     │
-│ (Bevy client)  │ │ (planned)    │ │ (Claude Code,│
-│                │ │              │ │  opencode,   │
-│ ActorHandle    │ │ MCP server   │ │  Gemini CLI) │
-│ (Send+Sync)    │ │ exposing     │ │              │
-│                │ │ drift + tools│ │              │
+│ (Bevy client)  │ │ (25 tools)   │ │ (Claude Code,│
+│                │ │ stdio MCP    │ │  opencode,   │
+│ ActorHandle    │ │ server for   │ │  Gemini CLI) │
+│ (Send+Sync)    │ │ drift+tools  │ │              │
+│                │ │              │ │              │
 └────────────────┘ └──────────────┘ └──────────────┘
 ```
 
@@ -94,8 +93,11 @@ Nick is auto-generated from fingerprint tail if not specified. Use `set-nick` to
 | [docs/kernel-model.md](docs/kernel-model.md) | **Authoritative kernel model — start here** |
 | [docs/drift.md](docs/drift.md) | **Cross-context communication (drift) design** |
 | [docs/block-tools.md](docs/block-tools.md) | CRDT block interface design |
-| [docs/diamond-types-fork.md](docs/diamond-types-fork.md) | Why we forked diamond-types |
+| [docs/diamond-types-fork.md](docs/diamond-types-fork.md) | Why we forked diamond-types → diamond-types-extended |
+| [docs/dte-concurrent-merge-fix.md](docs/dte-concurrent-merge-fix.md) | Known concurrent merge issue (2 tests ignored) |
 | [docs/design-notes.md](docs/design-notes.md) | Collected design explorations |
+| [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
+| [docs/rig-migration.md](docs/rig-migration.md) | anthropic-api → rig-core migration |
 
 ## Core Concepts
 
@@ -184,14 +186,19 @@ Key data types:
 - `ConstellationCamera` — offset, zoom, target_offset, target_zoom
 - `ConstellationVisible` — simple bool resource
 
-### Mode System (vim-style)
+### Input System (Focus-based)
 
-| Mode | Purpose | Enter | Exit |
-|------|---------|-------|------|
-| Normal | Navigate, read | `Esc` | - |
-| Chat | LLM prompts / edit | `i` | `Esc` |
-| Shell | kaish commands | `` ` `` or `:` | `Esc` |
-| Visual | Selection | `v` | `Esc` |
+Mode emerges from `FocusArea` (the sole authority for keyboard routing) plus compose text prefix:
+
+| FocusArea | Purpose | Key hints |
+|-----------|---------|-----------|
+| Compose | Text input (chat or shell) | `Esc` to Normal, `Enter` to submit |
+| Constellation | Context navigation | `hjkl` nav, `Enter` switch, `Tab` back |
+| Dialog | Modal dialogs | Dialog-specific |
+
+Shell vs Chat is auto-detected from compose text prefix (`:` or `` ` `` = shell).
+`dispatch_input` is the single system reading raw keyboard/mouse/gamepad → emits `ActionFired`/`TextInputReceived`.
+`InputMap` resource holds all bindings (BRP-mutable).
 
 ### Unified Edit Model (Phase 1)
 
@@ -319,12 +326,15 @@ kaijutsu/
 │   ├── kaijutsu-kernel/     # Kernel, VFS, ToolRegistry, McpServerPool, FlowBus
 │   ├── kaijutsu-client/     # RPC client library
 │   ├── kaijutsu-server/     # SSH server, EmbeddedKaish, KaijutsuBackend
-│   └── kaijutsu-app/        # Bevy GUI, kaish syntax validation
+│   ├── kaijutsu-app/        # Bevy 0.18 GUI with MSDF text rendering
+│   ├── kaijutsu-mcp/        # MCP server (25 tools: docs/blocks/drift/execution/identity)
+│   └── kaijutsu-telemetry/  # OpenTelemetry (W3C context propagation, sampling)
 └── docs/
     ├── kernel-model.md      # ✅ Start here
     ├── drift.md             # Cross-context communication
     ├── block-tools.md       # CRDT interface
-    ├── diamond-types-fork.md
+    ├── diamond-types-fork.md # diamond-types-extended fork rationale
+    ├── telemetry.md         # OTel integration
     └── design-notes.md
 ```
 
@@ -333,6 +343,7 @@ kaijutsu/
 | Repo | Purpose |
 |------|---------|
 | `~/src/kaish` | kaish shell (LANGUAGE.md) |
+| `~/src/diamond-types-extended` | Forked CRDT engine (Map/Set/Register/Text) |
 | `~/src/bevy` | Bevy 0.18 source |
 
 ## Development
@@ -419,7 +430,7 @@ Many cell and UI components are registered for BRP reflection, enabling runtime 
 - `kaijutsu_app::cell::components::WorkspaceLayout` — margins, line height, cell limits
 - `kaijutsu_app::cell::components::FocusedCell` — which entity has keyboard focus
 - `kaijutsu_app::cell::components::ConversationScrollState` — scroll offset, content height, following mode
-- `kaijutsu_app::cell::components::CurrentMode` — Normal/Input(Chat|Shell)/Visual
+- `kaijutsu_app::input::focus::FocusArea` — Compose/Constellation/Dialog (replaced CurrentMode)
 
 **Components** (use `world_query` with filter):
 - `Cell`, `CellId`, `CellPosition`, `CellState` — cell identity and visual state
