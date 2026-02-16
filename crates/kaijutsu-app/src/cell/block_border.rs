@@ -247,8 +247,8 @@ pub fn spawn_block_borders(
             .spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    top: Val::Px(0.0),
+                    left: Val::Px(-style.padding.left),
+                    top: Val::Px(-style.padding.top),
                     width: Val::Px(100.0),
                     height: Val::Px(50.0),
                     ..default()
@@ -258,14 +258,17 @@ pub fn spawn_block_borders(
             ))
             .id();
 
+        // Make border a child of the BlockCell so it scrolls/clips with it
         commands.entity(entity).insert(BlockBorderEntity(border_entity));
+        commands.entity(entity).add_child(border_entity);
     }
 }
 
 /// Position border nodes to match their associated BlockCell bounds.
+#[allow(dead_code)] // Legacy — kept for rollback reference during flex migration
 pub fn layout_block_borders(
     block_cells: Query<(&BlockCellLayout, &BlockBorderStyle, &BlockBorderEntity)>,
-    mut border_nodes: Query<&mut Node>,
+    mut border_nodes: Query<(&mut Node, &mut Visibility)>,
     mut materials: ResMut<Assets<BlockBorderMaterial>>,
     border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
     layout: Res<crate::cell::components::WorkspaceLayout>,
@@ -284,11 +287,12 @@ pub fn layout_block_borders(
     let (_, _, translation) = transform.to_scale_angle_translation();
     let content = node.content_box();
     let visible_top = translation.y + content.min.y;
+    let visible_bottom = translation.y + content.max.y;
     let base_width = content.width();
     let margin = layout.workspace_margin_left;
 
     for (block_layout, style, border_ent) in block_cells.iter() {
-        let Ok(mut node) = border_nodes.get_mut(border_ent.0) else {
+        let Ok((mut node, mut visibility)) = border_nodes.get_mut(border_ent.0) else {
             continue;
         };
 
@@ -297,15 +301,62 @@ pub fn layout_block_borders(
         let width = base_width - indent;
         let content_top = visible_top + block_layout.y_offset - scroll_state.offset;
 
-        // Position and size the border node
+        // Full border bounds (unclamped)
+        let border_top = content_top - style.padding.top;
+        let border_bottom = content_top + block_layout.height + style.padding.bottom;
+
+        // Clamp to visible conversation area
+        let clamped_top = border_top.max(visible_top);
+        let clamped_bottom = border_bottom.min(visible_bottom);
+
+        // Hide borders entirely outside the visible area
+        if clamped_top >= clamped_bottom {
+            *visibility = Visibility::Hidden;
+            continue;
+        }
+        *visibility = Visibility::Inherited;
+
+        let w = width + style.padding.left + style.padding.right;
+        let h = clamped_bottom - clamped_top;
+
+        // Position and size the border node (clamped to visible area)
         node.left = Val::Px(left - style.padding.left);
-        node.top = Val::Px(content_top - style.padding.top);
-        node.width = Val::Px(width + style.padding.left + style.padding.right);
-        node.height = Val::Px(block_layout.height + style.padding.vertical());
+        node.top = Val::Px(clamped_top);
+        node.width = Val::Px(w);
+        node.height = Val::Px(h);
 
         // Update dimensions uniform for aspect-correct rendering
-        let w = width + style.padding.left + style.padding.right;
-        let h = block_layout.height + style.padding.vertical();
+        if let Ok(mat_node) = border_material_query.get(border_ent.0) {
+            if let Some(mat) = materials.get_mut(mat_node.0.id()) {
+                mat.dimensions = Vec4::new(w, h, 0.0, 0.0);
+            }
+        }
+    }
+}
+
+/// Position border nodes from parent BlockCell's ComputedNode (flex layout).
+///
+/// Since borders are now children of BlockCells, they just need to be sized
+/// relative to their parent. No manual scroll/visibility clamping needed.
+pub fn layout_block_borders_from_flex(
+    block_cells: Query<(&ComputedNode, &BlockBorderStyle, &BlockBorderEntity)>,
+    mut border_nodes: Query<&mut Node>,
+    mut materials: ResMut<Assets<BlockBorderMaterial>>,
+    border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
+) {
+    for (computed, style, border_ent) in block_cells.iter() {
+        let size = computed.size();
+        let w = size.x + style.padding.left + style.padding.right;
+        let h = size.y + style.padding.top + style.padding.bottom;
+
+        if let Ok(mut node) = border_nodes.get_mut(border_ent.0) {
+            node.left = Val::Px(-style.padding.left);
+            node.top = Val::Px(-style.padding.top);
+            node.width = Val::Px(w);
+            node.height = Val::Px(h);
+        }
+
+        // Update dimensions uniform for aspect-correct rendering
         if let Ok(mat_node) = border_material_query.get(border_ent.0) {
             if let Some(mat) = materials.get_mut(mat_node.0.id()) {
                 mat.dimensions = Vec4::new(w, h, 0.0, 0.0);

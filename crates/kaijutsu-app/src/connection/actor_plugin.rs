@@ -218,8 +218,17 @@ fn periodic_reconnect(
     state: Res<RpcConnectionState>,
     mut timer: ResMut<ReconnectTimer>,
     bootstrap: Res<BootstrapChannel>,
+    existing_actor: Option<Res<RpcActor>>,
 ) {
     if state.connected {
+        return;
+    }
+
+    // Don't spawn a new actor if one already exists — it may still be in the
+    // process of connecting (SSH handshake → attach_kernel → join_context →
+    // subscriptions). Spawning a replacement would drop the existing handle,
+    // killing the actor before it can report Connected.
+    if existing_actor.is_some() {
         return;
     }
 
@@ -341,7 +350,11 @@ fn poll_server_events(
                 log::warn!("Server event broadcast lagged by {n} messages");
                 sync_gen.0 += 1;
             }
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+            Err(broadcast::error::TryRecvError::Empty) => {
+                break;
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                *receiver = None;
                 break;
             }
         }
@@ -349,7 +362,11 @@ fn poll_server_events(
 }
 
 /// Drain connection status events from ActorHandle's broadcast channel.
+///
+/// When the broadcast channel closes (actor exited), removes the `RpcActor`
+/// resource so `periodic_reconnect` can spawn a fresh one.
 fn poll_connection_status(
+    mut commands: Commands,
     actor: Option<Res<RpcActor>>,
     mut events: MessageWriter<ConnectionStatusMessage>,
     mut receiver: Local<Option<broadcast::Receiver<kaijutsu_client::ConnectionStatus>>>,
@@ -371,7 +388,14 @@ fn poll_connection_status(
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 log::warn!("Connection status broadcast lagged by {n}");
             }
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+            Err(broadcast::error::TryRecvError::Empty) => {
+                break;
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                // Actor exited — remove resource so periodic_reconnect can spawn a new one
+                log::debug!("Actor status channel closed, removing RpcActor resource (gen {})", actor.generation);
+                commands.remove_resource::<RpcActor>();
+                *receiver = None;
                 break;
             }
         }

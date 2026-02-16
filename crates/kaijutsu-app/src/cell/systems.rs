@@ -1,6 +1,7 @@
 //! Cell systems for input handling and rendering.
 
 use bevy::prelude::*;
+use bevy::ui::CalculatedClip;
 
 use super::components::{
     BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
@@ -406,6 +407,8 @@ pub struct EditorEntities {
     pub main_cell: Option<Entity>,
     /// The expanded block overlay view entity.
     pub expanded_view: Option<Entity>,
+    /// The ConversationContainer entity (flex parent for BlockCells).
+    pub conversation_container: Option<Entity>,
 }
 
 // Font metrics are now read from TextMetrics resource instead of hardcoded constants.
@@ -695,6 +698,8 @@ pub fn handle_prompt_submitted(
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
     time: Res<Time>,
+    entities: Res<EditorEntities>,
+    mut scroll_positions: Query<(&mut ScrollPosition, &ComputedNode), With<super::components::ConversationContainer>>,
 ) {
     // Clear the user_scrolled flag at end of frame
     // (This system runs late in the frame after block events)
@@ -713,22 +718,32 @@ pub fn smooth_scroll(
             scroll_state.offset = max;
             scroll_state.target_offset = max;
         }
-        return;
+    } else {
+        // Manual scroll: lerp toward target for smooth motion
+        const SCROLL_SPEED: f32 = 12.0;
+        let target = scroll_state.target_offset;
+        let offset = scroll_state.offset;
+        let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
+        let new_offset = offset + (target - offset) * t;
+
+        // Snap when close enough to prevent sub-pixel jitter
+        scroll_state.offset = if (new_offset - target).abs() < 0.5 {
+            target
+        } else {
+            new_offset
+        };
     }
 
-    // Manual scroll: lerp toward target for smooth motion
-    const SCROLL_SPEED: f32 = 12.0;
-    let target = scroll_state.target_offset;
-    let offset = scroll_state.offset;
-    let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
-    let new_offset = offset + (target - offset) * t;
-
-    // Snap when close enough to prevent sub-pixel jitter
-    scroll_state.offset = if (new_offset - target).abs() < 0.5 {
-        target
-    } else {
-        new_offset
-    };
+    // Write scroll offset to Bevy's ScrollPosition and read visible height
+    if let Some(conv) = entities.conversation_container {
+        if let Ok((mut scroll_pos, computed)) = scroll_positions.get_mut(conv) {
+            **scroll_pos = Vec2::new(scroll_pos.x, scroll_state.offset);
+            let visible_h = computed.size().y;
+            if visible_h > 0.0 {
+                scroll_state.visible_height = visible_h;
+            }
+        }
+    }
 }
 
 // handle_scroll_input — DELETED (Phase 5)
@@ -972,9 +987,11 @@ pub fn spawn_main_cell(
     }
 
     // Wait for conversation container to exist
-    if conversation_container.is_empty() {
+    let Ok(conv_entity) = conversation_container.single() else {
         return;
-    }
+    };
+
+    entities.conversation_container = Some(conv_entity);
 
     // Create the main kernel cell
     let cell = Cell::new();
@@ -1744,15 +1761,20 @@ pub fn spawn_block_cells(
     let current_version = editor.version();
 
     // Find blocks to add (in document but not in container)
+    let conv_entity = entities.conversation_container;
     for block_id in &current_blocks {
         if !container.contains(block_id) {
-            // Spawn new BlockCell with timeline visibility tracking
+            // Spawn new BlockCell as flex child of ConversationContainer
             let entity = commands
                 .spawn((
                     BlockCell::new(block_id.clone()),
                     BlockCellLayout::default(),
                     MsdfText,
                     MsdfTextAreaConfig::default(),
+                    Node {
+                        width: Val::Percent(100.0),
+                        ..default()
+                    },
                     TimelineVisibility {
                         created_at_version: current_version,
                         opacity: 1.0,
@@ -1760,6 +1782,9 @@ pub fn spawn_block_cells(
                     },
                 ))
                 .id();
+            if let Some(conv) = conv_entity {
+                commands.entity(conv).add_child(entity);
+            }
             container.add(block_id.clone(), entity);
         }
     }
@@ -1830,8 +1855,17 @@ pub fn sync_role_headers(
                     RoleHeaderLayout::default(),
                     MsdfText,
                     config,
+                    Node {
+                        width: Val::Percent(100.0),
+                        min_height: Val::Px(ROLE_HEADER_HEIGHT),
+                        margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
+                        ..default()
+                    },
                 ))
                 .id();
+            if let Some(conv) = entities.conversation_container {
+                commands.entity(conv).add_child(entity);
+            }
 
             container.role_headers.push(entity);
         }
@@ -2097,8 +2131,7 @@ pub fn layout_block_cells(
     let margin = layout.workspace_margin_left;
     let base_width = window_width - (margin * 2.0);
 
-    // Note: visible_height is now updated only in apply_block_cell_positions
-    // to consolidate scroll state updates and prevent double-clamping issues
+    // Note: visible_height is updated in smooth_scroll from ConversationContainer's ComputedNode
 
     // Lock font system for shaping
     let mut font_system = font_system.0.lock().unwrap();
@@ -2186,12 +2219,185 @@ pub fn layout_block_cells(
     scroll_state.content_height = y_offset;
 }
 
+/// Sync BlockCellLayout heights/indentation to Bevy Node for flex layout.
+///
+/// After `layout_block_cells` computes heights, this system writes them to the
+/// Node component so Bevy's flex layout knows how tall each block should be.
+pub fn update_block_cell_nodes(
+    entities: Res<EditorEntities>,
+    containers: Query<&BlockCellContainer>,
+    mut block_cells: Query<(&BlockCellLayout, &mut Node), With<BlockCell>>,
+    mut role_header_nodes: Query<&mut Node, (With<RoleHeader>, Without<BlockCell>)>,
+) {
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    for entity in &container.block_cells {
+        let Ok((layout, mut node)) = block_cells.get_mut(*entity) else {
+            continue;
+        };
+        node.min_height = Val::Px(layout.height);
+        node.margin = UiRect {
+            left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH),
+            bottom: Val::Px(BLOCK_SPACING),
+            ..default()
+        };
+    }
+
+    // Role header nodes already have fixed height from spawn, but update if needed
+    for entity in &container.role_headers {
+        if let Ok(mut node) = role_header_nodes.get_mut(*entity) {
+            node.min_height = Val::Px(ROLE_HEADER_HEIGHT);
+            node.margin = UiRect::bottom(Val::Px(ROLE_HEADER_SPACING));
+        }
+    }
+}
+
+/// Reorder ConversationContainer children to match document order.
+///
+/// Interleaves role headers before their associated blocks so flex layout
+/// renders them in the correct visual order.
+pub fn reorder_conversation_children(
+    entities: Res<EditorEntities>,
+    mut commands: Commands,
+    containers: Query<&BlockCellContainer>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    role_headers: Query<&RoleHeader>,
+) {
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Some(conv_entity) = entities.conversation_container else {
+        return;
+    };
+    let Ok(editor) = main_cells.get(main_ent) else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    // Build ordered child list: role headers interleaved with blocks
+    let blocks = editor.blocks();
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut ordered_children = Vec::new();
+
+    // Build block_id → role header entity map
+    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+        std::collections::HashMap::new();
+    for &header_ent in &container.role_headers {
+        if let Ok(header) = role_headers.get(header_ent) {
+            header_map.insert(header.block_id.clone(), header_ent);
+        }
+    }
+
+    for block in &blocks {
+        let is_transition = prev_role != Some(block.role);
+        if is_transition {
+            if let Some(&header_ent) = header_map.get(&block.id) {
+                ordered_children.push(header_ent);
+            }
+        }
+        if let Some(block_ent) = container.get_entity(&block.id) {
+            ordered_children.push(block_ent);
+        }
+        prev_role = Some(block.role);
+    }
+
+    commands.entity(conv_entity).replace_children(&ordered_children);
+}
+
+/// Position BlockCell text areas from ComputedNode (flex layout result).
+///
+/// Follows the same pattern as `position_compose_block`: reads ComputedNode +
+/// UiGlobalTransform to determine screen position, then writes MsdfTextAreaConfig.
+/// This replaces the manual positioning in `apply_block_cell_positions`.
+pub fn position_block_cells_from_flex(
+    mut block_cells: Query<
+        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&super::block_border::BlockBorderStyle>, Option<&CalculatedClip>),
+        With<BlockCell>,
+    >,
+) {
+    for (computed, transform, mut config, border_style, clip) in block_cells.iter_mut() {
+        let (_, _, translation) = transform.to_scale_angle_translation();
+        let size = computed.size();
+
+        let left = translation.x - size.x / 2.0;
+        let top = translation.y - size.y / 2.0;
+
+        let pad_left = border_style.map(|s| s.padding.left).unwrap_or(0.0);
+        let pad_top = border_style.map(|s| s.padding.top).unwrap_or(0.0);
+        let pad_right = border_style.map(|s| s.padding.right).unwrap_or(0.0);
+
+        config.left = left + pad_left;
+        config.top = top + pad_top;
+        config.scale = 1.0;
+
+        let raw_left = (left + pad_left) as i32;
+        let raw_top = (top + pad_top) as i32;
+        let raw_right = (left + size.x - pad_right) as i32;
+        let raw_bottom = (top + size.y) as i32;
+
+        config.bounds = if let Some(clip) = clip {
+            crate::text::TextBounds {
+                left: raw_left.max(clip.clip.min.x as i32),
+                top: raw_top.max(clip.clip.min.y as i32),
+                right: raw_right.min(clip.clip.max.x as i32),
+                bottom: raw_bottom.min(clip.clip.max.y as i32),
+            }
+        } else {
+            crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
+        };
+    }
+}
+
+/// Position RoleHeader text areas from ComputedNode (flex layout result).
+pub fn position_role_headers_from_flex(
+    mut role_headers: Query<
+        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&CalculatedClip>),
+        (With<RoleHeader>, Without<BlockCell>),
+    >,
+) {
+    for (computed, transform, mut config, clip) in role_headers.iter_mut() {
+        let (_, _, translation) = transform.to_scale_angle_translation();
+        let size = computed.size();
+
+        let left = translation.x - size.x / 2.0;
+        let top = translation.y - size.y / 2.0;
+
+        config.left = left;
+        config.top = top;
+        config.scale = 1.0;
+
+        let raw_left = left as i32;
+        let raw_top = top as i32;
+        let raw_right = (left + size.x) as i32;
+        let raw_bottom = (top + size.y) as i32;
+
+        config.bounds = if let Some(clip) = clip {
+            crate::text::TextBounds {
+                left: raw_left.max(clip.clip.min.x as i32),
+                top: raw_top.max(clip.clip.min.y as i32),
+                right: raw_right.min(clip.clip.max.x as i32),
+                bottom: raw_bottom.min(clip.clip.max.y as i32),
+            }
+        } else {
+            crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
+        };
+    }
+}
+
 /// Apply layout positions to BlockCell MsdfTextAreaConfig for rendering.
 ///
 /// **Performance optimization:** This system tracks the last-applied layout generation
 /// and scroll offset. It skips work when neither layout nor scroll has changed.
 /// Combined with layout_block_cells optimization, this means scrolling only runs
 /// this lightweight position update, not the expensive layout computation.
+#[allow(dead_code)] // Legacy — kept for rollback reference during flex migration
 pub fn apply_block_cell_positions(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,

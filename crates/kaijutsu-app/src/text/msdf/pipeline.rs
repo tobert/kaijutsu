@@ -874,11 +874,9 @@ impl ViewNode for MsdfTextRenderNode {
                 let clamped_w = w.min(vp_w.saturating_sub(x));
                 let clamped_h = h.min(vp_h.saturating_sub(y));
 
-                // Skip batches with zero-size scissor (would clip everything)
-                // This can happen if bounds are stale or inverted
+                // Skip batches with zero-size scissor (fully clipped)
                 if clamped_w == 0 || clamped_h == 0 {
-                    // Fall back to full viewport for this batch
-                    render_pass.set_scissor_rect(0, 0, vp_w, vp_h);
+                    continue;
                 } else {
                     render_pass.set_scissor_rect(
                         x.min(vp_w),

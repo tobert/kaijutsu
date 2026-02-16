@@ -187,15 +187,22 @@ impl Plugin for CellPlugin {
         // ====================================================================
         // CellPhase::Layout - Measure heights, scroll, position entities
         // ====================================================================
+        // Layout phase part 1: measure, scroll, position
         app.add_systems(
             Update,
             (
                 // Block cell layout (computes heights, updates content_height)
                 systems::layout_block_cells,
+                // Sync heights to Node for flex layout
+                systems::update_block_cell_nodes.after(systems::layout_block_cells),
+                // Reorder children to match document order
+                systems::reorder_conversation_children.after(systems::update_block_cell_nodes),
                 // Smooth scroll (uses content_height from layout)
                 systems::smooth_scroll.after(systems::layout_block_cells),
-                // Apply positions (uses scroll offset)
-                systems::apply_block_cell_positions.after(systems::smooth_scroll),
+                // (Legacy apply_block_cell_positions removed — flex positioning takes over)
+                // Flex-based positioning (after Bevy's UI layout)
+                systems::position_block_cells_from_flex.after(bevy::ui::UiSystems::Prepare),
+                systems::position_role_headers_from_flex.after(bevy::ui::UiSystems::Prepare),
                 // Compose block positioning (after Bevy's UI layout)
                 systems::position_compose_block.after(bevy::ui::UiSystems::Prepare),
                 // Cursor positioning
@@ -205,11 +212,21 @@ impl Plugin for CellPlugin {
                 systems::update_compose_cursor
                     .after(systems::update_cursor)
                     .after(systems::position_compose_block),
+            )
+                .in_set(CellPhase::Layout),
+        );
+
+        // Layout phase part 2: borders + frames
+        app.add_systems(
+            Update,
+            (
                 // Block border systems
                 block_border::spawn_block_borders
-                    .after(systems::apply_block_cell_positions),
-                block_border::layout_block_borders
-                    .after(block_border::spawn_block_borders),
+                    .after(systems::position_block_cells_from_flex),
+                // (Legacy layout_block_borders removed — flex positioning takes over)
+                block_border::layout_block_borders_from_flex
+                    .after(block_border::spawn_block_borders)
+                    .after(bevy::ui::UiSystems::Prepare),
                 block_border::update_block_border_state
                     .after(block_border::spawn_block_borders),
                 block_border::cleanup_block_borders,
