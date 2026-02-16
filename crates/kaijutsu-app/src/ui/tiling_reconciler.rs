@@ -334,7 +334,6 @@ fn spawn_content_subtree(
                     MsdfText,
                     MsdfTextAreaConfig::default(),
                     Node {
-                        width: Val::Percent(100.0),
                         min_height: Val::Px(60.0),
                         padding: UiRect::all(Val::Px(12.0)),
                         margin: UiRect::new(
