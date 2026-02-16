@@ -41,7 +41,6 @@ use super::components::{
 use super::block_border;
 use super::frame_assembly;
 use super::systems;
-use crate::dashboard::DashboardEventHandling;
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -111,8 +110,7 @@ impl Plugin for CellPlugin {
             Update,
             (
                 // Block event handling (server → client sync, routes through DocumentCache)
-                // Must run AFTER DashboardEventHandling so SeatTaken creates conversation first
-                systems::handle_block_events.after(DashboardEventHandling),
+                systems::handle_block_events,
                 // Context switching (reads ContextSwitchRequested, swaps active cache entry)
                 systems::handle_context_switch.after(systems::handle_block_events),
                 // Handle prompt submission

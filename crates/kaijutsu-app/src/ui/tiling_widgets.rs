@@ -50,7 +50,6 @@ pub fn update_mode_widget(
         FocusArea::EditingBlock { .. } => theme.mode_chat,
         FocusArea::Constellation => theme.mode_visual,
         FocusArea::Dialog => theme.mode_shell,
-        FocusArea::Dashboard => theme.mode_normal,
     };
 
     for (widget, children) in widget_panes.iter() {
@@ -345,7 +344,6 @@ pub fn update_hints_widget(
         FocusArea::EditingBlock { .. } => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
         FocusArea::Constellation => "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: compose │ +/-: zoom │ 0: reset",
         FocusArea::Dialog => "Enter: confirm │ Esc: cancel │ j/k: navigate",
-        FocusArea::Dashboard => "Enter: select │ j/k: navigate",
     };
 
     for (widget, children) in widget_panes.iter() {

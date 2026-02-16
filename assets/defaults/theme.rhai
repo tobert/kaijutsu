@@ -4,7 +4,6 @@
 // Edit this file to customize colors, fonts, and effects.
 //
 // Changes require an app restart to take effect (for now).
-// Seat-specific overrides go in seats/{seat_id}.rhai
 //
 // Available functions:
 //   hex("#rrggbb")        -> [r, g, b, 1.0]
@@ -181,3 +180,23 @@ let hud_panel_glow_intensity = 0.3;
 let hud_orbital_curve_radius = 300.0;
 let hud_text_color = hex("#c0caf5");
 let hud_font_size = 12.0;
+
+// ============================================================================
+// Compose Block (Input Area)
+// ============================================================================
+
+let compose_border = hexa("#7aa2f7", 0.6);     // Blue border matching accent
+let compose_bg = hexa("#1a1b26", 0.8);         // Dark bg with slight transparency
+
+// ============================================================================
+// Modal Overlays (Create Dialog, Model Picker)
+// ============================================================================
+
+let modal_backdrop = hexa("#000000", 0.6);     // Semi-transparent black backdrop
+
+// ============================================================================
+// User/Assistant Text Block Borders (opt-in, transparent = disabled)
+// ============================================================================
+
+let block_border_user = rgba(0.0, 0.0, 0.0, 0.0);       // Transparent (disabled)
+let block_border_assistant = rgba(0.0, 0.0, 0.0, 0.0);   // Transparent (disabled)

@@ -12,7 +12,6 @@ use crate::shaders::nine_slice::{
     CornerMarker, CornerMaterial, CornerPosition, EdgeMarker, EdgeMaterial, EdgePosition,
 };
 use crate::text::MsdfTextAreaConfig;
-use crate::ui::state::AppScreen;
 use crate::ui::theme::{color_to_vec4, Theme};
 
 /// Padding around cells for the frame.
@@ -41,7 +40,6 @@ pub fn spawn_nine_slice_frames(
     _commands: Commands,
     _new_cells: Query<(Entity, &Cell, &MsdfTextAreaConfig), (Added<Cell>, Without<NineSliceFrame>)>,
     _theme: Res<Theme>,
-    _screen: Res<State<AppScreen>>,
     _corner_materials: ResMut<Assets<CornerMaterial>>,
     _edge_materials: ResMut<Assets<EdgeMaterial>>,
 ) {
@@ -230,21 +228,15 @@ pub fn update_nine_slice_state(
 
 /// Syncs frame visibility with AppScreen state.
 pub fn sync_frame_visibility(
-    screen: Res<State<AppScreen>>,
     new_frames: Query<&NineSliceFrame, Added<NineSliceFrame>>,
-    all_frames: Query<&NineSliceFrame>,
     mut corners: Query<&mut Visibility, With<CornerMarker>>,
     mut edges: Query<&mut Visibility, (With<EdgeMarker>, Without<CornerMarker>)>,
 ) {
-    let target_visibility = match screen.get() {
-        AppScreen::Dashboard => Visibility::Hidden,
-        AppScreen::Conversation => Visibility::Hidden,
-    };
+    // Frames are always hidden (spawning disabled, ComposeBlock uses native borders)
+    let target_visibility = Visibility::Hidden;
 
     let frames_to_update: Box<dyn Iterator<Item = &NineSliceFrame>> =
-        if screen.is_changed() {
-            Box::new(all_frames.iter())
-        } else if !new_frames.is_empty() {
+        if !new_frames.is_empty() {
             Box::new(new_frames.iter())
         } else {
             return;

@@ -280,6 +280,5 @@ fn context_priority(ctx: InputContext) -> usize {
         InputContext::TextInput => 1,
         InputContext::Constellation => 1,
         InputContext::Dialog => 2, // Dialog beats everything
-        InputContext::Dashboard => 1,
     }
 }

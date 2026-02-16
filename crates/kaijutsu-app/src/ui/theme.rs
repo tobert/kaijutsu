@@ -580,10 +580,6 @@ impl ConfigFileStatus {
 pub struct ConfigStatus {
     /// Status of the base theme (theme.rhai).
     pub theme: ConfigFileStatus,
-    /// Status of the current seat config (seats/{seat_id}.rhai).
-    pub seat: ConfigFileStatus,
-    /// Current seat ID (hostname by default).
-    pub seat_id: String,
     /// Whether live reload is enabled (Phase 3+).
     pub live_reload_enabled: bool,
 }

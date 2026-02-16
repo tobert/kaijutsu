@@ -274,7 +274,7 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+            BackgroundColor(theme.modal_backdrop),
             ZIndex(crate::constants::ZLayer::MODAL),
             Interaction::None,
         ))

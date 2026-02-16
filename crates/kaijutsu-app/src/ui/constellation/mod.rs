@@ -50,7 +50,7 @@ impl Plugin for ConstellationPlugin {
             .add_systems(
                 Update,
                 (
-                    track_seat_events,
+                    track_context_events,
                     track_agent_activity,
                     // Input handling in input::systems (toggle_constellation + constellation_nav)
                     handle_node_click,
@@ -308,7 +308,7 @@ impl ActivityState {
 // ============================================================================
 
 /// Track context join events to add/update constellation nodes.
-fn track_seat_events(
+fn track_context_events(
     mut constellation: ResMut<Constellation>,
     mut events: MessageReader<crate::connection::RpcResultMessage>,
 ) {

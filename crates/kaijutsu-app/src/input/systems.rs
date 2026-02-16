@@ -9,41 +9,6 @@ use super::action::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
 use crate::ui::constellation::ConstellationVisible;
-use crate::ui::state::AppScreen;
-
-// ============================================================================
-// FOCUS SYNC — keep FocusArea consistent with app state
-// ============================================================================
-
-/// Sync FocusArea when AppScreen state changes.
-///
-/// When switching to Dashboard, focus goes to Dashboard.
-/// When switching to Conversation, focus goes to Conversation (block navigation).
-pub fn sync_focus_from_screen(
-    screen: Res<State<AppScreen>>,
-    mut focus: ResMut<FocusArea>,
-) {
-    if !screen.is_changed() {
-        return;
-    }
-
-    let target = match screen.get() {
-        AppScreen::Dashboard => FocusArea::Dashboard,
-        AppScreen::Conversation => {
-            // Only change if we're coming from Dashboard — preserve existing focus
-            // if already in conversation (e.g. switching between compose/nav)
-            if *focus == FocusArea::Dashboard {
-                FocusArea::Conversation
-            } else {
-                return; // already in a conversation-related focus, don't overwrite
-            }
-        }
-    };
-
-    if *focus != target {
-        *focus = target;
-    }
-}
 
 // ============================================================================
 // FOCUS CYCLING — Tab/Shift+Tab

@@ -7,7 +7,6 @@ use bevy::prelude::*;
 
 use super::components::*;
 use super::systems;
-use crate::ui::state::AppScreen;
 
 /// Plugin that enables timeline navigation.
 pub struct TimelinePlugin;
@@ -28,7 +27,7 @@ impl Plugin for TimelinePlugin {
             .add_message::<CherryPickRequest>()
             .add_message::<CherryPickResult>();
 
-        // Core systems (only run in Conversation state)
+        // Core systems
         // Note: Timeline keyboard navigation moved to input::systems::handle_timeline
         app.add_systems(
             Update,
@@ -43,8 +42,7 @@ impl Plugin for TimelinePlugin {
                 // Completion handlers
                 systems::handle_fork_complete,
                 systems::handle_cherry_pick_complete,
-            )
-                .run_if(in_state(AppScreen::Conversation)),
+            ),
         );
     }
 }

@@ -7,8 +7,7 @@
 //! TilingRoot (column)
 //!   [NorthDock — spawned by reconciler]
 //!   ContentArea (column, flex-grow: 1)
-//!     DashboardRoot (100%, toggled by AppScreen state)
-//!     ConversationRoot (100%, toggled by AppScreen state)
+//!     ConversationRoot (100%)
 //!       [Content tree — recursively spawned by reconciler]
 //!   [SouthDock — spawned by reconciler]
 //! ```
@@ -346,8 +345,8 @@ fn spawn_content_subtree(
                         border_radius: BorderRadius::all(Val::Px(4.0)),
                         ..default()
                     },
-                    BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
-                    BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
+                    BorderColor::all(theme.compose_border),
+                    BackgroundColor(theme.compose_bg),
                 ));
             if is_compose_focused {
                 entity_cmd.insert(PaneFocus);

@@ -83,7 +83,7 @@ pub use mcp_config::{McpConfig, load_mcp_config};
 pub use config_backend::{
     ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
     ConfigWatcherHandle, ValidationResult,
-    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_SYSTEM_PROMPT, EXAMPLE_SEAT,
+    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_SYSTEM_PROMPT,
 };
 
 pub use drift::{

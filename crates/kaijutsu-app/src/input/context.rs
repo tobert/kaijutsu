@@ -23,8 +23,6 @@ pub enum InputContext {
     Constellation,
     /// Active when a modal dialog is open: Enter/Escape/j/k
     Dialog,
-    /// Active when Dashboard is shown: Enter, arrow nav
-    Dashboard,
 }
 
 /// Resource tracking which input contexts are currently active.
@@ -71,9 +69,6 @@ pub fn sync_input_context(
         }
         FocusArea::Dialog => {
             active.0.push(InputContext::Dialog);
-        }
-        FocusArea::Dashboard => {
-            active.0.push(InputContext::Dashboard);
         }
     }
 }

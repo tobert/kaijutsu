@@ -181,12 +181,6 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(KeyCode::Backspace, InputContext::Dialog, Action::Backspace, "Backspace"));
 
     // ====================================================================
-    // Dashboard
-    // ====================================================================
-
-    b.push(Binding::key(KeyCode::Enter, InputContext::Dashboard, Action::Activate, "Select"));
-
-    // ====================================================================
     // Gamepad bindings
     // ====================================================================
 
@@ -194,7 +188,6 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::gamepad(GamepadButton::South, InputContext::Navigation, Action::Activate, "Activate"));
     b.push(Binding::gamepad(GamepadButton::South, InputContext::Constellation, Action::Activate, "Switch to context"));
     b.push(Binding::gamepad(GamepadButton::South, InputContext::Dialog, Action::Activate, "Confirm"));
-    b.push(Binding::gamepad(GamepadButton::South, InputContext::Dashboard, Action::Activate, "Select"));
 
     // East (B/O) — go back / cancel
     b.push(Binding::gamepad(GamepadButton::East, InputContext::Global, Action::Unfocus, "Back / Cancel"));

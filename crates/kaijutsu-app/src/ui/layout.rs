@@ -25,6 +25,8 @@ use bevy::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use super::theme::Theme;
+
 // ============================================================================
 // LAYOUT TYPES
 // ============================================================================
@@ -116,7 +118,7 @@ pub struct PanelSpawnContext {
 ///
 /// Panel builders receive a Commands reference and context,
 /// return the root entity of the spawned panel.
-pub type PanelBuilder = Box<dyn Fn(&mut Commands, PanelSpawnContext) -> Entity + Send + Sync>;
+pub type PanelBuilder = Box<dyn Fn(&mut Commands, PanelSpawnContext, &Theme) -> Entity + Send + Sync>;
 
 /// Registry mapping panel names to spawn capabilities.
 ///
@@ -154,7 +156,7 @@ impl PanelRegistry {
     pub fn register_with_builder(
         &mut self,
         name: impl Into<String>,
-        builder: impl Fn(&mut Commands, PanelSpawnContext) -> Entity + Send + Sync + 'static,
+        builder: impl Fn(&mut Commands, PanelSpawnContext, &Theme) -> Entity + Send + Sync + 'static,
     ) -> PanelTypeId {
         let id = self.register(name);
         self.builders.insert(id, Box::new(builder));
@@ -179,8 +181,9 @@ impl PanelRegistry {
         id: PanelTypeId,
         commands: &mut Commands,
         ctx: PanelSpawnContext,
+        theme: &Theme,
     ) -> Option<Entity> {
-        self.builders.get(&id).map(|builder| builder(commands, ctx))
+        self.builders.get(&id).map(|builder| builder(commands, ctx, theme))
     }
 
     /// Get all registered panel names.
@@ -339,7 +342,7 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     // =========================================================================
 
     // DagView - the scrollable conversation content area
-    registry.register_with_builder("DagView", |commands, ctx| {
+    registry.register_with_builder("DagView", |commands, ctx, _theme| {
         commands
             .spawn((
                 crate::cell::ConversationContainer,
@@ -356,7 +359,7 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
 
     // ComposeBlock - inline editable block at end of conversation
     // This is the "compose block" that replaces the floating prompt
-    registry.register_with_builder("ComposeBlock", |commands, ctx| {
+    registry.register_with_builder("ComposeBlock", |commands, ctx, theme| {
         commands
             .spawn((
                 crate::cell::ComposeBlock::default(),
@@ -378,8 +381,8 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
                     ..default()
                 },
                 // Distinct border color for compose block
-                BorderColor::all(Color::srgba(0.4, 0.6, 0.9, 0.6)),
-                BackgroundColor(Color::srgba(0.1, 0.1, 0.15, 0.8)),
+                BorderColor::all(theme.compose_border),
+                BackgroundColor(theme.compose_bg),
             ))
             .id()
     });
@@ -388,73 +391,6 @@ fn register_builtin_panels(mut registry: ResMut<PanelRegistry>) {
     // TODO: Move constellation spawning to a builder
     registry.register("ConstellationMini");
 
-
-    // =========================================================================
-    // DASHBOARD VIEW PANELS
-    // =========================================================================
-
-    // Dashboard columns - spawn marker that filler system detects
-    // The filler adds chasing border decoration and inner scrollable container
-    registry.register_with_builder("KernelList", |commands, ctx| {
-        commands
-            .spawn((
-                crate::dashboard::KernelListColumn,
-                Node {
-                    flex_grow: ctx.flex,
-                    flex_direction: FlexDirection::Column,
-                    ..default()
-                },
-            ))
-            .id()
-    });
-
-    registry.register_with_builder("ContextList", |commands, ctx| {
-        commands
-            .spawn((
-                crate::dashboard::ContextListColumn,
-                Node {
-                    flex_grow: ctx.flex,
-                    flex_direction: FlexDirection::Column,
-                    ..default()
-                },
-            ))
-            .id()
-    });
-
-    registry.register_with_builder("SeatsList", |commands, ctx| {
-        commands
-            .spawn((
-                crate::dashboard::SeatsListColumn,
-                Node {
-                    flex_grow: ctx.flex,
-                    flex_direction: FlexDirection::Column,
-                    ..default()
-                },
-            ))
-            .id()
-    });
-
-    // DashboardFooter - the Take Seat footer row
-    registry.register_with_builder("DashboardFooter", |commands, ctx| {
-        commands
-            .spawn((
-                crate::dashboard::DashboardFooter,
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_grow: ctx.flex,
-                    padding: UiRect::all(Val::Px(20.0)),
-                    border: UiRect::top(Val::Px(1.0)),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                },
-            ))
-            .id()
-    });
-
-    // SeatSelector stays in header chrome (not part of dashboard layout)
-    registry.register("SeatSelector");
 
     // =========================================================================
     // OVERLAY PANELS
@@ -476,7 +412,6 @@ fn load_layout_presets(asset_server: Res<AssetServer>, mut layouts: ResMut<Loade
     // Load all standard layouts
     let layout_files = [
         ("conversation", "layouts/conversation.layout.ron"),
-        ("dashboard", "layouts/dashboard.layout.ron"),
         ("expanded_block", "layouts/expanded_block.layout.ron"),
     ];
 

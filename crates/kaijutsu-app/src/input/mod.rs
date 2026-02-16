@@ -117,8 +117,7 @@ impl Plugin for InputPlugin {
         app.add_systems(
             Update,
             (
-                systems::sync_focus_from_screen,
-                context::sync_input_context.after(systems::sync_focus_from_screen),
+                context::sync_input_context,
             )
                 .in_set(InputPhase::SyncContext),
         );

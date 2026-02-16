@@ -16,6 +16,7 @@ use kaijutsu_crdt::BlockId;
 #[reflect(Resource)]
 pub enum FocusArea {
     /// Compose text input area. Typing inserts text. Enter submits.
+    #[default]
     Compose,
     /// Conversation block list. j/k navigates, Enter/i activates, f expands.
     Conversation,
@@ -29,9 +30,6 @@ pub enum FocusArea {
     Constellation,
     /// Modal dialog. Captures all input. Enter confirms, Escape cancels.
     Dialog,
-    /// Dashboard screen. Enter selects. Default focus on startup.
-    #[default]
-    Dashboard,
 }
 
 impl FocusArea {
@@ -71,7 +69,6 @@ impl FocusArea {
             FocusArea::EditingBlock { .. } => "EDITING",
             FocusArea::Constellation => "CONSTELLATION",
             FocusArea::Dialog => "DIALOG",
-            FocusArea::Dashboard => "DASHBOARD",
         }
     }
 }

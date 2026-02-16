@@ -5,12 +5,9 @@
 //!
 //! ## UI Architecture
 //!
-//! The UI uses Bevy's state system for screen transitions:
-//! - `AppScreen::Dashboard` - Kernel/Context/Seat selection
-//! - `AppScreen::Conversation` - Active conversation view
-//!
+//! The app starts directly in the tiling conversation view.
 //! Chrome is handled by the tiling WM system (North/South docks).
-//! Content area switches between views using `Display::None`.
+//! Connection + context join happens in the background (ActorPlugin bootstrap).
 
 // Bevy ECS idioms that trigger these lints
 #![allow(clippy::too_many_arguments)]
@@ -26,7 +23,6 @@ mod commands;
 mod connection;
 mod constants;
 mod conversation;
-mod dashboard;
 mod input;
 mod kaish;
 mod shaders;
@@ -100,10 +96,8 @@ fn main() {
         .add_plugins(connection::ActorPlugin)
         // Conversation management
         .add_plugins(conversation::ConversationPlugin)
-        // App screen state management (Dashboard vs Conversation)
+        // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
-        // Dashboard/lobby experience
-        .add_plugins(dashboard::DashboardPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
         // Constellation - context navigation as visual node graph
@@ -156,15 +150,13 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
 /// TilingRoot (column, 100%x100%)
 ///   [NorthDock — spawned by tiling reconciler]
 ///   ContentArea (column, flex-grow: 1)
-///     DashboardRoot (100%, toggled by AppScreen state)
-///     ConversationRoot (100%, toggled by AppScreen state)
+///     ConversationRoot (100%, visible immediately)
 ///       [ConversationContainer — spawned by tiling reconciler]
 ///       [ComposeBlock — spawned by tiling reconciler]
 ///   [SouthDock — spawned by tiling reconciler]
 /// ```
 fn setup_ui(
     mut commands: Commands,
-    theme: Res<ui::theme::Theme>,
 ) {
     // Root container — marked with TilingRoot for the reconciler to find.
     // Docks are inserted as children by the tiling reconciler.
@@ -180,7 +172,7 @@ fn setup_ui(
         ))
         .with_children(|root| {
             // ═══════════════════════════════════════════════════════════════
-            // CONTENT AREA (state-driven)
+            // CONTENT AREA
             // Docks are inserted before/after this by the reconciler
             // ═══════════════════════════════════════════════════════════════
             root.spawn((
@@ -193,21 +185,7 @@ fn setup_ui(
                 ZIndex(constants::ZLayer::CONTENT),
             ))
             .with_children(|content| {
-                // DASHBOARD VIEW (visible by default)
-                content.spawn((
-                    dashboard::DashboardRoot,
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Column,
-                        display: Display::Flex,
-                        ..default()
-                    },
-                    BackgroundColor(theme.bg),
-                    Visibility::Inherited,
-                ));
-
-                // CONVERSATION VIEW (hidden until AppScreen::Conversation)
+                // CONVERSATION VIEW (visible immediately — no dashboard)
                 // The tiling reconciler spawns ConversationContainer + ComposeBlock inside
                 content.spawn((
                     ui::state::ConversationRoot,
@@ -215,34 +193,11 @@ fn setup_ui(
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        display: Display::None,
+                        display: Display::Flex,
                         ..default()
                     },
-                    Visibility::Hidden,
+                    Visibility::Inherited,
                 ));
             });
-
-            // HEADER CONTAINER (attachment point for seat selector dropdown)
-            root.spawn((
-                HeaderContainer,
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(0.0),
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(6.0),
-                    right: Val::Px(16.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::FlexEnd,
-                    ..default()
-                },
-                ZIndex(constants::ZLayer::HUD + 1),
-            ));
         });
 }
-
-/// Marker for the header container (used by dashboard to attach seat selector).
-///
-/// The actual header content (title, connection status) is now in the tiling system.
-/// This component exists only as an attachment point for the seat selector dropdown.
-#[derive(Component)]
-pub struct HeaderContainer;

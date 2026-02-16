@@ -1,6 +1,6 @@
 //! ConfigCrdtBackend: CRDT-backed configuration files.
 //!
-//! This backend manages config files (theme.rhai, layouts/*.ron, seats/*.rhai)
+//! This backend manages config files (theme.rhai, layouts/*.ron)
 //! as CRDT documents for collaborative editing. The CRDT is the source of truth;
 //! disk files exist for external editors and backup.
 //!
@@ -27,16 +27,7 @@
 //!
 //! Config documents use the prefix `config:`:
 //! - `config:theme.rhai` — Base theme
-//! - `config:seats/amy-desktop.rhai` — Seat-specific overrides
-//!
-//! # Multi-Seat Architecture
-//!
-//! When multiple computers connect to the same kernel, each needs its own
-//! UI config (font size, DPI, layout proportions) while sharing semantic
-//! config (colors, styles).
-//!
-//! Base config is in `theme.rhai`, seat overrides in `seats/{seat_id}.rhai`.
-//! The merge happens at apply time: seat values override base values.
+//! - `config:llm.rhai` — LLM provider configuration
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,9 +48,6 @@ pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.rha
 
 /// Embedded default LLM configuration.
 pub const DEFAULT_LLM_CONFIG: &str = include_str!("../../../assets/defaults/llm.rhai");
-
-/// Embedded example seat config.
-pub const EXAMPLE_SEAT: &str = include_str!("../../../assets/defaults/seats/example.rhai");
 
 /// Embedded default MCP server configuration.
 pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.rhai");
@@ -330,10 +318,6 @@ impl ConfigCrdtBackend {
             "llm.rhai" => Some(DEFAULT_LLM_CONFIG.to_string()),
             "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
             "system.md" => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
-            p if p.starts_with("seats/") && p.ends_with(".rhai") => {
-                // Generate seat-specific default from template
-                Some(EXAMPLE_SEAT.to_string())
-            }
             _ => None,
         }
     }
@@ -770,31 +754,6 @@ impl ConfigCrdtBackend {
         Ok(())
     }
 
-    /// Ensure seat config exists for a seat ID.
-    ///
-    /// Creates from template if it doesn't exist.
-    pub async fn ensure_seat_config(&self, seat_id: &str) -> Result<ConfigSource, ConfigError> {
-        let path = format!("seats/{}.rhai", seat_id);
-        self.ensure_config(&path).await
-    }
-
-    /// Get merged config content (base + seat overrides).
-    ///
-    /// Returns the base content if seat config doesn't exist.
-    pub fn get_merged_content(&self, seat_id: Option<&str>) -> Result<String, ConfigError> {
-        let base = self.get_content("theme.rhai")?;
-
-        if let Some(seat_id) = seat_id {
-            let seat_path = format!("seats/{}.rhai", seat_id);
-            if let Ok(seat_content) = self.get_content(&seat_path) {
-                // Return concatenated content - Rhai will handle variable shadowing
-                // Later values override earlier ones
-                return Ok(format!("// Base theme\n{}\n\n// Seat overrides: {}\n{}", base, seat_id, seat_content));
-            }
-        }
-
-        Ok(base)
-    }
 }
 
 #[cfg(test)]

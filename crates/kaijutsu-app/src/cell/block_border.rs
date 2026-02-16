@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 
 use super::components::{
-    BlockCell, BlockCellLayout, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell,
+    BlockCell, BlockCellLayout, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell, Role,
     BlockCellContainer,
 };
 use super::systems::EditorEntities;
@@ -227,7 +227,25 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
             }
             _ => None,
         },
-        // Text, ShellCommand, ShellOutput, Drift Push/Commit — no border
+        BlockKind::Text => {
+            let color = match block.role {
+                Role::User => theme.block_border_user,
+                _ => theme.block_border_assistant,
+            };
+            // Skip if fully transparent (default)
+            if color.alpha() < 0.01 {
+                return None;
+            }
+            Some(BlockBorderStyle {
+                kind: BorderKind::TopAccent,
+                color,
+                thickness: theme.block_border_thickness,
+                corner_radius: theme.block_border_corner_radius,
+                padding,
+                animation: BorderAnimation::None,
+            })
+        }
+        // ShellCommand, ShellOutput, Drift Push/Commit — no border
         _ => None,
     }
 }

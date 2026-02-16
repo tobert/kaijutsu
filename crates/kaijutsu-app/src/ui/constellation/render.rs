@@ -64,13 +64,7 @@ fn spawn_constellation_container(
     mut commands: Commands,
     existing: Query<Entity, With<ConstellationContainer>>,
     content_area: Query<Entity, With<crate::ui::state::ContentArea>>,
-    screen: Res<State<crate::ui::state::AppScreen>>,
 ) {
-    // Only spawn in Conversation state
-    if *screen.get() != crate::ui::state::AppScreen::Conversation {
-        return;
-    }
-
     // Don't spawn if already exists
     if !existing.is_empty() {
         return;
@@ -532,7 +526,7 @@ fn spawn_connection_lines(
                 0.1,
             ),
             DriftConnectionKind::StagedDrift => (
-                Color::srgba(0.49, 0.85, 0.82, 0.8),
+                theme.ansi.cyan.with_alpha(0.8),
                 0.6,
                 0.5,
             ),

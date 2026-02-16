@@ -1,8 +1,8 @@
-//! App screen state management
+//! App state management
 //!
-//! Manages which screen is active (Dashboard vs Conversation) using Bevy's
-//! state system. This replaces manual visibility toggling with proper
-//! state-driven transitions.
+//! Manages view stack for overlay navigation (expanded blocks, etc.).
+//! The dashboard has been removed — the app starts directly in the
+//! conversation view. Connection + context join happens in background.
 //!
 //! ## Input Architecture
 //!
@@ -11,20 +11,7 @@
 
 use bevy::prelude::*;
 
-/// The main application screen state.
-///
-/// Uses Bevy's state system for clean screen transitions with proper
-/// system gating via `run_if(in_state(...))`.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States, Reflect)]
-pub enum AppScreen {
-    /// Dashboard - Kernel/Context/Seat selection view
-    #[default]
-    Dashboard,
-    /// Conversation - Active conversation view (the "world")
-    Conversation,
-}
-
-/// Marker for the main content area that contains both views
+/// Marker for the main content area
 #[derive(Component)]
 pub struct ContentArea;
 
@@ -33,7 +20,7 @@ pub struct ContentArea;
 pub struct ConversationRoot;
 
 // ============================================================================
-// VIEW STACK (Phase 4)
+// VIEW STACK
 // ============================================================================
 
 use kaijutsu_crdt::BlockId;
@@ -42,15 +29,12 @@ use kaijutsu_crdt::BlockId;
 ///
 /// Views are orthogonal to modes:
 /// - **Modes** = how you interact (Normal, Input, Visual)
-/// - **Views** = what you're looking at (Dashboard, Conversation, ExpandedBlock)
+/// - **Views** = what you're looking at (Conversation, ExpandedBlock)
 ///
 /// You can be in ExpandedBlock view in Normal mode or Input mode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
-    /// Dashboard - kernel/conversation selection
-    Dashboard,
     /// Conversation view - main chat/shell interface
-    #[allow(dead_code)]
     Conversation {
         /// The conversation/kernel ID being viewed
         kernel_id: String,
@@ -67,9 +51,9 @@ pub enum View {
 }
 
 impl View {
-    /// Check if this is a root view (Dashboard or Conversation).
+    /// Check if this is a root view (Conversation).
     pub fn is_root(&self) -> bool {
-        matches!(self, View::Dashboard | View::Conversation { .. })
+        matches!(self, View::Conversation { .. })
     }
 
     /// Check if this is an overlay view (pushed on top of root).
@@ -77,35 +61,6 @@ impl View {
     pub fn is_overlay(&self) -> bool {
         !self.is_root()
     }
-
-    /// Get the base AppScreen this view corresponds to.
-    #[allow(dead_code)]
-    pub fn base_screen(&self) -> AppScreen {
-        match self {
-            View::Dashboard => AppScreen::Dashboard,
-            View::Conversation { .. } | View::ExpandedBlock { .. } => AppScreen::Conversation,
-        }
-    }
-
-    /// Get the root container type for this view.
-    ///
-    /// Used by the layout reconciler to find the correct parent entity.
-    pub fn root_container(&self) -> ViewRootContainer {
-        match self {
-            View::Dashboard => ViewRootContainer::Dashboard,
-            View::Conversation { .. } => ViewRootContainer::Conversation,
-            View::ExpandedBlock { .. } => ViewRootContainer::Conversation, // Overlay on conversation
-        }
-    }
-}
-
-/// Identifies which root container a view uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewRootContainer {
-    /// Dashboard root (DashboardRoot marker)
-    Dashboard,
-    /// Conversation root (ConversationRoot marker)
-    Conversation,
 }
 
 /// Stack of views for navigation.
@@ -115,7 +70,7 @@ pub enum ViewRootContainer {
 /// - Popping back with Esc (in Normal mode)
 /// - Tracking navigation history
 ///
-/// The bottom of the stack is always a root view (Dashboard or Conversation).
+/// The bottom of the stack is always a root view (Conversation).
 #[derive(Resource, Debug)]
 pub struct ViewStack {
     stack: Vec<View>,
@@ -124,7 +79,9 @@ pub struct ViewStack {
 impl Default for ViewStack {
     fn default() -> Self {
         Self {
-            stack: vec![View::Dashboard],
+            stack: vec![View::Conversation {
+                kernel_id: String::new(),
+            }],
         }
     }
 }
@@ -185,71 +142,47 @@ impl ViewStack {
 #[derive(Component)]
 pub struct ExpandedBlockView;
 
-/// Plugin for app screen state management
+/// Plugin for app state management
 pub struct AppScreenPlugin;
 
 impl Plugin for AppScreenPlugin {
     fn build(&self, app: &mut App) {
-        // Register types for BRP reflection
-        app.register_type::<AppScreen>();
-
         // Initialize ViewStack resource
         app.init_resource::<ViewStack>();
 
-        app.init_state::<AppScreen>()
-            .add_systems(OnEnter(AppScreen::Dashboard), show_dashboard)
-            .add_systems(OnExit(AppScreen::Dashboard), hide_dashboard)
-            .add_systems(OnEnter(AppScreen::Conversation), show_conversation)
-            .add_systems(OnExit(AppScreen::Conversation), hide_conversation)
+        app
             // ViewStack visibility management
-            .add_systems(Update, sync_expanded_block_visibility);
+            .add_systems(Update, sync_expanded_block_visibility)
+            // Handle ContextJoined — create conversation metadata (replaces dashboard handler)
+            .add_systems(Update, handle_context_joined);
     }
 }
 
 // ============================================================================
-// State Transition Systems
+// CONTEXT JOINED HANDLER
 // ============================================================================
 
-// Note: We set both Display and Visibility because glyphon text rendering
-// doesn't respect Display::None - it only respects Visibility::Hidden.
-
-/// Show the dashboard view when entering Dashboard state.
+/// Handle ContextJoined events to create conversation metadata.
 ///
-/// Focus is automatically set to FocusArea::Dashboard by sync_focus_from_screen.
-fn show_dashboard(
-    mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
+/// This replaces the logic that was in dashboard::handle_dashboard_events.
+/// When a context is joined (from ActorPlugin bootstrap), creates the
+/// conversation in the registry and sets it as current.
+fn handle_context_joined(
+    mut result_events: MessageReader<crate::connection::RpcResultMessage>,
+    mut registry: ResMut<crate::conversation::ConversationRegistry>,
+    mut current_conv: ResMut<crate::conversation::CurrentConversation>,
 ) {
-    for (mut node, mut vis) in query.iter_mut() {
-        node.display = Display::Flex;
-        *vis = Visibility::Inherited;
-    }
-}
+    for result in result_events.read() {
+        if let crate::connection::RpcResultMessage::ContextJoined { document_id, .. } = result {
+            // Create conversation metadata if it doesn't exist (idempotent)
+            if registry.get(document_id).is_none() {
+                let conv = kaijutsu_kernel::Conversation::with_id(document_id, document_id);
+                registry.add(conv);
+                info!("Created conversation metadata for {}", document_id);
+            }
 
-/// Hide the dashboard view when leaving Dashboard state
-fn hide_dashboard(
-    mut query: Query<(&mut Node, &mut Visibility), With<crate::dashboard::DashboardRoot>>,
-) {
-    for (mut node, mut vis) in query.iter_mut() {
-        node.display = Display::None;
-        *vis = Visibility::Hidden;
-    }
-}
-
-/// Show the conversation view when entering Conversation state
-fn show_conversation(
-    mut query: Query<(&mut Node, &mut Visibility), With<ConversationRoot>>,
-) {
-    for (mut node, mut vis) in query.iter_mut() {
-        node.display = Display::Flex;
-        *vis = Visibility::Inherited;
-    }
-}
-
-/// Hide the conversation view when leaving Conversation state
-fn hide_conversation(mut query: Query<(&mut Node, &mut Visibility), With<ConversationRoot>>) {
-    for (mut node, mut vis) in query.iter_mut() {
-        node.display = Display::None;
-        *vis = Visibility::Hidden;
+            current_conv.0 = Some(document_id.clone());
+        }
     }
 }
 
@@ -295,4 +228,3 @@ fn sync_expanded_block_visibility(
         };
     }
 }
-

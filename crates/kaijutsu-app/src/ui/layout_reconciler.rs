@@ -200,7 +200,7 @@ fn spawn_node(
             if let Some(panel_id) = registry.get(id) {
                 let ctx = PanelSpawnContext { flex: *flex };
 
-                if let Some(entity) = registry.spawn(panel_id, commands, ctx) {
+                if let Some(entity) = registry.spawn(panel_id, commands, ctx, theme) {
                     // Mark spawned panel as layout-managed and add as child
                     commands.entity(entity).insert(LayoutManaged {
                         layout_name: layout_name.to_string(),
@@ -289,68 +289,17 @@ fn spawn_panel_placeholder(
 /// - Dashboard view → DashboardRoot
 /// - Conversation view → ConversationRoot
 pub fn on_view_change(
-    view_stack: Res<super::state::ViewStack>,
-    mut commands: Commands,
-    layouts: Res<LoadedLayouts>,
-    presets: Res<Assets<LayoutPreset>>,
-    registry: Res<PanelRegistry>,
-    theme: Res<Theme>,
-    existing: Query<(Entity, &LayoutManaged)>,
-    dashboard_root: Query<Entity, With<crate::dashboard::DashboardRoot>>,
-    children_query: Query<&Children>,
+    _view_stack: Res<super::state::ViewStack>,
+    _commands: Commands,
+    _layouts: Res<LoadedLayouts>,
+    _presets: Res<Assets<LayoutPreset>>,
+    _registry: Res<PanelRegistry>,
+    _theme: Res<Theme>,
+    _existing: Query<(Entity, &LayoutManaged)>,
 ) {
-    // NOTE: Conversation layout is now handled by the tiling reconciler
-    // (ui/tiling_reconciler.rs). This system only manages Dashboard.
-
-    let dash_root = dashboard_root.single().ok();
-
-    let needs_layout = |root: Option<Entity>| -> bool {
-        root.map(|e| children_query.get(e).map(|c| c.is_empty()).unwrap_or(true))
-            .unwrap_or(false)
-    };
-
-    let dash_needs_layout = needs_layout(dash_root);
-    let view_changed = view_stack.is_changed() || layouts.is_changed();
-
-    let mut reconciled_dash = false;
-
-    if dash_needs_layout {
-        if let Some(root) = dash_root {
-            reconcile_layout(
-                &mut commands,
-                &layouts,
-                &presets,
-                &registry,
-                &theme,
-                &existing,
-                root,
-                "dashboard",
-            );
-            reconciled_dash = true;
-        }
-    }
-
-    if view_changed && !reconciled_dash {
-        let current_view = view_stack.current();
-        if matches!(
-            current_view.root_container(),
-            super::state::ViewRootContainer::Dashboard
-        ) {
-            if let Some(root) = dash_root {
-                let layout_name = layouts.active.as_deref().unwrap_or("dashboard");
-                reconcile_layout(
-                    &mut commands,
-                    &layouts,
-                    &presets,
-                    &registry,
-                    &theme,
-                    &existing,
-                    root,
-                    layout_name,
-                );
-            }
-        }
-    }
+    // NOTE: Conversation layout is handled by the tiling reconciler
+    // (ui/tiling_reconciler.rs). Dashboard has been removed.
+    // This system is kept as a stub for future RON-driven layout reconciliation.
 }
 
 // ============================================================================

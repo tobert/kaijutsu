@@ -3,27 +3,6 @@
 //! Loads theme configuration from `~/.config/kaijutsu/theme.rhai` using the
 //! Rhai scripting language. Falls back to `Theme::default()` on any error.
 //!
-//! ## Config as CRDT (Phase 2)
-//!
-//! Config files are now managed by `ConfigCrdtBackend` on the server side.
-//! The server:
-//! 1. Loads config from disk into CRDT documents at kernel creation
-//! 2. Watches for external edits and syncs them to CRDT
-//! 3. Debounces CRDT changes and flushes to disk
-//!
-//! For Phase 2, the client loads directly from disk (which is synced by the server).
-//! Future phases will add:
-//! - Real-time CRDT sync for live updates
-//! - Multi-seat config merging (base + seat overrides)
-//!
-//! ## Multi-Seat Architecture
-//!
-//! When multiple computers connect to the same kernel, each needs its own UI config:
-//! - `~/.config/kaijutsu/theme.rhai` — Base theme (shared)
-//! - `~/.config/kaijutsu/seats/{seat_id}.rhai` — Per-seat overrides
-//!
-//! Seat config contains only values to override from base (e.g., font_size for 4K).
-//!
 //! ## Rhai API
 //!
 //! Functions available in theme scripts:
@@ -51,101 +30,33 @@ pub fn theme_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("kaijutsu").join("theme.rhai"))
 }
 
-/// Get the seat config file path (~/.config/kaijutsu/seats/{seat_id}.rhai).
-pub fn seat_config_path(seat_id: &str) -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("kaijutsu").join("seats").join(format!("{}.rhai", seat_id)))
-}
-
-/// Get the current seat ID (hostname by default).
-pub fn current_seat_id() -> String {
-    // Try hostname
-    if let Ok(name) = hostname::get() {
-        if let Some(name_str) = name.to_str() {
-            if !name_str.is_empty() {
-                return name_str.to_string();
-            }
-        }
-    }
-
-    // Fallback
-    "default".to_string()
-}
-
 /// Load theme from the user's config file.
 ///
-/// If the file doesn't exist or has errors, returns `Theme::default()` and logs a warning.
+/// Loads from `~/.config/kaijutsu/theme.rhai`. Falls back to `Theme::default()`
+/// if the file doesn't exist or has errors.
 pub fn load_theme() -> Theme {
-    let seat_id = current_seat_id();
-    load_theme_with_seat(Some(&seat_id))
-}
-
-/// Load theme with optional seat-specific overrides.
-///
-/// If `seat_id` is provided, loads base theme then applies seat overrides on top.
-/// Seat configs only need to define values they want to change.
-pub fn load_theme_with_seat(seat_id: Option<&str>) -> Theme {
     let Some(base_path) = theme_file_path() else {
         info!("No config directory available, using default theme");
         return Theme::default();
     };
 
-    // Load base theme
-    let base_script = if base_path.exists() {
-        match std::fs::read_to_string(&base_path) {
-            Ok(s) => {
-                info!("Loaded base theme from {:?}", base_path);
-                s
-            }
-            Err(e) => {
-                warn!("Failed to read base theme {:?}: {}", base_path, e);
-                String::new()
-            }
-        }
-    } else {
-        info!("Base theme not found at {:?}, using defaults", base_path);
-        String::new()
-    };
-
-    // Load seat overrides if specified
-    let seat_script = if let Some(seat_id) = seat_id {
-        if let Some(seat_path) = seat_config_path(seat_id) {
-            if seat_path.exists() {
-                match std::fs::read_to_string(&seat_path) {
-                    Ok(s) => {
-                        info!("Loaded seat config for '{}' from {:?}", seat_id, seat_path);
-                        s
-                    }
-                    Err(e) => {
-                        warn!("Failed to read seat config {:?}: {}", seat_path, e);
-                        String::new()
-                    }
-                }
-            } else {
-                debug!("No seat config found for '{}' at {:?}", seat_id, seat_path);
-                String::new()
-            }
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    // Merge: base first, then seat overrides (Rhai variable shadowing)
-    let merged_script = if seat_script.is_empty() {
-        base_script
-    } else {
-        format!(
-            "// Base theme\n{}\n\n// Seat overrides\n{}",
-            base_script, seat_script
-        )
-    };
-
-    if merged_script.is_empty() {
+    if !base_path.exists() {
+        info!("Theme not found at {:?}, using defaults", base_path);
         return Theme::default();
     }
 
-    match parse_theme_script(&merged_script) {
+    let script = match std::fs::read_to_string(&base_path) {
+        Ok(s) => {
+            info!("Loaded theme from {:?}", base_path);
+            s
+        }
+        Err(e) => {
+            warn!("Failed to read theme {:?}: {}", base_path, e);
+            return Theme::default();
+        }
+    };
+
+    match parse_theme_script(&script) {
         Ok(theme) => theme,
         Err(e) => {
             warn!("Failed to parse theme: {}", e);
@@ -550,6 +461,33 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     }
     if let Some(v) = get_float(&scope, "block_border_padding") {
         theme.block_border_padding = v;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Compose block
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(c) = get_color_with_alpha(&scope, "compose_border") {
+        theme.compose_border = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "compose_bg") {
+        theme.compose_bg = c;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Modal overlays
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(c) = get_color_with_alpha(&scope, "modal_backdrop") {
+        theme.modal_backdrop = c;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // User/assistant text block borders
+    // ═══════════════════════════════════════════════════════════════════════
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_user") {
+        theme.block_border_user = c;
+    }
+    if let Some(c) = get_color_with_alpha(&scope, "block_border_assistant") {
+        theme.block_border_assistant = c;
     }
 
     Ok(theme)

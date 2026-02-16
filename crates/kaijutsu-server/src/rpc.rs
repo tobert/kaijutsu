@@ -339,29 +339,6 @@ fn config_dir() -> std::path::PathBuf {
         .join("kaijutsu")
 }
 
-/// Get the default seat ID (hostname).
-fn get_default_seat_id() -> String {
-    // Try hostname crate first
-    if let Ok(name) = hostname::get() {
-        if let Some(name_str) = name.to_str() {
-            if !name_str.is_empty() {
-                return name_str.to_string();
-            }
-        }
-    }
-
-    // Fallback to reading /etc/hostname
-    if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
-        let hostname = hostname.trim();
-        if !hostname.is_empty() {
-            return hostname.to_string();
-        }
-    }
-
-    // Ultimate fallback
-    "default".to_string()
-}
-
 /// Create and initialize the config CRDT backend.
 ///
 /// This loads config files into CRDT documents and starts the file watcher.
@@ -599,19 +576,7 @@ impl world::Server for WorldImpl {
         let params_reader = pry!(params.get());
         let id = pry!(pry!(params_reader.get_id()).to_str()).to_owned();
 
-        // Get seat_id, defaulting to hostname if not provided or empty
-        let seat_id = match params_reader.get_seat_id() {
-            Ok(s) => {
-                let s = pry!(s.to_str());
-                if s.is_empty() {
-                    get_default_seat_id()
-                } else {
-                    s.to_owned()
-                }
-            }
-            Err(_) => get_default_seat_id(),
-        };
-
+        // seat_id param is vestigial — ignored
         let state = self.state.clone();
 
         Promise::from_future(async move {
@@ -651,11 +616,6 @@ impl world::Server for WorldImpl {
                 // Create config backend and ensure seat config exists
                 let (config_backend, config_watcher) =
                     create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
-
-                // Ensure seat-specific config exists
-                if let Err(e) = config_backend.ensure_seat_config(&seat_id).await {
-                    log::warn!("Failed to ensure seat config for '{}': {}", seat_id, e);
-                }
 
                 // Get identity for context manager
                 let nick = {
@@ -4019,36 +3979,13 @@ impl kernel::Server for KernelImpl {
 
     fn ensure_seat_config(
         self: Rc<Self>,
-        params: kernel::EnsureSeatConfigParams,
+        _params: kernel::EnsureSeatConfigParams,
         mut results: kernel::EnsureSeatConfigResults,
     ) -> Promise<(), capnp::Error> {
-        let seat_id = pry!(pry!(pry!(params.get()).get_seat_id()).to_str()).to_owned();
-        let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
-
-        Promise::from_future(async move {
-            let config_backend = {
-                let state_ref = state.borrow();
-                let kernel_state = match state_ref.kernels.get(&kernel_id) {
-                    Some(ks) => ks,
-                    None => return Err(capnp::Error::failed("Kernel not found".into())),
-                };
-                kernel_state.config_backend.clone()
-            };
-
-            match config_backend.ensure_seat_config(&seat_id).await {
-                Ok(_) => {
-                    results.get().set_success(true);
-                    results.get().set_error("");
-                }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(&format!("{}", e));
-                }
-            }
-
-            Ok(())
-        })
+        // Vestigial — seat abstraction removed. Keep ordinal for wire compat.
+        results.get().set_success(true);
+        results.get().set_error("");
+        Promise::ok(())
     }
 
     // ========================================================================
