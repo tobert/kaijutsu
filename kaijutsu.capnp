@@ -30,43 +30,13 @@ struct KernelInfo {
   name @1 :Text;
   userCount @2 :UInt32;
   agentCount @3 :UInt32;
-  contexts @4 :List(Context);       # Contexts within this kernel
-  seatCount @5 :UInt32;             # Total seats across all contexts
-}
-
-# ============================================================================
-# Vestigial Seat Types — kept for wire compatibility / schema evolution.
-# The seat abstraction has been removed. See ContextMembership in client code.
-# ============================================================================
-
-# Seat identifier (vestigial)
-struct SeatId {
-  nick @0 :Text;          # Display name, user-chosen: "amy", "refactor-bot"
-  instance @1 :Text;      # Device/model variant: "laptop", "haiku"
-  kernel @2 :Text;        # Kernel name: "kaijutsu-dev"
-  context @3 :Text;       # Context name: "refactor"
-}
-
-# Seat status
-enum SeatStatus {
-  active @0;              # Currently engaged
-  idle @1;                # Connected but not actively working
-  away @2;                # Stepped away
-}
-
-# Information about a seat
-struct SeatInfo {
-  id @0 :SeatId;
-  owner @1 :Text;                   # Strong identity: username from SSH auth
-  status @2 :SeatStatus;
-  lastActivity @3 :UInt64;          # Unix timestamp ms
-  cursorBlock @4 :Text;             # Which block they're focused on
+  contexts @4 :List(Context);
 }
 
 # A document attached to a context
 struct ContextDocument {
   id @0 :Text;                      # Block/document ID
-  attachedBy @1 :Text;              # Who attached it (seat nick:instance)
+  attachedBy @1 :Text;              # Who attached it
   attachedAt @2 :UInt64;            # When it was attached (unix timestamp ms)
 }
 
@@ -74,7 +44,6 @@ struct ContextDocument {
 struct Context {
   name @0 :Text;
   documents @1 :List(ContextDocument);
-  seats @2 :List(SeatInfo);
 }
 
 struct KernelConfig {
@@ -97,7 +66,6 @@ enum ConsentMode {
 struct ToolInfo {
   name @0 :Text;
   description @1 :Text;
-  equipped @2 :Bool;
 }
 
 struct ToolCall {
@@ -256,7 +224,7 @@ interface KernelOutput {
 }
 
 # ============================================================================
-# Agent Types (Phase 2: Collaborative Canvas)
+# Agent Types
 # ============================================================================
 
 # Configuration for attaching an agent
@@ -340,13 +308,8 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  # Attach to an existing kernel. seatId defaults to hostname if not provided.
-  attachKernel @2 (id :Text, seatId :Text, trace :TraceContext) -> (kernel :Kernel);
+  attachKernel @2 (id :Text, trace :TraceContext) -> (kernel :Kernel);
   createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
-
-  # Seat management (removed — ordinals preserved for schema evolution)
-  takeSeatDeprecated @4 () -> ();
-  listMySeatsDeprecated @5 () -> ();
 }
 
 interface Kernel {
@@ -360,236 +323,222 @@ interface Kernel {
   subscribeOutput @4 (callback :KernelOutput);
   getCommandHistory @5 (limit :UInt32) -> (entries :List(HistoryEntry));
 
-  # Equipment
-  listEquipment @6 () -> (tools :List(ToolInfo));
-  equip @7 (tool :Text);
-  unequip @8 (tool :Text);
-
   # Lifecycle
-  fork @9 (name :Text) -> (kernel :Kernel);
-  thread @10 (name :Text) -> (kernel :Kernel);
-  detach @11 ();
+  fork @6 (name :Text) -> (kernel :Kernel);
+  thread @7 (name :Text) -> (kernel :Kernel);
+  detach @8 ();
 
   # VFS
-  vfs @12 () -> (vfs :Vfs);
-  listMounts @13 () -> (mounts :List(MountInfo));
-  mount @14 (path :Text, source :Text, writable :Bool);
-  unmount @15 (path :Text) -> (success :Bool);
+  vfs @9 () -> (vfs :Vfs);
+  listMounts @10 () -> (mounts :List(MountInfo));
+  mount @11 (path :Text, source :Text, writable :Bool);
+  unmount @12 (path :Text) -> (success :Bool);
 
   # Tool execution
-  executeTool @16 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
-  getToolSchemas @17 () -> (schemas :List(ToolSchema));
+  executeTool @13 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
+  getToolSchemas @14 () -> (schemas :List(ToolSchema));
 
   # Block-based CRDT operations
-  applyBlockOp @18 (documentId :Text, op :BlockDocOp) -> (newVersion :UInt64);
-  subscribeBlocks @19 (callback :BlockEvents);
-  getDocumentState @20 (documentId :Text, trace :TraceContext) -> (state :DocumentState);
+  applyBlockOp @15 (documentId :Text, op :BlockDocOp) -> (newVersion :UInt64);
+  subscribeBlocks @16 (callback :BlockEvents);
+  getDocumentState @17 (documentId :Text, trace :TraceContext) -> (state :DocumentState);
 
   # LLM operations
-  prompt @21 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
+  prompt @18 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
-  # Context & seat management
-  listContexts @22 () -> (contexts :List(Context));
-  createContext @23 (name :Text) -> (context :Context);
-  joinContext @24 (contextName :Text, instance :Text) -> (documentId :Text);
-  attachDocument @25 (contextName :Text, documentId :Text);
-  detachDocument @26 (contextName :Text, documentId :Text);
+  # Context management
+  listContexts @19 () -> (contexts :List(Context));
+  createContext @20 (name :Text) -> (context :Context);
+  joinContext @21 (contextName :Text, instance :Text) -> (documentId :Text);
+  attachDocument @22 (contextName :Text, documentId :Text);
+  detachDocument @23 (contextName :Text, documentId :Text);
 
   # MCP (Model Context Protocol) management
-  registerMcp @27 (config :McpServerConfig) -> (info :McpServerInfo);
-  unregisterMcp @28 (name :Text);
-  listMcpServers @29 () -> (servers :List(McpServerInfo));
-  callMcpTool @30 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
+  registerMcp @24 (config :McpServerConfig) -> (info :McpServerInfo);
+  unregisterMcp @25 (name :Text);
+  listMcpServers @26 () -> (servers :List(McpServerInfo));
+  callMcpTool @27 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
 
   # Shell execution (kaish REPL with block output)
   # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
-  shellExecute @31 (code :Text, documentId :Text, trace :TraceContext) -> (commandBlockId :BlockId);
+  shellExecute @28 (code :Text, documentId :Text, trace :TraceContext) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
-  getCwd @32 () -> (path :Text);
-  setCwd @33 (path :Text) -> (success :Bool, error :Text);
-  getLastResult @34 () -> (result :ShellExecResult);
+  getCwd @29 () -> (path :Text);
+  setCwd @30 (path :Text) -> (success :Bool, error :Text);
+  getLastResult @31 () -> (result :ShellExecResult);
 
   # Blob storage (in-memory, size-capped)
   # Blobs are stored at /v/blobs/{id} in kaish's VFS
-  writeBlob @35 (data :Data, contentType :Text) -> (ref :BlobRef);
-  readBlob @36 (id :Text) -> (data :Data);
-  deleteBlob @37 (id :Text) -> (success :Bool);
-  listBlobs @38 () -> (refs :List(BlobRef));
+  writeBlob @32 (data :Data, contentType :Text) -> (ref :BlobRef);
+  readBlob @33 (id :Text) -> (data :Data);
+  deleteBlob @34 (id :Text) -> (success :Bool);
+  listBlobs @35 () -> (refs :List(BlobRef));
 
   # Git repository management (CRDT-backed worktrees)
-  registerRepo @39 (name :Text, path :Text) -> (success :Bool, error :Text);
-  unregisterRepo @40 (name :Text) -> (success :Bool, error :Text);
-  listRepos @41 () -> (repos :List(Text));
-  switchBranch @42 (repo :Text, branch :Text) -> (success :Bool, error :Text);
-  listBranches @43 (repo :Text) -> (branches :List(Text), error :Text);
-  getCurrentBranch @44 (repo :Text) -> (branch :Text);
-  flushGit @45 () -> (success :Bool, error :Text);
-  setAttribution @46 (source :Text, command :Text);
+  registerRepo @36 (name :Text, path :Text) -> (success :Bool, error :Text);
+  unregisterRepo @37 (name :Text) -> (success :Bool, error :Text);
+  listRepos @38 () -> (repos :List(Text));
+  switchBranch @39 (repo :Text, branch :Text) -> (success :Bool, error :Text);
+  listBranches @40 (repo :Text) -> (branches :List(Text), error :Text);
+  getCurrentBranch @41 (repo :Text) -> (branch :Text);
+  flushGit @42 () -> (success :Bool, error :Text);
+  setAttribution @43 (source :Text, command :Text);
 
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
-  pushOps @47 (documentId :Text, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  pushOps @44 (documentId :Text, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
-  listMcpResources @48 (server :Text) -> (resources :List(McpResource));
-  readMcpResource @49 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
-  subscribeMcpResources @50 (callback :ResourceEvents);
+  listMcpResources @45 (server :Text) -> (resources :List(McpResource));
+  readMcpResource @46 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
+  subscribeMcpResources @47 (callback :ResourceEvents);
 
   # MCP Roots (client advertises workspaces to servers)
-  setMcpRoots @51 (roots :List(McpRoot));
+  setMcpRoots @48 (roots :List(McpRoot));
 
   # MCP Prompts (poll-based with optional caching)
-  listMcpPrompts @52 (server :Text) -> (prompts :List(McpPrompt));
-  getMcpPrompt @53 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+  listMcpPrompts @49 (server :Text) -> (prompts :List(McpPrompt));
+  getMcpPrompt @50 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
 
   # MCP Progress (push-based streaming)
-  subscribeMcpProgress @54 (callback :ProgressEvents);
+  subscribeMcpProgress @51 (callback :ProgressEvents);
 
   # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @55 (callback :ElicitationEvents);
+  subscribeMcpElicitations @52 (callback :ElicitationEvents);
 
   # MCP Completion (request/response)
-  completeMcp @56 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+  completeMcp @53 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
 
   # MCP Logging
-  setMcpLogLevel @57 (server :Text, level :Text);
-  subscribeMcpLogs @58 (callback :LoggingEvents);
+  setMcpLogLevel @54 (server :Text, level :Text);
+  subscribeMcpLogs @55 (callback :LoggingEvents);
 
   # MCP Cancellation
-  cancelMcpRequest @59 (server :Text, requestId :Text);
+  cancelMcpRequest @56 (server :Text, requestId :Text);
 
   # ============================================================================
-  # Agent Attachment (Phase 2: Collaborative Canvas)
+  # Agent Attachment
   # ============================================================================
   # Agents are autonomous participants that can edit content alongside humans.
-  # Each agent gets a seat and can be invoked on focused content.
 
   # Attach an agent to this kernel
-  # The agent will be given a seat and can participate in all contexts
-  attachAgent @60 (config :AgentConfig) -> (info :AgentInfo);
+  attachAgent @57 (config :AgentConfig) -> (info :AgentInfo);
 
   # List all attached agents on this kernel
-  listAgents @61 () -> (agents :List(AgentInfo));
+  listAgents @58 () -> (agents :List(AgentInfo));
 
   # Detach an agent from this kernel
-  detachAgent @62 (nick :Text);
+  detachAgent @59 (nick :Text);
 
   # Update agent capabilities
-  setAgentCapabilities @63 (nick :Text, capabilities :List(AgentCapability));
+  setAgentCapabilities @60 (nick :Text, capabilities :List(AgentCapability));
 
   # Invoke an agent on a specific block (e.g., spell-check focused content)
-  invokeAgent @64 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
+  invokeAgent @61 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
 
   # Subscribe to agent activity events
-  subscribeAgentEvents @65 (callback :AgentEvents);
+  subscribeAgentEvents @62 (callback :AgentEvents);
 
   # ============================================================================
-  # Timeline Navigation (Phase 3: Fork-First Temporal Model)
+  # Timeline Navigation (Fork-First Temporal Model)
   # ============================================================================
   # Navigate through document history with fork and cherry-pick operations.
   # The past is read-only, but forking is ubiquitous.
 
   # Fork from a specific document version
-  # Creates a new context branching from the given historical point
-  forkFromVersion @66 (documentId :Text, version :UInt64, contextName :Text) -> (context :Context);
+  forkFromVersion @63 (documentId :Text, version :UInt64, contextName :Text) -> (context :Context);
 
   # Cherry-pick a block into another context (carries lineage)
-  # The block's history is preserved, enabling "why did we decide X?" queries
-  cherryPickBlock @67 (sourceBlockId :BlockId, targetContext :Text) -> (newBlockId :BlockId);
+  cherryPickBlock @64 (sourceBlockId :BlockId, targetContext :Text) -> (newBlockId :BlockId);
 
   # Get document version history for timeline scrubber
-  # Returns list of significant versions (block additions, major edits)
-  getDocumentHistory @68 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
+  getDocumentHistory @65 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
 
   # ============================================================================
-  # Configuration (Phase 2: Config as CRDT)
+  # Configuration (Config as CRDT)
   # ============================================================================
-  # Config files (theme.rhai, seats/*.rhai) are managed as CRDT documents.
-  # These methods provide safety valves for when CRDT gets into a bad state.
+  # Config files (theme.rhai) are managed as CRDT documents.
 
   # List loaded config documents
-  listConfigs @69 () -> (configs :List(Text));
+  listConfigs @66 () -> (configs :List(Text));
 
   # Reload a config file from disk, discarding CRDT changes (safety valve)
-  reloadConfig @70 (path :Text) -> (success :Bool, error :Text);
+  reloadConfig @67 (path :Text) -> (success :Bool, error :Text);
 
   # Reset a config file to embedded default
-  resetConfig @71 (path :Text) -> (success :Bool, error :Text);
+  resetConfig @68 (path :Text) -> (success :Bool, error :Text);
 
   # Get config content (from CRDT)
-  getConfig @72 (path :Text) -> (content :Text, error :Text);
-
-  # Ensure seat config exists for the current connection
-  ensureSeatConfig @73 (seatId :Text) -> (success :Bool, error :Text);
+  getConfig @69 (path :Text) -> (content :Text, error :Text);
 
   # ============================================================================
-  # Multi-Context Drifting (Phase 4: Cross-Context Communication)
+  # Multi-Context Drifting (Cross-Context Communication)
   # ============================================================================
   # Drift enables content transfer between kernel contexts with provenance tracking.
 
   # Get this kernel's context short ID and name
-  getContextId @74 () -> (shortId :Text, name :Text);
+  getContextId @70 () -> (shortId :Text, name :Text);
 
   # Configure LLM provider/model on an existing kernel
-  configureLlm @75 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  configureLlm @71 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
-  driftPush @76 (targetCtx :Text, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
+  driftPush @72 (targetCtx :Text, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
 
   # Flush all staged drifts (inject into target kernels)
-  driftFlush @77 (trace :TraceContext) -> (count :UInt32);
+  driftFlush @73 (trace :TraceContext) -> (count :UInt32);
 
   # List staged drifts pending flush
-  driftQueue @78 () -> (staged :List(StagedDriftInfo));
+  driftQueue @74 () -> (staged :List(StagedDriftInfo));
 
   # Cancel a staged drift by ID
-  driftCancel @79 (stagedId :UInt64) -> (success :Bool);
+  driftCancel @75 (stagedId :UInt64) -> (success :Bool);
 
   # Pull summarized content from another context
-  driftPull @80 (sourceCtx :Text, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
+  driftPull @76 (sourceCtx :Text, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # Merge a forked context back into its parent
-  driftMerge @81 (sourceCtx :Text, trace :TraceContext) -> (blockId :BlockId);
+  driftMerge @77 (sourceCtx :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # List all registered contexts across all kernels
-  listAllContexts @82 () -> (contexts :List(ContextHandleInfo));
+  listAllContexts @78 () -> (contexts :List(ContextHandleInfo));
 
   # ============================================================================
-  # LLM Configuration (Phase 5: Per-Kernel Multi-Provider LLM)
+  # LLM Configuration (Per-Kernel Multi-Provider LLM)
   # ============================================================================
 
   # Get current LLM configuration for this kernel
-  getLlmConfig @83 () -> (config :LlmConfigInfo);
+  getLlmConfig @79 () -> (config :LlmConfigInfo);
 
   # Set default LLM provider
-  setDefaultProvider @84 (provider :Text) -> (success :Bool, error :Text);
+  setDefaultProvider @80 (provider :Text) -> (success :Bool, error :Text);
 
   # Set default model for a provider
-  setDefaultModel @85 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  setDefaultModel @81 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # ============================================================================
-  # Tool Filter Configuration (Phase 5: Unified Tool Filtering)
+  # Tool Filter Configuration
   # ============================================================================
 
   # Get current tool filter configuration
-  getToolFilter @86 () -> (filter :ToolFilterConfig);
+  getToolFilter @82 () -> (filter :ToolFilterConfig);
 
   # Set tool filter configuration
-  setToolFilter @87 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
+  setToolFilter @83 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
 
   # ============================================================================
   # Shell Variable Introspection (kaish scope)
   # ============================================================================
 
   # Get a shell variable by name
-  getShellVar @88 (name :Text) -> (value :ShellValue, found :Bool);
+  getShellVar @84 (name :Text) -> (value :ShellValue, found :Bool);
 
   # Set a shell variable
-  setShellVar @89 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+  setShellVar @85 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
 
   # List all shell variables
-  listShellVars @90 () -> (vars :List(ShellVar));
+  listShellVars @86 () -> (vars :List(ShellVar));
 }
 
 # ============================================================================
@@ -649,10 +598,6 @@ struct ToolFilterConfig {
     denyList @2 :List(Text);      # All except these tools available
   }
 }
-
-# SeatHandle interface removed — seat abstraction replaced by ContextMembership.
-# Struct definitions (SeatId, SeatStatus, SeatInfo) preserved above for schema
-# evolution compatibility with older binaries that may reference the ordinals.
 
 # ============================================================================
 # Block-Based CRDT Types (DAG Architecture)
@@ -799,10 +744,6 @@ interface BlockEvents {
   onBlockStatusChanged @4 (documentId :Text, blockId :BlockId, status :Status);
   onBlockTextOps @5 (documentId :Text, blockId :BlockId, ops :Data);
 }
-
-# ============================================================================
-# VFS Interface
-# ============================================================================
 
 # ============================================================================
 # MCP (Model Context Protocol) Types

@@ -797,13 +797,6 @@ impl world::Server for WorldImpl {
         })
     }
 
-    fn list_my_seats_deprecated(
-        self: Rc<Self>,
-        _params: world::ListMySeatsDeprecatedParams,
-        _results: world::ListMySeatsDeprecatedResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
-    }
 }
 
 // ============================================================================
@@ -963,106 +956,6 @@ impl kernel::Server for KernelImpl {
             }
         }
         Promise::ok(())
-    }
-
-    // Equipment
-
-    fn list_equipment(
-        self: Rc<Self>,
-        _params: kernel::ListEquipmentParams,
-        mut results: kernel::ListEquipmentResults,
-    ) -> Promise<(), capnp::Error> {
-        let state = self.state.borrow();
-        let kernel = match state.kernels.get(&self.kernel_id) {
-            Some(k) => k.kernel.clone(),
-            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
-        };
-        drop(state);
-
-        Promise::from_future(async move {
-            let tool_config = kernel.tool_config().await;
-            let tools = kernel.list_with_engines().await;
-            let mut builder = results.get().init_tools(tools.len() as u32);
-            for (i, tool) in tools.iter().enumerate() {
-                let mut t = builder.reborrow().get(i as u32);
-                t.set_name(&tool.name);
-                t.set_description(&tool.description);
-                // "equipped" now means "allowed by tool filter"
-                t.set_equipped(tool_config.allows(&tool.name));
-            }
-            Ok(())
-        })
-    }
-
-    fn equip(
-        self: Rc<Self>,
-        params: kernel::EquipParams,
-        _results: kernel::EquipResults,
-    ) -> Promise<(), capnp::Error> {
-        let tool_name = pry!(pry!(pry!(params.get()).get_tool()).to_str()).to_owned();
-
-        let state = self.state.borrow();
-        let kernel = match state.kernels.get(&self.kernel_id) {
-            Some(k) => k.kernel.clone(),
-            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
-        };
-        drop(state);
-
-        // Equip now means "ensure tool is allowed by ToolFilter"
-        Promise::from_future(async move {
-            let config = kernel.tool_config().await;
-            match config.filter {
-                ToolFilter::DenyList(mut denied) => {
-                    denied.remove(&tool_name);
-                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
-                }
-                ToolFilter::AllowList(mut allowed) => {
-                    allowed.insert(tool_name);
-                    kernel.set_tool_filter(ToolFilter::AllowList(allowed)).await;
-                }
-                ToolFilter::All => {
-                    // Already allowed
-                }
-            }
-            Ok(())
-        })
-    }
-
-    fn unequip(
-        self: Rc<Self>,
-        params: kernel::UnequipParams,
-        _results: kernel::UnequipResults,
-    ) -> Promise<(), capnp::Error> {
-        let tool_name = pry!(pry!(pry!(params.get()).get_tool()).to_str()).to_owned();
-
-        let state = self.state.borrow();
-        let kernel = match state.kernels.get(&self.kernel_id) {
-            Some(k) => k.kernel.clone(),
-            None => return Promise::err(capnp::Error::failed("kernel not found".into())),
-        };
-        drop(state);
-
-        // Unequip now means "ensure tool is denied by ToolFilter"
-        Promise::from_future(async move {
-            let config = kernel.tool_config().await;
-            match config.filter {
-                ToolFilter::All => {
-                    // Switch to deny list with just this tool
-                    let mut denied = std::collections::HashSet::new();
-                    denied.insert(tool_name);
-                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
-                }
-                ToolFilter::DenyList(mut denied) => {
-                    denied.insert(tool_name);
-                    kernel.set_tool_filter(ToolFilter::DenyList(denied)).await;
-                }
-                ToolFilter::AllowList(mut allowed) => {
-                    allowed.remove(&tool_name);
-                    kernel.set_tool_filter(ToolFilter::AllowList(allowed)).await;
-                }
-            }
-            Ok(())
-        })
     }
 
     // Lifecycle
@@ -1979,8 +1872,6 @@ impl kernel::Server for KernelImpl {
                     d.set_attached_at(doc.attached_at);
                 }
 
-                // Seats field kept in schema for evolution but no longer populated
-                c.reborrow().init_seats(0);
             }
         }
         Promise::ok(())
@@ -3704,8 +3595,6 @@ impl kernel::Server for KernelImpl {
             doc_builder.set_attached_at(doc.attached_at);
         }
 
-        // Initialize seats list
-        ctx_builder.init_seats(0);
 
         log::info!(
             "Fork created: {} from document {} at version {}, new document {}",
@@ -3977,16 +3866,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn ensure_seat_config(
-        self: Rc<Self>,
-        _params: kernel::EnsureSeatConfigParams,
-        mut results: kernel::EnsureSeatConfigResults,
-    ) -> Promise<(), capnp::Error> {
-        // Vestigial — seat abstraction removed. Keep ordinal for wire compat.
-        results.get().set_success(true);
-        results.get().set_error("");
-        Promise::ok(())
-    }
 
     // ========================================================================
     // Drift: Cross-Context Communication
