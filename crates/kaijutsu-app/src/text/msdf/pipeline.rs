@@ -65,12 +65,12 @@ fn debug_dot(
     let uv = [0.5, 0.5];
 
     // Two triangles for the quad
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: DEBUG_IMPORTANCE, effects: 0 });
 }
 
 /// Generate a rectangle outline (4 thin quads) for the given screen rect.
@@ -99,42 +99,42 @@ fn debug_rect_outline(
     // Top edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + width, y + LINE_WIDTH);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
 
     // Bottom edge
     let [x0, y0] = to_ndc(x, y + height - LINE_WIDTH);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
 
     // Left edge
     let [x0, y0] = to_ndc(x, y);
     let [x1, y1] = to_ndc(x + LINE_WIDTH, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
 
     // Right edge
     let [x0, y0] = to_ndc(x + width - LINE_WIDTH, y);
     let [x1, y1] = to_ndc(x + width, y + height);
-    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp });
-    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp });
+    vertices.push(MsdfVertex { position: [x0, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y0, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x1, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
+    vertices.push(MsdfVertex { position: [x0, y1, DEBUG_Z], uv, color, importance: imp, effects: 0 });
 }
 
 /// Label for the MSDF text render node.
@@ -155,6 +155,9 @@ pub struct MsdfVertex {
     /// Semantic importance (0.0 = faded/thin, 0.5 = normal, 1.0 = bold/emphasized).
     /// Used by shader to adjust stroke weight based on cursor proximity or agent activity.
     pub importance: f32,
+    /// Per-vertex effect flags bitfield.
+    /// Bit 0: rainbow color cycling. Bits 1-31: reserved.
+    pub effects: u32,
 }
 
 /// GPU uniform for MSDF rendering.
@@ -277,6 +280,9 @@ pub struct ExtractedMsdfText {
     pub scale: f32,
     pub bounds: TextBounds,
     pub effects: SdfTextEffects,
+    /// Per-vertex effect flags computed from `effects`.
+    /// Bit 0: rainbow.
+    pub effects_bits: u32,
     /// Raw text content for UI text that needs shaping (None if pre-shaped)
     pub raw_text: Option<String>,
     /// Color for UI text
@@ -360,8 +366,6 @@ pub struct ExtractedMsdfRenderConfig {
     pub glow_spread: f32,
     /// Glow color [r, g, b, a].
     pub glow_color: [f32; 4],
-    /// Rainbow effect enabled.
-    pub rainbow: bool,
 }
 
 /// Extracted camera motion for TAA reprojection.
@@ -1073,6 +1077,8 @@ pub fn extract_msdf_texts(
             continue;
         }
 
+        let fx = effects.cloned().unwrap_or_default();
+        let effects_bits = if fx.rainbow { 1 } else { 0 };
         texts.push(ExtractedMsdfText {
             entity,
             glyphs: buffer.glyphs().to_vec(),
@@ -1080,7 +1086,8 @@ pub fn extract_msdf_texts(
             top: config.top,
             scale: config.scale,
             bounds: config.bounds,
-            effects: effects.cloned().unwrap_or_default(),
+            effects: fx,
+            effects_bits,
             raw_text: None, // Already shaped
             color: [220, 220, 240, 255],
         });
@@ -1106,6 +1113,7 @@ pub fn extract_msdf_texts(
                 bottom: (position.top + position.height) as i32,
             },
             effects: SdfTextEffects::default(),
+            effects_bits: 0,
             raw_text: Some(ui_text.text.clone()),
             color: ui_text.color,
         });
@@ -1151,7 +1159,6 @@ pub fn extract_msdf_render_config(
         glow_intensity: theme.font_glow_intensity,
         glow_spread: theme.font_glow_spread,
         glow_color: [glow_linear.red, glow_linear.green, glow_linear.blue, glow_linear.alpha],
-        rainbow: theme.font_rainbow,
         // TAA convergence parameters
         taa_convergence_frames: theme.font_taa_convergence_frames,
         taa_initial_weight: theme.font_taa_initial_weight,
@@ -1295,10 +1302,8 @@ pub fn prepare_msdf_texts(
     // Get viewport resolution from extracted config
     let resolution = render_config.resolution;
 
-    // Determine rainbow effect from first entity or theme
-    let effects = extracted.texts.first().map(|t| &t.effects);
-    let entity_rainbow = effects.map(|e| e.rainbow).unwrap_or(false);
-    let rainbow = entity_rainbow || render_config.rainbow;
+    // Rainbow is now per-vertex (effects bitfield on each glyph).
+    // Uniform kept at 0 for struct layout stability.
 
     // Get debug mode from extracted resource
     #[cfg(debug_assertions)]
@@ -1332,7 +1337,7 @@ pub fn prepare_msdf_texts(
         resolution,
         msdf_range: atlas.msdf_range,
         time: time.elapsed_secs(),
-        rainbow: if rainbow { 1 } else { 0 },
+        rainbow: 0,
         debug_mode: debug_mode_value,
         sdf_texel,
         // Use theme values for rendering quality parameters
@@ -1454,13 +1459,14 @@ pub fn prepare_msdf_texts(
             // Two triangles for the quad
             // V coordinates are flipped because msdfgen bitmaps have Y=0 at bottom
             let imp = glyph.importance;
-            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color, importance: imp });
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
+            let fx = text.effects_bits;
+            vertices.push(MsdfVertex { position: [x0, y0, z], uv: [u0, v1], color: glyph.color, importance: imp, effects: fx });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp, effects: fx });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp, effects: fx });
 
-            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp });
-            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color, importance: imp });
-            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp });
+            vertices.push(MsdfVertex { position: [x1, y0, z], uv: [u1, v1], color: glyph.color, importance: imp, effects: fx });
+            vertices.push(MsdfVertex { position: [x1, y1, z], uv: [u1, v0], color: glyph.color, importance: imp, effects: fx });
+            vertices.push(MsdfVertex { position: [x0, y1, z], uv: [u0, v0], color: glyph.color, importance: imp, effects: fx });
 
             // === DEBUG GEOMETRY ===
             // Generate debug visualization when debug mode is 1 or 2
@@ -1737,7 +1743,7 @@ pub fn init_msdf_resources(
     });
 
     // Create pipeline descriptor
-    // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) = 28 bytes
+    // MsdfVertex layout: position(12) + uv(8) + color(4) + importance(4) + effects(4) = 32 bytes
     let vertex_layout = VertexBufferLayout {
         array_stride: std::mem::size_of::<MsdfVertex>() as u64,
         step_mode: VertexStepMode::Vertex,
@@ -1765,6 +1771,12 @@ pub fn init_msdf_resources(
                 format: VertexFormat::Float32,
                 offset: 24, // 20 + 4 (color is 4 bytes)
                 shader_location: 3,
+            },
+            // Per-vertex effect flags (bit 0: rainbow)
+            VertexAttribute {
+                format: VertexFormat::Uint32,
+                offset: 28, // 24 + sizeof(f32)
+                shader_location: 4,
             },
         ],
     };

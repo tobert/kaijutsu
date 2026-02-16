@@ -301,6 +301,22 @@ pub struct Theme {
     /// Base padding inside borders (pixels)
     pub block_border_padding: f32,
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Compose block (input area)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub compose_border: Color,
+    pub compose_bg: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Modal overlays
+    // ═══════════════════════════════════════════════════════════════════════
+    pub modal_backdrop: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // User/assistant text block borders (transparent = disabled)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub block_border_user: Color,
+    pub block_border_assistant: Color,
 }
 
 impl Default for Theme {
@@ -322,7 +338,7 @@ impl Default for Theme {
 
             // Block text colors
             block_user: Color::srgb(0.88, 0.94, 1.00),          // #e0f0ff cool white
-            block_assistant: Color::srgb(0.88, 0.94, 1.00),     // Same as fg
+            block_assistant: Color::srgb(0.62, 0.81, 0.42),     // #9ece6a terminal green
             block_thinking: Color::srgb(0.38, 0.50, 0.63),      // #6080a0 muted
             block_tool_call: Color::srgb(1.00, 0.67, 0.00),     // #ffaa00 amber
             block_tool_result: Color::srgb(0.00, 1.00, 0.53),   // #00ff88 toxic green
@@ -463,6 +479,16 @@ impl Default for Theme {
             block_border_glow_intensity: 0.6,
             block_border_padding: 2.0,
 
+            // Compose block — debug defaults (WHITE on BLACK)
+            compose_border: Color::WHITE,
+            compose_bg: Color::BLACK,
+
+            // Modal backdrop — debug default (WHITE)
+            modal_backdrop: Color::WHITE,
+
+            // User/assistant text borders — transparent (opt-in)
+            block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
+            block_border_assistant: Color::srgba(0.0, 0.0, 0.0, 0.0),
         }
     }
 }

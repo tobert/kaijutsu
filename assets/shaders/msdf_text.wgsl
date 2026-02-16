@@ -50,6 +50,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) importance: f32,      // semantic weight (0.0 = faded, 0.5 = normal, 1.0 = bold)
+    @location(4) effects: u32,         // per-vertex effect flags (bit 0: rainbow)
 }
 
 struct VertexOutput {
@@ -58,6 +59,7 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) screen_pos: vec2<f32>,
     @location(3) importance: f32,
+    @location(4) @interpolate(flat) effects: u32,
 }
 
 // ============================================================================
@@ -85,6 +87,7 @@ fn vertex(in: VertexInput) -> VertexOutput {
     // Screen pos should use original position, not jittered (for effects like rainbow)
     out.screen_pos = (in.position.xy + 1.0) * 0.5 * uniforms.resolution;
     out.importance = in.importance;
+    out.effects = in.effects;
     return out;
 }
 
@@ -335,9 +338,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // text_bias from theme controls overall stroke thickness (default 0.5)
     let text_alpha = msdf_alpha_hinted(in.uv, uniforms.text_bias, in.importance);
 
-    // Determine text color
+    // Determine text color — per-vertex effects bitfield controls rainbow
     var text_color = in.color.rgb;
-    if uniforms.rainbow != 0u {
+    if (in.effects & 1u) != 0u {
         text_color = rainbow_color(in.screen_pos.x, uniforms.time);
     }
 

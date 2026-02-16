@@ -14,6 +14,7 @@ use crate::conversation::CurrentConversation;
 use crate::text::{
     bevy_to_cosmic_color, FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig,
     MsdfTextBuffer, TextMetrics,
+    msdf::SdfTextEffects,
 };
 use crate::text::markdown::{self, MarkdownColors};
 use crate::ui::format::format_for_display;
@@ -64,7 +65,13 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
             }
         }
         BlockKind::Thinking => theme.block_thinking,
-        BlockKind::ToolCall => theme.block_tool_call,
+        BlockKind::ToolCall => {
+            if block.status == kaijutsu_crdt::Status::Done {
+                theme.fg  // Completed tool calls: plain foreground
+            } else {
+                theme.block_tool_call  // Running/pending: amber
+            }
+        }
         BlockKind::ToolResult => {
             if block.is_error {
                 theme.block_tool_error
@@ -866,6 +873,7 @@ pub fn spawn_expanded_block_view(
         buffer.set_letter_spacing(text_metrics.letter_spacing);
 
         let color = block_color(block, &theme);
+        buffer.set_color(color);
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
         drop(fs);
@@ -963,6 +971,7 @@ pub fn sync_expanded_block_content(
 
         // Update color
         let color = block_color(block, &theme);
+        buffer.set_color(color);
         config.default_color = color;
 
         // Update bounds to fill screen (with padding)
@@ -1778,6 +1787,7 @@ pub fn spawn_block_cells(
                     BlockCellLayout::default(),
                     MsdfText,
                     MsdfTextAreaConfig::default(),
+                    SdfTextEffects::default(),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()
@@ -1883,7 +1893,7 @@ pub fn sync_role_headers(
 /// Initialize MsdfTextBuffers for RoleHeaders that don't have one.
 pub fn init_role_header_buffers(
     mut commands: Commands,
-    role_headers: Query<(Entity, &RoleHeader), (With<MsdfText>, Without<MsdfTextBuffer>)>,
+    role_headers: Query<(Entity, &RoleHeader, &MsdfTextAreaConfig), (With<MsdfText>, Without<MsdfTextBuffer>)>,
     font_system: Res<SharedFontSystem>,
     text_metrics: Res<TextMetrics>,
 ) {
@@ -1891,12 +1901,15 @@ pub fn init_role_header_buffers(
         return;
     };
 
-    for (entity, header) in role_headers.iter() {
+    for (entity, header, config) in role_headers.iter() {
         // Use UI metrics for headers (slightly smaller than content)
         let metrics = text_metrics.scaled_cell_metrics();
         let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         buffer.set_snap_x(true); // monospace: snap to pixel grid
         buffer.set_letter_spacing(text_metrics.letter_spacing);
+
+        // Apply the role color from MsdfTextAreaConfig (set during sync_role_headers)
+        buffer.set_color(config.default_color);
 
         // Set header text based on role
         let text = match header.role {
@@ -1942,6 +1955,7 @@ pub fn init_block_cell_buffers(
 /// mutates editor.doc directly which doesn't trigger Bevy change detection.
 /// Instead, we rely on block_cell.last_render_version for dirty tracking.
 pub fn sync_block_cell_buffers(
+    mut commands: Commands,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
@@ -2022,6 +2036,15 @@ pub fn sync_block_cell_buffers(
 
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
+        buffer.set_color(base_color);
+
+        // Set per-vertex effects: rainbow for user text only
+        let effects = if block.kind == BlockKind::Text && block.role == kaijutsu_crdt::Role::User {
+            SdfTextEffects { rainbow: true }
+        } else {
+            SdfTextEffects::default()
+        };
+        commands.entity(*entity).insert(effects);
 
         // Use rich text (markdown) for Text blocks, plain text for everything else
         let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
