@@ -108,8 +108,6 @@ fn main() {
         .add_plugins(ui::tiling_widgets::TilingWidgetsPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(ui::drift::DriftPlugin)
-        // Layout system - RON-driven view layouts
-        .add_plugins(ui::layout::LayoutPlugin)
         // Timeline navigation - temporal scrubbing through history
         .add_plugins(ui::timeline::TimelinePlugin)
         // Animation tweening for smooth mode transitions
@@ -117,10 +115,8 @@ fn main() {
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
         // Startup
-        // MaterialCache must run early so panel builders can access materials
         .add_systems(Startup, (
             setup_camera,
-            ui::materials::setup_material_cache,
             setup_ui,
             ui::debug::setup_debug_overlay,
         ).chain())

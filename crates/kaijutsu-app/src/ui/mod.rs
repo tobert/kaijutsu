@@ -2,10 +2,6 @@ pub mod constellation;
 pub mod debug;
 pub mod drift;
 pub mod format;
-pub mod layout;
-#[allow(dead_code)] // RON layout reconciler — not yet wired into tiling WM
-pub mod layout_reconciler;
-pub mod materials;
 pub mod state;
 pub mod theme;
 pub mod theme_loader;
