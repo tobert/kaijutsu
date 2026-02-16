@@ -734,13 +734,20 @@ pub fn smooth_scroll(
         };
     }
 
-    // Write scroll offset to Bevy's ScrollPosition and read visible height
+    // Write scroll offset to Bevy's ScrollPosition and read visible/content heights
     if let Some(conv) = entities.conversation_container {
         if let Ok((mut scroll_pos, computed)) = scroll_positions.get_mut(conv) {
             **scroll_pos = Vec2::new(scroll_pos.x, scroll_state.offset);
-            let visible_h = computed.size().y;
+            // Use content box height (inside border+padding) as the visible viewport
+            let content_box = computed.content_box();
+            let visible_h = content_box.height();
             if visible_h > 0.0 {
                 scroll_state.visible_height = visible_h;
+            }
+            // Use Bevy's computed content size as authoritative scroll extent
+            let bevy_content_h = computed.content_size().y;
+            if bevy_content_h > 0.0 {
+                scroll_state.content_height = bevy_content_h;
             }
         }
     }
