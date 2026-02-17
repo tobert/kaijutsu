@@ -1036,6 +1036,55 @@ pub fn spawn_main_cell(
     info!("Spawned main kernel cell with id {:?}", cell_id.0);
 }
 
+/// Track the focused ConversationContainer and re-parent block cells when it changes.
+///
+/// After a pane split, the reconciler despawns and rebuilds all PaneMarker entities.
+/// This orphans block cells from the old container. This system detects when the
+/// focused ConversationContainer changes (new entity with PaneFocus) and:
+/// 1. Updates `EditorEntities.conversation_container`
+/// 2. Re-parents existing block cells + role headers to the new container
+pub fn track_conversation_container(
+    mut commands: Commands,
+    mut entities: ResMut<EditorEntities>,
+    focused_containers: Query<Entity, (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
+    containers: Query<&BlockCellContainer>,
+) {
+    let Ok(focused) = focused_containers.single() else {
+        return;
+    };
+
+    if entities.conversation_container == Some(focused) {
+        return;
+    }
+
+    let old = entities.conversation_container;
+    entities.conversation_container = Some(focused);
+
+    // Re-parent block cells and role headers from old container to new one
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    info!(
+        "Conversation container changed: {:?} -> {:?}, re-parenting {} block cells + {} role headers",
+        old, focused, container.block_cells.len(), container.role_headers.len()
+    );
+
+    for &entity in &container.block_cells {
+        if let Ok(mut ec) = commands.get_entity(entity) {
+            ec.set_parent_in_place(focused);
+        }
+    }
+    for &entity in &container.role_headers {
+        if let Ok(mut ec) = commands.get_entity(entity) {
+            ec.set_parent_in_place(focused);
+        }
+    }
+}
+
 /// Sync the MainCell's content with DocumentSyncState.
 ///
 /// This system:
@@ -2130,7 +2179,7 @@ pub fn layout_block_cells(
     // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
     font_system: Res<SharedFontSystem>,
     mut metrics_cache: ResMut<FontMetricsCache>,
-    conv_containers: Query<&ComputedNode, With<super::components::ConversationContainer>>,
+    conv_containers: Query<&ComputedNode, (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
     windows: Query<&Window>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
@@ -2152,11 +2201,11 @@ pub fn layout_block_cells(
 
     let margin = layout.workspace_margin_left;
 
-    // Get pane width from ConversationContainer's ComputedNode (flex layout result).
+    // Get pane width from the focused ConversationContainer's ComputedNode.
     // Falls back to window width on first frame before layout runs.
-    let base_width = entities.conversation_container
-        .and_then(|e| conv_containers.get(e).ok())
+    let base_width = conv_containers.iter().next()
         .map(|node| node.size().x)
+        .filter(|w| *w > 0.0)
         .unwrap_or_else(|| {
             windows.iter().next()
                 .map(|w| w.resolution.width())

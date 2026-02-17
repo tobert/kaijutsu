@@ -137,6 +137,8 @@ impl Plugin for CellPlugin {
             (
                 // Main cell spawning
                 systems::spawn_main_cell,
+                // Track focused pane and re-parent block cells after split
+                systems::track_conversation_container.after(systems::spawn_main_cell),
                 // Block cell spawning (after sync)
                 systems::spawn_block_cells,
                 // Role header sync (after block cells)
