@@ -265,10 +265,10 @@ pub fn spawn_block_borders(
             .spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(-style.padding.left),
-                    top: Val::Px(-style.padding.top),
-                    width: Val::Px(100.0),
-                    height: Val::Px(50.0),
+                    left: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
                     ..default()
                 },
                 MaterialNode(handle),
@@ -357,27 +357,18 @@ pub fn layout_block_borders(
 /// Since borders are now children of BlockCells, they just need to be sized
 /// relative to their parent. No manual scroll/visibility clamping needed.
 pub fn layout_block_borders_from_flex(
-    block_cells: Query<(&ComputedNode, &BlockBorderStyle, &BlockBorderEntity)>,
-    mut border_nodes: Query<&mut Node>,
+    block_cells: Query<(&ComputedNode, &BlockBorderEntity)>,
     mut materials: ResMut<Assets<BlockBorderMaterial>>,
     border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
 ) {
-    for (computed, style, border_ent) in block_cells.iter() {
+    for (computed, border_ent) in block_cells.iter() {
         let size = computed.size();
-        let w = size.x + style.padding.left + style.padding.right;
-        let h = size.y + style.padding.top + style.padding.bottom;
 
-        if let Ok(mut node) = border_nodes.get_mut(border_ent.0) {
-            node.left = Val::Px(-style.padding.left);
-            node.top = Val::Px(-style.padding.top);
-            node.width = Val::Px(w);
-            node.height = Val::Px(h);
-        }
-
-        // Update dimensions uniform for aspect-correct rendering
+        // Update dimensions uniform for aspect-correct shader rendering.
+        // The border node itself uses 100% sizing so Bevy handles layout automatically.
         if let Ok(mat_node) = border_material_query.get(border_ent.0) {
             if let Some(mat) = materials.get_mut(mat_node.0.id()) {
-                mat.dimensions = Vec4::new(w, h, 0.0, 0.0);
+                mat.dimensions = Vec4::new(size.x, size.y, 0.0, 0.0);
             }
         }
     }
