@@ -375,7 +375,7 @@ impl KaijutsuMcp {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Serialize ops for transmission
-        let ops_bytes = serde_json::to_vec(&ops)
+        let ops_bytes = postcard::to_stdvec(&ops)
             .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         if ops_bytes.len() <= 2 {
@@ -2692,7 +2692,7 @@ mod tests {
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         // Before applying: store should have 1 block
         assert_eq!(
@@ -2731,7 +2731,7 @@ mod tests {
         let pre_frontier = server.frontier();
         server.edit_text(&block_id, 17, " — updated!", 0).expect("edit");
         let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         // Before: store has original text
         assert!(
@@ -2798,7 +2798,7 @@ mod tests {
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         // Apply with WRONG document_id — should be silently ignored
         apply_server_event(
@@ -2831,7 +2831,7 @@ mod tests {
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         apply_server_event(
             &store, &sync, doc_id,
@@ -2862,7 +2862,7 @@ mod tests {
                 &format!("Block {i}"), "server",
             ).expect("insert");
             let block = server.get_block_snapshot(&bid).expect("snap");
-            let ops = serde_json::to_vec(&server.ops_since(&pre)).expect("ser");
+            let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
 
             apply_server_event(&store, &sync, doc_id, ServerEvent::BlockInserted {
                 document_id: doc_id.to_string(),
@@ -2877,7 +2877,7 @@ mod tests {
         let last_content_len = blocks.last().unwrap().content.len();
         let pre = server.frontier();
         server.edit_text(&last_block_id, last_content_len, " — edited", 0).expect("edit");
-        let ops = serde_json::to_vec(&server.ops_since(&pre)).expect("ser");
+        let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
 
         apply_server_event(&store, &sync, doc_id, ServerEvent::BlockTextOps {
             document_id: doc_id.to_string(),
@@ -3003,7 +3003,7 @@ mod tests {
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = serde_json::to_vec(&ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         apply_server_event(
             &store, &sync, doc_id,

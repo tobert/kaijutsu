@@ -87,6 +87,7 @@ enum RpcCommand {
     // ── CRDT Sync ────────────────────────────────────────────────────────
     PushOps { document_id: String, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
     GetDocumentState { document_id: String, reply: oneshot::Sender<Result<DocumentState, ActorError>> },
+    CompactDocument { document_id: String, reply: oneshot::Sender<Result<(u64, u64), ActorError>> },
 
     // ── Shell / Execution ────────────────────────────────────────────────
     Execute { code: String, reply: oneshot::Sender<Result<u64, ActorError>> },
@@ -150,6 +151,7 @@ impl RpcCommand {
             Self::DetachDocument { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetDocumentState { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CompactDocument { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ShellExecute { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Interrupt { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -332,6 +334,11 @@ impl ActorHandle {
     /// Get full document state from the server.
     pub async fn get_document_state(&self, document_id: &str) -> Result<DocumentState, ActorError> {
         self.send(|reply| RpcCommand::GetDocumentState { document_id: document_id.into(), reply }).await
+    }
+
+    /// Compact a document's oplog. Returns (new_size, generation).
+    pub async fn compact_document(&self, document_id: &str) -> Result<(u64, u64), ActorError> {
+        self.send(|reply| RpcCommand::CompactDocument { document_id: document_id.into(), reply }).await
     }
 
     // ── Shell / Execution ────────────────────────────────────────────────
@@ -856,6 +863,9 @@ async fn dispatch_command(
         }
         RpcCommand::GetDocumentState { document_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_document_state(&document_id));
+        }
+        RpcCommand::CompactDocument { document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.compact_document(&document_id));
         }
 
         // ── Shell / Execution ────────────────────────────────────

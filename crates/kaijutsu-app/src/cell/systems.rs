@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 use bevy::ui::CalculatedClip;
+use bevy::ui::measurement::ContentSize;
 
 use super::components::{
     BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
@@ -1206,7 +1207,7 @@ pub fn handle_block_events(
     mut current_conv: ResMut<CurrentConversation>,
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
-    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
+    mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
 ) {
     use kaijutsu_client::ServerEvent;
     use super::components::CachedDocument;
@@ -1438,6 +1439,20 @@ pub fn handle_block_events(
                         warn!("Failed to move block: {}", e);
                     }
                 }
+            }
+            ServerEvent::SyncReset { document_id, generation } => {
+                info!(
+                    "Sync reset for document {}, generation {}. Resetting frontier.",
+                    document_id, generation
+                );
+                // Reset SyncManager frontier so next event triggers full re-sync
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    cached.sync.reset_frontier();
+                    // Mark as stale so staleness check triggers re-fetch
+                    cached.synced_at_generation = 0;
+                }
+                // Bump SyncGeneration to trigger staleness re-fetch
+                sync_gen.0 = sync_gen.0.wrapping_add(1);
             }
             // Resource events are not block-related — ignore here
             ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => {}
@@ -1850,6 +1865,7 @@ pub fn spawn_block_cells(
                     MsdfText,
                     MsdfTextAreaConfig::default(),
                     SdfTextEffects::default(),
+                    ContentSize::default(),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()
@@ -2283,7 +2299,9 @@ pub fn layout_block_cells(
             0
         };
 
-        // Calculate wrap width accounting for indentation and border padding
+        // Calculate wrap width accounting for indentation.
+        // Border padding is now on Node.padding — taffy subtracts it from available
+        // width automatically, so we don't account for it here.
         let indent = indent_level as f32 * INDENT_WIDTH;
         let border_h_padding = border_style
             .map(|s| s.padding.left + s.padding.right)
@@ -2294,7 +2312,9 @@ pub fn layout_block_cells(
         // This shapes the buffer if needed and returns accurate wrapped line count
         // Pixel alignment via metrics_cache helps small text render crisply
         let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
-        // Tight height: just the lines, minimal padding for future chrome
+        // Tight height: just the lines, minimal padding for future chrome.
+        // Border vertical padding is now on Node.padding — taffy adds it to the
+        // border box automatically, so min_height is content-only.
         let border_v_padding = border_style
             .map(|s| s.padding.vertical())
             .unwrap_or(0.0);
@@ -2319,7 +2339,7 @@ pub fn layout_block_cells(
 pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut Node), With<BlockCell>>,
+    mut block_cells: Query<(&BlockCellLayout, &mut Node, Option<&super::block_border::BlockBorderStyle>), With<BlockCell>>,
     mut role_header_nodes: Query<&mut Node, (With<RoleHeader>, Without<BlockCell>)>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -2330,7 +2350,7 @@ pub fn update_block_cell_nodes(
     };
 
     for entity in &container.block_cells {
-        let Ok((layout, mut node)) = block_cells.get_mut(*entity) else {
+        let Ok((layout, mut node, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
         node.min_height = Val::Px(layout.height);
@@ -2339,6 +2359,18 @@ pub fn update_block_cell_nodes(
             bottom: Val::Px(BLOCK_SPACING),
             ..default()
         };
+        // Set padding from border style so text sits inside the content box
+        // while the border (absolute child at 100%×100%) fills the border box.
+        if let Some(style) = border_style {
+            node.padding = UiRect {
+                left: Val::Px(style.padding.left),
+                right: Val::Px(style.padding.right),
+                top: Val::Px(style.padding.top),
+                bottom: Val::Px(style.padding.bottom),
+            };
+        } else {
+            node.padding = UiRect::ZERO;
+        }
     }
 
     // Role header nodes already have fixed height from spawn, but update if needed
@@ -2411,29 +2443,30 @@ pub fn reorder_conversation_children(
 /// This replaces the manual positioning in `apply_block_cell_positions`.
 pub fn position_block_cells_from_flex(
     mut block_cells: Query<
-        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&super::block_border::BlockBorderStyle>, Option<&CalculatedClip>),
+        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&CalculatedClip>),
         With<BlockCell>,
     >,
 ) {
-    for (computed, transform, mut config, border_style, clip) in block_cells.iter_mut() {
+    for (computed, transform, mut config, clip) in block_cells.iter_mut() {
         let (_, _, translation) = transform.to_scale_angle_translation();
         let size = computed.size();
+        let content = computed.content_box();
 
-        let left = translation.x - size.x / 2.0;
-        let top = translation.y - size.y / 2.0;
+        // Content box origin relative to the node's top-left corner.
+        // Translation is center-based, so convert to top-left first.
+        let node_left = translation.x - size.x / 2.0;
+        let node_top = translation.y - size.y / 2.0;
+        let left = node_left + content.min.x;
+        let top = node_top + content.min.y;
 
-        let pad_left = border_style.map(|s| s.padding.left).unwrap_or(0.0);
-        let pad_top = border_style.map(|s| s.padding.top).unwrap_or(0.0);
-        let pad_right = border_style.map(|s| s.padding.right).unwrap_or(0.0);
-
-        config.left = left + pad_left;
-        config.top = top + pad_top;
+        config.left = left;
+        config.top = top;
         config.scale = 1.0;
 
-        let raw_left = (left + pad_left) as i32;
-        let raw_top = (top + pad_top) as i32;
-        let raw_right = (left + size.x - pad_right) as i32;
-        let raw_bottom = (top + size.y) as i32;
+        let raw_left = left as i32;
+        let raw_top = top as i32;
+        let raw_right = (node_left + content.max.x) as i32;
+        let raw_bottom = (node_top + content.max.y) as i32;
 
         config.bounds = if let Some(clip) = clip {
             crate::text::TextBounds {

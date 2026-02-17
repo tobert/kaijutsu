@@ -439,6 +439,18 @@ impl KernelHandle {
         })
     }
 
+    /// Compact a document's oplog, returning new size and sync generation.
+    pub async fn compact_document(
+        &self,
+        document_id: &str,
+    ) -> Result<(u64, u64), RpcError> {
+        let mut request = self.kernel.compact_document_request();
+        request.get().set_document_id(document_id);
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        Ok((r.get_new_size(), r.get_generation()))
+    }
+
     // =========================================================================
     // LLM operations
     // =========================================================================

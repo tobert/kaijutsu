@@ -356,7 +356,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let ops = remote.store.ops_since(&remote.document_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let ops_bytes = serde_json::to_vec(&ops)
+    let ops_bytes = postcard::to_stdvec(&ops)
         .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
     if ops_bytes.len() <= 2 {

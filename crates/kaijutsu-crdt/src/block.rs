@@ -328,35 +328,35 @@ pub struct BlockSnapshot {
     // Tool-specific dedicated fields
 
     /// Tool name (for ToolCall blocks).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_name: Option<String>,
     /// Tool input as JSON (for ToolCall blocks).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_input: Option<serde_json::Value>,
     /// Reference to parent ToolCall block (for ToolResult blocks).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<BlockId>,
     /// Exit code from tool execution (for ToolResult blocks).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub exit_code: Option<i32>,
     /// Whether this is an error result (for ToolResult blocks).
     #[serde(default)]
     pub is_error: bool,
     /// Display hint for richer output formatting (JSON-serialized).
     /// Used for shell output blocks to enable per-viewer rendering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub display_hint: Option<String>,
 
     // Drift-specific fields (for Drift blocks)
 
     /// Short ID of the originating context (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_context: Option<String>,
     /// Model that produced this content (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_model: Option<String>,
     /// How this block arrived from another context (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub drift_kind: Option<DriftKind>,
 }
 

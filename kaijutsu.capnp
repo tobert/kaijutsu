@@ -539,6 +539,10 @@ interface Kernel {
 
   # List all shell variables
   listShellVars @86 () -> (vars :List(ShellVar));
+
+  # Compact a document's oplog, bumping sync generation.
+  # Connected clients will receive onSyncReset and must re-fetch full state.
+  compactDocument @87 (documentId :Text) -> (newSize :UInt64, generation :UInt64);
 }
 
 # ============================================================================
@@ -743,6 +747,7 @@ interface BlockEvents {
   onBlockMoved @3 (documentId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
   onBlockStatusChanged @4 (documentId :Text, blockId :BlockId, status :Status);
   onBlockTextOps @5 (documentId :Text, blockId :BlockId, ops :Data);
+  onSyncReset @6 (documentId :Text, generation :UInt64);
 }
 
 # ============================================================================

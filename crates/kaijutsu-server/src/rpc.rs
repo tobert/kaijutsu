@@ -1636,6 +1636,15 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
+                        BlockFlow::SyncReset { ref document_id, generation } => {
+                            let mut req = callback.on_sync_reset_request();
+                            {
+                                let mut params = req.get();
+                                params.set_document_id(document_id);
+                                params.set_generation(generation);
+                            }
+                            req.send().promise.await.is_ok()
+                        }
                     };
 
                     // If callback fails (client disconnected), stop the bridge task
@@ -1692,7 +1701,7 @@ impl kernel::Server for KernelImpl {
         drop(doc); // Release read ref before potential compaction
 
         if needs_compaction {
-            if let Err(e) = kernel.documents.compact_document(&cell_id) {
+            if let Err(e) = kernel.documents.compact_document_silent(&cell_id) {
                 log::warn!("Failed to compact document {}: {}", cell_id, e);
             }
         }
@@ -2934,7 +2943,7 @@ impl kernel::Server for KernelImpl {
         };
 
         // Deserialize the CRDT ops
-        let serialized_ops: kaijutsu_crdt::SerializedOpsOwned = match serde_json::from_slice(&ops_data) {
+        let serialized_ops: kaijutsu_crdt::SerializedOpsOwned = match postcard::from_bytes(&ops_data) {
             Ok(ops) => ops,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
@@ -4738,6 +4747,39 @@ impl kernel::Server for KernelImpl {
 
             Ok(())
         })
+    }
+
+    fn compact_document(
+        self: Rc<Self>,
+        params: kernel::CompactDocumentParams,
+        mut results: kernel::CompactDocumentResults,
+    ) -> Promise<(), capnp::Error> {
+        let document_id = pry!(pry!(pry!(params.get()).get_document_id()).to_str()).to_string();
+
+        let state = self.state.borrow();
+        let kernel = match state.kernels.get(&self.kernel_id) {
+            Some(k) => k,
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "kernel '{}' not found",
+                    self.kernel_id
+                )));
+            }
+        };
+
+        match kernel.documents.compact_document(&document_id) {
+            Ok(new_size) => {
+                let generation = kernel.documents
+                    .get(&document_id)
+                    .map(|e| e.sync_generation())
+                    .unwrap_or(0);
+                let mut r = results.get();
+                r.set_new_size(new_size as u64);
+                r.set_generation(generation);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(e)),
+        }
     }
 }
 

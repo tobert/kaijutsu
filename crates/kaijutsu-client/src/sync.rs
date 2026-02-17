@@ -152,6 +152,16 @@ impl SyncManager {
         self.pending_ops.len()
     }
 
+    /// Reset frontier to force a full re-sync on the next event.
+    ///
+    /// Called when the server compacts a document (SyncReset event).
+    /// The client should follow this by calling `get_document_state`
+    /// and `apply_initial_state` with the new oplog.
+    pub fn reset_frontier(&mut self) {
+        self.frontier = None;
+        self.pending_ops.clear();
+    }
+
     /// Buffer failed ops for later replay.
     ///
     /// Called when both incremental merge and full sync fail. The ops are
@@ -486,7 +496,7 @@ impl SyncManager {
         block_id: Option<&kaijutsu_crdt::BlockId>,
     ) -> Result<SyncResult, SyncError> {
         // Deserialize ops
-        let serialized_ops: SerializedOpsOwned = match serde_json::from_slice(ops) {
+        let serialized_ops: SerializedOpsOwned = match postcard::from_bytes(ops) {
             Ok(ops) => ops,
             Err(e) => {
                 warn!("Failed to deserialize ops: {}", e);
@@ -595,7 +605,7 @@ mod tests {
 
         // Get incremental ops
         let incremental_ops = server.ops_since(&server_frontier);
-        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize ops");
+        let ops_bytes = postcard::to_stdvec(&incremental_ops).expect("serialize ops");
 
         // Apply incremental merge
         let result = sync
@@ -723,7 +733,7 @@ mod tests {
         // Get INCREMENTAL ops from server (not full oplog)
         // These ops reference server's oplog root which client doesn't have
         let incremental_ops = server.ops_since(&server_frontier_before);
-        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&incremental_ops).expect("serialize");
 
         // Try to apply incremental merge - should fail with DataMissing
         let result = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
@@ -863,7 +873,7 @@ mod tests {
         let block_id = server
             .insert_block(None, None, Role::Model, BlockKind::Text, "", "server")
             .expect("insert block");
-        let incremental_ops = serde_json::to_vec(&server.ops_since(&server_frontier)).unwrap();
+        let incremental_ops = postcard::to_stdvec(&server.ops_since(&server_frontier)).unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
 
         sync.apply_block_inserted(&mut client, "doc-1", &block, &incremental_ops)
@@ -874,7 +884,7 @@ mod tests {
         for chunk in chunks {
             let frontier_before = server.frontier();
             server.append_text(&block_id, chunk).expect("append text");
-            let chunk_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+            let chunk_ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
             let result = sync
                 .apply_text_ops(&mut client, "doc-1", &chunk_ops)
@@ -905,7 +915,7 @@ mod tests {
         let block_id = server
             .insert_block(None, None, Role::Model, BlockKind::Text, "", "server")
             .expect("insert block");
-        let incremental_ops = serde_json::to_vec(&server.ops_since(&server_frontier)).unwrap();
+        let incremental_ops = postcard::to_stdvec(&server.ops_since(&server_frontier)).unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
 
         sync.apply_block_inserted(&mut client, "doc-1", &block, &incremental_ops)
@@ -914,7 +924,7 @@ mod tests {
         // Stream chunk 1
         let frontier_before = server.frontier();
         server.append_text(&block_id, "Hello").expect("append");
-        let chunk_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+        let chunk_ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
         sync.apply_text_ops(&mut client, "doc-1", &chunk_ops)
             .expect("chunk 1");
 
@@ -1096,7 +1106,7 @@ mod tests {
         let new_block = server.get_block_snapshot(&new_block_id).expect("block exists");
 
         let incremental_ops = server.ops_since(&server_frontier_before);
-        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&incremental_ops).expect("serialize");
 
         // Try to apply — both paths should fail, ops should be buffered
         let result = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
@@ -1123,7 +1133,7 @@ mod tests {
             .expect("insert block");
         let new_block = server.get_block_snapshot(&new_block_id).expect("block exists");
         let incremental_ops = server.ops_since(&server_frontier_before);
-        let ops_bytes = serde_json::to_vec(&incremental_ops).expect("serialize");
+        let ops_bytes = postcard::to_stdvec(&incremental_ops).expect("serialize");
 
         // This fails and buffers
         let _ = sync.apply_block_inserted(&mut client, "doc-1", &new_block, &ops_bytes);
@@ -1164,7 +1174,7 @@ mod tests {
         let block_frontier = server.frontier();
 
         server.append_text(&block_id, "Hello from shell").expect("append");
-        let text_ops = serde_json::to_vec(&server.ops_since(&block_frontier)).unwrap();
+        let text_ops = postcard::to_stdvec(&server.ops_since(&block_frontier)).unwrap();
 
         // Text ops arrive FIRST (before BlockInserted) — should fail with Merge error
         let result = sync.apply_text_ops(&mut client, "doc-1", &text_ops);
@@ -1173,7 +1183,7 @@ mod tests {
 
         // Now BlockInserted arrives with full ops
         let block = server.get_block_snapshot(&block_id).expect("block exists");
-        let block_ops = serde_json::to_vec(&server.ops_since(&server_frontier_before)).unwrap();
+        let block_ops = postcard::to_stdvec(&server.ops_since(&server_frontier_before)).unwrap();
         let result = sync
             .apply_block_inserted(&mut client, "doc-1", &block, &block_ops)
             .expect("block insert should succeed");
@@ -1231,11 +1241,11 @@ mod tests {
         let block_id = server
             .insert_block(None, None, Role::Model, BlockKind::Text, "Valid block", "server")
             .expect("insert block");
-        let valid_block_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+        let valid_block_ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
         let frontier_before = server.frontier();
         server.append_text(&block_id, " extra").expect("append");
-        let valid_text_ops = serde_json::to_vec(&server.ops_since(&frontier_before)).unwrap();
+        let valid_text_ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
         // Buffer: valid block ops, then corrupt, then valid text ops
         // The block ops must be replayed first for the text ops to succeed

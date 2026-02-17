@@ -62,6 +62,11 @@ pub enum ServerEvent {
         block_id: BlockId,
         after_id: Option<BlockId>,
     },
+    /// Document was compacted — client must re-sync from full oplog.
+    SyncReset {
+        document_id: String,
+        generation: u64,
+    },
     /// An MCP resource's content was updated.
     ResourceUpdated {
         server: String,
@@ -331,6 +336,30 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let _ = self.event_tx.send(ServerEvent::BlockTextOps { document_id, block_id, ops });
+        Promise::ok(())
+    }
+
+    fn on_sync_reset(
+        self: Rc<Self>,
+        params: block_events::OnSyncResetParams,
+        _results: block_events::OnSyncResetResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let document_id = match params.get_document_id() {
+            Ok(s) => match read_text(s) {
+                Ok(s) => s,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let generation = params.get_generation();
+
+        let _ = self.event_tx.send(ServerEvent::SyncReset { document_id, generation });
         Promise::ok(())
     }
 }

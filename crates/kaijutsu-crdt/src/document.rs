@@ -1252,7 +1252,7 @@ impl BlockDocument {
     /// without having the oplog root operations.
     pub fn oplog_bytes(&self) -> Result<Vec<u8>> {
         let ops = self.ops_since(&Frontier::root());
-        serde_json::to_vec(&ops)
+        postcard::to_stdvec(&ops)
             .map_err(|e| CrdtError::Serialization(e.to_string()))
     }
 
@@ -1284,7 +1284,7 @@ impl BlockDocument {
         let mut doc = Document::new();
 
         // Merge server's full oplog
-        let ops: SerializedOpsOwned = serde_json::from_slice(oplog_bytes)
+        let ops: SerializedOpsOwned = postcard::from_bytes(oplog_bytes)
             .map_err(|e| CrdtError::Internal(format!("deserialize oplog: {}", e)))?;
         doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;
@@ -2306,5 +2306,60 @@ mod tests {
         let server_blocks = doc.blocks_ordered();
         assert_eq!(server_blocks.len(), 2);
         assert_eq!(server_blocks[1].id, client_id);
+    }
+
+    #[test]
+    fn test_compact_reduction_with_overwrites() {
+        let mut doc = BlockDocument::new("doc-1", "server");
+
+        // Create blocks, then heavily overwrite content (simulating status changes + edits)
+        let mut ids = Vec::new();
+        let mut last_id = None;
+        for i in 0..10 {
+            let role = if i % 2 == 0 { Role::User } else { Role::Model };
+            let id = doc.insert_block(
+                last_id.as_ref(), last_id.as_ref(),
+                role, BlockKind::Text, "initial content here", &format!("agent-{}", i),
+            ).unwrap();
+            ids.push(id.clone());
+            last_id = Some(id);
+        }
+
+        // Simulate heavy editing: delete and rewrite content multiple times
+        for id in &ids {
+            for round in 0..5 {
+                let current = doc.get_block_snapshot(id).unwrap().content;
+                let len = current.len();
+                // Delete all, then rewrite
+                doc.edit_text(id, 0, "", len).unwrap();
+                doc.edit_text(id, 0, &format!("rewritten content round {} for block", round), 0).unwrap();
+            }
+            // Multiple status toggles
+            doc.set_status(id, Status::Running).unwrap();
+            doc.set_status(id, Status::Error).unwrap();
+            doc.set_status(id, Status::Done).unwrap();
+        }
+
+        let oplog_before = doc.oplog_bytes().unwrap().len();
+        let blocks_before = doc.blocks_ordered();
+
+        doc.compact().unwrap();
+
+        let oplog_after = doc.oplog_bytes().unwrap().len();
+        let blocks_after = doc.blocks_ordered();
+
+        eprintln!(
+            "Compact: {} blocks, oplog {} -> {} bytes ({:.0}% reduction)",
+            blocks_before.len(), oplog_before, oplog_after,
+            (1.0 - oplog_after as f64 / oplog_before as f64) * 100.0,
+        );
+
+        assert_eq!(blocks_before.len(), blocks_after.len());
+        for (b, a) in blocks_before.iter().zip(blocks_after.iter()) {
+            assert_eq!(b.content, a.content, "block {} content mismatch", b.id);
+            assert_eq!(b.status, a.status, "block {} status mismatch", b.id);
+        }
+        // With delete+rewrite cycles, compaction should reduce oplog
+        assert!(oplog_after < oplog_before, "expected reduction: {} vs {}", oplog_after, oplog_before);
     }
 }

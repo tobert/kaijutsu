@@ -244,6 +244,14 @@ pub enum BlockFlow {
         #[serde(default)]
         source: OpSource,
     },
+
+    /// Document was compacted — clients must re-sync from full oplog.
+    SyncReset {
+        /// The document ID.
+        document_id: String,
+        /// New sync generation after compaction.
+        generation: u64,
+    },
 }
 
 impl BlockFlow {
@@ -256,6 +264,7 @@ impl BlockFlow {
             Self::StatusChanged { .. } => "block.status",
             Self::CollapsedChanged { .. } => "block.collapsed",
             Self::Moved { .. } => "block.moved",
+            Self::SyncReset { .. } => "block.sync_reset",
         }
     }
 
@@ -267,7 +276,8 @@ impl BlockFlow {
             | Self::Deleted { document_id, .. }
             | Self::StatusChanged { document_id, .. }
             | Self::CollapsedChanged { document_id, .. }
-            | Self::Moved { document_id, .. } => document_id,
+            | Self::Moved { document_id, .. }
+            | Self::SyncReset { document_id, .. } => document_id,
         }
     }
 
@@ -280,6 +290,7 @@ impl BlockFlow {
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }
             | Self::Moved { block_id, .. } => Some(block_id),
+            Self::SyncReset { .. } => None,
         }
     }
 
@@ -300,6 +311,7 @@ impl BlockFlow {
             | Self::StatusChanged { source, .. }
             | Self::CollapsedChanged { source, .. }
             | Self::Moved { source, .. } => *source,
+            Self::SyncReset { .. } => OpSource::Local,
         }
     }
 

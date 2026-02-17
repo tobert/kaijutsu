@@ -64,6 +64,8 @@ pub struct DocumentEntry {
     version: AtomicU64,
     /// Last agent to modify.
     last_agent: RwLock<String>,
+    /// Sync generation — bumped on compaction to force client re-sync.
+    sync_generation: AtomicU64,
 }
 
 impl DocumentEntry {
@@ -75,6 +77,7 @@ impl DocumentEntry {
             language,
             version: AtomicU64::new(0),
             last_agent: RwLock::new(agent_id.to_string()),
+            sync_generation: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +95,7 @@ impl DocumentEntry {
             language,
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id.to_string()),
+            sync_generation: AtomicU64::new(0),
         }
     }
 
@@ -114,6 +118,11 @@ impl DocumentEntry {
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.doc.is_empty()
+    }
+
+    /// Get the current sync generation.
+    pub fn sync_generation(&self) -> u64 {
+        self.sync_generation.load(Ordering::SeqCst)
     }
 }
 
@@ -279,6 +288,7 @@ impl BlockStore {
             language,
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id.clone()),
+            sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(id.clone(), entry);
 
@@ -392,6 +402,7 @@ impl BlockStore {
             language,
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id.clone()),
+            sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id.clone(), entry);
 
@@ -471,6 +482,7 @@ impl BlockStore {
             language,
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id.clone()),
+            sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id.clone(), entry);
 
@@ -547,7 +559,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -589,7 +601,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -632,7 +644,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, snapshot, ops_bytes)
         };
@@ -674,7 +686,7 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(&agent_id);
             (block_id, final_snapshot, ops_bytes)
         };
@@ -738,7 +750,7 @@ impl BlockStore {
             entry.touch(&agent_id);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text edits (high frequency during streaming)
 
@@ -785,7 +797,7 @@ impl BlockStore {
             entry.touch(&agent_id);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
@@ -861,7 +873,7 @@ impl BlockStore {
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
-            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
+            let ops_bytes = postcard::to_stdvec(&entry.doc.ops_since(&frontier_before))
                 .unwrap_or_default();
             (version, Self::diff_block_events(document_id, &before, &after, ops_bytes))
         };
@@ -884,7 +896,7 @@ impl BlockStore {
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
-            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
+            let ops_bytes = postcard::to_stdvec(&entry.doc.ops_since(&frontier_before))
                 .unwrap_or_default();
             (version, Self::diff_block_events(document_id, &before, &after, ops_bytes))
         };
@@ -1028,9 +1040,9 @@ impl BlockStore {
         for meta in document_metas {
             // Try to load snapshot for this document
             let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
-                // oplog_bytes contains JSON-encoded DocumentSnapshot
+                // oplog_bytes contains postcard-encoded DocumentSnapshot
                 if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
-                    match serde_json::from_slice::<DocumentSnapshot>(&oplog_bytes) {
+                    match postcard::from_bytes::<DocumentSnapshot>(&oplog_bytes) {
                         Ok(doc_snapshot) => {
                             tracing::debug!(
                                 document_id = %meta.id,
@@ -1063,13 +1075,11 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Compact a document's oplog by rebuilding from snapshot.
+    /// Compact a document's oplog silently (no SyncReset event).
     ///
-    /// This reduces the oplog to only the operations needed to represent
-    /// current state. Returns the serialized oplog size after compaction.
-    ///
-    /// Also saves the snapshot to the database if configured.
-    pub fn compact_document(&self, document_id: &str) -> Result<usize, String> {
+    /// Used by `get_document_state` auto-compaction where the client already
+    /// receives the compacted oplog in the same response.
+    pub fn compact_document_silent(&self, document_id: &str) -> Result<usize, String> {
         let mut entry = self.documents.get_mut(document_id)
             .ok_or_else(|| format!("Document {} not found", document_id))?;
 
@@ -1083,7 +1093,7 @@ impl BlockStore {
             old_bytes = old_size,
             new_bytes = new_size,
             reduction_pct = %((1.0 - new_size as f64 / old_size.max(1) as f64) * 100.0),
-            "Compacted document oplog"
+            "Compacted document oplog (silent)"
         );
 
         drop(entry);
@@ -1096,9 +1106,33 @@ impl BlockStore {
         Ok(new_size)
     }
 
+    /// Compact a document's oplog and notify connected clients.
+    ///
+    /// Bumps sync generation and emits `SyncReset` so clients re-fetch
+    /// the full state. Use this for explicit compaction requests (RPC).
+    /// For auto-compaction during `get_document_state`, use
+    /// `compact_document_silent` instead.
+    pub fn compact_document(&self, document_id: &str) -> Result<usize, String> {
+        let new_size = self.compact_document_silent(document_id)?;
+
+        // Bump sync generation and notify clients
+        let generation = if let Some(entry) = self.documents.get(document_id) {
+            entry.sync_generation.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            0
+        };
+
+        self.emit(BlockFlow::SyncReset {
+            document_id: document_id.to_string(),
+            generation,
+        });
+
+        Ok(new_size)
+    }
+
     /// Save a document's content to the database as a snapshot.
     ///
-    /// Stores the DocumentSnapshot as JSON in the `oplog_bytes` column.
+    /// Stores the DocumentSnapshot as postcard binary in the `oplog_bytes` column.
     pub fn save_snapshot(&self, document_id: &str) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
 
@@ -1107,8 +1141,8 @@ impl BlockStore {
         let version = entry.version() as i64;
         let content = entry.content();
 
-        // Serialize snapshot as JSON
-        let oplog_bytes = serde_json::to_vec(&snapshot)
+        // Serialize snapshot as binary (postcard)
+        let oplog_bytes = postcard::to_stdvec(&snapshot)
             .map_err(|e| format!("Failed to serialize snapshot: {}", e))?;
 
         drop(entry); // Release the read lock before acquiring DB lock
@@ -1514,7 +1548,7 @@ mod tests {
         };
 
         // Deserialize and merge incremental ops on client
-        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops)
+        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops)
             .expect("should deserialize ops");
 
         client.merge_ops_owned(serialized_ops)
@@ -1558,7 +1592,7 @@ mod tests {
         };
 
         // Client merges incremental ops
-        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
         client.merge_ops_owned(serialized_ops)
             .expect("should merge tool_call incremental ops");
 
@@ -1612,7 +1646,7 @@ mod tests {
         };
 
         // Client merges
-        let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
         client.merge_ops_owned(serialized_ops)
             .expect("should merge tool_result incremental ops");
 
@@ -1656,7 +1690,7 @@ mod tests {
                 _ => panic!("expected BlockInserted"),
             };
 
-            let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+            let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
             client.merge_ops_owned(serialized_ops)
                 .expect(&format!("should merge block {} incrementally", i));
         }
@@ -1710,7 +1744,7 @@ mod tests {
                 _ => panic!("expected TextOps event, got {:?}", msg.payload),
             };
 
-            let serialized_ops: SerializedOpsOwned = serde_json::from_slice(&ops).unwrap();
+            let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
             client.merge_ops_owned(serialized_ops)
                 .expect(&format!("should merge chunk '{}'", chunk));
         }
