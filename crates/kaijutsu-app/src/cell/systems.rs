@@ -910,7 +910,7 @@ pub fn spawn_expanded_block_view(
     } else if !should_show && entities.expanded_view.is_some() {
         // Despawn when leaving ExpandedBlock view
         for entity in existing_views.iter() {
-            commands.entity(entity).despawn();
+            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
         entities.expanded_view = None;
         info!("Despawned ExpandedBlockView");
@@ -1813,7 +1813,7 @@ pub fn spawn_block_cells(
                 ))
                 .id();
             if let Some(conv) = conv_entity {
-                commands.entity(conv).add_child(entity);
+                if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
             }
             container.add(block_id.clone(), entity);
         }
@@ -1894,7 +1894,7 @@ pub fn sync_role_headers(
                 ))
                 .id();
             if let Some(conv) = entities.conversation_container {
-                commands.entity(conv).add_child(entity);
+                if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
             }
 
             container.role_headers.push(entity);
@@ -2351,7 +2351,7 @@ pub fn reorder_conversation_children(
         prev_role = Some(block.role);
     }
 
-    commands.entity(conv_entity).replace_children(&ordered_children);
+    if let Ok(mut ec) = commands.get_entity(conv_entity) { ec.replace_children(&ordered_children); }
 }
 
 /// Position BlockCell text areas from ComputedNode (flex layout result).

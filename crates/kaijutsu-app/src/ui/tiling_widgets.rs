@@ -143,10 +143,10 @@ pub fn update_contexts_widget(
     // If there's an active notification, show as single text (despawn badges)
     if let Some(ref notif) = drift_state.notification {
         for (entity, _, _) in existing_badges.iter() {
-            commands.entity(entity).despawn();
+            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
         for entity in aux_entities.iter() {
-            commands.entity(entity).despawn();
+            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
         for child in widget_children.iter() {
             if let Ok(mut msdf_text) = texts.get_mut(child) {
@@ -192,10 +192,10 @@ pub fn update_contexts_widget(
         // Full rebuild: despawn existing badges and recreate in MRU order.
         // Badge count is <=5; always rebuilding ensures correct visual ordering.
         for (entity, _, _) in existing_badges.iter() {
-            commands.entity(entity).despawn();
+            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
         for entity in aux_entities.iter() {
-            commands.entity(entity).despawn();
+            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
 
         for (ctx_name, short, is_active) in &desired {
@@ -227,7 +227,7 @@ pub fn update_contexts_widget(
                     ));
                 })
                 .id();
-            commands.entity(widget_entity).add_child(badge);
+            if let Ok(mut ec) = commands.get_entity(widget_entity) { ec.add_child(badge); }
         }
 
         // Overflow indicator
@@ -251,7 +251,7 @@ pub fn update_contexts_widget(
                     ));
                 })
                 .id();
-            commands.entity(widget_entity).add_child(overflow);
+            if let Ok(mut ec) = commands.get_entity(widget_entity) { ec.add_child(overflow); }
         }
 
         // Staged count
@@ -275,17 +275,17 @@ pub fn update_contexts_widget(
                     ));
                 })
                 .id();
-            commands.entity(widget_entity).add_child(staged_text);
+            if let Ok(mut ec) = commands.get_entity(widget_entity) { ec.add_child(staged_text); }
         }
         return;
     }
 
     // No cached docs — despawn badges and fall back to single text
     for (entity, _, _) in existing_badges.iter() {
-        commands.entity(entity).despawn();
+        if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
     }
     for entity in aux_entities.iter() {
-        commands.entity(entity).despawn();
+        if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
     }
 
     // Fall back to drift state contexts as single text
