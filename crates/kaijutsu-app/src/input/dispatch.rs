@@ -28,11 +28,9 @@ use super::sequence::SequenceState;
 /// input, then emits `ActionFired` or `TextInputReceived` messages.
 /// Domain systems consume those messages instead of reading raw input.
 ///
-/// Known limitation: keyboard key repeat is not implemented. Holding keys
-/// like Backspace or arrows won't auto-repeat — only the initial press
-/// fires. Bevy delivers repeat events via `KeyboardInput` with
-/// `state.is_pressed()`, but OS repeat rate varies. A dedicated repeat
-/// timer system would provide consistent behavior.
+/// OS key repeat is allowed for text input (holding Backspace, typing
+/// repeated characters) but filtered out for action bindings to prevent
+/// accidental double-fires (e.g. Alt+V creating two splits).
 pub fn dispatch_input(
     mut keyboard: MessageReader<KeyboardInput>,
     mut mouse_wheel: MessageReader<MouseWheel>,
@@ -69,6 +67,7 @@ pub fn dispatch_input(
         }
 
         let key = event.key_code;
+        let is_repeat = event.repeat;
 
         // 1. Check sequence completion
         if sequence.pending.is_some() {
@@ -80,22 +79,30 @@ pub fn dispatch_input(
                 &active_contexts,
             ) {
                 sequence.clear();
-                action_writer.write(ActionFired(action));
+                if !is_repeat {
+                    action_writer.write(ActionFired(action));
+                }
                 continue;
             }
             // Key didn't complete a sequence — clear and fall through to direct match
-            sequence.clear();
+            if !is_repeat {
+                sequence.clear();
+            }
         }
 
-        // 2. Check if this key starts a sequence
-        if is_sequence_prefix(key, &input_map, &active_contexts) && no_modifiers_held(&keys) {
+        // 2. Check if this key starts a sequence (skip repeats)
+        if !is_repeat && is_sequence_prefix(key, &input_map, &active_contexts) && no_modifiers_held(&keys) {
             sequence.start(InputSource::Key(key));
             continue;
         }
 
         // 3. Check direct binding match
+        // Always check for a match — if bound, consume the event even on repeat
+        // to prevent fallthrough to text input (Bug: action leak on key repeat)
         if let Some(action) = find_direct_match(key, &keys, &input_map, &active_contexts) {
-            action_writer.write(ActionFired(action));
+            if !is_repeat {
+                action_writer.write(ActionFired(action));
+            }
             continue;
         }
 

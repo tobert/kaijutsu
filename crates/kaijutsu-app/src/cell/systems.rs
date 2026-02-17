@@ -2454,6 +2454,7 @@ pub fn apply_block_cell_positions(
     mut prev_scroll: Local<f32>,
     mut prev_visible_top: Local<f32>,
     mut prev_visible_bottom: Local<f32>,
+    mut prev_base_width: Local<f32>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -2467,15 +2468,18 @@ pub fn apply_block_cell_positions(
     // This respects the flex layout (North dock, ComposeBlock, South dock)
     // instead of relying on hardcoded constants that drift out of sync.
     // Computed BEFORE the early-return guard so bounds changes are always detected.
-    let Ok((node, transform)) = dag_view.single() else {
-        // No focused conversation container yet (normal during reconciler initialization)
-        debug!("apply_block_cell_positions: waiting for focused ConversationContainer");
-        return;
+    let (visible_top, visible_bottom, base_width) = if let Ok((node, transform)) = dag_view.single() {
+        let (_, _, translation) = transform.to_scale_angle_translation();
+        let content = node.content_box();
+        (translation.y + content.min.y, translation.y + content.max.y, content.width())
+    } else {
+        // No focused conversation container (e.g. reconciler rebuilding after split).
+        // Use cached bounds from previous frame to avoid text overflow.
+        if *prev_visible_top == 0.0 && *prev_visible_bottom == 0.0 {
+            return;
+        }
+        (*prev_visible_top, *prev_visible_bottom, *prev_base_width)
     };
-    let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = node.content_box();
-    let visible_top = translation.y + content.min.y;
-    let visible_bottom = translation.y + content.max.y;
 
     // === Performance optimization: skip if nothing changed ===
     let layout_changed = layout_gen.0 != *last_applied_gen;
@@ -2493,8 +2497,8 @@ pub fn apply_block_cell_positions(
     *prev_scroll = scroll_state.offset;
     *prev_visible_top = visible_top;
     *prev_visible_bottom = visible_bottom;
+    *prev_base_width = base_width;
     // === End performance optimization ===
-    let base_width = content.width();
     let visible_height = (visible_bottom - visible_top).max(100.0);
     let margin = layout.workspace_margin_left;
 
