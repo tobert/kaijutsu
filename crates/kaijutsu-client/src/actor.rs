@@ -736,6 +736,15 @@ impl RpcActor {
     /// The err_tx channel lets child tasks signal connection failures back
     /// to the main loop, which disconnects so the next command reconnects.
     async fn run(mut self, mut rx: mpsc::Receiver<RpcCommand>) {
+        // If created with an existing connection, register subscriptions now.
+        // (try_connect would do this, but ensure_connected skips when already connected)
+        if self.connection.is_some() {
+            if let Err(e) = self.setup_subscriptions().await {
+                log::warn!("Failed to setup subscriptions on existing connection: {e}");
+                self.disconnect();
+            }
+        }
+
         let (err_tx, mut err_rx) = mpsc::unbounded_channel::<()>();
 
         loop {
