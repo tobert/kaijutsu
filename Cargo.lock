@@ -5155,6 +5155,7 @@ dependencies = [
  "kaish-glob",
  "kaish-schema",
  "logos",
+ "nix 0.29.0",
  "procfs",
  "regex",
  "serde",

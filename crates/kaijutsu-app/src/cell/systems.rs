@@ -1198,6 +1198,19 @@ pub fn handle_block_events(
 
                 cached.synced_at_generation = sync_gen.0;
                 doc_cache.insert(document_id.clone(), cached);
+            } else if let Some(state) = initial_state {
+                // Reconnect case: cache entry exists but server has authoritative state
+                if let Some(cached) = doc_cache.get_mut(document_id) {
+                    match cached.sync.apply_initial_state(&mut cached.doc, &state.document_id, &state.ops) {
+                        Ok(result) => {
+                            info!("Cache: reconnect refresh for '{}' ({}) result: {:?}", context_name, document_id, result);
+                            cached.synced_at_generation = sync_gen.0;
+                        }
+                        Err(e) => {
+                            error!("Cache: reconnect refresh error for '{}' ({}): {}", context_name, document_id, e);
+                        }
+                    }
+                }
             }
 
             // If this is the first context or no active doc yet, make it active

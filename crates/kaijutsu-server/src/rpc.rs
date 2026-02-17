@@ -4934,8 +4934,6 @@ async fn process_llm_stream(
         let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
-        // Track stop reason
-        let mut stop_reason: Option<String> = None;
 
         log::debug!("Entering stream event loop");
         while let Some(event) = stream.next_event().await {
@@ -5007,12 +5005,11 @@ async fn process_llm_stream(
                     log::warn!("Unexpected ToolResult event during streaming");
                 }
 
-                StreamEvent::Done { stop_reason: sr, input_tokens, output_tokens } => {
+                StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
                     log::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
-                        sr, input_tokens, output_tokens
+                        stop_reason, input_tokens, output_tokens
                     );
-                    stop_reason = sr;
                 }
 
                 StreamEvent::Error(err) => {
@@ -5023,9 +5020,13 @@ async fn process_llm_stream(
             }
         }
 
-        // Check if we need to execute tools
-        if stop_reason.as_deref() != Some("tool_use") || tool_calls.is_empty() {
-            log::info!("Agentic loop complete - no more tool calls (stop_reason={:?})", stop_reason);
+        // Check if we need to execute tools.
+        // rig doesn't expose stop_reason through FinalCompletionResponse — its own
+        // agent uses the presence of tool calls as the continuation signal (see
+        // rig-core streaming.rs did_call_tool pattern). This is reliable because
+        // the API only emits ToolCall content blocks when stop_reason is "tool_use".
+        if tool_calls.is_empty() {
+            log::info!("Agentic loop complete - no tool calls this iteration");
             break;
         }
 
@@ -5070,24 +5071,39 @@ async fn process_llm_stream(
                     };
 
                     // Insert tool result block (CRDT DAG — each result parents its own tool_call)
+                    let mut result_block_id = None;
                     if let Some(ref tcb_id) = tool_call_block_id {
-                        if let Err(e) = documents.insert_tool_result(
+                        match documents.insert_tool_result(
                             &cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None,
                         ) {
-                            log::error!("Failed to insert tool result block: {}", e);
+                            Ok(id) => result_block_id = Some(id),
+                            Err(e) => log::error!("Failed to insert tool result block: {}", e),
                         }
                     }
 
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content: result_content,
-                        is_error,
-                    }
+                    (
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content: result_content,
+                            is_error,
+                        },
+                        result_block_id,
+                    )
                 }
             })
             .collect();
 
-        let tool_results = futures::future::join_all(futures).await;
+        let results_with_ids = futures::future::join_all(futures).await;
+
+        // Unzip and update last_block_id so the next iteration's blocks
+        // appear after tool results, not after tool calls.
+        let mut tool_results = Vec::new();
+        for (content_block, block_id_opt) in results_with_ids {
+            tool_results.push(content_block);
+            if let Some(id) = block_id_opt {
+                last_block_id = id;
+            }
+        }
 
         // Add assistant message with tool uses to conversation
         messages.push(LlmMessage::with_tool_uses(
