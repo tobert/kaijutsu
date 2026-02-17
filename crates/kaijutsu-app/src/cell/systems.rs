@@ -2130,10 +2130,11 @@ pub fn layout_block_cells(
     // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
     font_system: Res<SharedFontSystem>,
     mut metrics_cache: ResMut<FontMetricsCache>,
+    conv_containers: Query<&ComputedNode, With<super::components::ConversationContainer>>,
     windows: Query<&Window>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
-    mut last_window_size: Local<(f32, f32)>,
+    mut last_base_width: Local<f32>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -2149,30 +2150,30 @@ pub fn layout_block_cells(
 
     let mut y_offset = 0.0;
 
-    // Get window size for wrap width and visible height calculation
-    let (window_width, window_height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.resolution.width(), w.resolution.height()))
-        .unwrap_or((1280.0, 800.0));
+    let margin = layout.workspace_margin_left;
+
+    // Get pane width from ConversationContainer's ComputedNode (flex layout result).
+    // Falls back to window width on first frame before layout runs.
+    let base_width = entities.conversation_container
+        .and_then(|e| conv_containers.get(e).ok())
+        .map(|node| node.size().x)
+        .unwrap_or_else(|| {
+            windows.iter().next()
+                .map(|w| w.resolution.width())
+                .unwrap_or(1280.0)
+        });
+    let base_width = base_width - (margin * 2.0);
 
     // === Performance optimization: skip if nothing changed ===
-    // Check if content or window changed since last layout
-    let window_changed = (window_width, window_height) != *last_window_size;
+    let width_changed = (base_width - *last_base_width).abs() > 1.0;
     let content_changed = layout_gen.0 != *last_layout_gen;
 
-    if !window_changed && !content_changed {
-        // Nothing to re-layout - skip expensive computation
+    if !width_changed && !content_changed {
         return;
     }
 
-    // Record current state for next frame comparison
-    *last_window_size = (window_width, window_height);
+    *last_base_width = base_width;
     *last_layout_gen = layout_gen.0;
-    // === End performance optimization ===
-
-    let margin = layout.workspace_margin_left;
-    let base_width = window_width - (margin * 2.0);
 
     // Note: visible_height is updated in smooth_scroll from ConversationContainer's ComputedNode
 
@@ -2434,171 +2435,6 @@ pub fn position_role_headers_from_flex(
     }
 }
 
-/// Apply layout positions to BlockCell MsdfTextAreaConfig for rendering.
-///
-/// **Performance optimization:** This system tracks the last-applied layout generation
-/// and scroll offset. It skips work when neither layout nor scroll has changed.
-/// Combined with layout_block_cells optimization, this means scrolling only runs
-/// this lightweight position update, not the expensive layout computation.
-#[allow(dead_code)] // Legacy — kept for rollback reference during flex migration
-pub fn apply_block_cell_positions(
-    entities: Res<EditorEntities>,
-    containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut MsdfTextAreaConfig, Option<&super::block_border::BlockBorderStyle>), With<BlockCell>>,
-    mut role_headers: Query<(&RoleHeaderLayout, &mut MsdfTextAreaConfig), (With<RoleHeader>, Without<BlockCell>)>,
-    layout: Res<WorkspaceLayout>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-    dag_view: Query<(&ComputedNode, &UiGlobalTransform), (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
-    layout_gen: Res<super::components::LayoutGeneration>,
-    mut last_applied_gen: Local<u64>,
-    mut prev_scroll: Local<f32>,
-    mut prev_visible_top: Local<f32>,
-    mut prev_visible_bottom: Local<f32>,
-    mut prev_base_width: Local<f32>,
-) {
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
-
-    // Derive visible bounds from the DagView's actual computed layout.
-    // This respects the flex layout (North dock, ComposeBlock, South dock)
-    // instead of relying on hardcoded constants that drift out of sync.
-    // Computed BEFORE the early-return guard so bounds changes are always detected.
-    let (visible_top, visible_bottom, base_width) = if let Ok((node, transform)) = dag_view.single() {
-        let (_, _, translation) = transform.to_scale_angle_translation();
-        let content = node.content_box();
-        (translation.y + content.min.y, translation.y + content.max.y, content.width())
-    } else {
-        // No focused conversation container (e.g. reconciler rebuilding after split).
-        // Use cached bounds from previous frame to avoid text overflow.
-        if *prev_visible_top == 0.0 && *prev_visible_bottom == 0.0 {
-            return;
-        }
-        (*prev_visible_top, *prev_visible_bottom, *prev_base_width)
-    };
-
-    // === Performance optimization: skip if nothing changed ===
-    let layout_changed = layout_gen.0 != *last_applied_gen;
-    // Use 1.0 pixel threshold to prevent sub-pixel jitter during streaming
-    let scroll_changed = (scroll_state.offset - *prev_scroll).abs() >= 1.0;
-    let bounds_changed = (visible_top - *prev_visible_top).abs() >= 1.0
-        || (visible_bottom - *prev_visible_bottom).abs() >= 1.0;
-
-    if !layout_changed && !scroll_changed && !bounds_changed {
-        return;
-    }
-
-    // Record current state for next frame comparison
-    *last_applied_gen = layout_gen.0;
-    *prev_scroll = scroll_state.offset;
-    *prev_visible_top = visible_top;
-    *prev_visible_bottom = visible_bottom;
-    *prev_base_width = base_width;
-    // === End performance optimization ===
-    let visible_height = (visible_bottom - visible_top).max(100.0);
-    let margin = layout.workspace_margin_left;
-
-    // Update scroll state with visible area
-    // Note: smooth_scroll handles clamping, so we don't call clamp_target() here
-    scroll_state.visible_height = visible_height;
-
-    let scroll_offset = scroll_state.offset;
-
-    for entity in &container.block_cells {
-        let Ok((block_layout, mut config, border_style)) = block_cells.get_mut(*entity) else {
-            continue;
-        };
-
-        // Calculate actual position with scroll
-        let indent = block_layout.indent_level as f32 * INDENT_WIDTH;
-        let left = margin + indent;
-        let width = base_width - indent;
-        let content_top = visible_top + block_layout.y_offset - scroll_offset;
-
-        // Inset text when a shader border is present
-        let pad_left = border_style.map(|s| s.padding.left).unwrap_or(0.0);
-        let pad_top = border_style.map(|s| s.padding.top).unwrap_or(0.0);
-        let pad_right = border_style.map(|s| s.padding.right).unwrap_or(0.0);
-
-        config.left = left + pad_left;
-        config.top = content_top + pad_top;
-        config.scale = 1.0;
-
-        // Clamp bounds to intersection of visible area and block area.
-        // Snap to full line boundaries so partial lines aren't rendered at edges.
-        let block_bottom = content_top + block_layout.height;
-        let mut clamped_top = visible_top.max(content_top + pad_top).max(0.0);
-        let mut clamped_bottom = visible_bottom.min(block_bottom).max(clamped_top + 1.0);
-
-        let lh = layout.line_height;
-        // Bottom edge: snap UP to last full line boundary within the block
-        if block_bottom > visible_bottom && lh > 0.0 {
-            let full_lines = ((clamped_bottom - (content_top + pad_top)) / lh).floor();
-            let snapped = content_top + pad_top + full_lines * lh;
-            if snapped > clamped_top + 1.0 {
-                clamped_bottom = snapped;
-            }
-        }
-        // Top edge: snap DOWN to next full line boundary within the block
-        if (content_top + pad_top) < visible_top && lh > 0.0 {
-            let hidden = (clamped_top - (content_top + pad_top)) / lh;
-            let snapped = content_top + pad_top + hidden.ceil() * lh;
-            if snapped < clamped_bottom - 1.0 {
-                clamped_top = snapped;
-            }
-        }
-
-        config.bounds = crate::text::TextBounds {
-            left: (left + pad_left) as i32,
-            top: clamped_top as i32,
-            right: (left + width - pad_right) as i32,
-            bottom: clamped_bottom as i32,
-        };
-    }
-
-    // Position role headers
-    for entity in &container.role_headers {
-        let Ok((header_layout, mut config)) = role_headers.get_mut(*entity) else {
-            continue;
-        };
-
-        let content_top = visible_top + header_layout.y_offset - scroll_offset;
-        let header_bottom = content_top + ROLE_HEADER_HEIGHT;
-        let mut clamped_top = visible_top.max(content_top).max(0.0);
-        let mut clamped_bottom = visible_bottom.min(header_bottom).max(clamped_top + 1.0);
-
-        // Snap role headers to full line boundaries at edges (same as blocks)
-        let lh = layout.line_height;
-        if header_bottom > visible_bottom && lh > 0.0 {
-            let full_lines = ((clamped_bottom - content_top) / lh).floor();
-            let snapped = content_top + full_lines * lh;
-            if snapped > clamped_top + 1.0 {
-                clamped_bottom = snapped;
-            }
-        }
-        if content_top < visible_top && lh > 0.0 {
-            let hidden = (clamped_top - content_top) / lh;
-            let snapped = content_top + hidden.ceil() * lh;
-            if snapped < clamped_bottom - 1.0 {
-                clamped_top = snapped;
-            }
-        }
-
-        config.left = margin;
-        config.top = content_top;
-        config.scale = 1.0;
-        config.bounds = crate::text::TextBounds {
-            left: margin as i32,
-            top: clamped_top as i32,
-            right: (margin + base_width) as i32,
-            bottom: clamped_bottom as i32,
-        };
-    }
-}
 
 // ============================================================================
 // TURN/ROLE HEADER SYSTEMS (Removed in DAG migration)
