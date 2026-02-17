@@ -1344,6 +1344,26 @@ impl BlockDocument {
         }
     }
 
+    /// Compact the oplog by rebuilding from a snapshot of current state.
+    ///
+    /// This replaces the internal DTE Document with a fresh one containing only
+    /// the operations needed to represent current block state — no edit history,
+    /// no deleted block tombstones beyond what the snapshot captures.
+    ///
+    /// Returns the new frontier after compaction, or an error if something went wrong.
+    ///
+    /// **Warning:** Any connected client holding a pre-compaction frontier will get
+    /// DataMissing on the next incremental op. Callers must handle re-sync.
+    pub fn compact(&mut self) -> Result<Frontier> {
+        let snapshot = self.snapshot();
+        let compacted = Self::from_snapshot(snapshot, &self.agent_id_str);
+        self.doc = compacted.doc;
+        self.agent = compacted.agent;
+        self.next_seq = compacted.next_seq;
+        // version stays the same — compaction doesn't change logical version
+        Ok(self.frontier())
+    }
+
     /// Restore from a snapshot.
     pub fn from_snapshot(snapshot: DocumentSnapshot, agent_id: impl Into<String>) -> Self {
         let agent_id = agent_id.into();
@@ -2219,5 +2239,72 @@ mod tests {
         let bytes = doc.oplog_bytes();
         assert!(bytes.is_ok(), "oplog_bytes should succeed for valid document");
         assert!(!bytes.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_compact_preserves_blocks() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+
+        // Add several blocks with content
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!", "user:amy").unwrap();
+        let id2 = doc.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!", "model:claude").unwrap();
+        let id3 = doc.insert_block(Some(&id2), Some(&id2), Role::Model, BlockKind::Thinking, "Let me think...", "model:claude").unwrap();
+
+        // Edit content to grow the oplog
+        doc.edit_text(&id1, 6, " World", 0).unwrap();
+        doc.edit_text(&id2, 9, " How are you?", 0).unwrap();
+        doc.set_status(&id3, Status::Done).unwrap();
+
+        let blocks_before = doc.blocks_ordered();
+        let oplog_before = doc.oplog_bytes().unwrap().len();
+
+        // Compact
+        let new_frontier = doc.compact();
+        assert!(new_frontier.is_ok());
+
+        let blocks_after = doc.blocks_ordered();
+        let oplog_after = doc.oplog_bytes().unwrap().len();
+
+        // Blocks should be identical
+        assert_eq!(blocks_before.len(), blocks_after.len());
+        for (before, after) in blocks_before.iter().zip(blocks_after.iter()) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.content, after.content);
+            assert_eq!(before.role, after.role);
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.status, after.status);
+        }
+
+        // Oplog should be smaller (no edit history, just reconstructed state)
+        assert!(oplog_after <= oplog_before, "oplog should not grow: {} vs {}", oplog_after, oplog_before);
+    }
+
+    #[test]
+    fn test_compact_then_new_ops() {
+        let mut doc = BlockDocument::new("doc-1", "server");
+
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "user:amy").unwrap();
+        doc.edit_text(&id1, 5, " message", 0).unwrap();
+
+        // Compact the server doc
+        doc.compact().unwrap();
+
+        // A fresh client should be able to sync from the compacted oplog
+        let mut client = BlockDocument::new_for_sync("doc-1", "client");
+        let server_ops = doc.ops_since(&Frontier::root());
+        client.merge_ops_owned(server_ops).unwrap();
+
+        let client_blocks = client.blocks_ordered();
+        assert_eq!(client_blocks.len(), 1);
+        assert_eq!(client_blocks[0].content, "First message");
+
+        // Client should be able to send new ops back
+        let client_id = client.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Reply", "model:claude").unwrap();
+        let client_ops = client.ops_since(&doc.frontier());
+        doc.merge_ops_owned(client_ops).unwrap();
+
+        let server_blocks = doc.blocks_ordered();
+        assert_eq!(server_blocks.len(), 2);
+        assert_eq!(server_blocks[1].id, client_id);
     }
 }

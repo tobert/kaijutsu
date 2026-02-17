@@ -1686,6 +1686,28 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        // Check oplog size — compact if over 100KB to keep initial sync fast
+        let oplog_bytes = doc.doc.oplog_bytes().unwrap_or_default();
+        let needs_compaction = oplog_bytes.len() > 100_000;
+        drop(doc); // Release read ref before potential compaction
+
+        if needs_compaction {
+            if let Err(e) = kernel.documents.compact_document(&cell_id) {
+                log::warn!("Failed to compact document {}: {}", cell_id, e);
+            }
+        }
+
+        // Re-acquire read ref (post-compaction if it happened)
+        let doc = match kernel.documents.get(&cell_id) {
+            Some(d) => d,
+            None => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "cell '{}' not found in kernel '{}'",
+                    cell_id, self.kernel_id
+                )));
+            }
+        };
+
         let mut cell_state = results.get().init_state();
         cell_state.set_document_id(&cell_id);
         cell_state.reborrow().set_version(doc.version());

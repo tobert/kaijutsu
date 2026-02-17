@@ -853,10 +853,21 @@ impl BlockStore {
 
     /// Merge remote operations into a document.
     pub fn merge_ops(&self, document_id: &str, ops: SerializedOps<'_>) -> Result<u64, String> {
-        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
-        entry.doc.merge_ops(ops).map_err(|e| e.to_string())?;
-        let version = entry.doc.version();
-        entry.version.store(version, Ordering::SeqCst);
+        let (version, events) = {
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+            let before = entry.doc.blocks_ordered();
+            let frontier_before = entry.doc.frontier();
+            entry.doc.merge_ops(ops).map_err(|e| e.to_string())?;
+            let version = entry.doc.version();
+            entry.version.store(version, Ordering::SeqCst);
+            let after = entry.doc.blocks_ordered();
+            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
+                .unwrap_or_default();
+            (version, Self::diff_block_events(document_id, &before, &after, ops_bytes))
+        };
+        for event in events {
+            self.emit(event);
+        }
         Ok(version)
     }
 
@@ -865,11 +876,100 @@ impl BlockStore {
     /// Use this when receiving serialized ops that have been deserialized
     /// into the owned form (e.g., from network RPC via pushOps).
     pub fn merge_ops_owned(&self, document_id: &str, ops: SerializedOpsOwned) -> Result<u64, String> {
-        let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
-        entry.doc.merge_ops_owned(ops).map_err(|e| e.to_string())?;
-        let version = entry.doc.version();
-        entry.version.store(version, Ordering::SeqCst);
+        let (version, events) = {
+            let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
+            let before = entry.doc.blocks_ordered();
+            let frontier_before = entry.doc.frontier();
+            entry.doc.merge_ops_owned(ops).map_err(|e| e.to_string())?;
+            let version = entry.doc.version();
+            entry.version.store(version, Ordering::SeqCst);
+            let after = entry.doc.blocks_ordered();
+            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
+                .unwrap_or_default();
+            (version, Self::diff_block_events(document_id, &before, &after, ops_bytes))
+        };
+        for event in events {
+            self.emit(event);
+        }
         Ok(version)
+    }
+
+    /// Compare block snapshots before/after a merge and produce BlockFlow events.
+    ///
+    /// Detects new blocks (Inserted), removed blocks (Deleted), status changes,
+    /// collapsed changes, and text changes. All events carry `OpSource::Remote`
+    /// and share the same ops blob (CRDT dedup handles multiple merges).
+    fn diff_block_events(
+        document_id: &str,
+        before: &[BlockSnapshot],
+        after: &[BlockSnapshot],
+        ops: Vec<u8>,
+    ) -> Vec<BlockFlow> {
+        use std::collections::HashMap;
+
+        let before_map: HashMap<&BlockId, &BlockSnapshot> =
+            before.iter().map(|b| (&b.id, b)).collect();
+        let after_map: HashMap<&BlockId, &BlockSnapshot> =
+            after.iter().map(|b| (&b.id, b)).collect();
+
+        let mut events = Vec::new();
+
+        // New blocks
+        for (i, snap) in after.iter().enumerate() {
+            if !before_map.contains_key(&snap.id) {
+                let after_id = if i > 0 { Some(after[i - 1].id.clone()) } else { None };
+                events.push(BlockFlow::Inserted {
+                    document_id: document_id.to_string(),
+                    block: snap.clone(),
+                    after_id,
+                    ops: ops.clone(),
+                    source: OpSource::Remote,
+                });
+            }
+        }
+
+        // Deleted blocks
+        for snap in before {
+            if !after_map.contains_key(&snap.id) {
+                events.push(BlockFlow::Deleted {
+                    document_id: document_id.to_string(),
+                    block_id: snap.id.clone(),
+                    source: OpSource::Remote,
+                });
+            }
+        }
+
+        // Changes to existing blocks
+        for snap in after {
+            if let Some(old) = before_map.get(&snap.id) {
+                if old.status != snap.status {
+                    events.push(BlockFlow::StatusChanged {
+                        document_id: document_id.to_string(),
+                        block_id: snap.id.clone(),
+                        status: snap.status,
+                        source: OpSource::Remote,
+                    });
+                }
+                if old.collapsed != snap.collapsed {
+                    events.push(BlockFlow::CollapsedChanged {
+                        document_id: document_id.to_string(),
+                        block_id: snap.id.clone(),
+                        collapsed: snap.collapsed,
+                        source: OpSource::Remote,
+                    });
+                }
+                if old.content != snap.content {
+                    events.push(BlockFlow::TextOps {
+                        document_id: document_id.to_string(),
+                        block_id: snap.id.clone(),
+                        ops: ops.clone(),
+                        source: OpSource::Remote,
+                    });
+                }
+            }
+        }
+
+        events
     }
 
     /// Get the current frontier for a document.
@@ -961,6 +1061,39 @@ impl BlockStore {
         }
 
         Ok(())
+    }
+
+    /// Compact a document's oplog by rebuilding from snapshot.
+    ///
+    /// This reduces the oplog to only the operations needed to represent
+    /// current state. Returns the serialized oplog size after compaction.
+    ///
+    /// Also saves the snapshot to the database if configured.
+    pub fn compact_document(&self, document_id: &str) -> Result<usize, String> {
+        let mut entry = self.documents.get_mut(document_id)
+            .ok_or_else(|| format!("Document {} not found", document_id))?;
+
+        let old_size = entry.doc.oplog_bytes().map(|b| b.len()).unwrap_or(0);
+        entry.doc.compact()
+            .map_err(|e| format!("Compact failed: {}", e))?;
+        let new_size = entry.doc.oplog_bytes().map(|b| b.len()).unwrap_or(0);
+
+        tracing::info!(
+            document_id = %document_id,
+            old_bytes = old_size,
+            new_bytes = new_size,
+            reduction_pct = %((1.0 - new_size as f64 / old_size.max(1) as f64) * 100.0),
+            "Compacted document oplog"
+        );
+
+        drop(entry);
+
+        // Save compacted state to DB
+        if self.db.is_some() {
+            self.save_snapshot(document_id)?;
+        }
+
+        Ok(new_size)
     }
 
     /// Save a document's content to the database as a snapshot.
@@ -1585,5 +1718,111 @@ mod tests {
         // Verify final content
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "Hello World!");
+    }
+
+    /// Test that merge_ops emits BlockFlow events for new blocks.
+    ///
+    /// Simulates the pushOps RPC path: one store inserts a block, serializes
+    /// the ops, another store merges them — and subscribers see the Inserted event.
+    #[tokio::test]
+    async fn test_merge_ops_emits_inserted_event() {
+        let (server, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+
+        server.create_document("merge-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Get oplog before insertion (to compute incremental ops)
+        let frontier_before = server.frontier("merge-test").unwrap();
+
+        // Insert a block on the server (this emits Inserted locally)
+        let _block_id = server.insert_block(
+            "merge-test", None, None, Role::User, BlockKind::Text, "hello from remote",
+        ).unwrap();
+
+        // Drain the local Inserted event
+        let msg = sub.try_recv().expect("should get Inserted from insert_block");
+        assert!(matches!(msg.payload, BlockFlow::Inserted { .. }));
+
+        // Get the incremental ops that represent this insertion
+        let ops = server.ops_since("merge-test", &frontier_before).unwrap();
+
+        // Now create a second store (simulating a different server or the merge path)
+        // and merge those ops into a document that starts from the pre-insertion state.
+        let (receiver, recv_bus) = store_with_flows();
+        let mut recv_sub = recv_bus.subscribe("block.>");
+
+        // Create the document on receiver from the initial oplog (before the insert)
+        let initial_oplog = {
+            // We need a clean document — create fresh
+            receiver.create_document("merge-test".into(), DocumentKind::Conversation, None).unwrap();
+            ()
+        };
+
+        // Merge the remote ops
+        receiver.merge_ops_owned("merge-test", ops).unwrap();
+
+        // The receiver's FlowBus should have an Inserted event
+        let msg = recv_sub.try_recv().expect("merge_ops should emit Inserted event");
+        match msg.payload {
+            BlockFlow::Inserted { document_id, block, .. } => {
+                assert_eq!(document_id, "merge-test");
+                assert_eq!(block.content, "hello from remote");
+                assert_eq!(block.kind, BlockKind::Text);
+            }
+            other => panic!("expected Inserted, got {:?}", other),
+        }
+    }
+
+    /// Test that merge_ops emits StatusChanged and TextOps events for existing blocks.
+    #[tokio::test]
+    async fn test_merge_ops_emits_status_and_text_events() {
+        // Server A: will produce the block + modifications
+        let (server_a, _) = store_with_flows();
+        server_a.create_document("diff-test".into(), DocumentKind::Conversation, None).unwrap();
+
+        // Insert a block on A
+        let block_id = server_a.insert_block(
+            "diff-test", None, None, Role::Model, BlockKind::Text, "initial",
+        ).unwrap();
+
+        // Snapshot A's insert ops for receiver's initial sync
+        let insert_ops = {
+            let entry = server_a.get("diff-test").unwrap();
+            entry.doc.ops_since(&kaijutsu_crdt::Frontier::root())
+        };
+
+        // Receiver: create doc and merge insert ops (gets block at initial state)
+        let (receiver, recv_bus) = store_with_flows();
+        receiver.create_document("diff-test".into(), DocumentKind::Conversation, None).unwrap();
+        receiver.merge_ops_owned("diff-test", insert_ops).unwrap();
+
+        // Capture receiver's frontier before A's modifications
+        let recv_frontier = receiver.frontier("diff-test").unwrap();
+
+        // Now modify the block on A: change status (Done→Running) and edit text
+        server_a.set_status("diff-test", &block_id, Status::Running).unwrap();
+        server_a.edit_text("diff-test", &block_id, 7, " content", 0).unwrap();
+
+        // Get incremental ops covering A's modifications (since receiver's frontier)
+        let diff_ops = server_a.ops_since("diff-test", &recv_frontier).unwrap();
+
+        // Subscribe AFTER initial sync, before merging the diff
+        let mut recv_sub = recv_bus.subscribe("block.>");
+
+        // Merge the modifications
+        receiver.merge_ops_owned("diff-test", diff_ops).unwrap();
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(msg) = recv_sub.try_recv() {
+            events.push(msg.payload);
+        }
+
+        // Should have StatusChanged and TextOps events
+        let has_status = events.iter().any(|e| matches!(e, BlockFlow::StatusChanged { status: Status::Running, .. }));
+        let has_text = events.iter().any(|e| matches!(e, BlockFlow::TextOps { .. }));
+
+        assert!(has_status, "should emit StatusChanged, got: {:?}", events);
+        assert!(has_text, "should emit TextOps, got: {:?}", events);
     }
 }
