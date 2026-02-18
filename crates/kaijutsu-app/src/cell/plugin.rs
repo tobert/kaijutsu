@@ -180,6 +180,9 @@ impl Plugin for CellPlugin {
                 // Block border style determination (after buffer sync)
                 block_border::determine_block_border_style
                     .after(systems::sync_block_cell_buffers),
+                // MSDF measure update (after buffer sync, feeds into taffy layout)
+                super::measure::update_msdf_measures
+                    .after(systems::sync_block_cell_buffers),
             )
                 .in_set(CellPhase::Buffer),
         );
@@ -199,36 +202,18 @@ impl Plugin for CellPlugin {
                 systems::reorder_conversation_children.after(systems::update_block_cell_nodes),
                 // Smooth scroll (uses content_height from layout)
                 systems::smooth_scroll.after(systems::layout_block_cells),
-                // (Legacy apply_block_cell_positions removed — flex positioning takes over)
-                // Flex-based positioning (after Bevy's UI layout)
-                systems::position_block_cells_from_flex.after(bevy::ui::UiSystems::Prepare),
-                systems::position_role_headers_from_flex.after(bevy::ui::UiSystems::Prepare),
-                // Compose block positioning (after Bevy's UI layout)
-                systems::position_compose_block.after(bevy::ui::UiSystems::Prepare),
-                // Cursor positioning
+                // Cursor positioning (blinking, doesn't need UiGlobalTransform)
                 systems::update_cursor,
                 systems::update_block_edit_cursor.after(systems::update_cursor),
-                // Compose block cursor (Input mode, no inline edit active)
-                systems::update_compose_cursor
-                    .after(systems::update_cursor)
-                    .after(systems::position_compose_block),
             )
                 .in_set(CellPhase::Layout),
         );
 
-        // Layout phase part 2: borders + frames
+        // Layout phase part 2: borders + frames (non-position-dependent)
         app.add_systems(
             Update,
             (
-                // Block border systems
-                block_border::spawn_block_borders
-                    .after(systems::position_block_cells_from_flex),
-                // (Legacy layout_block_borders removed — flex positioning takes over)
-                block_border::layout_block_borders_from_flex
-                    .after(block_border::spawn_block_borders)
-                    .after(bevy::ui::UiSystems::Prepare),
-                block_border::update_block_border_state
-                    .after(block_border::spawn_block_borders),
+                block_border::update_block_border_state,
                 block_border::cleanup_block_borders,
                 // 9-slice frame layout
                 frame_assembly::spawn_nine_slice_frames,
@@ -238,6 +223,29 @@ impl Plugin for CellPlugin {
                 frame_assembly::cleanup_nine_slice_frames,
             )
                 .in_set(CellPhase::Layout),
+        );
+
+        // ====================================================================
+        // PostUpdate — Systems that read UiGlobalTransform (set by UiSystems::Layout)
+        // Must run in PostUpdate so layout values are fresh, not one frame behind.
+        // ====================================================================
+        app.add_systems(
+            PostUpdate,
+            (
+                // Flex-based positioning (reads UiGlobalTransform)
+                systems::position_block_cells_from_flex,
+                systems::position_role_headers_from_flex,
+                systems::position_compose_block,
+                // Compose cursor depends on compose position
+                systems::update_compose_cursor
+                    .after(systems::position_compose_block),
+                // Block border systems (depend on block cell positions)
+                block_border::spawn_block_borders
+                    .after(systems::position_block_cells_from_flex),
+                block_border::layout_block_borders_from_flex
+                    .after(block_border::spawn_block_borders),
+            )
+                .after(bevy::ui::UiSystems::Layout),
         );
     }
 }
