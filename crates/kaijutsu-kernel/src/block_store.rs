@@ -249,9 +249,16 @@ impl BlockStore {
                         parent_document: None,
                         created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
                     };
-                    db_guard
-                        .create_document(&meta)
-                        .map_err(|e| format!("DB error: {}", e))?;
+                    match db_guard.create_document(&meta) {
+                        Ok(()) => {}
+                        Err(e) if e.to_string().contains("UNIQUE constraint") => {
+                            // Document exists in DB (e.g., load_from_db skipped a
+                            // corrupted snapshot) but not in memory. Proceed with
+                            // DashMap insert so the document becomes usable again.
+                            tracing::warn!(document_id = %id, "Document already in DB but not in memory, recovering");
+                        }
+                        Err(e) => return Err(format!("DB error: {}", e)),
+                    }
                 }
 
                 let agent_id = self.agent_id();
