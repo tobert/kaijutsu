@@ -10,11 +10,11 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
 };
 
-use super::{ActivityState, Constellation, ConstellationNode, ContextNode};
+use super::{ActivityState, Constellation, ContextNode};
 use crate::ui::theme::Theme;
 
 /// Size of mini-render textures (square)
-pub const MINI_RENDER_SIZE: u32 = 192;
+pub const MINI_RENDER_SIZE: u32 = 256;
 
 /// Component marking a mini-render camera
 #[derive(Component)]
@@ -49,7 +49,6 @@ pub fn setup_mini_render_systems(app: &mut App) {
         (
             spawn_mini_renders,
             update_mini_render_content,
-            handle_mini_render_click,
             cleanup_removed_mini_renders,
         )
             .chain(),
@@ -266,23 +265,6 @@ fn update_mini_render_content(
                     _ => theme.fg_dim,
                 };
             }
-        }
-    }
-}
-
-/// Handle clicking on constellation nodes to focus them and switch context.
-fn handle_mini_render_click(
-    mut constellation: ResMut<Constellation>,
-    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    node_query: Query<(&ConstellationNode, &Interaction), Changed<Interaction>>,
-) {
-    for (node, interaction) in node_query.iter() {
-        if *interaction == Interaction::Pressed {
-            info!("Mini-render clicked: {}", node.context_id);
-            constellation.focus(&node.context_id);
-            switch_writer.write(crate::cell::ContextSwitchRequested {
-                context_name: node.context_id.clone(),
-            });
         }
     }
 }

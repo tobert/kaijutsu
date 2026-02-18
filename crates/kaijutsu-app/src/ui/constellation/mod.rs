@@ -390,19 +390,21 @@ fn handle_node_click(
     mut constellation: ResMut<Constellation>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
+    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
+    mut focus: ResMut<crate::input::focus::FocusArea>,
 ) {
     for (interaction, node) in nodes.iter() {
         if *interaction == Interaction::Pressed {
-            // Don't switch if already focused
-            if constellation.focus_id.as_deref() == Some(&node.context_id) {
-                continue;
-            }
-
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
             switch_writer.write(crate::cell::ContextSwitchRequested {
                 context_name: node.context_id.clone(),
             });
+            // Dismiss constellation and switch to compose
+            if let Some(ref mut vis) = constellation_visible {
+                vis.0 = false;
+            }
+            *focus = crate::input::focus::FocusArea::Compose;
         }
     }
 }

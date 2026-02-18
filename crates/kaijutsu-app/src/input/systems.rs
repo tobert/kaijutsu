@@ -563,15 +563,16 @@ use crate::ui::constellation::{
 /// leaking when a Dialog overlays the (still-visible) constellation.
 pub fn handle_constellation_nav(
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
+    mut focus: ResMut<FocusArea>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
 ) {
-    if !matches!(*focus_area, FocusArea::Constellation) {
+    if !matches!(*focus, FocusArea::Constellation) {
         return;
     }
 
@@ -601,12 +602,16 @@ pub fn handle_constellation_nav(
                 camera.reset();
             }
             Action::Activate => {
-                // Enter on focused node → switch context
+                // Enter on focused node → switch context and dismiss constellation
                 if let Some(ref focus_id) = constellation.focus_id {
                     info!("Constellation: switching to {}", focus_id);
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: focus_id.clone(),
                     });
+                    if let Some(ref mut vis) = constellation_visible {
+                        vis.0 = false;
+                    }
+                    *focus = FocusArea::Compose;
                 }
             }
             Action::NextContext => {
@@ -615,6 +620,10 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: id,
                     });
+                    if let Some(ref mut vis) = constellation_visible {
+                        vis.0 = false;
+                    }
+                    *focus = FocusArea::Compose;
                 }
             }
             Action::PrevContext => {
@@ -623,6 +632,10 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: id,
                     });
+                    if let Some(ref mut vis) = constellation_visible {
+                        vis.0 = false;
+                    }
+                    *focus = FocusArea::Compose;
                 }
             }
             Action::ToggleAlternate => {
@@ -631,6 +644,10 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: alt_id,
                     });
+                    if let Some(ref mut vis) = constellation_visible {
+                        vis.0 = false;
+                    }
+                    *focus = FocusArea::Compose;
                 }
             }
             Action::ConstellationFork => {

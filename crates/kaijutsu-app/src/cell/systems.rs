@@ -1433,6 +1433,11 @@ pub fn handle_context_switch(
         let target_doc_id = match doc_cache.document_id_for_context(context_name) {
             Some(id) => id.to_string(),
             None => {
+                // Already pending for this context? Skip duplicate spawn.
+                if pending_switch.0.as_deref() == Some(context_name.as_str()) {
+                    continue;
+                }
+
                 // Cache miss — spawn a new actor to join the context, then auto-switch
                 info!(
                     "Context switch: cache miss for '{}', spawning actor to join",
