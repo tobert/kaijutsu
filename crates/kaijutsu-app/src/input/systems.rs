@@ -20,7 +20,7 @@ use crate::ui::constellation::ConstellationVisible;
 pub fn handle_focus_cycle(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    constellation_visible: Option<Res<ConstellationVisible>>,
+    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
 ) {
     for ActionFired(action) in actions.read() {
         let constellation_on = constellation_visible
@@ -28,6 +28,7 @@ pub fn handle_focus_cycle(
             .map(|v| v.0)
             .unwrap_or(false);
 
+        let old_focus = focus.clone();
         match action {
             Action::CycleFocusForward => {
                 *focus = match focus.as_ref() {
@@ -59,6 +60,17 @@ pub fn handle_focus_cycle(
                 };
             }
             _ => {}
+        }
+
+        // Sync ConstellationVisible when cycling into/out of Constellation
+        if let Some(ref mut vis) = constellation_visible {
+            let was_constellation = matches!(old_focus, FocusArea::Constellation);
+            let is_constellation = matches!(*focus, FocusArea::Constellation);
+            if was_constellation && !is_constellation {
+                vis.0 = false;
+            } else if !was_constellation && is_constellation {
+                vis.0 = true;
+            }
         }
     }
 }

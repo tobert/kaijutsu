@@ -2393,12 +2393,16 @@ pub fn position_block_cells_from_flex(
         let size = computed.size();
         let content = computed.content_box();
 
-        // Content box origin relative to the node's top-left corner.
-        // Translation is center-based, so convert to top-left first.
-        let node_left = translation.x - size.x / 2.0;
-        let node_top = translation.y - size.y / 2.0;
-        let left = node_left + content.min.x;
-        let top = node_top + content.min.y;
+        // content_box() returns object-centered coordinates (centered around 0,0).
+        // UiGlobalTransform translation is also center-based. Add directly.
+        let left = translation.x + content.min.x;
+        let top = translation.y + content.min.y;
+
+        // Skip positioning when flex layout hasn't resolved yet
+        // (e.g. after toggling Display::None → Display::Flex on constellation switch).
+        if size.x < 1.0 {
+            continue;
+        }
 
         config.left = left;
         config.top = top;
@@ -2406,8 +2410,8 @@ pub fn position_block_cells_from_flex(
 
         let raw_left = left as i32;
         let raw_top = top as i32;
-        let raw_right = (node_left + content.max.x) as i32;
-        let raw_bottom = (node_top + content.max.y) as i32;
+        let raw_right = (translation.x + content.max.x) as i32;
+        let raw_bottom = (translation.y + content.max.y) as i32;
 
         config.bounds = if let Some(clip) = clip {
             crate::text::TextBounds {
@@ -2432,9 +2436,15 @@ pub fn position_role_headers_from_flex(
     for (computed, transform, mut config, clip) in role_headers.iter_mut() {
         let (_, _, translation) = transform.to_scale_angle_translation();
         let size = computed.size();
+        let content = computed.content_box();
 
-        let left = translation.x - size.x / 2.0;
-        let top = translation.y - size.y / 2.0;
+        // content_box() returns object-centered coordinates. Add to translation directly.
+        let left = translation.x + content.min.x;
+        let top = translation.y + content.min.y;
+
+        if size.x < 1.0 {
+            continue;
+        }
 
         config.left = left;
         config.top = top;
@@ -2442,8 +2452,8 @@ pub fn position_role_headers_from_flex(
 
         let raw_left = left as i32;
         let raw_top = top as i32;
-        let raw_right = (left + size.x) as i32;
-        let raw_bottom = (top + size.y) as i32;
+        let raw_right = (translation.x + content.max.x) as i32;
+        let raw_bottom = (translation.y + content.max.y) as i32;
 
         config.bounds = if let Some(clip) = clip {
             crate::text::TextBounds {
