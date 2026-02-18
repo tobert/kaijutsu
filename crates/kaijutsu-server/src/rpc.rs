@@ -1831,14 +1831,11 @@ impl kernel::Server for KernelImpl {
             let prompt_id = uuid::Uuid::new_v4().to_string();
             log::debug!("Generated prompt_id={}", prompt_id);
 
-            // Auto-create document if it doesn't exist (client conversation ID)
+            // Document must exist — join_context is the sole creator
             if documents.get(&cell_id).is_none() {
-                log::info!("Auto-creating document {} for prompt", cell_id);
-                documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
-                    .map_err(|e| {
-                        log::error!("Failed to create document: {}", e);
-                        capnp::Error::failed(format!("failed to create document: {}", e))
-                    })?;
+                return Err(capnp::Error::failed(
+                    format!("document {} not found — call join_context first", cell_id)
+                ));
             }
 
             // Create user message block at the end of the document
@@ -1948,9 +1945,9 @@ impl kernel::Server for KernelImpl {
                         .entry(context_name2.clone())
                         .or_insert_with(|| ContextState::new(context_name2.clone()));
 
-                    // Auto-create the document for this context if it doesn't exist
+                    // Create the document for this context (join_context is the sole creator)
                     if !kernel.documents.contains(&doc_id) {
-                        log::info!("Auto-creating document {} for context", doc_id);
+                        log::info!("Creating document {} for context {}", doc_id, context_name2);
                         if let Err(e) = kernel.documents.create_document(
                             doc_id.clone(),
                             DocumentKind::Conversation,
@@ -1958,6 +1955,8 @@ impl kernel::Server for KernelImpl {
                         ) {
                             log::error!("Failed to create document {}: {}", doc_id, e);
                         }
+                    } else {
+                        log::debug!("Re-joining existing context document {}", doc_id);
                     }
 
                     Some(kernel.kernel.clone())
@@ -2297,11 +2296,11 @@ impl kernel::Server for KernelImpl {
                 (kernel.documents.clone(), kernel.kaish.as_ref().unwrap().clone())
             };
 
-            // Auto-create document if it doesn't exist
+            // Document must exist — join_context is the sole creator
             if documents.get(&cell_id).is_none() {
-                log::info!("Auto-creating document {} for shell execute", cell_id);
-                documents.create_document(cell_id.clone(), DocumentKind::Conversation, None)
-                    .map_err(|e| capnp::Error::failed(format!("failed to create document: {}", e)))?;
+                return Err(capnp::Error::failed(
+                    format!("document {} not found — call join_context first", cell_id)
+                ));
             }
 
             // Create ShellCommand block at the end of the document
@@ -3680,15 +3679,11 @@ impl kernel::Server for KernelImpl {
         // Generate target document ID from context
         let target_doc_id = format!("{}@{}", kernel_id, target_context);
 
-        // Check if target document exists, create if not
+        // Target document must exist — join target context first
         if !kernel_state.documents.contains(&target_doc_id) {
-            if let Err(e) = kernel_state.documents.create_document(
-                target_doc_id.clone(),
-                kaijutsu_kernel::DocumentKind::Conversation,
-                None,
-            ) {
-                return Promise::err(capnp::Error::failed(format!("Failed to create target document: {}", e)));
-            }
+            return Promise::err(capnp::Error::failed(
+                format!("target document {} not found — join target context first", target_doc_id)
+            ));
         }
 
         // Get the last block ID in target document for ordering

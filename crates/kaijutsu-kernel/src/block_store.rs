@@ -221,45 +221,53 @@ impl BlockStore {
     }
 
     /// Create a new document.
+    ///
+    /// Uses DashMap `entry()` for atomicity — the DB INSERT only runs in the
+    /// `Vacant` branch, so concurrent callers can't race past the check.
     pub fn create_document(
         &self,
         id: DocumentId,
         kind: DocumentKind,
         language: Option<String>,
     ) -> Result<(), String> {
-        if self.documents.contains_key(&id) {
-            return Err(format!("Document {} already exists", id));
+        use dashmap::mapref::entry::Entry;
+
+        match self.documents.entry(id.clone()) {
+            Entry::Occupied(_) => {
+                Err(format!("Document {} already exists", id))
+            }
+            Entry::Vacant(vacant) => {
+                // Persist metadata if we have a DB
+                if let Some(db) = &self.db {
+                    let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+                    let meta = DocumentMeta {
+                        id: id.clone(),
+                        kind,
+                        language: language.clone(),
+                        position_col: None,
+                        position_row: None,
+                        parent_document: None,
+                        created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
+                    };
+                    db_guard
+                        .create_document(&meta)
+                        .map_err(|e| format!("DB error: {}", e))?;
+                }
+
+                let agent_id = self.agent_id();
+                let entry = DocumentEntry::new(&id, kind, language, &agent_id);
+                vacant.insert(entry);
+
+                // Broadcast event
+                let _ = self.event_tx.send(BlockEvent::DocumentCreated {
+                    document_id: id,
+                    kind,
+                    agent_id,
+                });
+
+                Ok(())
+            }
         }
-
-        // Persist metadata if we have a DB
-        if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
-            let meta = DocumentMeta {
-                id: id.clone(),
-                kind,
-                language: language.clone(),
-                position_col: None,
-                position_row: None,
-                parent_document: None,
-                created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
-            };
-            db_guard
-                .create_document(&meta)
-                .map_err(|e| format!("DB error: {}", e))?;
-        }
-
-        let agent_id = self.agent_id();
-        let entry = DocumentEntry::new(&id, kind, language, &agent_id);
-        self.documents.insert(id.clone(), entry);
-
-        // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
-            document_id: id,
-            kind,
-            agent_id,
-        });
-
-        Ok(())
     }
 
     /// Create a document from serialized oplog bytes (for sync from server).
