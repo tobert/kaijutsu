@@ -579,10 +579,8 @@ impl DocumentSyncState {
 /// A cached document for a single context, including its CRDT doc and sync state.
 #[allow(dead_code)]
 pub struct CachedDocument {
-    /// The CRDT document — authoritative content for this context.
-    pub doc: BlockDocument,
-    /// Sync manager for frontier tracking (one per document).
-    pub sync: kaijutsu_client::SyncManager,
+    /// Synced document — wraps BlockDocument + SyncManager.
+    pub synced: kaijutsu_client::SyncedDocument,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
     /// Generation counter at last sync (for staleness detection).

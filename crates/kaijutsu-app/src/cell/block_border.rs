@@ -51,6 +51,7 @@ impl Default for BorderPadding {
 }
 
 impl BorderPadding {
+    #[allow(dead_code)] // Phase 2: may be used for scroll height calculations
     pub fn vertical(&self) -> f32 {
         self.top + self.bottom
     }
@@ -261,6 +262,11 @@ pub fn spawn_block_borders(
         let material = BlockBorderMaterial::from_style(style, &theme);
         let handle = materials.add(material);
 
+        // Border sits inside BlockCell with inset margin. Text is already inset
+        // by BlockBorderStyle.padding from the BlockCell edge, so the border lands
+        // between the cell edge and the text content.
+        // Border fills BlockCell exactly. The ConversationContainer's 16px
+        // horizontal padding provides the visual margin from the window edge.
         let border_entity = commands
             .spawn((
                 Node {
@@ -357,19 +363,19 @@ pub fn layout_block_borders(
 /// Since borders are now children of BlockCells, they just need to be sized
 /// relative to their parent. No manual scroll/visibility clamping needed.
 pub fn layout_block_borders_from_flex(
-    block_cells: Query<(&ComputedNode, &BlockBorderEntity)>,
+    border_nodes: Query<
+        (&ComputedNode, &MaterialNode<BlockBorderMaterial>),
+        Changed<ComputedNode>,
+    >,
     mut materials: ResMut<Assets<BlockBorderMaterial>>,
-    border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
 ) {
-    for (computed, border_ent) in block_cells.iter() {
+    for (computed, mat_node) in border_nodes.iter() {
         let size = computed.size();
-
         // Update dimensions uniform for aspect-correct shader rendering.
-        // The border node itself uses 100% sizing so Bevy handles layout automatically.
-        if let Ok(mat_node) = border_material_query.get(border_ent.0) {
-            if let Some(mat) = materials.get_mut(mat_node.0.id()) {
-                mat.dimensions = Vec4::new(size.x, size.y, 0.0, 0.0);
-            }
+        // Border uses 100% sizing so Bevy handles layout; we just tell the shader
+        // the pixel size. Only fires when ComputedNode changes (resize, not scroll).
+        if let Some(mat) = materials.get_mut(mat_node.0.id()) {
+            mat.dimensions = Vec4::new(size.x, size.y, 0.0, 0.0);
         }
     }
 }

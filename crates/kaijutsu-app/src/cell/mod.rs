@@ -18,6 +18,7 @@
 pub mod block_border;
 mod components;
 pub mod frame_assembly;
+mod measure;
 pub mod plugin;
 mod systems;
 
