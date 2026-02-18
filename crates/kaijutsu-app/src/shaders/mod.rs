@@ -77,6 +77,7 @@ impl Plugin for ShaderFxPlugin {
             // Constellation effects
             UiMaterialPlugin::<ConnectionLineMaterial>::default(),
             UiMaterialPlugin::<ConstellationCardMaterial>::default(),
+            UiMaterialPlugin::<StarFieldMaterial>::default(),
             // HUD panel effects
             UiMaterialPlugin::<HudPanelMaterial>::default(),
             // Block border material
@@ -91,13 +92,14 @@ impl Plugin for ShaderFxPlugin {
         .register_type::<ChasingBorder>()
         .add_systems(Update, (
             update_shader_time,
+            update_shader_time_effects,
             sync_effect_context_to_text_glow,
             sync_text_geometry_to_materials,
         ));
     }
 }
 
-/// System to update time uniforms on all shader materials.
+/// System to update time uniforms on core shader materials.
 fn update_shader_time(
     time: Res<Time>,
     mut glow_materials: ResMut<Assets<GlowBorderMaterial>>,
@@ -111,10 +113,6 @@ fn update_shader_time(
     mut error_materials: ResMut<Assets<ErrorFrameMaterial>>,
     mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
     mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
-    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
-    mut constellation_card_materials: ResMut<Assets<ConstellationCardMaterial>>,
-    mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
-    mut block_border_materials: ResMut<Assets<block_border_material::BlockBorderMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -156,12 +154,29 @@ fn update_shader_time(
     for (_, mat) in text_glow_materials.iter_mut() {
         mat.time.x = t;
     }
+}
+
+/// System to update time uniforms on constellation/HUD/block border materials.
+///
+/// Split from `update_shader_time` to stay under Bevy's 16-parameter system limit.
+fn update_shader_time_effects(
+    time: Res<Time>,
+    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut constellation_card_materials: ResMut<Assets<ConstellationCardMaterial>>,
+    mut star_field_materials: ResMut<Assets<StarFieldMaterial>>,
+    mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
+    mut block_border_materials: ResMut<Assets<block_border_material::BlockBorderMaterial>>,
+) {
+    let t = time.elapsed_secs();
 
     // Constellation effects
     for (_, mat) in connection_materials.iter_mut() {
         mat.time.x = t;
     }
     for (_, mat) in constellation_card_materials.iter_mut() {
+        mat.time.x = t;
+    }
+    for (_, mat) in star_field_materials.iter_mut() {
         mat.time.x = t;
     }
 
@@ -607,6 +622,43 @@ impl Default for ConstellationCardMaterial {
 impl UiMaterial for ConstellationCardMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/constellation_card.wgsl".into()
+    }
+}
+
+// ============================================================================
+// STAR FIELD MATERIAL
+// ============================================================================
+
+/// Procedural star field background for constellation view.
+///
+/// Hash-based star positions with brightness variation, subtle twinkle,
+/// and color temperature. Camera offset creates a parallax depth effect.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct StarFieldMaterial {
+    /// Parameters: x=density, y=twinkle_speed, z=brightness, w=star_size
+    #[uniform(0)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time
+    #[uniform(1)]
+    pub time: Vec4,
+    /// Dimensions: x=width_px, y=height_px, z=camera_offset_x, w=camera_offset_y
+    #[uniform(2)]
+    pub dimensions: Vec4,
+}
+
+impl Default for StarFieldMaterial {
+    fn default() -> Self {
+        Self {
+            params: Vec4::new(10.0, 0.3, 0.6, 0.015), // density, twinkle_speed, brightness, star_size
+            time: Vec4::ZERO,
+            dimensions: Vec4::new(1280.0, 800.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl UiMaterial for StarFieldMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/star_field.wgsl".into()
     }
 }
 

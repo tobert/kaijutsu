@@ -14,7 +14,7 @@ use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
-use crate::shaders::{ConnectionLineMaterial, ConstellationCardMaterial};
+use crate::shaders::{ConnectionLineMaterial, ConstellationCardMaterial, StarFieldMaterial};
 use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
@@ -35,12 +35,17 @@ pub struct ModelLabel {
     pub context_id: String,
 }
 
+/// Marker for the procedural star field background behind constellation content.
+#[derive(Component)]
+pub struct StarFieldBackground;
+
 /// Setup the constellation rendering systems
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
         Update,
         (
             spawn_constellation_container,
+            spawn_star_field,
             sync_constellation_visibility,
             sync_cell_text_visibility,
             spawn_context_nodes,
@@ -48,6 +53,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_connection_lines,
             // attach_mini_renders disabled — card nodes don't use render-to-texture
             update_node_visuals,
+            update_star_field,
             update_create_node_visual,
             update_model_labels,
             update_connection_visuals,
@@ -97,6 +103,80 @@ fn spawn_constellation_container(
     commands.entity(content_entity).add_child(constellation_entity);
 
     info!("Spawned constellation container (full-takeover tile)");
+}
+
+/// Spawn a full-size star field background as first child of ConstellationContainer.
+///
+/// Uses `ZIndex(-2)` to render behind connection lines (-1) and card nodes (0).
+/// The shader draws procedural hash-based stars with subtle twinkle animation.
+fn spawn_star_field(
+    mut commands: Commands,
+    mut star_materials: ResMut<Assets<StarFieldMaterial>>,
+    container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
+    existing: Query<Entity, With<StarFieldBackground>>,
+) {
+    if !existing.is_empty() {
+        return;
+    }
+
+    let Ok((container_entity, computed)) = container.single() else {
+        return;
+    };
+
+    let size = computed.size();
+    if size == Vec2::ZERO {
+        return;
+    }
+
+    let material = star_materials.add(StarFieldMaterial {
+        dimensions: Vec4::new(size.x, size.y, 0.0, 0.0),
+        ..default()
+    });
+
+    let star_entity = commands
+        .spawn((
+            StarFieldBackground,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            MaterialNode(material),
+            ZIndex(-2),
+        ))
+        .id();
+
+    commands.entity(container_entity).add_child(star_entity);
+    info!("Spawned star field background");
+}
+
+/// Update star field dimensions and camera offset for parallax.
+fn update_star_field(
+    camera: Res<ConstellationCamera>,
+    mut star_materials: ResMut<Assets<StarFieldMaterial>>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
+    star_nodes: Query<&MaterialNode<StarFieldMaterial>, With<StarFieldBackground>>,
+) {
+    if !camera.is_changed() {
+        return;
+    }
+
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    let size = computed.size();
+    if size == Vec2::ZERO {
+        return;
+    }
+
+    for material_node in star_nodes.iter() {
+        if let Some(mat) = star_materials.get_mut(material_node.0.id()) {
+            mat.dimensions = Vec4::new(size.x, size.y, camera.offset.x, camera.offset.y);
+        }
+    }
 }
 
 /// Sync constellation visibility: toggle Display and Visibility on constellation
