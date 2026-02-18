@@ -269,12 +269,36 @@ pub struct Theme {
     pub constellation_node_glow_streaming: Color,
     /// Node glow color for error state
     pub constellation_node_glow_error: Color,
+    /// Card width in pixels
+    pub constellation_card_width: f32,
+    /// Card height in pixels
+    pub constellation_card_height: f32,
+    /// Card border thickness in pixels
+    pub constellation_card_border_thickness: f32,
+    /// Card corner radius in pixels
+    pub constellation_card_corner_radius: f32,
+    /// Card glow radius (0.0-1.0)
+    pub constellation_card_glow_radius: f32,
+    /// Card glow intensity (0.0-1.0)
+    pub constellation_card_glow_intensity: f32,
     /// Connection line glow intensity (0.0-1.0)
     pub constellation_connection_glow: f32,
     /// Connection line color
     pub constellation_connection_color: Color,
     /// Max particles per context for streaming effects
     pub constellation_particle_budget: u32,
+    /// Agent color: default (dim cyan) — used when provider is unknown
+    pub agent_color_default: Color,
+    /// Agent color: human user (electric cyan)
+    pub agent_color_human: Color,
+    /// Agent color: Anthropic/Claude (hot pink)
+    pub agent_color_claude: Color,
+    /// Agent color: Google/Gemini (gold)
+    pub agent_color_gemini: Color,
+    /// Agent color: local models (matrix green)
+    pub agent_color_local: Color,
+    /// Agent color: DeepSeek (orange)
+    pub agent_color_deepseek: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
@@ -457,15 +481,27 @@ impl Default for Theme {
             // Constellation
             constellation_base_radius: 120.0,
             constellation_ring_spacing: 160.0,
-            constellation_node_size: 96.0,
-            constellation_node_size_focused: 128.0,
+            constellation_node_size: 160.0,
+            constellation_node_size_focused: 200.0,
             constellation_node_glow_idle: Color::srgba(0.3, 0.4, 0.5, 0.3),
             constellation_node_glow_active: Color::srgba(0.00, 1.00, 1.00, 0.7),  // Cyan
             constellation_node_glow_streaming: Color::srgba(0.00, 1.00, 0.53, 0.8), // Green
             constellation_node_glow_error: Color::srgba(1.00, 0.13, 0.38, 0.8),   // Red
+            constellation_card_width: 180.0,
+            constellation_card_height: 130.0,
+            constellation_card_border_thickness: 2.0,
+            constellation_card_corner_radius: 6.0,
+            constellation_card_glow_radius: 0.4,
+            constellation_card_glow_intensity: 0.7,
             constellation_connection_glow: 0.4,
             constellation_connection_color: Color::srgba(0.00, 1.00, 1.00, 0.5),  // Cyan
             constellation_particle_budget: 500,
+            agent_color_default: Color::srgba(0.49, 0.85, 0.82, 0.8),   // #7dd9d1 dim cyan
+            agent_color_human: Color::srgba(0.49, 0.98, 1.00, 0.9),     // #7df9ff electric cyan
+            agent_color_claude: Color::srgba(1.00, 0.43, 0.78, 0.9),    // #ff6ec7 hot pink
+            agent_color_gemini: Color::srgba(1.00, 0.84, 0.00, 0.9),    // #ffd700 gold
+            agent_color_local: Color::srgba(0.31, 0.98, 0.48, 0.9),     // #50fa7b matrix green
+            agent_color_deepseek: Color::srgba(1.00, 0.72, 0.42, 0.9),  // #ffb86c orange
 
             // Block borders
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber
@@ -497,6 +533,28 @@ impl Default for Theme {
 pub fn color_to_vec4(color: Color) -> Vec4 {
     let srgba = color.to_srgba();
     Vec4::new(srgba.red, srgba.green, srgba.blue, srgba.alpha)
+}
+
+/// Map a provider string to an agent color from the theme.
+///
+/// Uses substring matching: "anthropic" or "claude" → claude color, etc.
+/// Returns `agent_color_default` for unknown providers.
+pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color {
+    let Some(p) = provider else {
+        return theme.agent_color_default;
+    };
+    let p_lower = p.to_ascii_lowercase();
+    if p_lower.contains("anthropic") || p_lower.contains("claude") {
+        theme.agent_color_claude
+    } else if p_lower.contains("google") || p_lower.contains("gemini") {
+        theme.agent_color_gemini
+    } else if p_lower.contains("deepseek") {
+        theme.agent_color_deepseek
+    } else if p_lower.contains("ollama") || p_lower.contains("local") || p_lower.contains("llama") {
+        theme.agent_color_local
+    } else {
+        theme.agent_color_default
+    }
 }
 
 /// Helper to convert Bevy Color to linear Vec4 (for GPU storage buffers).

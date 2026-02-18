@@ -3,6 +3,11 @@
 //! Renders simplified context previews to textures for display in constellation nodes.
 //! Each context gets its own render-to-texture camera that produces a small preview
 //! showing context info and activity state.
+//!
+//! Currently disabled — card nodes don't use render-to-texture previews.
+//! Will be resurrected when MSDF text content preview is added inside cards.
+
+#![allow(dead_code)]
 
 use bevy::{
     camera::RenderTarget,

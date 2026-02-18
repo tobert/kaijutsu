@@ -1,7 +1,7 @@
 //! Constellation rendering - visual representation of context nodes
 //!
 //! Renders the constellation as a full-takeover flex child of ContentArea:
-//! - Glowing orb nodes for each context (using PulseRingMaterial)
+//! - Rectangular card nodes for each context (using ConstellationCardMaterial)
 //! - Connection lines between related contexts
 //! - Camera-aware positioning with pan/zoom support
 //! - Tab toggles Display + Visibility::Hidden (prevents MSDF text bleed-through)
@@ -14,17 +14,19 @@ use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
-use crate::shaders::{ConnectionLineMaterial, PulseRingMaterial};
+use crate::shaders::{ConnectionLineMaterial, ConstellationCardMaterial};
 use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
-use crate::ui::theme::{color_to_vec4, Theme};
+use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
 
 /// System set for constellation rendering
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstellationRendering;
 
-/// Marker component for nodes that have a mini-render attached
+/// Marker component for nodes that have a mini-render attached.
+/// Currently unused — card nodes don't use render-to-texture previews.
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct HasMiniRender;
 
 /// Marker for model label text on constellation nodes.
@@ -44,7 +46,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
             spawn_context_nodes,
             spawn_create_node,
             spawn_connection_lines,
-            attach_mini_renders,
+            // attach_mini_renders disabled — card nodes don't use render-to-texture
             update_node_visuals,
             update_create_node_visual,
             update_model_labels,
@@ -175,13 +177,13 @@ fn container_center(container: &ComputedNode) -> Vec2 {
     Vec2::new(size.x / 2.0, size.y / 2.0)
 }
 
-/// Spawn entities for new constellation nodes
+/// Spawn entities for new constellation nodes as rectangular cards.
 fn spawn_context_nodes(
     mut commands: Commands,
     mut constellation: ResMut<Constellation>,
     camera: Res<ConstellationCamera>,
     theme: Res<Theme>,
-    mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
+    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_nodes: Query<&ConstellationNode>,
 ) {
@@ -202,21 +204,36 @@ fn spawn_context_nodes(
         .map(|n| n.context_id.clone())
         .collect();
 
+    let card_w = theme.constellation_card_width;
+    let card_h = theme.constellation_card_height;
+
     // Spawn nodes that don't have entities yet
     for node in constellation.nodes.iter_mut() {
         if existing_ids.contains(&node.context_id) {
             continue;
         }
 
-        let node_size = theme.constellation_node_size;
-        let half_size = node_size / 2.0;
+        // Agent color from provider
+        let agent_color = agent_color_for_provider(&theme, node.provider.as_deref());
+        let activity_dot_color = activity_to_color(node.activity, &theme);
+        let dot_srgba = activity_dot_color.to_srgba();
 
-        // Create pulse ring material based on activity state
-        let material = pulse_materials.add(create_node_material(node.activity, &theme));
+        let material = card_materials.add(ConstellationCardMaterial {
+            color: color_to_vec4(agent_color),
+            params: Vec4::new(
+                theme.constellation_card_border_thickness,
+                theme.constellation_card_corner_radius,
+                theme.constellation_card_glow_radius,
+                theme.constellation_card_glow_intensity,
+            ),
+            time: Vec4::ZERO,
+            mode: Vec4::new(dot_srgba.red, dot_srgba.green, dot_srgba.blue, 0.0),
+            dimensions: Vec4::new(card_w, card_h, 1.0, 0.0),
+        });
 
         // Camera-aware position
-        let px = center.x + node.position.x * camera.zoom + camera.offset.x - half_size;
-        let py = center.y + node.position.y * camera.zoom + camera.offset.y - half_size;
+        let px = center.x + node.position.x * camera.zoom + camera.offset.x - card_w / 2.0;
+        let py = center.y + node.position.y * camera.zoom + camera.offset.y - card_h / 2.0;
 
         let node_entity = commands
             .spawn((
@@ -227,24 +244,24 @@ fn spawn_context_nodes(
                     position_type: PositionType::Absolute,
                     left: Val::Px(px),
                     top: Val::Px(py),
-                    width: Val::Px(node_size),
-                    height: Val::Px(node_size),
+                    width: Val::Px(card_w),
+                    height: Val::Px(card_h),
                     ..default()
                 },
                 MaterialNode(material),
                 Interaction::None,
             ))
             .with_children(|parent| {
-                // Inner label showing context name (truncated)
-                let label = truncate_context_name(&node.context_id, 12);
+                // Context name label below the card
+                let label = truncate_context_name(&node.context_id, 16);
                 parent
                     .spawn((
                         Node {
                             position_type: PositionType::Absolute,
                             bottom: Val::Px(-24.0),
                             left: Val::Percent(50.0),
-                            margin: UiRect::left(Val::Px(-60.0)),
-                            width: Val::Px(120.0),
+                            margin: UiRect::left(Val::Px(-70.0)),
+                            width: Val::Px(140.0),
                             min_height: Val::Px(20.0),
                             justify_content: JustifyContent::Center,
                             align_items: AlignItems::Center,
@@ -273,8 +290,8 @@ fn spawn_context_nodes(
                             position_type: PositionType::Absolute,
                             bottom: Val::Px(-40.0),
                             left: Val::Percent(50.0),
-                            margin: UiRect::left(Val::Px(-50.0)),
-                            width: Val::Px(100.0),
+                            margin: UiRect::left(Val::Px(-60.0)),
+                            width: Val::Px(120.0),
                             min_height: Val::Px(14.0),
                             justify_content: JustifyContent::Center,
                             align_items: AlignItems::Center,
@@ -297,7 +314,7 @@ fn spawn_context_nodes(
         node.entity = Some(node_entity);
 
         info!(
-            "Spawned constellation node for {} at {:?}",
+            "Spawned constellation card for {} at {:?}",
             node.context_id, node.position
         );
     }
@@ -307,7 +324,7 @@ fn spawn_context_nodes(
 fn spawn_create_node(
     mut commands: Commands,
     theme: Res<Theme>,
-    mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
+    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
     container: Query<Entity, With<ConstellationContainer>>,
     existing_create_nodes: Query<Entity, With<CreateContextNode>>,
 ) {
@@ -323,11 +340,13 @@ fn spawn_create_node(
         &mut commands,
         container_entity,
         &theme,
-        &mut pulse_materials,
+        &mut card_materials,
     );
 }
 
-/// Attach mini-render textures to nodes that don't have them yet
+/// Attach mini-render textures to nodes that don't have them yet.
+/// Currently unused — card nodes don't use render-to-texture previews.
+#[allow(dead_code)]
 fn attach_mini_renders(
     mut commands: Commands,
     mini_registry: Res<MiniRenderRegistry>,
@@ -366,18 +385,19 @@ fn attach_mini_renders(
     }
 }
 
-/// Update visual properties of existing nodes — camera-aware positioning.
+/// Update visual properties of existing card nodes — camera-aware positioning,
+/// agent coloring, opacity based on depth/cache status, and focus state.
 fn update_node_visuals(
     constellation: Res<Constellation>,
     camera: Res<ConstellationCamera>,
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
-    mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
+    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
     container_q: Query<&ComputedNode, With<ConstellationContainer>>,
     mut nodes: Query<(
         &ConstellationNode,
         &mut Node,
-        &MaterialNode<PulseRingMaterial>,
+        &MaterialNode<ConstellationCardMaterial>,
     )>,
 ) {
     let needs_update = constellation.is_changed()
@@ -395,53 +415,74 @@ fn update_node_visuals(
     }
     let center = container_center(computed);
 
-    let node_size = theme.constellation_node_size;
-    let focused_size = theme.constellation_node_size_focused;
+    let card_w = theme.constellation_card_width;
+    let card_h = theme.constellation_card_height;
+    let focused_scale = 1.15;
 
     for (marker, mut node_style, material_node) in nodes.iter_mut() {
         if let Some(ctx_node) = constellation.node_by_id(&marker.context_id) {
             let is_focused = constellation.focus_id.as_deref() == Some(&ctx_node.context_id);
+            let is_in_cache = doc_cache
+                .document_id_for_context(&ctx_node.context_id)
+                .is_some();
 
-            // Size based on focus state
-            let base_size = if is_focused { focused_size } else { node_size };
-            let half_size = base_size / 2.0;
+            // Size: focused nodes are scaled up
+            let scale = if is_focused {
+                focused_scale
+            } else if ctx_node.activity == ActivityState::Streaming || ctx_node.activity == ActivityState::Active {
+                1.0
+            } else if is_in_cache {
+                0.9
+            } else {
+                0.85
+            };
+            let w = card_w * scale;
+            let h = card_h * scale;
 
             // Camera-aware position
-            let px = center.x + ctx_node.position.x * camera.zoom + camera.offset.x - half_size;
-            let py = center.y + ctx_node.position.y * camera.zoom + camera.offset.y - half_size;
+            let px = center.x + ctx_node.position.x * camera.zoom + camera.offset.x - w / 2.0;
+            let py = center.y + ctx_node.position.y * camera.zoom + camera.offset.y - h / 2.0;
 
             node_style.left = Val::Px(px);
             node_style.top = Val::Px(py);
-            node_style.width = Val::Px(base_size);
-            node_style.height = Val::Px(base_size);
+            node_style.width = Val::Px(w);
+            node_style.height = Val::Px(h);
 
-            // Update material properties based on activity
-            if let Some(mat) = pulse_materials.get_mut(material_node.0.id()) {
-                let color = activity_to_color(ctx_node.activity, &theme);
-                mat.color = color_to_vec4(color);
+            // Update card material
+            if let Some(mat) = card_materials.get_mut(material_node.0.id()) {
+                // Agent color from provider
+                let agent_color = agent_color_for_provider(&theme, ctx_node.provider.as_deref());
+                mat.color = color_to_vec4(agent_color);
 
-                mat.params.z = match ctx_node.activity {
-                    ActivityState::Idle => 0.3,
-                    ActivityState::Active => 0.6,
-                    ActivityState::Streaming => 1.2,
-                    ActivityState::Waiting => 0.8,
-                    ActivityState::Error => 1.5,
-                    ActivityState::Completed => 0.5,
-                };
+                // Activity dot color
+                let dot_color = activity_to_color(ctx_node.activity, &theme);
+                let dot_srgba = dot_color.to_srgba();
+                mat.mode = Vec4::new(dot_srgba.red, dot_srgba.green, dot_srgba.blue, 0.0);
 
-                // MRU boost for cached contexts
-                let is_in_cache = doc_cache
-                    .document_id_for_context(&ctx_node.context_id)
-                    .is_some();
-                let mru_boost = if is_in_cache { 0.1 } else { 0.0 };
-
-                if is_focused {
-                    mat.params.y = 0.08; // thicker rings for focus
-                    mat.color.w = (0.9_f32 + mru_boost).min(1.0);
+                // Opacity: depth + cache + activity
+                let depth = tree_depth(ctx_node, &constellation);
+                let depth_factor: f32 = if depth >= 3 { 0.7 } else { 1.0 };
+                let base_opacity: f32 = if is_focused {
+                    1.0
+                } else if ctx_node.activity == ActivityState::Streaming || ctx_node.activity == ActivityState::Active {
+                    0.9
+                } else if is_in_cache {
+                    0.7
                 } else {
-                    mat.params.y = if is_in_cache { 0.06 } else { 0.05 };
-                    mat.color.w = (0.7_f32 + mru_boost).min(1.0);
-                }
+                    0.5
+                };
+                let opacity = (base_opacity * depth_factor).clamp(0.3, 1.0);
+
+                mat.dimensions = Vec4::new(w, h, opacity, if is_focused { 1.0 } else { 0.0 });
+
+                // Update border params (thickness scales slightly with focus)
+                let thickness = theme.constellation_card_border_thickness * if is_focused { 1.5 } else { 1.0 };
+                mat.params = Vec4::new(
+                    thickness,
+                    theme.constellation_card_corner_radius,
+                    theme.constellation_card_glow_radius,
+                    theme.constellation_card_glow_intensity,
+                );
             }
         }
     }
@@ -485,7 +526,7 @@ fn spawn_connection_lines(
     }
 
     let center = container_center(computed);
-    let padding = theme.constellation_node_size;
+    let padding = theme.constellation_card_width;
 
     // Build set of existing connections
     let existing: Vec<(String, String, DriftConnectionKind)> = existing_connections
@@ -601,7 +642,7 @@ fn update_connection_visuals(
         return;
     }
     let center = container_center(computed);
-    let padding = theme.constellation_node_size;
+    let padding = theme.constellation_card_width;
 
     for (marker, mut node_style, material_node) in connections.iter_mut() {
         let from_node = constellation.node_by_id(&marker.from);
@@ -703,15 +744,15 @@ fn update_create_node_visual(
     let outer_radius = theme.constellation_base_radius
         + max_depth as f32 * theme.constellation_ring_spacing;
 
-    let node_size = theme.constellation_node_size * 0.8;
-    let half_size = node_size / 2.0;
+    let card_w = theme.constellation_card_width * 0.7;
+    let card_h = theme.constellation_card_height * 0.7;
 
     // Position at angle 0 (right side), outside the outermost ring
     let x_pos = outer_radius * 1.1;
     let y_pos = 0.0;
 
-    let px = center.x + x_pos * camera.zoom + camera.offset.x - half_size;
-    let py = center.y + y_pos * camera.zoom + camera.offset.y - half_size;
+    let px = center.x + x_pos * camera.zoom + camera.offset.x - card_w / 2.0;
+    let py = center.y + y_pos * camera.zoom + camera.offset.y - card_h / 2.0;
 
     for mut node_style in create_nodes.iter_mut() {
         node_style.left = Val::Px(px);
@@ -789,24 +830,20 @@ fn compute_connection_box(
     }
 }
 
-/// Create a PulseRingMaterial for a constellation node based on activity state
-fn create_node_material(activity: ActivityState, theme: &Theme) -> PulseRingMaterial {
-    let color = activity_to_color(activity, theme);
-
-    let speed = match activity {
-        ActivityState::Idle => 0.3,
-        ActivityState::Active => 0.6,
-        ActivityState::Streaming => 1.2,
-        ActivityState::Waiting => 0.8,
-        ActivityState::Error => 1.5,
-        ActivityState::Completed => 0.5,
-    };
-
-    PulseRingMaterial {
-        color: color_to_vec4(color),
-        params: Vec4::new(3.0, 0.05, speed, 1.0),
-        time: Vec4::ZERO,
+/// Compute tree depth of a context node by walking parent_id chain.
+fn tree_depth(node: &super::ContextNode, constellation: &Constellation) -> usize {
+    let mut depth = 0;
+    let mut current_id = node.parent_id.as_deref();
+    while let Some(pid) = current_id {
+        depth += 1;
+        current_id = constellation
+            .node_by_id(pid)
+            .and_then(|n| n.parent_id.as_deref());
+        if depth > constellation.nodes.len() {
+            break; // Cycle protection
+        }
     }
+    depth
 }
 
 /// Get node color based on activity state

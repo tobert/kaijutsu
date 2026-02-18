@@ -255,6 +255,17 @@ fn sync_model_info_to_constellation(
                 node.model = new_model;
             }
 
+            // Update provider if it changed
+            let new_provider = if ctx_info.provider.is_empty() {
+                None
+            } else {
+                Some(ctx_info.provider.clone())
+            };
+
+            if node.provider != new_provider {
+                node.provider = new_provider;
+            }
+
             // Sync parent_id for radial tree layout
             if node.parent_id != ctx_info.parent_id {
                 node.parent_id = ctx_info.parent_id.clone();

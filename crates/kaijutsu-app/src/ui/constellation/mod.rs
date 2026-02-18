@@ -12,9 +12,9 @@
 //!
 //! ## Visual Design
 //!
-//! - Nodes: Glowing orbs with activity-based pulse
+//! - Nodes: Rectangular cards with agent-colored borders and soft glow
 //! - Connections: Lines with distance falloff glow
-//! - States: Idle (dim), active (bright), streaming (particle flow), error (red)
+//! - States: Idle (dim), active (bright), streaming (green dot), error (red dot)
 //! - "+" node: Create new contexts by clicking
 
 mod create_dialog;
@@ -63,8 +63,9 @@ impl Plugin for ConstellationPlugin {
         // Add rendering systems from the render module
         render::setup_constellation_rendering(app);
 
-        // Add mini-render systems for context previews
-        mini::setup_mini_render_systems(app);
+        // Mini-render systems disabled — card nodes don't use render-to-texture
+        // mini::setup_mini_render_systems(app);
+        app.init_resource::<mini::MiniRenderRegistry>(); // Resource still needed for compile
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);
@@ -171,6 +172,7 @@ impl Constellation {
             activity: ActivityState::default(),
             entity: None,
             model: None,
+            provider: None,
             joined: true,
         };
 
@@ -197,6 +199,7 @@ impl Constellation {
             activity: ActivityState::Idle,
             entity: None,
             model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
+            provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
             joined: false,
         };
 
@@ -271,6 +274,8 @@ pub struct ContextNode {
     pub entity: Option<Entity>,
     /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
     pub model: Option<String>,
+    /// LLM provider name (e.g. "anthropic", "google", "deepseek") for agent coloring
+    pub provider: Option<String>,
     /// Whether we have an active actor connection to this context
     pub joined: bool,
 }

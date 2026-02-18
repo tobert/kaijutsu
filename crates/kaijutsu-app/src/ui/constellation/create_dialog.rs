@@ -112,23 +112,26 @@ pub fn spawn_create_context_node(
     commands: &mut Commands,
     container_entity: Entity,
     theme: &Theme,
-    pulse_materials: &mut Assets<crate::shaders::PulseRingMaterial>,
+    card_materials: &mut Assets<crate::shaders::ConstellationCardMaterial>,
 ) {
-    use crate::shaders::PulseRingMaterial;
+    use crate::shaders::ConstellationCardMaterial;
     use crate::ui::theme::color_to_vec4;
 
-    let node_size = theme.constellation_node_size * 0.8; // Slightly smaller
+    let card_w = theme.constellation_card_width * 0.7; // Smaller than context cards
+    let card_h = theme.constellation_card_height * 0.7;
 
     // Initial position at origin — update_create_node_visual repositions
     // with camera transform on the next frame.
     let initial_x = 0.0;
     let initial_y = 0.0;
 
-    // Create a distinct material for the + node (dimmer, using fg_dim color)
-    let material = pulse_materials.add(PulseRingMaterial {
-        color: color_to_vec4(theme.fg_dim.with_alpha(0.5)),
-        params: Vec4::new(2.0, 0.04, 0.2, 1.0), // Fewer rings, slower pulse
+    // Create a distinct material for the + node (dimmer, dashed feel)
+    let material = card_materials.add(ConstellationCardMaterial {
+        color: color_to_vec4(theme.fg_dim.with_alpha(0.4)),
+        params: Vec4::new(1.0, 6.0, 0.2, 0.3), // Thinner border, subtle glow
         time: Vec4::ZERO,
+        mode: Vec4::ZERO, // No activity dot
+        dimensions: Vec4::new(card_w, card_h, 0.6, 0.0), // Dimmer opacity
     });
 
     let node_entity = commands
@@ -138,8 +141,8 @@ pub fn spawn_create_context_node(
                 position_type: PositionType::Absolute,
                 left: Val::Px(initial_x),
                 top: Val::Px(initial_y),
-                width: Val::Px(node_size),
-                height: Val::Px(node_size),
+                width: Val::Px(card_w),
+                height: Val::Px(card_h),
                 ..default()
             },
             MaterialNode(material),
