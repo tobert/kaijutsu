@@ -5,7 +5,7 @@ use bevy::ui::CalculatedClip;
 use bevy::ui::measurement::ContentSize;
 
 use super::components::{
-    BlockDocument, BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
+    BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
     CellState, ComposeBlock, ConversationScrollState, DriftKind, EditingBlockCell,
     FocusTarget, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
     ViewingConversation, WorkspaceLayout,
@@ -13,8 +13,8 @@ use super::components::{
 use crate::input::FocusArea;
 use crate::conversation::CurrentConversation;
 use crate::text::{
-    bevy_to_cosmic_color, FontMetricsCache, MsdfText, SharedFontSystem, MsdfTextAreaConfig,
-    MsdfTextBuffer, TextMetrics,
+    bevy_to_cosmic_color, FontMetricsCache, MsdfBufferInfo, MsdfText, SharedFontSystem,
+    MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics,
     msdf::SdfTextEffects,
 };
 use crate::text::markdown::{self, MarkdownColors};
@@ -122,7 +122,7 @@ pub fn init_cell_buffers(
         );
 
         // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert(buffer);
+        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
         info!("Initialized MsdfTextBuffer for entity {:?}", entity);
     }
 }
@@ -885,6 +885,7 @@ pub fn spawn_expanded_block_view(
                 ExpandedBlockView,
                 MsdfText,
                 buffer,
+                MsdfBufferInfo::default(),
                 MsdfTextAreaConfig {
                     left: 40.0,
                     top: 60.0,  // Leave room for header
@@ -1108,11 +1109,11 @@ pub fn sync_main_cell_to_conversation(
         return;
     };
     let Some(entity) = entities.main_cell else {
-        debug!("sync_main_cell: no main cell entity");
+        trace!("sync_main_cell: no main cell entity");
         return;
     };
     let Some(ref source_doc) = sync_state.doc else {
-        debug!("sync_main_cell: no document in sync state");
+        trace!("sync_main_cell: no document in sync state");
         return;
     };
 
@@ -1225,20 +1226,13 @@ pub fn handle_block_events(
 
             // Create or update cache entry
             if !doc_cache.contains(document_id) {
-                let mut cached = CachedDocument {
-                    doc: BlockDocument::new(document_id, &agent_id),
-                    sync: kaijutsu_client::SyncManager::new(),
-                    context_name: context_name.clone(),
-                    synced_at_generation: 0,
-                    last_accessed: std::time::Instant::now(),
-                    scroll_offset: 0.0,
-                };
+                let mut synced = kaijutsu_client::SyncedDocument::new(document_id, &agent_id);
 
                 // Apply initial state if provided
                 if let Some(state) = initial_state {
-                    match cached.sync.apply_initial_state(&mut cached.doc, &state.document_id, &state.ops) {
-                        Ok(result) => {
-                            info!("Cache: initial sync for '{}' ({}) result: {:?}", context_name, document_id, result);
+                    match synced.apply_document_state(state) {
+                        Ok(effect) => {
+                            info!("Cache: initial sync for '{}' ({}) effect: {:?}", context_name, document_id, effect);
                         }
                         Err(e) => {
                             error!("Cache: initial sync error for '{}' ({}): {}", context_name, document_id, e);
@@ -1246,14 +1240,20 @@ pub fn handle_block_events(
                     }
                 }
 
-                cached.synced_at_generation = sync_gen.0;
+                let cached = CachedDocument {
+                    synced,
+                    context_name: context_name.clone(),
+                    synced_at_generation: sync_gen.0,
+                    last_accessed: std::time::Instant::now(),
+                    scroll_offset: 0.0,
+                };
                 doc_cache.insert(document_id.clone(), cached);
             } else if let Some(state) = initial_state {
                 // Reconnect case: cache entry exists but server has authoritative state
                 if let Some(cached) = doc_cache.get_mut(document_id) {
-                    match cached.sync.apply_initial_state(&mut cached.doc, &state.document_id, &state.ops) {
-                        Ok(result) => {
-                            info!("Cache: reconnect refresh for '{}' ({}) result: {:?}", context_name, document_id, result);
+                    match cached.synced.apply_document_state(state) {
+                        Ok(effect) => {
+                            info!("Cache: reconnect refresh for '{}' ({}) effect: {:?}", context_name, document_id, effect);
                             cached.synced_at_generation = sync_gen.0;
                         }
                         Err(e) => {
@@ -1310,152 +1310,94 @@ pub fn handle_block_events(
 
     // Handle streamed block events — route by document_id through DocumentCache
     for ServerEventMessage(event) in server_events.read() {
+        // Extract document_id from event for routing
+        let event_doc_id = match event {
+            ServerEvent::BlockInserted { document_id, .. }
+            | ServerEvent::BlockTextOps { document_id, .. }
+            | ServerEvent::BlockStatusChanged { document_id, .. }
+            | ServerEvent::BlockDeleted { document_id, .. }
+            | ServerEvent::BlockCollapsedChanged { document_id, .. }
+            | ServerEvent::BlockMoved { document_id, .. }
+            | ServerEvent::SyncReset { document_id, .. } => Some(document_id.as_str()),
+            _ => None,
+        };
+
+        // Route to cache entry via SyncedDocument.apply_event
+        if let Some(doc_id) = event_doc_id {
+            if let Some(cached) = doc_cache.get_mut(doc_id) {
+                let effect = cached.synced.apply_event(event);
+                match &effect {
+                    kaijutsu_client::SyncEffect::Updated { .. }
+                    | kaijutsu_client::SyncEffect::FullSync { .. } => {
+                        cached.synced_at_generation = sync_gen.0;
+                    }
+                    kaijutsu_client::SyncEffect::NeedsResync => {
+                        cached.synced_at_generation = 0;
+                        sync_gen.0 = sync_gen.0.wrapping_add(1);
+                    }
+                    kaijutsu_client::SyncEffect::Ignored => {}
+                }
+                trace!("Cache: event for {}: {:?}", doc_id, effect);
+            }
+        }
+
+        // Mirror to DocumentSyncState if active (legacy path — will be removed
+        // when DocumentSyncState is fully replaced by DocumentCache)
         match event {
             ServerEvent::BlockInserted { document_id, block, ops } => {
-                // Route to cache entry
-                if let Some(cached) = doc_cache.get_mut(document_id) {
-                    match cached.sync.apply_block_inserted(&mut cached.doc, document_id, block, ops) {
-                        Ok(result) => {
-                            cached.synced_at_generation = sync_gen.0;
-                            trace!("Cache: block insert for {} {:?}: {:?}", document_id, block.id, result);
-                        }
-                        Err(e) => {
-                            trace!("Cache: block insert error for {} {:?}: {}", document_id, block.id, e);
-                        }
-                    }
-                }
-
-                // Mirror to DocumentSyncState if active
                 if active_doc_id.as_deref() == Some(document_id.as_str()) {
                     match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
-                        Ok(result) => {
-                            trace!("Block insert sync result for {:?}: {:?}", block.id, result);
-                        }
-                        Err(e) => {
-                            trace!("Block insert sync error for {:?}: {}", block.id, e);
-                        }
+                        Ok(result) => trace!("Block insert sync: {:?}", result),
+                        Err(e) => trace!("Block insert sync error: {}", e),
                     }
                 }
             }
-
-            ServerEvent::BlockTextOps {
-                document_id,
-                block_id,
-                ops,
-            } => {
-                // Route to cache entry
-                if let Some(cached) = doc_cache.get_mut(document_id) {
-                    match cached.sync.apply_text_ops(&mut cached.doc, document_id, ops) {
-                        Ok(result) => {
-                            cached.synced_at_generation = sync_gen.0;
-                            trace!("Cache: text ops for {} {:?}: {:?}", document_id, block_id, result);
-                        }
-                        Err(e) => {
-                            trace!("Cache: text ops error for {} {:?}: {}", document_id, block_id, e);
-                        }
-                    }
-                }
-
-                // Mirror to DocumentSyncState if active
+            ServerEvent::BlockTextOps { document_id, ops, .. } => {
                 if active_doc_id.as_deref() == Some(document_id.as_str()) {
                     match sync_state.apply_text_ops(document_id, &agent_id, ops) {
-                        Ok(result) => {
-                            trace!("Text ops sync result for {:?}: {:?}", block_id, result);
+                        Ok(result) => trace!("Text ops sync: {:?}", result),
+                        Err(e) => trace!("Text ops sync error: {}", e),
+                    }
+                }
+            }
+            ServerEvent::BlockStatusChanged { document_id, block_id, status } => {
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    if let Some(ref mut doc) = sync_state.doc {
+                        if document_id == doc.document_id() {
+                            let _ = doc.set_status(block_id, *status);
                         }
-                        Err(e) => {
-                            trace!("Text ops sync error for {:?}: {}", block_id, e);
+                    }
+                }
+            }
+            ServerEvent::BlockDeleted { document_id, block_id } => {
+                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+                    if let Some(ref mut doc) = sync_state.doc {
+                        if document_id == doc.document_id() {
+                            let _ = doc.delete_block(block_id);
                         }
                     }
                 }
             }
-
-            ServerEvent::BlockStatusChanged {
-                document_id,
-                block_id,
-                status,
-            } => {
-                if let Some(cached) = doc_cache.get_mut(document_id)
-                    && let Err(e) = cached.doc.set_status(block_id, *status)
-                {
-                    warn!("Cache: failed to update block status for {}: {}", document_id, e);
-                }
+            ServerEvent::BlockCollapsedChanged { document_id, block_id, collapsed } => {
                 if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    let Some(ref mut doc) = sync_state.doc else { continue; };
-                    if document_id != doc.document_id() { continue; }
-                    if let Err(e) = doc.set_status(block_id, *status) {
-                        warn!("Failed to update block status: {}", e);
+                    if let Some(ref mut doc) = sync_state.doc {
+                        if document_id == doc.document_id() {
+                            let _ = doc.set_collapsed(block_id, *collapsed);
+                        }
                     }
                 }
             }
-            ServerEvent::BlockDeleted {
-                document_id,
-                block_id,
-            } => {
-                if let Some(cached) = doc_cache.get_mut(document_id)
-                    && let Err(e) = cached.doc.delete_block(block_id)
-                {
-                    warn!("Cache: failed to delete block for {}: {}", document_id, e);
-                }
+            ServerEvent::BlockMoved { document_id, block_id, after_id } => {
                 if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    let Some(ref mut doc) = sync_state.doc else { continue; };
-                    if document_id != doc.document_id() { continue; }
-                    if let Err(e) = doc.delete_block(block_id) {
-                        warn!("Failed to delete block: {}", e);
+                    if let Some(ref mut doc) = sync_state.doc {
+                        if document_id == doc.document_id() {
+                            let _ = doc.move_block(block_id, after_id.as_ref());
+                        }
                     }
                 }
             }
-            ServerEvent::BlockCollapsedChanged {
-                document_id,
-                block_id,
-                collapsed,
-            } => {
-                if let Some(cached) = doc_cache.get_mut(document_id)
-                    && let Err(e) = cached.doc.set_collapsed(block_id, *collapsed)
-                {
-                    warn!("Cache: failed to update collapsed for {}: {}", document_id, e);
-                }
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    let Some(ref mut doc) = sync_state.doc else { continue; };
-                    if document_id != doc.document_id() { continue; }
-                    if let Err(e) = doc.set_collapsed(block_id, *collapsed) {
-                        warn!("Failed to update block collapsed state: {}", e);
-                    }
-                }
-            }
-            ServerEvent::BlockMoved {
-                document_id,
-                block_id,
-                after_id,
-            } => {
-                if let Some(cached) = doc_cache.get_mut(document_id)
-                    && let Err(e) = cached.doc.move_block(block_id, after_id.as_ref())
-                {
-                    warn!("Cache: failed to move block for {}: {}", document_id, e);
-                }
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    let Some(ref mut doc) = sync_state.doc else { continue; };
-                    if document_id != doc.document_id() { continue; }
-                    if let Err(e) = doc.move_block(block_id, after_id.as_ref()) {
-                        warn!("Failed to move block: {}", e);
-                    }
-                }
-            }
-            ServerEvent::SyncReset { document_id, generation } => {
-                info!(
-                    "Sync reset for document {}, generation {}. Resetting frontier.",
-                    document_id, generation
-                );
-                // Reset SyncManager frontier so next event triggers full re-sync
-                if let Some(cached) = doc_cache.get_mut(document_id) {
-                    cached.sync.reset_frontier();
-                    // Mark as stale so staleness check triggers re-fetch
-                    cached.synced_at_generation = 0;
-                }
-                // Bump SyncGeneration to trigger staleness re-fetch
-                sync_gen.0 = sync_gen.0.wrapping_add(1);
-            }
-            // Resource events are not block-related — ignore here
-            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => {}
+            // SyncReset and resource events handled by cache path above
+            _ => {}
         }
     }
 
@@ -1535,7 +1477,7 @@ pub fn handle_context_switch(
             let agent_id = format!("user:{}", whoami::username());
 
             // Rebuild DocumentSyncState from cached document's oplog
-            let oplog_bytes = cached.doc.oplog_bytes().unwrap_or_default();
+            let oplog_bytes = cached.synced.doc().oplog_bytes().unwrap_or_default();
             sync_state.reset();
             match sync_state.apply_initial_state(&target_doc_id, &agent_id, &oplog_bytes) {
                 Ok(_) => {
@@ -2000,7 +1942,7 @@ pub fn init_role_header_buffers(
         buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
 
         // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert(buffer);
+        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
     }
 }
 
@@ -2019,7 +1961,7 @@ pub fn init_block_cell_buffers(
         let metrics = text_metrics.scaled_cell_metrics();
         let buffer = MsdfTextBuffer::new(&mut font_system, metrics);
         // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert(buffer);
+        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
     }
 }
 
@@ -2188,7 +2130,7 @@ pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer, Option<&super::block_border::BlockBorderStyle>)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2268,7 +2210,7 @@ pub fn layout_block_cells(
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
 
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, mut buffer, border_style)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout, mut buffer)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2300,26 +2242,20 @@ pub fn layout_block_cells(
         };
 
         // Calculate wrap width accounting for indentation.
-        // Border padding is now on Node.padding — taffy subtracts it from available
+        // Border padding is on Node.padding — taffy subtracts it from available
         // width automatically, so we don't account for it here.
         let indent = indent_level as f32 * INDENT_WIDTH;
-        let border_h_padding = border_style
-            .map(|s| s.padding.left + s.padding.right)
-            .unwrap_or(0.0);
-        let wrap_width = base_width - indent - border_h_padding;
+        let wrap_width = base_width - indent;
 
         // Compute height from visual line count (after text wrapping)
         // This shapes the buffer if needed and returns accurate wrapped line count
         // Pixel alignment via metrics_cache helps small text render crisply
         let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
         // Tight height: just the lines, minimal padding for future chrome.
-        // Border vertical padding is now on Node.padding — taffy adds it to the
+        // Border vertical padding is on Node.padding — taffy adds it to the
         // border box automatically, so min_height is content-only.
-        let border_v_padding = border_style
-            .map(|s| s.padding.vertical())
-            .unwrap_or(0.0);
         // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
-        let height = (line_count as f32) * layout.line_height + 4.0 + border_v_padding;
+        let height = (line_count as f32) * layout.line_height + 4.0;
 
         block_layout.y_offset = y_offset;
         block_layout.height = height;
@@ -2641,7 +2577,7 @@ pub fn init_compose_block_buffer(
         // Shape the text so glyphs are populated for MSDF rendering
         buffer.visual_line_count(&mut font_system, 800.0, None);
 
-        commands.entity(entity).insert(buffer);
+        commands.entity(entity).insert((buffer, MsdfBufferInfo::default()));
     }
 }
 

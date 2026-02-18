@@ -25,7 +25,7 @@ pub mod pipeline;
 mod tests;
 
 pub use atlas::MsdfAtlas;
-pub use buffer::{MsdfTextAreaConfig, MsdfTextBuffer, TextBounds};
+pub use buffer::{MsdfBufferInfo, MsdfTextAreaConfig, MsdfTextBuffer, TextBounds};
 pub use generator::MsdfGenerator;
 // Font metrics infrastructure for future pixel-alignment work
 #[allow(unused_imports)]

@@ -16,7 +16,7 @@ use super::msdf::{
     prepare_bloom, prepare_msdf_texts,
     ExtractedCameraMotion, FontMetricsCache, MsdfAtlas, MsdfBloomNode, MsdfBloomPipeline,
     MsdfBloomResources, MsdfCameraMotion, MsdfGenerator,
-    MsdfTaaConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
+    MsdfBufferInfo, MsdfTaaConfig, MsdfText, MsdfTextAreaConfig, MsdfTextBuffer, MsdfTextPipeline,
     MsdfTextRenderNode, MsdfTextTaaNode, MsdfTextTaaPipeline, MsdfTextTaaResources,
     MsdfTextTaaState, MsdfUiText, UiTextPositionCache,
 };
@@ -34,6 +34,11 @@ pub struct TextRenderPlugin;
 
 impl Plugin for TextRenderPlugin {
     fn build(&self, app: &mut App) {
+        // Register reflectable types for BRP inspection
+        app.register_type::<MsdfTextAreaConfig>()
+            .register_type::<super::msdf::TextBounds>()
+            .register_type::<MsdfBufferInfo>();
+
         // Main world resources
         app.init_resource::<SharedFontSystem>()
             .init_resource::<MsdfRenderConfig>()
@@ -55,6 +60,7 @@ impl Plugin for TextRenderPlugin {
                 sync_ui_text_config_positions,
                 request_atlas_glyphs,
                 update_msdf_generator,
+                sync_msdf_buffer_info,
             ).chain());
 
         #[cfg(debug_assertions)]
@@ -339,6 +345,7 @@ fn init_ui_text_buffers(
             buffer,
             MsdfText,
             MsdfTextAreaConfig::default(),
+            MsdfBufferInfo::default(),
         ));
     }
 }
@@ -399,6 +406,18 @@ fn update_ui_text_buffers(
             right: (position.left + position.width) as i32,
             bottom: (position.top + position.height) as i32,
         };
+    }
+}
+
+/// Sync key stats from MsdfTextBuffer → MsdfBufferInfo for BRP inspection.
+fn sync_msdf_buffer_info(
+    mut query: Query<(&MsdfTextBuffer, &mut MsdfBufferInfo)>,
+) {
+    for (buf, mut info) in query.iter_mut() {
+        info.glyph_count = buf.glyphs().len();
+        info.visual_lines = buf.visual_lines();
+        info.wrap_width = buf.wrap_width();
+        info.dirty = buf.is_dirty();
     }
 }
 

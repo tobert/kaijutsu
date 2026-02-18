@@ -21,8 +21,8 @@ mod plugin;
 mod resources;
 
 pub use msdf::{
-    FontMetricsCache, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig, MsdfUiText,
-    TextBounds, UiTextPositionCache,
+    FontMetricsCache, MsdfBufferInfo, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig,
+    MsdfUiText, TextBounds, UiTextPositionCache,
 };
 pub use plugin::TextRenderPlugin;
 pub use resources::{bevy_to_cosmic_color, bevy_to_rgba8, SharedFontSystem, TextMetrics};

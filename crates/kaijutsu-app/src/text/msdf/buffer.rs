@@ -297,6 +297,21 @@ impl MsdfTextBuffer {
         &self.glyphs
     }
 
+    /// Whether the buffer needs reshaping.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Cached visual line count from last layout.
+    pub fn visual_lines(&self) -> usize {
+        self.cached_visual_lines
+    }
+
+    /// Cached wrap width from last layout.
+    pub fn wrap_width(&self) -> f32 {
+        self.cached_wrap_width
+    }
+
     /// Get glyph positions (for testing).
     #[cfg(test)]
     pub fn glyph_positions(&self) -> Vec<(f32, f32)> {
@@ -336,7 +351,8 @@ impl MsdfTextBuffer {
 }
 
 /// Configuration for rendering a text area.
-#[derive(Component, Clone)]
+#[derive(Component, Clone, Reflect)]
+#[reflect(Component)]
 pub struct MsdfTextAreaConfig {
     /// Position from left edge of the screen.
     pub left: f32,
@@ -368,7 +384,7 @@ impl Default for MsdfTextAreaConfig {
 }
 
 /// Text clipping bounds.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Reflect)]
 pub struct TextBounds {
     pub left: i32,
     pub top: i32,
@@ -397,6 +413,19 @@ impl TextBounds {
     pub fn height(&self) -> i32 {
         self.bottom - self.top
     }
+}
+
+/// Reflectable summary of an `MsdfTextBuffer` for BRP inspection.
+///
+/// `MsdfTextBuffer` itself can't derive Reflect (contains `cosmic_text::Buffer`),
+/// so this lightweight component mirrors key stats for runtime debugging.
+#[derive(Component, Reflect, Default)]
+#[reflect(Component)]
+pub struct MsdfBufferInfo {
+    pub glyph_count: usize,
+    pub visual_lines: usize,
+    pub wrap_width: f32,
+    pub dirty: bool,
 }
 
 #[cfg(test)]
