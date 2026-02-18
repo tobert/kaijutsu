@@ -317,9 +317,14 @@ impl BlockDocument {
             .map(|n| n as u64)
             .unwrap_or(0);
 
-        let content = block_map.get_text("content")
-            .map(|t| t.content())
-            .unwrap_or_default();
+        // Prefer content_final (LWW register, 1 LV) over content (Text CRDT, 1 LV/char)
+        let content = block_map.get("content_final")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| {
+                block_map.get_text("content")
+                    .map(|t| t.content())
+                    .unwrap_or_default()
+            });
 
         let collapsed = block_map.get("collapsed")
             .and_then(|v| v.as_bool())
@@ -867,6 +872,37 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Promote a block's content from Text CRDT to an LWW register.
+    ///
+    /// Reads the current Text CRDT content and writes it as a `content_final`
+    /// map key (LWW string via `map.set()`). This consumes 1 LV total instead
+    /// of 1 LV per character, significantly reducing oplog size for finalized blocks.
+    ///
+    /// Should be called when a block transitions to Done or Error status.
+    /// Idempotent — re-promoting overwrites with the same content.
+    pub fn promote_to_register(&mut self, id: &BlockId) -> Result<()> {
+        let block_key = format!("block:{}", id.to_key());
+
+        // Read current text content
+        let content = {
+            let block_map = self.doc.get_map(&[&block_key])
+                .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            block_map.get_text("content")
+                .map(|t| t.content())
+                .unwrap_or_default()
+        };
+
+        // Write as LWW register
+        self.doc.transact(self.agent, |tx| {
+            if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                block_map.set("content_final", content.as_str());
+            }
+        });
+
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the display hint of a block.
     ///
     /// Display hints are used for richer output formatting (tables, trees).
@@ -1370,11 +1406,22 @@ impl BlockDocument {
         let mut doc = Self::new(&snapshot.document_id, &agent_id);
 
         let mut last_id: Option<BlockId> = None;
+        let mut finalized_content: Vec<(BlockId, String)> = Vec::new();
+
         for block_snap in &snapshot.blocks {
             // Track max seq for our agent_id to avoid ID collisions
             if block_snap.id.agent_id == agent_id {
                 doc.next_seq = doc.next_seq.max(block_snap.id.seq + 1);
             }
+
+            // For Done/Error blocks, skip Text CRDT content — use register instead
+            let is_finalized = matches!(block_snap.status, Status::Done | Status::Error);
+            let content = if is_finalized && !block_snap.content.is_empty() {
+                finalized_content.push((block_snap.id.clone(), block_snap.content.clone()));
+                String::new() // skip Text CRDT fill
+            } else {
+                block_snap.content.clone()
+            };
 
             if doc.insert_block_with_id(
                 block_snap.id.clone(),
@@ -1382,7 +1429,7 @@ impl BlockDocument {
                 last_id.as_ref(),
                 block_snap.role.clone(),
                 block_snap.kind.clone(),
-                block_snap.content.clone(),
+                content,
                 block_snap.author.clone(),
                 block_snap.tool_name.clone(),
                 block_snap.tool_input.clone(),
@@ -1396,6 +1443,16 @@ impl BlockDocument {
             ).is_ok() {
                 last_id = Some(block_snap.id.clone());
             }
+        }
+
+        // Write content_final registers for finalized blocks (1 LV each vs 1 LV/char)
+        for (id, content) in finalized_content {
+            let block_key = format!("block:{}", id.to_key());
+            doc.doc.transact(doc.agent, |tx| {
+                if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                    block_map.set("content_final", content.as_str());
+                }
+            });
         }
 
         doc.version = snapshot.version;
@@ -2361,5 +2418,99 @@ mod tests {
         }
         // With delete+rewrite cycles, compaction should reduce oplog
         assert!(oplog_after < oplog_before, "expected reduction: {} vs {}", oplog_after, oplog_before);
+    }
+
+    #[test]
+    fn test_promote_to_register() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Hello world", "claude").unwrap();
+
+        // Before promotion: content comes from Text CRDT
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "Hello world");
+
+        // Promote
+        doc.promote_to_register(&id).unwrap();
+
+        // After promotion: content comes from content_final register
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "Hello world");
+
+        // Verify the register key exists directly
+        let block_key = format!("block:{}", id.to_key());
+        let block_map = doc.doc.get_map(&[&block_key]).unwrap();
+        let final_val = block_map.get("content_final").unwrap();
+        assert_eq!(final_val.as_str().unwrap(), "Hello world");
+    }
+
+    #[test]
+    fn test_running_blocks_not_promoted() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "", "claude").unwrap();
+        doc.set_status(&id, Status::Running).unwrap();
+        doc.edit_text(&id, 0, "streaming...", 0).unwrap();
+
+        // Running block should not have content_final
+        let block_key = format!("block:{}", id.to_key());
+        let block_map = doc.doc.get_map(&[&block_key]).unwrap();
+        assert!(block_map.get("content_final").is_none());
+
+        // Content still readable from Text CRDT
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "streaming...");
+    }
+
+    #[test]
+    fn test_compaction_promotes_done_blocks() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+
+        // Insert blocks with streaming edits (simulates real LLM output)
+        for i in 0..20 {
+            let id = doc.insert_block(
+                None, None, Role::Model, BlockKind::Text,
+                "", &format!("agent-{}", i),
+            ).unwrap();
+            doc.set_status(&id, Status::Running).unwrap();
+            // Stream content char-by-char (each edit = 1 LV in Text CRDT)
+            for (j, ch) in "x".repeat(200).chars().enumerate() {
+                doc.edit_text(&id, j, &ch.to_string(), 0).unwrap();
+            }
+            doc.set_status(&id, Status::Done).unwrap();
+        }
+
+        let oplog_before = doc.oplog_bytes().unwrap().len();
+
+        // Compact (from_snapshot promotes Done blocks to registers)
+        doc.compact().unwrap();
+        let oplog_after = doc.oplog_bytes().unwrap().len();
+
+        // Verify all content preserved
+        let blocks = doc.blocks_ordered();
+        assert_eq!(blocks.len(), 20);
+        for b in &blocks {
+            assert_eq!(b.content.len(), 200);
+        }
+
+        // Compaction with register promotion should reduce oplog significantly
+        // (200 Text CRDT ops per block → 1 register set per block)
+        assert!(
+            oplog_after < oplog_before,
+            "expected reduction: {} vs {}",
+            oplog_after, oplog_before,
+        );
+    }
+
+    #[test]
+    fn test_promote_roundtrip_through_snapshot() {
+        let mut doc = BlockDocument::new("doc-1", "alice");
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "test content", "claude").unwrap();
+        doc.promote_to_register(&id).unwrap();
+
+        // Snapshot and restore
+        let snapshot = doc.snapshot();
+        let doc2 = BlockDocument::from_snapshot(snapshot, "bob");
+
+        let snap = doc2.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "test content");
     }
 }

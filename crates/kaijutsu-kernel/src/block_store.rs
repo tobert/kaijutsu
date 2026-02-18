@@ -722,6 +722,10 @@ impl BlockStore {
             let mut entry = self.get_mut(document_id).ok_or_else(|| format!("Document {} not found", document_id))?;
             let agent_id = self.agent_id();
             entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
+            // Promote finalized blocks to LWW register (1 LV vs 1 LV/char)
+            if matches!(status, Status::Done | Status::Error) {
+                let _ = entry.doc.promote_to_register(block_id);
+            }
             entry.touch(&agent_id);
         }
         self.auto_save(document_id);
@@ -1866,5 +1870,63 @@ mod tests {
 
         assert!(has_status, "should emit StatusChanged, got: {:?}", events);
         assert!(has_text, "should emit TextOps, got: {:?}", events);
+    }
+
+    /// Integration test: stream → finalize → promote → compact → verify content.
+    ///
+    /// Simulates the real LLM streaming lifecycle through BlockStore and verifies
+    /// that register promotion + compaction preserves content while reducing oplog.
+    #[tokio::test]
+    async fn test_register_promotion_lifecycle() {
+        let (store, _bus) = store_with_flows();
+        let doc_id = "promo-test";
+        store.create_document(doc_id.into(), DocumentKind::Conversation, None).unwrap();
+
+        // 1. Insert block and start streaming
+        let block_id = store.insert_block(
+            doc_id, None, None,
+            Role::Model, BlockKind::Text, "",
+        ).unwrap();
+        store.set_status(doc_id, &block_id, Status::Running).unwrap();
+
+        // 2. Stream content (many small edits — this is what register promotion saves)
+        let streaming_text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+        for (i, ch) in streaming_text.chars().enumerate() {
+            store.edit_text(doc_id, &block_id, i, &ch.to_string(), 0).unwrap();
+        }
+
+        // 3. Capture oplog before finalization
+        let oplog_before = {
+            let entry = store.get(doc_id).unwrap();
+            entry.doc.oplog_bytes().unwrap().len()
+        };
+
+        // 4. Finalize — set_status(Done) triggers promote_to_register
+        store.set_status(doc_id, &block_id, Status::Done).unwrap();
+
+        // 5. Verify content readable after promotion
+        {
+            let entry = store.get(doc_id).unwrap();
+            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
+            assert_eq!(snap.content, streaming_text);
+            assert_eq!(snap.status, Status::Done);
+        }
+
+        // 6. Compact
+        store.compact_document(doc_id).unwrap();
+
+        // 7. Verify content survives compaction
+        {
+            let entry = store.get(doc_id).unwrap();
+            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
+            assert_eq!(snap.content, streaming_text);
+
+            let oplog_after = entry.doc.oplog_bytes().unwrap().len();
+            assert!(
+                oplog_after < oplog_before,
+                "compaction should reduce oplog: {} vs {}",
+                oplog_after, oplog_before,
+            );
+        }
     }
 }
