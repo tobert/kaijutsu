@@ -14,7 +14,7 @@ use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
-use crate::shaders::{ConnectionLineMaterial, ConstellationCardMaterial, RingGuideMaterial, StarFieldMaterial};
+use crate::shaders::{DriftArcMaterial, ConstellationCardMaterial, RingGuideMaterial, StarFieldMaterial};
 use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
@@ -693,7 +693,7 @@ fn spawn_connection_lines(
     camera: Res<ConstellationCamera>,
     drift_state: Res<DriftState>,
     theme: Res<Theme>,
-    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut arc_materials: ResMut<Assets<DriftArcMaterial>>,
     container: Query<(Entity, &ComputedNode), With<ConstellationContainer>>,
     existing_connections: Query<&ConstellationConnection>,
 ) {
@@ -744,16 +744,18 @@ fn spawn_connection_lines(
         let Some(from_node) = constellation.node_by_id(from_id) else { continue };
         let Some(to_node) = constellation.node_by_id(to_id) else { continue };
 
-        let (color, intensity, flow_speed) = match kind {
+        let (color, intensity, flow_speed, curve_amount) = match kind {
             DriftConnectionKind::Ancestry => (
                 theme.constellation_connection_color,
                 0.2,
                 0.1,
+                0.25, // gentle curve for parent→child
             ),
             DriftConnectionKind::StagedDrift => (
                 theme.ansi.cyan.with_alpha(0.8),
                 0.6,
                 0.5,
+                0.35, // more pronounced curve for drift arcs
             ),
         };
 
@@ -767,9 +769,9 @@ fn spawn_connection_lines(
         let activity = (from_node.activity.glow_intensity() + to_node.activity.glow_intensity()) / 2.0;
         let aspect = cb.width / cb.height.max(1.0);
 
-        let material = connection_materials.add(ConnectionLineMaterial {
+        let material = arc_materials.add(DriftArcMaterial {
             color: color_to_vec4(color),
-            params: Vec4::new(0.08, intensity, flow_speed, 0.0),
+            params: Vec4::new(0.08, intensity, flow_speed, curve_amount),
             time: Vec4::new(0.0, activity, 0.0, 0.0),
             endpoints: Vec4::new(cb.rel_from_x, cb.rel_from_y, cb.rel_to_x, cb.rel_to_y),
             dimensions: Vec4::new(cb.width, cb.height, aspect, 4.0),
@@ -801,17 +803,17 @@ fn spawn_connection_lines(
     }
 }
 
-/// Update connection line visuals based on node activity and camera
+/// Update drift arc visuals based on node activity and camera
 fn update_connection_visuals(
     constellation: Res<Constellation>,
     camera: Res<ConstellationCamera>,
     theme: Res<Theme>,
-    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut arc_materials: ResMut<Assets<DriftArcMaterial>>,
     container_q: Query<&ComputedNode, With<ConstellationContainer>>,
     mut connections: Query<(
         &ConstellationConnection,
         &mut Node,
-        &MaterialNode<ConnectionLineMaterial>,
+        &MaterialNode<DriftArcMaterial>,
     )>,
 ) {
     let needs_update = constellation.is_changed() || camera.is_changed();
@@ -845,7 +847,7 @@ fn update_connection_visuals(
             node_style.width = Val::Px(cb.width);
             node_style.height = Val::Px(cb.height);
 
-            if let Some(mat) = connection_materials.get_mut(material_node.0.id()) {
+            if let Some(mat) = arc_materials.get_mut(material_node.0.id()) {
                 let activity =
                     (from.activity.glow_intensity() + to.activity.glow_intensity()) / 2.0;
                 mat.time.y = activity;

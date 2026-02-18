@@ -76,6 +76,7 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<TextGlowMaterial>::default(),
             // Constellation effects
             UiMaterialPlugin::<ConnectionLineMaterial>::default(),
+            UiMaterialPlugin::<DriftArcMaterial>::default(),
             UiMaterialPlugin::<ConstellationCardMaterial>::default(),
             UiMaterialPlugin::<StarFieldMaterial>::default(),
             UiMaterialPlugin::<RingGuideMaterial>::default(),
@@ -163,6 +164,7 @@ fn update_shader_time(
 fn update_shader_time_effects(
     time: Res<Time>,
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
+    mut drift_arc_materials: ResMut<Assets<DriftArcMaterial>>,
     mut constellation_card_materials: ResMut<Assets<ConstellationCardMaterial>>,
     mut star_field_materials: ResMut<Assets<StarFieldMaterial>>,
     mut ring_guide_materials: ResMut<Assets<RingGuideMaterial>>,
@@ -173,6 +175,9 @@ fn update_shader_time_effects(
 
     // Constellation effects
     for (_, mat) in connection_materials.iter_mut() {
+        mat.time.x = t;
+    }
+    for (_, mat) in drift_arc_materials.iter_mut() {
         mat.time.x = t;
     }
     for (_, mat) in constellation_card_materials.iter_mut() {
@@ -582,6 +587,52 @@ impl Default for ConnectionLineMaterial {
 impl UiMaterial for ConnectionLineMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/connection_line.wgsl".into()
+    }
+}
+
+// ============================================================================
+// DRIFT ARC MATERIAL
+// ============================================================================
+
+/// Quadratic Bezier arc for constellation drift connections.
+///
+/// Renders a curved arc between two points with animated particle flow.
+/// The control point is computed in the shader: perpendicular to the midpoint
+/// at `curve_amount` × endpoint distance.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct DriftArcMaterial {
+    /// Arc color (RGBA)
+    #[uniform(0)]
+    pub color: Vec4,
+    /// Parameters: x=glow_width, y=intensity, z=flow_speed, w=curve_amount
+    #[uniform(1)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time, y=activity_level (0-1)
+    #[uniform(2)]
+    pub time: Vec4,
+    /// Endpoints: x0, y0, x1, y1 (normalized 0-1 relative to bounding box)
+    #[uniform(3)]
+    pub endpoints: Vec4,
+    /// Dimensions: x=width, y=height, z=aspect (w/h), w=falloff
+    #[uniform(4)]
+    pub dimensions: Vec4,
+}
+
+impl Default for DriftArcMaterial {
+    fn default() -> Self {
+        Self {
+            color: Vec4::new(0.34, 0.65, 1.0, 0.6),
+            params: Vec4::new(0.08, 0.8, 0.5, 0.3), // glow_width, intensity, flow_speed, curve_amount
+            time: Vec4::new(0.0, 0.5, 0.0, 0.0),
+            endpoints: Vec4::new(0.0, 0.5, 1.0, 0.5),
+            dimensions: Vec4::new(100.0, 100.0, 1.0, 4.0),
+        }
+    }
+}
+
+impl UiMaterial for DriftArcMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/drift_arc.wgsl".into()
     }
 }
 
