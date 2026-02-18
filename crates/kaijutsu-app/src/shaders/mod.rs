@@ -78,6 +78,7 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<ConnectionLineMaterial>::default(),
             UiMaterialPlugin::<ConstellationCardMaterial>::default(),
             UiMaterialPlugin::<StarFieldMaterial>::default(),
+            UiMaterialPlugin::<RingGuideMaterial>::default(),
             // HUD panel effects
             UiMaterialPlugin::<HudPanelMaterial>::default(),
             // Block border material
@@ -164,6 +165,7 @@ fn update_shader_time_effects(
     mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
     mut constellation_card_materials: ResMut<Assets<ConstellationCardMaterial>>,
     mut star_field_materials: ResMut<Assets<StarFieldMaterial>>,
+    mut ring_guide_materials: ResMut<Assets<RingGuideMaterial>>,
     mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
     mut block_border_materials: ResMut<Assets<block_border_material::BlockBorderMaterial>>,
 ) {
@@ -177,6 +179,9 @@ fn update_shader_time_effects(
         mat.time.x = t;
     }
     for (_, mat) in star_field_materials.iter_mut() {
+        mat.time.x = t;
+    }
+    for (_, mat) in ring_guide_materials.iter_mut() {
         mat.time.x = t;
     }
 
@@ -659,6 +664,47 @@ impl Default for StarFieldMaterial {
 impl UiMaterial for StarFieldMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/star_field.wgsl".into()
+    }
+}
+
+// ============================================================================
+// RING GUIDE MATERIAL
+// ============================================================================
+
+/// Faint dashed concentric circles at ring boundaries for constellation layout.
+///
+/// Draws rings matching the radial tree layout algorithm's radii,
+/// updated each frame with camera offset/zoom for proper centering.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct RingGuideMaterial {
+    /// Parameters: x=base_radius, y=ring_spacing, z=max_rings, w=dash_count
+    #[uniform(0)]
+    pub params: Vec4,
+    /// Time: x=elapsed_time
+    #[uniform(1)]
+    pub time: Vec4,
+    /// Camera: x=offset_x, y=offset_y, z=zoom, w=line_opacity
+    #[uniform(2)]
+    pub camera: Vec4,
+    /// Dimensions: x=width_px, y=height_px
+    #[uniform(3)]
+    pub dimensions: Vec4,
+}
+
+impl Default for RingGuideMaterial {
+    fn default() -> Self {
+        Self {
+            params: Vec4::new(120.0, 160.0, 4.0, 24.0), // base_radius, ring_spacing, max_rings, dash_count
+            time: Vec4::ZERO,
+            camera: Vec4::new(0.0, 0.0, 1.0, 0.12), // offset_x, offset_y, zoom, line_opacity
+            dimensions: Vec4::new(1280.0, 800.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl UiMaterial for RingGuideMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/ring_guide.wgsl".into()
     }
 }
 
