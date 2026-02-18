@@ -9,6 +9,7 @@ pub mod rpc;
 pub mod ssh;
 pub mod subscriptions;
 pub mod sync;
+pub mod synced_document;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {
@@ -26,6 +27,7 @@ pub use rpc::{
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
+pub use synced_document::{SyncEffect, SyncedDocument};
 
 /// Connect to a server via SSH and return an RPC client
 ///
