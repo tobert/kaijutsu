@@ -654,7 +654,7 @@ pub struct StarFieldMaterial {
 impl Default for StarFieldMaterial {
     fn default() -> Self {
         Self {
-            params: Vec4::new(10.0, 0.3, 0.6, 0.015), // density, twinkle_speed, brightness, star_size
+            params: Vec4::new(10.0, 0.3, 1.5, 0.035), // density, twinkle_speed, brightness, star_size
             time: Vec4::ZERO,
             dimensions: Vec4::new(1280.0, 800.0, 0.0, 0.0),
         }

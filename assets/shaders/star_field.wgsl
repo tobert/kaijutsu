@@ -81,8 +81,8 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     // Circular dot with soft edge
     let star_alpha = smoothstep(size, size * 0.2, dist) * has_star;
 
-    // Soft glow halo around brighter stars only
-    let glow = exp(-dist / (size * 3.0)) * 0.15 * step(0.7, star_brightness) * has_star;
+    // Soft glow halo around brighter stars
+    let glow = exp(-dist / (size * 4.0)) * 0.3 * step(0.5, star_brightness) * has_star;
 
     // Color temperature: cool blue-white to warm yellow-white
     let temp = hash21(grid_id + 500.0);
