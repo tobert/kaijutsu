@@ -21,7 +21,7 @@ pub enum BootstrapCommand {
     SpawnActor {
         config: SshConfig,
         kernel_id: String,
-        context_name: String,
+        context_name: Option<String>,
         instance: String,
     },
 }
@@ -34,7 +34,7 @@ pub enum BootstrapResult {
         handle: ActorHandle,
         generation: u64,
         kernel_id: String,
-        context_name: String,
+        context_name: Option<String>,
     },
     /// Spawn failed (e.g. initial SSH connect failure).
     /// The actor will retry internally, but we report the first error.
@@ -108,7 +108,7 @@ fn bootstrap_thread(
                             let current_gen = generation;
 
                             log::info!(
-                                "Bootstrap: spawning actor generation={} kernel={} context={} instance={}",
+                                "Bootstrap: spawning actor generation={} kernel={} context={:?} instance={}",
                                 current_gen, kernel_id, context_name, instance
                             );
 

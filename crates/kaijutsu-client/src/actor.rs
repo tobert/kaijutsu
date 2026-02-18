@@ -574,7 +574,7 @@ const BASE_BACKOFF_SECS: f64 = 1.0;
 struct RpcActor {
     config: SshConfig,
     kernel_id: String,
-    context_name: String,
+    context_name: Option<String>,
     instance: String,
     /// Live connection state (None = disconnected, will reconnect)
     connection: Option<ConnectionState>,
@@ -599,7 +599,7 @@ impl RpcActor {
     fn new(
         config: SshConfig,
         kernel_id: String,
-        context_name: String,
+        context_name: Option<String>,
         instance: String,
         existing: Option<(RpcClient, KernelHandle)>,
         event_tx: broadcast::Sender<ServerEvent>,
@@ -645,7 +645,7 @@ impl RpcActor {
         });
 
         log::info!(
-            "Actor reconnecting to {}:{} kernel={} context={} (attempt {})",
+            "Actor reconnecting to {}:{} kernel={} context={:?} (attempt {})",
             self.config.host, self.config.port, self.kernel_id, self.context_name,
             self.reconnect_attempts,
         );
@@ -692,14 +692,16 @@ impl RpcActor {
                 ActorError::Rpc(msg)
             })?;
 
-        // Join context to register our presence (returns document_id)
-        let _document_id = kernel.join_context(&self.context_name, &self.instance)
-            .await
-            .map_err(|e| {
-                let msg = format!("join_context: {e}");
-                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
-                ActorError::Rpc(msg)
-            })?;
+        // Join context if one was specified
+        if let Some(ctx) = &self.context_name {
+            let _document_id = kernel.join_context(ctx, &self.instance)
+                .await
+                .map_err(|e| {
+                    let msg = format!("join_context: {e}");
+                    let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                    ActorError::Rpc(msg)
+                })?;
+        }
 
         self.connection = Some(ConnectionState { client, kernel });
 
@@ -993,7 +995,7 @@ async fn dispatch_command(
 pub fn spawn_actor(
     config: SshConfig,
     kernel_id: String,
-    context_name: String,
+    context_name: Option<String>,
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,
 ) -> ActorHandle {

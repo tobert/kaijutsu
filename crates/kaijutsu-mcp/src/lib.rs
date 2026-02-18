@@ -290,7 +290,7 @@ impl KaijutsuMcp {
         let actor = spawn_actor(
             config,
             kernel_id.to_string(),
-            context_name.to_string(),
+            Some(context_name.to_string()),
             "mcp-server".to_string(),
             Some((client, kernel)),
         );

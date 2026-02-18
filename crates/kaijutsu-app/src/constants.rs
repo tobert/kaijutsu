@@ -4,7 +4,7 @@
 
 
 /// Default kernel ID to attach to after connecting.
-pub const DEFAULT_KERNEL_ID: &str = "lobby";
+pub const DEFAULT_KERNEL_ID: &str = "default";
 
 /// Default window dimensions.
 pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;

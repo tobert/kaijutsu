@@ -542,7 +542,7 @@ fn submit_dialog(
             let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
                 config: conn_state.ssh_config.clone(),
                 kernel_id,
-                context_name: name.to_string(),
+                context_name: Some(name.to_string()),
                 instance,
             });
         }
@@ -573,7 +573,7 @@ fn submit_dialog(
                             let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
                                 config,
                                 kernel_id,
-                                context_name: fork_name,
+                                context_name: Some(fork_name),
                                 instance,
                             });
                         }

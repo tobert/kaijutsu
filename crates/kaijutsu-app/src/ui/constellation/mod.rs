@@ -79,9 +79,15 @@ impl Plugin for ConstellationPlugin {
 // ============================================================================
 
 /// Whether the constellation view is visible (full-takeover of content area).
-#[derive(Resource, Default, Reflect)]
+#[derive(Resource, Reflect)]
 #[reflect(Resource)]
 pub struct ConstellationVisible(pub bool);
+
+impl Default for ConstellationVisible {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// Camera for constellation pan/zoom.
 ///

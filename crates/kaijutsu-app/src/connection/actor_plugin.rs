@@ -173,7 +173,7 @@ impl Plugin for ActorPlugin {
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: SshConfig::default(),
             kernel_id: DEFAULT_KERNEL_ID.to_string(),
-            context_name: "lobby".to_string(),
+            context_name: None,
             instance: "bevy-client".to_string(),
         });
 
@@ -243,7 +243,7 @@ fn periodic_reconnect(
     let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
         config: state.ssh_config.clone(),
         kernel_id: DEFAULT_KERNEL_ID.to_string(),
-        context_name: "lobby".to_string(),
+        context_name: None,
         instance: "bevy-client".to_string(),
     });
 }
@@ -261,12 +261,12 @@ fn poll_bootstrap_results(
     while let Ok(result) = rx.try_recv() {
         match result {
             bootstrap::BootstrapResult::ActorReady { handle, generation, kernel_id, context_name } => {
-                log::info!("Actor ready (generation {}) kernel={} context={}", generation, kernel_id, context_name);
+                log::info!("Actor ready (generation {}) kernel={} context={:?}", generation, kernel_id, context_name);
 
                 // Eagerly connect: fire whoami to trigger ensure_connected
-                // (SSH → attach_kernel → join_context → subscriptions → Connected),
-                // then fetch document state and emit ContextJoined so the
-                // cell systems can initialize the DocumentCache and sync state.
+                // (SSH → attach_kernel → subscriptions → Connected).
+                // If a context was specified, also fetch document state and
+                // emit ContextJoined. Otherwise just get identity.
                 let h = handle.clone();
                 let tx = result_channel.sender();
                 let kid = kernel_id.clone();
@@ -285,7 +285,9 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 2. Fetch initial document state for the joined context
+                        // 2. If we joined a context, fetch its document state
+                        let Some(ctx) = ctx else { return };
+
                         let document_id = format!("{}@{}", kid, ctx);
                         let initial_state = match h.get_document_state(&document_id).await {
                             Ok(state) => Some(state),
