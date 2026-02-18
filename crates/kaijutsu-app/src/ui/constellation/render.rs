@@ -14,7 +14,7 @@ use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
-use crate::shaders::{DriftArcMaterial, ConstellationCardMaterial, RingGuideMaterial, StarFieldMaterial};
+use crate::shaders::{DriftArcMaterial, ConstellationCardMaterial, HudPanelMaterial, RingGuideMaterial, StarFieldMaterial};
 use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
@@ -43,6 +43,14 @@ pub struct StarFieldBackground;
 #[derive(Component)]
 pub struct RingGuideBackground;
 
+/// Marker for the legend panel container in the constellation view.
+#[derive(Component)]
+pub struct ConstellationLegend;
+
+/// Marker for individual text rows inside the legend (rebuilt on data change).
+#[derive(Component)]
+pub struct LegendContent;
+
 /// Setup the constellation rendering systems
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
@@ -63,6 +71,8 @@ pub fn setup_constellation_rendering(app: &mut App) {
             update_create_node_visual,
             update_model_labels,
             update_connection_visuals,
+            spawn_legend_panel,
+            update_legend_content,
             despawn_removed_nodes,
             despawn_removed_connections,
         )
@@ -1057,6 +1067,313 @@ fn truncate_context_name(name: &str, max_len: usize) -> String {
 /// Strip provider prefix from model name for compact display.
 fn truncate_model_name(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
+}
+
+// ============================================================================
+// LEGEND PANEL
+// ============================================================================
+
+/// Spawn the legend panel container as a child of ConstellationContainer.
+///
+/// Positioned top-left with `HudPanelMaterial` background. Content children
+/// are spawned/rebuilt by `update_legend_content`.
+fn spawn_legend_panel(
+    mut commands: Commands,
+    theme: Res<Theme>,
+    mut hud_materials: ResMut<Assets<HudPanelMaterial>>,
+    container: Query<Entity, With<ConstellationContainer>>,
+    existing: Query<Entity, With<ConstellationLegend>>,
+) {
+    if !existing.is_empty() {
+        return;
+    }
+
+    let Ok(container_entity) = container.single() else {
+        return;
+    };
+
+    let panel_color = color_to_vec4(theme.panel_bg.with_alpha(0.85));
+    let glow_color = color_to_vec4(theme.accent.with_alpha(0.3));
+
+    let material = hud_materials.add(HudPanelMaterial {
+        color: panel_color,
+        glow_color,
+        params: Vec4::new(0.3, 0.0, 1.0, 0.0),
+        time: Vec4::ZERO,
+    });
+
+    let legend_entity = commands
+        .spawn((
+            ConstellationLegend,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(16.0),
+                top: Val::Px(16.0),
+                width: Val::Px(220.0),
+                min_height: Val::Px(80.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(12.0)),
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+            MaterialNode(material),
+            ZIndex(1), // Above cards and connections
+        ))
+        .id();
+
+    commands.entity(container_entity).add_child(legend_entity);
+    info!("Spawned constellation legend panel");
+}
+
+/// Rebuild legend content when DriftState or Constellation changes.
+///
+/// Despawns all `LegendContent` children and rebuilds from current data.
+/// Shows: kernel name, context/agent summary, per-provider rows with colored
+/// dots and context counts, and staged drift count.
+fn update_legend_content(
+    mut commands: Commands,
+    visible: Res<ConstellationVisible>,
+    drift_state: Res<DriftState>,
+    constellation: Res<Constellation>,
+    theme: Res<Theme>,
+    legend_q: Query<Entity, With<ConstellationLegend>>,
+    content_q: Query<Entity, With<LegendContent>>,
+    mut last_fingerprint: Local<u64>,
+) {
+    if !visible.0 {
+        return;
+    }
+
+    // Build a cheap fingerprint of the data that drives legend content.
+    // Only rebuild when this fingerprint changes — avoids despawning MSDF
+    // text entities every frame (they need 2+ frames to initialize rendering).
+    let fingerprint = {
+        let mut h: u64 = constellation.nodes.len() as u64;
+        h = h.wrapping_mul(31).wrapping_add(drift_state.staged.len() as u64);
+        h = h.wrapping_mul(31).wrapping_add(drift_state.contexts.len() as u64);
+        for ctx in &drift_state.contexts {
+            h = h.wrapping_mul(31).wrapping_add(ctx.provider.len() as u64);
+        }
+        h
+    };
+
+    if fingerprint == *last_fingerprint && !content_q.is_empty() {
+        return;
+    }
+
+    let Ok(legend_entity) = legend_q.single() else {
+        return;
+    };
+
+    // Despawn old content
+    for entity in content_q.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    // Gather data from DriftState contexts
+    let contexts = &drift_state.contexts;
+    let total_contexts = constellation.nodes.len();
+    let staged_count = drift_state.staged_count();
+
+    // Kernel name (all contexts share the same kernel_id)
+    let kernel_name = contexts
+        .first()
+        .map(|c| c.kernel_id.as_str())
+        .unwrap_or("(no kernel)");
+
+    // Group contexts by provider
+    let mut provider_counts: Vec<(&str, Color, usize)> = Vec::new();
+    let provider_groups = [
+        ("human", theme.agent_color_human),
+        ("anthropic", theme.agent_color_claude),
+        ("google", theme.agent_color_gemini),
+        ("deepseek", theme.agent_color_deepseek),
+        ("local", theme.agent_color_local),
+    ];
+
+    for (provider_key, color) in &provider_groups {
+        let count = contexts
+            .iter()
+            .filter(|c| {
+                let p = c.provider.to_ascii_lowercase();
+                match *provider_key {
+                    "anthropic" => p.contains("anthropic") || p.contains("claude"),
+                    "google" => p.contains("google") || p.contains("gemini"),
+                    "deepseek" => p.contains("deepseek"),
+                    "local" => p.contains("ollama") || p.contains("local") || p.contains("llama"),
+                    "human" => p.is_empty(), // No provider = human
+                    _ => false,
+                }
+            })
+            .count();
+        if count > 0 {
+            provider_counts.push((provider_key, *color, count));
+        }
+    }
+
+    let unique_providers = provider_counts.len();
+
+    // === Spawn content rows ===
+
+    // Header: kernel name
+    let header = spawn_legend_text(
+        &mut commands,
+        &truncate_context_name(kernel_name, 22),
+        theme.fg,
+        11.0,
+    );
+    commands.entity(legend_entity).add_child(header);
+
+    // Summary line
+    let summary = format!("{} contexts \u{00b7} {} agents", total_contexts, unique_providers);
+    let summary_entity = spawn_legend_text(&mut commands, &summary, theme.fg_dim, 9.0);
+    commands.entity(legend_entity).add_child(summary_entity);
+
+    // Separator
+    let sep = commands
+        .spawn((
+            LegendContent,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Px(1.0),
+                margin: UiRect::vertical(Val::Px(3.0)),
+                ..default()
+            },
+            BackgroundColor(theme.border.with_alpha(0.4)),
+        ))
+        .id();
+    commands.entity(legend_entity).add_child(sep);
+
+    // Per-provider rows
+    for (label, color, count) in &provider_counts {
+        let display_name = match *label {
+            "anthropic" => "claude",
+            "google" => "gemini",
+            "human" => "amy", // TODO: get from Identity when available
+            l => l,
+        };
+        let row = spawn_legend_agent_row(
+            &mut commands,
+            display_name,
+            *color,
+            *count,
+            &theme,
+        );
+        commands.entity(legend_entity).add_child(row);
+    }
+
+    // Bottom separator + drift count (only if there are staged drifts)
+    if staged_count > 0 {
+        let sep2 = commands
+            .spawn((
+                LegendContent,
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(1.0),
+                    margin: UiRect::vertical(Val::Px(3.0)),
+                    ..default()
+                },
+                BackgroundColor(theme.border.with_alpha(0.4)),
+            ))
+            .id();
+        commands.entity(legend_entity).add_child(sep2);
+
+        let drift_text = format!("{} staged drifts", staged_count);
+        let drift_entity = spawn_legend_text(&mut commands, &drift_text, theme.ansi.cyan, 9.0);
+        commands.entity(legend_entity).add_child(drift_entity);
+    }
+
+    *last_fingerprint = fingerprint;
+}
+
+/// Spawn a simple text row for the legend panel.
+fn spawn_legend_text(commands: &mut Commands, text: &str, color: Color, font_size: f32) -> Entity {
+    commands
+        .spawn((
+            LegendContent,
+            Node {
+                min_height: Val::Px(font_size + 4.0),
+                ..default()
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                crate::text::MsdfUiText::new(text)
+                    .with_font_size(font_size)
+                    .with_color(color),
+                crate::text::UiTextPositionCache::default(),
+                // Explicit size needed — MsdfUiText doesn't participate in Bevy's
+                // layout intrinsic sizing, so the node would compute as 0-width.
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(font_size + 2.0),
+                    ..default()
+                },
+            ));
+        })
+        .id()
+}
+
+/// Spawn an agent row with colored dot + name + count.
+fn spawn_legend_agent_row(
+    commands: &mut Commands,
+    name: &str,
+    color: Color,
+    count: usize,
+    theme: &Theme,
+) -> Entity {
+    commands
+        .spawn((
+            LegendContent,
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                min_height: Val::Px(16.0),
+                ..default()
+            },
+        ))
+        .with_children(|parent| {
+            // Colored dot
+            parent.spawn((
+                Node {
+                    width: Val::Px(8.0),
+                    height: Val::Px(8.0),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(color),
+            ));
+
+            // Agent name
+            parent.spawn((
+                crate::text::MsdfUiText::new(name)
+                    .with_font_size(10.0)
+                    .with_color(color),
+                crate::text::UiTextPositionCache::default(),
+                Node {
+                    width: Val::Px(70.0),
+                    height: Val::Px(12.0),
+                    ..default()
+                },
+            ));
+
+            // Count (right-aligned)
+            let count_text = format!("{} ctx", count);
+            parent.spawn((
+                crate::text::MsdfUiText::new(&count_text)
+                    .with_font_size(9.0)
+                    .with_color(theme.fg_dim),
+                crate::text::UiTextPositionCache::default(),
+                Node {
+                    width: Val::Px(50.0),
+                    height: Val::Px(11.0),
+                    margin: UiRect::left(Val::Auto),
+                    ..default()
+                },
+            ));
+        })
+        .id()
 }
 
 /// Update model label text on constellation nodes when model info changes.
