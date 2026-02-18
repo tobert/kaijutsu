@@ -6,6 +6,37 @@
 use bevy::prelude::*;
 use kaijutsu_crdt::BlockId;
 
+/// Modal focus stack — push when opening a modal, pop when closing.
+///
+/// Replaces the old `ModalDialogOpen` + `DialogPreviousFocus` pair with a proper
+/// stack that supports nested modals and correct focus restoration.
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct FocusStack(pub Vec<FocusArea>);
+
+impl FocusStack {
+    /// Push current focus onto the stack and switch to new focus.
+    pub fn push(&mut self, focus: &mut FocusArea, new: FocusArea) {
+        self.0.push(focus.clone());
+        *focus = new;
+    }
+
+    /// Pop and restore previous focus. Returns None if stack empty.
+    pub fn pop(&mut self, focus: &mut FocusArea) -> Option<FocusArea> {
+        if let Some(prev) = self.0.pop() {
+            let was = std::mem::replace(focus, prev.clone());
+            Some(was)
+        } else {
+            None
+        }
+    }
+
+    /// True if a modal layer is active (anything pushed).
+    pub fn is_modal(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
 /// What area of the UI currently has keyboard focus.
 ///
 /// This is the single source of truth for "what should keyboard input do?"
@@ -16,7 +47,6 @@ use kaijutsu_crdt::BlockId;
 #[reflect(Resource)]
 pub enum FocusArea {
     /// Compose text input area. Typing inserts text. Enter submits.
-    #[default]
     Compose,
     /// Conversation block list. j/k navigates, Enter/i activates, f expands.
     Conversation,
@@ -27,6 +57,7 @@ pub enum FocusArea {
         block_id: Option<BlockId>,
     },
     /// Constellation node graph. hjkl spatial nav, Enter switches context.
+    #[default]
     Constellation,
     /// Modal dialog. Captures all input. Enter confirms, Escape cancels.
     Dialog,

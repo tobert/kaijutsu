@@ -385,13 +385,20 @@ fn track_agent_activity(
 }
 
 /// Handle clicks on constellation nodes to focus that context.
+///
+/// Guarded by `FocusStack::is_modal()` — clicks are ignored when a dialog
+/// is open over the constellation, preventing focus theft.
 fn handle_node_click(
     mut constellation: ResMut<Constellation>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
-    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
     mut focus: ResMut<crate::input::focus::FocusArea>,
+    focus_stack: Res<crate::input::focus::FocusStack>,
 ) {
+    if focus_stack.is_modal() {
+        return;
+    }
+
     for (interaction, node) in nodes.iter() {
         if *interaction == Interaction::Pressed {
             info!("Clicked constellation node: {}", node.context_id);
@@ -399,10 +406,7 @@ fn handle_node_click(
             switch_writer.write(crate::cell::ContextSwitchRequested {
                 context_name: node.context_id.clone(),
             });
-            // Dismiss constellation and switch to compose
-            if let Some(ref mut vis) = constellation_visible {
-                vis.0 = false;
-            }
+            // enforce_constellation_focus_sync handles visibility
             *focus = crate::input::focus::FocusArea::Compose;
         }
     }

@@ -13,6 +13,7 @@ use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
+use crate::input::focus::{FocusArea, FocusStack};
 use crate::shaders::{DriftArcMaterial, ConstellationCardMaterial, HudPanelMaterial, RingGuideMaterial, StarFieldMaterial};
 use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
@@ -49,6 +50,7 @@ pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
         Update,
         (
+            enforce_constellation_focus_sync,
             spawn_constellation_container,
             spawn_star_field,
             spawn_ring_guide,
@@ -72,6 +74,31 @@ pub fn setup_constellation_rendering(app: &mut App) {
             .chain()
             .in_set(ConstellationRendering),
     );
+}
+
+/// Enforce constellation↔focus sync: when `FocusArea` changes, update
+/// `ConstellationVisible` to match. This is the single source of truth for
+/// the invariant "constellation is visible iff focus is Constellation".
+///
+/// Skipped while a modal is active (dialog over constellation), so the
+/// constellation stays visible behind the dialog overlay.
+fn enforce_constellation_focus_sync(
+    mut visible: ResMut<ConstellationVisible>,
+    focus: Res<FocusArea>,
+    focus_stack: Res<FocusStack>,
+) {
+    if !focus.is_changed() {
+        return;
+    }
+    // Don't sync while modal is active — constellation stays as-is behind dialog
+    if focus_stack.is_modal() {
+        return;
+    }
+
+    let should_show = matches!(*focus, FocusArea::Constellation);
+    if visible.0 != should_show {
+        visible.0 = should_show;
+    }
 }
 
 /// Spawn the constellation container as a full-size flex child of ContentArea.

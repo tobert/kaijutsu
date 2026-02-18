@@ -69,6 +69,7 @@ pub fn sync_input_context(
         }
         FocusArea::Dialog => {
             active.0.push(InputContext::Dialog);
+            active.0.push(InputContext::TextInput);
         }
     }
 }

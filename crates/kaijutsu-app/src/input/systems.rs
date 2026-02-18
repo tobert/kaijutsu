@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use super::action::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
-use crate::ui::constellation::ConstellationVisible;
+use crate::ui::constellation::ConstellationVisible; // Used by handle_focus_cycle (reads visibility)
 
 // ============================================================================
 // FOCUS CYCLING — Tab/Shift+Tab
@@ -20,7 +20,7 @@ use crate::ui::constellation::ConstellationVisible;
 pub fn handle_focus_cycle(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
+    constellation_visible: Option<Res<ConstellationVisible>>,
 ) {
     for ActionFired(action) in actions.read() {
         let constellation_on = constellation_visible
@@ -28,7 +28,6 @@ pub fn handle_focus_cycle(
             .map(|v| v.0)
             .unwrap_or(false);
 
-        let old_focus = focus.clone();
         match action {
             Action::CycleFocusForward => {
                 *focus = match focus.as_ref() {
@@ -61,17 +60,7 @@ pub fn handle_focus_cycle(
             }
             _ => {}
         }
-
-        // Sync ConstellationVisible when cycling into/out of Constellation
-        if let Some(ref mut vis) = constellation_visible {
-            let was_constellation = matches!(old_focus, FocusArea::Constellation);
-            let is_constellation = matches!(*focus, FocusArea::Constellation);
-            if was_constellation && !is_constellation {
-                vis.0 = false;
-            } else if !was_constellation && is_constellation {
-                vis.0 = true;
-            }
-        }
+        // ConstellationVisible synced by enforce_constellation_focus_sync
     }
 }
 
@@ -100,7 +89,6 @@ pub fn handle_focus_compose(
 pub fn handle_unfocus(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Unfocus) {
@@ -112,9 +100,7 @@ pub fn handle_unfocus(
                 *focus = FocusArea::Conversation;
             }
             FocusArea::Constellation => {
-                if let Some(ref mut vis) = constellation_visible {
-                    vis.0 = false;
-                }
+                // ConstellationVisible synced by enforce_constellation_focus_sync
                 *focus = FocusArea::Conversation;
             }
             // Dialog handles its own close — don't interfere
@@ -186,21 +172,18 @@ pub fn handle_screenshot(
 pub fn handle_toggle_constellation(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::ToggleConstellation) {
             continue;
         }
 
-        if let Some(ref mut vis) = constellation_visible {
-            vis.0 = !vis.0;
-            if vis.0 {
-                *focus = FocusArea::Constellation;
-            } else {
-                *focus = FocusArea::Conversation;
-            }
-        }
+        // Just toggle focus — enforce_constellation_focus_sync handles visibility
+        *focus = if matches!(*focus, FocusArea::Constellation) {
+            FocusArea::Conversation
+        } else {
+            FocusArea::Constellation
+        };
     }
 }
 
@@ -582,7 +565,6 @@ pub fn handle_constellation_nav(
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
     doc_cache: Res<crate::cell::DocumentCache>,
-    mut constellation_visible: Option<ResMut<ConstellationVisible>>,
 ) {
     if !matches!(*focus, FocusArea::Constellation) {
         return;
@@ -591,10 +573,8 @@ pub fn handle_constellation_nav(
     for ActionFired(action) in actions.read() {
         match action {
             Action::SpatialNav(direction) => {
-                // Find nearest node in the given direction
                 if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
                     constellation.focus(&target_id);
-                    // Auto-center camera on focused node
                     if let Some(node) = constellation.node_by_id(&target_id) {
                         camera.target_offset = -node.position * camera.zoom;
                     }
@@ -614,15 +594,13 @@ pub fn handle_constellation_nav(
                 camera.reset();
             }
             Action::Activate => {
-                // Enter on focused node → switch context and dismiss constellation
+                // Enter → switch context and dismiss constellation
                 if let Some(ref focus_id) = constellation.focus_id {
                     info!("Constellation: switching to {}", focus_id);
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: focus_id.clone(),
                     });
-                    if let Some(ref mut vis) = constellation_visible {
-                        vis.0 = false;
-                    }
+                    // enforce_constellation_focus_sync handles visibility
                     *focus = FocusArea::Compose;
                 }
             }
@@ -632,9 +610,6 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: id,
                     });
-                    if let Some(ref mut vis) = constellation_visible {
-                        vis.0 = false;
-                    }
                     *focus = FocusArea::Compose;
                 }
             }
@@ -644,9 +619,6 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: id,
                     });
-                    if let Some(ref mut vis) = constellation_visible {
-                        vis.0 = false;
-                    }
                     *focus = FocusArea::Compose;
                 }
             }
@@ -656,9 +628,6 @@ pub fn handle_constellation_nav(
                     switch_writer.write(crate::cell::ContextSwitchRequested {
                         context_name: alt_id,
                     });
-                    if let Some(ref mut vis) = constellation_visible {
-                        vis.0 = false;
-                    }
                     *focus = FocusArea::Compose;
                 }
             }

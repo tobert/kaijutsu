@@ -13,11 +13,9 @@ use std::sync::{Arc, Mutex};
 use crate::connection::RpcActor;
 use crate::input::action::Action;
 use crate::input::events::ActionFired;
-use crate::input::focus::FocusArea;
+use crate::input::focus::{FocusArea, FocusStack};
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
-
-use super::create_dialog::ModalDialogOpen;
 
 // ============================================================================
 // MESSAGES
@@ -97,8 +95,8 @@ pub fn setup_model_picker_systems(app: &mut App) {
 fn handle_open_model_picker(
     mut commands: Commands,
     mut events: MessageReader<OpenModelPicker>,
-    mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut focus_stack: ResMut<FocusStack>,
     existing: Query<Entity, With<ModelPickerDialog>>,
     theme: Res<Theme>,
     actor: Option<Res<RpcActor>>,
@@ -114,8 +112,7 @@ fn handle_open_model_picker(
             continue;
         };
 
-        modal_state.0 = true;
-        *focus = FocusArea::Dialog;
+        focus_stack.push(&mut focus, FocusArea::Dialog);
 
         // Clear any stale result
         *result_slot.0.lock().unwrap() = None;
@@ -340,8 +337,8 @@ fn poll_model_picker_result(
 fn handle_model_picker_input(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
-    mut modal_state: ResMut<ModalDialogOpen>,
     mut focus: ResMut<FocusArea>,
+    mut focus_stack: ResMut<FocusStack>,
     mut dialogs: Query<(Entity, &ModelPickerDialog, Option<&mut ModelPickerSelection>)>,
     mut items: Query<(&ModelPickerItem, &mut BackgroundColor, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
@@ -356,7 +353,7 @@ fn handle_model_picker_input(
         // Still loading — only handle Escape/Unfocus
         for ActionFired(action) in actions.read() {
             if matches!(action, Action::Unfocus) {
-                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+                close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
             }
         }
         return;
@@ -365,7 +362,7 @@ fn handle_model_picker_input(
     for ActionFired(action) in actions.read() {
         match action {
             Action::Unfocus => {
-                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+                close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
             }
             Action::Activate => {
@@ -388,7 +385,7 @@ fn handle_model_picker_input(
                         .detach();
                 }
 
-                close_model_picker(&mut commands, dialog_entity, &mut modal_state, &mut focus);
+                close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
             }
             Action::FocusNextBlock => {
@@ -444,16 +441,13 @@ fn update_picker_visuals(
     }
 }
 
-/// Close the model picker and restore focus.
-///
-/// Known limitation: hardcoded return to Constellation (see create_dialog::close_dialog).
+/// Close the model picker and restore focus from the stack.
 fn close_model_picker(
     commands: &mut Commands,
     dialog_entity: Entity,
-    modal_state: &mut ModalDialogOpen,
     focus: &mut FocusArea,
+    focus_stack: &mut FocusStack,
 ) {
-    modal_state.0 = false;
-    *focus = FocusArea::Constellation;
+    focus_stack.pop(focus);
     commands.entity(dialog_entity).despawn();
 }

@@ -46,7 +46,7 @@ pub mod systems;
 // Re-export core types for ergonomic use.
 // FocusArea is consumed by cell, tiling_widgets, timeline, conversation, frame_assembly.
 // Others are pub API for future external consumers.
-pub use focus::FocusArea;
+pub use focus::{FocusArea, FocusStack};
 #[allow(unused_imports)]
 pub use action::Action;
 #[allow(unused_imports)]
@@ -84,6 +84,7 @@ impl Plugin for InputPlugin {
 
         // Register resources
         app.init_resource::<focus::FocusArea>()
+            .init_resource::<focus::FocusStack>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
             .init_resource::<sequence::SequenceState>()
@@ -91,6 +92,7 @@ impl Plugin for InputPlugin {
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
+            .register_type::<focus::FocusStack>()
             .register_type::<map::InputMap>()
             .register_type::<context::ActiveInputContexts>()
             .register_type::<context::InputContext>()
