@@ -10,7 +10,6 @@ use bevy::prelude::*;
 
 use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
-    mini::MiniRenderRegistry,
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
     ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
 };
@@ -22,12 +21,6 @@ use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
 /// System set for constellation rendering
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstellationRendering;
-
-/// Marker component for nodes that have a mini-render attached.
-/// Currently unused — card nodes don't use render-to-texture previews.
-#[derive(Component)]
-#[allow(dead_code)]
-pub struct HasMiniRender;
 
 /// Marker for model label text on constellation nodes.
 #[derive(Component)]
@@ -538,47 +531,6 @@ fn spawn_create_node(
     );
 }
 
-/// Attach mini-render textures to nodes that don't have them yet.
-/// Currently unused — card nodes don't use render-to-texture previews.
-#[allow(dead_code)]
-fn attach_mini_renders(
-    mut commands: Commands,
-    mini_registry: Res<MiniRenderRegistry>,
-    nodes: Query<(Entity, &ConstellationNode), Without<HasMiniRender>>,
-) {
-    for (entity, node) in nodes.iter() {
-        if let Some(entry) = mini_registry
-            .renders
-            .iter()
-            .find(|r| r.context_id == node.context_id)
-        {
-            let mini_child = commands
-                .spawn((
-                    ImageNode::new(entry.image.clone()),
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: Val::Percent(10.0),
-                        top: Val::Percent(10.0),
-                        width: Val::Percent(80.0),
-                        height: Val::Percent(80.0),
-                        border_radius: BorderRadius::all(Val::Percent(50.0)),
-                        overflow: Overflow::clip(),
-                        ..default()
-                    },
-                ))
-                .id();
-
-            commands.entity(entity).add_child(mini_child);
-            commands.entity(entity).insert(HasMiniRender);
-
-            info!(
-                "Attached mini-render to constellation node: {}",
-                node.context_id
-            );
-        }
-    }
-}
-
 /// Update visual properties of existing card nodes — camera-aware positioning,
 /// agent coloring, opacity based on depth/cache status, and focus state.
 fn update_node_visuals(
@@ -943,8 +895,9 @@ fn update_create_node_visual(
     let card_w = theme.constellation_card_width * 0.7;
     let card_h = theme.constellation_card_height * 0.7;
 
-    // Position at angle 0 (right side), outside the outermost ring
-    let x_pos = outer_radius * 1.1;
+    // Position at angle 0 (right side), clear of the widest card + padding
+    let min_clearance = card_w / 2.0 + card_w * 0.7 / 2.0 + 24.0;
+    let x_pos = outer_radius.max(min_clearance) + card_w * 0.4;
     let y_pos = 0.0;
 
     let px = center.x + x_pos * camera.zoom + camera.offset.x - card_w / 2.0;

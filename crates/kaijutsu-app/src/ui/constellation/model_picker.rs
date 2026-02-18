@@ -157,12 +157,17 @@ fn handle_open_model_picker(
                         Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
                     ))
                     .with_children(|dialog| {
+                        // TODO: explicit sizes — MsdfUiText doesn't do intrinsic sizing
                         dialog.spawn((
                             MsdfUiText::new(format!("Model: @{}", event.context_name))
                                 .with_font_size(16.0)
                                 .with_color(theme.fg),
                             UiTextPositionCache::default(),
-                            Node::default(),
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(18.0),
+                                ..default()
+                            },
                         ));
                         dialog.spawn((
                             ModelPickerLoading,
@@ -170,7 +175,11 @@ fn handle_open_model_picker(
                                 .with_font_size(12.0)
                                 .with_color(theme.fg_dim),
                             UiTextPositionCache::default(),
-                            Node::default(),
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(14.0),
+                                ..default()
+                            },
                         ));
                     });
             });
@@ -285,12 +294,17 @@ fn poll_model_picker_result(
                 BackgroundColor(bg),
             ))
             .with_children(|row| {
+                // TODO: explicit size — MsdfUiText no intrinsic sizing
                 row.spawn((
                     MsdfUiText::new(format!("{}{}/{}", prefix, provider, model))
                         .with_font_size(13.0)
                         .with_color(color),
                     UiTextPositionCache::default(),
-                    Node::default(),
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Px(15.0),
+                        ..default()
+                    },
                 ));
             })
             .id();
@@ -305,12 +319,17 @@ fn poll_model_picker_result(
             ..default()
         })
         .with_children(|parent| {
+            // TODO: explicit size — MsdfUiText no intrinsic sizing
             parent.spawn((
                 MsdfUiText::new("j/k: navigate │ Enter: select │ Esc: cancel")
                     .with_font_size(10.0)
                     .with_color(theme.fg_dim),
                 UiTextPositionCache::default(),
-                Node::default(),
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(12.0),
+                    ..default()
+                },
             ));
         })
         .id();

@@ -161,12 +161,17 @@ pub fn spawn_create_context_node(
                 },
             ))
             .with_children(|center| {
+                // TODO: explicit size — MsdfUiText no intrinsic sizing
                 center.spawn((
                     MsdfUiText::new("+")
                         .with_font_size(32.0)
                         .with_color(theme.fg_dim),
                     UiTextPositionCache::default(),
-                    Node::default(),
+                    Node {
+                        width: Val::Px(32.0),
+                        height: Val::Px(34.0),
+                        ..default()
+                    },
                 ));
             });
 
@@ -185,12 +190,17 @@ pub fn spawn_create_context_node(
                     BackgroundColor(theme.panel_bg.with_alpha(0.7)),
                 ))
                 .with_children(|label_bg| {
+                    // TODO: explicit size — MsdfUiText no intrinsic sizing
                     label_bg.spawn((
                         MsdfUiText::new("new")
                             .with_font_size(10.0)
                             .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),
-                        Node::default(),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(12.0),
+                            ..default()
+                        },
                     ));
                 });
         })
@@ -300,12 +310,18 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                 ))
                 .with_children(|dialog| {
                     // Title
+                    // TODO: MsdfUiText doesn't participate in Bevy's intrinsic sizing,
+                    // so explicit dimensions are needed. Should derive from font metrics.
                     dialog.spawn((
                         MsdfUiText::new(&title_text)
                             .with_font_size(16.0)
                             .with_color(theme.fg),
                         UiTextPositionCache::default(),
-                        Node::default(),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(18.0),
+                            ..default()
+                        },
                     ));
 
                     // Input field container
@@ -324,13 +340,18 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                             Outline::new(Val::Px(1.0), Val::ZERO, theme.accent),
                         ))
                         .with_children(|input_field| {
+                            // TODO: explicit size needed — MsdfUiText doesn't do intrinsic sizing
                             input_field.spawn((
                                 InputTextDisplay,
                                 MsdfUiText::new(&placeholder)
                                     .with_font_size(14.0)
                                     .with_color(theme.fg_dim),
                                 UiTextPositionCache::default(),
-                                Node::default(),
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(16.0),
+                                    ..default()
+                                },
                             ));
                         });
 
@@ -357,12 +378,17 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                                     Interaction::None,
                                 ))
                                 .with_children(|btn| {
+                                    // TODO: explicit size — MsdfUiText no intrinsic sizing
                                     btn.spawn((
                                         MsdfUiText::new("Cancel")
                                             .with_font_size(12.0)
                                             .with_color(theme.fg_dim),
                                         UiTextPositionCache::default(),
-                                        Node::default(),
+                                        Node {
+                                            width: Val::Px(60.0),
+                                            height: Val::Px(14.0),
+                                            ..default()
+                                        },
                                     ));
                                 });
 
@@ -379,12 +405,17 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                                     Interaction::None,
                                 ))
                                 .with_children(|btn| {
+                                    // TODO: explicit size — MsdfUiText no intrinsic sizing
                                     btn.spawn((
                                         MsdfUiText::new(submit_label)
                                             .with_font_size(12.0)
                                             .with_color(theme.accent),
                                         UiTextPositionCache::default(),
-                                        Node::default(),
+                                        Node {
+                                            width: Val::Px(60.0),
+                                            height: Val::Px(14.0),
+                                            ..default()
+                                        },
                                     ));
                                 });
                         });

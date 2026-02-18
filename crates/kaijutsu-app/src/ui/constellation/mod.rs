@@ -18,7 +18,6 @@
 //! - "+" node: Create new contexts by clicking
 
 mod create_dialog;
-mod mini;
 pub mod model_picker;
 mod render;
 
@@ -30,7 +29,6 @@ use crate::agents::AgentActivityMessage;
 pub use create_dialog::{DialogMode, OpenContextDialog};
 
 // Render module provides visual systems (used by the plugin internally)
-// Mini module provides render-to-texture previews for constellation nodes
 
 /// Plugin for constellation-based context navigation
 pub struct ConstellationPlugin;
@@ -62,10 +60,6 @@ impl Plugin for ConstellationPlugin {
 
         // Add rendering systems from the render module
         render::setup_constellation_rendering(app);
-
-        // Mini-render systems disabled — card nodes don't use render-to-texture
-        // mini::setup_mini_render_systems(app);
-        app.init_resource::<mini::MiniRenderRegistry>(); // Resource still needed for compile
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);

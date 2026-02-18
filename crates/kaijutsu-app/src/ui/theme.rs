@@ -515,12 +515,12 @@ impl Default for Theme {
             block_border_glow_intensity: 0.6,
             block_border_padding: 2.0,
 
-            // Compose block — debug defaults (WHITE on BLACK)
-            compose_border: Color::WHITE,
-            compose_bg: Color::BLACK,
+            // Compose block
+            compose_border: Color::srgb(0.19, 0.13, 0.31), // #302050 matches border
+            compose_bg: Color::srgb(0.04, 0.04, 0.06),     // #0a0a0f matches bg
 
-            // Modal backdrop — debug default (WHITE)
-            modal_backdrop: Color::WHITE,
+            // Modal backdrop — semi-transparent dark overlay
+            modal_backdrop: Color::srgba(0.0, 0.0, 0.0, 0.6),
 
             // User/assistant text borders — transparent (opt-in)
             block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
