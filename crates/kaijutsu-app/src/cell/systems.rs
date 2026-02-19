@@ -2112,6 +2112,18 @@ pub fn sync_block_cell_buffers(
         let local_ctx = drift_state.local_context_id.as_deref();
         let text = format_single_block(block, local_ctx);
 
+        // Debounce large blocks: skip reshape if text grew by < DEBOUNCE_CHARS.
+        // last_render_version is NOT updated on skip → block stays dirty for next frame.
+        // When streaming stops (growth=0) or accumulates to ≥ threshold → renders.
+        const DEBOUNCE_CHARS: usize = 200;
+        const DEBOUNCE_MIN_SIZE: usize = 10_000;
+        if text.len() > DEBOUNCE_MIN_SIZE && block_cell.last_text_len > 0 {
+            let growth = text.len().saturating_sub(block_cell.last_text_len);
+            if growth > 0 && growth < DEBOUNCE_CHARS {
+                continue;
+            }
+        }
+
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
         buffer.set_color(base_color);
@@ -2127,21 +2139,27 @@ pub fn sync_block_cell_buffers(
         // Use rich text (markdown) for Text blocks, plain text for everything else
         let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         if block.kind == BlockKind::Text {
-            // Build markdown colors from theme, with base block color as default
-            let md_colors = MarkdownColors {
-                heading: bevy_to_cosmic_color(theme.md_heading_color),
-                code: bevy_to_cosmic_color(theme.md_code_fg),
-                strong: theme.md_strong_color.map(bevy_to_cosmic_color),
-                code_block: bevy_to_cosmic_color(theme.md_code_block_fg),
-            };
-            let rich_spans = markdown::parse_to_rich_spans(&text);
-            let cosmic_spans = markdown::to_cosmic_spans(&rich_spans, &base_attrs, &md_colors);
-            buffer.set_rich_text(
-                &mut font_system,
-                cosmic_spans.into_iter(),
-                &base_attrs,
-                cosmic_text::Shaping::Advanced,
-            );
+            // Skip expensive markdown parse for huge blocks still streaming —
+            // markdown re-parse happens once when block finishes (status → Done)
+            if text.len() > 50_000 && block.status == kaijutsu_crdt::Status::Running {
+                buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
+            } else {
+                // Build markdown colors from theme, with base block color as default
+                let md_colors = MarkdownColors {
+                    heading: bevy_to_cosmic_color(theme.md_heading_color),
+                    code: bevy_to_cosmic_color(theme.md_code_fg),
+                    strong: theme.md_strong_color.map(bevy_to_cosmic_color),
+                    code_block: bevy_to_cosmic_color(theme.md_code_block_fg),
+                };
+                let rich_spans = markdown::parse_to_rich_spans(&text);
+                let cosmic_spans = markdown::to_cosmic_spans(&rich_spans, &base_attrs, &md_colors);
+                buffer.set_rich_text(
+                    &mut font_system,
+                    cosmic_spans.into_iter(),
+                    &base_attrs,
+                    cosmic_text::Shaping::Advanced,
+                );
+            }
         } else {
             buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
         }

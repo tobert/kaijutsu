@@ -1076,12 +1076,36 @@ pub fn extract_msdf_texts(
         if !visibility.get() {
             continue;
         }
+        // Skip entities fully outside their clip rect (scrolled offscreen)
+        if config.bounds.top >= config.bounds.bottom || config.bounds.left >= config.bounds.right {
+            continue;
+        }
 
         let fx = effects.cloned().unwrap_or_default();
         let effects_bits = if fx.rainbow { 1 } else { 0 };
+
+        // Cull glyphs outside the visible clip bounds for large buffers
+        const CULL_THRESHOLD: usize = 500;
+        let all_glyphs = buffer.glyphs();
+        let glyphs = if all_glyphs.len() > CULL_THRESHOLD {
+            let vis_top = config.bounds.top as f32;
+            let vis_bottom = config.bounds.bottom as f32;
+            let margin = config.scale * 40.0; // ~2 lines of margin for partially visible glyphs
+            all_glyphs
+                .iter()
+                .filter(|g| {
+                    let screen_y = config.top + g.y * config.scale;
+                    screen_y >= vis_top - margin && screen_y <= vis_bottom + margin
+                })
+                .cloned()
+                .collect()
+        } else {
+            all_glyphs.to_vec()
+        };
+
         texts.push(ExtractedMsdfText {
             entity,
-            glyphs: buffer.glyphs().to_vec(),
+            glyphs,
             left: config.left,
             top: config.top,
             scale: config.scale,
@@ -1401,6 +1425,9 @@ pub fn prepare_msdf_texts(
         #[cfg(debug_assertions)]
         let mut first_glyph_in_text = true;
 
+        let bounds_top = text.bounds.top as f32;
+        let bounds_bottom = text.bounds.bottom as f32;
+
         for glyph in &text.glyphs {
             let Some(region) = atlas.regions.get(&glyph.key) else {
                 continue;
@@ -1423,6 +1450,11 @@ pub fn prepare_msdf_texts(
 
             let px_x = text.left + (glyph.x - anchor_x) * text.scale;
             let px_y = text.top + (glyph.y - anchor_y) * text.scale;
+
+            // Skip glyphs outside clip bounds (defense in depth with extract filter)
+            if px_y + quad_height * text.scale < bounds_top || px_y > bounds_bottom {
+                continue;
+            }
 
             // Debug logging for first glyph of first text area
             #[cfg(debug_assertions)]
