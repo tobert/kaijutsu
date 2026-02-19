@@ -177,7 +177,7 @@ impl StreamRequest {
             model: model.into(),
             messages,
             system: None,
-            max_tokens: 4096,
+            max_tokens: 64000,
             temperature: None,
             thinking_enabled: false,
             thinking_budget: None,

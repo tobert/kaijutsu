@@ -32,7 +32,7 @@ let providers = #{
         enabled: true,
         api_key_env: "ANTHROPIC_API_KEY",
         default_model: "claude-haiku-4-5-20251001",
-        max_output_tokens: 8192,
+        max_output_tokens: 64000,
         default_tools: #{ type: "all" },
     },
 

@@ -481,6 +481,13 @@ async fn initialize_kernel_mcp(
     futures::future::join_all(futs).await;
 }
 
+/// Per-document LLM conversation cache.
+///
+/// Stores the exact `Vec<LlmMessage>` sent to the API so subsequent turns
+/// replay byte-for-byte identical prefixes for KV cache performance.
+/// Keyed by document_id (cell_id).
+pub type ConversationCache = Rc<RefCell<HashMap<String, Vec<LlmMessage>>>>;
+
 pub struct KernelState {
     pub id: String,
     pub name: String,
@@ -502,6 +509,8 @@ pub struct KernelState {
     pub config_backend: Arc<ConfigCrdtBackend>,
     /// Config watcher handle (stops when kernel is dropped)
     pub config_watcher: Option<ConfigWatcherHandle>,
+    /// Cached LLM conversation history per document (ephemeral, not persisted).
+    pub conversation_cache: ConversationCache,
 }
 
 #[derive(Clone, Copy)]
@@ -672,6 +681,7 @@ impl world::Server for WorldImpl {
                         context_manager,
                         config_backend,
                         config_watcher,
+                        conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
                 );
             }
@@ -787,6 +797,7 @@ impl world::Server for WorldImpl {
                         context_manager,
                         config_backend,
                         config_watcher,
+                        conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
                 );
             }
@@ -1068,6 +1079,7 @@ impl kernel::Server for KernelImpl {
                         context_manager,
                         config_backend,
                         config_watcher,
+                        conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
                 );
             }
@@ -1180,6 +1192,7 @@ impl kernel::Server for KernelImpl {
                         context_manager,
                         config_backend: parent_config_backend,
                         config_watcher: None, // Thread doesn't own the watcher
+                        conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
                 );
             }
@@ -1774,7 +1787,7 @@ impl kernel::Server for KernelImpl {
             log::debug!("prompt future started for cell_id={}", cell_id);
 
             // Get LLM provider and kernel references from the kernel's own registry
-            let (documents, kernel_arc, config_backend) = {
+            let (documents, kernel_arc, config_backend, conversation_cache) = {
                 let state_ref = state.borrow();
                 let kernel_state = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| {
@@ -1783,7 +1796,7 @@ impl kernel::Server for KernelImpl {
                     })?;
                 log::debug!("Got kernel state");
 
-                (kernel_state.documents.clone(), kernel_state.kernel.clone(), kernel_state.config_backend.clone())
+                (kernel_state.documents.clone(), kernel_state.kernel.clone(), kernel_state.config_backend.clone(), kernel_state.conversation_cache.clone())
             };
 
             // Load system prompt from config
@@ -1864,6 +1877,7 @@ impl kernel::Server for KernelImpl {
                 user_block_id, // last_block_id - streaming blocks appear after this
                 system_prompt,
                 max_output_tokens,
+                conversation_cache,
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -4944,9 +4958,17 @@ async fn process_llm_stream(
     after_block_id: kaijutsu_crdt::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
+    conversation_cache: ConversationCache,
 ) {
-    // Build initial conversation messages
-    let mut messages: Vec<LlmMessage> = vec![LlmMessage::user(&content)];
+    // Load existing conversation history for this document.
+    // Replaying the exact same bytes gives us KV cache hits on the API side.
+    let mut messages: Vec<LlmMessage> = conversation_cache.borrow()
+        .get(&cell_id)
+        .cloned()
+        .unwrap_or_default();
+    let history_len = messages.len();
+    messages.push(LlmMessage::user(&content));
+    log::info!("Loaded {} cached messages for cell {}, adding user message", history_len, cell_id);
 
     // Track total iterations to prevent infinite loops
     let max_iterations = 20;
@@ -5085,6 +5107,10 @@ async fn process_llm_stream(
         // rig-core streaming.rs did_call_tool pattern). This is reliable because
         // the API only emits ToolCall content blocks when stop_reason is "tool_use".
         if tool_calls.is_empty() {
+            // Add final assistant message to history before saving
+            if !assistant_text.is_empty() {
+                messages.push(LlmMessage::assistant(&assistant_text));
+            }
             log::info!("Agentic loop complete - no tool calls this iteration");
             break;
         }
@@ -5175,6 +5201,11 @@ async fn process_llm_stream(
 
         // Loop continues - re-prompt with tool results
     }
+
+    // Persist conversation history for next turn — byte-for-byte identical
+    // prefix on the next prompt() call gives us KV cache hits.
+    log::info!("Saving {} conversation messages for cell {}", messages.len(), cell_id);
+    conversation_cache.borrow_mut().insert(cell_id.clone(), messages);
 
     // Save final state after streaming completes
     if let Err(e) = documents.save_snapshot(&cell_id) {

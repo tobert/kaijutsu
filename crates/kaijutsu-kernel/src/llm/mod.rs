@@ -575,7 +575,9 @@ impl LlmRegistry {
         self.default_model.as_deref()
     }
 
-    /// Get max_output_tokens for the default provider, falling back to 16384.
+    /// Get max_output_tokens for the default provider, falling back to 64000.
+    ///
+    /// Set generously — the API enforces per-model ceilings.
     pub fn max_output_tokens(&self) -> u64 {
         self.provider_configs
             .as_ref()
@@ -584,7 +586,7 @@ impl LlmRegistry {
                 configs.iter().find(|c| c.provider_type == default)
             })
             .and_then(|c| c.max_output_tokens)
-            .unwrap_or(16384)
+            .unwrap_or(64000)
     }
 
     /// Get a provider's config by name.
