@@ -665,10 +665,45 @@ impl world::Server for WorldImpl {
                 let kernel_arc = Arc::new(kernel);
                 register_block_tools(&kernel_arc, documents.clone(), context_manager.clone()).await;
 
+                // Recover contexts from persisted document IDs.
+                // Documents use the convention {kernel_id}@{context_name}, so we
+                // scan for the prefix and reconstruct the contexts HashMap.
+                let mut contexts = HashMap::new();
+                let prefix = format!("{}@", id);
+                for doc_id in documents.list_ids() {
+                    if let Some(ctx_name) = doc_id.strip_prefix(&prefix) {
+                        if ctx_name == "main" {
+                            // @main is the "default" context's document
+                            contexts.entry("default".to_string())
+                                .or_insert_with(|| ContextState::new("default".to_string()));
+                        } else {
+                            contexts.entry(ctx_name.to_string())
+                                .or_insert_with(|| ContextState::new(ctx_name.to_string()));
+                        }
+                    }
+                }
+                // Ensure "default" always exists even if @main doc was missing
+                contexts.entry("default".to_string())
+                    .or_insert_with(|| ContextState::new("default".to_string()));
+
+                // Collect non-default context names for drift registration below
+                let recovered_contexts: Vec<(String, String)> = contexts.keys()
+                    .filter(|name| *name != "default")
+                    .map(|name| (name.clone(), format!("{}@{}", id, name)))
+                    .collect();
+
                 // Register "default" context in kernel's own DriftRouter
                 {
                     let mut drift = kernel_arc.drift().write().await;
                     drift.register("default", &main_document_id, None);
+
+                    // Register recovered non-default contexts
+                    for (ctx_name, doc_id) in &recovered_contexts {
+                        if !drift.list_contexts().iter().any(|c| c.context_name == *ctx_name) {
+                            drift.register(ctx_name, doc_id, None);
+                            log::info!("Recovered context '{}' (doc: {}) in kernel DriftRouter", ctx_name, doc_id);
+                        }
+                    }
                 }
 
                 // Initialize LLM registry from llm.rhai config
@@ -678,15 +713,20 @@ impl world::Server for WorldImpl {
                 let mcp_pool = state.borrow().mcp_pool.clone();
                 initialize_kernel_mcp(&kernel_arc, &config_backend, &mcp_pool).await;
 
-                // Create default context
-                let mut contexts = HashMap::new();
-                contexts.insert("default".to_string(), ContextState::new("default".to_string()));
-
                 let mut state_ref = state.borrow_mut();
 
                 // Register in server-level drift router (for listAllContexts).
                 // Use kernel_id as context name — drift RPCs look up by kernel_id.
                 state_ref.drift_router.register(&id, &main_document_id, None);
+
+                // Register recovered non-default contexts in server drift router
+                for (ctx_name, doc_id) in &recovered_contexts {
+                    if !state_ref.drift_router.list_contexts().iter().any(|c| c.context_name == *ctx_name) {
+                        let short_id = state_ref.drift_router.register(ctx_name, doc_id, None);
+                        log::info!("Recovered context '{}' (doc: {}, short_id: {}) in server DriftRouter",
+                            ctx_name, doc_id, short_id);
+                    }
+                }
 
                 state_ref.kernels.insert(
                     id.clone(),
