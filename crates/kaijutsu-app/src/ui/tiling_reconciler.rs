@@ -34,6 +34,7 @@ use crate::cell::ComposeBlock;
 use crate::cell::ConversationContainer;
 use crate::constants::ZLayer;
 use crate::text::{MsdfText, MsdfTextAreaConfig, MsdfUiText, UiTextPositionCache};
+use crate::text::msdf::SdfTextEffects;
 
 // ============================================================================
 // MARKERS
@@ -349,6 +350,7 @@ fn spawn_content_subtree(
                     compose,
                     MsdfText,
                     MsdfTextAreaConfig::default(),
+                    SdfTextEffects { rainbow: true },
                     Node {
                         min_height: Val::Px(60.0),
                         padding: UiRect::all(Val::Px(12.0)),

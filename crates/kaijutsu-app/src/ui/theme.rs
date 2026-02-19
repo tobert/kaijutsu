@@ -473,9 +473,12 @@ impl Default for Theme {
             font_gamma_correction: 0.78,
 
             // Font effects — post-process bloom glow
-            font_glow_intensity: 0.5,
-            font_glow_spread: 4.0,
-            font_glow_color: Color::srgba(0.0, 1.0, 1.0, 0.35),
+            // Subtle glow: just enough for rainbow text to pop, not enough to
+            // blur regular conversation text. Rainbow vertices are inherently
+            // brighter due to color cycling, so they pick up more bloom.
+            font_glow_intensity: 0.15,
+            font_glow_spread: 3.0,
+            font_glow_color: Color::srgba(0.0, 1.0, 1.0, 0.25),
             font_rainbow: false,
 
             // Constellation
