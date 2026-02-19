@@ -808,7 +808,10 @@ pub fn highlight_focused_block(
                 (srgba.blue * 1.15).min(1.0),
                 srgba.alpha,
             );
-            config.default_color = focused_color;
+            // Compare before writing to avoid triggering change detection
+            if config.default_color != focused_color {
+                config.default_color = focused_color;
+            }
         }
     }
 
@@ -1854,11 +1857,12 @@ pub fn sync_role_headers(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
+    role_header_query: Query<&RoleHeader>,
     theme: Res<Theme>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
-    // Only rebuild role headers when blocks are added/removed or line counts change
+    // Only check when layout generation changes
     if layout_gen.0 == *last_gen {
         return;
     }
@@ -1876,54 +1880,70 @@ pub fn sync_role_headers(
         return;
     };
 
-    // Despawn existing role headers (will rebuild each time blocks change)
+    // Compute expected role transitions: Vec<(role, block_id)>
+    let blocks = editor.blocks();
+    let mut expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = Vec::new();
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    for block in &blocks {
+        if prev_role != Some(block.role) {
+            expected.push((block.role, block.id.clone()));
+        }
+        prev_role = Some(block.role);
+    }
+
+    // Compare against existing headers — skip rebuild if transitions match.
+    // This prevents despawn/respawn flash when only text content changes
+    // (e.g. during streaming where line count changes bump LayoutGeneration).
+    let existing_matches = container.role_headers.len() == expected.len()
+        && container.role_headers.iter().zip(expected.iter()).all(|(ent, (role, block_id))| {
+            role_header_query
+                .get(*ent)
+                .map(|h| h.role == *role && h.block_id == *block_id)
+                .unwrap_or(false)
+        });
+
+    if existing_matches {
+        return;
+    }
+
+    // Role transitions changed — despawn and rebuild
     for entity in container.role_headers.drain(..) {
         commands.entity(entity).try_despawn();
     }
 
-    // Detect role transitions and spawn headers
-    let blocks = editor.blocks();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    for (role, block_id) in expected {
+        let color = match role {
+            kaijutsu_crdt::Role::User => theme.block_user,
+            kaijutsu_crdt::Role::Model => theme.block_assistant,
+            kaijutsu_crdt::Role::System => theme.fg_dim,
+            kaijutsu_crdt::Role::Tool => theme.block_tool_call,
+        };
 
-    for block in &blocks {
-        let is_transition = prev_role != Some(block.role);
-        if is_transition {
-            // Get color for this role
-            let color = match block.role {
-                kaijutsu_crdt::Role::User => theme.block_user,
-                kaijutsu_crdt::Role::Model => theme.block_assistant,
-                kaijutsu_crdt::Role::System => theme.fg_dim,
-                kaijutsu_crdt::Role::Tool => theme.block_tool_call,
-            };
+        let mut config = MsdfTextAreaConfig::default();
+        config.default_color = color;
 
-            // Use same rendering pattern as BlockCells
-            let mut config = MsdfTextAreaConfig::default();
-            config.default_color = color;
-
-            let entity = commands
-                .spawn((
-                    RoleHeader {
-                        role: block.role,
-                        block_id: block.id.clone(),
-                    },
-                    RoleHeaderLayout::default(),
-                    MsdfText,
-                    config,
-                    Node {
-                        width: Val::Percent(100.0),
-                        min_height: Val::Px(ROLE_HEADER_HEIGHT),
-                        margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
-                        ..default()
-                    },
-                ))
-                .id();
-            if let Some(conv) = entities.conversation_container {
-                if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
-            }
-
-            container.role_headers.push(entity);
+        let entity = commands
+            .spawn((
+                RoleHeader {
+                    role,
+                    block_id,
+                },
+                RoleHeaderLayout::default(),
+                MsdfText,
+                config,
+                Node {
+                    width: Val::Percent(100.0),
+                    min_height: Val::Px(ROLE_HEADER_HEIGHT),
+                    margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
+                    ..default()
+                },
+            ))
+            .id();
+        if let Some(conv) = entities.conversation_container {
+            if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
         }
-        prev_role = Some(block.role);
+
+        container.role_headers.push(entity);
     }
 }
 
@@ -2075,13 +2095,13 @@ pub fn sync_block_cell_buffers(
         let base_color = block_color(block, &theme);
         buffer.set_color(base_color);
 
-        // Set per-vertex effects: rainbow for user text only
-        let effects = if block.kind == BlockKind::Text && block.role == kaijutsu_crdt::Role::User {
-            SdfTextEffects { rainbow: true }
-        } else {
-            SdfTextEffects::default()
-        };
-        commands.entity(*entity).insert(effects);
+        // Set per-vertex effects: rainbow for user text only.
+        // Only insert when changed to avoid triggering Bevy change detection.
+        let rainbow = block.kind == BlockKind::Text && block.role == kaijutsu_crdt::Role::User;
+        if block_cell.last_rainbow != rainbow {
+            commands.entity(*entity).insert(SdfTextEffects { rainbow });
+            block_cell.last_rainbow = rainbow;
+        }
 
         // Use rich text (markdown) for Text blocks, plain text for everything else
         let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
@@ -2368,6 +2388,7 @@ pub fn reorder_conversation_children(
     containers: Query<&BlockCellContainer>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     role_headers: Query<&RoleHeader>,
+    children_query: Query<&Children>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
@@ -2417,7 +2438,19 @@ pub fn reorder_conversation_children(
         prev_role = Some(block.role);
     }
 
-    if let Ok(mut ec) = commands.get_entity(conv_entity) { ec.replace_children(&ordered_children); }
+    // Compare against current child order — skip replace_children if unchanged.
+    // replace_children triggers full flex relayout even when order matches.
+    let current_children = children_query.get(conv_entity).ok();
+    let order_matches = current_children
+        .map(|children| {
+            children.len() == ordered_children.len()
+                && children.iter().zip(ordered_children.iter()).all(|(a, b)| a == *b)
+        })
+        .unwrap_or(false);
+
+    if !order_matches {
+        if let Ok(mut ec) = commands.get_entity(conv_entity) { ec.replace_children(&ordered_children); }
+    }
 }
 
 /// Position BlockCell text areas from ComputedNode (flex layout result).

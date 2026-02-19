@@ -50,7 +50,7 @@ use crate::text::resources::bevy_to_rgba8;
 ///
 /// Rainbow effect is wired through MsdfUniforms to the msdf_text.wgsl shader.
 /// Glow is handled by the post-process bloom node (bloom.rs).
-#[derive(Component, Default, Clone)]
+#[derive(Component, Default, Clone, PartialEq, Eq)]
 pub struct SdfTextEffects {
     /// Enable rainbow color cycling effect.
     pub rainbow: bool,
