@@ -409,7 +409,29 @@ async fn initialize_kernel_llm(
             log::info!("Initialized kernel LLM registry from llm.rhai");
         }
         Err(e) => {
-            log::warn!("Failed to parse llm.rhai: {}", e);
+            log::warn!("Failed to parse llm.rhai from CRDT: {}, reloading from disk", e);
+            // CRDT snapshot is corrupted — reload from disk and retry
+            if let Err(reload_err) = config_backend.reload_from_disk("llm.rhai").await {
+                log::error!("Failed to reload llm.rhai from disk: {}", reload_err);
+                return;
+            }
+            let script = match config_backend.get_content("llm.rhai") {
+                Ok(content) => content,
+                Err(e) => {
+                    log::error!("Failed to read reloaded llm.rhai: {}", e);
+                    return;
+                }
+            };
+            match kaijutsu_kernel::load_llm_config(&script) {
+                Ok(config) => {
+                    let registry = kaijutsu_kernel::initialize_llm_registry(&config);
+                    *kernel.llm().write().await = registry;
+                    log::info!("Initialized kernel LLM registry from llm.rhai (reloaded from disk)");
+                }
+                Err(e) => {
+                    log::error!("Failed to parse llm.rhai even after reload: {}", e);
+                }
+            }
         }
     }
 }
