@@ -2135,12 +2135,13 @@ pub fn sync_block_cell_buffers(
         };
         config.default_color = color;
 
-        // Track line count for layout dirty detection
-        // Use newline count as a fast proxy - layout only needs to recompute
-        // when vertical extent changes, not on every character
-        let line_count = text.chars().filter(|c| *c == '\n').count() + 1;
-        if block_cell.last_line_count != line_count {
-            block_cell.last_line_count = line_count;
+        // Mark layout dirty when text length changes — word-wrap line
+        // count can only change when the text grows or shrinks.
+        // The old newline-count proxy missed lines added purely by
+        // word wrapping (no new '\n' characters).
+        let text_len = text.len();
+        if block_cell.last_text_len != text_len {
+            block_cell.last_text_len = text_len;
             layout_changed = true;
         }
 

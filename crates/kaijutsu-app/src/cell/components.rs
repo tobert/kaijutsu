@@ -1053,9 +1053,10 @@ pub struct BlockCell {
     pub block_id: BlockId,
     /// Last known content hash/version for dirty tracking.
     pub last_render_version: u64,
-    /// Last known visual line count for layout dirty tracking.
-    /// Only bump LayoutGeneration when this changes.
-    pub last_line_count: usize,
+    /// Last known text length for layout dirty detection.
+    /// Word-wrap line count can only change when text length changes,
+    /// so this catches wrapping that newline-count missed.
+    pub last_text_len: usize,
     /// Last known rainbow effect state for change detection.
     pub last_rainbow: bool,
 }
@@ -1065,7 +1066,7 @@ impl BlockCell {
         Self {
             block_id,
             last_render_version: 0,
-            last_line_count: 0,
+            last_text_len: 0,
             last_rainbow: false,
         }
     }
