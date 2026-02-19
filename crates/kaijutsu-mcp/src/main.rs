@@ -163,7 +163,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 Arc::new(HookListener::local(store.clone(), doc_id))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
-                Arc::new(HookListener::remote(remote.clone(), args.context_name.clone()))
+                Arc::new(HookListener::remote(remote.clone(), remote.context_id))
             }
         };
 

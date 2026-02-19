@@ -1246,7 +1246,7 @@ pub fn handle_block_events(
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
         if let RpcResultMessage::ContextJoined { membership, document_id, initial_state } = result {
-            let context_name = membership.context_name.clone();
+            let context_name = membership.context_id.to_string();
 
             // Create or update cache entry
             if !doc_cache.contains(document_id) {
@@ -1472,14 +1472,18 @@ pub fn handle_context_switch(
                 let kernel_id = conn_state
                     .current_kernel
                     .as_ref()
-                    .map(|k| k.id.clone())
+                    .map(|k| k.id.to_string())
                     .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
 
                 let instance = uuid::Uuid::new_v4().to_string();
+                // Context switch to a known context — parse the string context_name
+                // back to ContextId. If it doesn't parse, create a new one.
+                let ctx_id = kaijutsu_crdt::ContextId::parse(&context_name)
+                    .unwrap_or_else(|_| kaijutsu_crdt::ContextId::new());
                 let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
                     config: conn_state.ssh_config.clone(),
                     kernel_id,
-                    context_name: Some(context_name.clone()),
+                    context_id: Some(ctx_id),
                     instance,
                 });
                 continue;

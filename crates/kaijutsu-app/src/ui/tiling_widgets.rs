@@ -305,7 +305,7 @@ pub fn update_contexts_widget(
                     parts.push(format!("+{} more", remaining));
                     break;
                 }
-                parts.push(format!("@{}", ctx.short_id));
+                parts.push(format!("@{}", ctx.id.short()));
             }
 
             let mut text = parts.join(" ");

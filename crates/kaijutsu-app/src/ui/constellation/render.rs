@@ -712,15 +712,15 @@ fn spawn_connection_lines(
     // 1. Ancestry lines from DriftState.contexts (parent_id → child)
     for ctx in &drift_state.contexts {
         if let Some(ref parent_id) = ctx.parent_id {
-            wanted.push((parent_id.clone(), ctx.short_id.clone(), DriftConnectionKind::Ancestry));
+            wanted.push((parent_id.to_string(), ctx.id.to_string(), DriftConnectionKind::Ancestry));
         }
     }
 
     // 2. Staged drift lines
     for staged in &drift_state.staged {
         wanted.push((
-            staged.source_ctx.clone(),
-            staged.target_ctx.clone(),
+            staged.source_ctx.to_string(),
+            staged.target_ctx.to_string(),
             DriftConnectionKind::StagedDrift,
         ));
     }
@@ -870,7 +870,8 @@ fn despawn_removed_connections(
         // Verify ancestry relationship is still valid (parent_id may change)
         if marker.kind == DriftConnectionKind::Ancestry {
             let still_valid = drift_state.contexts.iter().any(|ctx| {
-                ctx.parent_id.as_deref() == Some(&marker.from) && ctx.short_id == marker.to
+                ctx.parent_id.as_ref().map(|p| p.to_string()).as_deref() == Some(marker.from.as_str())
+                    && ctx.id.to_string() == marker.to
             });
             if !still_valid {
                 commands.entity(entity).despawn();
@@ -881,7 +882,7 @@ fn despawn_removed_connections(
 
         if marker.kind == DriftConnectionKind::StagedDrift {
             let still_staged = drift_state.staged.iter().any(|s| {
-                s.source_ctx == marker.from && s.target_ctx == marker.to
+                s.source_ctx.to_string() == marker.from && s.target_ctx.to_string() == marker.to
             });
             if !still_staged {
                 commands.entity(entity).despawn();
@@ -1155,11 +1156,8 @@ fn update_legend_content(
     let total_contexts = constellation.nodes.len();
     let staged_count = drift_state.staged_count();
 
-    // Kernel name (all contexts share the same kernel_id)
-    let kernel_name = contexts
-        .first()
-        .map(|c| c.kernel_id.as_str())
-        .unwrap_or("(no kernel)");
+    // Kernel name from connection state (ContextInfo no longer carries kernel_id)
+    let kernel_name = "(kernel)";
 
     // Group contexts by provider
     let mut provider_counts: Vec<(&str, Color, usize)> = Vec::new();

@@ -139,7 +139,7 @@ pub enum RpcResultMessage {
     /// from a previous actor overwriting the current state.
     KernelList { kernels: Vec<KernelInfo>, generation: u64 },
     /// Context list received (for dashboard).
-    ContextList { contexts: Vec<kaijutsu_client::Context>, generation: u64 },
+    ContextList { contexts: Vec<kaijutsu_client::ContextInfo>, generation: u64 },
     /// Context memberships received (for dashboard).
     MyContextsList { memberships: Vec<ContextMembership>, generation: u64 },
     /// Drift contexts list received (from periodic polling).
@@ -173,7 +173,7 @@ impl Plugin for ActorPlugin {
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: SshConfig::default(),
             kernel_id: DEFAULT_KERNEL_ID.to_string(),
-            context_name: None,
+            context_id: None,
             instance: "bevy-client".to_string(),
         });
 
@@ -243,7 +243,7 @@ fn periodic_reconnect(
     let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
         config: state.ssh_config.clone(),
         kernel_id: DEFAULT_KERNEL_ID.to_string(),
-        context_name: None,
+        context_id: None,
         instance: "bevy-client".to_string(),
     });
 }
@@ -260,8 +260,8 @@ fn poll_bootstrap_results(
     let Ok(mut rx) = channel.rx.lock() else { return };
     while let Ok(result) = rx.try_recv() {
         match result {
-            bootstrap::BootstrapResult::ActorReady { handle, generation, kernel_id, context_name } => {
-                log::info!("Actor ready (generation {}) kernel={} context={:?}", generation, kernel_id, context_name);
+            bootstrap::BootstrapResult::ActorReady { handle, generation, kernel_id, context_id } => {
+                log::info!("Actor ready (generation {}) kernel={} context={:?}", generation, kernel_id, context_id);
 
                 // Eagerly connect: fire whoami to trigger ensure_connected
                 // (SSH → attach_kernel → subscriptions → Connected).
@@ -270,7 +270,7 @@ fn poll_bootstrap_results(
                 let h = handle.clone();
                 let tx = result_channel.sender();
                 let kid = kernel_id.clone();
-                let ctx = context_name.clone();
+                let ctx_id = context_id;
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
                         // 1. whoami triggers ensure_connected + gives us identity
@@ -286,9 +286,9 @@ fn poll_bootstrap_results(
                         };
 
                         // 2. If we joined a context, fetch its document state
-                        let Some(ctx) = ctx else { return };
+                        let Some(ctx_id) = ctx_id else { return };
 
-                        let document_id = format!("{}@{}", kid, ctx);
+                        let document_id = format!("{}@{}", kid, ctx_id);
                         let initial_state = match h.get_document_state(&document_id).await {
                             Ok(state) => Some(state),
                             Err(e) => {
@@ -300,8 +300,9 @@ fn poll_bootstrap_results(
                         // 3. Construct ContextMembership from what we know
                         let nick = identity.map(|id| id.username).unwrap_or_default();
                         let membership = ContextMembership {
-                            context_name: ctx.clone(),
-                            kernel_id: kid.clone(),
+                            context_id: ctx_id,
+                            kernel_id: kaijutsu_crdt::KernelId::parse(&kid)
+                                .unwrap_or_else(|_| kaijutsu_crdt::KernelId::nil()),
                             nick,
                             instance: "bevy-client".to_string(),
                         };

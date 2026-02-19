@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kaijutsu_crdt::{BlockId, BlockSnapshot, DriftKind};
+use kaijutsu_crdt::{BlockId, BlockSnapshot, ContextId, DriftKind};
 
 use crate::block_store::SharedBlockStore;
 use crate::drift::{build_commit_prompt, COMMIT_SYSTEM_PROMPT};
@@ -25,18 +25,17 @@ use crate::vfs::VfsOps;
 /// Resolves repository paths through the kernel's VFS mount table and records
 /// commits as `DriftKind::Commit` blocks for conversation provenance.
 ///
-/// **Context binding limitation:** Currently instantiated once per kernel with a
-/// fixed `context_name` (typically `"default"`). The pwd lookup and conversation
-/// history for `--summarize` are bound to this context. Multi-context scenarios
-/// require either per-context engine instances or passing the active context
-/// through `ExecutionEngine::execute()`. See also `DriftEngine`.
+/// Git execution engine — context-aware git with optional LLM commit summaries.
+///
+/// Bound to a specific `ContextId` at creation time. The pwd lookup and
+/// conversation history for `--summarize` use this context's document.
 pub struct GitEngine {
     /// Weak reference to the kernel (avoids reference cycle).
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     /// Shared BlockStore (all contexts' documents).
     documents: SharedBlockStore,
     /// Which context this engine operates as.
-    context_name: String,
+    context_id: ContextId,
 }
 
 impl GitEngine {
@@ -46,12 +45,12 @@ impl GitEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_name: impl Into<String>,
+        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_name: context_name.into(),
+            context_id,
         }
     }
 
@@ -75,16 +74,8 @@ impl GitEngine {
             c.to_string()
         } else {
             let router = kernel.drift().read().await;
-            let short_id = router
-                .short_id_for_context(&self.context_name)
-                .ok_or_else(|| {
-                    format!(
-                        "context '{}' not registered in drift router",
-                        self.context_name
-                    )
-                })?;
             router
-                .get(short_id)
+                .get(self.context_id)
                 .and_then(|h| h.pwd.clone())
                 .ok_or_else(|| {
                     "No repository path. Use -C <path> or set context pwd.".to_string()
@@ -298,16 +289,10 @@ impl GitEngine {
         // Phase 2 (async): get conversation context + LLM call
         let blocks = {
             let router = kernel.drift().read().await;
-            let short_id = router
-                .short_id_for_context(&self.context_name)
-                .ok_or_else(|| {
-                    format!("context '{}' not registered", self.context_name)
-                })?
-                .to_string();
             let doc_id = router
-                .get(&short_id)
+                .get(self.context_id)
                 .map(|h| h.document_id.clone())
-                .ok_or_else(|| format!("context {} not found", short_id))?;
+                .ok_or_else(|| format!("context {} not found", self.context_id.short()))?;
             drop(router);
 
             self.documents
@@ -463,14 +448,10 @@ EXAMPLES:
     ) -> Result<(), String> {
         let kernel = self.kernel()?;
         let router = kernel.drift().read().await;
-        let short_id = router
-            .short_id_for_context(&self.context_name)
-            .ok_or_else(|| format!("context '{}' not registered", self.context_name))?
-            .to_string();
         let doc_id = router
-            .get(&short_id)
+            .get(self.context_id)
             .map(|h| h.document_id.clone())
-            .ok_or_else(|| format!("context {} not found", short_id))?;
+            .ok_or_else(|| format!("context {} not found", self.context_id.short()))?;
         drop(router);
 
         let snapshot = BlockSnapshot::drift(
@@ -478,7 +459,7 @@ EXAMPLES:
             None,
             message,
             "git",
-            &self.context_name,
+            self.context_id.short(),
             Some(model.to_string()),
             DriftKind::Commit,
         );
@@ -631,7 +612,8 @@ mod tests {
     async fn test_git_engine_help() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         let documents = crate::block_store::shared_block_store("test");
-        let engine = GitEngine::new(&kernel, documents, "default");
+        let ctx_id = ContextId::new();
+        let engine = GitEngine::new(&kernel, documents, ctx_id);
 
         let result = engine
             .execute(r#"{"_positional": ["help"]}"#)
@@ -645,7 +627,8 @@ mod tests {
     async fn test_git_engine_unknown_subcommand() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         let documents = crate::block_store::shared_block_store("test");
-        let engine = GitEngine::new(&kernel, documents, "default");
+        let ctx_id = ContextId::new();
+        let engine = GitEngine::new(&kernel, documents, ctx_id);
 
         let result = engine
             .execute(r#"{"_positional": ["frobnicate"]}"#)
@@ -658,12 +641,13 @@ mod tests {
     #[tokio::test]
     async fn test_git_engine_no_path_error() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
+        let ctx_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            r.register("default", "doc-test", None);
+            r.register(ctx_id, Some("default"), "doc-test", None);
         }
         let documents = crate::block_store::shared_block_store("test");
-        let engine = GitEngine::new(&kernel, documents, "default");
+        let engine = GitEngine::new(&kernel, documents, ctx_id);
 
         let result = engine
             .execute(r#"{"_positional": ["status"]}"#)

@@ -1,7 +1,7 @@
 //! Kernel-native drift — cross-context communication and content transfer.
 //!
 //! The DriftRouter is the central coordinator for moving content between contexts
-//! *within a kernel*. It maintains a registry of all contexts (keyed by short IDs)
+//! *within a kernel*. It maintains a registry of all contexts (keyed by ContextId)
 //! and a staging queue for drift operations.
 //!
 //! # Architecture
@@ -31,13 +31,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role};
+use kaijutsu_crdt::ids::{resolve_context_prefix, PrefixError};
+use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine};
-
-/// Short ID length — first 6 hex chars of a UUID.
-const SHORT_ID_LEN: usize = 6;
 
 /// Shared, thread-safe DriftRouter reference.
 pub type SharedDriftRouter = Arc<RwLock<DriftRouter>>;
@@ -51,17 +49,16 @@ pub fn shared_drift_router() -> SharedDriftRouter {
 // ContextHandle — registered context within a kernel
 // ============================================================================
 
-/// A registered context, mapping a short ID to a context within this kernel.
+/// A registered context within this kernel.
 ///
-/// Unlike the previous server-level `ContextHandle` (which tracked `kernel_id`),
-/// this tracks `context_name` + `document_id` since all contexts share the same
-/// kernel's `SharedBlockStore`.
+/// Keyed by `ContextId` (UUIDv7). The `label` is an optional mutable
+/// human-friendly name — never used as a lookup key.
 #[derive(Debug, Clone)]
 pub struct ContextHandle {
-    /// Short hex ID (e.g., "a1b2c3") — derived from a UUID.
-    pub short_id: String,
-    /// Context name (e.g., "main", "debug-session", "refactor-auth").
-    pub context_name: String,
+    /// Globally unique context identifier (UUIDv7).
+    pub id: ContextId,
+    /// Optional human-friendly label (mutable, not an identifier).
+    pub label: Option<String>,
     /// Primary document ID in the shared BlockStore.
     pub document_id: String,
     /// Working directory in VFS (e.g., "/mnt/kaijutsu").
@@ -70,10 +67,17 @@ pub struct ContextHandle {
     pub provider: Option<String>,
     /// Model name if configured (e.g., "claude-opus-4-6", "gemini-2.0-flash").
     pub model: Option<String>,
-    /// Short ID of parent context (for fork lineage).
-    pub parent_short_id: Option<String>,
+    /// Parent context ID (for fork lineage).
+    pub parent_id: Option<ContextId>,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at: u64,
+}
+
+impl ContextHandle {
+    /// Display string: label if set, else short hex.
+    pub fn display_name(&self) -> String {
+        self.id.display_or(self.label.as_deref())
+    }
 }
 
 // ============================================================================
@@ -85,10 +89,10 @@ pub struct ContextHandle {
 pub struct StagedDrift {
     /// Unique ID for this staged operation.
     pub id: u64,
-    /// Short ID of the source context.
-    pub source_ctx: String,
-    /// Short ID of the target context.
-    pub target_ctx: String,
+    /// Source context ID.
+    pub source_ctx: ContextId,
+    /// Target context ID.
+    pub target_ctx: ContextId,
     /// Content to transfer.
     pub content: String,
     /// Model that produced this content (if known).
@@ -106,18 +110,21 @@ pub struct StagedDrift {
 /// Central drift coordinator for a kernel.
 ///
 /// Manages drift between contexts within a single kernel. All contexts share
-/// the same `SharedBlockStore`, so drift only needs context names and document
+/// the same `SharedBlockStore`, so drift only needs ContextIds and document
 /// IDs — no cross-kernel lookup required.
+///
+/// This is the single source of truth for context registration. The server-level
+/// drift router has been removed; `listContexts` reads directly from here.
 #[derive(Debug)]
 pub struct DriftRouter {
-    /// All registered contexts, keyed by short_id.
-    contexts: HashMap<String, ContextHandle>,
+    /// All registered contexts, keyed by ContextId.
+    contexts: HashMap<ContextId, ContextHandle>,
     /// Staging queue for pending drift operations.
     staging: Vec<StagedDrift>,
     /// Counter for staged drift IDs.
     next_staged_id: u64,
-    /// Reverse lookup: context_name → short_id.
-    context_to_short: HashMap<String, String>,
+    /// Reverse lookup: label → ContextId (for prefix matching).
+    label_to_id: HashMap<String, ContextId>,
 }
 
 impl Default for DriftRouter {
@@ -133,78 +140,103 @@ impl DriftRouter {
             contexts: HashMap::new(),
             staging: Vec::new(),
             next_staged_id: 1,
-            context_to_short: HashMap::new(),
+            label_to_id: HashMap::new(),
         }
     }
 
-    /// Register a context.
+    /// Register a context with a pre-assigned ContextId.
     ///
-    /// Generates a short ID from a fresh UUID. If the first 6 hex chars
-    /// collide with an existing context, extends until unique.
+    /// The caller (server RPC) creates the ContextId and passes it in.
     pub fn register(
         &mut self,
-        context_name: &str,
+        id: ContextId,
+        label: Option<&str>,
         document_id: &str,
-        parent_short_id: Option<&str>,
-    ) -> String {
-        let uuid = uuid::Uuid::new_v4();
-        let hex = uuid.as_simple().to_string();
-        let mut short_id = hex[..SHORT_ID_LEN].to_string();
-
-        // Handle collisions by extending
-        let mut len = SHORT_ID_LEN;
-        while self.contexts.contains_key(&short_id) && len < hex.len() {
-            len += 1;
-            short_id = hex[..len].to_string();
+        parent_id: Option<ContextId>,
+    ) {
+        if let Some(l) = label {
+            self.label_to_id.insert(l.to_string(), id);
         }
 
         let handle = ContextHandle {
-            short_id: short_id.clone(),
-            context_name: context_name.to_string(),
+            id,
+            label: label.map(|s| s.to_string()),
             document_id: document_id.to_string(),
             pwd: None,
             provider: None,
             model: None,
-            parent_short_id: parent_short_id.map(|s| s.to_string()),
+            parent_id,
             created_at: now_epoch(),
         };
 
-        self.context_to_short
-            .insert(context_name.to_string(), short_id.clone());
-        self.contexts.insert(short_id.clone(), handle);
-        short_id
+        self.contexts.insert(id, handle);
     }
 
     /// Unregister a context (e.g., when a context is destroyed).
-    pub fn unregister(&mut self, short_id: &str) {
-        if let Some(handle) = self.contexts.remove(short_id) {
-            self.context_to_short.remove(&handle.context_name);
+    pub fn unregister(&mut self, id: ContextId) {
+        if let Some(handle) = self.contexts.remove(&id) {
+            if let Some(label) = &handle.label {
+                self.label_to_id.remove(label);
+            }
         }
     }
 
-    /// Look up a context by short ID.
-    pub fn get(&self, short_id: &str) -> Option<&ContextHandle> {
-        self.contexts.get(short_id)
+    /// Look up a context by ContextId.
+    pub fn get(&self, id: ContextId) -> Option<&ContextHandle> {
+        self.contexts.get(&id)
     }
 
-    /// Look up context short ID by context name.
-    pub fn short_id_for_context(&self, context_name: &str) -> Option<&str> {
-        self.context_to_short
-            .get(context_name)
-            .map(|s| s.as_str())
+    /// Look up a context mutably by ContextId.
+    pub fn get_mut(&mut self, id: ContextId) -> Option<&mut ContextHandle> {
+        self.contexts.get_mut(&id)
+    }
+
+    /// Rename a context's label.
+    pub fn rename(&mut self, id: ContextId, new_label: Option<&str>) -> Result<(), DriftError> {
+        let handle = self.contexts.get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
+
+        // Remove old label from index
+        if let Some(old_label) = &handle.label {
+            self.label_to_id.remove(old_label);
+        }
+
+        // Set new label
+        handle.label = new_label.map(|s| s.to_string());
+        if let Some(l) = new_label {
+            self.label_to_id.insert(l.to_string(), id);
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a query string (label, label prefix, or hex prefix) to a ContextId.
+    ///
+    /// Resolution order:
+    /// 1. Exact label match
+    /// 2. Unique label prefix match
+    /// 3. Unique hex prefix match
+    pub fn resolve_context(&self, query: &str) -> Result<ContextId, DriftError> {
+        let entries = self.contexts.values().map(|h| (h.id, h.label.as_deref()));
+        resolve_context_prefix(entries, query).map_err(|e| match e {
+            PrefixError::NoMatch(q) => DriftError::UnknownContext(q),
+            PrefixError::Ambiguous { prefix, candidates } => {
+                DriftError::AmbiguousContext { prefix, candidates }
+            }
+        })
     }
 
     /// Update provider/model for a context.
     pub fn configure_llm(
         &mut self,
-        short_id: &str,
+        id: ContextId,
         provider: &str,
         model: &str,
     ) -> Result<(), DriftError> {
         let handle = self
             .contexts
-            .get_mut(short_id)
-            .ok_or_else(|| DriftError::UnknownContext(short_id.to_string()))?;
+            .get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
         handle.provider = Some(provider.to_string());
         handle.model = Some(model.to_string());
         Ok(())
@@ -213,18 +245,13 @@ impl DriftRouter {
     /// Set the working directory for a context.
     pub fn set_pwd(
         &mut self,
-        context_name: &str,
+        id: ContextId,
         pwd: Option<String>,
     ) -> Result<(), DriftError> {
-        let short_id = self
-            .context_to_short
-            .get(context_name)
-            .ok_or_else(|| DriftError::UnknownContext(context_name.to_string()))?
-            .clone();
         let handle = self
             .contexts
-            .get_mut(&short_id)
-            .ok_or_else(|| DriftError::UnknownContext(short_id))?;
+            .get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
         handle.pwd = pwd;
         Ok(())
     }
@@ -242,18 +269,18 @@ impl DriftRouter {
     #[tracing::instrument(skip(self, content, source_model), fields(drift.source = %source_ctx, drift.target = %target_ctx))]
     pub fn stage(
         &mut self,
-        source_ctx: &str,
-        target_ctx: &str,
+        source_ctx: ContextId,
+        target_ctx: ContextId,
         content: String,
         source_model: Option<String>,
         drift_kind: DriftKind,
     ) -> Result<u64, DriftError> {
         // Validate both contexts exist
-        if !self.contexts.contains_key(source_ctx) {
-            return Err(DriftError::UnknownContext(source_ctx.to_string()));
+        if !self.contexts.contains_key(&source_ctx) {
+            return Err(DriftError::UnknownContext(source_ctx.short()));
         }
-        if !self.contexts.contains_key(target_ctx) {
-            return Err(DriftError::UnknownContext(target_ctx.to_string()));
+        if !self.contexts.contains_key(&target_ctx) {
+            return Err(DriftError::UnknownContext(target_ctx.short()));
         }
 
         let id = self.next_staged_id;
@@ -261,8 +288,8 @@ impl DriftRouter {
 
         self.staging.push(StagedDrift {
             id,
-            source_ctx: source_ctx.to_string(),
-            target_ctx: target_ctx.to_string(),
+            source_ctx,
+            target_ctx,
             content,
             source_model,
             drift_kind,
@@ -291,7 +318,7 @@ impl DriftRouter {
     ///
     /// The caller is responsible for injecting blocks into target documents.
     /// Failed items should be returned via [`requeue`](Self::requeue).
-    pub fn drain(&mut self, for_context: Option<&str>) -> Vec<StagedDrift> {
+    pub fn drain(&mut self, for_context: Option<ContextId>) -> Vec<StagedDrift> {
         match for_context {
             None => std::mem::take(&mut self.staging),
             Some(ctx) => {
@@ -317,7 +344,7 @@ impl DriftRouter {
             None,                                     // parent set during insertion
             drift.content.clone(),
             author,
-            drift.source_ctx.clone(),
+            drift.source_ctx.short(),
             drift.source_model.clone(),
             drift.drift_kind.clone(),
         )
@@ -333,6 +360,11 @@ impl DriftRouter {
 pub enum DriftError {
     #[error("unknown context: {0}")]
     UnknownContext(String),
+    #[error("ambiguous context prefix '{prefix}': matches {candidates:?}")]
+    AmbiguousContext {
+        prefix: String,
+        candidates: Vec<String>,
+    },
     #[error("document error: {0}")]
     DocumentError(String),
     #[error("LLM error: {0}")]
@@ -503,31 +535,19 @@ fn drift_kernel(
         .ok_or_else(|| "kernel has been dropped".to_string())
 }
 
-/// Get the caller's short ID from the drift router.
-async fn drift_caller_short_id(
-    kernel: &Arc<crate::kernel::Kernel>,
-    context_name: &str,
-) -> Result<String, String> {
-    let router = kernel.drift().read().await;
-    router
-        .short_id_for_context(context_name)
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("context '{}' not registered in drift router", context_name))
-}
-
 // ── DriftLsEngine ─────────────────────────────────────────────────────────
 
 /// List all contexts in the kernel's drift router.
 pub struct DriftLsEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
-    context_name: String,
+    context_id: ContextId,
 }
 
 impl DriftLsEngine {
-    pub fn new(kernel: &Arc<crate::kernel::Kernel>, context_name: impl Into<String>) -> Self {
+    pub fn new(kernel: &Arc<crate::kernel::Kernel>, context_id: ContextId) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
-            context_name: context_name.into(),
+            context_id,
         }
     }
 }
@@ -553,26 +573,24 @@ impl ExecutionEngine for DriftLsEngine {
 
         let router = kernel.drift().read().await;
         let contexts = router.list_contexts();
-        let caller_short = router
-            .short_id_for_context(&self.context_name)
-            .unwrap_or("");
 
         let mut output = String::new();
         for ctx in &contexts {
-            let marker = if ctx.short_id == caller_short { "* " } else { "  " };
+            let marker = if ctx.id == self.context_id { "* " } else { "  " };
+            let display = ctx.display_name();
             let provider_info = match (&ctx.provider, &ctx.model) {
                 (Some(p), Some(m)) => format!(" ({}:{})", p, m),
                 (Some(p), None) => format!(" ({})", p),
                 _ => String::new(),
             };
             let parent_info = ctx
-                .parent_short_id
+                .parent_id
                 .as_ref()
-                .map(|p| format!(" [parent: {}]", p))
+                .map(|p| format!(" [parent: {}]", p.short()))
                 .unwrap_or_default();
             output.push_str(&format!(
                 "{}{} {} [doc: {}]{}{}\n",
-                marker, ctx.short_id, ctx.context_name, ctx.document_id, provider_info, parent_info,
+                marker, ctx.id.short(), display, ctx.document_id, provider_info, parent_info,
             ));
         }
 
@@ -592,7 +610,7 @@ impl ExecutionEngine for DriftLsEngine {
 pub struct DriftPushEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_name: String,
+    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -607,12 +625,12 @@ impl DriftPushEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_name: impl Into<String>,
+        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_name: context_name.into(),
+            context_id,
         }
     }
 }
@@ -628,7 +646,7 @@ impl ExecutionEngine for DriftPushEngine {
             "properties": {
                 "target_ctx": {
                     "type": "string",
-                    "description": "Short ID of the target context"
+                    "description": "Label or hex prefix of the target context"
                 },
                 "content": {
                     "type": "string",
@@ -656,17 +674,21 @@ impl ExecutionEngine for DriftPushEngine {
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
-            Ok(s) => s,
-            Err(e) => return Ok(ExecResult::failure(1, e)),
+        // Resolve target by label or hex prefix
+        let target_id = {
+            let router = kernel.drift().read().await;
+            match router.resolve_context(&p.target_ctx) {
+                Ok(id) => id,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            }
         };
 
         if p.summarize {
             let (source_doc_id, source_model) = {
                 let router = kernel.drift().read().await;
-                let source_handle = match router.get(&caller_short) {
+                let source_handle = match router.get(self.context_id) {
                     Some(h) => h,
-                    None => return Ok(ExecResult::failure(1, format!("caller context {} not found", caller_short))),
+                    None => return Ok(ExecResult::failure(1, format!("caller context {} not found", self.context_id.short()))),
                 };
                 (source_handle.document_id.clone(), source_handle.model.clone())
             };
@@ -697,12 +719,12 @@ impl ExecutionEngine for DriftPushEngine {
             };
 
             let mut router = kernel.drift().write().await;
-            let staged_id = match router.stage(&caller_short, &p.target_ctx, summary, Some(model.to_string()), DriftKind::Distill) {
+            let staged_id = match router.stage(self.context_id, target_id, summary, Some(model.to_string()), DriftKind::Distill) {
                 Ok(id) => id,
                 Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
 
-            Ok(ExecResult::success(format!("Staged distilled drift → {} (id={})", p.target_ctx, staged_id)))
+            Ok(ExecResult::success(format!("Staged distilled drift → {} (id={})", target_id.short(), staged_id)))
         } else {
             let content = match p.content {
                 Some(c) if !c.is_empty() => c,
@@ -710,13 +732,13 @@ impl ExecutionEngine for DriftPushEngine {
             };
 
             let mut router = kernel.drift().write().await;
-            let source_model = router.get(&caller_short).and_then(|h| h.model.clone());
-            let staged_id = match router.stage(&caller_short, &p.target_ctx, content, source_model, DriftKind::Push) {
+            let source_model = router.get(self.context_id).and_then(|h| h.model.clone());
+            let staged_id = match router.stage(self.context_id, target_id, content, source_model, DriftKind::Push) {
                 Ok(id) => id,
                 Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
 
-            Ok(ExecResult::success(format!("Staged drift → {} (id={})", p.target_ctx, staged_id)))
+            Ok(ExecResult::success(format!("Staged drift → {} (id={})", target_id.short(), staged_id)))
         }
     }
 
@@ -729,7 +751,7 @@ impl ExecutionEngine for DriftPushEngine {
 pub struct DriftPullEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_name: String,
+    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -742,12 +764,12 @@ impl DriftPullEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_name: impl Into<String>,
+        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_name: context_name.into(),
+            context_id,
         }
     }
 }
@@ -761,7 +783,7 @@ impl ExecutionEngine for DriftPullEngine {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "source_ctx": { "type": "string", "description": "Short ID of the source context" },
+                "source_ctx": { "type": "string", "description": "Label or hex prefix of the source context" },
                 "prompt": { "type": "string", "description": "Optional focus prompt to guide the summary" }
             },
             "required": ["source_ctx"]
@@ -780,17 +802,15 @@ impl ExecutionEngine for DriftPullEngine {
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
-            Ok(s) => s,
-            Err(e) => return Ok(ExecResult::failure(1, e)),
-        };
-
-        let (source_doc_id, source_model) = {
+        // Resolve source by label or hex prefix
+        let (source_id, source_doc_id, source_model) = {
             let router = kernel.drift().read().await;
-            match router.get(&p.source_ctx) {
-                Some(h) => (h.document_id.clone(), h.model.clone()),
-                None => return Ok(ExecResult::failure(1, format!("unknown source context: {}", p.source_ctx))),
-            }
+            let source_id = match router.resolve_context(&p.source_ctx) {
+                Ok(id) => id,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            };
+            let h = router.get(source_id).unwrap();
+            (source_id, h.document_id.clone(), h.model.clone())
         };
 
         let blocks = match self.documents.block_snapshots(&source_doc_id) {
@@ -810,7 +830,7 @@ impl ExecutionEngine for DriftPullEngine {
         });
         drop(registry);
 
-        tracing::info!("Pulling from {} ({} blocks, model={}) → {}", p.source_ctx, blocks.len(), model, caller_short);
+        tracing::info!("Pulling from {} ({} blocks, model={}) → {}", source_id.short(), blocks.len(), model, self.context_id.short());
 
         let summary = match provider
             .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
@@ -822,23 +842,23 @@ impl ExecutionEngine for DriftPullEngine {
 
         let caller_doc_id = {
             let router = kernel.drift().read().await;
-            match router.get(&caller_short) {
+            match router.get(self.context_id) {
                 Some(h) => h.document_id.clone(),
-                None => return Ok(ExecResult::failure(1, format!("caller context {} not found", caller_short))),
+                None => return Ok(ExecResult::failure(1, format!("caller context {} not found", self.context_id.short()))),
             }
         };
 
         let staged = StagedDrift {
             id: 0,
-            source_ctx: p.source_ctx.clone(),
-            target_ctx: caller_short.clone(),
+            source_ctx: source_id,
+            target_ctx: self.context_id,
             content: summary,
             source_model: Some(model.to_string()),
             drift_kind: DriftKind::Pull,
             created_at: now_epoch(),
         };
 
-        let author = format!("drift:{}", p.source_ctx);
+        let author = format!("drift:{}", source_id.short());
         let snapshot = DriftRouter::build_drift_block(&staged, &author);
         let after = self.documents.last_block_id(&caller_doc_id);
 
@@ -847,7 +867,7 @@ impl ExecutionEngine for DriftPullEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject drift block: {}", e))),
         };
 
-        Ok(ExecResult::success(format!("Pulled from {} → {} (block={})", p.source_ctx, caller_short, block_id.to_key())))
+        Ok(ExecResult::success(format!("Pulled from {} → {} (block={})", source_id.short(), self.context_id.short(), block_id.to_key())))
     }
 
     async fn is_available(&self) -> bool { true }
@@ -859,19 +879,19 @@ impl ExecutionEngine for DriftPullEngine {
 pub struct DriftFlushEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_name: String,
+    context_id: ContextId,
 }
 
 impl DriftFlushEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_name: impl Into<String>,
+        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_name: context_name.into(),
+            context_id,
         }
     }
 }
@@ -896,14 +916,9 @@ impl ExecutionEngine for DriftFlushEngine {
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let caller_short = match drift_caller_short_id(&kernel, &self.context_name).await {
-            Ok(s) => s,
-            Err(e) => return Ok(ExecResult::failure(1, e)),
-        };
-
         let staged = {
             let mut router = kernel.drift().write().await;
-            router.drain(Some(&caller_short))
+            router.drain(Some(self.context_id))
         };
 
         let count = staged.len();
@@ -913,27 +928,27 @@ impl ExecutionEngine for DriftFlushEngine {
         for drift in staged {
             let target_doc_id = {
                 let router = kernel.drift().read().await;
-                match router.get(&drift.target_ctx) {
+                match router.get(drift.target_ctx) {
                     Some(h) => h.document_id.clone(),
                     None => {
-                        tracing::warn!("Drift flush: target context {} not found, re-queuing", drift.target_ctx);
+                        tracing::warn!("Drift flush: target context {} not found, re-queuing", drift.target_ctx.short());
                         failed.push(drift);
                         continue;
                     }
                 }
             };
 
-            let author = format!("drift:{}", drift.source_ctx);
+            let author = format!("drift:{}", drift.source_ctx.short());
             let snapshot = DriftRouter::build_drift_block(&drift, &author);
             let after = self.documents.last_block_id(&target_doc_id);
 
             match self.documents.insert_from_snapshot(&target_doc_id, snapshot, after.as_ref()) {
                 Ok(block_id) => {
-                    tracing::info!("Drift flushed: {} → {} (block={})", drift.source_ctx, drift.target_ctx, block_id.to_key());
+                    tracing::info!("Drift flushed: {} → {} (block={})", drift.source_ctx.short(), drift.target_ctx.short(), block_id.to_key());
                     injected += 1;
                 }
                 Err(e) => {
-                    tracing::error!("Drift flush failed for {} → {}: {}, re-queuing", drift.source_ctx, drift.target_ctx, e);
+                    tracing::error!("Drift flush failed for {} → {}: {}, re-queuing", drift.source_ctx.short(), drift.target_ctx.short(), e);
                     failed.push(drift);
                 }
             }
@@ -960,7 +975,7 @@ pub struct DriftMergeEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
     #[allow(dead_code)] // kept for structural consistency; may be used for auth checks
-    context_name: String,
+    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -972,12 +987,12 @@ impl DriftMergeEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_name: impl Into<String>,
+        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_name: context_name.into(),
+            context_id,
         }
     }
 }
@@ -991,7 +1006,7 @@ impl ExecutionEngine for DriftMergeEngine {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "source_ctx": { "type": "string", "description": "Short ID of the forked context to merge back" }
+                "source_ctx": { "type": "string", "description": "Label or hex prefix of the forked context to merge back" }
             },
             "required": ["source_ctx"]
         }))
@@ -1009,24 +1024,25 @@ impl ExecutionEngine for DriftMergeEngine {
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let (source_doc_id, source_model, parent_ctx_id) = {
+        let (source_id, source_doc_id, source_model, parent_ctx_id) = {
             let router = kernel.drift().read().await;
-            let source_handle = match router.get(&p.source_ctx) {
-                Some(h) => h,
-                None => return Ok(ExecResult::failure(1, format!("unknown source context: {}", p.source_ctx))),
+            let source_id = match router.resolve_context(&p.source_ctx) {
+                Ok(id) => id,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
-            let parent = match &source_handle.parent_short_id {
-                Some(p) => p.clone(),
-                None => return Ok(ExecResult::failure(1, format!("context {} has no parent — cannot merge", p.source_ctx))),
+            let source_handle = router.get(source_id).unwrap();
+            let parent = match source_handle.parent_id {
+                Some(p) => p,
+                None => return Ok(ExecResult::failure(1, format!("context {} has no parent — cannot merge", source_id.short()))),
             };
-            (source_handle.document_id.clone(), source_handle.model.clone(), parent)
+            (source_id, source_handle.document_id.clone(), source_handle.model.clone(), parent)
         };
 
         let parent_doc_id = {
             let router = kernel.drift().read().await;
-            match router.get(&parent_ctx_id) {
+            match router.get(parent_ctx_id) {
                 Some(h) => h.document_id.clone(),
-                None => return Ok(ExecResult::failure(1, format!("parent context {} not found", parent_ctx_id))),
+                None => return Ok(ExecResult::failure(1, format!("parent context {} not found", parent_ctx_id.short()))),
             }
         };
 
@@ -1047,7 +1063,7 @@ impl ExecutionEngine for DriftMergeEngine {
         });
         drop(registry);
 
-        tracing::info!("Merging {} ({} blocks, model={}) → parent {}", p.source_ctx, blocks.len(), model, parent_ctx_id);
+        tracing::info!("Merging {} ({} blocks, model={}) → parent {}", source_id.short(), blocks.len(), model, parent_ctx_id.short());
 
         let summary = match provider
             .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
@@ -1059,15 +1075,15 @@ impl ExecutionEngine for DriftMergeEngine {
 
         let staged = StagedDrift {
             id: 0,
-            source_ctx: p.source_ctx.clone(),
-            target_ctx: parent_ctx_id.clone(),
+            source_ctx: source_id,
+            target_ctx: parent_ctx_id,
             content: summary,
             source_model: Some(model.to_string()),
             drift_kind: DriftKind::Merge,
             created_at: now_epoch(),
         };
 
-        let author = format!("drift:{}", p.source_ctx);
+        let author = format!("drift:{}", source_id.short());
         let snapshot = DriftRouter::build_drift_block(&staged, &author);
         let after = self.documents.last_block_id(&parent_doc_id);
 
@@ -1076,7 +1092,7 @@ impl ExecutionEngine for DriftMergeEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject merge block: {}", e))),
         };
 
-        Ok(ExecResult::success(format!("Merged {} → parent {} (block={})", p.source_ctx, parent_ctx_id, block_id.to_key())))
+        Ok(ExecResult::success(format!("Merged {} → parent {} (block={})", source_id.short(), parent_ctx_id.short(), block_id.to_key())))
     }
 
     async fn is_available(&self) -> bool { true }
@@ -1103,54 +1119,79 @@ mod tests {
     #[test]
     fn test_register_and_lookup() {
         let mut router = DriftRouter::new();
-        let short_id = router.register("main-session", "doc-abc", None);
+        let id = ContextId::new();
+        router.register(id, Some("main-session"), "doc-abc", None);
 
-        assert_eq!(short_id.len(), SHORT_ID_LEN);
-        let handle = router.get(&short_id).unwrap();
-        assert_eq!(handle.context_name, "main-session");
+        let handle = router.get(id).unwrap();
+        assert_eq!(handle.label.as_deref(), Some("main-session"));
         assert_eq!(handle.document_id, "doc-abc");
-        assert!(handle.parent_short_id.is_none());
+        assert!(handle.parent_id.is_none());
     }
 
     #[test]
     fn test_register_with_parent() {
         let mut router = DriftRouter::new();
-        let parent_id = router.register("main", "doc-1", None);
-        let child_id = router.register("fork-debug", "doc-2", Some(&parent_id));
+        let parent_id = ContextId::new();
+        let child_id = ContextId::new();
+        router.register(parent_id, Some("main"), "doc-1", None);
+        router.register(child_id, Some("fork-debug"), "doc-2", Some(parent_id));
 
-        let child = router.get(&child_id).unwrap();
-        assert_eq!(child.parent_short_id.as_deref(), Some(parent_id.as_str()));
+        let child = router.get(child_id).unwrap();
+        assert_eq!(child.parent_id, Some(parent_id));
     }
 
     #[test]
-    fn test_short_id_uniqueness() {
+    fn test_resolve_by_label() {
         let mut router = DriftRouter::new();
-        let mut ids = Vec::new();
-        for i in 0..100 {
-            let id = router.register(&format!("ctx-{}", i), &format!("doc-{}", i), None);
-            assert!(!ids.contains(&id), "duplicate short_id: {}", id);
-            ids.push(id);
+        let id = ContextId::new();
+        router.register(id, Some("test-ctx"), "doc-42", None);
+        assert_eq!(router.resolve_context("test-ctx").unwrap(), id);
+    }
+
+    #[test]
+    fn test_resolve_by_label_prefix() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("test-ctx"), "doc-42", None);
+        let other_id = ContextId::new();
+        router.register(other_id, Some("debug"), "doc-43", None);
+        assert_eq!(router.resolve_context("test").unwrap(), id);
+    }
+
+    #[test]
+    fn test_resolve_by_hex_prefix() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, None, "doc-42", None);
+        let hex_prefix = &id.to_hex()[..8];
+        // Should match by hex prefix
+        let result = router.resolve_context(hex_prefix);
+        match result {
+            Ok(resolved) => assert_eq!(resolved, id),
+            Err(DriftError::AmbiguousContext { .. }) => {} // possible but unlikely
+            Err(e) => panic!("unexpected error: {}", e),
         }
     }
 
     #[test]
-    fn test_context_to_short_id() {
+    fn test_resolve_unknown() {
         let mut router = DriftRouter::new();
-        let short = router.register("test-ctx", "doc-42", None);
-        assert_eq!(router.short_id_for_context("test-ctx"), Some(short.as_str()));
-        assert_eq!(router.short_id_for_context("nonexistent"), None);
+        let id = ContextId::new();
+        router.register(id, Some("main"), "doc-1", None);
+        assert!(router.resolve_context("nonexistent").is_err());
     }
 
     #[test]
     fn test_configure_llm() {
         let mut router = DriftRouter::new();
-        let short = router.register("test", "doc-1", None);
+        let id = ContextId::new();
+        router.register(id, Some("test"), "doc-1", None);
 
         router
-            .configure_llm(&short, "gemini", "gemini-2.0-flash")
+            .configure_llm(id, "gemini", "gemini-2.0-flash")
             .unwrap();
 
-        let handle = router.get(&short).unwrap();
+        let handle = router.get(id).unwrap();
         assert_eq!(handle.provider.as_deref(), Some("gemini"));
         assert_eq!(handle.model.as_deref(), Some("gemini-2.0-flash"));
     }
@@ -1158,18 +1199,20 @@ mod tests {
     #[test]
     fn test_configure_llm_unknown_context() {
         let mut router = DriftRouter::new();
-        let result = router.configure_llm("nonexistent", "anthropic", "claude-opus-4-6");
+        let result = router.configure_llm(ContextId::new(), "anthropic", "claude-opus-4-6");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_stage_and_queue() {
         let mut router = DriftRouter::new();
-        let src = router.register("source", "doc-1", None);
-        let tgt = router.register("target", "doc-2", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("source"), "doc-1", None);
+        router.register(tgt, Some("target"), "doc-2", None);
 
         let id = router
-            .stage(&src, &tgt, "hello from source".into(), None, DriftKind::Push)
+            .stage(src, tgt, "hello from source".into(), None, DriftKind::Push)
             .unwrap();
 
         assert_eq!(router.queue().len(), 1);
@@ -1180,23 +1223,26 @@ mod tests {
     #[test]
     fn test_stage_unknown_target() {
         let mut router = DriftRouter::new();
-        let src = router.register("source", "doc-1", None);
+        let src = ContextId::new();
+        router.register(src, Some("source"), "doc-1", None);
 
-        let result = router.stage(&src, "bad", "nope".into(), None, DriftKind::Push);
+        let result = router.stage(src, ContextId::new(), "nope".into(), None, DriftKind::Push);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_cancel() {
         let mut router = DriftRouter::new();
-        let src = router.register("src", "doc-1", None);
-        let tgt = router.register("tgt", "doc-2", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), "doc-1", None);
+        router.register(tgt, Some("tgt"), "doc-2", None);
 
         let id1 = router
-            .stage(&src, &tgt, "one".into(), None, DriftKind::Push)
+            .stage(src, tgt, "one".into(), None, DriftKind::Push)
             .unwrap();
         let _id2 = router
-            .stage(&src, &tgt, "two".into(), None, DriftKind::Push)
+            .stage(src, tgt, "two".into(), None, DriftKind::Push)
             .unwrap();
 
         assert_eq!(router.queue().len(), 2);
@@ -1208,14 +1254,16 @@ mod tests {
     #[test]
     fn test_drain() {
         let mut router = DriftRouter::new();
-        let src = router.register("src", "doc-1", None);
-        let tgt = router.register("tgt", "doc-2", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), "doc-1", None);
+        router.register(tgt, Some("tgt"), "doc-2", None);
 
         router
-            .stage(&src, &tgt, "a".into(), None, DriftKind::Push)
+            .stage(src, tgt, "a".into(), None, DriftKind::Push)
             .unwrap();
         router
-            .stage(&src, &tgt, "b".into(), None, DriftKind::Push)
+            .stage(src, tgt, "b".into(), None, DriftKind::Push)
             .unwrap();
 
         let drained = router.drain(None);
@@ -1226,13 +1274,15 @@ mod tests {
     #[test]
     fn test_build_drift_block() {
         let mut router = DriftRouter::new();
-        let src = router.register("src", "doc-1", None);
-        let tgt = router.register("tgt", "doc-2", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("src"), "doc-1", None);
+        router.register(tgt, Some("tgt"), "doc-2", None);
 
         let id = router
             .stage(
-                &src,
-                &tgt,
+                src,
+                tgt,
                 "important finding".into(),
                 Some("claude-opus-4-6".into()),
                 DriftKind::Distill,
@@ -1242,11 +1292,11 @@ mod tests {
         let staged = &router.queue()[0];
         assert_eq!(staged.id, id);
 
-        let block = DriftRouter::build_drift_block(staged, &format!("drift:{}", src));
+        let block = DriftRouter::build_drift_block(staged, &format!("drift:{}", src.short()));
         assert_eq!(block.kind, BlockKind::Drift);
         assert_eq!(block.role, Role::System);
         assert_eq!(block.content, "important finding");
-        assert_eq!(block.source_context.as_deref(), Some(src.as_str()));
+        assert_eq!(block.source_context.as_deref(), Some(src.short().as_str()));
         assert_eq!(block.source_model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(block.drift_kind, Some(DriftKind::Distill));
     }
@@ -1254,20 +1304,24 @@ mod tests {
     #[test]
     fn test_unregister() {
         let mut router = DriftRouter::new();
-        let short = router.register("test", "doc-1", None);
+        let id = ContextId::new();
+        router.register(id, Some("test"), "doc-1", None);
 
-        assert!(router.get(&short).is_some());
-        router.unregister(&short);
-        assert!(router.get(&short).is_none());
-        assert!(router.short_id_for_context("test").is_none());
+        assert!(router.get(id).is_some());
+        router.unregister(id);
+        assert!(router.get(id).is_none());
+        assert!(router.resolve_context("test").is_err());
     }
 
     #[test]
     fn test_list_contexts_sorted() {
         let mut router = DriftRouter::new();
-        let _a = router.register("alpha", "doc-1", None);
-        let _b = router.register("beta", "doc-2", None);
-        let _c = router.register("gamma", "doc-3", None);
+        let a = ContextId::new();
+        let b = ContextId::new();
+        let c = ContextId::new();
+        router.register(a, Some("alpha"), "doc-1", None);
+        router.register(b, Some("beta"), "doc-2", None);
+        router.register(c, Some("gamma"), "doc-3", None);
 
         let list = router.list_contexts();
         assert_eq!(list.len(), 3);
@@ -1279,25 +1333,43 @@ mod tests {
     #[test]
     fn test_drain_scoped() {
         let mut router = DriftRouter::new();
-        let a = router.register("alpha", "doc-1", None);
-        let b = router.register("beta", "doc-2", None);
-        let c = router.register("gamma", "doc-3", None);
+        let a = ContextId::new();
+        let b = ContextId::new();
+        let c = ContextId::new();
+        router.register(a, Some("alpha"), "doc-1", None);
+        router.register(b, Some("beta"), "doc-2", None);
+        router.register(c, Some("gamma"), "doc-3", None);
 
         // Stage: a→b and c→b
         router
-            .stage(&a, &b, "from alpha".into(), None, DriftKind::Push)
+            .stage(a, b, "from alpha".into(), None, DriftKind::Push)
             .unwrap();
         router
-            .stage(&c, &b, "from gamma".into(), None, DriftKind::Push)
+            .stage(c, b, "from gamma".into(), None, DriftKind::Push)
             .unwrap();
 
         // Scoped drain for alpha — should only get a→b
-        let drained = router.drain(Some(&a));
+        let drained = router.drain(Some(a));
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].source_ctx, a);
         // c→b should remain
         assert_eq!(router.queue().len(), 1);
         assert_eq!(router.queue()[0].source_ctx, c);
+    }
+
+    #[test]
+    fn test_rename() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("old-name"), "doc-1", None);
+
+        assert!(router.resolve_context("old-name").is_ok());
+        router.rename(id, Some("new-name")).unwrap();
+        assert!(router.resolve_context("old-name").is_err());
+        assert_eq!(router.resolve_context("new-name").unwrap(), id);
+
+        let handle = router.get(id).unwrap();
+        assert_eq!(handle.label.as_deref(), Some("new-name"));
     }
 
     #[test]
@@ -1393,13 +1465,15 @@ mod tests {
     #[tokio::test]
     async fn test_drift_ls_engine() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
+        let main_id = ContextId::new();
+        let debug_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            r.register("main", "doc-main", None);
-            r.register("debug", "doc-debug", None);
+            r.register(main_id, Some("main"), "doc-main", None);
+            r.register(debug_id, Some("debug"), "doc-debug", None);
         }
 
-        let engine = DriftLsEngine::new(&kernel, "main");
+        let engine = DriftLsEngine::new(&kernel, main_id);
         let result = engine.execute("{}").await.unwrap();
 
         assert!(result.success);
@@ -1410,12 +1484,12 @@ mod tests {
     #[tokio::test]
     async fn test_drift_push_and_flush_engines() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
-        let src_short;
-        let tgt_short;
+        let src_id = ContextId::new();
+        let tgt_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            src_short = r.register("source", "doc-src", None);
-            tgt_short = r.register("target", "doc-tgt", None);
+            r.register(src_id, Some("source"), "doc-src", None);
+            r.register(tgt_id, Some("target"), "doc-tgt", None);
         }
 
         let documents = crate::block_store::shared_block_store("test");
@@ -1424,13 +1498,10 @@ mod tests {
             .create_document("doc-tgt".to_string(), crate::db::DocumentKind::Conversation, None)
             .unwrap();
 
-        // Push via DriftPushEngine
-        let push_engine = DriftPushEngine::new(&kernel, documents.clone(), "source");
+        // Push via DriftPushEngine (target_ctx accepts label prefix)
+        let push_engine = DriftPushEngine::new(&kernel, documents.clone(), src_id);
         let push_result = push_engine
-            .execute(&format!(
-                r#"{{"target_ctx": "{}", "content": "hello from source"}}"#,
-                tgt_short
-            ))
+            .execute(r#"{"target_ctx": "target", "content": "hello from source"}"#)
             .await
             .unwrap();
         assert!(push_result.success, "push failed: {}", push_result.stderr);
@@ -1440,12 +1511,12 @@ mod tests {
             let router = kernel.drift().read().await;
             let queue = router.queue();
             assert_eq!(queue.len(), 1);
-            assert_eq!(queue[0].source_ctx, src_short);
-            assert_eq!(queue[0].target_ctx, tgt_short);
+            assert_eq!(queue[0].source_ctx, src_id);
+            assert_eq!(queue[0].target_ctx, tgt_id);
         }
 
         // Flush via DriftFlushEngine
-        let flush_engine = DriftFlushEngine::new(&kernel, documents.clone(), "source");
+        let flush_engine = DriftFlushEngine::new(&kernel, documents.clone(), src_id);
         let flush_result = flush_engine.execute("{}").await.unwrap();
         assert!(flush_result.success, "flush failed: {}", flush_result.stderr);
         assert!(flush_result.stdout.contains("Flushed 1 drifts"));
@@ -1463,10 +1534,11 @@ mod tests {
         let router = shared_drift_router();
 
         // Register from "parent" side
-        let short_id = {
+        let parent_id = ContextId::new();
+        {
             let mut r = router.write().await;
-            r.register("main", "doc-main", None)
-        };
+            r.register(parent_id, Some("main"), "doc-main", None);
+        }
 
         // Clone the Arc (simulating what fork/thread does)
         let child_router = Arc::clone(&router);
@@ -1474,87 +1546,75 @@ mod tests {
         // Child should see the parent's contexts
         let child_handle = {
             let r = child_router.read().await;
-            r.get(&short_id).map(|h| h.context_name.clone())
+            r.get(parent_id).map(|h| h.label.clone())
         };
-        assert_eq!(child_handle, Some("main".to_string()));
+        assert_eq!(child_handle, Some(Some("main".to_string())));
 
         // Child registers a new context
-        let child_short = {
+        let child_id = ContextId::new();
+        {
             let mut r = child_router.write().await;
-            r.register("debug-fork", "doc-debug", Some(&short_id))
-        };
+            r.register(child_id, Some("debug-fork"), "doc-debug", Some(parent_id));
+        }
 
         // Parent should see the child's context
         let parent_sees_child = {
             let r = router.read().await;
-            r.get(&child_short).is_some()
+            r.get(child_id).is_some()
         };
         assert!(parent_sees_child);
     }
 
-    /// Test 4c: Drift flush re-queue test.
-    ///
-    /// When flush encounters a nonexistent target context, the drift items should
-    /// be re-queued rather than lost. This test verifies that failed flushes preserve
-    /// staged drifts for future delivery.
     #[test]
     fn test_drift_flush_requeue_on_missing_target() {
         let mut router = DriftRouter::new();
-        let src = router.register("source", "doc-src", None);
-        let tgt = router.register("target", "doc-tgt", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("source"), "doc-src", None);
+        router.register(tgt, Some("target"), "doc-tgt", None);
 
-        // Stage a drift to target
         let staged_id = router
-            .stage(&src, &tgt, "test content".into(), None, DriftKind::Push)
+            .stage(src, tgt, "test content".into(), None, DriftKind::Push)
             .unwrap();
 
-        // Verify it's in the queue
         assert_eq!(router.queue().len(), 1);
         assert_eq!(router.queue()[0].id, staged_id);
 
         // Unregister target (simulating context shutdown)
-        router.unregister(&tgt);
+        router.unregister(tgt);
 
-        // Manually drain and attempt to deliver (simulating flush logic)
         let staged = router.drain(None);
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].id, staged_id);
 
-        // Target is missing — would fail in actual flush. Re-queue via requeue()
         router.requeue(staged);
 
-        // Verify staging queue still contains the failed item
         assert_eq!(router.queue().len(), 1);
         assert_eq!(router.queue()[0].id, staged_id);
         assert_eq!(router.queue()[0].content, "test content");
     }
 
-    /// Test 4c: Direct requeue() method test.
-    ///
-    /// Verifies that the requeue() method correctly restores items to the staging queue.
     #[test]
     fn test_requeue_method() {
         let mut router = DriftRouter::new();
-        let src = router.register("source", "doc-src", None);
-        let tgt = router.register("target", "doc-tgt", None);
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("source"), "doc-src", None);
+        router.register(tgt, Some("target"), "doc-tgt", None);
 
-        // Stage multiple drifts
         let id1 = router
-            .stage(&src, &tgt, "first".into(), None, DriftKind::Push)
+            .stage(src, tgt, "first".into(), None, DriftKind::Push)
             .unwrap();
         let id2 = router
-            .stage(&src, &tgt, "second".into(), None, DriftKind::Push)
+            .stage(src, tgt, "second".into(), None, DriftKind::Push)
             .unwrap();
 
-        // Drain all
         let drained = router.drain(None);
         assert_eq!(drained.len(), 2);
         assert!(router.queue().is_empty());
 
-        // Re-queue them
         router.requeue(drained);
 
-        // Both should be back in the queue
         assert_eq!(router.queue().len(), 2);
         let ids: Vec<_> = router.queue().iter().map(|s| s.id).collect();
         assert!(ids.contains(&id1));

@@ -8,6 +8,7 @@
 //! focused context, using ActionFired/TextInputReceived messages.
 
 use bevy::prelude::*;
+use kaijutsu_crdt::ContextId;
 use uuid::Uuid;
 
 use crate::cell::DocumentCache;
@@ -91,34 +92,34 @@ pub fn create_or_fork_context(
     let kernel_id = conn_state
         .current_kernel
         .as_ref()
-        .map(|k| k.id.clone())
+        .map(|k| k.id.to_string())
         .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
-    let context_name = Uuid::new_v4().to_string()[..8].to_string();
+    let context_label = Uuid::new_v4().to_string()[..8].to_string();
 
     if let Some(ref parent) = config.parent_context {
         if let Some(doc_id) = doc_cache.document_id_for_context(parent) {
             let Some(actor) = actor else {
                 error!("Cannot fork from parent: no active RPC actor");
-                create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+                create_empty(bootstrap, conn_state, &kernel_id, &context_label);
                 return;
             };
             let handle = actor.handle.clone();
             let doc_id = doc_id.to_string();
-            let fork_name = context_name.clone();
+            let fork_label = context_label.clone();
             let config = conn_state.ssh_config.clone();
             let kernel_id = kernel_id.clone();
             let bootstrap_tx = bootstrap.tx.clone();
 
             bevy::tasks::IoTaskPool::get()
                 .spawn(async move {
-                    match handle.fork_from_version(&doc_id, 0, &fork_name).await {
-                        Ok(ctx) => {
-                            info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
+                    match handle.fork_from_version(&doc_id, 0, &fork_label).await {
+                        Ok(ctx_id) => {
+                            info!("Fork created: {}", ctx_id);
                             let instance = Uuid::new_v4().to_string();
                             let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
                                 config,
                                 kernel_id,
-                                context_name: Some(fork_name),
+                                context_id: Some(ctx_id),
                                 instance,
                             });
                         }
@@ -128,26 +129,31 @@ pub fn create_or_fork_context(
                 .detach();
         } else {
             warn!("Parent context '{}' not in cache, creating empty", parent);
-            create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+            create_empty(bootstrap, conn_state, &kernel_id, &context_label);
         }
     } else {
-        create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+        create_empty(bootstrap, conn_state, &kernel_id, &context_label);
     }
 }
 
 /// Create an empty context by spawning an actor.
+///
+/// `label` is a human-readable name hint. The server assigns the actual ContextId
+/// when the actor joins; we pass `None` to let `spawn_actor` create a fresh context.
 fn create_empty(
     bootstrap: &BootstrapChannel,
     conn_state: &RpcConnectionState,
     kernel_id: &str,
-    context_name: &str,
+    label: &str,
 ) {
     let instance = Uuid::new_v4().to_string();
-    info!("Creating empty context: {} (instance: {})", context_name, instance);
+    // Create a new ContextId for the empty context
+    let ctx_id = ContextId::new();
+    info!("Creating empty context: {} (label: {}, instance: {})", ctx_id, label, instance);
     let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
         config: conn_state.ssh_config.clone(),
         kernel_id: kernel_id.to_string(),
-        context_name: Some(context_name.to_string()),
+        context_id: Some(ctx_id),
         instance,
     });
 }
@@ -590,7 +596,7 @@ fn submit_fork(
     let kernel_id = conn_state
         .current_kernel
         .as_ref()
-        .map(|k| k.id.clone())
+        .map(|k| k.id.to_string())
         .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
 
     let DialogMode::ForkContext { source_document_id, source_context } = mode;
@@ -604,7 +610,7 @@ fn submit_fork(
     // Fork via ActorHandle, then spawn actor to join the new context
     let handle = actor.handle.clone();
     let doc_id = source_document_id.clone();
-    let fork_name = name.to_string();
+    let fork_label = name.to_string();
     let config = conn_state.ssh_config.clone();
     let kernel_id = kernel_id.clone();
     let bootstrap_tx = bootstrap.tx.clone();
@@ -612,15 +618,15 @@ fn submit_fork(
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
             // Use version 0 to fork from latest
-            match handle.fork_from_version(&doc_id, 0, &fork_name).await {
-                Ok(ctx) => {
-                    info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
+            match handle.fork_from_version(&doc_id, 0, &fork_label).await {
+                Ok(ctx_id) => {
+                    info!("Fork created: {}", ctx_id);
                     // Now spawn actor to join the newly forked context
                     let instance = Uuid::new_v4().to_string();
                     let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
                         config,
                         kernel_id,
-                        context_name: Some(fork_name),
+                        context_id: Some(ctx_id),
                         instance,
                     });
                 }

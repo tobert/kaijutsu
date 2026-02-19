@@ -105,15 +105,15 @@ pub fn process_fork_requests(
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
                 match handle.fork_from_version(&doc_id, version, &ctx_name).await {
-                    Ok(context) => {
+                    Ok(ctx_id) => {
                         let new_doc_id = format!(
                             "{}@{}",
                             doc_id.split('@').next().unwrap_or(&doc_id),
-                            context.name
+                            ctx_id
                         );
                         let _ = tx.send(RpcResultMessage::Forked {
                             success: true,
-                            context_name: Some(context.name),
+                            context_name: Some(ctx_id.to_string()),
                             document_id: Some(new_doc_id),
                             error: None,
                         });
@@ -168,7 +168,18 @@ pub fn process_cherry_pick_requests(
         let target = request.target_context.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                match handle.cherry_pick_block(&block_id, &target).await {
+                let target_ctx_id = match kaijutsu_crdt::ContextId::parse(&target) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = tx.send(RpcResultMessage::CherryPicked {
+                            success: false,
+                            new_block_id: None,
+                            error: Some(format!("Invalid target context ID '{}': {}", target, e)),
+                        });
+                        return;
+                    }
+                };
+                match handle.cherry_pick_block(&block_id, target_ctx_id).await {
                     Ok(new_id) => {
                         let _ = tx.send(RpcResultMessage::CherryPicked {
                             success: true,

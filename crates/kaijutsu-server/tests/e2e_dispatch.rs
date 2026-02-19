@@ -19,6 +19,7 @@ use kaijutsu_kernel::drift::{DriftLsEngine, DriftPushEngine, DriftFlushEngine};
 use kaijutsu_kernel::git_engine::GitEngine;
 use kaijutsu_kernel::tools::{EngineArgs, ExecutionEngine, ToolInfo};
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
+use kaijutsu_crdt::ContextId;
 use kaijutsu_server::EmbeddedKaish;
 
 // ============================================================================
@@ -38,24 +39,27 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
         .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
         .unwrap();
 
+    // Generate a ContextId for the default context
+    let ctx_id = ContextId::new();
+
     // Register individual drift engines
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_ls", "List drift contexts", "drift"),
-        Arc::new(DriftLsEngine::new(&kernel, "default")),
+        Arc::new(DriftLsEngine::new(&kernel, ctx_id)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_push", "Stage drift content", "drift"),
-        Arc::new(DriftPushEngine::new(&kernel, documents.clone(), "default")),
+        Arc::new(DriftPushEngine::new(&kernel, documents.clone(), ctx_id)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_flush", "Flush staged drifts", "drift"),
-        Arc::new(DriftFlushEngine::new(&kernel, documents.clone(), "default")),
+        Arc::new(DriftFlushEngine::new(&kernel, documents.clone(), ctx_id)),
     ).await;
 
     // Register "default" context in drift router
     {
         let mut router = kernel.drift().write().await;
-        router.register("default", "doc-default", None);
+        router.register(ctx_id, Some("default"), "doc-default", None);
     }
 
     let kaish = EmbeddedKaish::new("e2e-drift", documents.clone(), kernel.clone(), None)
@@ -81,7 +85,8 @@ async fn setup_git(
         .mount("/mnt/repo", LocalBackend::new(repo_dir))
         .await;
 
-    let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), "default"));
+    let ctx_id = ContextId::new();
+    let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), ctx_id));
 
     kernel
         .register_tool_with_engine(
@@ -93,9 +98,9 @@ async fn setup_git(
     // Register context with pwd pointing at the VFS mount
     {
         let mut router = kernel.drift().write().await;
-        router.register("default", "doc-default", None);
+        router.register(ctx_id, Some("default"), "doc-default", None);
         router
-            .set_pwd("default", Some("/mnt/repo".to_string()))
+            .set_pwd(ctx_id, Some("/mnt/repo".to_string()))
             .unwrap();
     }
 
@@ -233,21 +238,21 @@ async fn drift_push_flush_lifecycle() {
     let (kaish, kernel, documents) = setup_drift_e2e().await;
 
     // Register a second context as drift target
-    let target_short = {
+    let target_ctx_id = ContextId::new();
+    {
         let mut router = kernel.drift().write().await;
-        router.register("target", "doc-target", None)
-    };
+        router.register(target_ctx_id, Some("target"), "doc-target", None);
+    }
 
     documents
         .create_document("doc-target".to_string(), DocumentKind::Conversation, None)
         .unwrap();
 
     // Stage a drift push via DriftPushEngine through kaish dispatch.
-    // drift_push takes JSON params: target_ctx and content.
+    // Use the label "target" (not short hex) because UUIDv7 IDs created in the
+    // same millisecond share their 8-char prefix, making hex prefix ambiguous.
     let push_result = kaish
-        .execute(&format!(
-            r#"drift_push "{target_short}" "hello from e2e test""#
-        ))
+        .execute(r#"drift_push "target" "hello from e2e test""#)
         .await
         .unwrap();
     assert!(push_result.ok(), "push failed: {}", push_result.err);
@@ -406,7 +411,8 @@ async fn git_status_without_pwd_gives_guidance() {
         .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
         .unwrap();
 
-    let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), "default"));
+    let ctx_id = ContextId::new();
+    let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), ctx_id));
 
     kernel
         .register_tool_with_engine(
@@ -418,7 +424,7 @@ async fn git_status_without_pwd_gives_guidance() {
     // Register context but don't set pwd
     {
         let mut router = kernel.drift().write().await;
-        router.register("default", "doc-default", None);
+        router.register(ctx_id, Some("default"), "doc-default", None);
     }
 
     let result = engine.execute(&kaish_json(&["status"], &[])).await.unwrap();

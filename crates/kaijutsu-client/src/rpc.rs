@@ -4,7 +4,7 @@
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
-use kaijutsu_crdt::DriftKind;
+use kaijutsu_crdt::{ContextId, DriftKind, KernelId};
 use russh::client::Msg;
 use russh::ChannelStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -94,10 +94,11 @@ impl RpcClient {
         Ok(result)
     }
 
-    /// Attach to a kernel by ID
-    pub async fn attach_kernel(&self, id: &str) -> Result<KernelHandle, RpcError> {
+    /// Attach to the server's kernel.
+    ///
+    /// Returns the kernel handle and its ID (assigned by the server).
+    pub async fn attach_kernel(&self) -> Result<(KernelHandle, KernelId), RpcError> {
         let mut request = self.world.attach_kernel_request();
-        request.get().set_id(id);
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -105,33 +106,11 @@ impl RpcClient {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let kernel = response.get()?.get_kernel()?;
+        let reader = response.get()?;
+        let kernel = reader.get_kernel()?;
+        let kernel_id = parse_kernel_id(reader.get_kernel_id()?)?;
 
-        Ok(KernelHandle { kernel })
-    }
-
-    /// Create a new kernel
-    pub async fn create_kernel(&self, config: KernelConfig) -> Result<KernelHandle, RpcError> {
-        let mut request = self.world.create_kernel_request();
-        {
-            let mut cfg = request.get().init_config();
-            cfg.set_name(&config.name);
-            cfg.set_consent_mode(match config.consent_mode {
-                ConsentMode::Collaborative => crate::kaijutsu_capnp::ConsentMode::Collaborative,
-                ConsentMode::Autonomous => crate::kaijutsu_capnp::ConsentMode::Autonomous,
-            });
-            let mut mounts = cfg.init_mounts(config.mounts.len() as u32);
-            for (i, mount) in config.mounts.iter().enumerate() {
-                let mut m = mounts.reborrow().get(i as u32);
-                m.set_path(&mount.path);
-                m.set_source(&mount.source);
-                m.set_writable(mount.writable);
-            }
-        }
-        let response = request.send().promise.await?;
-        let kernel = response.get()?.get_kernel()?;
-
-        Ok(KernelHandle { kernel })
+        Ok((KernelHandle { kernel }, kernel_id))
     }
 
 }
@@ -148,11 +127,11 @@ pub struct Identity {
 
 #[derive(Debug, Clone)]
 pub struct KernelInfo {
-    pub id: String,
+    pub id: KernelId,
     pub name: String,
     pub user_count: u32,
     pub agent_count: u32,
-    pub contexts: Vec<Context>,
+    pub contexts: Vec<ContextInfo>,
 }
 
 // ============================================================================
@@ -160,12 +139,10 @@ pub struct KernelInfo {
 // ============================================================================
 
 /// Lightweight context membership — tracks what context we joined and as whom.
-///
-/// A 4-tuple: (context_name, kernel_id, nick, instance).
 #[derive(Debug, Clone)]
 pub struct ContextMembership {
-    pub context_name: String,
-    pub kernel_id: String,
+    pub context_id: ContextId,
+    pub kernel_id: KernelId,
     pub nick: String,
     pub instance: String,
 }
@@ -178,11 +155,16 @@ pub struct ContextDocument {
     pub attached_at: u64,
 }
 
-/// Context within a kernel
+/// Context within a kernel (rich info from ContextHandleInfo wire type)
 #[derive(Debug, Clone)]
-pub struct Context {
-    pub name: String,
-    pub documents: Vec<ContextDocument>,
+pub struct ContextInfo {
+    pub id: ContextId,
+    pub label: String,
+    pub parent_id: Option<ContextId>,
+    pub provider: String,
+    pub model: String,
+    pub created_at: u64,
+    pub document_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -225,38 +207,36 @@ impl KernelHandle {
     // Context management
     // =========================================================================
 
-    /// List all contexts in this kernel
-    pub async fn list_contexts(&self) -> Result<Vec<Context>, RpcError> {
+    /// List all contexts in this kernel (includes drift info).
+    pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, RpcError> {
         let request = self.kernel.list_contexts_request();
         let response = request.send().promise.await?;
         let contexts = response.get()?.get_contexts()?;
 
         let mut result = Vec::with_capacity(contexts.len() as usize);
         for ctx in contexts.iter() {
-            result.push(parse_context(&ctx)?);
+            result.push(parse_context_info(&ctx)?);
         }
         Ok(result)
     }
 
-    /// Create a new context
-    pub async fn create_context(&self, name: &str) -> Result<Context, RpcError> {
+    /// Create a new context with an optional label.
+    ///
+    /// Returns the server-assigned ContextId.
+    pub async fn create_context(&self, label: &str) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.create_context_request();
-        request.get().set_name(name);
+        request.get().set_label(label);
         let response = request.send().promise.await?;
-        let ctx = response.get()?.get_context()?;
-        parse_context(&ctx)
+        parse_context_id(response.get()?.get_id()?)
     }
 
-    /// Join a context (creates if doesn't exist).
+    /// Join a context by ID.
     ///
     /// Returns the document_id for the joined context. The `instance` param
     /// identifies which client connected (for logging/debugging).
-    ///
-    /// Note: If multi-user presence is needed later, this is the place to
-    /// reintroduce a thinner presence protocol.
-    pub async fn join_context(&self, context_name: &str, instance: &str) -> Result<String, RpcError> {
+    pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<String, RpcError> {
         let mut request = self.kernel.join_context_request();
-        request.get().set_context_name(context_name);
+        request.get().set_context_id(context_id.as_bytes());
         request.get().set_instance(instance);
         let response = request.send().promise.await?;
         let document_id = response.get()?.get_document_id()?.to_string()?;
@@ -264,18 +244,18 @@ impl KernelHandle {
     }
 
     /// Attach a document to a context
-    pub async fn attach_document(&self, context_name: &str, document_id: &str) -> Result<(), RpcError> {
+    pub async fn attach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
         let mut request = self.kernel.attach_document_request();
-        request.get().set_context_name(context_name);
+        request.get().set_context_id(context_id.as_bytes());
         request.get().set_document_id(document_id);
         request.send().promise.await?;
         Ok(())
     }
 
     /// Detach a document from a context
-    pub async fn detach_document(&self, context_name: &str, document_id: &str) -> Result<(), RpcError> {
+    pub async fn detach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
         let mut request = self.kernel.detach_document_request();
-        request.get().set_context_name(context_name);
+        request.get().set_context_id(context_id.as_bytes());
         request.get().set_document_id(document_id);
         request.send().promise.await?;
         Ok(())
@@ -678,23 +658,22 @@ impl KernelHandle {
 
     /// Fork a document at a specific version, creating a new context.
     ///
-    /// Returns the newly created context.
+    /// Returns the server-assigned ContextId for the new fork.
     pub async fn fork_from_version(
         &self,
         document_id: &str,
         version: u64,
-        context_name: &str,
-    ) -> Result<Context, RpcError> {
+        label: &str,
+    ) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.fork_from_version_request();
         {
             let mut params = request.get();
             params.set_document_id(document_id);
             params.set_version(version);
-            params.set_context_name(context_name);
+            params.set_context_label(label);
         }
         let response = request.send().promise.await?;
-        let ctx = response.get()?.get_context()?;
-        parse_context(&ctx)
+        parse_context_id(response.get()?.get_context_id()?)
     }
 
     /// Cherry-pick a block from one context into another.
@@ -703,7 +682,7 @@ impl KernelHandle {
     pub async fn cherry_pick_block(
         &self,
         block_id: &kaijutsu_crdt::BlockId,
-        target_context: &str,
+        target_context: ContextId,
     ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
         let mut request = self.kernel.cherry_pick_block_request();
         {
@@ -712,7 +691,7 @@ impl KernelHandle {
             source.set_document_id(&block_id.document_id);
             source.set_agent_id(&block_id.agent_id);
             source.set_seq(block_id.seq);
-            params.set_target_context(target_context);
+            params.set_target_context_id(target_context.as_bytes());
         }
         let response = request.send().promise.await?;
         let new_block = response.get()?.get_new_block_id()?;
@@ -752,14 +731,14 @@ impl KernelHandle {
     // Drift: Cross-Context Communication
     // ========================================================================
 
-    /// Get this kernel's context short ID and name.
-    pub async fn get_context_id(&self) -> Result<(String, String), RpcError> {
+    /// Get this kernel's context ID and label.
+    pub async fn get_context_id(&self) -> Result<(ContextId, String), RpcError> {
         let request = self.kernel.get_context_id_request();
         let response = request.send().promise.await?;
         let reader = response.get()?;
-        let short_id = reader.get_short_id()?.to_string()?;
-        let name = reader.get_name()?.to_string()?;
-        Ok((short_id, name))
+        let id = parse_context_id(reader.get_id()?)?;
+        let label = reader.get_label()?.to_string()?;
+        Ok((id, label))
     }
 
     /// Configure the LLM provider and model for this kernel.
@@ -787,14 +766,14 @@ impl KernelHandle {
     /// Stage a drift push to another context.
     pub async fn drift_push(
         &self,
-        target_ctx: &str,
+        target_ctx: ContextId,
         content: &str,
         summarize: bool,
     ) -> Result<u64, RpcError> {
         let mut request = self.kernel.drift_push_request();
         {
             let mut params = request.get();
-            params.set_target_ctx(target_ctx);
+            params.set_target_ctx(target_ctx.as_bytes());
             params.set_content(content);
             params.set_summarize(summarize);
         }
@@ -831,8 +810,8 @@ impl KernelHandle {
         for entry in staged.iter() {
             result.push(StagedDriftInfo {
                 id: entry.get_id(),
-                source_ctx: entry.get_source_ctx()?.to_string()?,
-                target_ctx: entry.get_target_ctx()?.to_string()?,
+                source_ctx: parse_context_id(entry.get_source_ctx()?)?,
+                target_ctx: parse_context_id(entry.get_target_ctx()?)?,
                 content: entry.get_content()?.to_string()?,
                 source_model: entry.get_source_model()?.to_string()?,
                 drift_kind: entry.get_drift_kind()?.to_string()?,
@@ -856,11 +835,11 @@ impl KernelHandle {
     /// and injects the summary as a Drift block in this kernel's document.
     pub async fn drift_pull(
         &self,
-        source_ctx: &str,
+        source_ctx: ContextId,
         prompt: Option<&str>,
     ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
         let mut request = self.kernel.drift_pull_request();
-        request.get().set_source_ctx(source_ctx);
+        request.get().set_source_ctx(source_ctx.as_bytes());
         if let Some(p) = prompt {
             request.get().set_prompt(p);
         }
@@ -881,10 +860,10 @@ impl KernelHandle {
     /// into the parent context as a Drift block with DriftKind::Merge.
     pub async fn drift_merge(
         &self,
-        source_ctx: &str,
+        source_ctx: ContextId,
     ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
         let mut request = self.kernel.drift_merge_request();
-        request.get().set_source_ctx(source_ctx);
+        request.get().set_source_ctx(source_ctx.as_bytes());
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -896,29 +875,17 @@ impl KernelHandle {
         parse_block_id(&block_id_reader)
     }
 
-    /// List all registered contexts.
-    pub async fn list_all_contexts(&self) -> Result<Vec<ContextInfo>, RpcError> {
-        let request = self.kernel.list_all_contexts_request();
-        let response = request.send().promise.await?;
-        let contexts = response.get()?.get_contexts()?;
-
-        let mut result = Vec::with_capacity(contexts.len() as usize);
-        for ctx in contexts.iter() {
-            result.push(ContextInfo {
-                short_id: ctx.get_short_id()?.to_string()?,
-                name: ctx.get_name()?.to_string()?,
-                kernel_id: ctx.get_kernel_id()?.to_string()?,
-                provider: ctx.get_provider()?.to_string()?,
-                model: ctx.get_model()?.to_string()?,
-                parent_id: if ctx.get_has_parent_id() {
-                    Some(ctx.get_parent_id()?.to_string()?)
-                } else {
-                    None
-                },
-                created_at: ctx.get_created_at(),
-            });
-        }
-        Ok(result)
+    /// Rename a context's human-friendly label.
+    pub async fn rename_context(
+        &self,
+        context_id: ContextId,
+        label: &str,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.rename_context_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_label(label);
+        request.send().promise.await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -1132,25 +1099,42 @@ fn write_shell_value(mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_
 // Helper Functions
 // ============================================================================
 
-/// Helper to parse Context from Cap'n Proto
-fn parse_context(
-    reader: &crate::kaijutsu_capnp::context::Reader<'_>,
-) -> Result<Context, RpcError> {
-    let name = reader.get_name()?.to_string()?;
+/// Parse 16-byte Data into ContextId.
+fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
+    ContextId::try_from_slice(data).ok_or_else(|| {
+        RpcError::ServerError(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
+    })
+}
 
-    let docs_reader = reader.get_documents()?;
-    let mut documents = Vec::with_capacity(docs_reader.len() as usize);
-    for doc in docs_reader.iter() {
-        documents.push(ContextDocument {
-            id: doc.get_id()?.to_string()?,
-            attached_by: doc.get_attached_by()?.to_string()?,
-            attached_at: doc.get_attached_at(),
-        });
-    }
+/// Parse 16-byte Data into KernelId.
+fn parse_kernel_id(data: &[u8]) -> Result<KernelId, RpcError> {
+    KernelId::try_from_slice(data).ok_or_else(|| {
+        RpcError::ServerError(format!("invalid kernel ID: expected 16 bytes, got {}", data.len()))
+    })
+}
 
-    Ok(Context {
-        name,
-        documents,
+/// Helper to parse ContextInfo from Cap'n Proto ContextHandleInfo.
+fn parse_context_info(
+    reader: &crate::kaijutsu_capnp::context_handle_info::Reader<'_>,
+) -> Result<ContextInfo, RpcError> {
+    let id = parse_context_id(reader.get_id()?)?;
+    let label = reader.get_label()?.to_string()?;
+    let parent_data = reader.get_parent_id()?;
+    let parent_id = if parent_data.len() == 16 {
+        let pid = ContextId::try_from_slice(parent_data);
+        pid.filter(|id| !id.is_nil())
+    } else {
+        None
+    };
+
+    Ok(ContextInfo {
+        id,
+        label,
+        parent_id,
+        provider: reader.get_provider()?.to_string()?,
+        model: reader.get_model()?.to_string()?,
+        created_at: reader.get_created_at(),
+        document_id: reader.get_document_id()?.to_string()?,
     })
 }
 
@@ -1158,14 +1142,15 @@ fn parse_context(
 fn parse_kernel_info(
     reader: &crate::kaijutsu_capnp::kernel_info::Reader<'_>,
 ) -> Result<KernelInfo, RpcError> {
+    let id = parse_kernel_id(reader.get_id()?)?;
     let contexts_reader = reader.get_contexts()?;
     let mut contexts = Vec::with_capacity(contexts_reader.len() as usize);
     for ctx in contexts_reader.iter() {
-        contexts.push(parse_context(&ctx)?);
+        contexts.push(parse_context_info(&ctx)?);
     }
 
     Ok(KernelInfo {
-        id: reader.get_id()?.to_string()?,
+        id,
         name: reader.get_name()?.to_string()?,
         user_count: reader.get_user_count(),
         agent_count: reader.get_agent_count(),
@@ -1366,23 +1351,11 @@ pub struct VersionSnapshot {
 #[derive(Debug, Clone)]
 pub struct StagedDriftInfo {
     pub id: u64,
-    pub source_ctx: String,
-    pub target_ctx: String,
+    pub source_ctx: ContextId,
+    pub target_ctx: ContextId,
     pub content: String,
     pub source_model: String,
     pub drift_kind: String,
-    pub created_at: u64,
-}
-
-/// Info about a registered drift context.
-#[derive(Debug, Clone)]
-pub struct ContextInfo {
-    pub short_id: String,
-    pub name: String,
-    pub kernel_id: String,
-    pub provider: String,
-    pub model: String,
-    pub parent_id: Option<String>,
     pub created_at: u64,
 }
 

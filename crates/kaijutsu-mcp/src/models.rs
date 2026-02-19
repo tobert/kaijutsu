@@ -289,8 +289,8 @@ pub struct ShellRequest {
 /// Push content to another context's staging queue.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DriftPushRequest {
-    /// Short ID of the target context
-    #[schemars(description = "Short ID of the target context (e.g., 'a1b2c3')")]
+    /// Target context (short hex ID or label)
+    #[schemars(description = "Target context — short hex ID (e.g., 'a1b2c3') or label (e.g., 'default')")]
     pub target_ctx: String,
     /// Content to transfer
     #[schemars(description = "Content to push to the target context")]
@@ -312,8 +312,8 @@ pub struct DriftCancelRequest {
 /// Pull summarized content from another context.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DriftPullRequest {
-    /// Short ID of the source context to pull from
-    #[schemars(description = "Short ID of the source context (e.g., 'a1b2c3')")]
+    /// Source context (short hex ID or label)
+    #[schemars(description = "Source context — short hex ID (e.g., 'a1b2c3') or label (e.g., 'default')")]
     pub source_ctx: String,
     /// Optional directed prompt to focus the summary
     #[schemars(description = "Optional prompt to focus the summary (e.g., 'what decisions were made about auth?')")]
@@ -323,8 +323,8 @@ pub struct DriftPullRequest {
 /// Merge a forked context back into its parent.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DriftMergeRequest {
-    /// Short ID of the source context (the fork) to merge
-    #[schemars(description = "Short ID of the forked context to merge back into its parent")]
+    /// Source context to merge (short hex ID or label)
+    #[schemars(description = "Forked context to merge — short hex ID or label")]
     pub source_ctx: String,
 }
 

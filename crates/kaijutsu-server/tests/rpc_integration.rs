@@ -88,11 +88,11 @@ fn test_attach_kernel_creates_kernel() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        // Attach to a kernel (should auto-create for now)
-        let kernel = client.attach_kernel("test-kernel").await.unwrap();
+        // Attach to a kernel (server auto-creates)
+        let (kernel, kernel_id) = client.attach_kernel().await.unwrap();
         let info = kernel.get_info().await.unwrap();
-        assert_eq!(info.name, "test-kernel");
-        assert_eq!(info.id, "test-kernel");
+        assert!(!kernel_id.is_nil());
+        assert_eq!(info.id, kernel_id);
     });
 }
 
@@ -103,29 +103,10 @@ fn test_kernel_appears_in_list() {
         let client = connect_client(addr).await;
 
         // Attach to a kernel
-        let _kernel = client.attach_kernel("listed-kernel").await.unwrap();
+        let (_kernel, _kernel_id) = client.attach_kernel().await.unwrap();
 
         // Check it appears in list
         let kernels = client.list_kernels().await.unwrap();
         assert_eq!(kernels.len(), 1);
-        assert_eq!(kernels[0].name, "listed-kernel");
-    });
-}
-
-#[test]
-fn test_create_kernel_with_config() {
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await;
-
-        let config = kaijutsu_client::KernelConfig {
-            name: "feature/test".to_string(),
-            consent_mode: kaijutsu_client::ConsentMode::Collaborative,
-            mounts: vec![],
-        };
-        let kernel = client.create_kernel(config).await.unwrap();
-        let info = kernel.get_info().await.unwrap();
-
-        assert_eq!(info.name, "feature/test");
     });
 }

@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as TokioMutex;
 
-use kaijutsu_crdt::{BlockKind, Role};
+use kaijutsu_crdt::{BlockKind, ContextId, Role};
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::hook_types::{HookEvent, HookResponse, PingResponse, KAIJUTSU_MCP_TOOLS};
@@ -35,8 +35,8 @@ pub struct HookListener {
     remote: Option<RemoteState>,
     /// Max content size per block.
     max_block_size: usize,
-    /// Context name for ping responses.
-    context_name: String,
+    /// Context ID for drift filtering.
+    context_id: ContextId,
     /// Serializes push_ops to avoid concurrent pushes sending duplicate ops.
     push_lock: TokioMutex<()>,
 }
@@ -49,19 +49,19 @@ impl HookListener {
             document_id,
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            context_name: "local".to_string(),
+            context_id: ContextId::nil(),
             push_lock: TokioMutex::new(()),
         }
     }
 
     /// Create a listener backed by a remote connection.
-    pub fn remote(remote: RemoteState, context_name: String) -> Self {
+    pub fn remote(remote: RemoteState, context_id: ContextId) -> Self {
         Self {
             store: remote.store.clone(),
             document_id: remote.document_id.clone(),
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            context_name,
+            context_id,
             push_lock: TokioMutex::new(()),
         }
     }
@@ -129,7 +129,7 @@ impl HookListener {
                 status: "ok".to_string(),
                 pid: std::process::id(),
                 cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
-                context_name: Some(self.context_name.clone()),
+                context_name: Some(self.context_id.short()),
                 document_id: Some(self.document_id.clone()),
                 pending_drifts: pending,
             };
@@ -297,7 +297,7 @@ impl HookListener {
         let Some(ref remote) = self.remote else { return 0 };
         match remote.actor.drift_queue().await {
             Ok(queue) => queue.iter()
-                .filter(|d| d.target_ctx == self.context_name)
+                .filter(|d| d.target_ctx == self.context_id)
                 .count() as u32,
             Err(_) => 0,
         }
@@ -315,7 +315,7 @@ impl HookListener {
         };
 
         let our_drifts: Vec<_> = queue.iter()
-            .filter(|d| d.target_ctx == self.context_name)
+            .filter(|d| d.target_ctx == self.context_id)
             .collect();
 
         if our_drifts.is_empty() {
@@ -324,7 +324,7 @@ impl HookListener {
 
         // Build context string from drifts targeted at us
         let context: String = our_drifts.iter()
-            .map(|d| format!("[Drift from {}]: {}", d.source_ctx, d.content))
+            .map(|d| format!("[Drift from {}]: {}", d.source_ctx.short(), d.content))
             .collect::<Vec<_>>()
             .join("\n\n");
 

@@ -18,11 +18,11 @@
 //! when the actor is saturated — `.send().await` blocks until commands complete
 //! and slots free up. The system recovers as in-flight RPCs finish.
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_crdt::{BlockId, ContextId};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::rpc::{
-    ClientToolFilter, Completion, Context, ContextInfo, DocumentState, HistoryEntry, Identity,
+    ClientToolFilter, Completion, ContextInfo, DocumentState, HistoryEntry, Identity,
     KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, ShellValue,
     StagedDriftInfo, ToolResult, VersionSnapshot,
 };
@@ -69,20 +69,19 @@ pub enum ActorError {
 #[allow(clippy::large_enum_variant)]
 enum RpcCommand {
     // ── Drift ────────────────────────────────────────────────────────────
-    DriftPush { target_ctx: String, content: String, summarize: bool, reply: oneshot::Sender<Result<u64, ActorError>> },
+    DriftPush { target_ctx: ContextId, content: String, summarize: bool, reply: oneshot::Sender<Result<u64, ActorError>> },
     DriftFlush { reply: oneshot::Sender<Result<u32, ActorError>> },
     DriftQueue { reply: oneshot::Sender<Result<Vec<StagedDriftInfo>, ActorError>> },
     DriftCancel { staged_id: u64, reply: oneshot::Sender<Result<bool, ActorError>> },
-    DriftPull { source_ctx: String, prompt: Option<String>, reply: oneshot::Sender<Result<BlockId, ActorError>> },
-    DriftMerge { source_ctx: String, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    DriftPull { source_ctx: ContextId, prompt: Option<String>, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    DriftMerge { source_ctx: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
 
     // ── Context ──────────────────────────────────────────────────────────
-    ListAllContexts { reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>> },
-    GetContextId { reply: oneshot::Sender<Result<(String, String), ActorError>> },
-    ListContexts { reply: oneshot::Sender<Result<Vec<Context>, ActorError>> },
-    CreateContext { name: String, reply: oneshot::Sender<Result<Context, ActorError>> },
-    AttachDocument { context_name: String, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
-    DetachDocument { context_name: String, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
+    GetContextId { reply: oneshot::Sender<Result<(ContextId, String), ActorError>> },
+    ListContexts { reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>> },
+    CreateContext { label: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
+    AttachDocument { context_id: ContextId, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
+    DetachDocument { context_id: ContextId, document_id: String, reply: oneshot::Sender<Result<(), ActorError>> },
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
     PushOps { document_id: String, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
@@ -121,8 +120,8 @@ enum RpcCommand {
     SetToolFilter { filter: ClientToolFilter, reply: oneshot::Sender<Result<bool, ActorError>> },
 
     // ── Timeline / Fork ──────────────────────────────────────────────────
-    ForkFromVersion { document_id: String, version: u64, context_name: String, reply: oneshot::Sender<Result<Context, ActorError>> },
-    CherryPickBlock { block_id: BlockId, target_context: String, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    ForkFromVersion { document_id: String, version: u64, label: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
+    CherryPickBlock { block_id: BlockId, target_context: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
     GetDocumentHistory { document_id: String, limit: u32, reply: oneshot::Sender<Result<Vec<VersionSnapshot>, ActorError>> },
 
     // ── Kernel Info ──────────────────────────────────────────────────────
@@ -143,7 +142,6 @@ impl RpcCommand {
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftPull { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ListAllContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -235,12 +233,12 @@ impl ActorHandle {
     #[tracing::instrument(skip(self, content))]
     pub async fn drift_push(
         &self,
-        target_ctx: &str,
+        target_ctx: ContextId,
         content: &str,
         summarize: bool,
     ) -> Result<u64, ActorError> {
         self.send(|reply| RpcCommand::DriftPush {
-            target_ctx: target_ctx.into(), content: content.into(), summarize, reply,
+            target_ctx, content: content.into(), summarize, reply,
         }).await
     }
 
@@ -264,61 +262,56 @@ impl ActorHandle {
     #[tracing::instrument(skip(self, prompt))]
     pub async fn drift_pull(
         &self,
-        source_ctx: &str,
+        source_ctx: ContextId,
         prompt: Option<&str>,
     ) -> Result<BlockId, ActorError> {
         self.send(|reply| RpcCommand::DriftPull {
-            source_ctx: source_ctx.into(), prompt: prompt.map(String::from), reply,
+            source_ctx, prompt: prompt.map(String::from), reply,
         }).await
     }
 
     /// Merge a forked context back into its parent.
     #[tracing::instrument(skip(self))]
-    pub async fn drift_merge(&self, source_ctx: &str) -> Result<BlockId, ActorError> {
-        self.send(|reply| RpcCommand::DriftMerge { source_ctx: source_ctx.into(), reply }).await
+    pub async fn drift_merge(&self, source_ctx: ContextId) -> Result<BlockId, ActorError> {
+        self.send(|reply| RpcCommand::DriftMerge { source_ctx, reply }).await
     }
 
     // ── Context ──────────────────────────────────────────────────────────
 
-    /// List all registered drift contexts.
-    pub async fn list_all_contexts(&self) -> Result<Vec<ContextInfo>, ActorError> {
-        self.send(|reply| RpcCommand::ListAllContexts { reply }).await
-    }
-
-    /// Get this kernel's context short ID and name.
-    pub async fn get_context_id(&self) -> Result<(String, String), ActorError> {
+    /// Get this kernel's context ID and label.
+    pub async fn get_context_id(&self) -> Result<(ContextId, String), ActorError> {
         self.send(|reply| RpcCommand::GetContextId { reply }).await
     }
 
-    /// List all contexts in this kernel.
-    pub async fn list_contexts(&self) -> Result<Vec<Context>, ActorError> {
+    /// List all contexts in this kernel (includes drift info).
+    pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, ActorError> {
         self.send(|reply| RpcCommand::ListContexts { reply }).await
     }
 
-    /// Create a new context.
-    pub async fn create_context(&self, name: &str) -> Result<Context, ActorError> {
-        self.send(|reply| RpcCommand::CreateContext { name: name.into(), reply }).await
+    /// Create a new context with an optional label.
+    pub async fn create_context(&self, label: &str) -> Result<ContextId, ActorError> {
+        self.send(|reply| RpcCommand::CreateContext { label: label.into(), reply }).await
     }
 
     /// Attach a document to a context.
     pub async fn attach_document(
         &self,
-        context_name: &str,
+        context_id: ContextId,
         document_id: &str,
     ) -> Result<(), ActorError> {
         self.send(|reply| RpcCommand::AttachDocument {
-            context_name: context_name.into(), document_id: document_id.into(), reply,
+            context_id, document_id: document_id.into(), reply,
         }).await
     }
 
     /// Detach a document from a context.
     pub async fn detach_document(
         &self,
-        context_name: &str,
+        context_id: ContextId,
         document_id: &str,
     ) -> Result<(), ActorError> {
         self.send(|reply| RpcCommand::DetachDocument {
-            context_name: context_name.into(), document_id: document_id.into(), reply,
+            context_id, document_id: document_id.into(), reply,
         }).await
     }
 
@@ -484,14 +477,16 @@ impl ActorHandle {
     // ── Timeline / Fork ──────────────────────────────────────────────────
 
     /// Fork a document at a specific version, creating a new context.
+    ///
+    /// Returns the server-assigned ContextId for the new fork.
     pub async fn fork_from_version(
         &self,
         document_id: &str,
         version: u64,
-        context_name: &str,
-    ) -> Result<Context, ActorError> {
+        label: &str,
+    ) -> Result<ContextId, ActorError> {
         self.send(|reply| RpcCommand::ForkFromVersion {
-            document_id: document_id.into(), version, context_name: context_name.into(), reply,
+            document_id: document_id.into(), version, label: label.into(), reply,
         }).await
     }
 
@@ -499,10 +494,10 @@ impl ActorHandle {
     pub async fn cherry_pick_block(
         &self,
         block_id: &BlockId,
-        target_context: &str,
+        target_context: ContextId,
     ) -> Result<BlockId, ActorError> {
         self.send(|reply| RpcCommand::CherryPickBlock {
-            block_id: block_id.clone(), target_context: target_context.into(), reply,
+            block_id: block_id.clone(), target_context, reply,
         }).await
     }
 
@@ -573,8 +568,9 @@ const BASE_BACKOFF_SECS: f64 = 1.0;
 /// The actual actor that holds !Send Cap'n Proto types.
 struct RpcActor {
     config: SshConfig,
+    #[allow(dead_code)] // Phase 5: used for logging/display
     kernel_id: String,
-    context_name: Option<String>,
+    context_id: Option<ContextId>,
     instance: String,
     /// Live connection state (None = disconnected, will reconnect)
     connection: Option<ConnectionState>,
@@ -599,7 +595,7 @@ impl RpcActor {
     fn new(
         config: SshConfig,
         kernel_id: String,
-        context_name: Option<String>,
+        context_id: Option<ContextId>,
         instance: String,
         existing: Option<(RpcClient, KernelHandle)>,
         event_tx: broadcast::Sender<ServerEvent>,
@@ -609,7 +605,7 @@ impl RpcActor {
         Self {
             config,
             kernel_id,
-            context_name,
+            context_id,
             instance,
             connection,
             event_tx,
@@ -646,7 +642,7 @@ impl RpcActor {
 
         log::info!(
             "Actor reconnecting to {}:{} kernel={} context={:?} (attempt {})",
-            self.config.host, self.config.port, self.kernel_id, self.context_name,
+            self.config.host, self.config.port, self.kernel_id, self.context_id,
             self.reconnect_attempts,
         );
 
@@ -684,7 +680,7 @@ impl RpcActor {
                 ActorError::ConnectionLost(msg)
             })?;
 
-        let kernel = client.attach_kernel(&self.kernel_id)
+        let (kernel, _kernel_id) = client.attach_kernel()
             .await
             .map_err(|e| {
                 let msg = format!("attach_kernel: {e}");
@@ -693,8 +689,8 @@ impl RpcActor {
             })?;
 
         // Join context if one was specified
-        if let Some(ctx) = &self.context_name {
-            let _document_id = kernel.join_context(ctx, &self.instance)
+        if let Some(ctx_id) = &self.context_id {
+            let _document_id = kernel.join_context(*ctx_id, &self.instance)
                 .await
                 .map_err(|e| {
                     let msg = format!("join_context: {e}");
@@ -821,7 +817,7 @@ async fn dispatch_command(
     match cmd {
         // ── Drift ────────────────────────────────────────────────
         RpcCommand::DriftPush { target_ctx, content, summarize, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_push(&target_ctx, &content, summarize));
+            rpc_call!(kernel, reply, err_tx, k, k.drift_push(target_ctx, &content, summarize));
         }
         RpcCommand::DriftFlush { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.drift_flush());
@@ -833,30 +829,27 @@ async fn dispatch_command(
             rpc_call!(kernel, reply, err_tx, k, k.drift_cancel(staged_id));
         }
         RpcCommand::DriftPull { source_ctx, prompt, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_pull(&source_ctx, prompt.as_deref()));
+            rpc_call!(kernel, reply, err_tx, k, k.drift_pull(source_ctx, prompt.as_deref()));
         }
         RpcCommand::DriftMerge { source_ctx, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_merge(&source_ctx));
+            rpc_call!(kernel, reply, err_tx, k, k.drift_merge(source_ctx));
         }
 
         // ── Context ──────────────────────────────────────────────
-        RpcCommand::ListAllContexts { reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.list_all_contexts());
-        }
         RpcCommand::GetContextId { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_context_id());
         }
         RpcCommand::ListContexts { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.list_contexts());
         }
-        RpcCommand::CreateContext { name, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.create_context(&name));
+        RpcCommand::CreateContext { label, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.create_context(&label));
         }
-        RpcCommand::AttachDocument { context_name, document_id, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.attach_document(&context_name, &document_id));
+        RpcCommand::AttachDocument { context_id, document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.attach_document(context_id, &document_id));
         }
-        RpcCommand::DetachDocument { context_name, document_id, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.detach_document(&context_name, &document_id));
+        RpcCommand::DetachDocument { context_id, document_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.detach_document(context_id, &document_id));
         }
 
         // ── CRDT Sync ────────────────────────────────────────────
@@ -940,11 +933,11 @@ async fn dispatch_command(
         }
 
         // ── Timeline / Fork ──────────────────────────────────────
-        RpcCommand::ForkFromVersion { document_id, version, context_name, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.fork_from_version(&document_id, version, &context_name));
+        RpcCommand::ForkFromVersion { document_id, version, label, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.fork_from_version(&document_id, version, &label));
         }
         RpcCommand::CherryPickBlock { block_id, target_context, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.cherry_pick_block(&block_id, &target_context));
+            rpc_call!(kernel, reply, err_tx, k, k.cherry_pick_block(&block_id, target_context));
         }
         RpcCommand::GetDocumentHistory { document_id, limit, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_document_history(&document_id, limit));
@@ -995,7 +988,7 @@ async fn dispatch_command(
 pub fn spawn_actor(
     config: SshConfig,
     kernel_id: String,
-    context_name: Option<String>,
+    context_id: Option<ContextId>,
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,
 ) -> ActorHandle {
@@ -1006,7 +999,7 @@ pub fn spawn_actor(
     let actor = RpcActor::new(
         config,
         kernel_id,
-        context_name,
+        context_id,
         instance,
         existing,
         event_tx.clone(),

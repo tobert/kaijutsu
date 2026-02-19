@@ -26,11 +26,11 @@ struct Identity {
 }
 
 struct KernelInfo {
-  id @0 :Text;
+  id @0 :Data;                    # 16-byte KernelId (UUIDv7)
   name @1 :Text;
   userCount @2 :UInt32;
   agentCount @3 :UInt32;
-  contexts @4 :List(Context);
+  contexts @4 :List(ContextHandleInfo);
 }
 
 # A document attached to a context
@@ -42,8 +42,9 @@ struct ContextDocument {
 
 # A context within a kernel
 struct Context {
-  name @0 :Text;
-  documents @1 :List(ContextDocument);
+  id @0 :Data;                    # 16-byte ContextId (UUIDv7)
+  label @1 :Text;                 # Optional human-friendly name
+  documents @2 :List(ContextDocument);
 }
 
 struct KernelConfig {
@@ -308,8 +309,8 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  attachKernel @2 (id :Text, trace :TraceContext) -> (kernel :Kernel);
-  createKernel @3 (config :KernelConfig) -> (kernel :Kernel);
+  attachKernel @2 (trace :TraceContext) -> (kernel :Kernel, kernelId :Data);
+  # @3 reserved (was createKernel — kernel forking downplayed)
 }
 
 interface Kernel {
@@ -346,12 +347,12 @@ interface Kernel {
   # LLM operations
   prompt @18 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
-  # Context management
-  listContexts @19 () -> (contexts :List(Context));
-  createContext @20 (name :Text) -> (context :Context);
-  joinContext @21 (contextName :Text, instance :Text) -> (documentId :Text);
-  attachDocument @22 (contextName :Text, documentId :Text);
-  detachDocument @23 (contextName :Text, documentId :Text);
+  # Context management (ContextId = 16-byte UUIDv7 as Data)
+  listContexts @19 () -> (contexts :List(ContextHandleInfo));
+  createContext @20 (label :Text) -> (id :Data);
+  joinContext @21 (contextId :Data, instance :Text) -> (documentId :Text);
+  attachDocument @22 (contextId :Data, documentId :Text);
+  detachDocument @23 (contextId :Data, documentId :Text);
 
   # MCP (Model Context Protocol) management
   registerMcp @24 (config :McpServerConfig) -> (info :McpServerInfo);
@@ -447,10 +448,10 @@ interface Kernel {
   # The past is read-only, but forking is ubiquitous.
 
   # Fork from a specific document version
-  forkFromVersion @63 (documentId :Text, version :UInt64, contextName :Text) -> (context :Context);
+  forkFromVersion @63 (documentId :Text, version :UInt64, contextLabel :Text) -> (contextId :Data);
 
   # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @64 (sourceBlockId :BlockId, targetContext :Text) -> (newBlockId :BlockId);
+  cherryPickBlock @64 (sourceBlockId :BlockId, targetContextId :Data) -> (newBlockId :BlockId);
 
   # Get document version history for timeline scrubber
   getDocumentHistory @65 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
@@ -477,14 +478,14 @@ interface Kernel {
   # ============================================================================
   # Drift enables content transfer between kernel contexts with provenance tracking.
 
-  # Get this kernel's context short ID and name
-  getContextId @70 () -> (shortId :Text, name :Text);
+  # Get this kernel's context ID and label
+  getContextId @70 () -> (id :Data, label :Text);
 
   # Configure LLM provider/model on an existing kernel
   configureLlm @71 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
-  driftPush @72 (targetCtx :Text, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
+  driftPush @72 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
 
   # Flush all staged drifts (inject into target kernels)
   driftFlush @73 (trace :TraceContext) -> (count :UInt32);
@@ -496,13 +497,13 @@ interface Kernel {
   driftCancel @75 (stagedId :UInt64) -> (success :Bool);
 
   # Pull summarized content from another context
-  driftPull @76 (sourceCtx :Text, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
+  driftPull @76 (sourceCtx :Data, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # Merge a forked context back into its parent
-  driftMerge @77 (sourceCtx :Text, trace :TraceContext) -> (blockId :BlockId);
+  driftMerge @77 (sourceCtx :Data, trace :TraceContext) -> (blockId :BlockId);
 
-  # List all registered contexts across all kernels
-  listAllContexts @78 () -> (contexts :List(ContextHandleInfo));
+  # Rename a context's label
+  renameContext @78 (contextId :Data, label :Text);
 
   # ============================================================================
   # LLM Configuration (Per-Kernel Multi-Provider LLM)
@@ -552,24 +553,23 @@ interface Kernel {
 # Information about a staged drift (pending content transfer)
 struct StagedDriftInfo {
   id @0 :UInt64;
-  sourceCtx @1 :Text;
-  targetCtx @2 :Text;
+  sourceCtx @1 :Data;             # 16-byte ContextId
+  targetCtx @2 :Data;             # 16-byte ContextId
   content @3 :Text;
   sourceModel @4 :Text;
   driftKind @5 :Text;
   createdAt @6 :UInt64;
 }
 
-# Information about a registered context
+# Information about a registered context (used by listContexts, KernelInfo)
 struct ContextHandleInfo {
-  shortId @0 :Text;
-  name @1 :Text;
-  kernelId @2 :Text;
+  id @0 :Data;                    # 16-byte ContextId (UUIDv7) — the real identity
+  label @1 :Text;                 # Optional human-friendly name (mutable)
+  parentId @2 :Data;              # 16-byte ContextId of parent (empty = no parent)
   provider @3 :Text;
   model @4 :Text;
-  parentId @5 :Text;
-  hasParentId @6 :Bool;
-  createdAt @7 :UInt64;
+  createdAt @5 :UInt64;
+  documentId @6 :Text;            # Primary document ID for this context
 }
 
 # ============================================================================

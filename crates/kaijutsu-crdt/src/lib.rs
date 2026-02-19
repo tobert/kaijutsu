@@ -30,12 +30,14 @@ mod block;
 mod dag;
 mod document;
 mod error;
+pub mod ids;
 mod ops;
 
 pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
 pub use dag::ConversationDAG;
 pub use document::{BlockDocument, DocumentSnapshot};
 pub use error::CrdtError;
+pub use ids::{ContextId, KernelId, PrefixError, resolve_context_prefix};
 pub use ops::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
 /// Result type for CRDT operations.

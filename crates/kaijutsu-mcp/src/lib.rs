@@ -132,7 +132,9 @@ pub struct RemoteState {
     /// The document ID for our context
     pub document_id: String,
     /// Kernel ID we connected to
-    pub kernel_id: String,
+    pub kernel_id: kaijutsu_crdt::KernelId,
+    /// Context ID we joined
+    pub context_id: kaijutsu_crdt::ContextId,
     /// Local cache of synced state (with FlowBus for local event tracking).
     /// Single source of truth — background listener applies events here.
     pub store: SharedBlockStore,
@@ -227,12 +229,14 @@ impl KaijutsuMcp {
         tracing::debug!(?config, "Connecting via SSH");
 
         let client = connect_ssh(config.clone()).await?;
-        let kernel = client.attach_kernel(kernel_id).await?;
-        let document_id = kernel.join_context(context_name, "mcp-server").await?;
+        let (kernel, kernel_id_typed) = client.attach_kernel().await?;
+        let context_id = kernel.create_context(context_name).await?;
+        let document_id = kernel.join_context(context_id, "mcp-server").await?;
 
         tracing::info!(
-            kernel = %kernel_id,
-            context = %context_name,
+            kernel = %kernel_id_typed,
+            context_id = %context_id,
+            context_label = %context_name,
             document_id = %document_id,
             "Connected to server"
         );
@@ -290,7 +294,7 @@ impl KaijutsuMcp {
         let actor = spawn_actor(
             config,
             kernel_id.to_string(),
-            Some(context_name.to_string()),
+            Some(context_id),
             "mcp-server".to_string(),
             Some((client, kernel)),
         );
@@ -324,7 +328,8 @@ impl KaijutsuMcp {
         Ok(Self {
             backend: Backend::Remote(RemoteState {
                 document_id,
-                kernel_id: kernel_id.to_string(),
+                kernel_id: kernel_id_typed,
+                context_id,
                 store,
                 actor,
                 sync: sync_arc,
@@ -405,6 +410,22 @@ impl KaijutsuMcp {
             Backend::Local(_) => None,
             Backend::Remote(remote) => Some(&remote.actor),
         }
+    }
+
+    /// Resolve a user-provided context query (label or hex prefix) to a ContextId.
+    async fn resolve_context(
+        &self,
+        actor: &ActorHandle,
+        query: &str,
+    ) -> Result<kaijutsu_crdt::ContextId, String> {
+        let contexts = actor.list_contexts().await
+            .map_err(|e| format!("Error listing contexts: {e}"))?;
+        let entries = contexts.iter().map(|c| {
+            let label: Option<&str> = if c.label.is_empty() { None } else { Some(&c.label) };
+            (c.id, label)
+        });
+        kaijutsu_crdt::resolve_context_prefix(entries, query)
+            .map_err(|e| format!("Error resolving context '{query}': {e}"))
     }
 }
 
@@ -1110,7 +1131,7 @@ impl KaijutsuMcp {
     // Drift Tools (Cross-Context Communication)
     // ========================================================================
 
-    #[tool(description = "List all registered drift contexts. Shows short IDs, names, providers, models, and lineage.")]
+    #[tool(description = "List all registered drift contexts. Shows short IDs, labels, providers, models, and lineage.")]
     #[tracing::instrument(skip(self), name = "mcp.drift_ls")]
     async fn drift_ls(&self) -> String {
         let actor = match self.actor() {
@@ -1118,18 +1139,19 @@ impl KaijutsuMcp {
             None => return "Error: drift_ls requires --connect to kaijutsu-server".to_string(),
         };
 
-        match actor.list_all_contexts().await {
+        match actor.list_contexts().await {
             Ok(contexts) => {
-                let mut lines = vec![format!("{:<8} {:<20} {:<12} {:<20} {}", "ID", "NAME", "PROVIDER", "MODEL", "PARENT")];
+                let mut lines = vec![format!("{:<8} {:<20} {:<12} {:<20} {}", "ID", "LABEL", "PROVIDER", "MODEL", "PARENT")];
                 lines.push("─".repeat(72));
                 for ctx in &contexts {
+                    let parent = ctx.parent_id.as_ref().map(|p| p.short()).unwrap_or_else(|| "—".to_string());
                     lines.push(format!(
                         "{:<8} {:<20} {:<12} {:<20} {}",
-                        ctx.short_id,
-                        ctx.name,
+                        ctx.id.short(),
+                        ctx.label,
                         ctx.provider,
                         ctx.model,
-                        ctx.parent_id.as_deref().unwrap_or("—"),
+                        parent,
                     ));
                 }
                 lines.push(format!("\n{} context(s)", contexts.len()));
@@ -1139,7 +1161,7 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush.")]
+    #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush. Target can be a short ID prefix or label.")]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_push")]
     async fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
         let actor = match self.actor() {
@@ -1147,7 +1169,12 @@ impl KaijutsuMcp {
             None => return "Error: drift_push requires --connect to kaijutsu-server".to_string(),
         };
 
-        match actor.drift_push(&req.target_ctx, &req.content, req.summarize).await {
+        let target_id = match self.resolve_context(actor, &req.target_ctx).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match actor.drift_push(target_id, &req.content, req.summarize).await {
             Ok(staged_id) => serde_json::json!({
                 "success": true,
                 "staged_id": staged_id,
@@ -1176,8 +1203,8 @@ impl KaijutsuMcp {
                     lines.push(format!(
                         "{:<6} {:<8} {:<8} {:<10} {}{}",
                         entry.id,
-                        entry.source_ctx,
-                        entry.target_ctx,
+                        entry.source_ctx.short(),
+                        entry.target_ctx.short(),
                         entry.drift_kind,
                         preview,
                         if entry.content.len() > 40 { "…" } else { "" },
@@ -1227,7 +1254,12 @@ impl KaijutsuMcp {
             None => return "Error: drift_pull requires --connect to kaijutsu-server".to_string(),
         };
 
-        match actor.drift_pull(&req.source_ctx, req.prompt.as_deref()).await {
+        let source_id = match self.resolve_context(actor, &req.source_ctx).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match actor.drift_pull(source_id, req.prompt.as_deref()).await {
             Ok(block_id) => serde_json::json!({
                 "success": true,
                 "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
@@ -1245,7 +1277,12 @@ impl KaijutsuMcp {
             None => return "Error: drift_merge requires --connect to kaijutsu-server".to_string(),
         };
 
-        match actor.drift_merge(&req.source_ctx).await {
+        let source_id = match self.resolve_context(actor, &req.source_ctx).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match actor.drift_merge(source_id).await {
             Ok(block_id) => serde_json::json!({
                 "success": true,
                 "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
@@ -1403,7 +1440,7 @@ impl KaijutsuMcp {
             Err(e) => return format!("Error getting identity: {e}"),
         };
 
-        let (short_id, ctx_name) = match actor.get_context_id().await {
+        let (context_id, ctx_label) = match actor.get_context_id().await {
             Ok(pair) => pair,
             Err(e) => return format!("Error getting context: {e}"),
         };
@@ -1411,8 +1448,8 @@ impl KaijutsuMcp {
         serde_json::json!({
             "username": identity.username,
             "display_name": identity.display_name,
-            "context_short_id": short_id,
-            "context_name": ctx_name,
+            "context_id": context_id.short(),
+            "context_label": ctx_label,
         }).to_string()
     }
 

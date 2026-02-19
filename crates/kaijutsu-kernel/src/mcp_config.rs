@@ -260,8 +260,8 @@ mod tests {
             let servers = #{
                 brp: #{ command: "/bin/brp", fork: "share" },
                 kaish: #{ command: "/bin/kaish", fork: "instance" },
-                debug: #{ command: "/bin/debug", fork: "exclude" },
-                default: #{ command: "/bin/default" },
+                debugger: #{ command: "/bin/debugger", fork: "exclude" },
+                fallback: #{ command: "/bin/fallback" },
             };
         "#;
         let config = load_mcp_config(script).unwrap();
@@ -269,7 +269,7 @@ mod tests {
 
         assert_eq!(find("brp").fork_mode, McpForkMode::Share);
         assert_eq!(find("kaish").fork_mode, McpForkMode::Instance);
-        assert_eq!(find("debug").fork_mode, McpForkMode::Exclude);
-        assert_eq!(find("default").fork_mode, McpForkMode::Share); // default
+        assert_eq!(find("debugger").fork_mode, McpForkMode::Exclude);
+        assert_eq!(find("fallback").fork_mode, McpForkMode::Share); // default
     }
 }

@@ -162,7 +162,7 @@ impl Constellation {
 
     /// Add a node for a context we've actively joined (have an actor connection).
     pub fn add_node(&mut self, membership: &ContextMembership) {
-        let context_id = &membership.context_name;
+        let context_id = &membership.context_id.to_string();
 
         // If node already exists (e.g. from DriftState), mark it as joined
         if let Some(node) = self.nodes.iter_mut().find(|n| n.context_id == *context_id) {
@@ -194,15 +194,15 @@ impl Constellation {
 
     /// Add a placeholder node from DriftState context info (not yet joined).
     pub fn add_node_from_context_info(&mut self, ctx_info: &kaijutsu_client::ContextInfo) {
-        let context_id = &ctx_info.name;
+        let context_id = ctx_info.id.to_string();
 
-        if self.node_by_id(context_id).is_some() {
+        if self.node_by_id(&context_id).is_some() {
             return;
         }
 
         let node = ContextNode {
             context_id: context_id.clone(),
-            parent_id: ctx_info.parent_id.clone(),
+            parent_id: ctx_info.parent_id.as_ref().map(|p| p.to_string()),
             position: Vec2::ZERO,
             activity: ActivityState::Idle,
             entity: None,
@@ -336,7 +336,7 @@ fn track_context_events(
     for event in events.read() {
         match event {
             RpcResultMessage::ContextJoined { membership, .. } => {
-                info!("Constellation: Adding node for context '{}' (kernel: {})", membership.context_name, membership.kernel_id);
+                info!("Constellation: Adding node for context '{}' (kernel: {})", membership.context_id, membership.kernel_id);
                 constellation.add_node(membership);
             }
             RpcResultMessage::ContextLeft => {

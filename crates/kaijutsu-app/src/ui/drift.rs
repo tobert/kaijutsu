@@ -44,7 +44,7 @@ impl DriftState {
     /// Get context info by short ID (used by Phase 4 constellation navigation).
     #[allow(dead_code)]
     pub fn context_by_id(&self, short_id: &str) -> Option<&ContextInfo> {
-        self.contexts.iter().find(|c| c.short_id == short_id)
+        self.contexts.iter().find(|c| c.id.short() == short_id)
     }
 
     /// Count of staged drifts.
@@ -127,7 +127,7 @@ fn poll_drift_state(
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
             // Fetch contexts
-            match handle.list_all_contexts().await {
+            match handle.list_contexts().await {
                 Ok(contexts) => {
                     let _ = tx.send(RpcResultMessage::DriftContextsReceived { contexts });
                 }
@@ -167,10 +167,11 @@ fn update_drift_state(
                 // local_context_name is the membership's context name (e.g. kernel_id);
                 // we need the short_id that drift blocks use in source_context.
                 if let Some(ref name) = drift_state.local_context_name {
-                    if let Some(ctx) = contexts.iter().find(|c| c.name == *name || c.short_id == *name) {
-                        if drift_state.local_context_id.as_ref() != Some(&ctx.short_id) {
-                            log::info!("DriftState: resolved local context → @{}", ctx.short_id);
-                            drift_state.local_context_id = Some(ctx.short_id.clone());
+                    if let Some(ctx) = contexts.iter().find(|c| c.label == *name || c.id.to_string() == *name || c.id.short() == *name) {
+                        let short = ctx.id.short();
+                        if drift_state.local_context_id.as_deref() != Some(short.as_str()) {
+                            log::info!("DriftState: resolved local context → @{}", short);
+                            drift_state.local_context_id = Some(short);
                         }
                     }
                 }
@@ -181,8 +182,8 @@ fn update_drift_state(
             RpcResultMessage::ContextJoined { membership, .. } => {
                 // Store context name — will be resolved to short_id
                 // when contexts arrive from the next poll.
-                drift_state.local_context_name = Some(membership.context_name.clone());
-                log::info!("DriftState: joined context = {}", membership.context_name);
+                drift_state.local_context_name = Some(membership.context_id.to_string());
+                log::info!("DriftState: joined context = {}", membership.context_id);
             }
             _ => {}
         }
@@ -238,11 +239,13 @@ fn sync_model_info_to_constellation(
     }
 
     for ctx_info in &drift_state.contexts {
-        // Find matching constellation node by context name or short_id
+        // Find matching constellation node by context id (full or short)
+        let ctx_id_str = ctx_info.id.to_string();
+        let ctx_short = ctx_info.id.short();
         if let Some(node) = constellation
             .nodes
             .iter_mut()
-            .find(|n| n.context_id == ctx_info.name || n.context_id == ctx_info.short_id)
+            .find(|n| n.context_id == ctx_id_str || n.context_id == ctx_short)
         {
             // Update model if it changed
             let new_model = if ctx_info.model.is_empty() {
@@ -267,8 +270,9 @@ fn sync_model_info_to_constellation(
             }
 
             // Sync parent_id for radial tree layout
-            if node.parent_id != ctx_info.parent_id {
-                node.parent_id = ctx_info.parent_id.clone();
+            let new_parent_id = ctx_info.parent_id.as_ref().map(|p| p.to_string());
+            if node.parent_id != new_parent_id {
+                node.parent_id = new_parent_id;
             }
         } else {
             // Create placeholder node for server-known contexts not yet in constellation.

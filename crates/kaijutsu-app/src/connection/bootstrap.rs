@@ -8,6 +8,7 @@ use std::thread;
 
 use bevy::prelude::*;
 use kaijutsu_client::{ActorHandle, SshConfig};
+use kaijutsu_crdt::ContextId;
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -21,7 +22,7 @@ pub enum BootstrapCommand {
     SpawnActor {
         config: SshConfig,
         kernel_id: String,
-        context_name: Option<String>,
+        context_id: Option<ContextId>,
         instance: String,
     },
 }
@@ -34,7 +35,7 @@ pub enum BootstrapResult {
         handle: ActorHandle,
         generation: u64,
         kernel_id: String,
-        context_name: Option<String>,
+        context_id: Option<ContextId>,
     },
     /// Spawn failed (e.g. initial SSH connect failure).
     /// The actor will retry internally, but we report the first error.
@@ -101,7 +102,7 @@ fn bootstrap_thread(
                         BootstrapCommand::SpawnActor {
                             config,
                             kernel_id,
-                            context_name,
+                            context_id,
                             instance,
                         } => {
                             generation += 1;
@@ -109,7 +110,7 @@ fn bootstrap_thread(
 
                             log::info!(
                                 "Bootstrap: spawning actor generation={} kernel={} context={:?} instance={}",
-                                current_gen, kernel_id, context_name, instance
+                                current_gen, kernel_id, context_id, instance
                             );
 
                             // spawn_actor creates the actor in this LocalSet.
@@ -124,7 +125,7 @@ fn bootstrap_thread(
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
                                 kernel_id.clone(),
-                                context_name.clone(),
+                                context_id,
                                 instance,
                                 None,
                             );
@@ -133,7 +134,7 @@ fn bootstrap_thread(
                                 handle,
                                 generation: current_gen,
                                 kernel_id,
-                                context_name,
+                                context_id,
                             });
                         }
                     }
