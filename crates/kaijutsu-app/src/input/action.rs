@@ -105,6 +105,8 @@ pub enum Action {
     ZoomReset,
     /// f in constellation — fork focused context
     ConstellationFork,
+    /// n in constellation — create new context immediately
+    ConstellationCreate,
     /// m in constellation — open model picker
     ConstellationModelPicker,
     /// g→t — next context

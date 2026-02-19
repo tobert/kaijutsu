@@ -1,30 +1,32 @@
-//! Create/Fork context dialog for the constellation
+//! New context tile + fork dialog for the constellation
 //!
-//! Provides a modal dialog for creating new contexts (clicking "+") or
-//! forking existing contexts (pressing `f` on a focused node).
+//! The "New" tile creates contexts instantly (click or `n` key) with a
+//! UUID-based name. `NewContextConfig` controls whether "New" forks from
+//! a parent context or creates empty.
 //!
-//! Dialog input is dispatched via `ActionFired`/`TextInputReceived` messages
-//! from the focus-based input system (FocusArea::Dialog context).
+//! The fork dialog (`f` key) remains for named forks from a specific
+//! focused context, using ActionFired/TextInputReceived messages.
 
 use bevy::prelude::*;
 use uuid::Uuid;
 
-use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor};
+use crate::cell::DocumentCache;
+use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
 use crate::input::action::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
 use crate::input::focus::{FocusArea, FocusStack};
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
+use super::NewContextConfig;
+
 // ============================================================================
 // DIALOG MODE
 // ============================================================================
 
-/// What kind of dialog to show.
+/// What kind of dialog to show (fork only — create is instant now).
 #[derive(Clone, Debug)]
 pub enum DialogMode {
-    /// Create a brand new context (from "+" node click)
-    CreateContext,
     /// Fork from an existing context (from `f` on focused node)
     ForkContext {
         source_context: String,
@@ -32,7 +34,7 @@ pub enum DialogMode {
     },
 }
 
-/// Message requesting the dialog to open in a specific mode.
+/// Message requesting the fork dialog to open.
 #[derive(Message, Clone, Debug)]
 pub struct OpenContextDialog(pub DialogMode);
 
@@ -40,13 +42,12 @@ pub struct OpenContextDialog(pub DialogMode);
 // COMPONENTS
 // ============================================================================
 
-/// Marker for the "+" create context node in the constellation
+/// Marker for the "New" create context tile in the constellation
 #[derive(Component, Default, Reflect)]
 #[reflect(Component)]
 pub struct CreateContextNode;
 
-/// Marker for the create context dialog (modal overlay).
-/// Carries the dialog mode for submit routing.
+/// Marker for the fork context dialog (modal overlay).
 #[derive(Component)]
 pub struct CreateContextDialog {
     pub mode: DialogMode,
@@ -72,10 +73,90 @@ pub struct CreateContextCancel;
 pub struct InputTextDisplay;
 
 // ============================================================================
+// INSTANT CONTEXT CREATION
+// ============================================================================
+
+/// Create a new context immediately, optionally forking from a parent.
+///
+/// When `config.parent_context` is set and found in the document cache,
+/// forks from that context. Otherwise creates an empty context.
+/// Used by both the "New" tile click and the `n` key binding.
+pub fn create_or_fork_context(
+    config: &NewContextConfig,
+    bootstrap: &BootstrapChannel,
+    conn_state: &RpcConnectionState,
+    actor: Option<&RpcActor>,
+    doc_cache: &DocumentCache,
+) {
+    let kernel_id = conn_state
+        .current_kernel
+        .as_ref()
+        .map(|k| k.id.clone())
+        .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+    let context_name = Uuid::new_v4().to_string()[..8].to_string();
+
+    if let Some(ref parent) = config.parent_context {
+        if let Some(doc_id) = doc_cache.document_id_for_context(parent) {
+            let Some(actor) = actor else {
+                error!("Cannot fork from parent: no active RPC actor");
+                create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+                return;
+            };
+            let handle = actor.handle.clone();
+            let doc_id = doc_id.to_string();
+            let fork_name = context_name.clone();
+            let config = conn_state.ssh_config.clone();
+            let kernel_id = kernel_id.clone();
+            let bootstrap_tx = bootstrap.tx.clone();
+
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    match handle.fork_from_version(&doc_id, 0, &fork_name).await {
+                        Ok(ctx) => {
+                            info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
+                            let instance = Uuid::new_v4().to_string();
+                            let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
+                                config,
+                                kernel_id,
+                                context_name: Some(fork_name),
+                                instance,
+                            });
+                        }
+                        Err(e) => error!("Fork from parent failed: {}", e),
+                    }
+                })
+                .detach();
+        } else {
+            warn!("Parent context '{}' not in cache, creating empty", parent);
+            create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+        }
+    } else {
+        create_empty(bootstrap, conn_state, &kernel_id, &context_name);
+    }
+}
+
+/// Create an empty context by spawning an actor.
+fn create_empty(
+    bootstrap: &BootstrapChannel,
+    conn_state: &RpcConnectionState,
+    kernel_id: &str,
+    context_name: &str,
+) {
+    let instance = Uuid::new_v4().to_string();
+    info!("Creating empty context: {} (instance: {})", context_name, instance);
+    let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
+        config: conn_state.ssh_config.clone(),
+        kernel_id: kernel_id.to_string(),
+        context_name: Some(context_name.to_string()),
+        instance,
+    });
+}
+
+// ============================================================================
 // SYSTEMS
 // ============================================================================
 
-/// Setup the create dialog systems
+/// Setup the create/fork dialog systems
 pub fn setup_create_dialog_systems(app: &mut App) {
     app.register_type::<CreateContextNode>()
         .add_message::<OpenContextDialog>()
@@ -90,7 +171,7 @@ pub fn setup_create_dialog_systems(app: &mut App) {
         );
 }
 
-/// Spawn the "+" create context node (called from render.rs)
+/// Spawn the "New" context tile (called from render.rs)
 pub fn spawn_create_context_node(
     commands: &mut Commands,
     container_entity: Entity,
@@ -100,15 +181,10 @@ pub fn spawn_create_context_node(
     use crate::shaders::ConstellationCardMaterial;
     use crate::ui::theme::color_to_vec4;
 
-    let card_w = theme.constellation_card_width * 0.7; // Smaller than context cards
-    let card_h = theme.constellation_card_height * 0.7;
+    let card_w = theme.constellation_card_width;
+    let card_h = theme.constellation_card_height;
 
-    // Initial position at origin — update_create_node_visual repositions
-    // with camera transform on the next frame.
-    let initial_x = 0.0;
-    let initial_y = 0.0;
-
-    // Create a distinct material for the + node (dimmer, dashed feel)
+    // Create a distinct material for the New tile (dimmer, subtle)
     let material = card_materials.add(ConstellationCardMaterial {
         color: color_to_vec4(theme.fg_dim.with_alpha(0.4)),
         params: Vec4::new(1.0, 6.0, 0.2, 0.3), // Thinner border, subtle glow
@@ -122,8 +198,8 @@ pub fn spawn_create_context_node(
             CreateContextNode,
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(initial_x),
-                top: Val::Px(initial_y),
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
                 width: Val::Px(card_w),
                 height: Val::Px(card_h),
                 ..default()
@@ -132,7 +208,7 @@ pub fn spawn_create_context_node(
             Interaction::None,
         ))
         .with_children(|parent| {
-            // "+" symbol in the center
+            // "New" text in the center
             parent.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -146,19 +222,19 @@ pub fn spawn_create_context_node(
             .with_children(|center| {
                 // TODO: explicit size — MsdfUiText no intrinsic sizing
                 center.spawn((
-                    MsdfUiText::new("+")
-                        .with_font_size(32.0)
+                    MsdfUiText::new("New")
+                        .with_font_size(14.0)
                         .with_color(theme.fg_dim),
                     UiTextPositionCache::default(),
                     Node {
-                        width: Val::Px(32.0),
-                        height: Val::Px(34.0),
+                        width: Val::Px(40.0),
+                        height: Val::Px(16.0),
                         ..default()
                     },
                 ));
             });
 
-            // Label below
+            // Key hint label below
             parent
                 .spawn((
                     Node {
@@ -175,7 +251,7 @@ pub fn spawn_create_context_node(
                 .with_children(|label_bg| {
                     // TODO: explicit size — MsdfUiText no intrinsic sizing
                     label_bg.spawn((
-                        MsdfUiText::new("new")
+                        MsdfUiText::new("n")
                             .with_font_size(10.0)
                             .with_color(theme.fg_dim),
                         UiTextPositionCache::default(),
@@ -190,27 +266,28 @@ pub fn spawn_create_context_node(
         .id();
 
     commands.entity(container_entity).add_child(node_entity);
-    info!("Spawned create context (+) node");
+    info!("Spawned create context (New) tile");
 }
 
-/// Handle clicks on the create context node
+/// Handle clicks on the "New" tile — instant context creation, no dialog.
 fn handle_create_node_click(
-    mut commands: Commands,
-    theme: Res<Theme>,
-    mut focus: ResMut<FocusArea>,
-    mut focus_stack: ResMut<FocusStack>,
     create_nodes: Query<&Interaction, (Changed<Interaction>, With<CreateContextNode>)>,
-    existing_dialog: Query<Entity, With<CreateContextDialog>>,
+    new_ctx_config: Res<NewContextConfig>,
+    bootstrap: Res<BootstrapChannel>,
+    conn_state: Res<RpcConnectionState>,
+    actor: Option<Res<RpcActor>>,
+    doc_cache: Res<DocumentCache>,
 ) {
-    if !existing_dialog.is_empty() {
-        return;
-    }
-
     for interaction in create_nodes.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Create context node clicked - spawning dialog");
-            focus_stack.push(&mut focus, FocusArea::Dialog);
-            spawn_context_dialog(&mut commands, &theme, DialogMode::CreateContext);
+            info!("New context tile clicked — creating instantly");
+            create_or_fork_context(
+                &new_ctx_config,
+                &bootstrap,
+                &conn_state,
+                actor.as_deref(),
+                &doc_cache,
+            );
         }
     }
 }
@@ -229,26 +306,16 @@ fn handle_open_dialog_message(
     }
 
     for OpenContextDialog(mode) in events.read() {
-        info!("Opening context dialog: {:?}", mode);
+        info!("Opening fork dialog: {:?}", mode);
         focus_stack.push(&mut focus, FocusArea::Dialog);
-        spawn_context_dialog(&mut commands, &theme, mode.clone());
+        spawn_fork_dialog(&mut commands, &theme, mode.clone());
     }
 }
 
-/// Spawn the context dialog (modal) — supports both create and fork modes.
-fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode) {
-    let (title_text, placeholder, submit_label) = match &mode {
-        DialogMode::CreateContext => (
-            "Create New Context".to_string(),
-            "Enter context name...".to_string(),
-            "Create",
-        ),
-        DialogMode::ForkContext { source_context, .. } => (
-            format!("Fork from @{}", source_context),
-            "Enter fork name...".to_string(),
-            "Fork",
-        ),
-    };
+/// Spawn the fork dialog (modal).
+fn spawn_fork_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode) {
+    let DialogMode::ForkContext { ref source_context, .. } = mode;
+    let title_text = format!("Fork from @{}", source_context);
 
     // Modal overlay (darkens background)
     commands
@@ -287,8 +354,6 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                 ))
                 .with_children(|dialog| {
                     // Title
-                    // TODO: MsdfUiText doesn't participate in Bevy's intrinsic sizing,
-                    // so explicit dimensions are needed. Should derive from font metrics.
                     dialog.spawn((
                         MsdfUiText::new(&title_text)
                             .with_font_size(16.0)
@@ -317,10 +382,9 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                             Outline::new(Val::Px(1.0), Val::ZERO, theme.accent),
                         ))
                         .with_children(|input_field| {
-                            // TODO: explicit size needed — MsdfUiText doesn't do intrinsic sizing
                             input_field.spawn((
                                 InputTextDisplay,
-                                MsdfUiText::new(&placeholder)
+                                MsdfUiText::new("Enter fork name...")
                                     .with_font_size(14.0)
                                     .with_color(theme.fg_dim),
                                 UiTextPositionCache::default(),
@@ -355,7 +419,6 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                                     Interaction::None,
                                 ))
                                 .with_children(|btn| {
-                                    // TODO: explicit size — MsdfUiText no intrinsic sizing
                                     btn.spawn((
                                         MsdfUiText::new("Cancel")
                                             .with_font_size(12.0)
@@ -369,7 +432,7 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                                     ));
                                 });
 
-                            // Submit button
+                            // Fork button
                             buttons
                                 .spawn((
                                     CreateContextSubmit,
@@ -382,9 +445,8 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                                     Interaction::None,
                                 ))
                                 .with_children(|btn| {
-                                    // TODO: explicit size — MsdfUiText no intrinsic sizing
                                     btn.spawn((
-                                        MsdfUiText::new(submit_label)
+                                        MsdfUiText::new("Fork")
                                             .with_font_size(12.0)
                                             .with_color(theme.accent),
                                         UiTextPositionCache::default(),
@@ -399,10 +461,10 @@ fn spawn_context_dialog(commands: &mut Commands, theme: &Theme, mode: DialogMode
                 });
         });
 
-    info!("Spawned context dialog");
+    info!("Spawned fork dialog");
 }
 
-/// Handle input in the dialog via ActionFired / TextInputReceived.
+/// Handle input in the fork dialog via ActionFired / TextInputReceived.
 fn handle_dialog_input(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
@@ -414,7 +476,7 @@ fn handle_dialog_input(
     dialog_query: Query<(Entity, &CreateContextDialog)>,
     theme: Res<Theme>,
     bootstrap: Res<BootstrapChannel>,
-    conn_state: Res<crate::connection::RpcConnectionState>,
+    conn_state: Res<RpcConnectionState>,
     actor: Option<Res<RpcActor>>,
 ) {
     let Ok(mut input) = input_query.single_mut() else {
@@ -444,13 +506,13 @@ fn handle_dialog_input(
                 if !input.text.is_empty()
                     && let Ok((dialog_entity, dialog)) = dialog_query.single()
                 {
-                    submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
+                    submit_fork(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
                     close_dialog(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 }
             }
             Action::Unfocus => {
                 if let Ok((dialog_entity, _)) = dialog_query.single() {
-                    info!("Dialog cancelled (Escape)");
+                    info!("Fork dialog cancelled (Escape)");
                     close_dialog(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 }
             }
@@ -461,18 +523,8 @@ fn handle_dialog_input(
     if text_changed
         && let Ok(mut msdf_text) = text_query.single_mut()
     {
-        let placeholder = if dialog_query
-            .single()
-            .map(|(_, d)| matches!(d.mode, DialogMode::ForkContext { .. }))
-            .unwrap_or(false)
-        {
-            "Enter fork name..."
-        } else {
-            "Enter context name..."
-        };
-
         if input.text.is_empty() {
-            msdf_text.text = placeholder.to_string();
+            msdf_text.text = "Enter fork name...".to_string();
             msdf_text.color = bevy_to_rgba8(theme.fg_dim);
         } else {
             msdf_text.text = input.text.clone();
@@ -502,7 +554,7 @@ fn handle_dialog_buttons(
     input_query: Query<&ContextNameInput>,
     dialog_query: Query<(Entity, &CreateContextDialog)>,
     bootstrap: Res<BootstrapChannel>,
-    conn_state: Res<crate::connection::RpcConnectionState>,
+    conn_state: Res<RpcConnectionState>,
     actor: Option<Res<RpcActor>>,
 ) {
     let Ok((dialog_entity, dialog)) = dialog_query.single() else {
@@ -514,25 +566,25 @@ fn handle_dialog_buttons(
             && let Ok(input) = input_query.single()
             && !input.text.is_empty()
         {
-            submit_dialog(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
+            submit_fork(&input.text, &dialog.mode, &bootstrap, &conn_state, actor.as_deref());
             close_dialog(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
         }
     }
 
     for interaction in cancel_query.iter() {
         if *interaction == Interaction::Pressed {
-            info!("Dialog cancelled");
+            info!("Fork dialog cancelled");
             close_dialog(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
         }
     }
 }
 
-/// Submit the dialog — routes to create or fork depending on mode.
-fn submit_dialog(
+/// Submit the fork dialog.
+fn submit_fork(
     name: &str,
     mode: &DialogMode,
     bootstrap: &BootstrapChannel,
-    conn_state: &crate::connection::RpcConnectionState,
+    conn_state: &RpcConnectionState,
     actor: Option<&RpcActor>,
 ) {
     let kernel_id = conn_state
@@ -541,55 +593,41 @@ fn submit_dialog(
         .map(|k| k.id.clone())
         .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
 
-    match mode {
-        DialogMode::CreateContext => {
-            let instance = Uuid::new_v4().to_string();
-            info!("Creating context: {} (instance: {})", name, instance);
+    let DialogMode::ForkContext { source_document_id, source_context } = mode;
+    info!("Forking context: {} from @{} (doc: {})", name, source_context, source_document_id);
 
-            let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
-                config: conn_state.ssh_config.clone(),
-                kernel_id,
-                context_name: Some(name.to_string()),
-                instance,
-            });
-        }
-        DialogMode::ForkContext { source_document_id, source_context } => {
-            info!("Forking context: {} from @{} (doc: {})", name, source_context, source_document_id);
+    let Some(actor) = actor else {
+        error!("Cannot fork: no active RPC actor");
+        return;
+    };
 
-            let Some(actor) = actor else {
-                error!("Cannot fork: no active RPC actor");
-                return;
-            };
+    // Fork via ActorHandle, then spawn actor to join the new context
+    let handle = actor.handle.clone();
+    let doc_id = source_document_id.clone();
+    let fork_name = name.to_string();
+    let config = conn_state.ssh_config.clone();
+    let kernel_id = kernel_id.clone();
+    let bootstrap_tx = bootstrap.tx.clone();
 
-            // Fork via ActorHandle, then spawn actor to join the new context
-            let handle = actor.handle.clone();
-            let doc_id = source_document_id.clone();
-            let fork_name = name.to_string();
-            let config = conn_state.ssh_config.clone();
-            let kernel_id = kernel_id.clone();
-            let bootstrap_tx = bootstrap.tx.clone();
-
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    // Use version 0 to fork from latest
-                    match handle.fork_from_version(&doc_id, 0, &fork_name).await {
-                        Ok(ctx) => {
-                            info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
-                            // Now spawn actor to join the newly forked context
-                            let instance = Uuid::new_v4().to_string();
-                            let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
-                                config,
-                                kernel_id,
-                                context_name: Some(fork_name),
-                                instance,
-                            });
-                        }
-                        Err(e) => {
-                            error!("Fork failed: {}", e);
-                        }
-                    }
-                })
-                .detach();
-        }
-    }
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            // Use version 0 to fork from latest
+            match handle.fork_from_version(&doc_id, 0, &fork_name).await {
+                Ok(ctx) => {
+                    info!("Fork created: {} with {} documents", ctx.name, ctx.documents.len());
+                    // Now spawn actor to join the newly forked context
+                    let instance = Uuid::new_v4().to_string();
+                    let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
+                        config,
+                        kernel_id,
+                        context_name: Some(fork_name),
+                        instance,
+                    });
+                }
+                Err(e) => {
+                    error!("Fork failed: {}", e);
+                }
+            }
+        })
+        .detach();
 }

@@ -15,7 +15,7 @@
 //! - Nodes: Rectangular cards with agent-colored borders and soft glow
 //! - Connections: Lines with distance falloff glow
 //! - States: Idle (dim), active (bright), streaming (green dot), error (red dot)
-//! - "+" node: Create new contexts by clicking
+//! - "New" tile: Create new contexts by clicking or pressing `n`
 
 mod create_dialog;
 pub mod model_picker;
@@ -26,9 +26,21 @@ use kaijutsu_client::ContextMembership;
 
 use crate::agents::AgentActivityMessage;
 
-pub use create_dialog::{DialogMode, OpenContextDialog};
+pub use create_dialog::{DialogMode, OpenContextDialog, create_or_fork_context};
 
 // Render module provides visual systems (used by the plugin internally)
+
+/// Configuration for the "New" context tile.
+///
+/// Tools can set `parent_context` via BRP to make "New" fork from a
+/// starter/template context instead of creating empty. Future: per-repo
+/// starters, template pinning, etc.
+#[derive(Resource, Default, Reflect)]
+#[reflect(Resource)]
+pub struct NewContextConfig {
+    /// When set, "New" forks from this context instead of creating empty.
+    pub parent_context: Option<String>,
+}
 
 /// Plugin for constellation-based context navigation
 pub struct ConstellationPlugin;
@@ -38,7 +50,9 @@ impl Plugin for ConstellationPlugin {
         app.init_resource::<Constellation>()
             .init_resource::<ConstellationVisible>()
             .init_resource::<ConstellationCamera>()
+            .init_resource::<NewContextConfig>()
             .register_type::<ConstellationVisible>()
+            .register_type::<NewContextConfig>()
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()

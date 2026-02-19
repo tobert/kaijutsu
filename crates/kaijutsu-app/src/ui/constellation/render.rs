@@ -919,12 +919,12 @@ fn update_create_node_visual(
     let outer_radius = theme.constellation_base_radius
         + max_depth as f32 * theme.constellation_ring_spacing;
 
-    let card_w = theme.constellation_card_width * 0.7;
-    let card_h = theme.constellation_card_height * 0.7;
+    let card_w = theme.constellation_card_width;
+    let card_h = theme.constellation_card_height;
 
     // Position at angle 0 (right side), clear of the widest card + padding
-    let min_clearance = card_w / 2.0 + card_w * 0.7 / 2.0 + 24.0;
-    let x_pos = outer_radius.max(min_clearance) + card_w * 0.4;
+    let min_clearance = card_w + 24.0;
+    let x_pos = outer_radius.max(min_clearance) + card_w * 0.3;
     let y_pos = 0.0;
 
     let px = center.x + x_pos * camera.zoom + camera.offset.x - card_w / 2.0;

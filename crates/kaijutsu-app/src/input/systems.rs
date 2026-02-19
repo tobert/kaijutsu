@@ -548,8 +548,8 @@ use crate::cell::{
     BlockEditCursor, ComposeBlock, EditingBlockCell, PromptSubmitted,
 };
 use crate::ui::constellation::{
-    Constellation, ConstellationCamera, DialogMode, OpenContextDialog,
-    find_nearest_in_direction, model_picker::OpenModelPicker,
+    Constellation, ConstellationCamera, DialogMode, NewContextConfig, OpenContextDialog,
+    create_or_fork_context, find_nearest_in_direction, model_picker::OpenModelPicker,
 };
 
 /// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
@@ -565,6 +565,10 @@ pub fn handle_constellation_nav(
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    bootstrap: Res<crate::connection::BootstrapChannel>,
+    conn_state: Res<crate::connection::RpcConnectionState>,
+    new_ctx_config: Res<NewContextConfig>,
+    actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     if !matches!(*focus, FocusArea::Constellation) {
         return;
@@ -642,6 +646,16 @@ pub fn handle_constellation_nav(
                         warn!("Cannot fork '{}': not in document cache", focus_id);
                     }
                 }
+            }
+            Action::ConstellationCreate => {
+                info!("Constellation: creating new context");
+                create_or_fork_context(
+                    &new_ctx_config,
+                    &bootstrap,
+                    &conn_state,
+                    actor.as_deref(),
+                    &doc_cache,
+                );
             }
             Action::ConstellationModelPicker => {
                 if let Some(ref focus_id) = constellation.focus_id {

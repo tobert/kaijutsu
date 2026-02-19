@@ -122,6 +122,7 @@ pub fn default_bindings() -> Vec<Binding> {
     // Actions
     b.push(Binding::key(KeyCode::Enter, InputContext::Constellation, Action::Activate, "Switch to context"));
     b.push(Binding::key(KeyCode::KeyF, InputContext::Constellation, Action::ConstellationFork, "Fork context"));
+    b.push(Binding::key(KeyCode::KeyN, InputContext::Constellation, Action::ConstellationCreate, "New context"));
     b.push(Binding::key(KeyCode::KeyM, InputContext::Constellation, Action::ConstellationModelPicker, "Model picker"));
     b.push(Binding::key(KeyCode::Tab, InputContext::Constellation, Action::CycleFocusForward, "Cycle focus"));
     b.push(Binding::key(KeyCode::Escape, InputContext::Constellation, Action::Unfocus, "Close constellation"));
