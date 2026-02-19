@@ -286,36 +286,28 @@ pub fn sync_cell_buffers(
 /// For cells with blocks, counts lines from the formatted display text.
 /// Collapsed thinking blocks contribute minimal lines.
 ///
-/// For MainCell, also updates ConversationScrollState with content height.
+/// Note: For MainCell, content_height is set by layout_block_cells (the
+/// authoritative per-block layout system), NOT here. This system only
+/// computes CellState.computed_height for non-MainCell cells.
 pub fn compute_cell_heights(
     mut cells: Query<(&CellEditor, &mut CellState, Option<&MainCell>), Changed<CellEditor>>,
     layout: Res<WorkspaceLayout>,
-    mut scroll_state: ResMut<ConversationScrollState>,
 ) {
     for (editor, mut state, main_cell) in cells.iter_mut() {
+        // MainCell content height is computed by layout_block_cells
+        // which accounts for per-block visual wrapping, indentation,
+        // role headers, and spacing. Skip it here to avoid competing writes.
+        if main_cell.is_some() {
+            continue;
+        }
+
         let display_text = if editor.has_blocks() {
             format_blocks_for_display(&editor.blocks())
         } else {
             editor.text()
         };
         let line_count = display_text.lines().count().max(1);
-
-        // For MainCell, don't cap height - we need full content height for scrolling
-        let content_height = if main_cell.is_some() {
-            // Full height without max cap, tight padding
-            // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
-            (line_count as f32) * layout.line_height + 4.0
-        } else {
-            // Other cells use capped height
-            layout.height_for_lines(line_count)
-        };
-
-        state.computed_height = content_height;
-
-        // For MainCell, update scroll state with content height
-        if main_cell.is_some() {
-            scroll_state.content_height = content_height;
-        }
+        state.computed_height = layout.height_for_lines(line_count);
     }
 }
 
@@ -336,7 +328,10 @@ pub fn highlight_focused_cell(
         } else {
             theme.fg_dim
         };
-        config.default_color = color;
+        // Compare before writing to avoid triggering change detection
+        if config.default_color != color {
+            config.default_color = color;
+        }
     }
 }
 
@@ -742,7 +737,11 @@ pub fn smooth_scroll(
         };
     }
 
-    // Write scroll offset to Bevy's ScrollPosition and read visible/content heights
+    // Write scroll offset to Bevy's ScrollPosition and read visible height.
+    // Note: content_height is set by layout_block_cells (authoritative source).
+    // We do NOT overwrite it from computed.content_size() here because Bevy's
+    // taffy-computed value lags 1 frame behind our layout pass, causing vertical
+    // jitter during streaming as the values oscillate.
     if let Some(conv) = entities.conversation_container {
         if let Ok((mut scroll_pos, computed)) = scroll_positions.get_mut(conv) {
             **scroll_pos = Vec2::new(scroll_pos.x, scroll_state.offset);
@@ -751,11 +750,6 @@ pub fn smooth_scroll(
             let visible_h = content_box.height();
             if visible_h > 0.0 {
                 scroll_state.visible_height = visible_h;
-            }
-            // Use Bevy's computed content size as authoritative scroll extent
-            let bevy_content_h = computed.content_size().y;
-            if bevy_content_h > 0.0 {
-                scroll_state.content_height = bevy_content_h;
             }
         }
     }
