@@ -384,7 +384,7 @@ impl Default for MsdfTextAreaConfig {
 }
 
 /// Text clipping bounds.
-#[derive(Clone, Copy, Debug, Default, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
 pub struct TextBounds {
     pub left: i32,
     pub top: i32,

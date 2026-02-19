@@ -1762,6 +1762,7 @@ pub fn spawn_block_cells(
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
     _block_cells: Query<(Entity, &BlockCell)>,
+    mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -1792,6 +1793,7 @@ pub fn spawn_block_cells(
         .map(|(_, e)| *e)
         .collect();
 
+    let had_removals = !to_remove.is_empty();
     for entity in to_remove {
         commands.entity(entity).try_despawn();
         container.remove(entity);
@@ -1802,6 +1804,7 @@ pub fn spawn_block_cells(
 
     // Find blocks to add (in document but not in container)
     let conv_entity = entities.conversation_container;
+    let mut had_additions = false;
     for block_id in &current_blocks {
         if !container.contains(block_id) {
             // Spawn new BlockCell as flex child of ConversationContainer
@@ -1828,7 +1831,14 @@ pub fn spawn_block_cells(
                 if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
             }
             container.add(block_id.clone(), entity);
+            had_additions = true;
         }
+    }
+
+    // Bump LayoutGeneration when blocks are added or removed so downstream
+    // systems (role headers, child ordering, border styles) know to rebuild.
+    if had_additions || had_removals {
+        layout_gen.bump();
     }
 
     // Reorder container.block_cells to match document order
@@ -1851,7 +1861,15 @@ pub fn sync_role_headers(
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
     theme: Res<Theme>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_gen: Local<u64>,
 ) {
+    // Only rebuild role headers when blocks are added/removed or line counts change
+    if layout_gen.0 == *last_gen {
+        return;
+    }
+    *last_gen = layout_gen.0;
+
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -2282,7 +2300,15 @@ pub fn update_block_cell_nodes(
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCellLayout, &mut Node, Option<&super::block_border::BlockBorderStyle>), With<BlockCell>>,
     mut role_header_nodes: Query<&mut Node, (With<RoleHeader>, Without<BlockCell>)>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_gen: Local<u64>,
 ) {
+    // Node values only change when layout changes (block add/remove/line count)
+    if layout_gen.0 == *last_gen {
+        return;
+    }
+    *last_gen = layout_gen.0;
+
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -2294,31 +2320,46 @@ pub fn update_block_cell_nodes(
         let Ok((layout, mut node, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
-        node.min_height = Val::Px(layout.height);
-        node.margin = UiRect {
+        // Compare before writing to avoid triggering Bevy change detection → taffy relayout
+        let target_height = Val::Px(layout.height);
+        if node.min_height != target_height {
+            node.min_height = target_height;
+        }
+        let target_margin = UiRect {
             left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH),
             bottom: Val::Px(BLOCK_SPACING),
             ..default()
         };
+        if node.margin != target_margin {
+            node.margin = target_margin;
+        }
         // Set padding from border style so text sits inside the content box
         // while the border (absolute child at 100%×100%) fills the border box.
-        if let Some(style) = border_style {
-            node.padding = UiRect {
+        let target_padding = if let Some(style) = border_style {
+            UiRect {
                 left: Val::Px(style.padding.left),
                 right: Val::Px(style.padding.right),
                 top: Val::Px(style.padding.top),
                 bottom: Val::Px(style.padding.bottom),
-            };
+            }
         } else {
-            node.padding = UiRect::ZERO;
+            UiRect::ZERO
+        };
+        if node.padding != target_padding {
+            node.padding = target_padding;
         }
     }
 
     // Role header nodes already have fixed height from spawn, but update if needed
     for entity in &container.role_headers {
         if let Ok(mut node) = role_header_nodes.get_mut(*entity) {
-            node.min_height = Val::Px(ROLE_HEADER_HEIGHT);
-            node.margin = UiRect::bottom(Val::Px(ROLE_HEADER_SPACING));
+            if node.min_height != Val::Px(ROLE_HEADER_HEIGHT) {
+                node.min_height = Val::Px(ROLE_HEADER_HEIGHT);
+            }
+            let target = UiRect::bottom(Val::Px(ROLE_HEADER_SPACING));
+            if node.margin != target {
+                node.margin = target;
+            }
         }
     }
 }
@@ -2333,7 +2374,15 @@ pub fn reorder_conversation_children(
     containers: Query<&BlockCellContainer>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     role_headers: Query<&RoleHeader>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_gen: Local<u64>,
 ) {
+    // Child order only changes when blocks are added/removed
+    if layout_gen.0 == *last_gen {
+        return;
+    }
+    *last_gen = layout_gen.0;
+
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -2395,8 +2444,8 @@ pub fn position_block_cells_from_flex(
 
         // content_box() returns object-centered coordinates (centered around 0,0).
         // UiGlobalTransform translation is also center-based. Add directly.
-        let left = translation.x + content.min.x;
-        let top = translation.y + content.min.y;
+        let new_left = translation.x + content.min.x;
+        let new_top = translation.y + content.min.y;
 
         // Skip positioning when flex layout hasn't resolved yet
         // (e.g. after toggling Display::None → Display::Flex on constellation switch).
@@ -2404,16 +2453,12 @@ pub fn position_block_cells_from_flex(
             continue;
         }
 
-        config.left = left;
-        config.top = top;
-        config.scale = 1.0;
-
-        let raw_left = left as i32;
-        let raw_top = top as i32;
+        let raw_left = new_left as i32;
+        let raw_top = new_top as i32;
         let raw_right = (translation.x + content.max.x) as i32;
         let raw_bottom = (translation.y + content.max.y) as i32;
 
-        config.bounds = if let Some(clip) = clip {
+        let new_bounds = if let Some(clip) = clip {
             crate::text::TextBounds {
                 left: raw_left.max(clip.clip.min.x as i32),
                 top: raw_top.max(clip.clip.min.y as i32),
@@ -2423,6 +2468,19 @@ pub fn position_block_cells_from_flex(
         } else {
             crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
         };
+
+        // Compare before writing to avoid triggering Bevy change detection
+        if (config.left - new_left).abs() < 0.5
+            && (config.top - new_top).abs() < 0.5
+            && config.bounds == new_bounds
+        {
+            continue;
+        }
+
+        config.left = new_left;
+        config.top = new_top;
+        config.scale = 1.0;
+        config.bounds = new_bounds;
     }
 }
 
@@ -2439,23 +2497,19 @@ pub fn position_role_headers_from_flex(
         let content = computed.content_box();
 
         // content_box() returns object-centered coordinates. Add to translation directly.
-        let left = translation.x + content.min.x;
-        let top = translation.y + content.min.y;
+        let new_left = translation.x + content.min.x;
+        let new_top = translation.y + content.min.y;
 
         if size.x < 1.0 {
             continue;
         }
 
-        config.left = left;
-        config.top = top;
-        config.scale = 1.0;
-
-        let raw_left = left as i32;
-        let raw_top = top as i32;
+        let raw_left = new_left as i32;
+        let raw_top = new_top as i32;
         let raw_right = (translation.x + content.max.x) as i32;
         let raw_bottom = (translation.y + content.max.y) as i32;
 
-        config.bounds = if let Some(clip) = clip {
+        let new_bounds = if let Some(clip) = clip {
             crate::text::TextBounds {
                 left: raw_left.max(clip.clip.min.x as i32),
                 top: raw_top.max(clip.clip.min.y as i32),
@@ -2465,6 +2519,19 @@ pub fn position_role_headers_from_flex(
         } else {
             crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
         };
+
+        // Compare before writing to avoid triggering Bevy change detection
+        if (config.left - new_left).abs() < 0.5
+            && (config.top - new_top).abs() < 0.5
+            && config.bounds == new_bounds
+        {
+            continue;
+        }
+
+        config.left = new_left;
+        config.top = new_top;
+        config.scale = 1.0;
+        config.bounds = new_bounds;
     }
 }
 

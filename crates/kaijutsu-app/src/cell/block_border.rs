@@ -18,7 +18,7 @@ use crate::ui::theme::Theme;
 // ============================================================================
 
 /// Visual style for a block's shader border.
-#[derive(Component, Debug, Clone, Reflect)]
+#[derive(Component, Debug, Clone, PartialEq, Reflect)]
 #[reflect(Component)]
 pub struct BlockBorderStyle {
     pub kind: BorderKind,
@@ -31,7 +31,7 @@ pub struct BlockBorderStyle {
 }
 
 /// Simplified padding (top, bottom, left, right in pixels).
-#[derive(Debug, Clone, Copy, Reflect)]
+#[derive(Debug, Clone, Copy, PartialEq, Reflect)]
 pub struct BorderPadding {
     pub top: f32,
     pub bottom: f32,
@@ -99,7 +99,15 @@ pub fn determine_block_border_style(
     containers: Query<&BlockCellContainer>,
     block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>)>,
     theme: Res<Theme>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_gen: Local<u64>,
 ) {
+    // Border styles only change when blocks change (add/remove/line count/status)
+    if layout_gen.0 == *last_gen {
+        return;
+    }
+    *last_gen = layout_gen.0;
+
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -131,9 +139,12 @@ pub fn determine_block_border_style(
 
         let new_style = compute_border_style(block, &theme);
 
-        match (new_style, existing_style) {
+        match (&new_style, existing_style) {
+            (Some(style), Some(existing)) if style == existing => {
+                // Style unchanged — skip insert to avoid triggering change detection
+            }
             (Some(style), _) => {
-                commands.entity(ent).insert(style);
+                commands.entity(ent).insert(style.clone());
             }
             (None, Some(_)) => {
                 commands.entity(ent).remove::<BlockBorderStyle>();

@@ -19,6 +19,10 @@ use crate::ui::tiling::PaneFocus;
 /// Runs after `sync_block_cell_buffers` (CellPhase::Buffer), before Bevy's
 /// layout pass. Computes visual line count at the current pane width and
 /// sets a `FixedMeasure` so taffy can derive correct heights.
+///
+/// **Optimization:** Compares computed height against existing measure before
+/// calling `content_size.set()`, since `.set()` triggers `&mut self` →
+/// Bevy change detection → taffy relayout for ALL nodes.
 pub fn update_msdf_measures(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
@@ -34,7 +38,11 @@ pub fn update_msdf_measures(
         (With<ConversationContainer>, With<PaneFocus>),
     >,
     windows: Query<&Window>,
+    layout_gen: Res<super::components::LayoutGeneration>,
+    mut last_gen: Local<u64>,
+    mut last_base_width: Local<f32>,
 ) {
+    // Only recompute measures when content or width changes
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -57,6 +65,15 @@ pub fn update_msdf_measures(
         });
     let base_width = base_width - (margin * 2.0);
 
+    let width_changed = (base_width - *last_base_width).abs() > 1.0;
+    let content_changed = layout_gen.0 != *last_gen;
+
+    if !width_changed && !content_changed {
+        return;
+    }
+    *last_gen = layout_gen.0;
+    *last_base_width = base_width;
+
     let mut fs = font_system.0.lock().unwrap();
 
     for entity in &container.block_cells {
@@ -74,6 +91,7 @@ pub fn update_msdf_measures(
             buffer.visual_line_count(&mut fs, wrap_width, Some(&mut metrics_cache));
 
         let height = (line_count as f32) * layout.line_height + 4.0;
+
         // Width is unconstrained — the node's 100% width handles it.
         // Height is the content-only height; Node.padding adds border padding.
         content_size.set(NodeMeasure::Fixed(FixedMeasure {
