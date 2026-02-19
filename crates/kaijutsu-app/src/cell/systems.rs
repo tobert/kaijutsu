@@ -704,52 +704,79 @@ pub fn smooth_scroll(
     entities: Res<EditorEntities>,
     mut scroll_positions: Query<(&mut ScrollPosition, &ComputedNode), With<super::components::ConversationContainer>>,
 ) {
-    // Clear the user_scrolled flag at end of frame
-    // (This system runs late in the frame after block events)
-    scroll_state.user_scrolled_this_frame = false;
+    // Clear the user_scrolled flag without triggering change detection
+    // (this is bookkeeping, not a meaningful state change)
+    scroll_state.bypass_change_detection().user_scrolled_this_frame = false;
+
+    // Read current values through Deref (no change detection triggered)
+    let old_offset = scroll_state.offset;
+    let old_target = scroll_state.target_offset;
+    let old_visible = scroll_state.visible_height;
 
     // Clamp target in case content shrank (context switch, block collapse)
-    scroll_state.clamp_target();
-
+    // Compute clamped values without triggering DerefMut yet
     let max = scroll_state.max_offset();
+    let clamped_target = scroll_state.target_offset.min(max).max(0.0);
 
-    // In follow mode, lock directly to bottom — no interpolation needed.
-    // This is how terminals work: content grows, viewport stays anchored.
-    if scroll_state.following {
+    // Compute new offset
+    let (new_offset, new_target) = if scroll_state.following {
+        // In follow mode, lock directly to bottom — no interpolation needed.
         // Jitter prevention: only update if max changed by at least 1 pixel
-        if (max - scroll_state.offset).abs() >= 1.0 {
-            scroll_state.offset = max;
-            scroll_state.target_offset = max;
+        if (max - old_offset).abs() >= 1.0 {
+            (max, max)
+        } else {
+            (old_offset, old_target)
         }
     } else {
         // Manual scroll: lerp toward target for smooth motion
         const SCROLL_SPEED: f32 = 12.0;
-        let target = scroll_state.target_offset;
-        let offset = scroll_state.offset;
         let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
-        let new_offset = offset + (target - offset) * t;
+        let new_offset = old_offset + (clamped_target - old_offset) * t;
 
         // Snap when close enough to prevent sub-pixel jitter
-        scroll_state.offset = if (new_offset - target).abs() < 0.5 {
-            target
+        let snapped = if (new_offset - clamped_target).abs() < 0.5 {
+            clamped_target
         } else {
             new_offset
         };
+        (snapped, clamped_target)
+    };
+
+    // Read visible height from Bevy layout
+    let new_visible = if let Some(conv) = entities.conversation_container {
+        if let Ok((_, computed)) = scroll_positions.get(conv) {
+            let content_box = computed.content_box();
+            let h = content_box.height();
+            if h > 0.0 { h } else { old_visible }
+        } else {
+            old_visible
+        }
+    } else {
+        old_visible
+    };
+
+    // Only trigger DerefMut (change detection) if something actually changed
+    let offset_changed = (new_offset - old_offset).abs() > 0.01;
+    let target_changed = (new_target - old_target).abs() > 0.01;
+    let visible_changed = (new_visible - old_visible).abs() > 0.5;
+
+    if offset_changed || target_changed || visible_changed {
+        let state = scroll_state.as_mut();
+        state.offset = new_offset;
+        state.target_offset = new_target;
+        state.visible_height = new_visible;
     }
 
-    // Write scroll offset to Bevy's ScrollPosition and read visible height.
+    // Write scroll offset to Bevy's ScrollPosition.
     // Note: content_height is set by layout_block_cells (authoritative source).
     // We do NOT overwrite it from computed.content_size() here because Bevy's
     // taffy-computed value lags 1 frame behind our layout pass, causing vertical
     // jitter during streaming as the values oscillate.
     if let Some(conv) = entities.conversation_container {
-        if let Ok((mut scroll_pos, computed)) = scroll_positions.get_mut(conv) {
-            **scroll_pos = Vec2::new(scroll_pos.x, scroll_state.offset);
-            // Use content box height (inside border+padding) as the visible viewport
-            let content_box = computed.content_box();
-            let visible_h = content_box.height();
-            if visible_h > 0.0 {
-                scroll_state.visible_height = visible_h;
+        if let Ok((mut scroll_pos, _)) = scroll_positions.get_mut(conv) {
+            let current_y = scroll_pos.y;
+            if (new_offset - current_y).abs() > 0.01 {
+                **scroll_pos = Vec2::new(scroll_pos.x, new_offset);
             }
         }
     }
@@ -1780,8 +1807,8 @@ pub fn spawn_block_cells(
         return; // Will run again next frame with the container
     };
 
-    // Get current block IDs from the document
-    let current_blocks: Vec<_> = editor.blocks().iter().map(|b| b.id.clone()).collect();
+    // Get current block IDs from the document (lightweight: no snapshot construction)
+    let current_blocks = editor.block_ids();
     let current_ids: std::collections::HashSet<_> = current_blocks.iter().collect();
 
     // Find blocks to remove (in container but not in document)
@@ -2056,21 +2083,12 @@ pub fn sync_block_cell_buffers(
         return;
     };
 
-    // Get ordered blocks for role transition detection
+    // Get ordered blocks and build a borrowed lookup index
     let blocks_ordered = editor.blocks();
-
-    // Build lookup map and track role transitions
-    let mut blocks: std::collections::HashMap<_, _> = std::collections::HashMap::new();
-    let mut is_role_transition: std::collections::HashMap<kaijutsu_crdt::BlockId, (bool, kaijutsu_crdt::Role)> =
-        std::collections::HashMap::new();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-
-    for block in &blocks_ordered {
-        let transition = prev_role != Some(block.role);
-        is_role_transition.insert(block.id.clone(), (transition, block.role));
-        blocks.insert(block.id.clone(), block.clone());
-        prev_role = Some(block.role);
-    }
+    let block_index: std::collections::HashMap<&kaijutsu_crdt::BlockId, usize> = blocks_ordered.iter()
+        .enumerate()
+        .map(|(i, b)| (&b.id, i))
+        .collect();
 
     let mut layout_changed = false;
     for entity in &container.block_cells {
@@ -2083,9 +2101,10 @@ pub fn sync_block_cell_buffers(
             continue;
         }
 
-        let Some(block) = blocks.get(&block_cell.block_id) else {
+        let Some(&idx) = block_index.get(&block_cell.block_id) else {
             continue;
         };
+        let block = &blocks_ordered[idx];
 
         // Format and update the buffer
         // Note: Role headers are now rendered as separate RoleHeader entities,
@@ -2227,24 +2246,19 @@ pub fn layout_block_cells(
     // Lock font system for shaping
     let mut font_system = font_system.0.lock().unwrap();
 
-    // Get blocks for lookup
-    let blocks: std::collections::HashMap<_, _> = editor
-        .blocks()
-        .into_iter()
-        .map(|b| (b.id.clone(), b))
-        .collect();
-
-    // Get blocks in order for role transition detection
+    // Single blocks() call — build borrowed lookup and role transition map
     let blocks_ordered = editor.blocks();
+    let block_lookup: std::collections::HashMap<&kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
+        blocks_ordered.iter().map(|b| (&b.id, b)).collect();
 
     // Track role transitions for inline headers
     let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-    let mut block_is_role_transition: std::collections::HashMap<kaijutsu_crdt::BlockId, bool> =
+    let mut block_is_role_transition: std::collections::HashMap<&kaijutsu_crdt::BlockId, bool> =
         std::collections::HashMap::new();
     for block in &blocks_ordered {
         let is_transition = prev_role != Some(block.role);
-        block_is_role_transition.insert(block.id.clone(), is_transition);
-        prev_role = Some(block.role); // Role is Copy, no clone needed
+        block_is_role_transition.insert(&block.id, is_transition);
+        prev_role = Some(block.role);
     }
 
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
@@ -2267,7 +2281,7 @@ pub fn layout_block_cells(
         }
 
         // Determine indentation level based on parent_id (DAG nesting)
-        let indent_level = if let Some(block) = blocks.get(&block_cell.block_id) {
+        let indent_level = if let Some(block) = block_lookup.get(&block_cell.block_id) {
             // ToolResult blocks with a tool_call_id are nested under the tool call
             if block.kind == BlockKind::ToolResult && block.tool_call_id.is_some() {
                 1
@@ -2304,8 +2318,10 @@ pub fn layout_block_cells(
         y_offset += height + BLOCK_SPACING;
     }
 
-    // Update scroll state with total content height
-    scroll_state.content_height = y_offset;
+    // Update scroll state with total content height (guard to avoid spurious change detection)
+    if (scroll_state.content_height - y_offset).abs() > 0.5 {
+        scroll_state.content_height = y_offset;
+    }
 }
 
 /// Sync BlockCellLayout heights/indentation to Bevy Node for flex layout.

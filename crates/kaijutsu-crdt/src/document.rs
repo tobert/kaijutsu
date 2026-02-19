@@ -211,7 +211,7 @@ impl BlockDocument {
     }
 
     /// Get block IDs in document order.
-    fn block_ids_ordered(&self) -> Vec<BlockId> {
+    pub fn block_ids_ordered(&self) -> Vec<BlockId> {
         // Get all block IDs from the Set
         let Some(blocks_set) = self.doc.get_set(&["blocks"]) else {
             return Vec::new();

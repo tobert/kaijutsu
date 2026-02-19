@@ -193,6 +193,11 @@ impl CellEditor {
         self.doc.blocks_ordered()
     }
 
+    /// Get block IDs in order without constructing full snapshots.
+    pub fn block_ids(&self) -> Vec<BlockId> {
+        self.doc.block_ids_ordered()
+    }
+
     // =========================================================================
     // TEXT MUTATION
     // (Currently unused — block cell input uses handle_block_cell_input which
