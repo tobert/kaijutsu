@@ -114,6 +114,32 @@ A kernel:
 
 See [docs/kernel-model.md](docs/kernel-model.md) for full details.
 
+### Context Identifiers
+
+Every context and kernel has a typed UUID (UUIDv7, time-ordered) defined in `kaijutsu-crdt/src/ids.rs`:
+
+- **`ContextId`** — identifies a context within a kernel
+- **`KernelId`** — identifies a kernel instance
+
+Each context also has an optional human-readable **label** (e.g., "default", "debug-auth").
+Contexts are resolved by exact label, label prefix, or hex prefix via `resolve_context_prefix()`.
+
+```
+ContextId: 019c779b-1a2b-7def-8901-234567890abc
+  short():  "019c779b"     (first 8 hex chars, for display)
+  label:    "default"       (optional, human-assigned)
+```
+
+**Wire format:** 16 bytes (`Data` in Cap'n Proto). The `contextId` field carries the UUID;
+`contextName` carries the label. RPC methods like `createContext(label)` return a `ContextId`,
+and `joinContext(contextId, instance)` accepts one.
+
+**Resolution order** (for drift commands, MCP tools, constellation):
+1. Exact label match
+2. Unique label prefix
+3. Unique hex prefix
+4. Error (no match or ambiguous)
+
 ### Context Generation
 
 Context isn't stored, it's *generated*. When a context payload is needed (for Claude, for export), kaish walks the kernel state and mounted VFS to emit a fresh payload. Mounts determine what's visible.
@@ -148,10 +174,14 @@ to another — optionally distilled by an LLM into a concise briefing.
 | `drift flush` | Deliver staged drifts |
 | `drift queue` / `drift cancel` | Manage staging queue |
 
+The `<ctx>` argument accepts a label (e.g., "default"), label prefix ("def"), or hex prefix ("019c77").
+
 **DriftKind** tracks provenance: Push, Pull, Distill, Merge, Commit.
 
-**Architecture:** `SharedDriftRouter = Arc<RwLock<DriftRouter>>` is shared across
-fork/thread, so parent and child contexts can immediately see and drift to each other.
+**Architecture:** Single `SharedDriftRouter = Arc<RwLock<DriftRouter>>` lives on the kernel,
+shared across fork/thread so parent and child can immediately drift to each other.
+Contexts are registered by `ContextId` with optional label. The server-level drift router
+was removed — all drift operations go through `kernel.drift()`.
 
 See [docs/drift.md](docs/drift.md) for the full design.
 
@@ -184,10 +214,11 @@ Radial tree layout: root at center, children in concentric rings with proportion
 | `0` | Reset camera to default view |
 
 Key data types:
-- `Constellation` — nodes, focus_id, alternate_id
-- `ContextNode` — context_id, parent_id, position, activity, model
+- `Constellation` — nodes (`HashMap<ContextId, ContextNode>`), focus_id, alternate_id
+- `ContextNode` — context_id (`ContextId`), parent_id (`Option<ContextId>`), label, position, activity, model
 - `ConstellationCamera` — offset, zoom, target_offset, target_zoom
 - `ConstellationVisible` — simple bool resource
+- `ContextSwitchRequested` — carries `ContextId` for context switching
 
 ### Input System (Focus-based)
 
@@ -261,7 +292,10 @@ Widgets are the unified UI primitive for all non-content chrome. Located in `ui/
 ### RPC (Cap'n Proto)
 
 - Object-capability model over SSH
-- `attachKernel()` returns a `Kernel` capability
+- `attachKernel()` returns a `Kernel` capability + `KernelId` (88 Kernel ordinals @0-@87, 4 World ordinals @0-@3)
+- `createContext(label)` → `ContextId`, `joinContext(contextId, instance)` → `document_id`
+- `listContexts()` returns all contexts with `ContextId`, label, provider, model, parent
+- Context IDs on wire: 16-byte `Data` fields (`contextId`, `parentId`); labels as `Text` (`contextName`)
 - Real-time streaming for messages and kernel output
 
 ### MCP Integration
@@ -325,7 +359,7 @@ into a boolean flag + separate positional. Use `set_pwd()` or named args instead
 ```
 kaijutsu/
 ├── crates/
-│   ├── kaijutsu-crdt/       # CRDT primitives (BlockDocument, DAG)
+│   ├── kaijutsu-crdt/       # CRDT primitives (BlockDocument, DAG, ContextId/KernelId)
 │   ├── kaijutsu-kernel/     # Kernel, VFS, ToolRegistry, McpServerPool, FlowBus
 │   ├── kaijutsu-client/     # RPC client library
 │   ├── kaijutsu-server/     # SSH server, EmbeddedKaish, KaijutsuBackend
