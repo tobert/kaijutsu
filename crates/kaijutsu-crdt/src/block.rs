@@ -330,9 +330,9 @@ pub struct BlockSnapshot {
     /// Tool name (for ToolCall blocks).
     #[serde(default)]
     pub tool_name: Option<String>,
-    /// Tool input as JSON (for ToolCall blocks).
+    /// Tool input as JSON string (for ToolCall blocks).
     #[serde(default)]
-    pub tool_input: Option<serde_json::Value>,
+    pub tool_input: Option<String>,
     /// Reference to parent ToolCall block (for ToolResult blocks).
     #[serde(default)]
     pub tool_call_id: Option<BlockId>,
@@ -435,12 +435,12 @@ impl BlockSnapshot {
             role: Role::Model,
             status: Status::Running,
             kind: BlockKind::ToolCall,
-            content: input_json,
+            content: input_json.clone(),
             collapsed: false,
             author: author.into(),
             created_at: Self::now_millis(),
             tool_name: Some(tool_name.into()),
-            tool_input: Some(tool_input),
+            tool_input: Some(input_json),
             tool_call_id: None,
             exit_code: None,
             is_error: false,
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(snap.kind, BlockKind::ToolCall);
         assert_eq!(snap.status, Status::Running);
         assert_eq!(snap.tool_name, Some("read_file".to_string()));
-        assert_eq!(snap.tool_input, Some(input));
+        assert_eq!(snap.tool_input, Some(serde_json::to_string_pretty(&input).unwrap()));
     }
 
     #[test]

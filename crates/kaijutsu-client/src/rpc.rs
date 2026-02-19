@@ -1242,13 +1242,7 @@ pub(crate) fn parse_block_snapshot(
 
     let tool_input = if reader.has_tool_input() {
         let input_str = reader.get_tool_input()?.to_string()?;
-        match serde_json::from_str(&input_str) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                log::warn!("Failed to parse tool_input as JSON: {}", e);
-                None
-            }
-        }
+        if input_str.is_empty() { None } else { Some(input_str) }
     } else {
         None
     };

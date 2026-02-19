@@ -339,10 +339,8 @@ impl BlockDocument {
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         let tool_input = block_map.get_text("tool_input")
-            .and_then(|t| {
-                let json_str = t.content();
-                serde_json::from_str(&json_str).ok()
-            });
+            .map(|t| t.content())
+            .filter(|s| !s.is_empty());
 
         let tool_call_id = block_map.get("tool_call_id")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -597,10 +595,10 @@ impl BlockDocument {
             after,
             Role::Model,
             BlockKind::ToolCall,
-            input_json,
+            input_json.clone(),
             author.into(),
             Some(tool_name.into()),
-            Some(tool_input),
+            Some(input_json),
             None,
             None,
             false,
@@ -714,7 +712,7 @@ impl BlockDocument {
         content: String,
         author: String,
         tool_name: Option<String>,
-        tool_input: Option<serde_json::Value>,
+        tool_input: Option<String>,
         tool_call_id: Option<BlockId>,
         exit_code: Option<i32>,
         is_error: bool,
@@ -838,11 +836,9 @@ impl BlockDocument {
 
             if let Some(ref input) = tool_input {
                 if let Some(input_id) = tool_input_id {
-                    // Note: unwrap is safe here because serde_json::Value always serializes
-                    let input_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                    if !input_json.is_empty() {
+                    if !input.is_empty() {
                         if let Some(mut input_text) = tx.text_by_id(input_id) {
-                            input_text.insert(0, &input_json);
+                            input_text.insert(0, input);
                         }
                     }
                 }

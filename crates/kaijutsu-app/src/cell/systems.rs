@@ -1705,12 +1705,14 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
                 _ => "",
             };
             let mut output = format!("{}{}", name, status_tag);
-            if let Some(ref input) = block.tool_input {
-                if !input.is_null() {
-                    let args = format_tool_args(input);
-                    if !args.is_empty() {
-                        output.push('\n');
-                        output.push_str(&args);
+            if let Some(ref input_str) = block.tool_input {
+                if let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str) {
+                    if !input_val.is_null() {
+                        let args = format_tool_args(&input_val);
+                        if !args.is_empty() {
+                            output.push('\n');
+                            output.push_str(&args);
+                        }
                     }
                 }
             }

@@ -5250,7 +5250,7 @@ fn set_block_snapshot(
         builder.set_tool_name(name);
     }
     if let Some(ref input) = block.tool_input {
-        builder.set_tool_input(&input.to_string());
+        builder.set_tool_input(input);
     }
     if let Some(ref tc_id) = block.tool_call_id {
         builder.set_has_tool_call_id(true);
@@ -5369,7 +5369,7 @@ fn parse_block_snapshot(
         .ok()
         .and_then(|s| s.to_str().ok())
         .filter(|s| !s.is_empty())
-        .and_then(|s| serde_json::from_str(s).ok());
+        .map(|s| s.to_owned());
 
     // Read display hint from wire protocol
     let display_hint = if reader.get_has_display_hint() {

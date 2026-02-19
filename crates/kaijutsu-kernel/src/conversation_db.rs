@@ -180,7 +180,7 @@ fn row_to_block(
     // Extract tool-specific fields from extension rows
     let (tool_name, tool_input) = tool_call
         .map(|tc| {
-            let input = tc.tool_input.and_then(|s| serde_json::from_str(&s).ok());
+            let input = tc.tool_input;
             (Some(tc.tool_name), input)
         })
         .unwrap_or((None, None));
@@ -366,10 +366,7 @@ impl ConversationDb {
         match block.kind {
             BlockKind::ToolCall => {
                 if let Some(ref tool_name) = block.tool_name {
-                    let tool_input = block
-                        .tool_input
-                        .as_ref()
-                        .map(|v| serde_json::to_string(v).unwrap_or_default());
+                    let tool_input = block.tool_input.as_deref();
                     tx.execute(
                         "INSERT INTO tool_calls (cell_id, agent_id, seq, tool_name, tool_input)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -829,7 +826,7 @@ mod tests {
         let block = &blocks[0];
         assert_eq!(block.kind, BlockKind::ToolCall);
         assert_eq!(block.tool_name, Some("read_file".to_string()));
-        assert_eq!(block.tool_input, Some(tool_input));
+        assert_eq!(block.tool_input, Some(serde_json::to_string_pretty(&tool_input).unwrap()));
     }
 
     #[test]
