@@ -619,6 +619,7 @@ fn strip_shell_prefix(text: &str) -> &str {
 
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
+    mut fail_writer: MessageWriter<super::components::SubmitFailed>,
     current_conv: Res<CurrentConversation>,
     sync_state: Res<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -687,6 +688,56 @@ pub fn handle_prompt_submitted(
             scroll_state.start_following();
         } else {
             warn!("No connection available, prompt not sent to server");
+            fail_writer.write(super::components::SubmitFailed {
+                text: event.text.clone(),
+                reason: "Not connected to server".into(),
+            });
+        }
+    }
+}
+
+/// Restore compose text and flash error border when submit fails.
+pub fn handle_submit_failed(
+    mut commands: Commands,
+    mut fail_events: MessageReader<super::components::SubmitFailed>,
+    mut compose_blocks: Query<(Entity, &mut ComposeBlock), With<crate::ui::tiling::PaneFocus>>,
+) {
+    for failed in fail_events.read() {
+        warn!("Submit failed: {}", failed.reason);
+        if let Ok((entity, mut compose)) = compose_blocks.single_mut() {
+            // Restore the text that was taken
+            compose.text = failed.text.clone();
+            compose.cursor = compose.text.len();
+            // Mark compose block for error animation
+            commands.entity(entity).insert(super::components::ComposeError {
+                started: std::time::Instant::now(),
+            });
+        }
+    }
+}
+
+/// Animate compose error border: flash red then fade back to theme color.
+pub fn animate_compose_error(
+    mut commands: Commands,
+    theme: Res<crate::ui::theme::Theme>,
+    mut query: Query<(Entity, &super::components::ComposeError, &mut BorderColor)>,
+) {
+    for (entity, error, mut border) in query.iter_mut() {
+        let elapsed = error.started.elapsed().as_secs_f32();
+        const DURATION: f32 = 2.0;
+
+        if elapsed >= DURATION {
+            // Animation done — restore theme border and remove marker
+            *border = BorderColor::all(theme.compose_border);
+            commands.entity(entity).remove::<super::components::ComposeError>();
+        } else {
+            // Lerp from red to theme border color
+            let t = elapsed / DURATION;
+            let red = Color::srgb(0.9, 0.2, 0.2);
+            let target = theme.compose_border;
+
+            let r = red.mix(&target, t);
+            *border = BorderColor::all(r);
         }
     }
 }

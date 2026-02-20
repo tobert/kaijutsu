@@ -36,7 +36,8 @@ use super::components::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
     DocumentCache, DocumentSyncState, FocusTarget, LayoutGeneration, MainCell,
-    PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, ViewingConversation, WorkspaceLayout,
+    PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, SubmitFailed,
+    ViewingConversation, WorkspaceLayout,
 };
 use super::block_border;
 use super::frame_assembly;
@@ -49,6 +50,7 @@ impl Plugin for CellPlugin {
     fn build(&self, app: &mut App) {
         // Register messages
         app.add_message::<PromptSubmitted>()
+            .add_message::<SubmitFailed>()
             .add_message::<ContextSwitchRequested>();
 
         // Register types for BRP reflection
@@ -115,6 +117,9 @@ impl Plugin for CellPlugin {
                 systems::handle_context_switch.after(systems::handle_block_events),
                 // Handle prompt submission
                 systems::handle_prompt_submitted,
+                // Restore text + flash border on submit failure
+                systems::handle_submit_failed
+                    .after(systems::handle_prompt_submitted),
                 // Sync main cell to conversation (after block events, context switch, and prompt submission)
                 systems::sync_main_cell_to_conversation
                     .after(systems::handle_block_events)
@@ -213,6 +218,8 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
+                // Compose error border animation
+                systems::animate_compose_error,
                 block_border::update_block_border_state,
                 block_border::cleanup_block_borders,
                 // 9-slice frame layout

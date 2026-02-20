@@ -26,9 +26,10 @@ mod systems;
 #[allow(unused_imports)]
 pub use components::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
-    CellState, ComposeBlock, ContextSwitchRequested, ConversationContainer,
+    CellState, ComposeBlock, ComposeError, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditingBlockCell,
-    FocusTarget, FocusedBlockCell, MainCell, PromptSubmitted, ViewingConversation,
+    FocusTarget, FocusedBlockCell, MainCell, PromptSubmitted, SubmitFailed,
+    ViewingConversation,
 };
 pub use plugin::CellPlugin;
 pub use systems::EditorEntities;

@@ -877,6 +877,24 @@ pub struct PromptSubmitted {
     pub text: String,
 }
 
+/// Message fired when prompt submission fails (e.g. disconnected).
+///
+/// Carries the original text so it can be restored to the compose block.
+#[derive(Message)]
+pub struct SubmitFailed {
+    pub text: String,
+    pub reason: String,
+}
+
+/// Marker component for compose blocks in error state.
+///
+/// Inserted when a submit fails, drives a red border flash animation.
+/// Removed automatically after the animation completes.
+#[derive(Component)]
+pub struct ComposeError {
+    pub started: std::time::Instant,
+}
+
 /// Message requesting a context switch.
 ///
 /// Emitted by constellation navigation (gt/gT/Ctrl-^/click) and the
