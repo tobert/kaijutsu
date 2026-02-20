@@ -58,6 +58,14 @@ pub use map::InputMap;
 
 use bevy::prelude::*;
 
+/// System clipboard access via arboard.
+///
+/// Inserted as a resource during plugin init. When the OS clipboard is
+/// unavailable (headless, no display server), this resource is absent
+/// and clipboard actions silently no-op.
+#[derive(Resource)]
+pub struct SystemClipboard(pub arboard::Clipboard);
+
 /// SystemSet for input dispatch — runs before all domain input handling.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputPhase {
@@ -83,6 +91,16 @@ impl Plugin for InputPlugin {
         // Register messages
         app.add_message::<events::ActionFired>()
             .add_message::<events::TextInputReceived>();
+
+        // System clipboard (graceful fallback if unavailable)
+        match arboard::Clipboard::new() {
+            Ok(clipboard) => {
+                app.insert_resource(SystemClipboard(clipboard));
+            }
+            Err(e) => {
+                warn!("System clipboard unavailable: {e}. Copy/paste disabled.");
+            }
+        }
 
         // Register resources
         app.init_resource::<focus::FocusArea>()

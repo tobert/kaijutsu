@@ -8,6 +8,7 @@ members = [
     "crates/kaijutsu-app",
     "crates/kaijutsu-mcp",
     "crates/kaijutsu-telemetry",
+    "crates/kaijutsu-agent-tools",
 ]
 
 [workspace.package]
@@ -78,8 +79,14 @@ rig-core = "0.30"
 # MCP (Model Context Protocol)
 rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
+# System clipboard
+arboard = "3"
+
 # Kaijutsu telemetry
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
+
+# Agent detection
+kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
 # OpenTelemetry
 opentelemetry = "0.30"

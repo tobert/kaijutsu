@@ -332,6 +332,7 @@ fn spawn_content_subtree(
                 ComposeBlock {
                     text: text.clone(),
                     cursor: *cursor,
+                    selection_anchor: None,
                 }
             } else {
                 ComposeBlock::default()

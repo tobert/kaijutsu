@@ -180,7 +180,7 @@ pub fn handle_activate_navigation(
             
             commands.entity(entity).insert((
                 EditingBlockCell,
-                BlockEditCursor { offset: block.content.len() },
+                BlockEditCursor { offset: block.content.len(), selection_anchor: None },
             ));
 
             *focus = FocusArea::EditingBlock;
@@ -772,6 +772,7 @@ pub fn handle_compose_input(
     mut actions: MessageReader<ActionFired>,
     mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
+    mut clipboard: Option<ResMut<super::SystemClipboard>>,
 ) {
     let Ok(mut compose) = compose_blocks.single_mut() else {
         return;
@@ -807,7 +808,37 @@ pub fn handle_compose_input(
             Action::CursorRight => {
                 compose.move_right();
             }
-            // Phase 4+: CursorUp/Down (multi-line compose), word movement, clipboard
+            Action::SelectAll => {
+                compose.select_all();
+            }
+            Action::Copy => {
+                if let Some(ref mut clip) = clipboard {
+                    if let Some(text) = compose.selected_text() {
+                        if let Err(e) = clip.0.set_text(text) {
+                            warn!("Copy failed: {e}");
+                        }
+                    }
+                }
+            }
+            Action::Cut => {
+                if let Some(ref mut clip) = clipboard {
+                    if let Some(text) = compose.selected_text() {
+                        if let Err(e) = clip.0.set_text(text) {
+                            warn!("Cut failed: {e}");
+                        } else {
+                            compose.delete_selection();
+                        }
+                    }
+                }
+            }
+            Action::Paste => {
+                if let Some(ref mut clip) = clipboard {
+                    match clip.0.get_text() {
+                        Ok(text) => compose.insert(&text),
+                        Err(e) => warn!("Paste failed: {e}"),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -823,6 +854,7 @@ pub fn handle_block_edit_input(
     entities: Res<EditorEntities>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
+    mut clipboard: Option<ResMut<super::SystemClipboard>>,
 ) {
     let Ok((block_cell, mut cursor)) = editing_cells.single_mut() else {
         return;
@@ -834,8 +866,16 @@ pub fn handle_block_edit_input(
         return;
     };
 
-    // Handle text insertion
+    // Handle text insertion — clears selection, replaces if active
     for super::events::TextInputReceived(text) in text_events.read() {
+        // Delete selection before inserting
+        if let Some(anchor) = cursor.selection_anchor {
+            let start = anchor.min(cursor.offset);
+            let end = anchor.max(cursor.offset);
+            let _ = editor.doc.edit_text(&block_cell.block_id, start, "", end - start);
+            cursor.offset = start;
+            cursor.selection_anchor = None;
+        }
         for c in text.chars() {
             if c.is_control() {
                 continue;
@@ -855,6 +895,14 @@ pub fn handle_block_edit_input(
     for ActionFired(action) in actions.read() {
         match action {
             Action::InsertNewline => {
+                // Delete selection first if active
+                if let Some(anchor) = cursor.selection_anchor {
+                    let start = anchor.min(cursor.offset);
+                    let end = anchor.max(cursor.offset);
+                    let _ = editor.doc.edit_text(&block_cell.block_id, start, "", end - start);
+                    cursor.offset = start;
+                    cursor.selection_anchor = None;
+                }
                 if editor
                     .doc
                     .edit_text(&block_cell.block_id, cursor.offset, "\n", 0)
@@ -864,7 +912,15 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::Backspace => {
-                if cursor.offset > 0
+                // Delete selection if active
+                if let Some(anchor) = cursor.selection_anchor {
+                    let start = anchor.min(cursor.offset);
+                    let end = anchor.max(cursor.offset);
+                    if editor.doc.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
+                        cursor.offset = start;
+                    }
+                    cursor.selection_anchor = None;
+                } else if cursor.offset > 0
                     && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
                 {
                     let text = &block.content;
@@ -883,7 +939,15 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::Delete => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                // Delete selection if active
+                if let Some(anchor) = cursor.selection_anchor {
+                    let start = anchor.min(cursor.offset);
+                    let end = anchor.max(cursor.offset);
+                    if editor.doc.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
+                        cursor.offset = start;
+                    }
+                    cursor.selection_anchor = None;
+                } else if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     if cursor.offset < text.len() {
                         let mut end = cursor.offset + 1;
@@ -898,6 +962,7 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::CursorLeft => {
+                cursor.selection_anchor = None;
                 if cursor.offset > 0
                     && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
                 {
@@ -910,6 +975,7 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::CursorRight => {
+                cursor.selection_anchor = None;
                 if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     if cursor.offset < text.len() {
@@ -922,6 +988,7 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::CursorHome => {
+                cursor.selection_anchor = None;
                 if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     let before_cursor = &text[..cursor.offset];
@@ -929,10 +996,83 @@ pub fn handle_block_edit_input(
                 }
             }
             Action::CursorEnd => {
+                cursor.selection_anchor = None;
                 if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     let after_cursor = &text[cursor.offset..];
                     cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
+                }
+            }
+            Action::SelectAll => {
+                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                    if !block.content.is_empty() {
+                        cursor.selection_anchor = Some(0);
+                        cursor.offset = block.content.len();
+                    }
+                }
+            }
+            Action::Copy => {
+                if let Some(ref mut clip) = clipboard {
+                    if let Some(anchor) = cursor.selection_anchor {
+                        if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                            let start = anchor.min(cursor.offset);
+                            let end = anchor.max(cursor.offset);
+                            if end <= block.content.len() {
+                                let selected = &block.content[start..end];
+                                if let Err(e) = clip.0.set_text(selected) {
+                                    warn!("Copy failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::Cut => {
+                if let Some(ref mut clip) = clipboard {
+                    if let Some(anchor) = cursor.selection_anchor {
+                        if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                            let start = anchor.min(cursor.offset);
+                            let end = anchor.max(cursor.offset);
+                            if end <= block.content.len() {
+                                let selected = block.content[start..end].to_string();
+                                if let Err(e) = clip.0.set_text(&selected) {
+                                    warn!("Cut failed: {e}");
+                                } else {
+                                    let _ = editor.doc.edit_text(
+                                        &block_cell.block_id, start, "", end - start,
+                                    );
+                                    cursor.offset = start;
+                                    cursor.selection_anchor = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::Paste => {
+                if let Some(ref mut clip) = clipboard {
+                    match clip.0.get_text() {
+                        Ok(pasted) => {
+                            // Delete selection first if active
+                            if let Some(anchor) = cursor.selection_anchor {
+                                let start = anchor.min(cursor.offset);
+                                let end = anchor.max(cursor.offset);
+                                let _ = editor.doc.edit_text(
+                                    &block_cell.block_id, start, "", end - start,
+                                );
+                                cursor.offset = start;
+                                cursor.selection_anchor = None;
+                            }
+                            if editor
+                                .doc
+                                .edit_text(&block_cell.block_id, cursor.offset, &pasted, 0)
+                                .is_ok()
+                            {
+                                cursor.offset += pasted.len();
+                            }
+                        }
+                        Err(e) => warn!("Paste failed: {e}"),
+                    }
                 }
             }
             _ => {}

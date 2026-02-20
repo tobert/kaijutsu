@@ -456,8 +456,10 @@ pub struct EditingBlockCell;
 /// The cursor is an offset within the block's content string.
 #[derive(Component, Default)]
 pub struct BlockEditCursor {
-    /// Character offset within the block's content.
+    /// Byte offset within the block's content.
     pub offset: usize,
+    /// Selection anchor (byte offset). When Some, selection spans anchor..offset.
+    pub selection_anchor: Option<usize>,
 }
 
 /// Resource tracking CRDT sync state and owning the authoritative BlockDocument.
@@ -789,19 +791,66 @@ pub struct ConversationContainer;
 pub struct ComposeBlock {
     /// Current text content (before submission)
     pub text: String,
-    /// Cursor position within the text
+    /// Cursor position within the text (byte offset)
     pub cursor: usize,
+    /// Selection anchor (byte offset). When Some, selection spans anchor..cursor.
+    pub selection_anchor: Option<usize>,
 }
 
 impl ComposeBlock {
-    /// Insert text at cursor position
+    /// Get the selected range (ordered start..end), or None if no selection.
+    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        self.selection_anchor.map(|anchor| {
+            let start = anchor.min(self.cursor);
+            let end = anchor.max(self.cursor);
+            start..end
+        })
+    }
+
+    /// Get the selected text, or None if no selection.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection_range().map(|r| &self.text[r])
+    }
+
+    /// Delete the current selection and return the deleted text.
+    /// Cursor moves to start of deleted range.
+    pub fn delete_selection(&mut self) -> Option<String> {
+        let range = self.selection_range()?;
+        let deleted: String = self.text[range.clone()].to_string();
+        self.text.drain(range.clone());
+        self.cursor = range.start;
+        self.selection_anchor = None;
+        Some(deleted)
+    }
+
+    /// Select all text.
+    pub fn select_all(&mut self) {
+        if !self.text.is_empty() {
+            self.selection_anchor = Some(0);
+            self.cursor = self.text.len();
+        }
+    }
+
+    /// Clear selection without modifying text.
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Insert text at cursor position. Replaces selection if active.
     pub fn insert(&mut self, s: &str) {
+        if self.selection_range().is_some() {
+            self.delete_selection();
+        }
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
 
-    /// Delete character before cursor (backspace)
+    /// Delete character before cursor (backspace). Deletes selection if active.
     pub fn backspace(&mut self) {
+        if self.selection_range().is_some() {
+            self.delete_selection();
+            return;
+        }
         if self.cursor > 0 {
             // Find the previous char boundary
             let prev = self.text[..self.cursor]
@@ -814,8 +863,12 @@ impl ComposeBlock {
         }
     }
 
-    /// Delete character after cursor (delete)
+    /// Delete character after cursor (delete). Deletes selection if active.
     pub fn delete(&mut self) {
+        if self.selection_range().is_some() {
+            self.delete_selection();
+            return;
+        }
         if self.cursor < self.text.len() {
             // Find the next char boundary
             let next = self.text[self.cursor..]
@@ -827,8 +880,9 @@ impl ComposeBlock {
         }
     }
 
-    /// Move cursor left
+    /// Move cursor left. Clears selection.
     pub fn move_left(&mut self) {
+        self.clear_selection();
         if self.cursor > 0 {
             self.cursor = self.text[..self.cursor]
                 .char_indices()
@@ -838,8 +892,9 @@ impl ComposeBlock {
         }
     }
 
-    /// Move cursor right
+    /// Move cursor right. Clears selection.
     pub fn move_right(&mut self) {
+        self.clear_selection();
         if self.cursor < self.text.len() {
             self.cursor = self.text[self.cursor..]
                 .char_indices()
@@ -849,13 +904,14 @@ impl ComposeBlock {
         }
     }
 
-    /// Clear and return the text (for submission)
+    /// Clear and return the text (for submission).
     pub fn take(&mut self) -> String {
         self.cursor = 0;
+        self.selection_anchor = None;
         std::mem::take(&mut self.text)
     }
 
-    /// Check if the compose block is empty
+    /// Check if the compose block is empty.
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
