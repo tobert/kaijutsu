@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
-[features]
-default = ["telemetry"]
-telemetry = ["kaijutsu-telemetry/telemetry"]
-
 [dependencies]
 # Kaijutsu kernel (VFS + state + control plane)
 kaijutsu-kernel.workspace = true

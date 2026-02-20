@@ -97,7 +97,6 @@ async fn main() -> Result<()> {
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false));
 
-    #[cfg(feature = "telemetry")]
     let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
         let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-mcp");
         registry.with(otel_layer).init();
@@ -106,9 +105,6 @@ async fn main() -> Result<()> {
         registry.init();
         None
     };
-
-    #[cfg(not(feature = "telemetry"))]
-    registry.init();
 
     let cli = Cli::parse();
 

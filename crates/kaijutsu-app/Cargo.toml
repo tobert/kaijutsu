@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Bevy GUI client for kaijutsu"
 
-[features]
-default = ["telemetry"]
-telemetry = ["kaijutsu-telemetry/telemetry"]
-
 [dependencies]
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-client = { path = "../kaijutsu-client" }

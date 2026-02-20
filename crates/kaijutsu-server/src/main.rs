@@ -74,7 +74,6 @@ async fn main() -> ExitCode {
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr));
 
-    #[cfg(feature = "telemetry")]
     let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
         let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-server");
         registry.with(otel_layer).init();
@@ -83,9 +82,6 @@ async fn main() -> ExitCode {
         registry.init();
         None
     };
-
-    #[cfg(not(feature = "telemetry"))]
-    registry.init();
 
     let args: Vec<String> = env::args().collect();
 

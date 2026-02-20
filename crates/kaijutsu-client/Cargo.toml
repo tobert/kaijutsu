@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Cap'n Proto RPC client library for kaijutsu"
 
-[features]
-default = []
-telemetry = ["kaijutsu-telemetry/telemetry"]
-
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true

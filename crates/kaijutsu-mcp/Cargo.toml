@@ -6,10 +6,6 @@ license.workspace = true
 repository.workspace = true
 description = "MCP server exposing kaijutsu CRDT kernel to Claude Code, Gemini CLI, and opencode"
 
-[features]
-default = []
-telemetry = ["kaijutsu-telemetry/telemetry"]
-
 [[bin]]
 name = "kaijutsu-mcp"
 path = "src/main.rs"
