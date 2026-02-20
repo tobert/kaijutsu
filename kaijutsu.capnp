@@ -315,14 +315,14 @@ interface World {
 
 interface Kernel {
   # Info
-  getInfo @0 () -> (info :KernelInfo);
+  getInfo @0 (trace :TraceContext) -> (info :KernelInfo);
 
   # kaish execution
   execute @1 (code :Text, trace :TraceContext) -> (execId :UInt64);
-  interrupt @2 (execId :UInt64);
-  complete @3 (partial :Text, cursor :UInt32) -> (completions :List(Completion));
+  interrupt @2 (execId :UInt64, trace :TraceContext);
+  complete @3 (partial :Text, cursor :UInt32, trace :TraceContext) -> (completions :List(Completion));
   subscribeOutput @4 (callback :KernelOutput);
-  getCommandHistory @5 (limit :UInt32) -> (entries :List(HistoryEntry));
+  getCommandHistory @5 (limit :UInt32, trace :TraceContext) -> (entries :List(HistoryEntry));
 
   # Lifecycle
   fork @6 (name :Text) -> (kernel :Kernel);
@@ -337,7 +337,7 @@ interface Kernel {
 
   # Tool execution
   executeTool @13 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
-  getToolSchemas @14 () -> (schemas :List(ToolSchema));
+  getToolSchemas @14 (trace :TraceContext) -> (schemas :List(ToolSchema));
 
   # Block-based CRDT operations
   applyBlockOp @15 (documentId :Text, op :BlockDocOp) -> (newVersion :UInt64);
@@ -348,9 +348,9 @@ interface Kernel {
   prompt @18 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
 
   # Context management (ContextId = 16-byte UUIDv7 as Data)
-  listContexts @19 () -> (contexts :List(ContextHandleInfo));
+  listContexts @19 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
   createContext @20 (label :Text) -> (id :Data);
-  joinContext @21 (contextId :Data, instance :Text) -> (documentId :Text);
+  joinContext @21 (contextId :Data, instance :Text, trace :TraceContext) -> (documentId :Text);
   attachDocument @22 (contextId :Data, documentId :Text);
   detachDocument @23 (contextId :Data, documentId :Text);
 
@@ -391,8 +391,8 @@ interface Kernel {
   pushOps @44 (documentId :Text, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
-  listMcpResources @45 (server :Text) -> (resources :List(McpResource));
-  readMcpResource @46 (server :Text, uri :Text) -> (contents :McpResourceContents, hasContents :Bool);
+  listMcpResources @45 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
+  readMcpResource @46 (server :Text, uri :Text, trace :TraceContext) -> (contents :McpResourceContents, hasContents :Bool);
   subscribeMcpResources @47 (callback :ResourceEvents);
 
   # MCP Roots (client advertises workspaces to servers)
@@ -448,13 +448,13 @@ interface Kernel {
   # The past is read-only, but forking is ubiquitous.
 
   # Fork from a specific document version
-  forkFromVersion @63 (documentId :Text, version :UInt64, contextLabel :Text) -> (contextId :Data);
+  forkFromVersion @63 (documentId :Text, version :UInt64, contextLabel :Text, trace :TraceContext) -> (contextId :Data);
 
   # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @64 (sourceBlockId :BlockId, targetContextId :Data) -> (newBlockId :BlockId);
+  cherryPickBlock @64 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
 
   # Get document version history for timeline scrubber
-  getDocumentHistory @65 (documentId :Text, limit :UInt32) -> (snapshots :List(VersionSnapshot));
+  getDocumentHistory @65 (documentId :Text, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
 
   # ============================================================================
   # Configuration (Config as CRDT)
@@ -479,10 +479,10 @@ interface Kernel {
   # Drift enables content transfer between kernel contexts with provenance tracking.
 
   # Get this kernel's context ID and label
-  getContextId @70 () -> (id :Data, label :Text);
+  getContextId @70 (trace :TraceContext) -> (id :Data, label :Text);
 
   # Configure LLM provider/model on an existing kernel
-  configureLlm @71 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  configureLlm @71 (provider :Text, model :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
   driftPush @72 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
@@ -510,7 +510,7 @@ interface Kernel {
   # ============================================================================
 
   # Get current LLM configuration for this kernel
-  getLlmConfig @79 () -> (config :LlmConfigInfo);
+  getLlmConfig @79 (trace :TraceContext) -> (config :LlmConfigInfo);
 
   # Set default LLM provider
   setDefaultProvider @80 (provider :Text) -> (success :Bool, error :Text);
@@ -543,7 +543,7 @@ interface Kernel {
 
   # Compact a document's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
-  compactDocument @87 (documentId :Text) -> (newSize :UInt64, generation :UInt64);
+  compactDocument @87 (documentId :Text, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
 }
 
 # ============================================================================

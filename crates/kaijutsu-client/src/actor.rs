@@ -20,6 +20,7 @@
 
 use kaijutsu_crdt::{BlockId, ContextId};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::rpc::{
     ClientToolFilter, Completion, ContextInfo, DocumentState, HistoryEntry, Identity,
@@ -182,6 +183,21 @@ impl RpcCommand {
 }
 
 // ============================================================================
+// Channel wrapper (carries caller span across mpsc boundary)
+// ============================================================================
+
+/// Wraps an [`RpcCommand`] with the caller's tracing span so that
+/// actor-side dispatch inherits the correct parent context.
+///
+/// Without this, the mpsc channel severs the span hierarchy — the actor's
+/// `spawn_local` tasks would start new root spans instead of being children
+/// of the `ActorHandle` method that initiated the call.
+struct ChannelCmd {
+    command: RpcCommand,
+    span: tracing::Span,
+}
+
+// ============================================================================
 // ActorHandle (Send + Sync public API)
 // ============================================================================
 
@@ -195,20 +211,27 @@ impl RpcCommand {
 /// The handle can be cloned and shared across threads.
 #[derive(Clone)]
 pub struct ActorHandle {
-    tx: mpsc::Sender<RpcCommand>,
+    tx: mpsc::Sender<ChannelCmd>,
     event_tx: broadcast::Sender<ServerEvent>,
     status_tx: broadcast::Sender<ConnectionStatus>,
 }
 
 impl ActorHandle {
     /// Generic send helper — creates a oneshot, sends the command, awaits reply.
+    ///
+    /// Captures `tracing::Span::current()` so the actor-side dispatch inherits
+    /// the caller's span context across the mpsc channel boundary.
     async fn send<T: Send + 'static>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<T, ActorError>>) -> RpcCommand,
     ) -> Result<T, ActorError> {
         let (reply, rx) = oneshot::channel();
+        let cmd = ChannelCmd {
+            command: build(reply),
+            span: tracing::Span::current(),
+        };
         self.tx
-            .send(build(reply))
+            .send(cmd)
             .await
             .map_err(|_| ActorError::Shutdown)?;
         rx.await.map_err(|_| ActorError::Shutdown)?
@@ -809,7 +832,10 @@ impl RpcActor {
     /// RPC calls are dispatched concurrently via spawn_local child tasks.
     /// The err_tx channel lets child tasks signal connection failures back
     /// to the main loop, which disconnects so the next command reconnects.
-    async fn run(mut self, mut rx: mpsc::Receiver<RpcCommand>) {
+    ///
+    /// Each [`ChannelCmd`] carries the caller's tracing span so that
+    /// dispatched tasks inherit the correct parent context.
+    async fn run(mut self, mut rx: mpsc::Receiver<ChannelCmd>) {
         // If created with an existing connection, register subscriptions now.
         // (try_connect would do this, but ensure_connected skips when already connected)
         if self.connection.is_some() {
@@ -832,8 +858,8 @@ impl RpcActor {
                     log::warn!("Child task reported RPC error, disconnecting");
                     self.disconnect();
                 }
-                cmd = rx.recv() => {
-                    let Some(cmd) = cmd else { break };
+                envelope = rx.recv() => {
+                    let Some(ChannelCmd { command: cmd, span }) = envelope else { break };
 
                     // Serial: ensure connection
                     if let Err(e) = self.ensure_connected().await {
@@ -863,12 +889,14 @@ impl RpcActor {
                         _ => {}
                     }
 
-                    // Kernel-level commands: clone handles and dispatch concurrently
+                    // Kernel-level commands: clone handles and dispatch concurrently.
+                    // The caller's span is used as parent so rpc_client spans are
+                    // children of the ActorHandle method that initiated the call.
                     let kernel = conn.kernel.clone();
                     let err_tx = err_tx.clone();
-                    tokio::task::spawn_local(async move {
-                        dispatch_command(cmd, kernel, err_tx).await;
-                    });
+                    tokio::task::spawn_local(
+                        dispatch_command(cmd, kernel, err_tx).instrument(span),
+                    );
                 }
             }
         }
@@ -1068,7 +1096,7 @@ pub fn spawn_actor(
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,
 ) -> ActorHandle {
-    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<ChannelCmd>(CHANNEL_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
     let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
 

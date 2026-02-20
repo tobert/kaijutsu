@@ -210,7 +210,13 @@ impl KernelHandle {
     /// Get kernel info
     #[tracing::instrument(skip(self), name = "rpc_client.get_info")]
     pub async fn get_info(&self) -> Result<KernelInfo, RpcError> {
-        let request = self.kernel.get_info_request();
+        let mut request = self.kernel.get_info_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let info = response.get()?.get_info()?;
         parse_kernel_info(&info)
@@ -223,7 +229,13 @@ impl KernelHandle {
     /// List all contexts in this kernel (includes drift info).
     #[tracing::instrument(skip(self), name = "rpc_client.list_contexts")]
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, RpcError> {
-        let request = self.kernel.list_contexts_request();
+        let mut request = self.kernel.list_contexts_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let contexts = response.get()?.get_contexts()?;
 
@@ -254,6 +266,12 @@ impl KernelHandle {
         let mut request = self.kernel.join_context_request();
         request.get().set_context_id(context_id.as_bytes());
         request.get().set_instance(instance);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let document_id = response.get()?.get_document_id()?.to_string()?;
         Ok(document_id)
@@ -330,6 +348,12 @@ impl KernelHandle {
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {
         let mut request = self.kernel.interrupt_request();
         request.get().set_exec_id(exec_id);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         request.send().promise.await?;
         Ok(())
     }
@@ -340,6 +364,12 @@ impl KernelHandle {
         let mut request = self.kernel.complete_request();
         request.get().set_partial(partial);
         request.get().set_cursor(cursor);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let completions = response.get()?.get_completions()?;
 
@@ -359,6 +389,12 @@ impl KernelHandle {
     pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, RpcError> {
         let mut request = self.kernel.get_command_history_request();
         request.get().set_limit(limit);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let entries = response.get()?.get_entries()?;
 
@@ -453,6 +489,12 @@ impl KernelHandle {
     ) -> Result<(u64, u64), RpcError> {
         let mut request = self.kernel.compact_document_request();
         request.get().set_document_id(document_id);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let r = response.get()?;
         Ok((r.get_new_size(), r.get_generation()))
@@ -587,6 +629,12 @@ impl KernelHandle {
     pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, RpcError> {
         let mut request = self.kernel.list_mcp_resources_request();
         request.get().set_server(server);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let resources = response.get()?.get_resources()?;
 
@@ -623,6 +671,12 @@ impl KernelHandle {
         let mut request = self.kernel.read_mcp_resource_request();
         request.get().set_server(server);
         request.get().set_uri(uri);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let result = response.get()?;
 
@@ -708,6 +762,12 @@ impl KernelHandle {
             params.set_version(version);
             params.set_context_label(label);
         }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         parse_context_id(response.get()?.get_context_id()?)
     }
@@ -730,6 +790,12 @@ impl KernelHandle {
             source.set_seq(block_id.seq);
             params.set_target_context_id(target_context.as_bytes());
         }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let new_block = response.get()?.get_new_block_id()?;
         parse_block_id(&new_block)
@@ -749,6 +815,12 @@ impl KernelHandle {
             let mut params = request.get();
             params.set_document_id(document_id);
             params.set_limit(limit);
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
         let snapshots = response.get()?.get_snapshots()?;
@@ -772,7 +844,13 @@ impl KernelHandle {
     /// Get this kernel's context ID and label.
     #[tracing::instrument(skip(self), name = "rpc_client.get_context_id")]
     pub async fn get_context_id(&self) -> Result<(ContextId, String), RpcError> {
-        let request = self.kernel.get_context_id_request();
+        let mut request = self.kernel.get_context_id_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let reader = response.get()?;
         let id = parse_context_id(reader.get_id()?)?;
@@ -792,6 +870,12 @@ impl KernelHandle {
             let mut params = request.get();
             params.set_provider(provider);
             params.set_model(model);
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
         let reader = response.get()?;
@@ -942,7 +1026,13 @@ impl KernelHandle {
     /// Get current LLM configuration
     #[tracing::instrument(skip(self), name = "rpc_client.get_llm_config")]
     pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, RpcError> {
-        let request = self.kernel.get_llm_config_request();
+        let mut request = self.kernel.get_llm_config_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
         let response = request.send().promise.await?;
         let config = response.get()?.get_config()?;
 

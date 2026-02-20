@@ -807,9 +807,11 @@ impl KernelImpl {
 impl kernel::Server for KernelImpl {
     fn get_info(
         self: Rc<Self>,
-        _params: kernel::GetInfoParams,
+        params: kernel::GetInfoParams,
         mut results: kernel::GetInfoResults,
     ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "get_info").entered();
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
             let mut info = results.get().init_info();
@@ -900,17 +902,21 @@ impl kernel::Server for KernelImpl {
 
     fn interrupt(
         self: Rc<Self>,
-        _params: kernel::InterruptParams,
+        params: kernel::InterruptParams,
         _results: kernel::InterruptResults,
     ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "interrupt").entered();
         Promise::ok(())
     }
 
     fn complete(
         self: Rc<Self>,
-        _params: kernel::CompleteParams,
+        params: kernel::CompleteParams,
         mut results: kernel::CompleteResults,
     ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "complete").entered();
         results.get().init_completions(0);
         Promise::ok(())
     }
@@ -928,8 +934,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetCommandHistoryParams,
         mut results: kernel::GetCommandHistoryResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "get_command_history").entered();
-        let limit = pry!(params.get()).get_limit() as usize;
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "get_command_history").entered();
+        let limit = p.get_limit() as usize;
 
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
@@ -1382,7 +1389,7 @@ impl kernel::Server for KernelImpl {
 
     fn get_tool_schemas(
         self: Rc<Self>,
-        _params: kernel::GetToolSchemasParams,
+        params: kernel::GetToolSchemasParams,
         mut results: kernel::GetToolSchemasResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
@@ -1392,7 +1399,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
-        let span = tracing::info_span!("rpc", method = "get_tool_schemas");
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_tool_schemas");
         Promise::from_future(async move {
             let registry = kernel.tools().read().await;
             let tools = registry.list();
@@ -1879,7 +1886,7 @@ impl kernel::Server for KernelImpl {
 
     fn list_contexts(
         self: Rc<Self>,
-        _params: kernel::ListContextsParams,
+        params: kernel::ListContextsParams,
         mut results: kernel::ListContextsResults,
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = {
@@ -1890,7 +1897,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
-        let span = tracing::info_span!("rpc", method = "list_contexts");
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
         Promise::from_future(async move {
             // Read from the kernel's drift router — the single source of truth
             let drift = kernel_arc.drift().read().await;
@@ -1939,7 +1946,7 @@ impl kernel::Server for KernelImpl {
         let state2 = state.clone();
         let kernel_id2 = kernel_id.clone();
 
-        let span = tracing::info_span!("rpc", method = "join_context");
+        let span = extract_rpc_trace(params.get_trace(), "join_context");
         Promise::from_future(async move {
             // Full context UUID as part of document ID for persistence
             let doc_id = format!("{}@{}", kernel_id2, context_id);
@@ -2995,12 +3002,13 @@ impl kernel::Server for KernelImpl {
         params: kernel::ListMcpResourcesParams,
         mut results: kernel::ListMcpResourcesResults,
     ) -> Promise<(), capnp::Error> {
-        let server = pry!(pry!(pry!(params.get()).get_server()).to_str()).to_owned();
+        let params_reader = pry!(params.get());
+        let server = pry!(pry!(params_reader.get_server()).to_str()).to_owned();
         log::debug!("list_mcp_resources: server={}", server);
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
 
-        let span = tracing::info_span!("rpc", method = "list_mcp_resources");
+        let span = extract_rpc_trace(params_reader.get_trace(), "list_mcp_resources");
         Promise::from_future(async move {
             match mcp_pool.list_resources(&server).await {
                 Ok(resources) => {
@@ -3040,7 +3048,7 @@ impl kernel::Server for KernelImpl {
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
 
-        let span = tracing::info_span!("rpc", method = "read_mcp_resource");
+        let span = extract_rpc_trace(params_reader.get_trace(), "read_mcp_resource");
         Promise::from_future(async move {
             match mcp_pool.read_resource(&server, &uri).await {
                 Ok(contents) => {
@@ -3634,7 +3642,7 @@ impl kernel::Server for KernelImpl {
         let _seat_info = context_manager.join_context(&ctx_name);
         context_manager.attach_document(&ctx_name, &new_doc_id, "server");
 
-        let span = tracing::info_span!("rpc", method = "fork_from_version");
+        let span = extract_rpc_trace(params_reader.get_trace(), "fork_from_version");
         Promise::from_future(async move {
             // Register in drift router
             let label = label_owned.as_deref();
@@ -3693,7 +3701,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(doc_entry);
 
-        let span = tracing::info_span!("rpc", method = "cherry_pick_block");
+        let span = extract_rpc_trace(params_reader.get_trace(), "cherry_pick_block");
         Promise::from_future(async move {
             // Look up target context's document ID from drift router
             let drift = kernel_arc.drift().read().await;
@@ -3738,8 +3746,8 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetDocumentHistoryParams,
         mut results: kernel::GetDocumentHistoryResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "get_document_history").entered();
         let params_reader = pry!(params.get());
+        let _span = extract_rpc_trace(params_reader.get_trace(), "get_document_history").entered();
         let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
         let limit = params_reader.get_limit() as usize;
 
@@ -3918,7 +3926,7 @@ impl kernel::Server for KernelImpl {
 
     fn get_context_id(
         self: Rc<Self>,
-        _params: kernel::GetContextIdParams,
+        params: kernel::GetContextIdParams,
         mut results: kernel::GetContextIdResults,
     ) -> Promise<(), capnp::Error> {
         let (ctx_id, kernel_arc) = {
@@ -3929,7 +3937,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
-        let span = tracing::info_span!("rpc", method = "get_context_id");
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_context_id");
         Promise::from_future(async move {
             results.get().set_id(ctx_id.as_bytes());
             let drift = kernel_arc.drift().read().await;
@@ -3952,7 +3960,7 @@ impl kernel::Server for KernelImpl {
         let kernel_id = self.kernel_id.clone();
         let state = self.state.clone();
 
-        let span = tracing::info_span!("rpc", method = "configure_llm");
+        let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
         Promise::from_future(async move {
             // Get kernel
             let (kernel_arc, ctx_id) = {
@@ -4438,7 +4446,7 @@ impl kernel::Server for KernelImpl {
 
     fn get_llm_config(
         self: Rc<Self>,
-        _params: kernel::GetLlmConfigParams,
+        params: kernel::GetLlmConfigParams,
         mut results: kernel::GetLlmConfigResults,
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = {
@@ -4449,7 +4457,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
-        let span = tracing::info_span!("rpc", method = "get_llm_config");
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_llm_config");
         Promise::from_future(async move {
             let registry = kernel_arc.llm().read().await;
 
@@ -4755,8 +4763,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::CompactDocumentParams,
         mut results: kernel::CompactDocumentResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "compact_document").entered();
-        let document_id = pry!(pry!(pry!(params.get()).get_document_id()).to_str()).to_string();
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "compact_document").entered();
+        let document_id = pry!(pry!(p.get_document_id()).to_str()).to_string();
 
         let state = self.state.borrow();
         let kernel = match state.kernels.get(&self.kernel_id) {
