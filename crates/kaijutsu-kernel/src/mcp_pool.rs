@@ -954,6 +954,31 @@ impl Default for McpServerPool {
     }
 }
 
+/// Forward host environment variables that MCP subprocesses commonly need.
+///
+/// Explicitly propagates OpenTelemetry and HTTP proxy configuration.
+/// Called before config.env overlay so explicit server config always wins.
+fn propagate_host_env(cmd: &mut Command) {
+    const FORWARD_VARS: &[&str] = &[
+        // OpenTelemetry — ensure MCP servers export to the same collector
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_TRACES_EXPORTER",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        // HTTP proxy — needed in corporate/enterprise environments
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ];
+    for var in FORWARD_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+}
+
 impl McpServerPool {
     /// Create a new empty pool.
     pub fn new() -> Self {
@@ -1099,6 +1124,7 @@ impl McpServerPool {
             McpTransport::Stdio => {
                 let mut cmd = Command::new(&config.command);
                 cmd.args(&config.args);
+                propagate_host_env(&mut cmd);
                 for (key, value) in &config.env {
                     cmd.env(key, value);
                 }
