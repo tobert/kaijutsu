@@ -121,6 +121,21 @@ async fn main() -> Result<()> {
 
 /// MCP stdio server + hook socket listener.
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    // Detect hosting agent (Claude Code, Gemini CLI, etc.)
+    let agent = kaijutsu_agent_tools::detect();
+    if let Some(ref a) = agent {
+        tracing::info!(
+            agent = a.agent_name(),
+            session_id = a.session_id(),
+            slug = a.slug(),
+            version = a.version(),
+            "Detected hosting agent"
+        );
+    }
+
+    // Extract session ID from agent detection (if any)
+    let detected_session_id = agent.as_ref().and_then(|a| a.session_id().map(String::from));
+
     // Cap'n Proto RPC requires LocalSet for !Send types
     let local_set = tokio::task::LocalSet::new();
     local_set.run_until(async {
@@ -131,7 +146,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 kernel = %args.kernel,
                 "Connecting via SSH"
             );
-            KaijutsuMcp::connect(&args.host, args.port, &args.kernel, &args.context_name).await?
+            KaijutsuMcp::connect(
+                &args.host,
+                args.port,
+                &args.kernel,
+                &args.context_name,
+                detected_session_id.as_deref(),
+            ).await?
         } else {
             tracing::info!("Starting with in-memory store");
             KaijutsuMcp::new()
@@ -163,7 +184,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 Arc::new(HookListener::local(store.clone(), doc_id))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
-                Arc::new(HookListener::remote(remote.clone(), remote.context_id))
+                Arc::new(HookListener::remote(
+                    remote.clone(),
+                    remote.context_id,
+                    Arc::clone(mcp.session_id_arc()),
+                ))
             }
         };
 

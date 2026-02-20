@@ -161,6 +161,9 @@ pub struct PingResponse {
     pub context_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_id: Option<String>,
+    /// Agent session ID (e.g., Claude Code session UUID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub pending_drifts: u32,
 }
 

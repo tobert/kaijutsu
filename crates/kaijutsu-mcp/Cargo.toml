@@ -19,6 +19,7 @@ path = "src/main.rs"
 kaijutsu-kernel = { workspace = true }
 kaijutsu-crdt = { workspace = true }
 kaijutsu-client = { workspace = true }
+kaijutsu-agent-tools = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

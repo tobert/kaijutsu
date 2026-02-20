@@ -10,7 +10,7 @@
 //! 3. Checks for pending drift and injects it into the response
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -39,6 +39,8 @@ pub struct HookListener {
     context_id: ContextId,
     /// Serializes push_ops to avoid concurrent pushes sending duplicate ops.
     push_lock: TokioMutex<()>,
+    /// Shared session ID — updated from hook events when detected.
+    session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl HookListener {
@@ -51,11 +53,16 @@ impl HookListener {
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             context_id: ContextId::nil(),
             push_lock: TokioMutex::new(()),
+            session_id: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Create a listener backed by a remote connection.
-    pub fn remote(remote: RemoteState, context_id: ContextId) -> Self {
+    pub fn remote(
+        remote: RemoteState,
+        context_id: ContextId,
+        session_id: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
             store: remote.store.clone(),
             document_id: remote.document_id.clone(),
@@ -63,6 +70,7 @@ impl HookListener {
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             context_id,
             push_lock: TokioMutex::new(()),
+            session_id,
         }
     }
 
@@ -125,18 +133,30 @@ impl HookListener {
         // Handle ping — return status without creating blocks
         if event.event == "ping" {
             let pending = self.pending_drift_count().await;
+            let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
             let ping = PingResponse {
                 status: "ok".to_string(),
                 pid: std::process::id(),
                 cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
                 context_name: Some(self.context_id.short()),
                 document_id: Some(self.document_id.clone()),
+                session_id,
                 pending_drifts: pending,
             };
             let json = serde_json::to_string(&ping).unwrap_or_default();
             writer.write_all(json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
             return Ok(());
+        }
+
+        // Capture session_id from hook events if we don't have one yet
+        if let Some(ref event_session_id) = event.session_id {
+            if let Ok(mut guard) = self.session_id.lock() {
+                if guard.is_none() {
+                    tracing::info!(session_id = %event_session_id, "Captured session ID from hook event");
+                    *guard = Some(event_session_id.clone());
+                }
+            }
         }
 
         let response = self.process_event(&event).await;
@@ -162,7 +182,11 @@ impl HookListener {
         match event.event.as_str() {
             "session.start" => {
                 let model_info = event.model.as_deref().unwrap_or("unknown");
-                let content = format!("Session started: {}, model: {}", event.source, model_info);
+                let sid = event.session_id.as_deref().unwrap_or("unknown");
+                let content = format!(
+                    "Session started: {}, model: {}, session: {}",
+                    event.source, model_info, sid
+                );
                 self.insert_text_block(Role::System, &content);
             }
 

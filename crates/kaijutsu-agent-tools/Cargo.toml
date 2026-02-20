@@ -1,0 +1,13 @@
+[package]
+name = "kaijutsu-agent-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent detection and session correlation for MCP servers"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+dirs = "6"

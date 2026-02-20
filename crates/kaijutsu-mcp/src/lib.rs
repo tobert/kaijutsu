@@ -175,6 +175,12 @@ pub struct KaijutsuMcp {
     server_state: McpServerState,
     /// Handle to abort the background event listener when all clones are dropped.
     _bg_task: Option<Arc<AbortOnDrop>>,
+    /// Agent session ID (e.g., Claude Code session UUID).
+    session_id: Arc<Mutex<Option<String>>>,
+    /// Context label used at connection time.
+    context_name: String,
+    /// Detected agent name (e.g., "claude-code").
+    agent_name: Option<String>,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -199,6 +205,9 @@ impl KaijutsuMcp {
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
             _bg_task: None,
+            session_id: Arc::new(Mutex::new(None)),
+            context_name: "local".to_string(),
+            agent_name: None,
         }
     }
 
@@ -211,13 +220,18 @@ impl KaijutsuMcp {
     ///
     /// Uses ssh-agent for authentication. Must be called within a `LocalSet`.
     ///
-    /// Syncs initial state from the server into a local cache, then spawns
-    /// an `ActorHandle` for persistent RPC access (drift, tool execution, etc.).
+    /// If `cc_session_id` is provided (e.g., from Claude Code session detection),
+    /// it is used as the `ContextId` directly — same UUID everywhere for easy
+    /// correlation. Otherwise a fresh UUIDv7 `ContextId` is generated.
+    ///
+    /// `joinContext` auto-creates the context on the server if it doesn't exist,
+    /// so reconnection with the same UUID re-joins the same context.
     pub async fn connect(
         host: &str,
         port: u16,
         kernel_id: &str,
         context_name: &str,
+        cc_session_id: Option<&str>,
     ) -> Result<Self, anyhow::Error> {
         let config = SshConfig {
             host: host.to_string(),
@@ -230,7 +244,23 @@ impl KaijutsuMcp {
 
         let client = connect_ssh(config.clone()).await?;
         let (kernel, kernel_id_typed) = client.attach_kernel().await?;
-        let context_id = kernel.create_context(context_name).await?;
+
+        // Client provides ContextId — CC session UUID or fresh v7
+        let context_id = match cc_session_id {
+            Some(uuid) => {
+                let id = kaijutsu_crdt::ContextId::parse(uuid)
+                    .map_err(|e| anyhow::anyhow!("Invalid CC session UUID '{uuid}': {e}"))?;
+                tracing::info!(
+                    cc_session = uuid,
+                    context_id = %id,
+                    "Using Claude Code session UUID as ContextId"
+                );
+                id
+            }
+            None => kaijutsu_crdt::ContextId::new(),
+        };
+
+        // joinContext auto-creates if the context doesn't exist
         let document_id = kernel.join_context(context_id, "mcp-server").await?;
 
         tracing::info!(
@@ -338,12 +368,20 @@ impl KaijutsuMcp {
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
             _bg_task: Some(Arc::new(AbortOnDrop(bg_abort))),
+            session_id: Arc::new(Mutex::new(cc_session_id.map(String::from))),
+            context_name: context_name.to_string(),
+            agent_name: cc_session_id.map(|_| "claude-code".to_string()),
         })
     }
 
     /// Get the backend variant (for hook listener setup, etc.).
     pub fn backend(&self) -> &Backend {
         &self.backend
+    }
+
+    /// Get the shared session ID arc (for hook listener to share).
+    pub fn session_id_arc(&self) -> &Arc<Mutex<Option<String>>> {
+        &self.session_id
     }
 
     /// Get the underlying store for tool operations.
@@ -1428,11 +1466,21 @@ impl KaijutsuMcp {
     // Context Identity
     // ========================================================================
 
-    #[tool(description = "Get this MCP server's identity: context short ID, context name, and authenticated user. Useful for understanding your position in the drift network.")]
+    #[tool(description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.")]
     async fn whoami(&self) -> String {
+        let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
+
         let actor = match self.actor() {
             Some(a) => a,
-            None => return "Error: whoami requires --connect to kaijutsu-server".to_string(),
+            None => {
+                // Local mode — return what we have
+                return serde_json::json!({
+                    "mode": "local",
+                    "context_name": self.context_name,
+                    "session_id": session_id,
+                    "agent_name": self.agent_name,
+                }).to_string();
+            }
         };
 
         let identity = match actor.whoami().await {
@@ -1450,6 +1498,9 @@ impl KaijutsuMcp {
             "display_name": identity.display_name,
             "context_id": context_id.short(),
             "context_label": ctx_label,
+            "context_name": self.context_name,
+            "session_id": session_id,
+            "agent_name": self.agent_name,
         }).to_string()
     }
 
