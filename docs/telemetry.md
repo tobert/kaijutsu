@@ -5,21 +5,20 @@ boundary between client and server.
 
 ## Quick Start
 
-All three binaries support OTel export behind the `telemetry` feature flag.
-Export activates when standard OTel environment variables are set:
+OTel is always compiled in. Export activates when standard OTel environment
+variables are set:
 
 ```bash
 # Point at your OTLP collector (gRPC)
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 
-# Run with telemetry enabled
-cargo run -p kaijutsu-server --features telemetry
-cargo run -p kaijutsu-app --features telemetry
-cargo run -p kaijutsu-mcp --features telemetry
+# Run normally — OTel export activates automatically
+cargo run -p kaijutsu-server
+cargo run -p kaijutsu-app
+cargo run -p kaijutsu-mcp
 ```
 
-Without the `telemetry` feature, no OTel deps are compiled in. Without
-`OTEL_EXPORTER_OTLP_ENDPOINT` set, nothing is exported even with the feature.
+Without `OTEL_EXPORTER_OTLP_ENDPOINT` set, nothing is exported.
 
 ## Environment Variables
 
@@ -204,17 +203,24 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 
 Parent-sampled spans always inherit (trace continuity).
 
+## Per-Context Traces
+
+Each context gets a `trace_id` ([u8; 16], UUIDv4) at registration time. Every RPC
+operation touching that context creates a span under the context's trace via
+`context_root_span()`. This enables querying "show me everything that happened
+in context X" in Jaeger/Grafana.
+
+**Instrumented RPC methods:** join_context, push_ops, get_document_state,
+shell_execute, drift_push/pull/merge/flush, fork_from_version, cherry_pick_block,
+get_document_history, compact_document.
+
+The `trace_id` is exposed on the wire via `ContextHandleInfo.traceId` and parsed
+into `ContextInfo.trace_id` on the client side. A reverse index
+(`DriftRouter.doc_to_context`) enables document-keyed RPCs to find their context's
+trace without an extra lookup.
+
 ## Deferred (not yet instrumented)
 
 - **VFS methods** (~15 filesystem ops in `impl vfs::Server`) — high volume, low debugging value
 - **BlockStore internals** — CRDT ops, add when sync debugging needed
 - **Unimplemented schema methods** — instrument when implemented
-
-## Without the Feature
-
-When compiled without `--features telemetry`:
-
-- No OTel dependencies are pulled in
-- `inject_trace_context()` returns empty strings (zero-cost)
-- `extract_trace_context()` returns a disabled span
-- `#[instrument]` spans still work with any tracing subscriber (file logging, etc.)
