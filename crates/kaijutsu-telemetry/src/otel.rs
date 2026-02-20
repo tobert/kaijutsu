@@ -1,10 +1,10 @@
-//! OTel internals — only compiled with `telemetry` feature.
+//! OTel internals — tracing layer, W3C propagation, and sampling.
 
 use std::collections::HashMap;
 
 use opentelemetry::trace::{
-    Link, SamplingDecision, SamplingResult, SpanKind, TraceContextExt, TracerProvider as _,
-    TraceId, TraceState,
+    Link, SamplingDecision, SamplingResult, SpanContext, SpanId, SpanKind, TraceContextExt,
+    TraceFlags, TracerProvider as _, TraceId, TraceState,
 };
 use opentelemetry::{global, Context, KeyValue};
 use opentelemetry_otlp::SpanExporter;
@@ -127,6 +127,38 @@ pub(crate) fn extract_trace_context_impl(traceparent: &str, tracestate: &str) ->
 
     // Return a tracing span linked to the extracted OTel context
     let span = tracing::info_span!("rpc.request");
+    span.set_parent(cx);
+    span
+}
+
+// ============================================================================
+// Per-context long-running trace
+// ============================================================================
+
+/// Create a span under a context's long-running trace.
+///
+/// Synthesizes a remote parent with the given trace ID so that every RPC
+/// touching a context shares a single trace. Returns a detached span if
+/// `trace_id` is all zeros.
+pub(crate) fn context_root_span_impl(trace_id: &[u8; 16], name: &'static str) -> tracing::Span {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    if *trace_id == [0u8; 16] {
+        return tracing::Span::none();
+    }
+
+    let otel_trace_id = TraceId::from_bytes(*trace_id);
+    // Derive a stable span ID from the first 8 bytes of the trace ID
+    let root_span_id = SpanId::from_bytes(trace_id[0..8].try_into().unwrap());
+    let span_context = SpanContext::new(
+        otel_trace_id,
+        root_span_id,
+        TraceFlags::SAMPLED,
+        true, // remote
+        TraceState::default(),
+    );
+    let cx = Context::current().with_remote_span_context(span_context);
+    let span = tracing::info_span!("context", method = name);
     span.set_parent(cx);
     span
 }

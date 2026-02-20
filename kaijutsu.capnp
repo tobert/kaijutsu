@@ -570,6 +570,7 @@ struct ContextHandleInfo {
   model @4 :Text;
   createdAt @5 :UInt64;
   documentId @6 :Text;            # Primary document ID for this context
+  traceId @7 :Data;              # 16-byte OTel trace ID for context-scoped tracing
 }
 
 # ============================================================================

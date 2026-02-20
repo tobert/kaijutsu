@@ -1690,6 +1690,12 @@ impl kernel::Server for KernelImpl {
                 )));
             }
         };
+        let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
+            let trace_id = drift.trace_id_for_document(&cell_id).unwrap_or([0u8; 16]);
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_state").entered())
+        } else {
+            None
+        };
 
         let doc = match kernel.documents.get(&cell_id) {
             Some(d) => d,
@@ -1913,6 +1919,7 @@ impl kernel::Server for KernelImpl {
                 c.set_model(ctx.model.as_deref().unwrap_or(""));
                 c.set_created_at(ctx.created_at);
                 c.set_document_id(&ctx.document_id);
+                c.set_trace_id(&ctx.trace_id);
             }
 
             Ok(())
@@ -1996,6 +2003,8 @@ impl kernel::Server for KernelImpl {
                     log::info!("Registered context {} (doc: {}) in kernel DriftRouter",
                         context_id, doc_id);
                 }
+                let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
+                let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
             }
 
             // Return the document_id
@@ -2277,7 +2286,7 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             // Get or create embedded kaish executor (same pattern as execute RPC)
-            let (documents, kaish) = {
+            let (documents, kaish, kernel_arc) = {
                 let mut state_ref = state.borrow_mut();
                 let kernel = state_ref.kernels.get_mut(&kernel_id)
                     .ok_or_else(|| {
@@ -2303,8 +2312,15 @@ impl kernel::Server for KernelImpl {
                     }
                 }
 
-                (kernel.documents.clone(), kernel.kaish.as_ref().unwrap().clone())
+                (kernel.documents.clone(), kernel.kaish.as_ref().unwrap().clone(), kernel.kernel.clone())
             };
+
+            // Link to context's long-running trace
+            let trace_id = {
+                let drift = kernel_arc.drift().read().await;
+                drift.trace_id_for_document(&cell_id).unwrap_or([0u8; 16])
+            };
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute").entered();
 
             // Document must exist — join_context is the sole creator
             if documents.get(&cell_id).is_none() {
@@ -2964,6 +2980,12 @@ impl kernel::Server for KernelImpl {
                     self.kernel_id
                 )));
             }
+        };
+        let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
+            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "push_ops").entered())
+        } else {
+            None
         };
 
         // Deserialize the CRDT ops
@@ -3648,6 +3670,9 @@ impl kernel::Server for KernelImpl {
             let label = label_owned.as_deref();
             let mut drift = kernel_arc.drift().write().await;
             drift.register(new_ctx_id, label, &new_doc_id, Some(parent_ctx_id));
+            // Link to the parent context's long-running trace
+            let trace_id = drift.get(parent_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_from_version").entered();
 
             // Return the new context ID
             results.get().set_context_id(new_ctx_id.as_bytes());
@@ -3710,7 +3735,9 @@ impl kernel::Server for KernelImpl {
                     format!("target context {} not found", target_ctx_id)
                 ))?;
             let target_doc_id = target_handle.document_id.clone();
+            let trace_id = target_handle.trace_id;
             drop(drift);
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "cherry_pick_block").entered();
 
             // Target document must exist
             if !documents.contains(&target_doc_id) {
@@ -3758,6 +3785,12 @@ impl kernel::Server for KernelImpl {
         let kernel_state = match state_ref.kernels.get(&kernel_id) {
             Some(ks) => ks,
             None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
+        };
+        let _ctx_span = if let Ok(drift) = kernel_state.kernel.drift().try_read() {
+            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_history").entered())
+        } else {
+            None
         };
 
         // Get the document (DashMap access is sync)
@@ -4029,10 +4062,13 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let drift_ref = kernel_arc.drift();
-            let source_model = {
+            let (source_model, trace_id) = {
                 let drift = drift_ref.read().await;
-                drift.get(source_ctx).and_then(|h| h.model.clone())
+                let model = drift.get(source_ctx).and_then(|h| h.model.clone());
+                let tid = drift.get(source_ctx).map(|h| h.trace_id).unwrap_or([0u8; 16]);
+                (model, tid)
             };
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_push").entered();
 
             if !summarize {
                 // Direct push — no LLM needed
@@ -4120,6 +4156,12 @@ impl kernel::Server for KernelImpl {
         };
 
         Promise::from_future(async move {
+            let trace_id = {
+                let drift = kernel_arc.drift().read().await;
+                drift.get(caller_ctx).map(|h| h.trace_id).unwrap_or([0u8; 16])
+            };
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_flush").entered();
+
             let mut drift = kernel_arc.drift().write().await;
             let staged = drift.drain(Some(caller_ctx));
             let count = staged.len() as u32;
@@ -4241,7 +4283,7 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
             let (kernel_arc, source_doc_id, source_model,
-                 target_docs, target_main_doc, target_ctx_id) = {
+                 target_docs, target_main_doc, target_ctx_id, trace_id) = {
                 let state_ref = state.borrow();
                 let ks = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
@@ -4253,10 +4295,12 @@ impl kernel::Server for KernelImpl {
                 let source_model = source_handle.model.clone();
 
                 let target_ctx_id = ks.context_id;
+                let trace_id = drift.get(target_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
 
                 (ks.kernel.clone(), source_doc_id, source_model,
-                 ks.documents.clone(), ks.main_document_id.clone(), target_ctx_id)
+                 ks.documents.clone(), ks.main_document_id.clone(), target_ctx_id, trace_id)
             };
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_pull").entered();
 
             // Get LLM provider from kernel's registry
             let provider = {
@@ -4345,7 +4389,7 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
             let (kernel_arc, source_doc_id, source_model,
-                 parent_ctx_id, parent_doc_id) = {
+                 parent_ctx_id, parent_doc_id, trace_id) = {
                 let state_ref = state.borrow();
                 let ks = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
@@ -4361,14 +4405,16 @@ impl kernel::Server for KernelImpl {
 
                 let source_doc_id = source_handle.document_id.clone();
                 let source_model = source_handle.model.clone();
+                let trace_id = source_handle.trace_id;
 
                 let parent_handle = drift.get(parent_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("parent context {} not found", parent_ctx_id)))?;
                 let parent_doc_id = parent_handle.document_id.clone();
 
                 (ks.kernel.clone(), source_doc_id, source_model,
-                 parent_ctx_id, parent_doc_id)
+                 parent_ctx_id, parent_doc_id, trace_id)
             };
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_merge").entered();
 
             // Get LLM provider from kernel's registry
             let provider = {
@@ -4776,6 +4822,12 @@ impl kernel::Server for KernelImpl {
                     self.kernel_id
                 )));
             }
+        };
+        let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
+            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            Some(kaijutsu_telemetry::context_root_span(&trace_id, "compact_document").entered())
+        } else {
+            None
         };
 
         match kernel.documents.compact_document(&document_id) {

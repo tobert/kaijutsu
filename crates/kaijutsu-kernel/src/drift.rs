@@ -71,6 +71,12 @@ pub struct ContextHandle {
     pub parent_id: Option<ContextId>,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at: u64,
+    /// Long-running OTel trace ID for this context.
+    ///
+    /// Generated at registration time. All RPC operations touching this
+    /// context become child spans under this trace ID, enabling
+    /// "show me everything that happened in context X" queries.
+    pub trace_id: [u8; 16],
 }
 
 impl ContextHandle {
@@ -125,6 +131,8 @@ pub struct DriftRouter {
     next_staged_id: u64,
     /// Reverse lookup: label → ContextId (for prefix matching).
     label_to_id: HashMap<String, ContextId>,
+    /// Reverse lookup: document_id → ContextId (for document-keyed RPCs).
+    doc_to_context: HashMap<String, ContextId>,
 }
 
 impl Default for DriftRouter {
@@ -141,6 +149,7 @@ impl DriftRouter {
             staging: Vec::new(),
             next_staged_id: 1,
             label_to_id: HashMap::new(),
+            doc_to_context: HashMap::new(),
         }
     }
 
@@ -158,6 +167,7 @@ impl DriftRouter {
         if let Some(l) = label {
             self.label_to_id.insert(l.to_string(), id);
         }
+        self.doc_to_context.insert(document_id.to_string(), id);
 
         let handle = ContextHandle {
             id,
@@ -168,6 +178,7 @@ impl DriftRouter {
             model: None,
             parent_id,
             created_at: now_epoch(),
+            trace_id: uuid::Uuid::new_v4().into_bytes(),
         };
 
         self.contexts.insert(id, handle);
@@ -180,6 +191,7 @@ impl DriftRouter {
             if let Some(label) = &handle.label {
                 self.label_to_id.remove(label);
             }
+            self.doc_to_context.remove(&handle.document_id);
         }
     }
 
@@ -264,6 +276,17 @@ impl DriftRouter {
         let mut contexts: Vec<_> = self.contexts.values().collect();
         contexts.sort_by_key(|c| c.created_at);
         contexts
+    }
+
+    /// Look up the ContextId for a document ID.
+    pub fn context_for_document(&self, document_id: &str) -> Option<ContextId> {
+        self.doc_to_context.get(document_id).copied()
+    }
+
+    /// Look up the trace_id for a document ID (convenience for document-keyed RPCs).
+    pub fn trace_id_for_document(&self, document_id: &str) -> Option<[u8; 16]> {
+        let ctx_id = self.doc_to_context.get(document_id)?;
+        self.contexts.get(ctx_id).map(|h| h.trace_id)
     }
 
     /// Stage a drift operation for later flush.
@@ -1624,5 +1647,63 @@ mod tests {
         let ids: Vec<_> = router.queue().iter().map(|s| s.id).collect();
         assert!(ids.contains(&id1));
         assert!(ids.contains(&id2));
+    }
+
+    #[test]
+    fn test_trace_id_generated() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("traced"), "doc-traced", None);
+
+        let handle = router.get(id).unwrap();
+        // trace_id should be non-zero (generated from UUIDv4)
+        assert_ne!(handle.trace_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn test_trace_ids_unique() {
+        let mut router = DriftRouter::new();
+        let a = ContextId::new();
+        let b = ContextId::new();
+        router.register(a, Some("alpha"), "doc-a", None);
+        router.register(b, Some("beta"), "doc-b", None);
+
+        let ta = router.get(a).unwrap().trace_id;
+        let tb = router.get(b).unwrap().trace_id;
+        assert_ne!(ta, tb);
+    }
+
+    #[test]
+    fn test_doc_to_context_reverse_lookup() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("main"), "doc-main", None);
+
+        assert_eq!(router.context_for_document("doc-main"), Some(id));
+        assert_eq!(router.context_for_document("doc-nonexistent"), None);
+    }
+
+    #[test]
+    fn test_trace_id_for_document() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("test"), "doc-test", None);
+
+        let trace_id = router.trace_id_for_document("doc-test");
+        assert!(trace_id.is_some());
+        assert_eq!(trace_id.unwrap(), router.get(id).unwrap().trace_id);
+
+        assert!(router.trace_id_for_document("doc-missing").is_none());
+    }
+
+    #[test]
+    fn test_unregister_cleans_doc_index() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("ephemeral"), "doc-eph", None);
+        assert!(router.context_for_document("doc-eph").is_some());
+
+        router.unregister(id);
+        assert!(router.context_for_document("doc-eph").is_none());
     }
 }

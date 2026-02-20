@@ -4,33 +4,25 @@
 //! distributed tracing across the Cap'n Proto SSH boundary, and a custom
 //! sampler with differentiated rates by span category.
 //!
-//! # Feature flag
-//!
-//! All OTel dependencies are behind the `telemetry` feature. Without it,
-//! the public API compiles to no-ops — `inject_trace_context` returns empty
-//! strings and `extract_trace_context` returns a detached span.
-//!
 //! # Activation
 //!
 //! OTel export activates when standard OTel environment variables are set:
 //!
 //! ```bash
 //! # Minimal — enables OTLP export to localhost:4317
-//! OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p kaijutsu-server --features telemetry
+//! OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -p kaijutsu-server
 //!
 //! # Full control
 //! OTEL_SERVICE_NAME=kaijutsu-server \
 //! OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 \
 //! OTEL_TRACES_EXPORTER=otlp \
-//! cargo run -p kaijutsu-server --features telemetry
+//! cargo run -p kaijutsu-server
 //! ```
 //!
 //! Set `OTEL_SDK_DISABLED=true` to explicitly disable even when the endpoint is set.
 
-#[cfg(feature = "telemetry")]
 mod otel;
 
-#[cfg(feature = "telemetry")]
 pub use otel::{otel_layer, OtelGuard};
 
 /// Check whether OTel export should be enabled.
@@ -65,29 +57,23 @@ pub fn otel_enabled() -> bool {
 /// Inject W3C Trace Context from the current tracing span.
 ///
 /// Returns `(traceparent, tracestate)` for propagation across the Cap'n Proto
-/// SSH boundary. Without the `telemetry` feature, returns empty strings.
+/// SSH boundary.
 pub fn inject_trace_context() -> (String, String) {
-    #[cfg(feature = "telemetry")]
-    {
-        otel::inject_trace_context_impl()
-    }
-    #[cfg(not(feature = "telemetry"))]
-    {
-        (String::new(), String::new())
-    }
+    otel::inject_trace_context_impl()
 }
 
 /// Extract W3C Trace Context and create a child span linked to the remote parent.
-///
-/// Without the `telemetry` feature, returns a disabled span (no-op).
 pub fn extract_trace_context(traceparent: &str, tracestate: &str) -> tracing::Span {
-    #[cfg(feature = "telemetry")]
-    {
-        otel::extract_trace_context_impl(traceparent, tracestate)
-    }
-    #[cfg(not(feature = "telemetry"))]
-    {
-        let _ = (traceparent, tracestate);
-        tracing::Span::none()
-    }
+    otel::extract_trace_context_impl(traceparent, tracestate)
+}
+
+/// Create a span under a long-running context trace.
+///
+/// Constructs a synthetic remote parent with the given trace ID so that all
+/// RPC operations touching a context share a single trace. The span name
+/// identifies the specific operation (e.g., "join_context", "push_ops").
+///
+/// Pass `[0u8; 16]` to get a detached span (no context trace linkage).
+pub fn context_root_span(trace_id: &[u8; 16], name: &'static str) -> tracing::Span {
+    otel::context_root_span_impl(trace_id, name)
 }

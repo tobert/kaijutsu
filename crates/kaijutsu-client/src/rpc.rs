@@ -177,6 +177,8 @@ pub struct ContextInfo {
     pub model: String,
     pub created_at: u64,
     pub document_id: String,
+    /// Long-running OTel trace ID for this context (16 bytes, or zeros if unavailable).
+    pub trace_id: [u8; 16],
 }
 
 #[derive(Debug, Clone)]
@@ -1272,6 +1274,15 @@ fn parse_context_info(
         None
     };
 
+    let trace_data = reader.get_trace_id()?;
+    let trace_id = if trace_data.len() == 16 {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(trace_data);
+        buf
+    } else {
+        [0u8; 16]
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -1280,6 +1291,7 @@ fn parse_context_info(
         model: reader.get_model()?.to_string()?,
         created_at: reader.get_created_at(),
         document_id: reader.get_document_id()?.to_string()?,
+        trace_id,
     })
 }
 
