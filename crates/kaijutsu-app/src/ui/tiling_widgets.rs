@@ -47,7 +47,7 @@ pub fn update_mode_widget(
     let color = match focus_area.as_ref() {
         FocusArea::Compose => theme.mode_chat,
         FocusArea::Conversation => theme.mode_normal,
-        FocusArea::EditingBlock { .. } => theme.mode_chat,
+        FocusArea::EditingBlock => theme.mode_chat,
         FocusArea::Constellation => theme.mode_visual,
         FocusArea::Dialog => theme.mode_shell,
     };
@@ -341,7 +341,7 @@ pub fn update_hints_widget(
     let hints = match focus_area.as_ref() {
         FocusArea::Compose => "Enter: submit │ Shift+Enter: newline │ Tab: navigate │ Esc: back │ :/`: shell prefix",
         FocusArea::Conversation => "j/k: navigate │ Tab: compose │ f: expand │ i: compose │ `: constellation │ Alt+hjkl: pane",
-        FocusArea::EditingBlock { .. } => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
+        FocusArea::EditingBlock => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
         FocusArea::Constellation => "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: compose │ +/-: zoom │ 0: reset",
         FocusArea::Dialog => "Enter: confirm │ Esc: cancel │ j/k: navigate",
     };

@@ -47,8 +47,6 @@ pub enum Action {
     ExpandBlock,
     /// Tab on thinking block — toggle collapse
     CollapseToggle,
-    /// Esc in expanded view — pop back
-    PopView,
 
     // ========================================================================
     // Scrolling

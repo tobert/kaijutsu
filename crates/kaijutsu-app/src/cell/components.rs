@@ -395,7 +395,6 @@ pub struct CellState {
 ///
 /// - `entity`: Which entity has keyboard focus (for cursor rendering, input routing)
 /// - `block_id`: Which block is focused for j/k navigation and reply workflows
-/// - `editing`: Whether the focused target is actively being edited
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
 pub struct FocusTarget {
@@ -404,8 +403,6 @@ pub struct FocusTarget {
     /// Block ID for navigation (j/k, reply workflows).
     #[reflect(ignore)]
     pub block_id: Option<BlockId>,
-    /// Whether actively editing the focused target.
-    pub editing: bool,
 }
 
 impl FocusTarget {
@@ -420,7 +417,6 @@ impl FocusTarget {
     pub fn clear(&mut self) {
         self.entity = None;
         self.block_id = None;
-        self.editing = false;
     }
 
     /// Set focus to a block (for j/k navigation).

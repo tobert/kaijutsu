@@ -80,32 +80,110 @@ pub fn handle_focus_compose(
     }
 }
 
+use crate::ui::state::ViewStack;
+
 /// Handle Unfocus action (Escape — context-dependent "go up").
 ///
-/// - EditingBlock → Conversation (stop editing)
-/// - Compose → Conversation (keep draft)
-/// - Constellation → Conversation + close constellation
-/// - Dialog → previous focus (handled by dialog system)
+/// Escape precedence:
+/// 1. FocusArea::Dialog → ignored (handled by dialog systems via FocusStack)
+/// 2. ViewStack overlay active → pop view, keep FocusArea
+/// 3. FocusArea::EditingBlock → clean up markers, FocusArea::Conversation
+/// 4. FocusArea::Compose → FocusArea::Conversation
+/// 5. FocusArea::Constellation → FocusArea::Conversation (visibility synced by render)
 pub fn handle_unfocus(
+    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
+    mut view_stack: ResMut<ViewStack>,
+    editing_cells: Query<Entity, With<EditingBlockCell>>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Unfocus) {
             continue;
         }
 
+        // 1. Dialogs handle their own Escape/Unfocus via FocusStack.
+        if matches!(*focus, FocusArea::Dialog) {
+            continue;
+        }
+
+        // 2. Pop ViewStack if an overlay view is active (ExpandedBlock, etc)
+        if !view_stack.is_at_root() {
+            info!("Escape: popping view stack");
+            view_stack.pop();
+            continue;
+        }
+
+        // 3. Normal focus transitions
         match focus.as_ref() {
-            FocusArea::EditingBlock { .. } | FocusArea::Compose => {
+            FocusArea::EditingBlock => {
+                // ECS Cleanup
+                for entity in editing_cells.iter() {
+                    commands.entity(entity).remove::<EditingBlockCell>();
+                    commands.entity(entity).remove::<BlockEditCursor>();
+                }
+                *focus = FocusArea::Conversation;
+            }
+            FocusArea::Compose => {
                 *focus = FocusArea::Conversation;
             }
             FocusArea::Constellation => {
                 // ConstellationVisible synced by enforce_constellation_focus_sync
                 *focus = FocusArea::Conversation;
             }
-            // Dialog handles its own close — don't interfere
-            FocusArea::Dialog => {}
             _ => {}
+        }
+    }
+}
+
+/// Handle Activate action in Navigation context (Enter on focused block → edit).
+pub fn handle_activate_navigation(
+    mut commands: Commands,
+    mut actions: MessageReader<ActionFired>,
+    mut focus: ResMut<FocusArea>,
+    focus_target: Res<FocusTarget>,
+    entities: Res<EditorEntities>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+) {
+    for ActionFired(action) in actions.read() {
+        if !matches!(action, Action::Activate) {
+            continue;
+        }
+
+        let Some(ref block_id) = focus_target.block_id else {
+            continue;
+        };
+
+        let Some(main_ent) = entities.main_cell else {
+            continue;
+        };
+        let Ok(editor) = main_cells.get(main_ent) else {
+            continue;
+        };
+        let Ok(container) = containers.get(main_ent) else {
+            continue;
+        };
+
+        // Only allow editing User Text blocks
+        let Some(block) = editor.doc.get_block_snapshot(block_id) else {
+            continue;
+        };
+
+        if block.role != kaijutsu_crdt::Role::User || block.kind != kaijutsu_crdt::BlockKind::Text {
+            warn!("Cannot edit block {:?}: only User Text blocks are editable", block_id);
+            continue;
+        }
+
+        if let Some(entity) = container.get_entity(block_id) {
+            info!("Entering edit mode for block {:?}", block_id);
+            
+            commands.entity(entity).insert((
+                EditingBlockCell,
+                BlockEditCursor { offset: block.content.len() },
+            ));
+
+            *focus = FocusArea::EditingBlock;
         }
     }
 }
@@ -212,7 +290,6 @@ enum NavigationDirection {
 pub fn handle_navigate_blocks(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
@@ -221,10 +298,6 @@ pub fn handle_navigate_blocks(
     mut scroll_state: ResMut<ConversationScrollState>,
     focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
-    if !matches!(*focus_area, FocusArea::Conversation) {
-        return;
-    }
-
     let mut direction: Option<NavigationDirection> = None;
 
     for ActionFired(action) in actions.read() {
@@ -335,16 +408,8 @@ fn scroll_to_block_visible(
 /// Prevents gamepad scroll leaking into dialogs or constellation.
 pub fn handle_scroll(
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
-    if !matches!(
-        *focus_area,
-        FocusArea::Conversation | FocusArea::Compose | FocusArea::EditingBlock { .. }
-    ) {
-        return;
-    }
-
     for ActionFired(action) in actions.read() {
         match action {
             Action::ScrollDelta(delta) => {
@@ -380,13 +445,9 @@ pub fn handle_scroll(
 /// Guarded to Conversation focus — ExpandBlock is Navigation-only.
 pub fn handle_expand_block(
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
     focus: Res<FocusTarget>,
     mut view_stack: ResMut<crate::ui::state::ViewStack>,
 ) {
-    if !matches!(*focus_area, FocusArea::Conversation) {
-        return;
-    }
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::ExpandBlock) {
             continue;
@@ -406,13 +467,9 @@ pub fn handle_expand_block(
 /// Guarded to Conversation focus — CollapseToggle is Navigation-only.
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
     focus: Res<FocusTarget>,
     mut cells: Query<(&mut CellEditor, &mut CellState)>,
 ) {
-    if !matches!(*focus_area, FocusArea::Conversation) {
-        return;
-    }
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::CollapseToggle) {
             continue;
@@ -458,17 +515,6 @@ pub fn handle_collapse_toggle(
     }
 }
 
-/// Handle PopView action (Esc in expanded view → pop back).
-pub fn handle_view_pop(
-    mut actions: MessageReader<ActionFired>,
-    mut view_stack: ResMut<crate::ui::state::ViewStack>,
-) {
-    for ActionFired(action) in actions.read() {
-        if matches!(action, Action::PopView) && !view_stack.is_at_root() {
-            view_stack.pop();
-        }
-    }
-}
 
 // ============================================================================
 // TILING PANE MANAGEMENT
@@ -570,10 +616,6 @@ pub fn handle_constellation_nav(
     new_ctx_config: Res<NewContextConfig>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
-    if !matches!(*focus, FocusArea::Constellation) {
-        return;
-    }
-
     for ActionFired(action) in actions.read() {
         match action {
             Action::SpatialNav(direction) => {
@@ -680,13 +722,9 @@ use crate::ui::timeline::{ForkRequest, TimelineState};
 /// Guarded to Conversation focus — timeline keys are Navigation-only.
 pub fn handle_timeline(
     mut actions: MessageReader<ActionFired>,
-    focus_area: Res<FocusArea>,
     mut timeline: ResMut<TimelineState>,
     mut fork_writer: MessageWriter<ForkRequest>,
 ) {
-    if !matches!(*focus_area, FocusArea::Conversation) {
-        return;
-    }
     for ActionFired(action) in actions.read() {
         match action {
             Action::TimelineStepBack => {
@@ -732,14 +770,9 @@ pub fn handle_timeline(
 pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
-    focus: Res<FocusArea>,
     mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
 ) {
-    if !matches!(*focus, FocusArea::Compose) {
-        return;
-    }
-
     let Ok(mut compose) = compose_blocks.single_mut() else {
         return;
     };
@@ -787,15 +820,10 @@ pub fn handle_compose_input(
 pub fn handle_block_edit_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
-    focus: Res<FocusArea>,
     entities: Res<EditorEntities>,
     mut main_cells: Query<&mut CellEditor, With<MainCell>>,
     mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
 ) {
-    if !matches!(*focus, FocusArea::EditingBlock { .. }) {
-        return;
-    }
-
     let Ok((block_cell, mut cursor)) = editing_cells.single_mut() else {
         return;
     };
@@ -909,5 +937,47 @@ pub fn handle_block_edit_input(
             }
             _ => {}
         }
+    }
+}
+
+// ============================================================================
+// DEFENSIVE CLEANUP
+// ============================================================================
+
+/// Safety net: remove EditingBlockCell/BlockEditCursor if FocusArea is not EditingBlock.
+/// 
+/// This prevents stale markers from accumulating due to logic bugs in transition handlers.
+/// Runs at the end of InputPhase::Handle so it catches anything the handlers missed.
+pub fn cleanup_stale_editing_markers(
+    mut commands: Commands,
+    focus_area: Res<FocusArea>,
+    editing_cells: Query<Entity, With<EditingBlockCell>>,
+) {
+    if matches!(*focus_area, FocusArea::EditingBlock) {
+        return; // Markers are valid
+    }
+    for entity in editing_cells.iter() {
+        commands.entity(entity).remove::<EditingBlockCell>();
+        commands.entity(entity).remove::<BlockEditCursor>();
+        trace!("Cleaned up stale EditingBlockCell on {:?}", entity);
+    }
+}
+
+/// Safety net: remove FocusedBlockCell if FocusArea is not suitable for navigation.
+/// 
+/// Prevents ghost highlights when focus switches to areas where j/k navigation
+/// is not active (Compose, Constellation, etc).
+pub fn cleanup_stale_focused_markers(
+    mut commands: Commands,
+    focus_area: Res<FocusArea>,
+    focused_markers: Query<Entity, With<FocusedBlockCell>>,
+) {
+    // Only valid in Conversation or EditingBlock (where it serves as an edit anchor)
+    if matches!(*focus_area, FocusArea::Conversation | FocusArea::EditingBlock) {
+        return;
+    }
+    for entity in focused_markers.iter() {
+        commands.entity(entity).remove::<FocusedBlockCell>();
+        debug!("Cleaned up stale FocusedBlockCell on {:?}", entity);
     }
 }

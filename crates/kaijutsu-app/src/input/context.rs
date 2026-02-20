@@ -58,7 +58,7 @@ pub fn sync_input_context(
     active.0.push(InputContext::Global);
 
     match focus.as_ref() {
-        FocusArea::Compose | FocusArea::EditingBlock { .. } => {
+        FocusArea::Compose | FocusArea::EditingBlock => {
             active.0.push(InputContext::TextInput);
         }
         FocusArea::Conversation => {

@@ -45,8 +45,8 @@ pub mod systems;
 
 // Re-export core types for ergonomic use.
 // FocusArea is consumed by cell, tiling_widgets, timeline, conversation, frame_assembly.
-// Others are pub API for future external consumers.
-pub use focus::{FocusArea, FocusStack};
+// others are pub API for future external consumers.
+pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use action::Action;
 #[allow(unused_imports)]
@@ -67,6 +67,8 @@ pub enum InputPhase {
     Dispatch,
     /// Handle actions (focus cycling, debug, etc.)
     Handle,
+    /// Defensive cleanup of stale state
+    Cleanup,
 }
 
 /// Plugin that registers the focus-based input dispatch system.
@@ -112,6 +114,7 @@ impl Plugin for InputPlugin {
                 InputPhase::SyncContext,
                 InputPhase::Dispatch.after(InputPhase::SyncContext),
                 InputPhase::Handle.after(InputPhase::Dispatch),
+                InputPhase::Cleanup.after(InputPhase::Handle),
             ),
         );
 
@@ -134,32 +137,42 @@ impl Plugin for InputPlugin {
         app.add_systems(
             Update,
             (
-                // Focus management
+                // Focus management (global)
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
                 systems::handle_unfocus,
                 systems::handle_toggle_constellation,
-                // App-level actions
+                // App-level actions (global)
                 systems::handle_quit,
                 systems::handle_debug_toggle,
                 systems::handle_screenshot,
-                // Block navigation + scroll
-                systems::handle_navigate_blocks,
-                systems::handle_scroll,
-                systems::handle_expand_block,
-                systems::handle_collapse_toggle,
-                systems::handle_view_pop,
-                // Tiling pane management
+                // Tiling pane management (global)
                 systems::handle_tiling,
-                // Timeline navigation
-                systems::handle_timeline,
-                // Constellation spatial nav
-                systems::handle_constellation_nav,
-                // Text input (compose + inline block editing)
-                systems::handle_compose_input,
-                systems::handle_block_edit_input,
+                // Navigation context
+                systems::handle_navigate_blocks.run_if(focus::in_conversation),
+                systems::handle_expand_block.run_if(focus::in_conversation),
+                systems::handle_collapse_toggle.run_if(focus::in_conversation),
+                systems::handle_timeline.run_if(focus::in_conversation),
+                systems::handle_activate_navigation.run_if(focus::in_conversation),
+                // Constellation context
+                systems::handle_constellation_nav.run_if(focus::in_constellation),
+                // Scrolling (multi-context)
+                systems::handle_scroll.run_if(focus::scroll_context_active),
+                // Text input contexts
+                systems::handle_compose_input.run_if(focus::in_compose),
+                systems::handle_block_edit_input.run_if(focus::in_editing_block),
             )
                 .in_set(InputPhase::Handle),
+        );
+
+        // Cleanup phase: defensive logic
+        app.add_systems(
+            Update,
+            (
+                systems::cleanup_stale_editing_markers,
+                systems::cleanup_stale_focused_markers,
+            )
+                .in_set(InputPhase::Cleanup),
         );
     }
 }

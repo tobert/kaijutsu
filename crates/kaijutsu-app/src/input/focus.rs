@@ -4,12 +4,29 @@
 //! from what has focus, not an explicit state machine.
 
 use bevy::prelude::*;
-use kaijutsu_crdt::BlockId;
 
 /// Modal focus stack — push when opening a modal, pop when closing.
 ///
-/// Replaces the old `ModalDialogOpen` + `DialogPreviousFocus` pair with a proper
-/// stack that supports nested modals and correct focus restoration.
+/// ## Two-Stack Architecture
+///
+/// Kaijutsu has two independent stacks that work together:
+///
+/// ### FocusStack (Modal Overlay Focus)
+/// Manages keyboard focus for modal dialogs (model picker, create context).
+/// - `push()`: Save current FocusArea, switch to Dialog
+/// - `pop()`: Restore previous FocusArea
+/// - Used by: model_picker, create_dialog
+///
+/// ### ViewStack (Content Navigation)
+/// Manages which content view is displayed (conversation, expanded block, etc.).
+/// - `push()`: Show overlay view (ExpandedBlock)
+/// - `pop()`: Return to previous view
+/// - Used by: handle_expand_block, handle_unfocus (Escape)
+///
+/// They are orthogonal:
+/// - FocusStack is about *who gets keyboard input*
+/// - ViewStack is about *what content is visible*
+/// - A dialog (FocusStack) can be open over an expanded block (ViewStack)
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
 pub struct FocusStack(pub Vec<FocusArea>);
@@ -37,6 +54,44 @@ impl FocusStack {
     }
 }
 
+// ============================================================================
+// RUN CONDITIONS
+// ============================================================================
+
+/// System run condition: FocusArea is Conversation.
+pub fn in_conversation(focus: Res<FocusArea>) -> bool {
+    matches!(*focus, FocusArea::Conversation)
+}
+
+/// System run condition: FocusArea is Compose.
+pub fn in_compose(focus: Res<FocusArea>) -> bool {
+    matches!(*focus, FocusArea::Compose)
+}
+
+/// System run condition: FocusArea is EditingBlock.
+pub fn in_editing_block(focus: Res<FocusArea>) -> bool {
+    matches!(*focus, FocusArea::EditingBlock)
+}
+
+/// System run condition: FocusArea is Constellation.
+pub fn in_constellation(focus: Res<FocusArea>) -> bool {
+    matches!(*focus, FocusArea::Constellation)
+}
+
+/// System run condition: any text input mode (Compose or EditingBlock).
+#[allow(dead_code)]
+pub fn in_text_input(focus: Res<FocusArea>) -> bool {
+    focus.is_text_input()
+}
+
+/// System run condition: FocusArea allows conversation scrolling.
+pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
+    matches!(
+        *focus,
+        FocusArea::Conversation | FocusArea::Compose | FocusArea::EditingBlock
+    )
+}
+
 /// What area of the UI currently has keyboard focus.
 ///
 /// This is the single source of truth for "what should keyboard input do?"
@@ -51,11 +106,7 @@ pub enum FocusArea {
     /// Conversation block list. j/k navigates, Enter/i activates, f expands.
     Conversation,
     /// Inline editing of an existing block (User Text blocks only).
-    EditingBlock {
-        /// The block being edited (not reflected — BlockId has no Default)
-        #[reflect(ignore)]
-        block_id: Option<BlockId>,
-    },
+    EditingBlock,
     /// Constellation node graph. hjkl spatial nav, Enter switches context.
     #[default]
     Constellation,
@@ -64,17 +115,9 @@ pub enum FocusArea {
 }
 
 impl FocusArea {
-    /// Create an EditingBlock focus with a block ID.
-    #[allow(dead_code)] // Used when inline block editing is wired up
-    pub fn editing(block_id: BlockId) -> Self {
-        FocusArea::EditingBlock {
-            block_id: Some(block_id),
-        }
-    }
-
     /// Check if focus is on text input (Compose or EditingBlock).
     pub fn is_text_input(&self) -> bool {
-        matches!(self, FocusArea::Compose | FocusArea::EditingBlock { .. })
+        matches!(self, FocusArea::Compose | FocusArea::EditingBlock)
     }
 
     /// Check if focus is on navigation (Conversation blocks).
@@ -83,21 +126,12 @@ impl FocusArea {
         matches!(self, FocusArea::Conversation)
     }
 
-    /// Get the block ID if editing a block.
-    #[allow(dead_code)] // Used when inline block editing is wired up
-    pub fn editing_block_id(&self) -> Option<&BlockId> {
-        match self {
-            FocusArea::EditingBlock { block_id } => block_id.as_ref(),
-            _ => None,
-        }
-    }
-
     /// Human-readable name for the current focus area (for hint widget).
     pub fn name(&self) -> &'static str {
         match self {
             FocusArea::Compose => "COMPOSE",
             FocusArea::Conversation => "NAVIGATE",
-            FocusArea::EditingBlock { .. } => "EDITING",
+            FocusArea::EditingBlock => "EDITING",
             FocusArea::Constellation => "CONSTELLATION",
             FocusArea::Dialog => "DIALOG",
         }
