@@ -19,6 +19,8 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use kaijutsu_kernel::McpServerPool;
+
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
 use crate::rpc::{ServerState, WorldImpl};
@@ -175,6 +177,81 @@ impl SshServer {
         Self { config }
     }
 
+    /// Spawn a background task to pre-initialize MCP servers from mcp.rhai.
+    ///
+    /// This runs concurrently with the SSH accept loop so server startup
+    /// isn't blocked by slow MCP servers (e.g. streamable_http with no listener).
+    fn start_mcp_initialization(
+        pool: Arc<McpServerPool>,
+        config_dir: Option<PathBuf>,
+    ) {
+        let config_path = config_dir
+            .unwrap_or_else(|| {
+                kaish_kernel::xdg_config_home().join("kaijutsu")
+            })
+            .join("mcp.rhai");
+
+        tokio::spawn(async move {
+            let script = match tokio::fs::read_to_string(&config_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("Failed to read {}: {}", config_path.display(), e);
+                    }
+                    return;
+                }
+            };
+
+            let config = match kaijutsu_kernel::load_mcp_config(&script) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Failed to parse mcp.rhai: {}", e);
+                    return;
+                }
+            };
+
+            if config.servers.is_empty() {
+                return;
+            }
+
+            log::info!(
+                "Pre-initializing {} MCP servers from {}",
+                config.servers.len(),
+                config_path.display(),
+            );
+
+            let timeout = std::time::Duration::from_secs(5);
+            let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
+                let pool = pool.clone();
+                let name = server_config.name.clone();
+                async move {
+                    match tokio::time::timeout(timeout, pool.register(server_config)).await {
+                        Ok(Ok(info)) => {
+                            log::info!(
+                                "MCP server '{}' pre-initialized ({} tools)",
+                                name,
+                                info.tools.len(),
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!("MCP server '{}' failed to pre-initialize: {}", name, e);
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "MCP server '{}' timed out during pre-initialization ({}s)",
+                                name,
+                                timeout.as_secs(),
+                            );
+                        }
+                    }
+                }
+            }).collect();
+
+            futures::future::join_all(futs).await;
+            log::info!("MCP pre-initialization complete");
+        });
+    }
+
     /// Run the SSH server
     pub async fn run(&self) -> Result<(), std::io::Error> {
         // Load or generate the host key
@@ -203,7 +280,11 @@ impl SshServer {
         }
 
         let config = russh::server::Config {
-            auth_rejection_time: std::time::Duration::from_secs(1),
+            // 100ms delay on rejected keys (after the first, which is 0ms).
+            // This is a local dev server bound to 127.0.0.1 — brute-force
+            // timing attack defense is unnecessary, and 1s per rejected agent
+            // key adds painful latency during SSH agent enumeration.
+            auth_rejection_time: std::time::Duration::from_millis(100),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
             keys: vec![host_key],
             ..Default::default()
@@ -216,10 +297,16 @@ impl SshServer {
             log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
         }
 
+        // Create shared MCP server pool and pre-initialize from config.
+        // This avoids blocking each client's attach_kernel on MCP server startup.
+        let mcp_pool = Arc::new(McpServerPool::new());
+        Self::start_mcp_initialization(mcp_pool.clone(), self.config.config_dir.clone());
+
         let mut server = Server {
             auth_db: Arc::new(Mutex::new(auth_db)),
             allow_anonymous,
             config_dir: self.config.config_dir.clone(),
+            mcp_pool,
         };
         let socket = TcpListener::bind(self.config.bind_addr).await?;
 
@@ -235,13 +322,21 @@ struct Server {
     auth_db: Arc<Mutex<AuthDb>>,
     allow_anonymous: bool,
     config_dir: Option<PathBuf>,
+    /// Shared MCP server pool (pre-initialized at server startup)
+    mcp_pool: Arc<McpServerPool>,
 }
 
 impl server::Server for Server {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        ConnectionHandler::new(self.auth_db.clone(), peer_addr, self.allow_anonymous, self.config_dir.clone())
+        ConnectionHandler::new(
+            self.auth_db.clone(),
+            peer_addr,
+            self.allow_anonymous,
+            self.config_dir.clone(),
+            self.mcp_pool.clone(),
+        )
     }
 
     fn handle_session_error(&mut self, error: <Self::Handler as server::Handler>::Error) {
@@ -264,27 +359,46 @@ struct ConnectionHandler {
     allow_anonymous: bool,
     identity: Option<Identity>,
     config_dir: Option<PathBuf>,
+    /// Shared MCP server pool (pre-initialized at server startup)
+    mcp_pool: Arc<McpServerPool>,
+    /// Channel index counter — only channel 1 (RPC) gets a handler thread
+    channel_count: u32,
 }
 
 impl ConnectionHandler {
-    fn new(auth_db: Arc<Mutex<AuthDb>>, peer_addr: Option<SocketAddr>, allow_anonymous: bool, config_dir: Option<PathBuf>) -> Self {
+    fn new(
+        auth_db: Arc<Mutex<AuthDb>>,
+        peer_addr: Option<SocketAddr>,
+        allow_anonymous: bool,
+        config_dir: Option<PathBuf>,
+        mcp_pool: Arc<McpServerPool>,
+    ) -> Self {
         Self {
             auth_db,
             peer_addr,
             allow_anonymous,
             identity: None,
             config_dir,
+            mcp_pool,
+            channel_count: 0,
         }
     }
 }
 
 /// Run Cap'n Proto RPC over an SSH channel stream
-async fn run_rpc(stream: russh::ChannelStream<Msg>, identity: Identity, config_dir: Option<PathBuf>) {
+async fn run_rpc(
+    stream: russh::ChannelStream<Msg>,
+    identity: Identity,
+    config_dir: Option<PathBuf>,
+    mcp_pool: Arc<McpServerPool>,
+) {
     let stream = stream.compat();
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
     // Use nick as the username for RPC state
-    let state = Rc::new(RefCell::new(ServerState::new(identity.nick.clone(), config_dir)));
+    let mut server_state = ServerState::new(identity.nick.clone(), config_dir);
+    server_state.mcp_pool = mcp_pool;
+    let state = Rc::new(RefCell::new(server_state));
     let world = WorldImpl::new(state);
     let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
 
@@ -334,15 +448,33 @@ impl server::Handler for ConnectionHandler {
             }
         };
 
+        let channel_index = self.channel_count;
+        self.channel_count += 1;
+
         log::info!(
-            "Channel {} opened for {} ({})",
+            "Channel {} (index {}) opened for {} ({})",
             channel.id(),
+            channel_index,
             identity.nick,
             identity.display_name
         );
 
+        // Only channel 1 (RPC) gets a handler thread. Channels 0 (control)
+        // and 2 (events) are accepted but don't need their own RPC system —
+        // they're retained by the client to keep the SSH connection alive.
+        if channel_index != 1 {
+            log::debug!(
+                "Channel {} (index {}) accepted without RPC handler",
+                channel.id(),
+                channel_index,
+            );
+            // Channel is kept alive by the SSH session; no thread needed.
+            return Ok(true);
+        }
+
         let stream = channel.into_stream();
         let config_dir = self.config_dir.clone();
+        let mcp_pool = self.mcp_pool.clone();
 
         // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet)
         std::thread::spawn(move || {
@@ -352,7 +484,7 @@ impl server::Handler for ConnectionHandler {
                 .expect("Failed to create tokio runtime for RPC");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                run_rpc(stream, identity, config_dir).await;
+                run_rpc(stream, identity, config_dir, mcp_pool).await;
             });
         });
 

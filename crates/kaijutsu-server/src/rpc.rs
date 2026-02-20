@@ -467,32 +467,63 @@ async fn initialize_kernel_mcp(
         return;
     }
 
-    log::info!("Registering {} MCP servers from mcp.rhai", config.servers.len());
+    // Check which servers are already pre-initialized in the shared pool
+    let already_registered = mcp_pool.list_servers();
 
-    // Launch all servers concurrently with per-server timeout
+    log::info!(
+        "Registering MCP servers from mcp.rhai ({} configured, {} already in pool)",
+        config.servers.len(),
+        already_registered.len(),
+    );
+
+    // For servers already in the pool (pre-initialized at server startup),
+    // just register their tools with this kernel. For new servers, do full
+    // registration including process spawn.
     let timeout = std::time::Duration::from_secs(5);
     let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
         let pool = mcp_pool.clone();
         let kernel = kernel.clone();
         let name = server_config.name.clone();
+        let is_pre_registered = already_registered.contains(&name);
         async move {
-            match tokio::time::timeout(timeout, pool.register(server_config)).await {
-                Ok(Ok(info)) => {
-                    let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
-                    for (qualified_name, engine) in tools {
-                        let desc = engine.description().to_string();
-                        kernel.register_tool_with_engine(
-                            ToolInfo::new(&qualified_name, &desc, "mcp"),
-                            engine,
-                        ).await;
+            if is_pre_registered {
+                // Server already running — just get its info and register tools
+                match pool.get_server_info(&name).await {
+                    Ok(info) => {
+                        let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
+                        for (qualified_name, engine) in tools {
+                            let desc = engine.description().to_string();
+                            kernel.register_tool_with_engine(
+                                ToolInfo::new(&qualified_name, &desc, "mcp"),
+                                engine,
+                            ).await;
+                        }
+                        log::info!("MCP server '{}' tools registered from pool ({} tools)", name, info.tools.len());
                     }
-                    log::info!("MCP server '{}' registered ({} tools)", name, info.tools.len());
+                    Err(e) => {
+                        log::warn!("MCP server '{}' in pool but get_server_info failed: {}", name, e);
+                    }
                 }
-                Ok(Err(e)) => {
-                    log::warn!("MCP server '{}' failed to register: {}", name, e);
-                }
-                Err(_) => {
-                    log::warn!("MCP server '{}' timed out during registration ({}s)", name, timeout.as_secs());
+            } else {
+                // Server not in pool yet — full registration with timeout
+                match tokio::time::timeout(timeout, pool.register(server_config)).await {
+                    Ok(Ok(info)) => {
+                        let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
+                        for (qualified_name, engine) in tools {
+                            let desc = engine.description().to_string();
+                            kernel.register_tool_with_engine(
+                                ToolInfo::new(&qualified_name, &desc, "mcp"),
+                                engine,
+                            ).await;
+                        }
+                        log::info!("MCP server '{}' registered ({} tools)", name, info.tools.len());
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("MCP server '{}' failed to register: {}", name, e);
+                    }
+                    Err(_) => {
+                        log::warn!("MCP server '{}' timed out during registration ({}s)", name, timeout.as_secs());
+                    }
                 }
             }
         }

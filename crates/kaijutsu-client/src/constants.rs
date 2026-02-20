@@ -18,3 +18,8 @@ pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// SSH keep-alive max retries.
 pub const SSH_KEEPALIVE_MAX: usize = 3;
+
+/// Timeout for the entire connect_ssh → attach_kernel → join_context sequence.
+/// Prevents the actor from hanging indefinitely on SYN blackholes or stalled
+/// servers. 10 seconds is generous for a local SSH connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

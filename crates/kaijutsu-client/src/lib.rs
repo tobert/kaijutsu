@@ -42,6 +42,10 @@ pub async fn connect_ssh(config: SshConfig) -> Result<RpcClient, ConnectError> {
     let rpc_stream = channels.rpc.into_stream();
     let mut client = RpcClient::new(rpc_stream).await?;
     client.retain_ssh_channels(control, events);
+    // Retain the SSH session handle for clean disconnect and keepalive.
+    // Without this, the Handle<ClientHandler> is dropped and no
+    // SSH_MSG_DISCONNECT can be sent for graceful shutdown.
+    client.retain_ssh_session(ssh);
     Ok(client)
 }
 

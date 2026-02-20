@@ -637,11 +637,16 @@ impl RpcActor {
 
         // Check backoff cooldown — reject immediately if we're in a cooldown period
         if let Some(next_at) = self.next_reconnect_at {
-            if tokio::time::Instant::now() < next_at {
-                return Err(ActorError::ConnectionLost(format!(
-                    "reconnect backoff (attempt {}, waiting)",
+            let now = tokio::time::Instant::now();
+            if now < next_at {
+                let remaining = (next_at - now).as_secs_f64();
+                let msg = format!(
+                    "reconnect backoff (attempt {}, {remaining:.1}s remaining)",
                     self.reconnect_attempts,
-                )));
+                );
+                log::warn!("{msg}");
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                return Err(ActorError::ConnectionLost(msg));
             }
         }
 
@@ -683,7 +688,24 @@ impl RpcActor {
     }
 
     /// Attempt SSH connect → attach_kernel → join_context → subscriptions.
+    ///
+    /// The entire sequence is wrapped in a timeout to prevent hanging on
+    /// SYN blackholes or stalled servers.
     async fn try_connect(&mut self) -> Result<(), ActorError> {
+        use crate::constants::CONNECT_TIMEOUT;
+
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.try_connect_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                let msg = format!("connect timeout ({}s)", CONNECT_TIMEOUT.as_secs());
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                Err(ActorError::ConnectionLost(msg))
+            }
+        }
+    }
+
+    /// Inner connect logic (separated so try_connect can wrap with timeout).
+    async fn try_connect_inner(&mut self) -> Result<(), ActorError> {
         let client = connect_ssh(self.config.clone())
             .await
             .map_err(|e| {

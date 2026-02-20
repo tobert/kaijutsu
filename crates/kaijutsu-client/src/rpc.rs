@@ -24,6 +24,10 @@ pub struct RpcClient {
     /// These are unused but must stay alive for the connection's lifetime.
     #[allow(dead_code)]
     retained_channels: Option<std::sync::Arc<(russh::Channel<Msg>, russh::Channel<Msg>)>>,
+    /// Retained SSH session for clean disconnect and keepalive.
+    /// Without this, no SSH_MSG_DISCONNECT can be sent on shutdown.
+    #[allow(dead_code)]
+    ssh_session: Option<std::rc::Rc<std::cell::RefCell<crate::ssh::SshClient>>>,
 }
 
 impl RpcClient {
@@ -57,7 +61,7 @@ impl RpcClient {
         // Spawn the RPC system to run in the background (requires LocalSet)
         tokio::task::spawn_local(rpc_system);
 
-        Ok(Self { world, retained_channels: None })
+        Ok(Self { world, retained_channels: None, ssh_session: None })
     }
 
     /// Retain SSH channels to prevent them from being dropped (which closes them).
@@ -67,6 +71,11 @@ impl RpcClient {
         events: russh::Channel<Msg>,
     ) {
         self.retained_channels = Some(std::sync::Arc::new((control, events)));
+    }
+
+    /// Retain the SSH session handle for clean disconnect and keepalive.
+    pub fn retain_ssh_session(&mut self, ssh: crate::ssh::SshClient) {
+        self.ssh_session = Some(std::rc::Rc::new(std::cell::RefCell::new(ssh)));
     }
 
     /// Get current identity from the server
