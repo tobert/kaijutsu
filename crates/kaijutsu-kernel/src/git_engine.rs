@@ -497,6 +497,7 @@ impl ExecutionEngine for GitEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.git")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let parsed: serde_json::Value = match serde_json::from_str(params) {
             Ok(v) => v,

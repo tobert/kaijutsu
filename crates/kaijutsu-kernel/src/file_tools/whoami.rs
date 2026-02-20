@@ -43,6 +43,7 @@ impl ExecutionEngine for WhoamiEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, _params), name = "engine.whoami")]
     async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
         let router = self.drift_router.read().await;
 

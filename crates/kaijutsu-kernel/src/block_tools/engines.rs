@@ -318,6 +318,7 @@ impl ExecutionEngine for BlockCreateEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_create")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockCreateParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -403,6 +404,7 @@ impl ExecutionEngine for BlockAppendEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_append")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockAppendParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -603,6 +605,7 @@ impl ExecutionEngine for BlockEditEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_edit")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockEditParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -700,6 +703,7 @@ impl ExecutionEngine for BlockSpliceEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_splice")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockSpliceParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -821,6 +825,7 @@ impl ExecutionEngine for BlockReadEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_read")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockReadParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -966,6 +971,7 @@ impl ExecutionEngine for BlockSearchEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_search")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -1109,6 +1115,7 @@ impl ExecutionEngine for BlockListEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_list")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockListParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -1195,6 +1202,7 @@ impl ExecutionEngine for BlockStatusEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.block_status")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: BlockStatusParams = match serde_json::from_str(params) {
             Ok(p) => p,
@@ -1401,6 +1409,7 @@ impl ExecutionEngine for KernelSearchEngine {
         Some(Self::schema())
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.kernel_search")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let params: KernelSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,

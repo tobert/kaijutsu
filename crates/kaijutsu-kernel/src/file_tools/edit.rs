@@ -65,6 +65,7 @@ impl ExecutionEngine for EditEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.edit")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: EditParams = match serde_json::from_str(params) {
             Ok(v) => v,

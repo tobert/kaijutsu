@@ -5,7 +5,7 @@ edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
 [features]
-default = []
+default = ["telemetry"]
 telemetry = ["kaijutsu-telemetry/telemetry"]
 
 [dependencies]

@@ -103,7 +103,12 @@ start_watch() {
     pkill -f "target/$PROFILE/kaijutsu-app" 2>/dev/null || true
     sleep 0.5
 
-    RUST_LOG="${RUST_LOG:-debug,wgpu=warn}" \
+    export RUST_LOG="${RUST_LOG:-debug,wgpu=warn}"
+    # Always include http:// scheme — tonic gRPC requires it
+    export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+    export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}"
+    export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-kaijutsu-app}"
+
     cargo watch \
         -x "run -p kaijutsu-app $CARGO_PROFILE_FLAG" \
         -w crates/kaijutsu-app \

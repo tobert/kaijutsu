@@ -1863,6 +1863,7 @@ impl ExecutionEngine for McpToolEngine {
         Some(self.input_schema.clone())
     }
 
+    #[tracing::instrument(skip(self, code), name = "engine.mcp_tool")]
     async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
         // Parse the input as JSON
         let arguments: JsonValue = if code.trim().is_empty() {

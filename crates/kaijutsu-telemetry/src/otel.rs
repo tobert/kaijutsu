@@ -13,8 +13,13 @@ use opentelemetry_sdk::Resource;
 use tracing_opentelemetry::OpenTelemetryLayer;
 
 /// Guard that shuts down the OTel tracer provider on drop, flushing pending spans.
+/// Also keeps the Tokio runtime alive when one was created for tonic channel setup
+/// (e.g. in the Bevy app which doesn't have its own Tokio runtime at init time).
 pub struct OtelGuard {
     provider: SdkTracerProvider,
+    // Order matters: enter guard must drop before runtime
+    _runtime_enter: Option<tokio::runtime::EnterGuard<'static>>,
+    _runtime: Option<&'static tokio::runtime::Runtime>,
 }
 
 impl Drop for OtelGuard {
@@ -35,10 +40,32 @@ pub fn otel_layer<S>(
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .build()
-        .expect("failed to build OTLP exporter");
+    // Tonic needs a Tokio runtime for channel setup and ongoing gRPC exports.
+    // The server already has one, but the Bevy app doesn't when main() starts.
+    // Create a dedicated runtime, leak it (lives for the process), and enter it
+    // so that BatchSpanProcessor's tokio::spawn calls succeed.
+    let (exporter, runtime_ref, enter_guard) = match tokio::runtime::Handle::try_current() {
+        Ok(_handle) => {
+            let exp = SpanExporter::builder()
+                .with_tonic()
+                .build()
+                .expect("failed to build OTLP exporter");
+            (exp, None, None)
+        }
+        Err(_) => {
+            let rt: &'static tokio::runtime::Runtime =
+                Box::leak(Box::new(tokio::runtime::Runtime::new()
+                    .expect("failed to create OTel tokio runtime")));
+            let guard = rt.enter();
+            let exp = rt.block_on(async {
+                SpanExporter::builder()
+                    .with_tonic()
+                    .build()
+                    .expect("failed to build OTLP exporter")
+            });
+            (exp, Some(rt), Some(guard))
+        }
+    };
 
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
@@ -56,7 +83,7 @@ where
     let tracer = provider.tracer("kaijutsu");
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    (layer, OtelGuard { provider })
+    (layer, OtelGuard { provider, _runtime_enter: enter_guard, _runtime: runtime_ref })
 }
 
 // ============================================================================

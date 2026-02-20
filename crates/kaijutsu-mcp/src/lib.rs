@@ -480,6 +480,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Create a new document for collaborative editing. Documents contain blocks of content organized in a DAG structure.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.doc_create")]
     fn doc_create(&self, Parameters(req): Parameters<DocCreateRequest>) -> String {
         let kind = match parse_document_kind(&req.kind) {
             Some(k) => k,
@@ -497,6 +498,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "List all documents in the kernel with their metadata and block counts.")]
+    #[tracing::instrument(skip(self), name = "mcp.doc_list")]
     fn doc_list(&self) -> String {
         let docs: Vec<DocumentInfo> = self.store().list_ids().iter().map(|id| {
             let (kind, language, block_count) = self.store().get(id)
@@ -523,6 +525,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Delete a document and all its blocks.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.doc_delete")]
     fn doc_delete(&self, Parameters(req): Parameters<DocDeleteRequest>) -> String {
         match self.store().delete_document(&req.id) {
             Ok(()) => serde_json::json!({
@@ -538,6 +541,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_create")]
     fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
         let role = match parse_role(&req.role) {
             Some(r) => r,
@@ -578,6 +582,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
     fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -648,6 +653,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_append")]
     fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -670,6 +676,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_edit")]
     fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -769,6 +776,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "List blocks with optional filters for document, kind, status, and role.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_list")]
     fn block_list(&self, Parameters(req): Parameters<BlockListRequest>) -> String {
         let kind_filter = req.kind.as_ref().and_then(|k| parse_block_kind(k));
         let status_filter = req.status.as_ref().and_then(|s| parse_status(s));
@@ -846,6 +854,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Set the status of a block: pending, running, done, or error.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_status")]
     fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -877,6 +886,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Search across all blocks using regex patterns. Returns matches with context lines.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.kernel_search")]
     fn kernel_search(&self, Parameters(req): Parameters<KernelSearchRequest>) -> String {
         let regex = match Regex::new(&req.query) {
             Ok(r) => r,
@@ -970,6 +980,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.doc_tree")]
     fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
         let entry = match self.store().get(&req.document_id) {
             Some(e) => e,
@@ -997,6 +1008,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
     fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -1045,6 +1057,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Get version history information for a block. Shows creation time and current version details.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
     fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -1088,6 +1101,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
     fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
         let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
@@ -1225,6 +1239,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush.")]
+    #[tracing::instrument(skip(self), name = "mcp.drift_queue")]
     async fn drift_queue(&self) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1256,6 +1271,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Cancel a staged drift by its ID.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.drift_cancel")]
     async fn drift_cancel(&self, Parameters(req): Parameters<DriftCancelRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
@@ -1467,6 +1483,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.")]
+    #[tracing::instrument(skip(self), name = "mcp.whoami")]
     async fn whoami(&self) -> String {
         let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
 
@@ -1509,6 +1526,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.doc_undo")]
     fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {
         let entry = match self.store().get(&req.document_id) {
             Some(e) => e,

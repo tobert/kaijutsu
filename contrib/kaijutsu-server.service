@@ -5,13 +5,16 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'export ANTHROPIC_API_KEY=$(cat %h/.anthropic-key.txt) && exec cargo run --release -p kaijutsu-server --manifest-path %h/src/kaijutsu/Cargo.toml'
+ExecStart=/bin/bash -c 'export ANTHROPIC_API_KEY=$(< %h/.anthropic-key.txt) && exec %h/src/kaijutsu/target/debug/kaijutsu-server'
 WorkingDirectory=%h/src/kaijutsu
 Restart=on-failure
 RestartSec=5
 
 # Environment
 Environment=RUST_LOG=info
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+Environment=OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+Environment=OTEL_SERVICE_NAME=kaijutsu-server
 
 [Install]
 WantedBy=default.target

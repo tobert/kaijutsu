@@ -147,6 +147,7 @@ impl DriftRouter {
     /// Register a context with a pre-assigned ContextId.
     ///
     /// The caller (server RPC) creates the ContextId and passes it in.
+    #[tracing::instrument(skip(self, document_id), name = "drift.register")]
     pub fn register(
         &mut self,
         id: ContextId,
@@ -173,6 +174,7 @@ impl DriftRouter {
     }
 
     /// Unregister a context (e.g., when a context is destroyed).
+    #[tracing::instrument(skip(self), name = "drift.unregister")]
     pub fn unregister(&mut self, id: ContextId) {
         if let Some(handle) = self.contexts.remove(&id) {
             if let Some(label) = &handle.label {
@@ -192,6 +194,7 @@ impl DriftRouter {
     }
 
     /// Rename a context's label.
+    #[tracing::instrument(skip(self), name = "drift.rename")]
     pub fn rename(&mut self, id: ContextId, new_label: Option<&str>) -> Result<(), DriftError> {
         let handle = self.contexts.get_mut(&id)
             .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
@@ -318,6 +321,7 @@ impl DriftRouter {
     ///
     /// The caller is responsible for injecting blocks into target documents.
     /// Failed items should be returned via [`requeue`](Self::requeue).
+    #[tracing::instrument(skip(self), name = "drift.drain")]
     pub fn drain(&mut self, for_context: Option<ContextId>) -> Vec<StagedDrift> {
         match for_context {
             None => std::mem::take(&mut self.staging),
@@ -565,6 +569,7 @@ impl ExecutionEngine for DriftLsEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, _params), name = "engine.drift_ls")]
     async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
         let kernel = match drift_kernel(&self.kernel) {
             Ok(k) => k,

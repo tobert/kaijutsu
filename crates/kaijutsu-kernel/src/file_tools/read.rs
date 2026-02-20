@@ -59,6 +59,7 @@ impl ExecutionEngine for ReadEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.read")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: ReadParams = match serde_json::from_str(params) {
             Ok(v) => v,

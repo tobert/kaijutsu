@@ -251,11 +251,13 @@ impl ActorHandle {
     }
 
     /// View the drift staging queue.
+    #[tracing::instrument(skip(self))]
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, ActorError> {
         self.send(|reply| RpcCommand::DriftQueue { reply }).await
     }
 
     /// Cancel a staged drift.
+    #[tracing::instrument(skip(self))]
     pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::DriftCancel { staged_id, reply }).await
     }
@@ -281,21 +283,25 @@ impl ActorHandle {
     // ── Context ──────────────────────────────────────────────────────────
 
     /// Get this kernel's context ID and label.
+    #[tracing::instrument(skip(self))]
     pub async fn get_context_id(&self) -> Result<(ContextId, String), ActorError> {
         self.send(|reply| RpcCommand::GetContextId { reply }).await
     }
 
     /// List all contexts in this kernel (includes drift info).
+    #[tracing::instrument(skip(self))]
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, ActorError> {
         self.send(|reply| RpcCommand::ListContexts { reply }).await
     }
 
     /// Create a new context with an optional label.
+    #[tracing::instrument(skip(self))]
     pub async fn create_context(&self, label: &str) -> Result<ContextId, ActorError> {
         self.send(|reply| RpcCommand::CreateContext { label: label.into(), reply }).await
     }
 
     /// Attach a document to a context.
+    #[tracing::instrument(skip(self))]
     pub async fn attach_document(
         &self,
         context_id: ContextId,
@@ -307,6 +313,7 @@ impl ActorHandle {
     }
 
     /// Detach a document from a context.
+    #[tracing::instrument(skip(self))]
     pub async fn detach_document(
         &self,
         context_id: ContextId,
@@ -320,6 +327,7 @@ impl ActorHandle {
     // ── CRDT Sync ────────────────────────────────────────────────────────
 
     /// Push CRDT operations to the server.
+    #[tracing::instrument(skip(self, ops))]
     pub async fn push_ops(&self, document_id: &str, ops: &[u8]) -> Result<u64, ActorError> {
         self.send(|reply| RpcCommand::PushOps {
             document_id: document_id.into(), ops: ops.to_vec(), reply,
@@ -327,11 +335,13 @@ impl ActorHandle {
     }
 
     /// Get full document state from the server.
+    #[tracing::instrument(skip(self))]
     pub async fn get_document_state(&self, document_id: &str) -> Result<DocumentState, ActorError> {
         self.send(|reply| RpcCommand::GetDocumentState { document_id: document_id.into(), reply }).await
     }
 
     /// Compact a document's oplog. Returns (new_size, generation).
+    #[tracing::instrument(skip(self))]
     pub async fn compact_document(&self, document_id: &str) -> Result<(u64, u64), ActorError> {
         self.send(|reply| RpcCommand::CompactDocument { document_id: document_id.into(), reply }).await
     }
@@ -353,16 +363,19 @@ impl ActorHandle {
     }
 
     /// Interrupt an execution.
+    #[tracing::instrument(skip(self))]
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), ActorError> {
         self.send(|reply| RpcCommand::Interrupt { exec_id, reply }).await
     }
 
     /// Get completions for partial input.
+    #[tracing::instrument(skip(self, partial))]
     pub async fn complete(&self, partial: &str, cursor: u32) -> Result<Vec<Completion>, ActorError> {
         self.send(|reply| RpcCommand::Complete { partial: partial.into(), cursor, reply }).await
     }
 
     /// Get command history.
+    #[tracing::instrument(skip(self))]
     pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, ActorError> {
         self.send(|reply| RpcCommand::GetCommandHistory { limit, reply }).await
     }
@@ -370,16 +383,19 @@ impl ActorHandle {
     // ── Shell Variables ─────────────────────────────────────────────────
 
     /// Get a shell variable by name.
+    #[tracing::instrument(skip(self))]
     pub async fn get_shell_var(&self, name: &str) -> Result<(Option<ShellValue>, bool), ActorError> {
         self.send(|reply| RpcCommand::GetShellVar { name: name.into(), reply }).await
     }
 
     /// Set a shell variable.
+    #[tracing::instrument(skip(self, value))]
     pub async fn set_shell_var(&self, name: &str, value: ShellValue) -> Result<(), ActorError> {
         self.send(|reply| RpcCommand::SetShellVar { name: name.into(), value, reply }).await
     }
 
     /// List all shell variables with their values.
+    #[tracing::instrument(skip(self))]
     pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, ActorError> {
         self.send(|reply| RpcCommand::ListShellVars { reply }).await
     }
@@ -410,11 +426,13 @@ impl ActorHandle {
     // ── MCP Resources ────────────────────────────────────────────────────
 
     /// List resources from an MCP server.
+    #[tracing::instrument(skip(self))]
     pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, ActorError> {
         self.send(|reply| RpcCommand::ListMcpResources { server: server.into(), reply }).await
     }
 
     /// Read a resource from an MCP server.
+    #[tracing::instrument(skip(self))]
     pub async fn read_mcp_resource(
         &self,
         server: &str,
@@ -441,6 +459,7 @@ impl ActorHandle {
     }
 
     /// Configure the LLM provider and model for this kernel.
+    #[tracing::instrument(skip(self))]
     pub async fn configure_llm(&self, provider: &str, model: &str) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::ConfigureLlm {
             provider: provider.into(), model: model.into(), reply,
@@ -448,16 +467,19 @@ impl ActorHandle {
     }
 
     /// Get current LLM configuration.
+    #[tracing::instrument(skip(self))]
     pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, ActorError> {
         self.send(|reply| RpcCommand::GetLlmConfig { reply }).await
     }
 
     /// Set the default LLM provider.
+    #[tracing::instrument(skip(self))]
     pub async fn set_default_provider(&self, provider: &str) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::SetDefaultProvider { provider: provider.into(), reply }).await
     }
 
     /// Set the default model for a provider.
+    #[tracing::instrument(skip(self))]
     pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::SetDefaultModel {
             provider: provider.into(), model: model.into(), reply,
@@ -467,11 +489,13 @@ impl ActorHandle {
     // ── Tool Filter ──────────────────────────────────────────────────────
 
     /// Get current tool filter configuration.
+    #[tracing::instrument(skip(self))]
     pub async fn get_tool_filter(&self) -> Result<ClientToolFilter, ActorError> {
         self.send(|reply| RpcCommand::GetToolFilter { reply }).await
     }
 
     /// Set tool filter configuration.
+    #[tracing::instrument(skip(self, filter))]
     pub async fn set_tool_filter(&self, filter: ClientToolFilter) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::SetToolFilter { filter, reply }).await
     }
@@ -481,6 +505,7 @@ impl ActorHandle {
     /// Fork a document at a specific version, creating a new context.
     ///
     /// Returns the server-assigned ContextId for the new fork.
+    #[tracing::instrument(skip(self))]
     pub async fn fork_from_version(
         &self,
         document_id: &str,
@@ -493,6 +518,7 @@ impl ActorHandle {
     }
 
     /// Cherry-pick a block from one context into another.
+    #[tracing::instrument(skip(self))]
     pub async fn cherry_pick_block(
         &self,
         block_id: &BlockId,
@@ -504,6 +530,7 @@ impl ActorHandle {
     }
 
     /// Get document history (version snapshots).
+    #[tracing::instrument(skip(self))]
     pub async fn get_document_history(
         &self,
         document_id: &str,
@@ -517,6 +544,7 @@ impl ActorHandle {
     // ── Kernel Info ──────────────────────────────────────────────────────
 
     /// Get kernel info.
+    #[tracing::instrument(skip(self))]
     pub async fn get_info(&self) -> Result<KernelInfo, ActorError> {
         self.send(|reply| RpcCommand::GetInfo { reply }).await
     }
@@ -524,16 +552,19 @@ impl ActorHandle {
     // ── World-level Methods ──────────────────────────────────────────────
 
     /// Get the current user's identity.
+    #[tracing::instrument(skip(self))]
     pub async fn whoami(&self) -> Result<Identity, ActorError> {
         self.send(|reply| RpcCommand::Whoami { reply }).await
     }
 
     /// Get the document ID returned by join_context (server-authoritative).
+    #[tracing::instrument(skip(self))]
     pub async fn document_id(&self) -> Result<Option<String>, ActorError> {
         self.send(|reply| RpcCommand::GetDocumentId { reply }).await
     }
 
     /// List available kernels.
+    #[tracing::instrument(skip(self))]
     pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, ActorError> {
         self.send(|reply| RpcCommand::ListKernels { reply }).await
     }

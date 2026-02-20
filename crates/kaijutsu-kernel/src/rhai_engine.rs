@@ -476,6 +476,7 @@ impl ExecutionEngine for RhaiEngine {
         "Rhai scripting engine with CRDT-aware cell and block operations"
     }
 
+    #[tracing::instrument(skip(self, code), name = "engine.rhai")]
     async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
         // Clear interrupt flag before execution
         self.interrupted.store(false, Ordering::SeqCst);

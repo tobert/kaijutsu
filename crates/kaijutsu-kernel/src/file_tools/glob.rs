@@ -55,6 +55,7 @@ impl ExecutionEngine for GlobEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.glob")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: GlobParams = match serde_json::from_str(params) {
             Ok(v) => v,

@@ -80,7 +80,7 @@ rig-core = "0.30"
 rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # System clipboard
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 # Kaijutsu telemetry
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }

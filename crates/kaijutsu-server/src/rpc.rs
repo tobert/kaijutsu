@@ -636,6 +636,7 @@ impl world::Server for WorldImpl {
         mut results: world::AttachKernelResults,
     ) -> Promise<(), capnp::Error> {
         let _params_reader = pry!(params.get());
+        let span = tracing::info_span!("rpc", method = "attach_kernel");
         // Schema: attachKernel(trace) -> (kernel, kernelId :Data)
         // Server generates the kernel ID; client receives it.
         let id = {
@@ -782,7 +783,7 @@ impl world::Server for WorldImpl {
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
             results.get().set_kernel_id(context_id.as_bytes());
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // @3 reserved (was createKernel — kernel forking downplayed)
@@ -927,6 +928,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetCommandHistoryParams,
         mut results: kernel::GetCommandHistoryResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "get_command_history").entered();
         let limit = pry!(params.get()).get_limit() as usize;
 
         let state = self.state.borrow();
@@ -958,6 +960,7 @@ impl kernel::Server for KernelImpl {
         let parent_kernel_id = self.kernel_id.clone();
         let state = self.state.clone();
 
+        let span = tracing::info_span!("rpc", method = "fork");
         Promise::from_future(async move {
             // Get parent kernel
             let parent_kernel = {
@@ -1066,7 +1069,7 @@ impl kernel::Server for KernelImpl {
             let kernel_impl = KernelImpl::new(state.clone(), id);
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn thread(
@@ -1078,6 +1081,7 @@ impl kernel::Server for KernelImpl {
         let parent_kernel_id = self.kernel_id.clone();
         let state = self.state.clone();
 
+        let span = tracing::info_span!("rpc", method = "thread");
         Promise::from_future(async move {
             // Get parent kernel and documents (thread shares VFS + documents)
             let (parent_kernel, parent_documents, parent_config_backend) = {
@@ -1178,7 +1182,7 @@ impl kernel::Server for KernelImpl {
             let kernel_impl = KernelImpl::new(state.clone(), id);
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn detach(
@@ -1226,6 +1230,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        let span = tracing::info_span!("rpc", method = "list_mounts");
         Promise::from_future(async move {
             let mounts = kernel.list_mounts().await;
             let mut builder = results.get().init_mounts(mounts.len() as u32);
@@ -1235,7 +1240,7 @@ impl kernel::Server for KernelImpl {
                 m.set_read_only(mount.read_only);
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn mount(
@@ -1265,6 +1270,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        let span = tracing::info_span!("rpc", method = "mount");
         Promise::from_future(async move {
             // Expand source path (e.g., ~ to home dir)
             let expanded = shellexpand::tilde(&source);
@@ -1285,7 +1291,7 @@ impl kernel::Server for KernelImpl {
 
             kernel.mount(&path, backend).await;
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn unmount(
@@ -1306,11 +1312,12 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        let span = tracing::info_span!("rpc", method = "unmount");
         Promise::from_future(async move {
             let success = kernel.unmount(&path).await;
             results.get().set_success(success);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // Tool execution
@@ -1385,6 +1392,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(state);
 
+        let span = tracing::info_span!("rpc", method = "get_tool_schemas");
         Promise::from_future(async move {
             let registry = kernel.tools().read().await;
             let tools = registry.list();
@@ -1403,7 +1411,7 @@ impl kernel::Server for KernelImpl {
                 s.set_input_schema(&schema);
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // =========================================================================
@@ -1415,6 +1423,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::ApplyBlockOpParams,
         mut results: kernel::ApplyBlockOpResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("sync.apply_block_op").entered();
         let params = pry!(params.get());
         let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
         let op = pry!(params.get_op());
@@ -1518,6 +1527,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::SubscribeBlocksParams,
         _results: kernel::SubscribeBlocksResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_blocks").entered();
         let callback = pry!(pry!(params.get()).get_callback());
 
         let state = self.state.borrow();
@@ -1658,7 +1668,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetDocumentStateResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _trace_span = extract_rpc_trace(p.get_trace(), "get_document_state");
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_document_state").entered();
         let cell_id = pry!(pry!(p.get_document_id()).to_str()).to_owned();
 
         log::debug!("get_document_state called for cell {}", cell_id);
@@ -1880,6 +1890,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "list_contexts");
         Promise::from_future(async move {
             // Read from the kernel's drift router — the single source of truth
             let drift = kernel_arc.drift().read().await;
@@ -1898,7 +1909,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     /// Join a context, returning its document_id.
@@ -1928,6 +1939,7 @@ impl kernel::Server for KernelImpl {
         let state2 = state.clone();
         let kernel_id2 = kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "join_context");
         Promise::from_future(async move {
             // Full context UUID as part of document ID for persistence
             let doc_id = format!("{}@{}", kernel_id2, context_id);
@@ -1983,7 +1995,7 @@ impl kernel::Server for KernelImpl {
             results.get().set_document_id(&doc_id);
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // ========================================================================
@@ -2075,6 +2087,7 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.state.borrow().kernels.get(&self.kernel_id)
             .map(|k| k.kernel.clone());
 
+        let span = tracing::info_span!("rpc", method = "register_mcp");
         Promise::from_future(async move {
             let info = mcp_pool.register(config).await
                 .map_err(|e| capnp::Error::failed(format!("Failed to register MCP server: {}", e)))?;
@@ -2108,7 +2121,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn unregister_mcp(
@@ -2121,6 +2134,7 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.state.borrow().kernels.get(&self.kernel_id)
             .map(|k| k.kernel.clone());
 
+        let span = tracing::info_span!("rpc", method = "unregister_mcp");
         Promise::from_future(async move {
             // Remove engines for MCP tools before unregistering the server
             if let Some(kernel) = kernel_arc {
@@ -2136,7 +2150,7 @@ impl kernel::Server for KernelImpl {
             mcp_pool.unregister(&name).await
                 .map_err(|e| capnp::Error::failed(format!("Failed to unregister MCP server: {}", e)))?;
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_mcp_servers(
@@ -2146,6 +2160,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let mcp_pool = self.state.borrow().mcp_pool.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_mcp_servers");
         Promise::from_future(async move {
             let server_names = mcp_pool.list_servers();
             let mut servers_info = Vec::new();
@@ -2175,7 +2190,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn call_mcp_tool(
@@ -2406,6 +2421,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "get_cwd");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2422,7 +2438,7 @@ impl kernel::Server for KernelImpl {
 
             results.get().set_path(&cwd.to_string_lossy());
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_cwd(
@@ -2441,6 +2457,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "set_cwd");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2456,7 +2473,7 @@ impl kernel::Server for KernelImpl {
             results.get().set_success(true);
             results.get().set_error("");
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_last_result(
@@ -2467,6 +2484,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "get_last_result");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2510,7 +2528,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // =========================================================================
@@ -2530,6 +2548,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "write_blob");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2548,7 +2567,7 @@ impl kernel::Server for KernelImpl {
             ref_builder.set_content_type(&blob_info.content_type);
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn read_blob(
@@ -2567,6 +2586,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "read_blob");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2581,7 +2601,7 @@ impl kernel::Server for KernelImpl {
 
             results.get().set_data(&data);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn delete_blob(
@@ -2600,6 +2620,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "delete_blob");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2614,7 +2635,7 @@ impl kernel::Server for KernelImpl {
 
             results.get().set_success(success);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_blobs(
@@ -2625,6 +2646,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_blobs");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2646,7 +2668,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // =========================================================================
@@ -2665,6 +2687,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "register_repo");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2685,7 +2708,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn unregister_repo(
@@ -2699,6 +2722,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "unregister_repo");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2719,7 +2743,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_repos(
@@ -2730,6 +2754,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_repos");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2746,7 +2771,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn switch_branch(
@@ -2761,6 +2786,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "switch_branch");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2781,7 +2807,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_branches(
@@ -2795,6 +2821,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_branches");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2818,7 +2845,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_current_branch(
@@ -2832,6 +2859,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "get_current_branch");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2844,7 +2872,7 @@ impl kernel::Server for KernelImpl {
             let branch = kaish.get_current_branch(&repo).unwrap_or_default();
             results.get().set_branch(&branch);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn flush_git(
@@ -2855,6 +2883,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "flush_git");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2875,7 +2904,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_attribution(
@@ -2890,6 +2919,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "set_attribution");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -2903,7 +2933,7 @@ impl kernel::Server for KernelImpl {
                 kaish.set_pending_attribution(&source, cmd);
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn push_ops(
@@ -2912,7 +2942,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::PushOpsResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
-        let _trace_span = extract_rpc_trace(params_reader.get_trace(), "push_ops");
+        let _trace_guard = extract_rpc_trace(params_reader.get_trace(), "push_ops").entered();
         let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
         let ops_data = pry!(params_reader.get_ops()).to_vec();
 
@@ -2970,6 +3000,7 @@ impl kernel::Server for KernelImpl {
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_mcp_resources");
         Promise::from_future(async move {
             match mcp_pool.list_resources(&server).await {
                 Ok(resources) => {
@@ -2994,7 +3025,7 @@ impl kernel::Server for KernelImpl {
                     e
                 ))),
             }
-        })
+        }.instrument(span))
     }
 
     fn read_mcp_resource(
@@ -3009,6 +3040,7 @@ impl kernel::Server for KernelImpl {
 
         let mcp_pool = self.state.borrow().mcp_pool.clone();
 
+        let span = tracing::info_span!("rpc", method = "read_mcp_resource");
         Promise::from_future(async move {
             match mcp_pool.read_resource(&server, &uri).await {
                 Ok(contents) => {
@@ -3048,7 +3080,7 @@ impl kernel::Server for KernelImpl {
                     )))
                 }
             }
-        })
+        }.instrument(span))
     }
 
     fn subscribe_mcp_resources(
@@ -3056,6 +3088,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::SubscribeMcpResourcesParams,
         _results: kernel::SubscribeMcpResourcesResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_mcp_resources").entered();
         let callback = pry!(pry!(params.get()).get_callback());
 
         let state = self.state.borrow();
@@ -3130,6 +3163,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::SubscribeMcpElicitationsParams,
         _results: kernel::SubscribeMcpElicitationsResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_mcp_elicitations").entered();
         let callback = pry!(pry!(params.get()).get_callback());
 
         let state = self.state.borrow();
@@ -3273,6 +3307,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "attach_agent");
         Promise::from_future(async move {
             let kernel = {
                 let state_ref = state.borrow();
@@ -3293,7 +3328,7 @@ impl kernel::Server for KernelImpl {
             set_agent_info(&mut info, &agent_info);
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_agents(
@@ -3304,6 +3339,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_agents");
         Promise::from_future(async move {
             let agents = {
                 let state_ref = state.borrow();
@@ -3322,7 +3358,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn detach_agent(
@@ -3335,6 +3371,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "detach_agent");
         Promise::from_future(async move {
             let kernel = {
                 let state_ref = state.borrow();
@@ -3347,7 +3384,7 @@ impl kernel::Server for KernelImpl {
 
             kernel.detach_agent(&nick).await;
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_agent_capabilities(
@@ -3368,6 +3405,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "set_agent_capabilities");
         Promise::from_future(async move {
             let kernel = {
                 let state_ref = state.borrow();
@@ -3384,7 +3422,7 @@ impl kernel::Server for KernelImpl {
                 .map_err(|e| capnp::Error::failed(format!("failed to set capabilities: {}", e)))?;
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn invoke_agent(
@@ -3407,6 +3445,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "invoke_agent");
         Promise::from_future(async move {
             let kernel = {
                 let state_ref = state.borrow();
@@ -3441,7 +3480,7 @@ impl kernel::Server for KernelImpl {
 
             results.get().set_request_id(&request_id);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn subscribe_agent_events(
@@ -3449,6 +3488,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::SubscribeAgentEventsParams,
         _results: kernel::SubscribeAgentEventsResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_agent_events").entered();
         let callback = pry!(pry!(params.get()).get_callback());
 
         let state = self.state.clone();
@@ -3594,6 +3634,7 @@ impl kernel::Server for KernelImpl {
         let _seat_info = context_manager.join_context(&ctx_name);
         context_manager.attach_document(&ctx_name, &new_doc_id, "server");
 
+        let span = tracing::info_span!("rpc", method = "fork_from_version");
         Promise::from_future(async move {
             // Register in drift router
             let label = label_owned.as_deref();
@@ -3608,7 +3649,7 @@ impl kernel::Server for KernelImpl {
                 new_ctx_id, label, document_id, version, new_doc_id
             );
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn cherry_pick_block(
@@ -3652,6 +3693,7 @@ impl kernel::Server for KernelImpl {
         };
         drop(doc_entry);
 
+        let span = tracing::info_span!("rpc", method = "cherry_pick_block");
         Promise::from_future(async move {
             // Look up target context's document ID from drift router
             let drift = kernel_arc.drift().read().await;
@@ -3688,7 +3730,7 @@ impl kernel::Server for KernelImpl {
 
             log::info!("Cherry-pick complete: {} -> {}", block_id.to_key(), new_block_id.to_key());
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_document_history(
@@ -3696,6 +3738,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetDocumentHistoryParams,
         mut results: kernel::GetDocumentHistoryResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "get_document_history").entered();
         let params_reader = pry!(params.get());
         let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
         let limit = params_reader.get_limit() as usize;
@@ -3754,6 +3797,7 @@ impl kernel::Server for KernelImpl {
         _params: kernel::ListConfigsParams,
         mut results: kernel::ListConfigsResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "list_configs").entered();
         let state_ref = self.state.borrow();
         let kernel_state = match state_ref.kernels.get(&self.kernel_id) {
             Some(ks) => ks,
@@ -3778,6 +3822,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "reload_config");
         Promise::from_future(async move {
             let config_backend = {
                 let state_ref = state.borrow();
@@ -3800,7 +3845,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn reset_config(
@@ -3812,6 +3857,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "reset_config");
         Promise::from_future(async move {
             let config_backend = {
                 let state_ref = state.borrow();
@@ -3834,7 +3880,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_config(
@@ -3842,6 +3888,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetConfigParams,
         mut results: kernel::GetConfigResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "get_config").entered();
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
 
         let state_ref = self.state.borrow();
@@ -3882,6 +3929,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "get_context_id");
         Promise::from_future(async move {
             results.get().set_id(ctx_id.as_bytes());
             let drift = kernel_arc.drift().read().await;
@@ -3890,7 +3938,7 @@ impl kernel::Server for KernelImpl {
                 .unwrap_or("");
             results.get().set_label(label);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn configure_llm(
@@ -3904,6 +3952,7 @@ impl kernel::Server for KernelImpl {
         let kernel_id = self.kernel_id.clone();
         let state = self.state.clone();
 
+        let span = tracing::info_span!("rpc", method = "configure_llm");
         Promise::from_future(async move {
             // Get kernel
             let (kernel_arc, ctx_id) = {
@@ -3940,7 +3989,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn drift_push(
@@ -4053,7 +4102,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::DriftFlushParams,
         mut results: kernel::DriftFlushResults,
     ) -> Promise<(), capnp::Error> {
-        let _trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
+        let trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
         let (caller_ctx, kernel_arc, documents) = {
             let state = self.state.borrow();
             match state.kernels.get(&self.kernel_id) {
@@ -4102,7 +4151,7 @@ impl kernel::Server for KernelImpl {
 
             results.get().set_count(count);
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     fn drift_queue(
@@ -4118,6 +4167,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "drift_queue");
         Promise::from_future(async move {
             let drift = kernel_arc.drift().read().await;
             let queue = drift.queue();
@@ -4135,7 +4185,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn drift_cancel(
@@ -4152,12 +4202,13 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "drift_cancel");
         Promise::from_future(async move {
             let mut drift = kernel_arc.drift().write().await;
             let success = drift.cancel(staged_id);
             results.get().set_success(success);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn drift_pull(
@@ -4398,6 +4449,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "get_llm_config");
         Promise::from_future(async move {
             let registry = kernel_arc.llm().read().await;
 
@@ -4426,7 +4478,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_default_provider(
@@ -4443,6 +4495,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "set_default_provider");
         Promise::from_future(async move {
             let mut registry = kernel_arc.llm().write().await;
             if registry.set_default(&provider_name) {
@@ -4454,7 +4507,7 @@ impl kernel::Server for KernelImpl {
                 results.get().set_error(&format!("provider '{}' not found", provider_name));
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_default_model(
@@ -4473,6 +4526,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "set_default_model");
         Promise::from_future(async move {
             let mut registry = kernel_arc.llm().write().await;
             // Verify the provider exists
@@ -4486,7 +4540,7 @@ impl kernel::Server for KernelImpl {
             results.get().set_error("");
             log::info!("Default model set to: {} (provider: {})", model, provider_name);
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // ========================================================================
@@ -4506,6 +4560,7 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "get_tool_filter");
         Promise::from_future(async move {
             let tool_config = kernel_arc.tool_config().await;
             let mut filter = results.get().init_filter();
@@ -4531,7 +4586,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_tool_filter(
@@ -4570,13 +4625,14 @@ impl kernel::Server for KernelImpl {
             }
         };
 
+        let span = tracing::info_span!("rpc", method = "set_tool_filter");
         Promise::from_future(async move {
             kernel_arc.set_tool_filter(filter).await;
             results.get().set_success(true);
             results.get().set_error("");
             log::info!("Tool filter updated for kernel");
             Ok(())
-        })
+        }.instrument(span))
     }
 
     // =========================================================================
@@ -4599,6 +4655,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "get_shell_var");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -4617,7 +4674,7 @@ impl kernel::Server for KernelImpl {
                 builder.set_found(false);
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn set_shell_var(
@@ -4641,6 +4698,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "set_shell_var");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -4654,7 +4712,7 @@ impl kernel::Server for KernelImpl {
             results.get().set_success(true);
             results.get().set_error("");
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn list_shell_vars(
@@ -4665,6 +4723,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.clone();
         let kernel_id = self.kernel_id.clone();
 
+        let span = tracing::info_span!("rpc", method = "list_shell_vars");
         Promise::from_future(async move {
             let kaish = {
                 let state_ref = state.borrow();
@@ -4688,7 +4747,7 @@ impl kernel::Server for KernelImpl {
             }
 
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn compact_document(
@@ -4696,6 +4755,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::CompactDocumentParams,
         mut results: kernel::CompactDocumentResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "compact_document").entered();
         let document_id = pry!(pry!(pry!(params.get()).get_document_id()).to_str()).to_string();
 
         let state = self.state.borrow();

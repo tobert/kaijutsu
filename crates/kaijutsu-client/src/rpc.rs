@@ -79,6 +79,7 @@ impl RpcClient {
     }
 
     /// Get current identity from the server
+    #[tracing::instrument(skip(self), name = "rpc_client.whoami")]
     pub async fn whoami(&self) -> Result<Identity, RpcError> {
         let request = self.world.whoami_request();
         let response = request.send().promise.await?;
@@ -91,6 +92,7 @@ impl RpcClient {
     }
 
     /// List available kernels
+    #[tracing::instrument(skip(self), name = "rpc_client.list_kernels")]
     pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, RpcError> {
         let request = self.world.list_kernels_request();
         let response = request.send().promise.await?;
@@ -106,6 +108,7 @@ impl RpcClient {
     /// Attach to the server's kernel.
     ///
     /// Returns the kernel handle and its ID (assigned by the server).
+    #[tracing::instrument(skip(self), name = "rpc_client.attach_kernel")]
     pub async fn attach_kernel(&self) -> Result<(KernelHandle, KernelId), RpcError> {
         let mut request = self.world.attach_kernel_request();
         {
@@ -205,6 +208,7 @@ pub struct KernelHandle {
 
 impl KernelHandle {
     /// Get kernel info
+    #[tracing::instrument(skip(self), name = "rpc_client.get_info")]
     pub async fn get_info(&self) -> Result<KernelInfo, RpcError> {
         let request = self.kernel.get_info_request();
         let response = request.send().promise.await?;
@@ -217,6 +221,7 @@ impl KernelHandle {
     // =========================================================================
 
     /// List all contexts in this kernel (includes drift info).
+    #[tracing::instrument(skip(self), name = "rpc_client.list_contexts")]
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, RpcError> {
         let request = self.kernel.list_contexts_request();
         let response = request.send().promise.await?;
@@ -232,6 +237,7 @@ impl KernelHandle {
     /// Create a new context with an optional label.
     ///
     /// Returns the server-assigned ContextId.
+    #[tracing::instrument(skip(self), name = "rpc_client.create_context")]
     pub async fn create_context(&self, label: &str) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.create_context_request();
         request.get().set_label(label);
@@ -243,6 +249,7 @@ impl KernelHandle {
     ///
     /// Returns the document_id for the joined context. The `instance` param
     /// identifies which client connected (for logging/debugging).
+    #[tracing::instrument(skip(self), name = "rpc_client.join_context")]
     pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<String, RpcError> {
         let mut request = self.kernel.join_context_request();
         request.get().set_context_id(context_id.as_bytes());
@@ -253,6 +260,7 @@ impl KernelHandle {
     }
 
     /// Attach a document to a context
+    #[tracing::instrument(skip(self), name = "rpc_client.attach_document")]
     pub async fn attach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
         let mut request = self.kernel.attach_document_request();
         request.get().set_context_id(context_id.as_bytes());
@@ -262,6 +270,7 @@ impl KernelHandle {
     }
 
     /// Detach a document from a context
+    #[tracing::instrument(skip(self), name = "rpc_client.detach_document")]
     pub async fn detach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
         let mut request = self.kernel.detach_document_request();
         request.get().set_context_id(context_id.as_bytes());
@@ -273,6 +282,7 @@ impl KernelHandle {
     // kaish execution methods
 
     /// Execute code in the kernel
+    #[tracing::instrument(skip(self, code), name = "rpc_client.execute")]
     pub async fn execute(&self, code: &str) -> Result<u64, RpcError> {
         let mut request = self.kernel.execute_request();
         request.get().set_code(code);
@@ -291,6 +301,7 @@ impl KernelHandle {
     /// Creates ShellCommand and ShellOutput blocks in the specified cell.
     /// Output is streamed via block events.
     /// Returns the BlockId of the command block.
+    #[tracing::instrument(skip(self, code), name = "rpc_client.shell_execute")]
     pub async fn shell_execute(
         &self,
         code: &str,
@@ -315,6 +326,7 @@ impl KernelHandle {
     }
 
     /// Interrupt an execution
+    #[tracing::instrument(skip(self), name = "rpc_client.interrupt")]
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {
         let mut request = self.kernel.interrupt_request();
         request.get().set_exec_id(exec_id);
@@ -323,6 +335,7 @@ impl KernelHandle {
     }
 
     /// Get completions
+    #[tracing::instrument(skip(self, partial), name = "rpc_client.complete")]
     pub async fn complete(&self, partial: &str, cursor: u32) -> Result<Vec<Completion>, RpcError> {
         let mut request = self.kernel.complete_request();
         request.get().set_partial(partial);
@@ -342,6 +355,7 @@ impl KernelHandle {
     }
 
     /// Get command history
+    #[tracing::instrument(skip(self), name = "rpc_client.get_command_history")]
     pub async fn get_command_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, RpcError> {
         let mut request = self.kernel.get_command_history_request();
         request.get().set_limit(limit);
@@ -360,6 +374,7 @@ impl KernelHandle {
     }
 
     /// Detach from the kernel
+    #[tracing::instrument(skip(self), name = "rpc_client.detach")]
     pub async fn detach(self) -> Result<(), RpcError> {
         let request = self.kernel.detach_request();
         request.send().promise.await?;
@@ -377,6 +392,7 @@ impl KernelHandle {
     ///
     /// Returns the acknowledged version so the client knows ops were accepted.
     /// The ops should be serialized using serde_json from SerializedOpsOwned.
+    #[tracing::instrument(skip(self, ops), name = "rpc_client.push_ops")]
     pub async fn push_ops(&self, document_id: &str, ops: &[u8]) -> Result<u64, RpcError> {
         let mut request = self.kernel.push_ops_request();
         request.get().set_document_id(document_id);
@@ -392,6 +408,7 @@ impl KernelHandle {
     }
 
     /// Get document state (blocks and CRDT oplog)
+    #[tracing::instrument(skip(self), name = "rpc_client.get_document_state")]
     pub async fn get_document_state(
         &self,
         document_id: &str,
@@ -429,6 +446,7 @@ impl KernelHandle {
     }
 
     /// Compact a document's oplog, returning new size and sync generation.
+    #[tracing::instrument(skip(self), name = "rpc_client.compact_document")]
     pub async fn compact_document(
         &self,
         document_id: &str,
@@ -448,6 +466,7 @@ impl KernelHandle {
     ///
     /// Returns a prompt ID that can be used to track the response.
     /// The response will be streamed via block events if subscribed.
+    #[tracing::instrument(skip(self, content), name = "rpc_client.prompt")]
     pub async fn prompt(
         &self,
         content: &str,
@@ -476,6 +495,7 @@ impl KernelHandle {
     /// Subscribe to block events (for LLM streaming updates)
     ///
     /// The callback will receive block insertions, edits, and other events.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_blocks")]
     pub async fn subscribe_blocks(
         &self,
         callback: crate::kaijutsu_capnp::block_events::Client,
@@ -494,6 +514,7 @@ impl KernelHandle {
     ///
     /// This is the general-purpose tool execution path (executeTool @16).
     /// Tools include git, drift, and any registered execution engines.
+    #[tracing::instrument(skip(self, params), name = "rpc_client.execute_tool")]
     pub async fn execute_tool(
         &self,
         tool: &str,
@@ -524,6 +545,7 @@ impl KernelHandle {
     /// Call an MCP tool
     ///
     /// Invokes a tool on a registered MCP server and returns the result.
+    #[tracing::instrument(skip(self, arguments), name = "rpc_client.call_mcp_tool")]
     pub async fn call_mcp_tool(
         &self,
         server: &str,
@@ -561,6 +583,7 @@ impl KernelHandle {
     ///
     /// Returns a list of resources available from the specified server.
     /// Results may be cached on the server for efficiency.
+    #[tracing::instrument(skip(self), name = "rpc_client.list_mcp_resources")]
     pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, RpcError> {
         let mut request = self.kernel.list_mcp_resources_request();
         request.get().set_server(server);
@@ -591,6 +614,7 @@ impl KernelHandle {
     ///
     /// Returns the contents of the specified resource.
     /// Results may be cached on the server for efficiency.
+    #[tracing::instrument(skip(self), name = "rpc_client.read_mcp_resource")]
     pub async fn read_mcp_resource(
         &self,
         server: &str,
@@ -634,6 +658,7 @@ impl KernelHandle {
     ///
     /// The callback will receive notifications when resources are updated
     /// or when a server's resource list changes.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_mcp_resources")]
     pub async fn subscribe_mcp_resources(
         &self,
         callback: crate::kaijutsu_capnp::resource_events::Client,
@@ -651,6 +676,7 @@ impl KernelHandle {
     ///
     /// Elicitation is a server-initiated pattern where MCP servers can request
     /// confirmation or input from the user for operations that require consent.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_mcp_elicitations")]
     pub async fn subscribe_mcp_elicitations(
         &self,
         callback: crate::kaijutsu_capnp::elicitation_events::Client,
@@ -668,6 +694,7 @@ impl KernelHandle {
     /// Fork a document at a specific version, creating a new context.
     ///
     /// Returns the server-assigned ContextId for the new fork.
+    #[tracing::instrument(skip(self), name = "rpc_client.fork_from_version")]
     pub async fn fork_from_version(
         &self,
         document_id: &str,
@@ -688,6 +715,7 @@ impl KernelHandle {
     /// Cherry-pick a block from one context into another.
     ///
     /// Returns the new block ID in the target context.
+    #[tracing::instrument(skip(self), name = "rpc_client.cherry_pick_block")]
     pub async fn cherry_pick_block(
         &self,
         block_id: &kaijutsu_crdt::BlockId,
@@ -710,6 +738,7 @@ impl KernelHandle {
     /// Get document history (version snapshots).
     ///
     /// Returns a list of version snapshots for timeline navigation.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_document_history")]
     pub async fn get_document_history(
         &self,
         document_id: &str,
@@ -741,6 +770,7 @@ impl KernelHandle {
     // ========================================================================
 
     /// Get this kernel's context ID and label.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_id")]
     pub async fn get_context_id(&self) -> Result<(ContextId, String), RpcError> {
         let request = self.kernel.get_context_id_request();
         let response = request.send().promise.await?;
@@ -751,6 +781,7 @@ impl KernelHandle {
     }
 
     /// Configure the LLM provider and model for this kernel.
+    #[tracing::instrument(skip(self), name = "rpc_client.configure_llm")]
     pub async fn configure_llm(
         &self,
         provider: &str,
@@ -773,6 +804,7 @@ impl KernelHandle {
     }
 
     /// Stage a drift push to another context.
+    #[tracing::instrument(skip(self, content), name = "rpc_client.drift_push")]
     pub async fn drift_push(
         &self,
         target_ctx: ContextId,
@@ -797,6 +829,7 @@ impl KernelHandle {
     }
 
     /// Flush all staged drifts.
+    #[tracing::instrument(skip(self), name = "rpc_client.drift_flush")]
     pub async fn drift_flush(&self) -> Result<u32, RpcError> {
         let mut request = self.kernel.drift_flush_request();
         {
@@ -810,6 +843,7 @@ impl KernelHandle {
     }
 
     /// View the drift staging queue.
+    #[tracing::instrument(skip(self), name = "rpc_client.drift_queue")]
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, RpcError> {
         let request = self.kernel.drift_queue_request();
         let response = request.send().promise.await?;
@@ -831,6 +865,7 @@ impl KernelHandle {
     }
 
     /// Cancel a staged drift.
+    #[tracing::instrument(skip(self), name = "rpc_client.drift_cancel")]
     pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, RpcError> {
         let mut request = self.kernel.drift_cancel_request();
         request.get().set_staged_id(staged_id);
@@ -842,6 +877,7 @@ impl KernelHandle {
     ///
     /// Reads the source context's conversation, distills it via LLM,
     /// and injects the summary as a Drift block in this kernel's document.
+    #[tracing::instrument(skip(self, prompt), name = "rpc_client.drift_pull")]
     pub async fn drift_pull(
         &self,
         source_ctx: ContextId,
@@ -867,6 +903,7 @@ impl KernelHandle {
     ///
     /// Distills the source context's conversation and injects the summary
     /// into the parent context as a Drift block with DriftKind::Merge.
+    #[tracing::instrument(skip(self), name = "rpc_client.drift_merge")]
     pub async fn drift_merge(
         &self,
         source_ctx: ContextId,
@@ -885,6 +922,7 @@ impl KernelHandle {
     }
 
     /// Rename a context's human-friendly label.
+    #[tracing::instrument(skip(self), name = "rpc_client.rename_context")]
     pub async fn rename_context(
         &self,
         context_id: ContextId,
@@ -902,6 +940,7 @@ impl KernelHandle {
     // ========================================================================
 
     /// Get current LLM configuration
+    #[tracing::instrument(skip(self), name = "rpc_client.get_llm_config")]
     pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, RpcError> {
         let request = self.kernel.get_llm_config_request();
         let response = request.send().promise.await?;
@@ -925,6 +964,7 @@ impl KernelHandle {
     }
 
     /// Set the default LLM provider
+    #[tracing::instrument(skip(self), name = "rpc_client.set_default_provider")]
     pub async fn set_default_provider(&self, provider: &str) -> Result<bool, RpcError> {
         let mut request = self.kernel.set_default_provider_request();
         request.get().set_provider(provider);
@@ -940,6 +980,7 @@ impl KernelHandle {
     }
 
     /// Set the default model for a provider
+    #[tracing::instrument(skip(self), name = "rpc_client.set_default_model")]
     pub async fn set_default_model(&self, provider: &str, model: &str) -> Result<bool, RpcError> {
         let mut request = self.kernel.set_default_model_request();
         request.get().set_provider(provider);
@@ -960,6 +1001,7 @@ impl KernelHandle {
     // ========================================================================
 
     /// Get current tool filter configuration
+    #[tracing::instrument(skip(self), name = "rpc_client.get_tool_filter")]
     pub async fn get_tool_filter(&self) -> Result<ClientToolFilter, RpcError> {
         let request = self.kernel.get_tool_filter_request();
         let response = request.send().promise.await?;
@@ -988,6 +1030,7 @@ impl KernelHandle {
     }
 
     /// Set tool filter configuration
+    #[tracing::instrument(skip(self, filter), name = "rpc_client.set_tool_filter")]
     pub async fn set_tool_filter(&self, filter: &ClientToolFilter) -> Result<bool, RpcError> {
         let mut request = self.kernel.set_tool_filter_request();
         {
@@ -1026,6 +1069,7 @@ impl KernelHandle {
     // =========================================================================
 
     /// Get a shell variable by name.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_shell_var")]
     pub async fn get_shell_var(&self, name: &str) -> Result<(Option<ShellValue>, bool), RpcError> {
         let mut request = self.kernel.get_shell_var_request();
         request.get().set_name(name);
@@ -1041,6 +1085,7 @@ impl KernelHandle {
     }
 
     /// Set a shell variable.
+    #[tracing::instrument(skip(self, value), name = "rpc_client.set_shell_var")]
     pub async fn set_shell_var(&self, name: &str, value: &ShellValue) -> Result<(), RpcError> {
         let mut request = self.kernel.set_shell_var_request();
         request.get().set_name(name);
@@ -1057,6 +1102,7 @@ impl KernelHandle {
     }
 
     /// List all shell variables with their values.
+    #[tracing::instrument(skip(self), name = "rpc_client.list_shell_vars")]
     pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, RpcError> {
         let request = self.kernel.list_shell_vars_request();
         let response = request.send().promise.await?;

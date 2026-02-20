@@ -73,6 +73,7 @@ impl ExecutionEngine for GrepEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.grep")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: GrepParams = match serde_json::from_str(params) {
             Ok(v) => v,

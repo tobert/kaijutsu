@@ -53,6 +53,7 @@ impl ExecutionEngine for WriteEngine {
         }))
     }
 
+    #[tracing::instrument(skip(self, params), name = "engine.write")]
     async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
         let p: WriteParams = match serde_json::from_str(params) {
             Ok(v) => v,

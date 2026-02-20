@@ -12,6 +12,7 @@ telemetry = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
+    "dep:tokio",
 ]
 
 [dependencies]
@@ -24,3 +25,4 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
