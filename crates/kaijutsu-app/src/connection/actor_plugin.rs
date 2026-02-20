@@ -46,6 +46,8 @@ pub struct RpcConnectionState {
     pub ssh_config: SshConfig,
     /// Reconnect attempt counter (0 = connected or idle)
     pub reconnect_attempt: u32,
+    /// Document ID returned by server's join_context (server-authoritative)
+    pub document_id: Option<String>,
 }
 
 /// Channel for async tasks to send results back to Bevy systems.
@@ -269,7 +271,7 @@ fn poll_bootstrap_results(
                 // emit ContextJoined. Otherwise just get identity.
                 let h = handle.clone();
                 let tx = result_channel.sender();
-                let kid = kernel_id.clone();
+                let kernel_id_str = kernel_id.clone();
                 let ctx_id = context_id;
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
@@ -288,7 +290,18 @@ fn poll_bootstrap_results(
                         // 2. If we joined a context, fetch its document state
                         let Some(ctx_id) = ctx_id else { return };
 
-                        let document_id = format!("{}@{}", kid, ctx_id);
+                        // Get server-authoritative document_id (set during join_context)
+                        let document_id = match h.document_id().await {
+                            Ok(Some(doc_id)) => doc_id,
+                            Ok(None) => {
+                                log::warn!("No document_id after join_context");
+                                return;
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to get document_id: {e}");
+                                return;
+                            }
+                        };
                         let initial_state = match h.get_document_state(&document_id).await {
                             Ok(state) => Some(state),
                             Err(e) => {
@@ -301,7 +314,7 @@ fn poll_bootstrap_results(
                         let nick = identity.map(|id| id.username).unwrap_or_default();
                         let membership = ContextMembership {
                             context_id: ctx_id,
-                            kernel_id: kaijutsu_crdt::KernelId::parse(&kid)
+                            kernel_id: kaijutsu_crdt::KernelId::parse(&kernel_id_str)
                                 .unwrap_or_else(|_| kaijutsu_crdt::KernelId::nil()),
                             nick,
                             instance: "bevy-client".to_string(),
@@ -424,9 +437,10 @@ fn update_connection_state(
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
-            kaijutsu_client::ConnectionStatus::Connected => {
+            kaijutsu_client::ConnectionStatus::Connected { document_id } => {
                 state.connected = true;
                 state.reconnect_attempt = 0;
+                state.document_id = document_id.clone();
             }
             kaijutsu_client::ConnectionStatus::Disconnected => {
                 state.connected = false;

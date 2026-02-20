@@ -77,6 +77,7 @@ enum RpcCommand {
     DriftMerge { source_ctx: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
 
     // ── Context ──────────────────────────────────────────────────────────
+    GetDocumentId { reply: oneshot::Sender<Result<Option<String>, ActorError>> },
     GetContextId { reply: oneshot::Sender<Result<(ContextId, String), ActorError>> },
     ListContexts { reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>> },
     CreateContext { label: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
@@ -142,6 +143,7 @@ impl RpcCommand {
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftPull { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetDocumentId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -526,6 +528,11 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::Whoami { reply }).await
     }
 
+    /// Get the document ID returned by join_context (server-authoritative).
+    pub async fn document_id(&self) -> Result<Option<String>, ActorError> {
+        self.send(|reply| RpcCommand::GetDocumentId { reply }).await
+    }
+
     /// List available kernels.
     pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, ActorError> {
         self.send(|reply| RpcCommand::ListKernels { reply }).await
@@ -574,6 +581,8 @@ struct RpcActor {
     instance: String,
     /// Live connection state (None = disconnected, will reconnect)
     connection: Option<ConnectionState>,
+    /// Document ID returned by join_context (server-authoritative)
+    document_id: Option<String>,
     /// Broadcast sender for server events
     event_tx: broadcast::Sender<ServerEvent>,
     /// Broadcast sender for connection status
@@ -608,6 +617,7 @@ impl RpcActor {
             context_id,
             instance,
             connection,
+            document_id: None,
             event_tx,
             status_tx,
             reconnect_attempts: 0,
@@ -652,7 +662,9 @@ impl RpcActor {
             Ok(()) => {
                 self.reconnect_attempts = 0;
                 self.next_reconnect_at = None;
-                let _ = self.status_tx.send(ConnectionStatus::Connected);
+                let _ = self.status_tx.send(ConnectionStatus::Connected {
+                    document_id: self.document_id.clone(),
+                });
                 Ok(())
             }
             Err(e) => {
@@ -689,16 +701,20 @@ impl RpcActor {
             })?;
 
         // Join context if one was specified
-        if let Some(ctx_id) = &self.context_id {
-            let _document_id = kernel.join_context(*ctx_id, &self.instance)
+        let document_id = if let Some(ctx_id) = &self.context_id {
+            let doc_id = kernel.join_context(*ctx_id, &self.instance)
                 .await
                 .map_err(|e| {
                     let msg = format!("join_context: {e}");
                     let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
                     ActorError::Rpc(msg)
                 })?;
-        }
+            Some(doc_id)
+        } else {
+            None
+        };
 
+        self.document_id = document_id;
         self.connection = Some(ConnectionState { client, kernel });
 
         // Set up subscriptions on the new connection
@@ -773,8 +789,12 @@ impl RpcActor {
                     }
                     let conn = self.connection.as_ref().unwrap();
 
-                    // World-level commands need RpcClient — handle inline
+                    // Local queries and world-level commands — handle inline
                     match cmd {
+                        RpcCommand::GetDocumentId { reply } => {
+                            let _ = reply.send(Ok(self.document_id.clone()));
+                            continue;
+                        }
                         RpcCommand::Whoami { reply } => {
                             let result = conn.client.whoami().await
                                 .map_err(|e| ActorError::Rpc(e.to_string()));
@@ -836,6 +856,9 @@ async fn dispatch_command(
         }
 
         // ── Context ──────────────────────────────────────────────
+        RpcCommand::GetDocumentId { reply } => {
+            let _ = reply.send(Err(ActorError::Rpc("local command in kernel dispatch".into())));
+        }
         RpcCommand::GetContextId { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_context_id());
         }

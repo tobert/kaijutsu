@@ -83,7 +83,7 @@ pub enum ServerEvent {
 /// Subscribe via [`ActorHandle::subscribe_status()`](crate::ActorHandle::subscribe_status).
 #[derive(Clone, Debug)]
 pub enum ConnectionStatus {
-    Connected,
+    Connected { document_id: Option<String> },
     Disconnected,
     Reconnecting { attempt: u32 },
     Error(String),
