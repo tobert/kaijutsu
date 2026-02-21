@@ -110,6 +110,59 @@ impl std::fmt::Debug for BlockId {
     }
 }
 
+/// Maximum expected DAG depth. Traversal code should use this as a circuit breaker.
+///
+/// Real conversations rarely exceed depth 50 (user -> thinking -> text -> tool_call ->
+/// tool_result, repeated). Depth 512 is generous; exceeding it likely indicates a
+/// cycle or corruption.
+pub const MAX_DAG_DEPTH: usize = 512;
+
+/// Lightweight Copy-able subset of [`BlockSnapshot`] for DAG indexing.
+///
+/// Contains only the fields needed for traversal, ordering, and filtering —
+/// ~99 bytes vs ~300+ for the full snapshot. Use this when building indexes
+/// or walking the DAG without needing content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockHeader {
+    pub id: BlockId,
+    pub parent_id: Option<BlockId>,
+    pub role: Role,
+    pub kind: BlockKind,
+    pub status: Status,
+    pub compacted: bool,
+    pub created_at: u64,
+}
+
+impl BlockHeader {
+    /// Extract a header from a full [`BlockSnapshot`].
+    pub fn from_snapshot(snap: &BlockSnapshot) -> Self {
+        Self {
+            id: snap.id,
+            parent_id: snap.parent_id,
+            role: snap.role,
+            kind: snap.kind,
+            status: snap.status,
+            compacted: snap.compacted,
+            created_at: snap.created_at,
+        }
+    }
+
+    /// Check if this is a root block (no parent).
+    pub fn is_root(&self) -> bool {
+        self.parent_id.is_none()
+    }
+
+    /// Check if this block has a parent.
+    pub fn has_parent(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
+    /// Check if this is a tool-related block (call or result).
+    pub fn is_tool(&self) -> bool {
+        self.kind.is_tool()
+    }
+}
+
 /// Role in conversation (participant type).
 ///
 /// Uses User/Model terminology to reflect collaborative peer model
@@ -395,6 +448,10 @@ pub struct BlockSnapshot {
     /// Whether this block is collapsed (only meaningful for Thinking).
     #[serde(default, skip_serializing_if = "is_false")]
     pub collapsed: bool,
+    /// Whether this block has been superseded by a compaction summary.
+    /// Compacted blocks are retained for history but excluded from active views.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compacted: bool,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
@@ -454,6 +511,10 @@ impl BlockSnapshot {
         role: Role,
         content: impl Into<String>,
     ) -> Self {
+        debug_assert!(
+            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            "parent_id must be in same context as block (use source_context for drift)"
+        );
         Self {
             id,
             parent_id,
@@ -462,6 +523,7 @@ impl BlockSnapshot {
             kind: BlockKind::Text,
             content: content.into(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -482,6 +544,10 @@ impl BlockSnapshot {
         parent_id: Option<BlockId>,
         content: impl Into<String>,
     ) -> Self {
+        debug_assert!(
+            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            "parent_id must be in same context as block (use source_context for drift)"
+        );
         Self {
             id,
             parent_id,
@@ -490,6 +556,7 @@ impl BlockSnapshot {
             kind: BlockKind::Thinking,
             content: content.into(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -516,6 +583,10 @@ impl BlockSnapshot {
         tool_input: serde_json::Value,
         role: Role,
     ) -> Self {
+        debug_assert!(
+            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            "parent_id must be in same context as block (use source_context for drift)"
+        );
         let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
         Self {
             id,
@@ -525,6 +596,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolCall,
             content: input_json.clone(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
@@ -548,6 +620,10 @@ impl BlockSnapshot {
         is_error: bool,
         exit_code: Option<i32>,
     ) -> Self {
+        debug_assert!(
+            tool_call_id.context_id == id.context_id,
+            "tool_call_id must be in same context as result block"
+        );
         Self {
             id,
             parent_id: Some(tool_call_id),
@@ -556,6 +632,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -583,6 +660,10 @@ impl BlockSnapshot {
         exit_code: Option<i32>,
         display_hint: Option<String>,
     ) -> Self {
+        debug_assert!(
+            tool_call_id.context_id == id.context_id,
+            "tool_call_id must be in same context as result block"
+        );
         Self {
             id,
             parent_id: Some(tool_call_id),
@@ -591,6 +672,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -614,6 +696,10 @@ impl BlockSnapshot {
         source_model: Option<String>,
         drift_kind: DriftKind,
     ) -> Self {
+        debug_assert!(
+            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            "parent_id must be in same context as block (use source_context for drift)"
+        );
         Self {
             id,
             parent_id,
@@ -622,6 +708,7 @@ impl BlockSnapshot {
             kind: BlockKind::Drift,
             content: content.into(),
             collapsed: false,
+            compacted: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -668,6 +755,7 @@ impl BlockSnapshot {
             && self.kind == other.kind
             && self.content == other.content
             && self.collapsed == other.collapsed
+            && self.compacted == other.compacted
             && self.tool_kind == other.tool_kind
             && self.tool_name == other.tool_name
             && self.tool_input == other.tool_input
@@ -717,6 +805,7 @@ impl BlockSnapshotBuilder {
                 kind,
                 content: String::new(),
                 collapsed: false,
+                compacted: false,
                 created_at: crate::now_millis(),
                 tool_kind: None,
                 tool_name: None,
@@ -754,6 +843,11 @@ impl BlockSnapshotBuilder {
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.snap.collapsed = collapsed;
+        self
+    }
+
+    pub fn compacted(mut self, compacted: bool) -> Self {
+        self.snap.compacted = compacted;
         self
     }
 
@@ -1366,6 +1460,7 @@ mod tests {
             .status(Status::Error)
             .content("error output")
             .collapsed(true)
+            .compacted(true)
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
             .tool_input("{\"cmd\":\"ls\"}")
@@ -1384,6 +1479,7 @@ mod tests {
         assert_eq!(snap.status, Status::Error);
         assert_eq!(snap.content, "error output");
         assert!(snap.collapsed);
+        assert!(snap.compacted);
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
         assert_eq!(snap.tool_name, Some("shell".to_string()));
         assert_eq!(snap.tool_input, Some("{\"cmd\":\"ls\"}".to_string()));
@@ -1409,5 +1505,106 @@ mod tests {
         b.created_at = a.created_at + 1000;
         assert_ne!(a, b); // PartialEq sees the difference
         assert!(a.content_eq(&b)); // content_eq ignores it
+    }
+
+    // ── compacted ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compacted_defaults_to_false() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        assert!(!snap.compacted);
+    }
+
+    #[test]
+    fn test_compacted_skipped_in_json_when_false() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("compacted"));
+    }
+
+    #[test]
+    fn test_compacted_roundtrip_when_true() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let mut snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        snap.compacted = true;
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"compacted\":true"));
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.compacted);
+    }
+
+    // ── BlockHeader ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_block_header_from_snapshot() {
+        let ctx = test_context();
+        let author = test_agent();
+        let parent = BlockId::new(ctx, author, 0);
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::text(id, Some(parent), Role::User, "hello");
+        let header = BlockHeader::from_snapshot(&snap);
+
+        assert_eq!(header.id, snap.id);
+        assert_eq!(header.parent_id, snap.parent_id);
+        assert_eq!(header.role, snap.role);
+        assert_eq!(header.kind, snap.kind);
+        assert_eq!(header.status, snap.status);
+        assert_eq!(header.compacted, snap.compacted);
+        assert_eq!(header.created_at, snap.created_at);
+    }
+
+    #[test]
+    fn test_block_header_is_root() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "root");
+        let header = BlockHeader::from_snapshot(&snap);
+        assert!(header.is_root());
+        assert!(!header.has_parent());
+    }
+
+    #[test]
+    fn test_block_header_is_tool() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::tool_call(
+            id,
+            None,
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"cmd": "ls"}),
+            Role::User,
+        );
+        let header = BlockHeader::from_snapshot(&snap);
+        assert!(header.is_tool());
+    }
+
+    #[test]
+    fn test_block_header_is_copy() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        let header = BlockHeader::from_snapshot(&snap);
+        let a = header;
+        let b = header; // copy — would fail without Copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_block_header_serde_roundtrip() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        let header = BlockHeader::from_snapshot(&snap);
+        let json = serde_json::to_string(&header).unwrap();
+        let parsed: BlockHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(header, parsed);
+    }
+
+    // ── MAX_DAG_DEPTH ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_max_dag_depth_is_512() {
+        assert_eq!(MAX_DAG_DEPTH, 512);
     }
 }
