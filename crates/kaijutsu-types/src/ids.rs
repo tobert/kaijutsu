@@ -181,12 +181,12 @@ pub fn resolve_context_prefix<'a>(
     }
 
     // 2. Unique label prefix match
-    let label_matches: Vec<ContextId> = entries
+    let label_matches: Vec<(ContextId, &str)> = entries
         .iter()
         .filter_map(|&(id, label)| {
             label.and_then(|l| {
                 if l.starts_with(query) {
-                    Some(id)
+                    Some((id, l))
                 } else {
                     None
                 }
@@ -195,12 +195,12 @@ pub fn resolve_context_prefix<'a>(
         .collect();
 
     if label_matches.len() == 1 {
-        return Ok(label_matches[0]);
+        return Ok(label_matches[0].0);
     }
     if label_matches.len() > 1 {
         return Err(PrefixError::Ambiguous {
             prefix: query.to_string(),
-            candidates: label_matches.iter().map(|id| id.short()).collect(),
+            candidates: label_matches.iter().map(|(_, l)| l.to_string()).collect(),
         });
     }
 

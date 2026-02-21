@@ -319,7 +319,7 @@ impl std::fmt::Display for DriftKind {
 /// All identity fields use typed IDs: `PrincipalId` for author/agent,
 /// `ContextId` for context references. Tool-specific fields are `Option`
 /// types — only populated for relevant block kinds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockSnapshot {
     /// Block ID.
     pub id: BlockId,
@@ -490,6 +490,98 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        }
+    }
+
+    /// Create a new shell command block (user input in shell mode).
+    pub fn shell_command(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        content: impl Into<String>,
+        author: PrincipalId,
+    ) -> Self {
+        Self {
+            id,
+            parent_id,
+            role: Role::User,
+            status: Status::Done,
+            kind: BlockKind::ShellCommand,
+            content: content.into(),
+            collapsed: false,
+            author,
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        }
+    }
+
+    /// Create a new shell output block (kaish execution result).
+    pub fn shell_output(
+        id: BlockId,
+        command_block_id: BlockId,
+        content: impl Into<String>,
+        is_error: bool,
+        exit_code: Option<i32>,
+        author: PrincipalId,
+    ) -> Self {
+        Self {
+            id,
+            parent_id: Some(command_block_id),
+            role: Role::System,
+            status: if is_error { Status::Error } else { Status::Done },
+            kind: BlockKind::ShellOutput,
+            content: content.into(),
+            collapsed: false,
+            author,
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code,
+            is_error,
+            display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        }
+    }
+
+    /// Create a new shell output block with a display hint.
+    pub fn shell_output_with_hint(
+        id: BlockId,
+        command_block_id: BlockId,
+        content: impl Into<String>,
+        is_error: bool,
+        exit_code: Option<i32>,
+        author: PrincipalId,
+        display_hint: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            parent_id: Some(command_block_id),
+            role: Role::System,
+            status: if is_error { Status::Error } else { Status::Done },
+            kind: BlockKind::ShellOutput,
+            content: content.into(),
+            collapsed: false,
+            author,
+            created_at: Self::now_millis(),
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code,
+            is_error,
+            display_hint,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -835,6 +927,63 @@ mod tests {
     }
 
     #[test]
+    fn test_block_snapshot_shell_command() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::shell_command(id.clone(), None, "ls -la", author);
+
+        assert_eq!(snap.kind, BlockKind::ShellCommand);
+        assert_eq!(snap.role, Role::User);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.content, "ls -la");
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_output() {
+        let ctx = test_context();
+        let author = PrincipalId::system();
+        let cmd_id = BlockId::new(ctx, test_agent(), 1);
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::shell_output(
+            id.clone(),
+            cmd_id.clone(),
+            "total 42\ndrwxr-xr-x ...",
+            false,
+            Some(0),
+            author,
+        );
+
+        assert_eq!(snap.kind, BlockKind::ShellOutput);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.parent_id, Some(cmd_id));
+        assert!(!snap.is_error);
+        assert_eq!(snap.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_output_with_hint() {
+        let ctx = test_context();
+        let author = PrincipalId::system();
+        let cmd_id = BlockId::new(ctx, test_agent(), 1);
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::shell_output_with_hint(
+            id,
+            cmd_id,
+            "output",
+            true,
+            Some(1),
+            author,
+            Some("ansi".to_string()),
+        );
+
+        assert_eq!(snap.kind, BlockKind::ShellOutput);
+        assert!(snap.is_error);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.display_hint, Some("ansi".to_string()));
+    }
+
+    #[test]
     fn test_block_snapshot_serde_roundtrip() {
         let ctx = test_context();
         let author = test_agent();
@@ -845,5 +994,18 @@ mod tests {
         assert_eq!(snap.id, parsed.id);
         assert_eq!(snap.content, parsed.content);
         assert_eq!(snap.author, parsed.author);
+    }
+
+    #[test]
+    fn test_block_snapshot_partial_eq() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello", author);
+        let b = BlockSnapshot::text(id, None, Role::User, "hello", author);
+        // created_at will differ by nanoseconds, so we check field equality
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.content, b.content);
+        assert_eq!(a.role, b.role);
     }
 }

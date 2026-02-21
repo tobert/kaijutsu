@@ -74,8 +74,12 @@ pub fn fork_lineage(
     start: ContextId,
 ) -> Vec<&ContextInfo> {
     let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut current = Some(start);
     while let Some(id) = current {
+        if !seen.insert(id) {
+            break; // cycle detected
+        }
         if let Some(ctx) = contexts.iter().find(|c| c.id == id) {
             chain.push(ctx);
             current = ctx.parent_id;
@@ -195,5 +199,24 @@ mod tests {
         let bytes = postcard::to_stdvec(&info).unwrap();
         let parsed: ContextInfo = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(info, parsed);
+    }
+
+    #[test]
+    fn test_fork_lineage_cycle_terminates() {
+        let kernel = KernelId::new();
+        let creator = PrincipalId::new();
+
+        // Manually construct a cycle: A → B → A
+        let mut a = ContextInfo::new(kernel, Some("a".into()), None, creator);
+        let b = ContextInfo::new(kernel, Some("b".into()), Some(a.id), creator);
+        // Create the cycle
+        a.parent_id = Some(b.id);
+
+        let contexts = vec![a.clone(), b.clone()];
+        let chain = fork_lineage(&contexts, a.id);
+        // Should terminate without infinite loop
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, a.id);
+        assert_eq!(chain[1].id, b.id);
     }
 }
