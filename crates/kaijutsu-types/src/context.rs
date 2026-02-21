@@ -1,8 +1,8 @@
 //! Context metadata types.
 //!
-//! A `ContextInfo` captures the metadata of a context within a kernel —
-//! its identity, lineage, and who created it. This is the listing/display
-//! type, not the full runtime state.
+//! A `Context` captures the metadata of a context within a kernel —
+//! its identity, lineage, and who created it. This is the birth certificate,
+//! not the full runtime state.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,7 @@ use crate::ids::{ContextId, KernelId, PrincipalId};
 /// Used for listing, display, and constellation rendering. The actual CRDT
 /// document lives in the kernel; this is the lightweight summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextInfo {
+pub struct Context {
     /// Globally unique context identifier (also serves as document_id).
     pub id: ContextId,
     /// The kernel this context belongs to.
@@ -28,7 +28,7 @@ pub struct ContextInfo {
     pub created_at: u64,
 }
 
-impl ContextInfo {
+impl Context {
     /// Create a new context info for a freshly created context.
     pub fn new(
         kernel_id: KernelId,
@@ -70,9 +70,9 @@ impl ContextInfo {
 /// Given a set of contexts and a starting ID, returns the chain from
 /// the starting context up to the root (inclusive).
 pub fn fork_lineage(
-    contexts: &[ContextInfo],
+    contexts: &[Context],
     start: ContextId,
-) -> Vec<&ContextInfo> {
+) -> Vec<&Context> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut current = Some(start);
@@ -102,7 +102,7 @@ mod tests {
     fn test_context_info_construction() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = ContextInfo::new(kernel, Some("default".into()), None, creator);
+        let info = Context::new(kernel, Some("default".into()), None, creator);
 
         assert_eq!(info.kernel_id, kernel);
         assert_eq!(info.label, Some("default".to_string()));
@@ -117,7 +117,7 @@ mod tests {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
         let parent = ContextId::new();
-        let info = ContextInfo::new(kernel, Some("debug".into()), Some(parent), creator);
+        let info = Context::new(kernel, Some("debug".into()), Some(parent), creator);
 
         assert!(info.is_child());
         assert!(!info.is_root());
@@ -128,7 +128,7 @@ mod tests {
     fn test_display_name_prefers_label() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = ContextInfo::new(kernel, Some("main".into()), None, creator);
+        let info = Context::new(kernel, Some("main".into()), None, creator);
         assert_eq!(info.display_name(), "main");
     }
 
@@ -136,7 +136,7 @@ mod tests {
     fn test_display_name_falls_back_to_short_hex() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = ContextInfo::new(kernel, None, None, creator);
+        let info = Context::new(kernel, None, None, creator);
         assert_eq!(info.display_name().len(), 8); // short hex
     }
 
@@ -145,10 +145,10 @@ mod tests {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
 
-        let root = ContextInfo::new(kernel, Some("root".into()), None, creator);
-        let child = ContextInfo::new(kernel, Some("child".into()), Some(root.id), creator);
+        let root = Context::new(kernel, Some("root".into()), None, creator);
+        let child = Context::new(kernel, Some("child".into()), Some(root.id), creator);
         let grandchild =
-            ContextInfo::new(kernel, Some("grandchild".into()), Some(child.id), creator);
+            Context::new(kernel, Some("grandchild".into()), Some(child.id), creator);
 
         let contexts = vec![root.clone(), child.clone(), grandchild.clone()];
         let chain = fork_lineage(&contexts, grandchild.id);
@@ -163,7 +163,7 @@ mod tests {
     fn test_fork_lineage_root_only() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let root = ContextInfo::new(kernel, None, None, creator);
+        let root = Context::new(kernel, None, None, creator);
         let contexts = vec![root.clone()];
         let chain = fork_lineage(&contexts, root.id);
         assert_eq!(chain.len(), 1);
@@ -174,7 +174,7 @@ mod tests {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
         // Child references a parent that doesn't exist in the list
-        let orphan = ContextInfo::new(kernel, None, Some(ContextId::new()), creator);
+        let orphan = Context::new(kernel, None, Some(ContextId::new()), creator);
         let contexts = vec![orphan.clone()];
         let chain = fork_lineage(&contexts, orphan.id);
         // Stops at the orphan since parent isn't found
@@ -185,9 +185,9 @@ mod tests {
     fn test_context_info_serde_roundtrip() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = ContextInfo::new(kernel, Some("test".into()), None, creator);
+        let info = Context::new(kernel, Some("test".into()), None, creator);
         let json = serde_json::to_string(&info).unwrap();
-        let parsed: ContextInfo = serde_json::from_str(&json).unwrap();
+        let parsed: Context = serde_json::from_str(&json).unwrap();
         assert_eq!(info, parsed);
     }
 
@@ -195,9 +195,9 @@ mod tests {
     fn test_context_info_postcard_roundtrip() {
         let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = ContextInfo::new(kernel, Some("test".into()), None, creator);
+        let info = Context::new(kernel, Some("test".into()), None, creator);
         let bytes = postcard::to_stdvec(&info).unwrap();
-        let parsed: ContextInfo = postcard::from_bytes(&bytes).unwrap();
+        let parsed: Context = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(info, parsed);
     }
 
@@ -207,8 +207,8 @@ mod tests {
         let creator = PrincipalId::new();
 
         // Manually construct a cycle: A → B → A
-        let mut a = ContextInfo::new(kernel, Some("a".into()), None, creator);
-        let b = ContextInfo::new(kernel, Some("b".into()), Some(a.id), creator);
+        let mut a = Context::new(kernel, Some("a".into()), None, creator);
+        let b = Context::new(kernel, Some("b".into()), Some(a.id), creator);
         // Create the cycle
         a.parent_id = Some(b.id);
 
