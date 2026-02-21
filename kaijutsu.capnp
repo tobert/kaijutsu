@@ -17,13 +17,189 @@ struct TraceContext {
 }
 
 # ============================================================================
-# Core Types
+# Identity
 # ============================================================================
 
 struct Identity {
   username @0 :Text;
   displayName @1 :Text;
+  principalId @2 :Data;   # 16-byte PrincipalId (UUIDv7)
 }
+
+# ============================================================================
+# Block-Based CRDT Types (DAG Architecture)
+# ============================================================================
+# Blocks are the fundamental primitive. Everything is blocks.
+# BlockSnapshot is the unit of replication and display.
+
+# Block identifier — globally unique across all contexts and agents.
+# Uses typed UUIDs (binary, 16 bytes each) instead of strings.
+struct BlockId {
+  contextId @0 :Data;   # 16-byte ContextId (UUIDv7)
+  agentId @1 :Data;     # 16-byte PrincipalId (UUIDv7)
+  seq @2 :UInt64;
+}
+
+# Role in conversation (User/Model terminology for collaborative peer model)
+enum Role {
+  user @0;
+  model @1;
+  system @2;
+  tool @3;
+}
+
+# Execution/processing status
+enum Status {
+  pending @0;
+  running @1;
+  done @2;
+  error @3;
+}
+
+# Block content type — 5 variants covering what a block *is*.
+# Mechanism metadata lives in companion enums:
+# - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
+# - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
+enum BlockKind {
+  text @0;
+  thinking @1;
+  toolCall @2;
+  toolResult @3;
+  drift @4;
+}
+
+# Which execution engine handled a tool call/result.
+enum ToolKind {
+  shell @0;     # kaish shell execution (shell_execute RPC)
+  mcp @1;       # MCP tool invocation (via registered MCP server)
+  builtin @2;   # Kernel builtin tool (no external process)
+}
+
+# How a drift block arrived from another context.
+enum DriftKind {
+  push @0;      # User manually pushed content
+  pull @1;      # User pulled/requested content
+  merge @2;     # Context merge (fork coming home)
+  distill @3;   # LLM-summarized before transfer
+  commit @4;    # Git commit recorded as conversation provenance
+}
+
+# Flat block snapshot — all fields present, some unused depending on kind.
+struct BlockSnapshot {
+  # Core identity
+  id @0 :BlockId;
+
+  # DAG structure
+  parentId @1 :BlockId;
+  hasParentId @2 :Bool;       # True if parentId is set
+
+  # Metadata
+  role @3 :Role;
+  status @4 :Status;
+  kind @5 :BlockKind;
+  author @6 :Data;            # 16-byte PrincipalId (UUIDv7)
+  createdAt @7 :UInt64;       # Unix timestamp in milliseconds
+
+  # Content (all blocks)
+  content @8 :Text;           # Main text content
+  collapsed @9 :Bool;         # For thinking blocks
+
+  # Tool-specific fields (toolCall)
+  toolName @10 :Text;         # Tool name for toolCall
+  toolInput @11 :Text;        # JSON-encoded input for toolCall
+
+  # Tool-specific fields (toolResult)
+  toolCallId @12 :BlockId;    # Reference to parent toolCall block
+  hasToolCallId @13 :Bool;    # True if toolCallId is set
+  exitCode @14 :Int32;        # Exit code for toolResult
+  hasExitCode @15 :Bool;      # True if exitCode is set
+  isError @16 :Bool;          # True if toolResult is an error
+
+  # Display hint for richer output formatting (JSON-serialized)
+  displayHint @17 :Text;      # JSON DisplayHint for tables/trees
+  hasDisplayHint @18 :Bool;   # True if displayHint is set
+
+  # Drift-specific fields (cross-context transfer)
+  sourceContext @19 :Data;    # 16-byte ContextId of originating context
+  hasSourceContext @20 :Bool; # True if sourceContext is set
+  sourceModel @21 :Text;      # Model that produced this content
+  hasSourceModel @22 :Bool;   # True if sourceModel is set
+  driftKind @23 :DriftKind;   # How this block arrived (push/pull/merge/distill/commit)
+  hasDriftKind @24 :Bool;     # True if driftKind is set
+
+  # Tool mechanism metadata (ToolCall / ToolResult)
+  toolKind @25 :ToolKind;     # Which execution engine (shell/mcp/builtin)
+  hasToolKind @26 :Bool;      # True if toolKind is set
+}
+
+# Operations on block documents
+struct BlockDocOp {
+  union {
+    # Insert a new block
+    insertBlock :group {
+      block @0 :BlockSnapshot;
+      afterId @1 :BlockId;
+      hasAfterId @2 :Bool;    # False = insert at start
+    }
+    # Delete a block
+    deleteBlock @3 :BlockId;
+    # Edit text within a block (Thinking/Text only)
+    editBlockText :group {
+      id @4 :BlockId;
+      pos @5 :UInt64;
+      insert @6 :Text;
+      delete @7 :UInt64;
+    }
+    # Toggle collapsed state (Thinking only)
+    setCollapsed :group {
+      id @8 :BlockId;
+      collapsed @9 :Bool;
+    }
+    # Update block status
+    setStatus :group {
+      id @10 :BlockId;
+      status @11 :Status;
+    }
+    # Move block to new position
+    moveBlock :group {
+      id @12 :BlockId;
+      afterId @13 :BlockId;
+      hasAfterId @14 :Bool;
+    }
+  }
+}
+
+# Full document state with blocks
+struct DocumentState {
+  documentId @0 :Text;
+  blocks @1 :List(BlockSnapshot);
+  version @2 :UInt64;
+  ops @3 :Data;  # Full oplog bytes for CRDT sync
+}
+
+# Snapshot of a document version for timeline navigation
+struct VersionSnapshot {
+  version @0 :UInt64;         # Document version number
+  timestamp @1 :UInt64;       # Unix millis when this version was created
+  blockCount @2 :UInt32;      # Number of blocks at this version
+  changeKind @3 :Text;        # Type of change: "block_added", "edit", "status_change"
+  changedBlockId @4 :BlockId; # The block that changed (if applicable)
+}
+
+# Callback for receiving block updates from server
+interface BlockEvents {
+  onBlockInserted @0 (documentId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
+  onBlockDeleted @1 (documentId :Text, blockId :BlockId);
+  onBlockCollapsed @2 (documentId :Text, blockId :BlockId, collapsed :Bool);
+  onBlockMoved @3 (documentId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
+  onBlockStatusChanged @4 (documentId :Text, blockId :BlockId, status :Status);
+  onBlockTextOps @5 (documentId :Text, blockId :BlockId, ops :Data);
+  onSyncReset @6 (documentId :Text, generation :UInt64);
+}
+
+# ============================================================================
+# Context & Kernel Types
+# ============================================================================
 
 struct KernelInfo {
   id @0 :Data;                    # 16-byte KernelId (UUIDv7)
@@ -47,6 +223,18 @@ struct Context {
   documents @2 :List(ContextDocument);
 }
 
+# Information about a registered context (used by listContexts, KernelInfo)
+struct ContextHandleInfo {
+  id @0 :Data;                    # 16-byte ContextId (UUIDv7) — the real identity
+  label @1 :Text;                 # Optional human-friendly name (mutable)
+  parentId @2 :Data;              # 16-byte ContextId of parent (empty = no parent)
+  provider @3 :Text;
+  model @4 :Text;
+  createdAt @5 :UInt64;
+  documentId @6 :Text;            # Primary document ID for this context
+  traceId @7 :Data;               # 16-byte OTel trace ID for context-scoped tracing
+}
+
 struct KernelConfig {
   name @0 :Text;
   mounts @1 :List(MountSpec);
@@ -63,6 +251,67 @@ enum ConsentMode {
   collaborative @0;
   autonomous @1;
 }
+
+struct MountInfo {
+  path @0 :Text;
+  readOnly @1 :Bool;
+}
+
+# ============================================================================
+# Drift Types (Multi-Context Communication)
+# ============================================================================
+
+# Information about a staged drift (pending content transfer)
+struct StagedDriftInfo {
+  id @0 :UInt64;
+  sourceCtx @1 :Data;             # 16-byte ContextId
+  targetCtx @2 :Data;             # 16-byte ContextId
+  content @3 :Text;
+  sourceModel @4 :Text;
+  driftKind @5 :DriftKind;
+  createdAt @6 :UInt64;
+}
+
+# ============================================================================
+# LLM Types
+# ============================================================================
+
+struct LlmRequest {
+  content @0 :Text;       # The prompt text
+  model @1 :Text;         # Optional model name, uses server default if empty
+  documentId @2 :Text;    # Target document for response blocks
+}
+
+struct Completion {
+  text @0 :Text;
+  displayText @1 :Text;
+  kind @2 :CompletionKind;
+}
+
+enum CompletionKind {
+  command @0;
+  path @1;
+  variable @2;
+  keyword @3;
+}
+
+# Information about a single LLM provider
+struct LlmProviderInfo {
+  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
+  defaultModel @1 :Text;      # Default model for this provider
+  available @2 :Bool;         # Whether the provider is available (has API key)
+}
+
+# Current LLM configuration for a kernel
+struct LlmConfigInfo {
+  defaultProvider @0 :Text;   # Name of the default provider
+  defaultModel @1 :Text;      # Name of the default model
+  providers @2 :List(LlmProviderInfo);
+}
+
+# ============================================================================
+# Tool Types
+# ============================================================================
 
 struct ToolInfo {
   name @0 :Text;
@@ -89,24 +338,18 @@ struct ToolSchema {
   category @3 :Text;
 }
 
-struct LlmRequest {
-  content @0 :Text;       # The prompt text
-  model @1 :Text;         # Optional model name, uses server default if empty
-  documentId @2 :Text;    # Target document for response blocks
+# Tool filter mode — controls which tools are available
+struct ToolFilterConfig {
+  union {
+    all @0 :Void;                 # All tools available
+    allowList @1 :List(Text);     # Only these tools available
+    denyList @2 :List(Text);      # All except these tools available
+  }
 }
 
-struct Completion {
-  text @0 :Text;
-  displayText @1 :Text;
-  kind @2 :CompletionKind;
-}
-
-enum CompletionKind {
-  command @0;
-  path @1;
-  variable @2;
-  keyword @3;
-}
+# ============================================================================
+# Shell Types
+# ============================================================================
 
 struct HistoryEntry {
   id @0 :UInt64;
@@ -148,6 +391,24 @@ struct BlobRef {
   id @0 :Text;              # Unique blob identifier
   size @1 :UInt64;          # Size in bytes
   contentType @2 :Text;     # MIME type (e.g., "image/png")
+}
+
+struct KernelOutputEvent {
+  execId @0 :UInt64;
+  event @1 :OutputEvent;
+}
+
+struct OutputEvent {
+  union {
+    stdout @0 :Text;
+    stderr @1 :Text;
+    exitCode @2 :Int32;
+    structured @3 :Text;        # JSON structured output
+  }
+}
+
+interface KernelOutput {
+  onOutput @0 (event :KernelOutputEvent);
 }
 
 # ============================================================================
@@ -193,37 +454,6 @@ struct StatFs {
   namelen @6 :UInt32;
 }
 
-struct MountInfo {
-  path @0 :Text;
-  readOnly @1 :Bool;
-}
-
-# ============================================================================
-# Kernel Output Types
-# ============================================================================
-
-struct KernelOutputEvent {
-  execId @0 :UInt64;
-  event @1 :OutputEvent;
-}
-
-struct OutputEvent {
-  union {
-    stdout @0 :Text;
-    stderr @1 :Text;
-    exitCode @2 :Int32;
-    structured @3 :Text;        # JSON structured output
-  }
-}
-
-# ============================================================================
-# Event Callbacks (Client implements these)
-# ============================================================================
-
-interface KernelOutput {
-  onOutput @0 (event :KernelOutputEvent);
-}
-
 # ============================================================================
 # Agent Types
 # ============================================================================
@@ -249,7 +479,7 @@ struct AgentInfo {
   lastActivity @7 :UInt64;    # Unix timestamp ms
 }
 
-# Agent capabilities - what actions an agent can perform
+# Agent capabilities — what actions an agent can perform
 enum AgentCapability {
   spellCheck @0;              # Quick spell-checking
   grammar @1;                 # Grammar correction
@@ -297,6 +527,163 @@ struct AgentActivityEvent {
 # Callback for receiving agent activity events
 interface AgentEvents {
   onActivity @0 (event :AgentActivityEvent);
+}
+
+# ============================================================================
+# MCP (Model Context Protocol) Types
+# ============================================================================
+
+struct McpServerConfig {
+  name @0 :Text;              # Unique name for this server (e.g., "git", "exa")
+  command @1 :Text;           # Command to run (e.g., "uvx", "npx") — stdio only
+  args @2 :List(Text);        # Arguments for the command — stdio only
+  env @3 :List(EnvVar);       # Environment variables
+  cwd @4 :Text;               # Working directory (optional) — stdio only
+  transport @5 :Text;         # "stdio" (default) or "streamable_http"
+  url @6 :Text;               # Server URL — streamable_http only
+}
+
+struct EnvVar {
+  key @0 :Text;
+  value @1 :Text;
+}
+
+struct McpServerInfo {
+  name @0 :Text;              # Server name
+  protocolVersion @1 :Text;   # MCP protocol version
+  serverName @2 :Text;        # Server's reported name
+  serverVersion @3 :Text;     # Server's reported version
+  tools @4 :List(McpToolInfo);
+}
+
+struct McpToolInfo {
+  name @0 :Text;              # Tool name (e.g., "git_status")
+  description @1 :Text;       # Tool description
+  inputSchema @2 :Text;       # JSON Schema for parameters
+}
+
+struct McpToolCall {
+  server @0 :Text;            # Server name (e.g., "git")
+  tool @1 :Text;              # Tool name (e.g., "git_status")
+  arguments @2 :Text;         # JSON-encoded arguments
+}
+
+struct McpToolResult {
+  success @0 :Bool;
+  content @1 :Text;           # Result content (text)
+  isError @2 :Bool;           # True if the tool returned an error
+}
+
+struct McpResource {
+  uri @0 :Text;               # Resource URI (e.g., "file:///path/to/file")
+  name @1 :Text;              # Resource name
+  description @2 :Text;       # Optional description
+  mimeType @3 :Text;          # Optional MIME type
+  hasDescription @4 :Bool;    # True if description is set
+  hasMimeType @5 :Bool;       # True if mimeType is set
+}
+
+struct McpResourceContents {
+  uri @0 :Text;               # Resource URI
+  mimeType @1 :Text;          # MIME type of content
+  hasMimeType @2 :Bool;       # True if mimeType is set
+  union {
+    text @3 :Text;            # Text content
+    blob @4 :Data;            # Binary content (base64 on wire)
+  }
+}
+
+# Callback interface for receiving MCP resource events from the server
+interface ResourceEvents {
+  # Called when a resource's content is updated
+  onResourceUpdated @0 (server :Text, uri :Text, contents :McpResourceContents, hasContents :Bool);
+  # Called when a server's resource list changes (resources added or removed)
+  onResourceListChanged @1 (server :Text, resources :List(McpResource), hasResources :Bool);
+}
+
+# MCP Root — workspace directory advertised to servers
+struct McpRoot {
+  uri @0 :Text;              # file:// URI for the root
+  name @1 :Text;             # Optional display name
+  hasName @2 :Bool;
+}
+
+# MCP Prompt — reusable prompt template from a server
+struct McpPrompt {
+  name @0 :Text;             # Prompt identifier
+  title @1 :Text;            # Optional display title
+  hasTitle @2 :Bool;
+  description @3 :Text;      # Optional description
+  hasDescription @4 :Bool;
+  arguments @5 :List(McpPromptArgument);
+}
+
+struct McpPromptArgument {
+  name @0 :Text;             # Argument name
+  title @1 :Text;            # Optional title
+  hasTitle @2 :Bool;
+  description @3 :Text;      # Optional description
+  hasDescription @4 :Bool;
+  required @5 :Bool;         # Whether the argument is required
+}
+
+struct McpPromptMessage {
+  role @0 :Text;             # "user" or "assistant"
+  content @1 :Text;          # Message content
+}
+
+# MCP Progress — updates during long-running operations
+struct McpProgress {
+  server @0 :Text;           # Server name
+  token @1 :Text;            # Progress token
+  progress @2 :Float64;      # Current progress value
+  total @3 :Float64;         # Total value if known
+  hasTotal @4 :Bool;
+  message @5 :Text;          # Human-readable message
+  hasMessage @6 :Bool;
+}
+
+interface ProgressEvents {
+  onProgress @0 (progress :McpProgress);
+}
+
+# MCP Elicitation — server requests user input
+struct McpElicitationRequest {
+  requestId @0 :Text;        # Unique request ID
+  server @1 :Text;           # Server name
+  message @2 :Text;          # Message to display
+  schema @3 :Text;           # JSON Schema for response validation
+  hasSchema @4 :Bool;
+}
+
+struct McpElicitationResponse {
+  action @0 :Text;           # "accept", "decline", or "cancel"
+  content @1 :Text;          # JSON response data
+  hasContent @2 :Bool;
+}
+
+interface ElicitationEvents {
+  onRequest @0 (request :McpElicitationRequest) -> (response :McpElicitationResponse);
+}
+
+# MCP Completion — argument value suggestions
+struct McpCompletionResult {
+  values @0 :List(Text);     # Suggested completions
+  total @1 :UInt32;          # Total available if known
+  hasTotal @2 :Bool;
+}
+
+# MCP Logging — log messages from servers
+struct McpLogMessage {
+  server @0 :Text;           # Server name
+  level @1 :Text;            # Log level (error, warn, info, debug)
+  logger @2 :Text;           # Logger name
+  hasLogger @3 :Bool;
+  data @4 :Text;             # JSON log data
+}
+
+interface LoggingEvents {
+  onLog @0 (log :McpLogMessage);
 }
 
 # ============================================================================
@@ -361,7 +748,7 @@ interface Kernel {
   callMcpTool @27 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
 
   # Shell execution (kaish REPL with block output)
-  # Creates ShellCommand and ShellOutput blocks, streams output via BlockEvents
+  # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
   shellExecute @28 (code :Text, documentId :Text, trace :TraceContext) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
@@ -544,370 +931,6 @@ interface Kernel {
   # Compact a document's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
   compactDocument @87 (documentId :Text, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
-}
-
-# ============================================================================
-# Drift Types (Multi-Context Communication)
-# ============================================================================
-
-# Information about a staged drift (pending content transfer)
-struct StagedDriftInfo {
-  id @0 :UInt64;
-  sourceCtx @1 :Data;             # 16-byte ContextId
-  targetCtx @2 :Data;             # 16-byte ContextId
-  content @3 :Text;
-  sourceModel @4 :Text;
-  driftKind @5 :Text;
-  createdAt @6 :UInt64;
-}
-
-# Information about a registered context (used by listContexts, KernelInfo)
-struct ContextHandleInfo {
-  id @0 :Data;                    # 16-byte ContextId (UUIDv7) — the real identity
-  label @1 :Text;                 # Optional human-friendly name (mutable)
-  parentId @2 :Data;              # 16-byte ContextId of parent (empty = no parent)
-  provider @3 :Text;
-  model @4 :Text;
-  createdAt @5 :UInt64;
-  documentId @6 :Text;            # Primary document ID for this context
-  traceId @7 :Data;              # 16-byte OTel trace ID for context-scoped tracing
-}
-
-# ============================================================================
-# LLM Configuration Types
-# ============================================================================
-
-# Information about a single LLM provider
-struct LlmProviderInfo {
-  name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
-  defaultModel @1 :Text;     # Default model for this provider
-  available @2 :Bool;         # Whether the provider is available (has API key)
-}
-
-# Current LLM configuration for a kernel
-struct LlmConfigInfo {
-  defaultProvider @0 :Text;   # Name of the default provider
-  defaultModel @1 :Text;     # Name of the default model
-  providers @2 :List(LlmProviderInfo);
-}
-
-# ============================================================================
-# Tool Filter Configuration Types
-# ============================================================================
-
-# Tool filter mode — controls which tools are available
-struct ToolFilterConfig {
-  union {
-    all @0 :Void;                 # All tools available
-    allowList @1 :List(Text);     # Only these tools available
-    denyList @2 :List(Text);      # All except these tools available
-  }
-}
-
-# ============================================================================
-# Block-Based CRDT Types (DAG Architecture)
-# ============================================================================
-
-# Block identifier - globally unique across all documents and agents
-struct BlockId {
-  documentId @0 :Text;
-  agentId @1 :Text;
-  seq @2 :UInt64;
-}
-
-# Role in conversation (User/Model terminology for collaborative peer model)
-enum Role {
-  user @0;
-  model @1;
-  system @2;
-  tool @3;
-}
-
-# Execution/processing status
-enum Status {
-  pending @0;
-  running @1;
-  done @2;
-  error @3;
-}
-
-# Block content type
-enum BlockKind {
-  text @0;
-  thinking @1;
-  toolCall @2;
-  toolResult @3;
-  shellCommand @4;
-  shellOutput @5;
-  drift @6;
-}
-
-# Flat block snapshot - all fields present, some unused depending on kind
-struct BlockSnapshot {
-  # Core identity
-  id @0 :BlockId;
-
-  # DAG structure
-  parentId @1 :BlockId;
-  hasParentId @2 :Bool;       # True if parentId is set
-
-  # Metadata
-  role @3 :Role;
-  status @4 :Status;
-  kind @5 :BlockKind;
-  author @6 :Text;
-  createdAt @7 :UInt64;       # Unix timestamp in milliseconds
-
-  # Content (all blocks)
-  content @8 :Text;           # Main text content
-  collapsed @9 :Bool;         # For thinking blocks
-
-  # Tool-specific fields (toolCall)
-  toolName @10 :Text;         # Tool name for toolCall
-  toolInput @11 :Text;        # JSON-encoded input for toolCall
-
-  # Tool-specific fields (toolResult)
-  toolCallId @12 :BlockId;    # Reference to parent toolCall block
-  hasToolCallId @13 :Bool;    # True if toolCallId is set
-  exitCode @14 :Int32;        # Exit code for toolResult
-  hasExitCode @15 :Bool;      # True if exitCode is set
-  isError @16 :Bool;          # True if toolResult is an error
-
-  # Display hint for richer output formatting (JSON-serialized)
-  displayHint @17 :Text;      # JSON DisplayHint for tables/trees
-  hasDisplayHint @18 :Bool;   # True if displayHint is set
-
-  # Drift-specific fields (cross-context transfer)
-  sourceContext @19 :Text;    # Short ID of originating context
-  hasSourceContext @20 :Bool; # True if sourceContext is set
-  sourceModel @21 :Text;     # Model that produced this content
-  hasSourceModel @22 :Bool;  # True if sourceModel is set
-  driftKind @23 :Text;       # How this block arrived (push/pull/merge/distill)
-  hasDriftKind @24 :Bool;    # True if driftKind is set
-}
-
-# Operations on block documents
-struct BlockDocOp {
-  union {
-    # Insert a new block
-    insertBlock :group {
-      block @0 :BlockSnapshot;
-      afterId @1 :BlockId;
-      hasAfterId @2 :Bool;    # False = insert at start
-    }
-    # Delete a block
-    deleteBlock @3 :BlockId;
-    # Edit text within a block (Thinking/Text only)
-    editBlockText :group {
-      id @4 :BlockId;
-      pos @5 :UInt64;
-      insert @6 :Text;
-      delete @7 :UInt64;
-    }
-    # Toggle collapsed state (Thinking only)
-    setCollapsed :group {
-      id @8 :BlockId;
-      collapsed @9 :Bool;
-    }
-    # Update block status
-    setStatus :group {
-      id @10 :BlockId;
-      status @11 :Status;
-    }
-    # Move block to new position
-    moveBlock :group {
-      id @12 :BlockId;
-      afterId @13 :BlockId;
-      hasAfterId @14 :Bool;
-    }
-  }
-}
-
-# Full document state with blocks
-struct DocumentState {
-  documentId @0 :Text;
-  blocks @1 :List(BlockSnapshot);
-  version @2 :UInt64;
-  ops @3 :Data;  # Full oplog bytes for CRDT sync
-}
-
-# Snapshot of a document version for timeline navigation
-struct VersionSnapshot {
-  version @0 :UInt64;         # Document version number
-  timestamp @1 :UInt64;       # Unix millis when this version was created
-  blockCount @2 :UInt32;      # Number of blocks at this version
-  changeKind @3 :Text;        # Type of change: "block_added", "edit", "status_change"
-  changedBlockId @4 :BlockId; # The block that changed (if applicable)
-}
-
-# Callback for receiving block updates from server
-interface BlockEvents {
-  onBlockInserted @0 (documentId :Text, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
-  onBlockDeleted @1 (documentId :Text, blockId :BlockId);
-  onBlockCollapsed @2 (documentId :Text, blockId :BlockId, collapsed :Bool);
-  onBlockMoved @3 (documentId :Text, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (documentId :Text, blockId :BlockId, status :Status);
-  onBlockTextOps @5 (documentId :Text, blockId :BlockId, ops :Data);
-  onSyncReset @6 (documentId :Text, generation :UInt64);
-}
-
-# ============================================================================
-# MCP (Model Context Protocol) Types
-# ============================================================================
-
-struct McpServerConfig {
-  name @0 :Text;              # Unique name for this server (e.g., "git", "exa")
-  command @1 :Text;           # Command to run (e.g., "uvx", "npx") — stdio only
-  args @2 :List(Text);        # Arguments for the command — stdio only
-  env @3 :List(EnvVar);       # Environment variables
-  cwd @4 :Text;               # Working directory (optional) — stdio only
-  transport @5 :Text;         # "stdio" (default) or "streamable_http"
-  url @6 :Text;               # Server URL — streamable_http only
-}
-
-struct EnvVar {
-  key @0 :Text;
-  value @1 :Text;
-}
-
-struct McpServerInfo {
-  name @0 :Text;              # Server name
-  protocolVersion @1 :Text;   # MCP protocol version
-  serverName @2 :Text;        # Server's reported name
-  serverVersion @3 :Text;     # Server's reported version
-  tools @4 :List(McpToolInfo);
-}
-
-struct McpToolInfo {
-  name @0 :Text;              # Tool name (e.g., "git_status")
-  description @1 :Text;       # Tool description
-  inputSchema @2 :Text;       # JSON Schema for parameters
-}
-
-struct McpToolCall {
-  server @0 :Text;            # Server name (e.g., "git")
-  tool @1 :Text;              # Tool name (e.g., "git_status")
-  arguments @2 :Text;         # JSON-encoded arguments
-}
-
-struct McpToolResult {
-  success @0 :Bool;
-  content @1 :Text;           # Result content (text)
-  isError @2 :Bool;           # True if the tool returned an error
-}
-
-# MCP Resource Types
-
-struct McpResource {
-  uri @0 :Text;               # Resource URI (e.g., "file:///path/to/file")
-  name @1 :Text;              # Resource name
-  description @2 :Text;       # Optional description
-  mimeType @3 :Text;          # Optional MIME type
-  hasDescription @4 :Bool;    # True if description is set
-  hasMimeType @5 :Bool;       # True if mimeType is set
-}
-
-struct McpResourceContents {
-  uri @0 :Text;               # Resource URI
-  mimeType @1 :Text;          # MIME type of content
-  hasMimeType @2 :Bool;       # True if mimeType is set
-  union {
-    text @3 :Text;            # Text content
-    blob @4 :Data;            # Binary content (base64 on wire)
-  }
-}
-
-# Callback interface for receiving MCP resource events from the server
-interface ResourceEvents {
-  # Called when a resource's content is updated
-  onResourceUpdated @0 (server :Text, uri :Text, contents :McpResourceContents, hasContents :Bool);
-  # Called when a server's resource list changes (resources added or removed)
-  onResourceListChanged @1 (server :Text, resources :List(McpResource), hasResources :Bool);
-}
-
-# MCP Root - workspace directory advertised to servers
-struct McpRoot {
-  uri @0 :Text;              # file:// URI for the root
-  name @1 :Text;             # Optional display name
-  hasName @2 :Bool;
-}
-
-# MCP Prompt - reusable prompt template from a server
-struct McpPrompt {
-  name @0 :Text;             # Prompt identifier
-  title @1 :Text;            # Optional display title
-  hasTitle @2 :Bool;
-  description @3 :Text;      # Optional description
-  hasDescription @4 :Bool;
-  arguments @5 :List(McpPromptArgument);
-}
-
-struct McpPromptArgument {
-  name @0 :Text;             # Argument name
-  title @1 :Text;            # Optional title
-  hasTitle @2 :Bool;
-  description @3 :Text;      # Optional description
-  hasDescription @4 :Bool;
-  required @5 :Bool;         # Whether the argument is required
-}
-
-struct McpPromptMessage {
-  role @0 :Text;             # "user" or "assistant"
-  content @1 :Text;          # Message content
-}
-
-# MCP Progress - updates during long-running operations
-struct McpProgress {
-  server @0 :Text;           # Server name
-  token @1 :Text;            # Progress token
-  progress @2 :Float64;      # Current progress value
-  total @3 :Float64;         # Total value if known
-  hasTotal @4 :Bool;
-  message @5 :Text;          # Human-readable message
-  hasMessage @6 :Bool;
-}
-
-interface ProgressEvents {
-  onProgress @0 (progress :McpProgress);
-}
-
-# MCP Elicitation - server requests user input
-struct McpElicitationRequest {
-  requestId @0 :Text;        # Unique request ID
-  server @1 :Text;           # Server name
-  message @2 :Text;          # Message to display
-  schema @3 :Text;           # JSON Schema for response validation
-  hasSchema @4 :Bool;
-}
-
-struct McpElicitationResponse {
-  action @0 :Text;           # "accept", "decline", or "cancel"
-  content @1 :Text;          # JSON response data
-  hasContent @2 :Bool;
-}
-
-interface ElicitationEvents {
-  onRequest @0 (request :McpElicitationRequest) -> (response :McpElicitationResponse);
-}
-
-# MCP Completion - argument value suggestions
-struct McpCompletionResult {
-  values @0 :List(Text);     # Suggested completions
-  total @1 :UInt32;          # Total available if known
-  hasTotal @2 :Bool;
-}
-
-# MCP Logging - log messages from servers
-struct McpLogMessage {
-  server @0 :Text;           # Server name
-  level @1 :Text;            # Log level (error, warn, info, debug)
-  logger @2 :Text;           # Logger name
-  hasLogger @3 :Bool;
-  data @4 :Text;             # JSON log data
-}
-
-interface LoggingEvents {
-  onLog @0 (log :McpLogMessage);
 }
 
 # ============================================================================
