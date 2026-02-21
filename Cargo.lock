@@ -5115,12 +5115,11 @@ name = "kaijutsu-crdt"
 version = "0.1.0"
 dependencies = [
  "diamond-types-extended",
+ "kaijutsu-types",
  "postcard",
  "rand 0.8.5",
  "serde",
  "serde_json",
- "smartstring",
- "strum 0.26.3",
  "thiserror 2.0.18",
  "tracing",
  "uuid",

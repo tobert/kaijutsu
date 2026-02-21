@@ -8,7 +8,7 @@ pub use diamond_types_extended::{Frontier, SerializedOps, SerializedOpsOwned, LV
 
 #[cfg(test)]
 mod tests {
-    use diamond_types_extended::{Document, Frontier};
+    use diamond_types_extended::{Document, Frontier, Uuid};
 
     #[test]
     fn test_ops_sync() {
@@ -16,8 +16,10 @@ mod tests {
         let mut doc_a = Document::new();
         let mut doc_b = Document::new();
 
-        let alice = doc_a.create_agent(crate::document::agent_uuid("alice"));
-        let bob = doc_b.create_agent(crate::document::agent_uuid("bob"));
+        let alice_uuid = Uuid::from_bytes(*crate::PrincipalId::new().as_bytes());
+        let bob_uuid = Uuid::from_bytes(*crate::PrincipalId::new().as_bytes());
+        let alice = doc_a.create_agent(alice_uuid);
+        let bob = doc_b.create_agent(bob_uuid);
 
         // Alice makes changes
         doc_a.transact(alice, |tx| {

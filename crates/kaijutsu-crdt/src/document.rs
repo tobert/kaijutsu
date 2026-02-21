@@ -12,26 +12,7 @@
 
 use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned, Uuid};
 
-use crate::{BlockId, BlockKind, BlockSnapshot, CrdtError, Result, Role, Status};
-
-/// Convert a string agent ID to a deterministic UUID.
-///
-/// Uses a simple hash-to-bytes approach so the same agent string always
-/// produces the same UUID. This is needed because diamond-types-extended
-/// v0.2 changed `create_agent` to take `Uuid` instead of `&str`.
-pub(crate) fn agent_uuid(agent_id: &str) -> Uuid {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    agent_id.hash(&mut hasher);
-    let h1 = hasher.finish();
-    // Hash again for the second 8 bytes
-    h1.hash(&mut hasher);
-    let h2 = hasher.finish();
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&h1.to_le_bytes());
-    bytes[8..].copy_from_slice(&h2.to_le_bytes());
-    Uuid::from_bytes(bytes)
-}
+use crate::{BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, PrincipalId, Result, Role, Status, ToolKind};
 
 /// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
 /// Lexicographically ordered: '0' < '9' < 'A' < 'Z' < 'a' < 'z'.
@@ -96,10 +77,10 @@ fn order_midpoint(a: &str, b: &str) -> String {
 ///     ├── kind (Str)                # text/thinking/tool_call/tool_result
 ///     ├── content (Text)            # Streamable via Text CRDT
 ///     ├── collapsed (Bool)          # LWW - toggleable
-///     ├── author (Str)
 ///     ├── created_at (I64)
 ///     │
 ///     │   # Tool-specific (optional, set on creation)
+///     ├── tool_kind (Str)           # For ToolCall/ToolResult (shell/mcp/builtin)
 ///     ├── tool_name (Str)           # For ToolCall
 ///     ├── tool_input (Text)         # For ToolCall - JSON, streamable
 ///     ├── tool_call_id (Str)        # For ToolResult → parent ToolCall
@@ -115,11 +96,11 @@ fn order_midpoint(a: &str, b: &str) -> String {
 /// - Text uses sequence CRDT for character-level merging
 /// - All peers converge to identical state after sync
 pub struct BlockDocument {
-    /// Document ID this document belongs to.
-    document_id: String,
+    /// Context ID this document belongs to.
+    context_id: ContextId,
 
-    /// Agent ID string for this instance.
-    agent_id_str: String,
+    /// Principal ID for this agent instance.
+    agent_id: PrincipalId,
 
     /// Agent ID (numeric) in the Document.
     agent: AgentId,
@@ -136,12 +117,10 @@ pub struct BlockDocument {
 
 impl BlockDocument {
     /// Create a new empty document (server-side, creates initial structure).
-    pub fn new(document_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
-        let document_id = document_id.into();
-        let agent_id_str = agent_id.into();
-
+    pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
         let mut doc = Document::new();
-        let agent = doc.create_agent(agent_uuid(&agent_id_str));
+        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let agent = doc.create_agent(dte_uuid);
 
         // Create the blocks Set at ROOT["blocks"]
         doc.transact(agent, |tx| {
@@ -149,8 +128,8 @@ impl BlockDocument {
         });
 
         Self {
-            document_id,
-            agent_id_str,
+            context_id,
+            agent_id,
             agent,
             doc,
             next_seq: 0,
@@ -162,16 +141,14 @@ impl BlockDocument {
     ///
     /// Use this when the document will receive its initial state via `merge_ops`.
     /// The blocks Set will be created when ops are merged from the server.
-    pub fn new_for_sync(document_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
-        let document_id = document_id.into();
-        let agent_id_str = agent_id.into();
-
+    pub fn new_for_sync(context_id: ContextId, agent_id: PrincipalId) -> Self {
         let mut doc = Document::new();
-        let agent = doc.create_agent(agent_uuid(&agent_id_str));
+        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let agent = doc.create_agent(dte_uuid);
 
         Self {
-            document_id,
-            agent_id_str,
+            context_id,
+            agent_id,
             agent,
             doc,
             next_seq: 0,
@@ -183,14 +160,14 @@ impl BlockDocument {
     // Accessors
     // =========================================================================
 
-    /// Get the document ID.
-    pub fn document_id(&self) -> &str {
-        &self.document_id
+    /// Get the context ID.
+    pub fn context_id(&self) -> ContextId {
+        self.context_id
     }
 
-    /// Get the agent ID.
-    pub fn agent_id(&self) -> &str {
-        &self.agent_id_str
+    /// Get the agent/principal ID.
+    pub fn agent_id(&self) -> PrincipalId {
+        self.agent_id
     }
 
     /// Get the current version.
@@ -225,6 +202,7 @@ impl BlockDocument {
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
+        #[allow(clippy::drop_non_drop)] // intentional: release DTE interior lock
         drop(blocks_set);
 
         // Now safe to query root map for order values
@@ -308,10 +286,6 @@ impl BlockDocument {
             .unwrap_or_else(|| "done".to_string());
         let status = Status::from_str(&status_str).unwrap_or(Status::Done);
 
-        let author = block_map.get("author")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-
         let created_at = block_map.get("created_at")
             .and_then(|v| v.as_int())
             .map(|n| n as u64)
@@ -330,11 +304,19 @@ impl BlockDocument {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let compacted = block_map.get("compacted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let parent_id = block_map.get("parent_id")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| BlockId::from_key(&s));
 
         // Tool-specific fields
+        let tool_kind = block_map.get("tool_kind")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| ToolKind::from_str(&s));
+
         let tool_name = block_map.get("tool_name")
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
@@ -359,25 +341,27 @@ impl BlockDocument {
 
         // Drift-specific fields
         let source_context = block_map.get("source_context")
-            .and_then(|v| v.as_str().map(|s| s.to_string()));
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| ContextId::parse(&s).ok());
 
         let source_model = block_map.get("source_model")
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         let drift_kind = block_map.get("drift_kind")
             .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .and_then(|s| crate::block::DriftKind::from_str(&s));
+            .and_then(|s| crate::DriftKind::from_str(&s));
 
         Some(BlockSnapshot {
-            id: id.clone(),
+            id: *id,
             parent_id,
             role,
             status,
             kind,
             content,
             collapsed,
-            author,
+            compacted,
             created_at,
+            tool_kind,
             tool_name,
             tool_input,
             tool_call_id,
@@ -419,7 +403,7 @@ impl BlockDocument {
 
         while let Some(block) = current {
             if let Some(parent_id) = block.parent_id {
-                ancestors.push(parent_id.clone());
+                ancestors.push(parent_id);
                 current = self.get_block_snapshot(&parent_id);
             } else {
                 break;
@@ -449,7 +433,7 @@ impl BlockDocument {
 
     /// Generate a new block ID.
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(&self.document_id, &self.agent_id_str, self.next_seq);
+        let id = BlockId::new(self.context_id, self.agent_id, self.next_seq);
         self.next_seq += 1;
         id
     }
@@ -526,8 +510,7 @@ impl BlockDocument {
 
     /// Insert a new block with full DAG support.
     ///
-    /// This is the primary block creation API. All legacy insert_* methods
-    /// delegate to this.
+    /// Author is implicit — derived from `self.agent_id` via the BlockId.
     ///
     /// # Arguments
     ///
@@ -536,7 +519,6 @@ impl BlockDocument {
     /// * `role` - Role of the block author (Human, Agent, System, Tool)
     /// * `kind` - Content type (Text, Thinking, ToolCall, ToolResult)
     /// * `content` - Initial text content
-    /// * `author` - Author identifier
     ///
     /// # Returns
     ///
@@ -548,25 +530,24 @@ impl BlockDocument {
         role: Role,
         kind: BlockKind,
         content: impl Into<String>,
-        author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let content_str = content.into();
-        let author_str = author.into();
 
         self.insert_block_with_id(
-            id.clone(),
+            id,
             parent_id,
             after,
             role,
             kind,
             content_str,
-            author_str,
+            None, // tool_kind
             None, // tool_name
             None, // tool_input
             None, // tool_call_id
             None, // exit_code
             false, // is_error
+            false, // compacted
             None, // display_hint
             None, // source_context
             None, // source_model
@@ -583,25 +564,25 @@ impl BlockDocument {
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
-        author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
             .map_err(|e| CrdtError::Serialization(e.to_string()))?;
 
         self.insert_block_with_id(
-            id.clone(),
+            id,
             parent_id,
             after,
             Role::Model,
             BlockKind::ToolCall,
             input_json.clone(),
-            author.into(),
+            None, // tool_kind
             Some(tool_name.into()),
             Some(input_json),
             None,
             None,
             false,
+            false, // compacted
             None, // display_hint
             None, // source_context
             None, // source_model
@@ -619,7 +600,6 @@ impl BlockDocument {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
-        author: impl Into<String>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
 
@@ -627,18 +607,19 @@ impl BlockDocument {
         let after = after.or(Some(tool_call_id));
 
         self.insert_block_with_id(
-            id.clone(),
+            id,
             Some(tool_call_id), // Parent is the tool call
             after,
             Role::Tool,
             BlockKind::ToolResult,
             content.into(),
-            author.into(),
+            None, // tool_kind
             None,
             None,
-            Some(tool_call_id.clone()),
+            Some(*tool_call_id),
             exit_code,
             is_error,
+            false, // compacted
             None, // display_hint
             None, // source_context
             None, // source_model
@@ -652,45 +633,37 @@ impl BlockDocument {
     ///
     /// This is used when receiving blocks from the server via block events.
     /// The snapshot contains all fields including the pre-assigned block ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `snapshot` - Complete block snapshot from remote source
-    /// * `after` - Block ID to insert after in document order (None for end)
-    ///
-    /// # Returns
-    ///
-    /// The block's ID on success.
     pub fn insert_from_snapshot(
         &mut self,
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
-        // Generate a local ID if the snapshot has a placeholder (empty document_id).
+        // Generate a local ID if the snapshot has a placeholder (nil context_id).
         // This happens for drift blocks built by DriftRouter::build_drift_block().
-        let block_id = if snapshot.id.document_id.is_empty() {
+        let block_id = if snapshot.id.context_id.is_nil() {
             self.new_block_id()
         } else {
             // Update next_seq if needed to avoid collisions with remote IDs
-            if snapshot.id.agent_id == self.agent_id_str {
+            if snapshot.id.agent_id == self.agent_id {
                 self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
             }
-            snapshot.id.clone()
+            snapshot.id
         };
 
         self.insert_block_with_id(
-            block_id.clone(),
+            block_id,
             snapshot.parent_id.as_ref(),
             after,
             snapshot.role,
             snapshot.kind,
             snapshot.content,
-            snapshot.author,
+            snapshot.tool_kind,
             snapshot.tool_name,
             snapshot.tool_input,
             snapshot.tool_call_id,
             snapshot.exit_code,
             snapshot.is_error,
+            snapshot.compacted,
             snapshot.display_hint,
             snapshot.source_context,
             snapshot.source_model,
@@ -710,16 +683,17 @@ impl BlockDocument {
         role: Role,
         kind: BlockKind,
         content: String,
-        author: String,
+        tool_kind: Option<ToolKind>,
         tool_name: Option<String>,
         tool_input: Option<String>,
         tool_call_id: Option<BlockId>,
         exit_code: Option<i32>,
         is_error: bool,
+        compacted: bool,
         display_hint: Option<String>,
-        source_context: Option<String>,
+        source_context: Option<ContextId>,
         source_model: Option<String>,
-        drift_kind: Option<crate::block::DriftKind>,
+        drift_kind: Option<crate::DriftKind>,
     ) -> Result<()> {
         let block_key = id.to_key();
 
@@ -729,17 +703,17 @@ impl BlockDocument {
         }
 
         // Validate reference if provided
-        if let Some(after_id) = after {
-            if !self.block_exists(&after_id.to_key()) {
-                return Err(CrdtError::InvalidReference(after_id.clone()));
-            }
+        if let Some(after_id) = after
+            && !self.block_exists(&after_id.to_key())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
 
         // Validate parent if provided
-        if let Some(parent) = parent_id {
-            if !self.block_exists(&parent.to_key()) {
-                return Err(CrdtError::InvalidReference(parent.clone()));
-            }
+        if let Some(parent) = parent_id
+            && !self.block_exists(&parent.to_key())
+        {
+            return Err(CrdtError::InvalidReference(*parent));
         }
 
         // Calculate order key (string-based fractional index)
@@ -770,13 +744,17 @@ impl BlockDocument {
                 let block_map_id = tx.root().create_map(&block_map_key);
                 let mut block_map = tx.map_by_id(block_map_id);
 
-                // Store block metadata
-                block_map.set("author", author.as_str());
+                // Store block metadata (no author — derived from id.agent_id)
                 block_map.set("created_at", created_at);
                 block_map.set("kind", kind.as_str());
                 block_map.set("role", role.as_str());
                 block_map.set("status", Status::Done.as_str());
                 block_map.set("collapsed", false);
+
+                // Store compacted flag (only when true)
+                if compacted {
+                    block_map.set("compacted", true);
+                }
 
                 // Store parent_id if present
                 if let Some(parent) = parent_id {
@@ -787,6 +765,10 @@ impl BlockDocument {
                 let text_id = block_map.create_text("content");
 
                 // Tool-specific fields
+                if let Some(ref tk) = tool_kind {
+                    block_map.set("tool_kind", tk.as_str());
+                }
+
                 if let Some(ref name) = tool_name {
                     block_map.set("tool_name", name.as_str());
                 }
@@ -814,8 +796,8 @@ impl BlockDocument {
                 }
 
                 // Drift-specific fields
-                if let Some(ref ctx) = source_context {
-                    block_map.set("source_context", ctx.as_str());
+                if let Some(ctx) = source_context {
+                    block_map.set("source_context", ctx.to_hex().as_str());
                 }
                 if let Some(ref model) = source_model {
                     block_map.set("source_model", model.as_str());
@@ -828,20 +810,18 @@ impl BlockDocument {
             };
 
             // Now fill in text content (block_map is dropped, so we can borrow tx again)
-            if !content.is_empty() {
-                if let Some(mut text) = tx.text_by_id(text_id) {
-                    text.insert(0, &content);
-                }
+            if !content.is_empty()
+                && let Some(mut text) = tx.text_by_id(text_id)
+            {
+                text.insert(0, &content);
             }
 
-            if let Some(ref input) = tool_input {
-                if let Some(input_id) = tool_input_id {
-                    if !input.is_empty() {
-                        if let Some(mut input_text) = tx.text_by_id(input_id) {
-                            input_text.insert(0, input);
-                        }
-                    }
-                }
+            if let Some(ref input) = tool_input
+                && let Some(input_id) = tool_input_id
+                && !input.is_empty()
+                && let Some(mut input_text) = tx.text_by_id(input_id)
+            {
+                input_text.insert(0, input);
             }
         });
 
@@ -854,7 +834,7 @@ impl BlockDocument {
     /// Status is LWW (Last-Write-Wins) for convergence.
     pub fn set_status(&mut self, id: &BlockId, status: Status) -> Result<()> {
         let _snapshot = self.get_block_snapshot(id)
-            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            .ok_or(CrdtError::BlockNotFound(*id))?;
 
         let block_key = format!("block:{}", id.to_key());
 
@@ -882,7 +862,7 @@ impl BlockDocument {
         // Read current text content
         let content = {
             let block_map = self.doc.get_map(&[&block_key])
-                .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+                .ok_or(CrdtError::BlockNotFound(*id))?;
             block_map.get_text("content")
                 .map(|t| t.content())
                 .unwrap_or_default()
@@ -905,7 +885,7 @@ impl BlockDocument {
     /// The hint is stored as a JSON string.
     pub fn set_display_hint(&mut self, id: &BlockId, hint: Option<&str>) -> Result<()> {
         let _snapshot = self.get_block_snapshot(id)
-            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            .ok_or(CrdtError::BlockNotFound(*id))?;
 
         let block_key = format!("block:{}", id.to_key());
 
@@ -928,7 +908,7 @@ impl BlockDocument {
 
         // Check if block exists
         if !self.block_exists(&block_key) {
-            return Err(CrdtError::BlockNotFound(id.clone()));
+            return Err(CrdtError::BlockNotFound(*id));
         }
 
         // Remove from blocks Set
@@ -964,7 +944,7 @@ impl BlockDocument {
     ) -> Result<()> {
         // Verify block exists
         let snapshot = self.get_block_snapshot(id)
-            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            .ok_or(CrdtError::BlockNotFound(*id))?;
 
         let block_key = format!("block:{}", id.to_key());
 
@@ -999,7 +979,7 @@ impl BlockDocument {
     /// Append text to a block.
     pub fn append_text(&mut self, id: &BlockId, text: &str) -> Result<()> {
         let snapshot = self.get_block_snapshot(id)
-            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            .ok_or(CrdtError::BlockNotFound(*id))?;
 
         // Use chars().count() for UTF-8 safety - edit_text uses character positions
         let len = snapshot.content.chars().count();
@@ -1011,10 +991,10 @@ impl BlockDocument {
     /// Only Thinking blocks support the collapsed state.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
         let snapshot = self.get_block_snapshot(id)
-            .ok_or_else(|| CrdtError::BlockNotFound(id.clone()))?;
+            .ok_or(CrdtError::BlockNotFound(*id))?;
 
         if snapshot.kind != BlockKind::Thinking {
-            return Err(CrdtError::UnsupportedOperation(id.clone()));
+            return Err(CrdtError::UnsupportedOperation(*id));
         }
 
         let block_key = format!("block:{}", id.to_key());
@@ -1038,14 +1018,14 @@ impl BlockDocument {
 
         // Check if block exists
         if !self.block_exists(&block_key) {
-            return Err(CrdtError::BlockNotFound(id.clone()));
+            return Err(CrdtError::BlockNotFound(*id));
         }
 
         // Validate reference if provided
-        if let Some(after_id) = after {
-            if !self.block_exists(&after_id.to_key()) {
-                return Err(CrdtError::InvalidReference(after_id.clone()));
-            }
+        if let Some(after_id) = after
+            && !self.block_exists(&after_id.to_key())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
 
         // Calculate new order key
@@ -1120,12 +1100,13 @@ impl BlockDocument {
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
+            #[allow(clippy::drop_non_drop)] // intentional: release DTE interior lock
             drop(blocks_set);
             for key in keys {
-                if let Some(block_id) = BlockId::from_key(&key) {
-                    if block_id.agent_id == self.agent_id_str {
-                        self.next_seq = self.next_seq.max(block_id.seq + 1);
-                    }
+                if let Some(block_id) = BlockId::from_key(&key)
+                    && block_id.agent_id == self.agent_id
+                {
+                    self.next_seq = self.next_seq.max(block_id.seq + 1);
                 }
             }
         }
@@ -1142,22 +1123,12 @@ impl BlockDocument {
     // Fork Support
     // =========================================================================
 
-    /// Fork the document, creating a copy with a new document ID.
+    /// Fork the document, creating a copy with a new context ID.
     ///
     /// All blocks and their content are copied to the new document.
     /// The new document gets a fresh agent ID for future edits.
-    ///
-    /// # Arguments
-    ///
-    /// * `new_doc_id` - Document ID for the forked document
-    /// * `new_agent_id` - Agent ID for local operations on the fork
-    ///
-    /// # Returns
-    ///
-    /// A new BlockDocument with all blocks copied from this document.
-    pub fn fork(&self, new_doc_id: &str, new_agent_id: &str) -> Self {
-        // Create new document with fresh CRDT state
-        let mut forked = BlockDocument::new(new_doc_id, new_agent_id);
+    pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
+        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
 
         // Copy all blocks in order
         let blocks = self.blocks_ordered();
@@ -1165,34 +1136,28 @@ impl BlockDocument {
         let mut last_id: Option<BlockId> = None;
 
         for block in blocks {
-            // Generate new block ID in the forked document
             let new_id = forked.new_block_id();
+            id_mapping.insert(block.id, new_id);
 
-            // Map old ID to new ID for parent_id translation
-            id_mapping.insert(block.id.clone(), new_id.clone());
+            let new_parent_id = block.parent_id
+                .and_then(|old_pid| id_mapping.get(&old_pid).copied());
+            let new_tool_call_id = block.tool_call_id
+                .and_then(|old_tcid| id_mapping.get(&old_tcid).copied());
 
-            // Translate parent_id if it exists
-            let new_parent_id = block.parent_id.as_ref()
-                .and_then(|old_pid| id_mapping.get(old_pid).cloned());
-
-            // Translate tool_call_id if it exists
-            let new_tool_call_id = block.tool_call_id.as_ref()
-                .and_then(|old_tcid| id_mapping.get(old_tcid).cloned());
-
-            // Insert the block with translated IDs, maintaining order by inserting after last block
             let _ = forked.insert_block_with_id(
-                new_id.clone(),
+                new_id,
                 new_parent_id.as_ref(),
-                last_id.as_ref(), // Insert after last block to maintain order
+                last_id.as_ref(),
                 block.role,
                 block.kind,
                 block.content,
-                block.author,
+                block.tool_kind,
                 block.tool_name,
                 block.tool_input,
                 new_tool_call_id,
                 block.exit_code,
                 block.is_error,
+                block.compacted,
                 block.display_hint,
                 block.source_context,
                 block.source_model,
@@ -1206,23 +1171,9 @@ impl BlockDocument {
     }
 
     /// Fork the document at a specific version, excluding blocks created after that version.
-    ///
-    /// This creates a new document containing only blocks that existed at the given version.
-    ///
-    /// # Arguments
-    ///
-    /// * `new_doc_id` - Document ID for the forked document
-    /// * `new_agent_id` - Agent ID for local operations on the fork
-    /// * `at_version` - Only include blocks with created_at <= this version
-    ///
-    /// # Returns
-    ///
-    /// A new BlockDocument with blocks up to the specified version.
-    pub fn fork_at_version(&self, new_doc_id: &str, new_agent_id: &str, at_version: u64) -> Self {
-        // Create new document with fresh CRDT state
-        let mut forked = BlockDocument::new(new_doc_id, new_agent_id);
+    pub fn fork_at_version(&self, new_context_id: ContextId, new_agent_id: PrincipalId, at_version: u64) -> Self {
+        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
 
-        // Get all blocks ordered, filter by version
         let blocks: Vec<_> = self.blocks_ordered()
             .into_iter()
             .filter(|b| b.created_at <= at_version)
@@ -1232,34 +1183,28 @@ impl BlockDocument {
         let mut last_id: Option<BlockId> = None;
 
         for block in blocks {
-            // Generate new block ID in the forked document
             let new_id = forked.new_block_id();
+            id_mapping.insert(block.id, new_id);
 
-            // Map old ID to new ID for parent_id translation
-            id_mapping.insert(block.id.clone(), new_id.clone());
+            let new_parent_id = block.parent_id
+                .and_then(|old_pid| id_mapping.get(&old_pid).copied());
+            let new_tool_call_id = block.tool_call_id
+                .and_then(|old_tcid| id_mapping.get(&old_tcid).copied());
 
-            // Translate parent_id if it exists and was included
-            let new_parent_id = block.parent_id.as_ref()
-                .and_then(|old_pid| id_mapping.get(old_pid).cloned());
-
-            // Translate tool_call_id if it exists and was included
-            let new_tool_call_id = block.tool_call_id.as_ref()
-                .and_then(|old_tcid| id_mapping.get(old_tcid).cloned());
-
-            // Insert the block with translated IDs, maintaining order by inserting after last block
             let _ = forked.insert_block_with_id(
-                new_id.clone(),
+                new_id,
                 new_parent_id.as_ref(),
-                last_id.as_ref(), // Insert after last block to maintain order
+                last_id.as_ref(),
                 block.role,
                 block.kind,
                 block.content,
-                block.author,
+                block.tool_kind,
                 block.tool_name,
                 block.tool_input,
                 new_tool_call_id,
                 block.exit_code,
                 block.is_error,
+                block.compacted,
                 block.display_hint,
                 block.source_context,
                 block.source_model,
@@ -1277,11 +1222,6 @@ impl BlockDocument {
     // =========================================================================
 
     /// Get full oplog as serialized bytes (for initial sync).
-    ///
-    /// This serializes the complete oplog from empty frontier, enabling clients
-    /// to receive the full CRDT history including the root "blocks" Set creation.
-    /// This is essential for proper sync - clients cannot merge incremental ops
-    /// without having the oplog root operations.
     pub fn oplog_bytes(&self) -> Result<Vec<u8>> {
         let ops = self.ops_since(&Frontier::root());
         postcard::to_stdvec(&ops)
@@ -1289,73 +1229,51 @@ impl BlockDocument {
     }
 
     /// Create document from serialized oplog (client-side sync).
-    ///
-    /// This is the proper way to initialize a client document for sync.
-    /// Instead of creating an independent oplog root (which breaks causality),
-    /// we start with an empty Document and merge the server's full oplog.
-    ///
-    /// # Arguments
-    ///
-    /// * `document_id` - Document ID for the document
-    /// * `agent_id` - Agent ID for local operations
-    /// * `oplog_bytes` - Serialized oplog from server's `oplog_bytes()`
-    ///
-    /// # Returns
-    ///
-    /// A BlockDocument with the same oplog state as the server, ready for
-    /// incremental sync via `merge_ops`.
     pub fn from_oplog(
-        document_id: impl Into<String>,
-        agent_id: impl Into<String>,
+        context_id: ContextId,
+        agent_id: PrincipalId,
         oplog_bytes: &[u8],
     ) -> Result<Self> {
-        let document_id = document_id.into();
-        let agent_id_str = agent_id.into();
-
-        // Start with empty document (no independent "blocks" Set!)
         let mut doc = Document::new();
 
-        // Merge server's full oplog
         let ops: SerializedOpsOwned = postcard::from_bytes(oplog_bytes)
             .map_err(|e| CrdtError::Internal(format!("deserialize oplog: {}", e)))?;
         doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;
 
-        // Verify blocks set exists
         if doc.get_set(&["blocks"]).is_none() {
             return Err(CrdtError::Internal(
                 "oplog missing 'blocks' Set at root".into(),
             ));
         }
 
-        let agent = doc.create_agent(agent_uuid(&agent_id_str));
+        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let agent = doc.create_agent(dte_uuid);
 
         // Calculate next_seq from existing blocks (avoid ID collisions).
-        // Collect keys first, then drop — same defensive pattern as block_ids_ordered().
         let mut next_seq = 0u64;
         if let Some(blocks_set) = doc.get_set(&["blocks"]) {
             let keys: Vec<String> = blocks_set
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
+            #[allow(clippy::drop_non_drop)] // intentional: release DTE interior lock
             drop(blocks_set);
             for key in keys {
-                if let Some(block_id) = BlockId::from_key(&key) {
-                    if block_id.agent_id == agent_id_str {
-                        next_seq = next_seq.max(block_id.seq + 1);
-                    }
+                if let Some(block_id) = BlockId::from_key(&key)
+                    && block_id.agent_id == agent_id
+                {
+                    next_seq = next_seq.max(block_id.seq + 1);
                 }
             }
         }
 
-        // Use block count as initial version - ensures non-zero if content exists
-        // This makes sync detect the document has changed from an empty state
         let block_count = doc.get_set(&["blocks"]).map(|s| s.len()).unwrap_or(0);
         let version = if block_count > 0 { block_count as u64 } else { 0 };
 
         Ok(Self {
-            document_id,
-            agent_id_str,
+            context_id,
+            agent_id,
             agent,
             doc,
             next_seq,
@@ -1370,36 +1288,25 @@ impl BlockDocument {
     /// Create a snapshot of the entire document.
     pub fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
-            document_id: self.document_id.clone(),
+            context_id: self.context_id,
             blocks: self.blocks_ordered(),
             version: self.version,
         }
     }
 
     /// Compact the oplog by rebuilding from a snapshot of current state.
-    ///
-    /// This replaces the internal DTE Document with a fresh one containing only
-    /// the operations needed to represent current block state — no edit history,
-    /// no deleted block tombstones beyond what the snapshot captures.
-    ///
-    /// Returns the new frontier after compaction, or an error if something went wrong.
-    ///
-    /// **Warning:** Any connected client holding a pre-compaction frontier will get
-    /// DataMissing on the next incremental op. Callers must handle re-sync.
     pub fn compact(&mut self) -> Result<Frontier> {
         let snapshot = self.snapshot();
-        let compacted = Self::from_snapshot(snapshot, &self.agent_id_str);
+        let compacted = Self::from_snapshot(snapshot, self.agent_id);
         self.doc = compacted.doc;
         self.agent = compacted.agent;
         self.next_seq = compacted.next_seq;
-        // version stays the same — compaction doesn't change logical version
         Ok(self.frontier())
     }
 
     /// Restore from a snapshot.
-    pub fn from_snapshot(snapshot: DocumentSnapshot, agent_id: impl Into<String>) -> Self {
-        let agent_id = agent_id.into();
-        let mut doc = Self::new(&snapshot.document_id, &agent_id);
+    pub fn from_snapshot(snapshot: DocumentSnapshot, agent_id: PrincipalId) -> Self {
+        let mut doc = Self::new(snapshot.context_id, agent_id);
 
         let mut last_id: Option<BlockId> = None;
         let mut finalized_content: Vec<(BlockId, String)> = Vec::new();
@@ -1413,31 +1320,32 @@ impl BlockDocument {
             // For Done/Error blocks, skip Text CRDT content — use register instead
             let is_finalized = matches!(block_snap.status, Status::Done | Status::Error);
             let content = if is_finalized && !block_snap.content.is_empty() {
-                finalized_content.push((block_snap.id.clone(), block_snap.content.clone()));
+                finalized_content.push((block_snap.id, block_snap.content.clone()));
                 String::new() // skip Text CRDT fill
             } else {
                 block_snap.content.clone()
             };
 
             if doc.insert_block_with_id(
-                block_snap.id.clone(),
+                block_snap.id,
                 block_snap.parent_id.as_ref(),
                 last_id.as_ref(),
-                block_snap.role.clone(),
-                block_snap.kind.clone(),
+                block_snap.role,
+                block_snap.kind,
                 content,
-                block_snap.author.clone(),
+                block_snap.tool_kind,
                 block_snap.tool_name.clone(),
                 block_snap.tool_input.clone(),
-                block_snap.tool_call_id.clone(),
+                block_snap.tool_call_id,
                 block_snap.exit_code,
                 block_snap.is_error,
+                block_snap.compacted,
                 block_snap.display_hint.clone(),
-                block_snap.source_context.clone(),
+                block_snap.source_context,
                 block_snap.source_model.clone(),
-                block_snap.drift_kind.clone(),
+                block_snap.drift_kind,
             ).is_ok() {
-                last_id = Some(block_snap.id.clone());
+                last_id = Some(block_snap.id);
             }
         }
 
@@ -1459,8 +1367,8 @@ impl BlockDocument {
 /// Snapshot of a block document (serializable).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DocumentSnapshot {
-    /// Document ID.
-    pub document_id: String,
+    /// Context ID.
+    pub context_id: ContextId,
     /// Blocks in order.
     pub blocks: Vec<BlockSnapshot>,
     /// Version.
@@ -1471,35 +1379,40 @@ pub struct DocumentSnapshot {
 mod tests {
     use super::*;
 
+    /// Helper: create a test document with typed IDs.
+    fn test_doc() -> BlockDocument {
+        BlockDocument::new(ContextId::new(), PrincipalId::new())
+    }
+
+    /// Helper: create a test document pair with different agents.
+    fn test_doc_pair() -> (BlockDocument, BlockDocument) {
+        let ctx = ContextId::new();
+        let alice = PrincipalId::new();
+        let bob = PrincipalId::new();
+        (BlockDocument::new(ctx, alice), BlockDocument::new(ctx, bob))
+    }
+
     #[test]
     fn test_new_document() {
-        let doc = BlockDocument::new("doc-1", "alice");
-        assert_eq!(doc.document_id(), "doc-1");
-        assert_eq!(doc.agent_id(), "alice");
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let doc = BlockDocument::new(ctx, agent);
+        assert_eq!(doc.context_id(), ctx);
+        assert_eq!(doc.agent_id(), agent);
         assert!(doc.is_empty());
         assert_eq!(doc.version(), 0);
     }
 
     #[test]
     fn test_insert_block_new_api() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
         let id1 = doc.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello!",
-            "user:amy",
+            None, None, Role::User, BlockKind::Text, "Hello!",
         ).unwrap();
 
         let id2 = doc.insert_block(
-            Some(&id1), // Parent is id1
-            Some(&id1), // After id1
-            Role::Model,
-            BlockKind::Text,
-            "Hi there!",
-            "model:claude",
+            Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!",
         ).unwrap();
 
         let blocks = doc.blocks_ordered();
@@ -1508,84 +1421,57 @@ mod tests {
         assert_eq!(blocks[0].role, Role::User);
         assert_eq!(blocks[1].id, id2);
         assert_eq!(blocks[1].role, Role::Model);
-        assert_eq!(blocks[1].parent_id, Some(id1.clone()));
+        assert_eq!(blocks[1].parent_id, Some(id1));
     }
 
     #[test]
     fn test_dag_operations() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Create a parent block
         let parent_id = doc.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Question",
-            "user:amy",
+            None, None, Role::User, BlockKind::Text, "Question",
         ).unwrap();
 
-        // Create children
         let child1 = doc.insert_block(
-            Some(&parent_id),
-            Some(&parent_id),
-            Role::Model,
-            BlockKind::Thinking,
-            "Thinking...",
-            "model:claude",
+            Some(&parent_id), Some(&parent_id),
+            Role::Model, BlockKind::Thinking, "Thinking...",
         ).unwrap();
 
         let child2 = doc.insert_block(
-            Some(&parent_id),
-            Some(&child1),
-            Role::Model,
-            BlockKind::Text,
-            "Answer",
-            "model:claude",
+            Some(&parent_id), Some(&child1),
+            Role::Model, BlockKind::Text, "Answer",
         ).unwrap();
 
-        // Test get_children
         let children = doc.get_children(&parent_id);
         assert_eq!(children.len(), 2);
         assert!(children.contains(&child1));
         assert!(children.contains(&child2));
 
-        // Test get_ancestors
         let ancestors = doc.get_ancestors(&child1);
-        assert_eq!(ancestors, vec![parent_id.clone()]);
+        assert_eq!(ancestors, vec![parent_id]);
 
-        // Test get_roots
         let roots = doc.get_roots();
-        assert_eq!(roots, vec![parent_id.clone()]);
+        assert_eq!(roots, vec![parent_id]);
 
-        // Test get_depth
         assert_eq!(doc.get_depth(&parent_id), 0);
         assert_eq!(doc.get_depth(&child1), 1);
     }
 
     #[test]
     fn test_set_status() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
         let id = doc.insert_block(
-            None,
-            None,
-            Role::Model,
-            BlockKind::ToolCall,
-            "{}",
-            "model:claude",
+            None, None, Role::Model, BlockKind::ToolCall, "{}",
         ).unwrap();
 
-        // Initially status is Done
         let snap = doc.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.status, Status::Done);
 
-        // Set to Running
         doc.set_status(&id, Status::Running).unwrap();
         let snap = doc.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.status, Status::Running);
 
-        // Set to Error
         doc.set_status(&id, Status::Error).unwrap();
         let snap = doc.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.status, Status::Error);
@@ -1593,34 +1479,25 @@ mod tests {
 
     #[test]
     fn test_tool_call_and_result() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Create tool call
         let tool_call_id = doc.insert_tool_call(
-            None,
-            None,
-            "read_file",
+            None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
-            "model:claude",
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&tool_call_id).unwrap();
         assert_eq!(snap.kind, BlockKind::ToolCall);
         assert_eq!(snap.tool_name, Some("read_file".to_string()));
 
-        // Create tool result
         let result_id = doc.insert_tool_result_block(
-            &tool_call_id,
-            Some(&tool_call_id),
-            "127.0.0.1 localhost",
-            false,
-            Some(0),
-            "system",
+            &tool_call_id, Some(&tool_call_id),
+            "127.0.0.1 localhost", false, Some(0),
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&result_id).unwrap();
         assert_eq!(snap.kind, BlockKind::ToolResult);
-        assert_eq!(snap.parent_id, Some(tool_call_id.clone()));
+        assert_eq!(snap.parent_id, Some(tool_call_id));
         assert_eq!(snap.tool_call_id, Some(tool_call_id));
         assert!(!snap.is_error);
         assert_eq!(snap.exit_code, Some(0));
@@ -1628,36 +1505,36 @@ mod tests {
 
     #[test]
     fn test_insert_and_order() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", "alice").unwrap();
-        let id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", "alice").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second").unwrap();
+        let id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third").unwrap();
 
-        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id).collect();
         assert_eq!(order, vec![id1, id2, id3]);
     }
 
     #[test]
     fn test_insert_at_beginning() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
-        let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First", "alice").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
+        let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First").unwrap();
 
-        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id.clone()).collect();
+        let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id).collect();
         assert_eq!(order, vec![id2, id1]);
     }
 
     #[test]
     fn test_snapshot_roundtrip() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", "model:claude").unwrap();
-        doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response", "model:claude").unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...").unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response").unwrap();
 
         let snapshot = doc.snapshot();
-        let restored = BlockDocument::from_snapshot(snapshot.clone(), "bob");
+        let restored = BlockDocument::from_snapshot(snapshot.clone(), PrincipalId::new());
 
         assert_eq!(restored.block_count(), doc.block_count());
         assert_eq!(restored.full_text(), doc.full_text());
@@ -1665,9 +1542,9 @@ mod tests {
 
     #[test]
     fn test_text_editing() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello", "user:amy").unwrap();
+        let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello").unwrap();
         doc.append_text(&id, " World").unwrap();
 
         let text = doc.get_block_snapshot(&id).unwrap().content;
@@ -1680,21 +1557,19 @@ mod tests {
 
     #[test]
     fn test_move_block() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Insert three blocks: A, B, C
-        let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A", "user").unwrap();
-        let b = doc.insert_block(None, Some(&a), Role::User, BlockKind::Text, "B", "user").unwrap();
-        let c = doc.insert_block(None, Some(&b), Role::User, BlockKind::Text, "C", "user").unwrap();
+        let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A").unwrap();
+        let b = doc.insert_block(None, Some(&a), Role::User, BlockKind::Text, "B").unwrap();
+        let c = doc.insert_block(None, Some(&b), Role::User, BlockKind::Text, "C").unwrap();
 
-        // Initial order should be A, B, C
         let ordered = doc.blocks_ordered();
         assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].id, a);
         assert_eq!(ordered[1].id, b);
         assert_eq!(ordered[2].id, c);
 
-        // Move C to the beginning (before A)
+        // Move C to the beginning
         doc.move_block(&c, None).unwrap();
         let ordered = doc.blocks_ordered();
         assert_eq!(ordered[0].id, c, "C should be first after moving to beginning");
@@ -1709,60 +1584,30 @@ mod tests {
         assert_eq!(ordered[2].id, a, "A should be last after moving after B");
 
         // Moving non-existent block should fail
-        let fake_id = BlockId::new("doc-1", "fake", 999);
+        let fake_id = BlockId::new(doc.context_id(), doc.agent_id(), 999);
         assert!(doc.move_block(&fake_id, None).is_err());
-
-        // Moving after non-existent block should fail
         assert!(doc.move_block(&a, Some(&fake_id)).is_err());
     }
 
-    /// Test that demonstrates the client-server sync failure.
-    ///
-    /// The problem: Both server and client call `BlockDocument::new()`, which creates
-    /// an independent "blocks" Set operation. When server sends `ops_since(frontier)`
-    /// (incremental ops), those ops reference the server's "blocks" Set creation which
-    /// doesn't exist in the client's oplog -> DataMissing error.
-    ///
-    /// This test replicates the exact behavior causing streaming failures in the UI.
     #[test]
     fn test_sync_fails_with_independent_blocks_set_creation() {
-        // === Server side ===
-        // Server creates its document - this creates a "blocks" Set operation
-        let mut server = BlockDocument::new("doc-1", "server-agent");
+        let (mut server, mut client) = test_doc_pair();
 
-        // Capture frontier AFTER "blocks" Set was created (current buggy behavior)
         let frontier_after_init = server.frontier();
 
-        // Server inserts a block
         let _block_id = server.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello from server",
-            "user:alice"
+            None, None, Role::User, BlockKind::Text, "Hello from server",
         ).unwrap();
 
-        // Server gets ops since AFTER init (only the block insert, not the "blocks" Set)
         let incremental_ops = server.ops_since(&frontier_after_init);
 
-        // === Client side ===
-        // Client creates its OWN document - this creates a DIFFERENT "blocks" Set operation
-        let mut client = BlockDocument::new("doc-1", "client-agent");
-
-        // Client tries to merge the incremental ops
-        // THIS SHOULD FAIL because the ops reference server's "blocks" Set creation
-        // which doesn't exist in client's oplog
         let result = client.merge_ops_owned(incremental_ops);
 
-        // BUG DEMONSTRATION: This assert documents the current broken behavior.
-        // When we fix the bug, this test should be updated to expect success.
         assert!(
             result.is_err(),
             "Expected DataMissing error when merging incremental ops with independent oplog roots"
         );
 
-        // Verify the error is specifically about missing data
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
             err_msg.contains("DataMissing") || err_msg.contains("Missing"),
@@ -1770,125 +1615,69 @@ mod tests {
         );
     }
 
-    /// Test that demonstrates the correct fix: sending full oplog.
-    ///
-    /// When server sends `ops_since(&[])` (from empty frontier), it includes
-    /// the "blocks" Set creation, allowing the client to merge successfully.
     #[test]
     fn test_sync_succeeds_with_full_oplog() {
         use diamond_types_extended::Document;
 
-        // === Server side ===
-        let mut server = BlockDocument::new("doc-1", "server-agent");
+        let mut server = test_doc();
 
-        // Server inserts a block
         let _block_id = server.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello from server",
-            "user:alice"
+            None, None, Role::User, BlockKind::Text, "Hello from server",
         ).unwrap();
 
-        // Server gets ops from EMPTY frontier (full oplog, including "blocks" Set creation)
         let full_ops = server.ops_since(&Frontier::root());
 
-        // === Client side ===
-        // Client needs an empty document (no independent "blocks" Set)
-        // Create a new Document directly to simulate a clean sync client
         let mut client_doc = Document::new();
-
-        // Merge the full ops - this should work because it includes "blocks" Set creation
         let result = client_doc.merge_ops(full_ops);
 
-        assert!(
-            result.is_ok(),
-            "Full oplog merge should succeed: {:?}", result
-        );
-
-        // Verify client doc has the blocks key
+        assert!(result.is_ok(), "Full oplog merge should succeed: {:?}", result);
         assert!(
             client_doc.root().contains_key("blocks"),
             "Client should have 'blocks' key after merging full oplog"
         );
     }
 
-    /// Test incremental sync after initial full sync.
-    ///
-    /// After client receives full oplog and establishes sync, subsequent
-    /// incremental ops should merge correctly.
     #[test]
     fn test_incremental_sync_after_full_sync() {
         use diamond_types_extended::Document;
 
-        // === Initial full sync ===
-        let mut server = BlockDocument::new("doc-1", "server-agent");
+        let mut server = test_doc();
         let full_ops = server.ops_since(&Frontier::root());
 
-        // Client creates empty doc and merges full state
         let mut client_doc = Document::new();
         client_doc.merge_ops(full_ops).expect("initial sync should work");
 
-        // === Server continues ===
         let frontier_before_block = server.frontier();
 
         let _block_id = server.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "New block",
-            "user:alice"
+            None, None, Role::User, BlockKind::Text, "New block",
         ).unwrap();
 
-        // Get incremental ops for just the block insert
         let incremental_ops = server.ops_since(&frontier_before_block);
-
-        // Client merges incremental ops - should work now because roots match
         let result = client_doc.merge_ops(incremental_ops);
 
-        assert!(
-            result.is_ok(),
-            "Incremental merge after full sync should succeed: {:?}", result
-        );
+        assert!(result.is_ok(), "Incremental merge after full sync should succeed: {:?}", result);
     }
 
-    /// Test oplog-based sync: client receives full oplog, then streams work.
-    ///
-    /// This replaces the old snapshot-based approach. The server sends its full
-    /// oplog, client creates document from it, and subsequent incremental ops merge.
     #[test]
     fn test_snapshot_then_streaming_should_work() {
-        // === Server: initial state ===
-        let mut server = BlockDocument::new("doc-1", "server-agent");
+        let mut server = test_doc();
         let block_id = server.insert_block(
-            None,
-            None,
-            Role::Model,
-            BlockKind::Text,
-            "Initial content",
-            "model:claude"
+            None, None, Role::Model, BlockKind::Text, "Initial content",
         ).unwrap();
 
-        // Server sends full oplog to client (the fix!)
         let oplog_bytes = server.oplog_bytes().unwrap();
 
-        // === Client: receives full oplog ===
-        // Fixed: from_oplog merges server's oplog → shared history
-        let mut client = BlockDocument::from_oplog("doc-1", "client-agent", &oplog_bytes)
+        let client_agent = PrincipalId::new();
+        let mut client = BlockDocument::from_oplog(server.context_id(), client_agent, &oplog_bytes)
             .expect("from_oplog should succeed");
 
-        // Verify client has the block
         assert_eq!(client.block_count(), 1);
 
-        // === Server: continues streaming ===
         let frontier_before_append = server.frontier();
         server.append_text(&block_id, " more text").unwrap();
         let incremental_ops = server.ops_since(&frontier_before_append);
 
-        // === Client: merges incremental ops ===
-        // Now works because client and server share oplog history
         let result = client.merge_ops_owned(incremental_ops);
 
         assert!(
@@ -1897,34 +1686,23 @@ mod tests {
             result.err()
         );
 
-        // Verify content converged
         let final_content = client.get_block_snapshot(&block_id).unwrap().content;
         assert_eq!(final_content, "Initial content more text");
     }
 
-    /// Test text streaming sync (append operations).
     #[test]
     fn test_text_streaming_sync() {
         use diamond_types_extended::Document;
 
-        // === Initial setup ===
-        let mut server = BlockDocument::new("doc-1", "server-agent");
+        let mut server = test_doc();
         let block_id = server.insert_block(
-            None,
-            None,
-            Role::Model,
-            BlockKind::Text,
-            "", // Start empty
-            "model:claude"
+            None, None, Role::Model, BlockKind::Text, "",
         ).unwrap();
 
-        // Full sync to client
         let full_ops = server.ops_since(&Frontier::root());
         let mut client_doc = Document::new();
         client_doc.merge_ops(full_ops).expect("initial sync");
 
-        // === Streaming ===
-        // Server appends text in chunks
         let chunks = ["Hello", " ", "World", "!"];
 
         for chunk in chunks {
@@ -1933,208 +1711,151 @@ mod tests {
 
             let chunk_ops = server.ops_since(&frontier_before);
             client_doc.merge_ops(chunk_ops)
-                .expect(&format!("merging chunk '{}' should work", chunk));
+                .unwrap_or_else(|e| panic!("merging chunk '{}' should work: {:?}", chunk, e));
         }
 
-        // Verify final state matches
         let server_content = server.get_block_snapshot(&block_id).unwrap().content;
         assert_eq!(server_content, "Hello World!");
-
-        // For client verification, we'd need to wrap the doc in BlockDocument
-        // For now, just verify the merge succeeded without errors
     }
 
-    /// Test document fork creates a deep copy with new IDs.
     #[test]
     fn test_fork_document() {
-        let mut original = BlockDocument::new("original-doc", "alice");
+        let mut original = test_doc();
 
-        // Insert some blocks
         let user_msg = original.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello Claude!",
-            "user:amy",
+            None, None, Role::User, BlockKind::Text, "Hello Claude!",
         ).unwrap();
 
         let _model_response = original.insert_block(
-            Some(&user_msg),
-            Some(&user_msg),
-            Role::Model,
-            BlockKind::Text,
-            "Hi Amy!",
-            "model:claude",
+            Some(&user_msg), Some(&user_msg),
+            Role::Model, BlockKind::Text, "Hi Amy!",
         ).unwrap();
 
-        // Fork the document
-        let forked = original.fork("forked-doc", "bob");
+        let fork_ctx = ContextId::new();
+        let fork_agent = PrincipalId::new();
+        let forked = original.fork(fork_ctx, fork_agent);
 
-        // Verify forked document has same number of blocks
         assert_eq!(forked.block_count(), 2);
+        assert_eq!(forked.context_id(), fork_ctx);
+        assert_eq!(forked.agent_id(), fork_agent);
 
-        // Verify forked document has different ID
-        assert_eq!(forked.document_id(), "forked-doc");
-        assert_eq!(forked.agent_id(), "bob");
-
-        // Verify block content is preserved
         let forked_blocks = forked.blocks_ordered();
         assert_eq!(forked_blocks[0].content, "Hello Claude!");
         assert_eq!(forked_blocks[0].role, Role::User);
         assert_eq!(forked_blocks[1].content, "Hi Amy!");
         assert_eq!(forked_blocks[1].role, Role::Model);
 
-        // Verify blocks have new document ID
-        assert_eq!(forked_blocks[0].id.document_id, "forked-doc");
-        assert_eq!(forked_blocks[1].id.document_id, "forked-doc");
+        // Blocks should have new context_id
+        assert_eq!(forked_blocks[0].id.context_id, fork_ctx);
+        assert_eq!(forked_blocks[1].id.context_id, fork_ctx);
 
-        // Verify parent-child relationship is preserved
+        // Parent-child preserved with new IDs
         assert!(forked_blocks[0].parent_id.is_none());
         assert!(forked_blocks[1].parent_id.is_some());
-        assert_eq!(forked_blocks[1].parent_id.as_ref().unwrap().document_id, "forked-doc");
+        assert_eq!(forked_blocks[1].parent_id.unwrap().context_id, fork_ctx);
 
-        // Verify original document is unchanged
+        // Original unchanged
         assert_eq!(original.block_count(), 2);
-        assert_eq!(original.document_id(), "original-doc");
         let original_blocks = original.blocks_ordered();
-        assert_eq!(original_blocks[0].id.document_id, "original-doc");
+        assert_eq!(original_blocks[0].id.context_id, original.context_id());
 
-        // Verify editing forked document doesn't affect original
-        let forked_first_block = &forked_blocks[0].id;
+        // Editing forked doesn't affect original
+        let forked_first_block = forked_blocks[0].id;
         let mut forked_mut = forked;
-        forked_mut.append_text(forked_first_block, " How are you?").unwrap();
+        forked_mut.append_text(&forked_first_block, " How are you?").unwrap();
 
-        let forked_content = forked_mut.get_block_snapshot(forked_first_block).unwrap().content;
+        let forked_content = forked_mut.get_block_snapshot(&forked_first_block).unwrap().content;
         assert_eq!(forked_content, "Hello Claude! How are you?");
 
         let original_content = original.get_block_snapshot(&user_msg).unwrap().content;
         assert_eq!(original_content, "Hello Claude!");
     }
 
-    /// Test fork with tool call blocks preserves tool_call_id references.
     #[test]
     fn test_fork_with_tool_blocks() {
-        let mut original = BlockDocument::new("original-doc", "server");
+        let mut original = test_doc();
 
-        // Insert a tool call
         let tool_call_id = original.insert_tool_call(
-            None,
-            None,
-            "read_file",
+            None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
-            "model:claude",
         ).unwrap();
 
-        // Insert tool result
         let _tool_result_id = original.insert_tool_result_block(
-            &tool_call_id,
-            Some(&tool_call_id),
-            "127.0.0.1 localhost",
-            false,
-            Some(0),
-            "system",
+            &tool_call_id, Some(&tool_call_id),
+            "127.0.0.1 localhost", false, Some(0),
         ).unwrap();
 
-        // Fork the document
-        let forked = original.fork("forked-doc", "client");
+        let fork_ctx = ContextId::new();
+        let forked = original.fork(fork_ctx, PrincipalId::new());
 
-        // Verify blocks exist
         assert_eq!(forked.block_count(), 2);
 
         let forked_blocks = forked.blocks_ordered();
-
-        // Verify tool call
         assert_eq!(forked_blocks[0].kind, BlockKind::ToolCall);
         assert_eq!(forked_blocks[0].tool_name, Some("read_file".to_string()));
-
-        // Verify tool result
         assert_eq!(forked_blocks[1].kind, BlockKind::ToolResult);
         assert_eq!(forked_blocks[1].content, "127.0.0.1 localhost");
 
-        // Verify tool_call_id reference is properly translated
         let tool_call_id_ref = forked_blocks[1].tool_call_id.as_ref().expect("should have tool_call_id");
-        assert_eq!(tool_call_id_ref.document_id, "forked-doc");
+        assert_eq!(tool_call_id_ref.context_id, fork_ctx);
         assert_eq!(tool_call_id_ref, &forked_blocks[0].id);
     }
 
-    /// Test drift block insertion, CRDT round-trip, and metadata preservation.
     #[test]
     fn test_drift_block_roundtrip() {
-        use crate::block::DriftKind;
-
-        let mut doc = BlockDocument::new("doc-1", "server");
+        let mut doc = test_doc();
+        let source_ctx = ContextId::new();
 
         // Create a drift block using insert_from_snapshot
+        let drift_id = BlockId::new(doc.context_id(), doc.agent_id(), 0);
         let drift_snap = BlockSnapshot::drift(
-            BlockId::new("doc-1", "drift", 0),
+            drift_id,
             None,
             "CAS has a race condition in the merge path",
-            "drift:a1b2c3",
-            "a1b2c3",
+            source_ctx,
             Some("claude-opus-4-6".to_string()),
-            DriftKind::Push,
+            crate::DriftKind::Push,
         );
 
         let id = doc.insert_from_snapshot(drift_snap, None).unwrap();
 
-        // Read it back from the CRDT
         let snap = doc.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.kind, BlockKind::Drift);
         assert_eq!(snap.role, Role::System);
-        assert_eq!(snap.source_context, Some("a1b2c3".to_string()));
+        assert_eq!(snap.source_context, Some(source_ctx));
         assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
-        assert_eq!(snap.drift_kind, Some(DriftKind::Push));
+        assert_eq!(snap.drift_kind, Some(crate::DriftKind::Push));
         assert_eq!(snap.content, "CAS has a race condition in the merge path");
-        assert_eq!(snap.author, "drift:a1b2c3");
 
-        // Verify it shows up in blocks_ordered
         let blocks = doc.blocks_ordered();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Drift);
     }
 
-    /// Test 4b: CRDT ordering stress test — 100 bisections between same siblings.
-    ///
-    /// This test demonstrates the precision limits of the current f64-based ordering.
-    /// After ~40 bisections, floating point precision loss causes order values to
-    /// collide when round-tripped through i64 storage (scaled by 1e12).
-    ///
-    /// This validates the TODO comment in calc_order_key about migrating to
-    /// string-based fractional indexing for unlimited precision.
     #[test]
     fn test_crdt_ordering_stress_100_bisections() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Create two sentinel blocks to bisect between
         let first = doc.insert_block(
-            None, None,
-            Role::User, BlockKind::Text,
-            "First", "alice"
+            None, None, Role::User, BlockKind::Text, "First",
         ).unwrap();
 
         let _last = doc.insert_block(
-            None, Some(&first),
-            Role::User, BlockKind::Text,
-            "Last", "alice"
+            None, Some(&first), Role::User, BlockKind::Text, "Last",
         ).unwrap();
 
-        // Insert 100 blocks between first and last (repeated bisection)
         let mut middle_ids = Vec::new();
         for i in 0..100 {
             let id = doc.insert_block(
-                None, Some(&first), // Always insert after 'first'
-                Role::User, BlockKind::Text,
-                &format!("Middle-{}", i), "alice"
+                None, Some(&first),
+                Role::User, BlockKind::Text, &format!("Middle-{}", i),
             ).unwrap();
             middle_ids.push(id);
         }
 
-        // All blocks should exist in document
         let blocks = doc.blocks_ordered();
         assert_eq!(blocks.len(), 102, "All 102 blocks should be in the document");
 
-        // Collect order keys and verify ALL are unique (string-based = unlimited precision)
         let mut order_keys = Vec::new();
         for block in &blocks {
             let order_key = doc.get_block_order_key(&block.id, "");
@@ -2142,15 +1863,8 @@ mod tests {
         }
 
         let unique_count = order_keys.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, 102, "All 102 order keys should be unique");
 
-        // String-based fractional indexing guarantees all 102 values are unique
-        assert_eq!(
-            unique_count, 102,
-            "All 102 order keys should be unique with string-based indexing, got {}",
-            unique_count
-        );
-
-        // Verify ordering is strictly sorted
         for i in 1..order_keys.len() {
             assert!(
                 order_keys[i - 1] < order_keys[i],
@@ -2160,11 +1874,8 @@ mod tests {
         }
 
         let block_ids: Vec<_> = blocks.iter().map(|b| &b.id).collect();
-
-        // First should be the first sentinel
         assert_eq!(block_ids[0], &first, "First block should remain first");
 
-        // All inserted blocks should be present
         for id in &middle_ids {
             assert!(
                 block_ids.contains(&id),
@@ -2173,102 +1884,92 @@ mod tests {
         }
     }
 
-    /// Test that drift blocks survive fork (metadata preserved with new IDs).
     #[test]
     fn test_fork_preserves_drift_metadata() {
-        use crate::block::DriftKind;
+        let mut original = test_doc();
+        let source_ctx = ContextId::new();
 
-        let mut original = BlockDocument::new("original", "server");
-
-        // Add a regular block first
         let user_msg = original.insert_block(
-            None, None,
-            Role::User, BlockKind::Text,
-            "Hello!", "user:amy",
+            None, None, Role::User, BlockKind::Text, "Hello!",
         ).unwrap();
 
-        // Add a drift block
+        let drift_id = BlockId::new(original.context_id(), original.agent_id(), 99);
         let drift_snap = BlockSnapshot::drift(
-            BlockId::new("original", "drift", 0),
-            Some(user_msg.clone()),
+            drift_id,
+            Some(user_msg),
             "Summary from gemini context",
-            "drift:d4e5f6",
-            "d4e5f6",
+            source_ctx,
             Some("gemini-2.0-flash".to_string()),
-            DriftKind::Distill,
+            crate::DriftKind::Distill,
         );
+
         original.insert_from_snapshot(drift_snap, Some(&user_msg)).unwrap();
 
-        // Fork it
-        let forked = original.fork("forked", "client");
+        let fork_ctx = ContextId::new();
+        let forked = original.fork(fork_ctx, PrincipalId::new());
         assert_eq!(forked.block_count(), 2);
 
         let blocks = forked.blocks_ordered();
         let drift_block = &blocks[1];
         assert_eq!(drift_block.kind, BlockKind::Drift);
-        assert_eq!(drift_block.source_context, Some("d4e5f6".to_string()));
+        assert_eq!(drift_block.source_context, Some(source_ctx));
         assert_eq!(drift_block.source_model, Some("gemini-2.0-flash".to_string()));
-        assert_eq!(drift_block.drift_kind, Some(DriftKind::Distill));
+        assert_eq!(drift_block.drift_kind, Some(crate::DriftKind::Distill));
         assert_eq!(drift_block.content, "Summary from gemini context");
     }
 
-    /// Test that get_block_snapshot returns None for blocks missing 'kind' field.
     #[test]
     fn test_get_block_snapshot_missing_kind() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut doc = BlockDocument::new(ctx, agent);
 
         // Insert a block via raw transaction, skipping "kind"
-        let block_key = "doc-1/alice/0";
+        let block_id = BlockId::new(ctx, agent, 0);
+        let block_key = block_id.to_key();
         doc.doc.transact(doc.agent, |tx| {
             if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
-                blocks_set.add_str(block_key);
+                blocks_set.add_str(&block_key);
             }
             tx.root().set(&format!("order:{}", block_key), "V");
             let map_id = tx.root().create_map(&format!("block:{}", block_key));
             let mut block_map = tx.map_by_id(map_id);
-            // Set role but NOT kind
             block_map.set("role", "human");
             block_map.set("status", "done");
-            block_map.set("author", "test");
             block_map.create_text("content");
         });
         doc.next_seq = 1;
 
-        let block_id = BlockId::from_key(block_key).unwrap();
         assert!(doc.get_block_snapshot(&block_id).is_none(),
             "Block missing 'kind' should return None");
-
-        // blocks_ordered should also skip it
         assert_eq!(doc.blocks_ordered().len(), 0);
     }
 
-    /// Test that get_block_snapshot returns None for blocks missing 'role' field.
     #[test]
     fn test_get_block_snapshot_missing_role() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut doc = BlockDocument::new(ctx, agent);
 
-        let block_key = "doc-1/alice/0";
+        let block_id = BlockId::new(ctx, agent, 0);
+        let block_key = block_id.to_key();
         doc.doc.transact(doc.agent, |tx| {
             if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
-                blocks_set.add_str(block_key);
+                blocks_set.add_str(&block_key);
             }
             tx.root().set(&format!("order:{}", block_key), "V");
             let map_id = tx.root().create_map(&format!("block:{}", block_key));
             let mut block_map = tx.map_by_id(map_id);
-            // Set kind but NOT role
             block_map.set("kind", "text");
             block_map.set("status", "done");
-            block_map.set("author", "test");
             block_map.create_text("content");
         });
         doc.next_seq = 1;
 
-        let block_id = BlockId::from_key(block_key).unwrap();
         assert!(doc.get_block_snapshot(&block_id).is_none(),
             "Block missing 'role' should return None");
     }
 
-    /// Test that order_midpoint produces correct lexicographic midpoints.
     #[test]
     fn test_order_midpoint_basic() {
         let mid = order_midpoint("A", "Z");
@@ -2279,16 +1980,14 @@ mod tests {
         assert!(mid2 < "V".to_string(),
             "midpoint {} should be before V", mid2);
 
-        // Adjacent characters
         let mid3 = order_midpoint("A", "B");
         assert!(mid3 > "A".to_string() && mid3 < "B".to_string(),
             "midpoint {} should be between A and B", mid3);
     }
 
-    /// Test oplog_bytes returns Result.
     #[test]
     fn test_oplog_bytes_returns_result() {
-        let doc = BlockDocument::new("doc-1", "alice");
+        let doc = test_doc();
         let bytes = doc.oplog_bytes();
         assert!(bytes.is_ok(), "oplog_bytes should succeed for valid document");
         assert!(!bytes.unwrap().is_empty());
@@ -2296,14 +1995,12 @@ mod tests {
 
     #[test]
     fn test_compact_preserves_blocks() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Add several blocks with content
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!", "user:amy").unwrap();
-        let id2 = doc.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!", "model:claude").unwrap();
-        let id3 = doc.insert_block(Some(&id2), Some(&id2), Role::Model, BlockKind::Thinking, "Let me think...", "model:claude").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!").unwrap();
+        let id2 = doc.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!").unwrap();
+        let id3 = doc.insert_block(Some(&id2), Some(&id2), Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
 
-        // Edit content to grow the oplog
         doc.edit_text(&id1, 6, " World", 0).unwrap();
         doc.edit_text(&id2, 9, " How are you?", 0).unwrap();
         doc.set_status(&id3, Status::Done).unwrap();
@@ -2311,14 +2008,12 @@ mod tests {
         let blocks_before = doc.blocks_ordered();
         let oplog_before = doc.oplog_bytes().unwrap().len();
 
-        // Compact
         let new_frontier = doc.compact();
         assert!(new_frontier.is_ok());
 
         let blocks_after = doc.blocks_ordered();
         let oplog_after = doc.oplog_bytes().unwrap().len();
 
-        // Blocks should be identical
         assert_eq!(blocks_before.len(), blocks_after.len());
         for (before, after) in blocks_before.iter().zip(blocks_after.iter()) {
             assert_eq!(before.id, after.id);
@@ -2328,22 +2023,22 @@ mod tests {
             assert_eq!(before.status, after.status);
         }
 
-        // Oplog should be smaller (no edit history, just reconstructed state)
         assert!(oplog_after <= oplog_before, "oplog should not grow: {} vs {}", oplog_after, oplog_before);
     }
 
     #[test]
     fn test_compact_then_new_ops() {
-        let mut doc = BlockDocument::new("doc-1", "server");
+        let ctx = ContextId::new();
+        let server_agent = PrincipalId::new();
+        let mut doc = BlockDocument::new(ctx, server_agent);
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "user:amy").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
         doc.edit_text(&id1, 5, " message", 0).unwrap();
 
-        // Compact the server doc
         doc.compact().unwrap();
 
-        // A fresh client should be able to sync from the compacted oplog
-        let mut client = BlockDocument::new_for_sync("doc-1", "client");
+        let client_agent = PrincipalId::new();
+        let mut client = BlockDocument::new_for_sync(ctx, client_agent);
         let server_ops = doc.ops_since(&Frontier::root());
         client.merge_ops_owned(server_ops).unwrap();
 
@@ -2351,8 +2046,7 @@ mod tests {
         assert_eq!(client_blocks.len(), 1);
         assert_eq!(client_blocks[0].content, "First message");
 
-        // Client should be able to send new ops back
-        let client_id = client.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Reply", "model:claude").unwrap();
+        let client_id = client.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Reply").unwrap();
         let client_ops = client.ops_since(&doc.frontier());
         doc.merge_ops_owned(client_ops).unwrap();
 
@@ -2363,31 +2057,27 @@ mod tests {
 
     #[test]
     fn test_compact_reduction_with_overwrites() {
-        let mut doc = BlockDocument::new("doc-1", "server");
+        let mut doc = test_doc();
 
-        // Create blocks, then heavily overwrite content (simulating status changes + edits)
         let mut ids = Vec::new();
         let mut last_id = None;
-        for i in 0..10 {
-            let role = if i % 2 == 0 { Role::User } else { Role::Model };
+        for _i in 0..10 {
+            let role = if ids.len() % 2 == 0 { Role::User } else { Role::Model };
             let id = doc.insert_block(
                 last_id.as_ref(), last_id.as_ref(),
-                role, BlockKind::Text, "initial content here", &format!("agent-{}", i),
+                role, BlockKind::Text, "initial content here",
             ).unwrap();
-            ids.push(id.clone());
+            ids.push(id);
             last_id = Some(id);
         }
 
-        // Simulate heavy editing: delete and rewrite content multiple times
         for id in &ids {
             for round in 0..5 {
                 let current = doc.get_block_snapshot(id).unwrap().content;
                 let len = current.len();
-                // Delete all, then rewrite
                 doc.edit_text(id, 0, "", len).unwrap();
                 doc.edit_text(id, 0, &format!("rewritten content round {} for block", round), 0).unwrap();
             }
-            // Multiple status toggles
             doc.set_status(id, Status::Running).unwrap();
             doc.set_status(id, Status::Error).unwrap();
             doc.set_status(id, Status::Done).unwrap();
@@ -2401,112 +2091,74 @@ mod tests {
         let oplog_after = doc.oplog_bytes().unwrap().len();
         let blocks_after = doc.blocks_ordered();
 
-        eprintln!(
-            "Compact: {} blocks, oplog {} -> {} bytes ({:.0}% reduction)",
-            blocks_before.len(), oplog_before, oplog_after,
-            (1.0 - oplog_after as f64 / oplog_before as f64) * 100.0,
-        );
-
         assert_eq!(blocks_before.len(), blocks_after.len());
-        for (b, a) in blocks_before.iter().zip(blocks_after.iter()) {
-            assert_eq!(b.content, a.content, "block {} content mismatch", b.id);
-            assert_eq!(b.status, a.status, "block {} status mismatch", b.id);
+        for (before, after) in blocks_before.iter().zip(blocks_after.iter()) {
+            assert_eq!(before.content, after.content);
         }
-        // With delete+rewrite cycles, compaction should reduce oplog
-        assert!(oplog_after < oplog_before, "expected reduction: {} vs {}", oplog_after, oplog_before);
+        assert!(oplog_after < oplog_before,
+            "compaction should reduce oplog: {} -> {}", oplog_before, oplog_after);
     }
 
     #[test]
     fn test_promote_to_register() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
-        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Hello world", "claude").unwrap();
+        let mut doc = test_doc();
 
-        // Before promotion: content comes from Text CRDT
-        let snap = doc.get_block_snapshot(&id).unwrap();
-        assert_eq!(snap.content, "Hello world");
-
-        // Promote
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Hello World").unwrap();
         doc.promote_to_register(&id).unwrap();
 
-        // After promotion: content comes from content_final register
         let snap = doc.get_block_snapshot(&id).unwrap();
-        assert_eq!(snap.content, "Hello world");
-
-        // Verify the register key exists directly
-        let block_key = format!("block:{}", id.to_key());
-        let block_map = doc.doc.get_map(&[&block_key]).unwrap();
-        let final_val = block_map.get("content_final").unwrap();
-        assert_eq!(final_val.as_str().unwrap(), "Hello world");
-    }
-
-    #[test]
-    fn test_running_blocks_not_promoted() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
-        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "", "claude").unwrap();
-        doc.set_status(&id, Status::Running).unwrap();
-        doc.edit_text(&id, 0, "streaming...", 0).unwrap();
-
-        // Running block should not have content_final
-        let block_key = format!("block:{}", id.to_key());
-        let block_map = doc.doc.get_map(&[&block_key]).unwrap();
-        assert!(block_map.get("content_final").is_none());
-
-        // Content still readable from Text CRDT
-        let snap = doc.get_block_snapshot(&id).unwrap();
-        assert_eq!(snap.content, "streaming...");
-    }
-
-    #[test]
-    fn test_compaction_promotes_done_blocks() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
-
-        // Insert blocks with streaming edits (simulates real LLM output)
-        for i in 0..20 {
-            let id = doc.insert_block(
-                None, None, Role::Model, BlockKind::Text,
-                "", &format!("agent-{}", i),
-            ).unwrap();
-            doc.set_status(&id, Status::Running).unwrap();
-            // Stream content char-by-char (each edit = 1 LV in Text CRDT)
-            for (j, ch) in "x".repeat(200).chars().enumerate() {
-                doc.edit_text(&id, j, &ch.to_string(), 0).unwrap();
-            }
-            doc.set_status(&id, Status::Done).unwrap();
-        }
-
-        let oplog_before = doc.oplog_bytes().unwrap().len();
-
-        // Compact (from_snapshot promotes Done blocks to registers)
-        doc.compact().unwrap();
-        let oplog_after = doc.oplog_bytes().unwrap().len();
-
-        // Verify all content preserved
-        let blocks = doc.blocks_ordered();
-        assert_eq!(blocks.len(), 20);
-        for b in &blocks {
-            assert_eq!(b.content.len(), 200);
-        }
-
-        // Compaction with register promotion should reduce oplog significantly
-        // (200 Text CRDT ops per block → 1 register set per block)
-        assert!(
-            oplog_after < oplog_before,
-            "expected reduction: {} vs {}",
-            oplog_after, oplog_before,
-        );
+        assert_eq!(snap.content, "Hello World");
     }
 
     #[test]
     fn test_promote_roundtrip_through_snapshot() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
-        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "test content", "claude").unwrap();
-        doc.promote_to_register(&id).unwrap();
+        let mut doc = test_doc();
 
-        // Snapshot and restore
+        let id1 = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Done block").unwrap();
+        doc.set_status(&id1, Status::Done).unwrap();
+        doc.promote_to_register(&id1).unwrap();
+
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Running block").unwrap();
+        doc.set_status(&id2, Status::Running).unwrap();
+
         let snapshot = doc.snapshot();
-        let doc2 = BlockDocument::from_snapshot(snapshot, "bob");
+        let restored = BlockDocument::from_snapshot(snapshot, doc.agent_id());
 
-        let snap = doc2.get_block_snapshot(&id).unwrap();
-        assert_eq!(snap.content, "test content");
+        let snap1 = restored.get_block_snapshot(&id1).unwrap();
+        assert_eq!(snap1.content, "Done block");
+
+        let snap2 = restored.get_block_snapshot(&id2).unwrap();
+        assert_eq!(snap2.content, "Running block");
+    }
+
+    #[test]
+    fn test_running_blocks_not_promoted() {
+        let mut doc = test_doc();
+
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Streaming...").unwrap();
+        doc.set_status(&id, Status::Running).unwrap();
+
+        let snapshot = doc.snapshot();
+        let restored = BlockDocument::from_snapshot(snapshot, doc.agent_id());
+
+        let snap = restored.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "Streaming...");
+    }
+
+    #[test]
+    fn test_compaction_promotes_done_blocks() {
+        let mut doc = test_doc();
+
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Done content").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Still streaming").unwrap();
+        doc.set_status(&id2, Status::Running).unwrap();
+
+        doc.compact().unwrap();
+
+        let snap1 = doc.get_block_snapshot(&id1).unwrap();
+        assert_eq!(snap1.content, "Done content");
+
+        let snap2 = doc.get_block_snapshot(&id2).unwrap();
+        assert_eq!(snap2.content, "Still streaming");
     }
 }

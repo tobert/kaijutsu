@@ -31,12 +31,12 @@ impl ConversationDAG {
         let mut blocks = HashMap::new();
 
         for snap in snapshots {
-            if let Some(ref parent_id) = snap.parent_id {
-                children.entry(parent_id.clone()).or_default().push(snap.id.clone());
+            if let Some(parent_id) = snap.parent_id {
+                children.entry(parent_id).or_default().push(snap.id);
             } else {
-                roots.push(snap.id.clone());
+                roots.push(snap.id);
             }
-            blocks.insert(snap.id.clone(), snap);
+            blocks.insert(snap.id, snap);
         }
 
         Self { roots, children, blocks }
@@ -69,7 +69,7 @@ impl ConversationDAG {
     /// Get all blocks in a subtree rooted at the given block.
     pub fn subtree(&self, root: &BlockId) -> Vec<&BlockSnapshot> {
         let mut result = Vec::new();
-        let mut stack = vec![root.clone()];
+        let mut stack = vec![*root];
 
         while let Some(id) = stack.pop() {
             if let Some(block) = self.blocks.get(&id) {
@@ -77,7 +77,7 @@ impl ConversationDAG {
                 if let Some(children) = self.children.get(&id) {
                     // Push children in reverse to maintain order
                     for child in children.iter().rev() {
-                        stack.push(child.clone());
+                        stack.push(*child);
                     }
                 }
             }
@@ -92,9 +92,9 @@ impl ConversationDAG {
         let mut current = self.blocks.get(id);
 
         while let Some(block) = current {
-            if let Some(ref parent_id) = block.parent_id {
+            if let Some(parent_id) = block.parent_id {
                 depth += 1;
-                current = self.blocks.get(parent_id);
+                current = self.blocks.get(&parent_id);
             } else {
                 break;
             }
@@ -109,8 +109,8 @@ impl ConversationDAG {
         let mut current = self.blocks.get(id);
 
         while let Some(block) = current {
-            if let Some(ref parent_id) = block.parent_id {
-                if let Some(parent) = self.blocks.get(parent_id) {
+            if let Some(parent_id) = block.parent_id {
+                if let Some(parent) = self.blocks.get(&parent_id) {
                     result.push(parent);
                     current = Some(parent);
                 } else {
@@ -144,7 +144,7 @@ struct DfsIterator<'a> {
 impl<'a> DfsIterator<'a> {
     fn new(dag: &'a ConversationDAG) -> Self {
         // Push roots in reverse order to process first root first
-        let stack: Vec<_> = dag.roots.iter().rev().map(|id| (0, id.clone())).collect();
+        let stack: Vec<_> = dag.roots.iter().rev().map(|id| (0, *id)).collect();
         Self { dag, stack }
     }
 }
@@ -158,7 +158,7 @@ impl<'a> Iterator for DfsIterator<'a> {
                 // Push children in reverse order
                 if let Some(children) = self.dag.children.get(&id) {
                     for child in children.iter().rev() {
-                        self.stack.push((depth + 1, child.clone()));
+                        self.stack.push((depth + 1, *child));
                     }
                 }
                 return Some((depth, block));
@@ -176,7 +176,7 @@ struct BfsIterator<'a> {
 
 impl<'a> BfsIterator<'a> {
     fn new(dag: &'a ConversationDAG) -> Self {
-        let queue: std::collections::VecDeque<_> = dag.roots.iter().map(|id| (0, id.clone())).collect();
+        let queue: std::collections::VecDeque<_> = dag.roots.iter().map(|id| (0, *id)).collect();
         Self { dag, queue }
     }
 }
@@ -190,7 +190,7 @@ impl<'a> Iterator for BfsIterator<'a> {
                 // Queue children
                 if let Some(children) = self.dag.children.get(&id) {
                     for child in children {
-                        self.queue.push_back((depth + 1, child.clone()));
+                        self.queue.push_back((depth + 1, *child));
                     }
                 }
                 return Some((depth, block));
@@ -203,15 +203,18 @@ impl<'a> Iterator for BfsIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockKind, Role};
+    use crate::{BlockKind, ContextId, PrincipalId, Role};
+
+    fn test_doc() -> BlockDocument {
+        BlockDocument::new(ContextId::new(), PrincipalId::new())
+    }
 
     #[test]
     fn test_dag_from_flat_document() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Create flat structure
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "alice").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Second", "claude").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Second").unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
@@ -222,12 +225,11 @@ mod tests {
 
     #[test]
     fn test_dag_with_parent_child() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        // Create parent-child structure
-        let parent = doc.insert_block(None, None, Role::User, BlockKind::Text, "Question", "alice").unwrap();
-        let child1 = doc.insert_block(Some(&parent), Some(&parent), Role::Model, BlockKind::Thinking, "Thinking...", "claude").unwrap();
-        let child2 = doc.insert_block(Some(&parent), Some(&child1), Role::Model, BlockKind::Text, "Answer", "claude").unwrap();
+        let parent = doc.insert_block(None, None, Role::User, BlockKind::Text, "Question").unwrap();
+        let child1 = doc.insert_block(Some(&parent), Some(&parent), Role::Model, BlockKind::Thinking, "Thinking...").unwrap();
+        let child2 = doc.insert_block(Some(&parent), Some(&child1), Role::Model, BlockKind::Text, "Answer").unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
@@ -246,31 +248,31 @@ mod tests {
 
     #[test]
     fn test_dfs_iteration() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", "alice").unwrap();
-        let child1 = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child1", "claude").unwrap();
-        let grandchild = doc.insert_block(Some(&child1), Some(&child1), Role::Model, BlockKind::Text, "Grandchild", "claude").unwrap();
+        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root").unwrap();
+        let child1 = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child1").unwrap();
+        let grandchild = doc.insert_block(Some(&child1), Some(&child1), Role::Model, BlockKind::Text, "Grandchild").unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
         let dfs: Vec<_> = dag.iter_dfs().collect();
         assert_eq!(dfs.len(), 3);
-        assert_eq!(dfs[0].0, 0); // Root depth
+        assert_eq!(dfs[0].0, 0);
         assert_eq!(dfs[0].1.id, root);
-        assert_eq!(dfs[1].0, 1); // Child depth
+        assert_eq!(dfs[1].0, 1);
         assert_eq!(dfs[1].1.id, child1);
-        assert_eq!(dfs[2].0, 2); // Grandchild depth
+        assert_eq!(dfs[2].0, 2);
         assert_eq!(dfs[2].1.id, grandchild);
     }
 
     #[test]
     fn test_subtree() {
-        let mut doc = BlockDocument::new("doc-1", "alice");
+        let mut doc = test_doc();
 
-        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", "alice").unwrap();
-        let child = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child", "claude").unwrap();
-        let _other_root = doc.insert_block(None, Some(&child), Role::User, BlockKind::Text, "Other", "alice").unwrap();
+        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root").unwrap();
+        let child = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child").unwrap();
+        let _other_root = doc.insert_block(None, Some(&child), Role::User, BlockKind::Text, "Other").unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 

@@ -7,27 +7,24 @@ repository.workspace = true
 description = "Block-based CRDT document model for Kaijutsu"
 
 [dependencies]
+# Shared identity + block types (typed UUIDs, BlockSnapshot, etc.)
+kaijutsu-types = { path = "../kaijutsu-types" }
+
 # Unified CRDT library with Map/Set/Register/Text support
 # Provides all CRDT types needed for block document model
 diamond-types-extended.workspace = true
-
-# SmartString (same as diamond-types uses)
-smartstring = "1.0"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 
-# UUID (v7 = time-ordered)
-uuid = { version = "1", features = ["v5", "v7", "serde"] }
+# UUID (v5 for context ID recovery from document IDs)
+uuid = { version = "1", features = ["v5"] }
 
 # Utilities
 thiserror = "2"
 tracing = "0.1"
-
-# Enum string conversion
-strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8"
