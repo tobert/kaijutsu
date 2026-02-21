@@ -49,7 +49,9 @@ kernel-generated blocks (shell output, system messages).
 | `Kernel` | Kernel birth certificate (founder + label) |
 | `Context` | Context metadata (kernel + lineage + label) |
 | `BlockId` | Unique block address (context + agent + seq) |
+| `BlockHeader` | Lightweight Copy-able subset for DAG indexing |
 | `BlockSnapshot` | Serializable block state |
+| `Session` | Session birth certificate (who + where + when) |
 
 ## BlockKind + ToolKind + DriftKind
 
@@ -94,7 +96,7 @@ as separate variants. In kaijutsu-types, these are unified:
 | `client::Identity` | kaijutsu-client | `Principal` |
 | `BlockId.document_id: String` | kaijutsu-crdt | `BlockId.context_id: ContextId` |
 | `BlockId.agent_id: String` | kaijutsu-crdt | `BlockId.agent_id: PrincipalId` |
-| `BlockSnapshot.author: String` | kaijutsu-crdt | `BlockSnapshot.author: PrincipalId` |
+| `BlockSnapshot.author: String` | kaijutsu-crdt | removed — use `author()` method (`id.agent_id`) |
 | `BlockKind::ShellCommand` | kaijutsu-crdt | `BlockKind::ToolCall` + `ToolKind::Shell` |
 | `BlockKind::ShellOutput` | kaijutsu-crdt | `BlockKind::ToolResult` + `ToolKind::Shell` |
 | `KernelState.id: String` | kaijutsu-kernel | `KernelId` + `Kernel` (metadata) |
@@ -197,7 +199,7 @@ let kernel = Kernel::new(amy.id, Some("team-dev".into()));
 // Create a context within the kernel
 let ctx = Context::new(kernel.id, Some("default".into()), None, amy.id);
 
-// User typed a shell command
+// User typed a shell command (author is amy.id via BlockId)
 let cmd = BlockSnapshot::tool_call(
     BlockId::new(ctx.id, amy.id, 1),
     None,
@@ -205,9 +207,9 @@ let cmd = BlockSnapshot::tool_call(
     "shell",
     serde_json::json!({"command": "ls -la"}),
     Role::User,
-    amy.id,
 );
 assert!(cmd.is_shell());
+assert_eq!(cmd.author(), amy.id);
 
 // Model requested an MCP tool
 let tool = BlockSnapshot::tool_call(
@@ -217,7 +219,6 @@ let tool = BlockSnapshot::tool_call(
     "read_file",
     serde_json::json!({"path": "/etc/hosts"}),
     Role::Model,
-    amy.id,
 );
 assert!(!tool.is_shell());
 

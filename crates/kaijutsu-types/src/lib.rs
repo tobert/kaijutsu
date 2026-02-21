@@ -39,12 +39,14 @@
 //! | [`ContextId`]     | Which context (= document)                   |
 //! | [`SessionId`]     | Which connection session                     |
 //! | [`BlockId`]       | Unique block address (context + agent + seq) |
+//! | [`BlockHeader`]   | Lightweight Copy-able subset for DAG indexing |
 //! | [`BlockSnapshot`] | Serializable block state                     |
 //! |-------------------|----------------------------------------------|
 
 pub mod ids;
 pub mod principal;
 pub mod block;
+pub mod compaction;
 pub mod context;
 pub mod kernel;
 pub mod session;
@@ -57,6 +59,7 @@ pub use block::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, DriftKind,
     MAX_DAG_DEPTH, Role, Status, ToolKind,
 };
+pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
 pub use kernel::Kernel;
 pub use session::Session;
