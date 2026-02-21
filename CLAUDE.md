@@ -292,8 +292,8 @@ Widgets are the unified UI primitive for all non-content chrome. Located in `ui/
 ### RPC (Cap'n Proto)
 
 - Object-capability model over SSH
-- `attachKernel()` returns a `Kernel` capability + `KernelId` (88 Kernel ordinals @0-@87, 4 World ordinals @0-@3)
-- `createContext(label)` → `ContextId`, `joinContext(contextId, instance)` → `document_id`
+- `attachKernel()` returns a `Kernel` capability + `KernelId`
+- `createContext(label)` → `ContextId`, `joinContext(contextId, instance)` → `ContextId`
 - `listContexts()` returns all contexts with `ContextId`, label, provider, model, parent
 - Context IDs on wire: 16-byte `Data` fields (`contextId`, `parentId`); labels as `Text` (`contextName`)
 - Real-time streaming for messages and kernel output
