@@ -20,7 +20,7 @@ serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 
 # UUID (v7 = time-ordered)
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
 
 # Utilities
 thiserror = "2"

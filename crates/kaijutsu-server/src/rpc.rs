@@ -697,8 +697,10 @@ impl world::Server for WorldImpl {
                     uuid::Uuid::new_v4().to_string(), // instance ID
                 ));
 
-                // Generate default ContextId for this kernel
-                let ctx_id = ContextId::new();
+                // Derive a stable ContextId for the default context from its document ID.
+                // This ensures the same kernel always gets the same default ContextId
+                // across server restarts.
+                let ctx_id = ContextId::from_document_id(&main_document_id);
 
                 // Register block tools (including context engine + drift)
                 let kernel_arc = Arc::new(kernel);
@@ -736,9 +738,11 @@ impl world::Server for WorldImpl {
                     let mut drift = kernel_arc.drift().write().await;
                     drift.register(ctx_id, Some("default"), &main_document_id, None);
 
-                    // Register recovered non-default contexts
+                    // Register recovered non-default contexts with stable IDs.
+                    // If the context name is a UUID (e.g. CC session), parse it back.
+                    // Otherwise derive a deterministic UUIDv5 from the document ID.
                     for (ctx_name, doc_id) in &recovered_contexts {
-                        let recovered_ctx_id = ContextId::new();
+                        let recovered_ctx_id = ContextId::recover(ctx_name, doc_id);
                         drift.register(recovered_ctx_id, Some(ctx_name), doc_id, Some(ctx_id));
                         log::info!("Recovered context '{}' (doc: {}, id: {}) in kernel DriftRouter",
                             ctx_name, doc_id, recovered_ctx_id.short());

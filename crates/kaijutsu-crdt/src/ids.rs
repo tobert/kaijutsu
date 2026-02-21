@@ -113,6 +113,29 @@ macro_rules! impl_typed_id {
 impl_typed_id!(KernelId, "KernelId");
 impl_typed_id!(ContextId, "ContextId");
 
+/// Fixed namespace for deriving stable ContextIds from document IDs via UUIDv5.
+const KAIJUTSU_CONTEXT_NS: uuid::Uuid = uuid::uuid!("b47d0a58-11b0-4694-9fbc-803f9f78c17d");
+
+impl ContextId {
+    /// Derive a stable ContextId from a document ID.
+    /// Same input always produces the same output (UUIDv5 deterministic hash).
+    pub fn from_document_id(document_id: &str) -> Self {
+        Self(uuid::Uuid::new_v5(&KAIJUTSU_CONTEXT_NS, document_id.as_bytes()))
+    }
+
+    /// Recover a ContextId from a context name (the part after `@` in a document ID).
+    ///
+    /// If the name is a valid UUID, parse it — preserving the original identity
+    /// (e.g. a CC session UUID used as a context name).
+    /// Otherwise, derive a stable ID from the full document ID via UUIDv5.
+    pub fn recover(context_name: &str, document_id: &str) -> Self {
+        match uuid::Uuid::parse_str(context_name) {
+            Ok(uuid) => Self(uuid),
+            Err(_) => Self::from_document_id(document_id),
+        }
+    }
+}
+
 // ── Prefix resolution ───────────────────────────────────────────────────────
 
 /// Error from ambiguous prefix resolution.
@@ -331,5 +354,48 @@ mod tests {
         let entries = vec![(a, Some("main-1")), (b, Some("main-2"))];
         let result = resolve_context_prefix(entries.into_iter(), "main");
         assert!(matches!(result, Err(PrefixError::Ambiguous { .. })));
+    }
+
+    #[test]
+    fn test_from_document_id_is_deterministic() {
+        let a = ContextId::from_document_id("kernel-1@main");
+        let b = ContextId::from_document_id("kernel-1@main");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_from_document_id_different_inputs() {
+        let a = ContextId::from_document_id("kernel-1@main");
+        let b = ContextId::from_document_id("kernel-1@debug");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_recover_parses_uuid_context_name() {
+        // Simulate a CC session UUID used as context name
+        let original = uuid::Uuid::parse_str("a1b2c3d4-e5f6-4789-abcd-ef0123456789").unwrap();
+        let context_name = original.to_string();
+        let doc_id = format!("kernel-1@{}", context_name);
+
+        let recovered = ContextId::recover(&context_name, &doc_id);
+        assert_eq!(recovered, ContextId::from_bytes(*original.as_bytes()));
+    }
+
+    #[test]
+    fn test_recover_derives_for_non_uuid_name() {
+        let recovered = ContextId::recover("main", "kernel-1@main");
+        let derived = ContextId::from_document_id("kernel-1@main");
+        assert_eq!(recovered, derived);
+    }
+
+    #[test]
+    fn test_recover_roundtrips_context_id() {
+        // A ContextId used as a context name should be recovered exactly
+        let original = ContextId::new();
+        let context_name = original.to_string();
+        let doc_id = format!("kernel-1@{}", context_name);
+
+        let recovered = ContextId::recover(&context_name, &doc_id);
+        assert_eq!(recovered, original);
     }
 }
