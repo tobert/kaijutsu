@@ -51,21 +51,22 @@ impl BlockId {
         }
     }
 
-    /// Convert to a compact string key: `"{context_hex}/{principal_hex}/{seq}"`.
+    /// Convert to a compact string key: `"{context_hex}:{principal_hex}:{seq}"`.
     ///
-    /// Safe because UUIDs are hex-only (never contain `/`).
+    /// Uses `:` as delimiter — safe because UUIDs are hex-only, and avoids
+    /// collision with `/` used as path separator in CRDT engines.
     pub fn to_key(&self) -> String {
         format!(
-            "{}/{}/{}",
+            "{}:{}:{}",
             self.context_id.to_hex(),
             self.agent_id.to_hex(),
             self.seq
         )
     }
 
-    /// Parse from key string: `"{context_hex}/{principal_hex}/{seq}"`.
+    /// Parse from key string: `"{context_hex}:{principal_hex}:{seq}"`.
     pub fn from_key(key: &str) -> Option<Self> {
-        let parts: Vec<&str> = key.splitn(3, '/').collect();
+        let parts: Vec<&str> = key.splitn(3, ':').collect();
         if parts.len() != 3 {
             return None;
         }
@@ -316,7 +317,7 @@ impl std::fmt::Display for ToolKind {
 }
 
 /// How a drift block arrived from another context.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, EnumString)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, EnumString)]
 #[serde(rename_all = "snake_case")]
 #[strum(ascii_case_insensitive)]
 pub enum DriftKind {
@@ -366,14 +367,17 @@ impl std::fmt::Display for DriftKind {
 ///
 /// ## Field groups
 ///
-/// - **Core**: id, parent_id, role, status, kind, content, author, created_at
+/// - **Core**: id, parent_id, role, status, kind, content, created_at
 /// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, display_hint
 /// - **Drift** (Drift): drift_kind, source_context, source_model
+///
+/// The block's author is always `id.agent_id` — no separate field to diverge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSnapshot {
-    /// Block ID.
+    /// Block ID (includes context_id, agent_id/author, and seq).
     pub id: BlockId,
     /// Parent block ID (DAG edge — None for root blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<BlockId>,
     /// Role of the block author (user, model, system, tool).
     pub role: Role,
@@ -384,58 +388,66 @@ pub struct BlockSnapshot {
     /// Primary text content.
     pub content: String,
     /// Whether this block is collapsed (only meaningful for Thinking).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub collapsed: bool,
-    /// Who created this block.
-    pub author: PrincipalId,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
     // Tool-specific fields (ToolCall / ToolResult)
 
     /// Which execution engine (Shell, Mcp, Builtin). Present on ToolCall/ToolResult.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_kind: Option<ToolKind>,
     /// Tool name (for ToolCall blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     /// Tool input as JSON string (for ToolCall blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_input: Option<String>,
     /// Reference to parent ToolCall block (for ToolResult blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<BlockId>,
     /// Exit code from tool execution (for ToolResult blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Whether this is an error result (for ToolResult blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_error: bool,
     /// Display hint for richer output formatting (JSON-serialized).
     /// Used for shell output blocks to enable per-viewer rendering.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_hint: Option<String>,
 
     // Drift-specific fields (Drift)
 
     /// Originating context (for Drift blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<ContextId>,
     /// Model that produced this content (for Drift blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_model: Option<String>,
     /// How this block arrived from another context (for Drift blocks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift_kind: Option<DriftKind>,
 }
 
+/// Helper for `#[serde(skip_serializing_if)]` on bool fields.
+fn is_false(v: &bool) -> bool {
+    !v
+}
+
 impl BlockSnapshot {
+    /// The principal that authored this block (always `id.agent_id`).
+    pub fn author(&self) -> PrincipalId {
+        self.id.agent_id
+    }
+
     /// Create a new text block snapshot.
     pub fn text(
         id: BlockId,
         parent_id: Option<BlockId>,
         role: Role,
         content: impl Into<String>,
-        author: PrincipalId,
     ) -> Self {
         Self {
             id,
@@ -445,8 +457,7 @@ impl BlockSnapshot {
             kind: BlockKind::Text,
             content: content.into(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
             tool_input: None,
@@ -465,7 +476,6 @@ impl BlockSnapshot {
         id: BlockId,
         parent_id: Option<BlockId>,
         content: impl Into<String>,
-        author: PrincipalId,
     ) -> Self {
         Self {
             id,
@@ -475,8 +485,7 @@ impl BlockSnapshot {
             kind: BlockKind::Thinking,
             content: content.into(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
             tool_input: None,
@@ -501,7 +510,6 @@ impl BlockSnapshot {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         role: Role,
-        author: PrincipalId,
     ) -> Self {
         let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
         Self {
@@ -512,8 +520,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolCall,
             content: input_json.clone(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
             tool_input: Some(input_json),
@@ -535,7 +542,6 @@ impl BlockSnapshot {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
-        author: PrincipalId,
     ) -> Self {
         Self {
             id,
@@ -545,8 +551,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
@@ -564,7 +569,6 @@ impl BlockSnapshot {
     ///
     /// Display hints enable per-viewer rendering (e.g., ANSI terminal output,
     /// table formatting) without baking presentation into content.
-    #[allow(clippy::too_many_arguments)]
     pub fn tool_result_with_hint(
         id: BlockId,
         tool_call_id: BlockId,
@@ -572,7 +576,6 @@ impl BlockSnapshot {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
-        author: PrincipalId,
         display_hint: Option<String>,
     ) -> Self {
         Self {
@@ -583,8 +586,7 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
@@ -603,7 +605,6 @@ impl BlockSnapshot {
         id: BlockId,
         parent_id: Option<BlockId>,
         content: impl Into<String>,
-        author: PrincipalId,
         source_context: ContextId,
         source_model: Option<String>,
         drift_kind: DriftKind,
@@ -616,8 +617,7 @@ impl BlockSnapshot {
             kind: BlockKind::Drift,
             content: content.into(),
             collapsed: false,
-            author,
-            created_at: Self::now_millis(),
+            created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
             tool_input: None,
@@ -629,19 +629,6 @@ impl BlockSnapshot {
             source_model,
             drift_kind: Some(drift_kind),
         }
-    }
-
-    /// Get current timestamp in milliseconds.
-    fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    /// Get text content (always available via content field).
-    pub fn text_content(&self) -> &str {
-        &self.content
     }
 
     /// Check if this block is collapsed (only meaningful for Thinking).
@@ -676,7 +663,6 @@ impl BlockSnapshot {
             && self.kind == other.kind
             && self.content == other.content
             && self.collapsed == other.collapsed
-            && self.author == other.author
             && self.tool_kind == other.tool_kind
             && self.tool_name == other.tool_name
             && self.tool_input == other.tool_input
@@ -690,10 +676,10 @@ impl BlockSnapshot {
     }
 }
 
-/// Builder for `BlockSnapshot` — reduces boilerplate for the 20-field struct.
+/// Builder for `BlockSnapshot` — reduces boilerplate for the many-field struct.
 ///
-/// Starts with required fields (id, kind, author) and sane defaults for the rest.
-/// Chain setters for optional fields.
+/// Starts with required fields (id, kind) and sane defaults for the rest.
+/// The author is always `id.agent_id` — no separate parameter.
 ///
 /// ```
 /// # use kaijutsu_types::*;
@@ -702,7 +688,6 @@ impl BlockSnapshot {
 /// let snap = BlockSnapshotBuilder::new(
 ///     BlockId::new(ctx, author, 1),
 ///     BlockKind::ToolCall,
-///     author,
 /// )
 ///     .role(Role::User)
 ///     .tool_kind(ToolKind::Shell)
@@ -716,8 +701,8 @@ pub struct BlockSnapshotBuilder {
 }
 
 impl BlockSnapshotBuilder {
-    /// Start building a snapshot with the three required fields.
-    pub fn new(id: BlockId, kind: BlockKind, author: PrincipalId) -> Self {
+    /// Start building a snapshot with the two required fields.
+    pub fn new(id: BlockId, kind: BlockKind) -> Self {
         Self {
             snap: BlockSnapshot {
                 id,
@@ -727,8 +712,7 @@ impl BlockSnapshotBuilder {
                 kind,
                 content: String::new(),
                 collapsed: false,
-                author,
-                created_at: BlockSnapshot::now_millis(),
+                created_at: crate::now_millis(),
                 tool_kind: None,
                 tool_name: None,
                 tool_input: None,
@@ -869,8 +853,8 @@ mod tests {
         let agent = test_agent();
         let id = BlockId::new(ctx, agent, 99);
         let key = id.to_key();
-        // Format: "{32-hex}/{32-hex}/{seq}"
-        let parts: Vec<&str> = key.splitn(3, '/').collect();
+        // Format: "{32-hex}:{32-hex}:{seq}"
+        let parts: Vec<&str> = key.splitn(3, ':').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].len(), 32); // context hex
         assert_eq!(parts[1].len(), 32); // agent hex
@@ -880,8 +864,8 @@ mod tests {
     #[test]
     fn test_block_id_from_key_rejects_bad_input() {
         assert!(BlockId::from_key("").is_none());
-        assert!(BlockId::from_key("a/b").is_none());
-        assert!(BlockId::from_key("not-a-uuid/not-a-uuid/1").is_none());
+        assert!(BlockId::from_key("a:b").is_none());
+        assert!(BlockId::from_key("not-a-uuid:not-a-uuid:1").is_none());
     }
 
     #[test]
@@ -1042,15 +1026,15 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::text(id.clone(), None, Role::User, "Hello!", author);
+        let snap = BlockSnapshot::text(id.clone(), None, Role::User, "Hello!");
 
         assert_eq!(snap.id, id);
         assert!(snap.parent_id.is_none());
         assert_eq!(snap.role, Role::User);
         assert_eq!(snap.status, Status::Done);
         assert_eq!(snap.kind, BlockKind::Text);
-        assert_eq!(snap.text_content(), "Hello!");
-        assert_eq!(snap.author, author);
+        assert_eq!(snap.content, "Hello!");
+        assert_eq!(snap.author(), author);
         assert!(!snap.is_collapsed());
         assert!(snap.is_root());
         assert!(!snap.is_shell());
@@ -1063,10 +1047,11 @@ mod tests {
         let author = test_agent();
         let id = BlockId::new(ctx, author, 2);
         let parent = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::thinking(id.clone(), Some(parent), "Let me think...", author);
+        let snap = BlockSnapshot::thinking(id.clone(), Some(parent), "Let me think...");
 
         assert_eq!(snap.kind, BlockKind::Thinking);
         assert_eq!(snap.role, Role::Model);
+        assert_eq!(snap.author(), author);
         assert!(snap.has_parent());
         assert!(!snap.is_root());
     }
@@ -1084,7 +1069,6 @@ mod tests {
             "read_file",
             input.clone(),
             Role::Model,
-            author,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
@@ -1092,12 +1076,12 @@ mod tests {
         assert_eq!(snap.tool_kind, Some(ToolKind::Mcp));
         assert_eq!(snap.tool_name, Some("read_file".to_string()));
         assert_eq!(snap.role, Role::Model);
+        assert_eq!(snap.author(), author);
         assert!(!snap.is_shell());
     }
 
     #[test]
     fn test_block_snapshot_shell_call_by_user() {
-        // User typed "ls -la" in kaish — this is a ToolCall with Shell kind
         let ctx = test_context();
         let user = test_agent();
         let id = BlockId::new(ctx, user, 1);
@@ -1109,7 +1093,6 @@ mod tests {
             "shell",
             input,
             Role::User,
-            user,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
@@ -1120,7 +1103,6 @@ mod tests {
 
     #[test]
     fn test_block_snapshot_shell_call_by_model() {
-        // Model requested shell execution — same ToolKind, different Role
         let ctx = test_context();
         let model = test_agent();
         let id = BlockId::new(ctx, model, 1);
@@ -1132,7 +1114,6 @@ mod tests {
             "shell",
             input,
             Role::Model,
-            model,
         );
 
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
@@ -1153,7 +1134,6 @@ mod tests {
             "file contents here",
             false,
             Some(0),
-            PrincipalId::system(),
         );
 
         assert_eq!(snap.kind, BlockKind::ToolResult);
@@ -1161,6 +1141,7 @@ mod tests {
         assert_eq!(snap.tool_kind, Some(ToolKind::Mcp));
         assert_eq!(snap.tool_call_id, Some(tool_call_id.clone()));
         assert_eq!(snap.parent_id, Some(tool_call_id));
+        assert_eq!(snap.author(), PrincipalId::system());
         assert!(!snap.is_error);
         assert_eq!(snap.exit_code, Some(0));
     }
@@ -1177,7 +1158,6 @@ mod tests {
             "total 42\ndrwxr-xr-x ...",
             false,
             Some(0),
-            PrincipalId::system(),
         );
 
         assert_eq!(snap.kind, BlockKind::ToolResult);
@@ -1198,7 +1178,6 @@ mod tests {
             "output",
             true,
             Some(1),
-            PrincipalId::system(),
             Some("ansi".to_string()),
         );
 
@@ -1218,7 +1197,6 @@ mod tests {
             id.clone(),
             None,
             "CAS has a race condition",
-            author,
             source_ctx,
             Some("claude-opus-4-6".to_string()),
             DriftKind::Push,
@@ -1226,6 +1204,7 @@ mod tests {
 
         assert_eq!(snap.kind, BlockKind::Drift);
         assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.author(), author);
         assert_eq!(snap.source_context, Some(source_ctx));
         assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
         assert_eq!(snap.drift_kind, Some(DriftKind::Push));
@@ -1237,12 +1216,34 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::text(id, None, Role::User, "hello", author);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap.id, parsed.id);
         assert_eq!(snap.content, parsed.content);
-        assert_eq!(snap.author, parsed.author);
+        assert_eq!(snap.author(), parsed.author());
+    }
+
+    #[test]
+    fn test_block_snapshot_skip_serializing_none_fields() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
+        let json = serde_json::to_string(&snap).unwrap();
+        // None fields should be absent, not "null"
+        assert!(!json.contains("tool_kind"));
+        assert!(!json.contains("tool_name"));
+        assert!(!json.contains("drift_kind"));
+        assert!(!json.contains("parent_id"));
+        // false bools should be absent too
+        assert!(!json.contains("collapsed"));
+        assert!(!json.contains("is_error"));
+        // Deserialize back — defaults fill in
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_kind, None);
+        assert!(!parsed.collapsed);
+        assert!(!parsed.is_error);
     }
 
     #[test]
@@ -1258,7 +1259,6 @@ mod tests {
             "shell",
             input,
             Role::User,
-            author,
         );
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
@@ -1272,11 +1272,11 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::Text, author).build();
+        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::Text).build();
 
         assert_eq!(snap.id, id);
         assert_eq!(snap.kind, BlockKind::Text);
-        assert_eq!(snap.author, author);
+        assert_eq!(snap.author(), author);
         assert_eq!(snap.status, Status::Done);
         assert_eq!(snap.content, "");
     }
@@ -1286,7 +1286,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolCall, author)
+        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolCall)
             .role(Role::User)
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
@@ -1309,7 +1309,7 @@ mod tests {
         let source = ContextId::new();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id, BlockKind::Drift, author)
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Drift)
             .role(Role::System)
             .content("finding from other context")
             .source_context(source)
@@ -1327,7 +1327,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolResult, author)
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolResult)
             .is_error(true)
             .exit_code(1)
             .build();
@@ -1337,6 +1337,52 @@ mod tests {
         assert_eq!(snap.exit_code, Some(1));
     }
 
+    #[test]
+    fn test_builder_exhaustive() {
+        // Exercises every builder method to catch any that forget to map their field.
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let parent_id = BlockId::new(ctx, author, 0);
+        let call_id = BlockId::new(ctx, author, 2);
+        let source = ContextId::new();
+
+        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolResult)
+            .parent_id(parent_id.clone())
+            .role(Role::Tool)
+            .status(Status::Error)
+            .content("error output")
+            .collapsed(true)
+            .tool_kind(ToolKind::Shell)
+            .tool_name("shell")
+            .tool_input("{\"cmd\":\"ls\"}")
+            .tool_call_id(call_id.clone())
+            .exit_code(127)
+            .is_error(true)
+            .display_hint("ansi")
+            .source_context(source)
+            .source_model("gemini-pro")
+            .drift_kind(DriftKind::Distill)
+            .build();
+
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.parent_id, Some(parent_id));
+        assert_eq!(snap.role, Role::Tool);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.content, "error output");
+        assert!(snap.collapsed);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
+        assert_eq!(snap.tool_name, Some("shell".to_string()));
+        assert_eq!(snap.tool_input, Some("{\"cmd\":\"ls\"}".to_string()));
+        assert_eq!(snap.tool_call_id, Some(call_id));
+        assert_eq!(snap.exit_code, Some(127));
+        assert!(snap.is_error);
+        assert_eq!(snap.display_hint, Some("ansi".to_string()));
+        assert_eq!(snap.source_context, Some(source));
+        assert_eq!(snap.source_model, Some("gemini-pro".to_string()));
+        assert_eq!(snap.drift_kind, Some(DriftKind::Distill));
+    }
+
     // ── content_eq ──────────────────────────────────────────────────────
 
     #[test]
@@ -1344,7 +1390,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello", author);
+        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello");
         // Simulate a different timestamp
         let mut b = a.clone();
         b.created_at = a.created_at + 1000;

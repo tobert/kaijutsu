@@ -144,6 +144,15 @@ macro_rules! impl_typed_id {
                 write!(f, "{}({})", $name, self.short())
             }
         }
+
+        impl PrefixResolvable for $T {
+            fn matches_hex_prefix(&self, prefix: &str) -> bool {
+                self.matches_hex_prefix(prefix)
+            }
+            fn short(&self) -> String {
+                self.short()
+            }
+        }
     };
 }
 
@@ -151,6 +160,19 @@ impl_typed_id!(PrincipalId, "PrincipalId");
 impl_typed_id!(KernelId, "KernelId");
 impl_typed_id!(ContextId, "ContextId");
 impl_typed_id!(SessionId, "SessionId");
+
+// ── PrefixResolvable ────────────────────────────────────────────────────────
+
+/// Trait for typed IDs that support prefix-based resolution.
+///
+/// Implemented automatically by `impl_typed_id!`. Enables generic
+/// `resolve_prefix()` for any ID type, not just `ContextId`.
+pub trait PrefixResolvable: Copy + PartialEq {
+    /// Check if a query string matches this ID by hex prefix.
+    fn matches_hex_prefix(&self, prefix: &str) -> bool;
+    /// First 8 hex characters — for human display and ambiguity reporting.
+    fn short(&self) -> String;
+}
 
 // ── PrincipalId sentinels ───────────────────────────────────────────────────
 
@@ -182,18 +204,20 @@ pub enum PrefixError {
     },
 }
 
-/// Resolve a query string against a set of context IDs and optional labels.
+/// Resolve a query string against a set of typed IDs with optional labels.
+///
+/// Works with any `PrefixResolvable` type — `ContextId`, `KernelId`, etc.
 ///
 /// Resolution order:
 /// 1. Exact label match
 /// 2. Unique label prefix match
 /// 3. Unique hex prefix match
 /// 4. Error (no match or ambiguous)
-pub fn resolve_context_prefix<'a>(
-    contexts: impl Iterator<Item = (ContextId, Option<&'a str>)>,
+pub fn resolve_prefix<'a, T: PrefixResolvable>(
+    items: impl Iterator<Item = (T, Option<&'a str>)>,
     query: &str,
-) -> Result<ContextId, PrefixError> {
-    let entries: Vec<(ContextId, Option<&str>)> = contexts.collect();
+) -> Result<T, PrefixError> {
+    let entries: Vec<(T, Option<&str>)> = items.collect();
 
     // 1. Exact label match
     for &(id, label) in &entries {
@@ -205,7 +229,7 @@ pub fn resolve_context_prefix<'a>(
     }
 
     // 2. Unique label prefix match
-    let label_matches: Vec<(ContextId, &str)> = entries
+    let label_matches: Vec<(T, &str)> = entries
         .iter()
         .filter_map(|&(id, label)| {
             label.and_then(|l| {
@@ -229,7 +253,7 @@ pub fn resolve_context_prefix<'a>(
     }
 
     // 3. Unique hex prefix match
-    let hex_matches: Vec<ContextId> = entries
+    let hex_matches: Vec<T> = entries
         .iter()
         .filter(|(id, _)| id.matches_hex_prefix(query))
         .map(|(id, _)| *id)
@@ -243,6 +267,14 @@ pub fn resolve_context_prefix<'a>(
             candidates: hex_matches.iter().map(|id| id.short()).collect(),
         }),
     }
+}
+
+/// Convenience alias for resolving context IDs by prefix.
+pub fn resolve_context_prefix<'a>(
+    contexts: impl Iterator<Item = (ContextId, Option<&'a str>)>,
+    query: &str,
+) -> Result<ContextId, PrefixError> {
+    resolve_prefix(contexts, query)
 }
 
 // ============================================================================

@@ -51,7 +51,7 @@ impl std::fmt::Display for Principal {
 }
 
 /// How a principal authenticates.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     /// SSH public key (the only kind today).
