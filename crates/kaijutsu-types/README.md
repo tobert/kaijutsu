@@ -32,6 +32,49 @@ Principal (PrincipalId)  ──── authenticates via ──── Credential
 **Well-known sentinel:** `PrincipalId::system()` — deterministic UUIDv5 for
 kernel-generated blocks (shell output, system messages).
 
+## BlockKind + ToolKind + DriftKind
+
+`BlockKind` is deliberately small — 5 variants covering *what* a block is:
+
+| BlockKind | Purpose |
+|-----------|---------|
+| `Text` | Content (user message, model response) |
+| `Thinking` | Model reasoning (collapsible) |
+| `ToolCall` | Request to execute something |
+| `ToolResult` | Execution response |
+| `Drift` | Cross-context transfer |
+
+Mechanism metadata lives in companion enums on BlockSnapshot:
+
+- **`ToolKind`** on ToolCall/ToolResult — which execution engine:
+  - `Shell` — kaish command execution (default)
+  - `Mcp` — MCP tool invocation
+  - `Builtin` — kernel builtins
+
+- **`DriftKind`** on Drift — how content transferred:
+  - `Push` / `Pull` / `Merge` / `Distill` / `Commit`
+
+### Shell → ToolCall migration
+
+The current codebase has `BlockKind::ShellCommand` and `BlockKind::ShellOutput`
+as separate variants. In kaijutsu-types, these are unified:
+
+| Old (kaijutsu-crdt) | New (kaijutsu-types) |
+|---------------------|---------------------|
+| `BlockKind::ShellCommand` | `BlockKind::ToolCall` + `ToolKind::Shell` + `Role::User` |
+| `BlockKind::ShellOutput` | `BlockKind::ToolResult` + `ToolKind::Shell` |
+
+The `Role` on the block already captures *who* initiated it (user typed `ls` vs
+model requested shell execution). `ToolKind` captures *which engine*. No separate
+BlockKind variants needed.
+
+**Migration notes for `match block.kind` arms:**
+- `BlockKind::ShellCommand` → `BlockKind::ToolCall` where `tool_kind == Some(ToolKind::Shell)`
+- `BlockKind::ShellOutput` → `BlockKind::ToolResult` where `tool_kind == Some(ToolKind::Shell)`
+- UI rendering that keys off `ShellCommand`/`ShellOutput` (the `$ ` prefix, no-border
+  style, display_hint formatting) should use `BlockSnapshot::is_shell()` instead
+- The `is_shell()` convenience method checks `tool_kind == Some(Shell) && kind.is_tool()`
+
 ## Type Mapping: Old → New
 
 | Current Type | Location | Replacement |
@@ -42,6 +85,8 @@ kernel-generated blocks (shell output, system messages).
 | `BlockId.document_id: String` | kaijutsu-crdt | `BlockId.context_id: ContextId` |
 | `BlockId.agent_id: String` | kaijutsu-crdt | `BlockId.agent_id: PrincipalId` |
 | `BlockSnapshot.author: String` | kaijutsu-crdt | `BlockSnapshot.author: PrincipalId` |
+| `BlockKind::ShellCommand` | kaijutsu-crdt | `BlockKind::ToolCall` + `ToolKind::Shell` |
+| `BlockKind::ShellOutput` | kaijutsu-crdt | `BlockKind::ToolResult` + `ToolKind::Shell` |
 | `KernelState.id: String` | kaijutsu-kernel | `KernelId` |
 | `ContextManager.kernel_id: String` | kaijutsu-kernel | `KernelId` |
 | `ContextHandle.document_id: String` | kaijutsu-kernel | `ContextId` |
@@ -56,6 +101,7 @@ kernel-generated blocks (shell output, system messages).
 - [ ] Keep `ids.rs` with `from_document_id()` and `recover()` as migration shims
 - [ ] Migrate `block.rs` `BlockId` to use `ContextId` + `PrincipalId`
 - [ ] Migrate `BlockSnapshot.author` from `String` to `PrincipalId`
+- [ ] Remove `ShellCommand`/`ShellOutput` from `BlockKind`, add `ToolKind` field
 - [ ] Update `BlockDocument` to use typed `BlockId`
 - [ ] Delete old `KernelId`/`ContextId` once consumers are migrated
 
@@ -72,6 +118,8 @@ kernel-generated blocks (shell output, system messages).
 - [ ] Add `uuid` column to `auth.db` (SQLite migration)
 - [ ] Map SSH fingerprint → `PrincipalId` at connection time
 - [ ] Replace hardcoded `"server"` agent_id with `PrincipalId::system()`
+- [ ] Update `shell_execute` to create `ToolCall`/`ToolResult` blocks with `ToolKind::Shell`
+- [ ] Remove `ShellCommand`/`ShellOutput` block creation paths
 
 ### kaijutsu-client
 
@@ -82,6 +130,8 @@ kernel-generated blocks (shell output, system messages).
 
 - [ ] Update block rendering to use `PrincipalId` for author display
 - [ ] Update constellation to use typed `ContextId` throughout
+- [ ] Replace `BlockKind::ShellCommand`/`ShellOutput` match arms with `is_shell()` checks
+- [ ] Shell rendering ($ prefix, no border, display_hint) keys off `is_shell()`
 
 ### kaijutsu-mcp
 
@@ -105,6 +155,8 @@ struct Identity {
 - `agentId @N :Data;` (16 bytes)
 - `seq @N :UInt64;`
 
+Block snapshot gains `toolKind` field, loses `shellCommand`/`shellOutput` kind values.
+
 ## Database Schema Changes
 
 ### auth.db
@@ -122,11 +174,35 @@ is the only persistent state that needs a proper schema migration.
 ## Usage
 
 ```rust
-use kaijutsu_types::{Principal, PrincipalId, BlockId, ContextId};
+use kaijutsu_types::{Principal, PrincipalId, BlockId, ContextId, ToolKind};
+use kaijutsu_types::{BlockSnapshot, Role};
 
 let amy = Principal::new("amy", "Amy Tobey");
 let ctx = ContextId::new();
-let block = BlockId::new(ctx, amy.id, 1);
+
+// User typed a shell command
+let cmd = BlockSnapshot::tool_call(
+    BlockId::new(ctx, amy.id, 1),
+    None,
+    ToolKind::Shell,
+    "shell",
+    serde_json::json!({"command": "ls -la"}),
+    Role::User,
+    amy.id,
+);
+assert!(cmd.is_shell());
+
+// Model requested an MCP tool
+let tool = BlockSnapshot::tool_call(
+    BlockId::new(ctx, amy.id, 2),
+    None,
+    ToolKind::Mcp,
+    "read_file",
+    serde_json::json!({"path": "/etc/hosts"}),
+    Role::Model,
+    amy.id,
+);
+assert!(!tool.is_shell());
 
 // System-generated content
 let system_block = BlockId::new(ctx, PrincipalId::system(), 1);

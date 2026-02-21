@@ -37,5 +37,5 @@ pub mod context;
 pub use ids::{ContextId, KernelId, PrincipalId, SessionId};
 pub use ids::{PrefixError, resolve_context_prefix};
 pub use principal::{Principal, Credential, CredentialKind};
-pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
+pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status, ToolKind};
 pub use context::{ContextInfo, fork_lineage};

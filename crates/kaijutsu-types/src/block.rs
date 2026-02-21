@@ -3,6 +3,17 @@
 //! DAG-native block model with parent/child relationships, role tracking, and
 //! status management. This module provides the *target* types that replace
 //! string-based identifiers in the current `kaijutsu-crdt::block`.
+//!
+//! ## Design: BlockKind + ToolKind + DriftKind
+//!
+//! `BlockKind` is deliberately small — 5 variants covering what a block *is*.
+//! Mechanism metadata lives in companion enums:
+//!
+//! - `ToolKind` on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
+//! - `DriftKind` on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
+//!
+//! Shell commands are tool calls where `tool_kind = Shell`. The principal on the
+//! block tells you who initiated it (user typed `ls` vs model requested shell exec).
 
 use std::str::FromStr;
 
@@ -192,7 +203,11 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// Block content type (what kind of content this block holds).
+/// What a block *is* (content type).
+///
+/// Deliberately small. Mechanism metadata lives in companion enums:
+/// - `ToolKind` on ToolCall/ToolResult — which execution engine
+/// - `DriftKind` on Drift — how content transferred
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
@@ -202,23 +217,18 @@ pub enum BlockKind {
     Text,
     /// Extended thinking/reasoning — collapsible.
     Thinking,
-    /// Tool invocation — content (input JSON) is streamable via Text CRDT.
+    /// Tool invocation — content is streamable via Text CRDT.
+    /// See `tool_kind` for which engine (Shell, Mcp, Builtin).
     #[serde(rename = "tool_call")]
     #[strum(serialize = "tool_call", serialize = "toolcall")]
     ToolCall,
     /// Tool result — content is streamable via Text CRDT.
+    /// See `tool_kind` for which engine.
     #[serde(rename = "tool_result")]
     #[strum(serialize = "tool_result", serialize = "toolresult")]
     ToolResult,
-    /// Shell command entered by user (kaish REPL).
-    #[serde(rename = "shell_command")]
-    #[strum(serialize = "shell_command", serialize = "shellcommand")]
-    ShellCommand,
-    /// Shell command output/result (stdout, exit code).
-    #[serde(rename = "shell_output")]
-    #[strum(serialize = "shell_output", serialize = "shelloutput")]
-    ShellOutput,
     /// Drifted content from another context (cross-context transfer).
+    /// See `drift_kind` for how it arrived.
     #[serde(rename = "drift")]
     #[strum(serialize = "drift")]
     Drift,
@@ -238,8 +248,6 @@ impl BlockKind {
             BlockKind::Thinking => "thinking",
             BlockKind::ToolCall => "tool_call",
             BlockKind::ToolResult => "tool_result",
-            BlockKind::ShellCommand => "shell_command",
-            BlockKind::ShellOutput => "shell_output",
             BlockKind::Drift => "drift",
         }
     }
@@ -249,14 +257,9 @@ impl BlockKind {
         true
     }
 
-    /// Check if this is a tool-related block.
+    /// Check if this is a tool-related block (call or result).
     pub fn is_tool(&self) -> bool {
         matches!(self, BlockKind::ToolCall | BlockKind::ToolResult)
-    }
-
-    /// Check if this is a shell-related block.
-    pub fn is_shell(&self) -> bool {
-        matches!(self, BlockKind::ShellCommand | BlockKind::ShellOutput)
     }
 
     /// Check if this is a drift block (cross-context transfer).
@@ -266,6 +269,47 @@ impl BlockKind {
 }
 
 impl std::fmt::Display for BlockKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Which execution engine handled a tool call/result.
+///
+/// Parallel to `DriftKind` — mechanism metadata on ToolCall/ToolResult blocks.
+/// The `Role` on the block tells you *who* (user typed a command vs model
+/// requested execution). `ToolKind` tells you *how* (kaish, MCP server, builtin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(ascii_case_insensitive)]
+pub enum ToolKind {
+    /// kaish shell execution (the default — `shell_execute` RPC).
+    #[default]
+    Shell,
+    /// MCP tool invocation (via registered MCP server).
+    Mcp,
+    /// Kernel builtin tool (no external process).
+    Builtin,
+}
+
+impl ToolKind {
+    /// Parse from string (case-insensitive).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        <Self as FromStr>::from_str(s).ok()
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolKind::Shell => "shell",
+            ToolKind::Mcp => "mcp",
+            ToolKind::Builtin => "builtin",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -317,8 +361,14 @@ impl std::fmt::Display for DriftKind {
 /// Serializable snapshot of a block (no CRDT state).
 ///
 /// All identity fields use typed IDs: `PrincipalId` for author/agent,
-/// `ContextId` for context references. Tool-specific fields are `Option`
-/// types — only populated for relevant block kinds.
+/// `ContextId` for context references. Mechanism-specific fields are
+/// `Option` types — only populated for relevant block kinds.
+///
+/// ## Field groups
+///
+/// - **Core**: id, parent_id, role, status, kind, content, author, created_at
+/// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, display_hint
+/// - **Drift** (Drift): drift_kind, source_context, source_model
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockSnapshot {
     /// Block ID.
@@ -329,7 +379,7 @@ pub struct BlockSnapshot {
     pub role: Role,
     /// Execution status (pending, running, done, error).
     pub status: Status,
-    /// Content type (text, thinking, tool_call, tool_result, etc.).
+    /// Content type (text, thinking, tool_call, tool_result, drift).
     pub kind: BlockKind,
     /// Primary text content.
     pub content: String,
@@ -340,8 +390,11 @@ pub struct BlockSnapshot {
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
-    // Tool-specific dedicated fields
+    // Tool-specific fields (ToolCall / ToolResult)
 
+    /// Which execution engine (Shell, Mcp, Builtin). Present on ToolCall/ToolResult.
+    #[serde(default)]
+    pub tool_kind: Option<ToolKind>,
     /// Tool name (for ToolCall blocks).
     #[serde(default)]
     pub tool_name: Option<String>,
@@ -358,10 +411,11 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub is_error: bool,
     /// Display hint for richer output formatting (JSON-serialized).
+    /// Used for shell output blocks to enable per-viewer rendering.
     #[serde(default)]
     pub display_hint: Option<String>,
 
-    // Drift-specific fields (for Drift blocks)
+    // Drift-specific fields (Drift)
 
     /// Originating context (for Drift blocks).
     #[serde(default)]
@@ -393,6 +447,7 @@ impl BlockSnapshot {
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: None,
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
@@ -422,6 +477,7 @@ impl BlockSnapshot {
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: None,
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
@@ -434,25 +490,31 @@ impl BlockSnapshot {
         }
     }
 
-    /// Create a new tool call block snapshot.
+    /// Create a tool call block snapshot.
+    ///
+    /// `role` determines who initiated: `Role::User` for user-typed shell commands,
+    /// `Role::Model` for LLM-issued tool calls.
     pub fn tool_call(
         id: BlockId,
         parent_id: Option<BlockId>,
+        tool_kind: ToolKind,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
+        role: Role,
         author: PrincipalId,
     ) -> Self {
         let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
         Self {
             id,
             parent_id,
-            role: Role::Model,
+            role,
             status: Status::Running,
             kind: BlockKind::ToolCall,
             content: input_json.clone(),
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
             tool_input: Some(input_json),
             tool_call_id: None,
@@ -465,10 +527,11 @@ impl BlockSnapshot {
         }
     }
 
-    /// Create a new tool result block snapshot.
+    /// Create a tool result block snapshot.
     pub fn tool_result(
         id: BlockId,
         tool_call_id: BlockId,
+        tool_kind: ToolKind,
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
@@ -484,6 +547,7 @@ impl BlockSnapshot {
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
             tool_call_id: Some(tool_call_id),
@@ -496,70 +560,15 @@ impl BlockSnapshot {
         }
     }
 
-    /// Create a new shell command block (user input in shell mode).
-    pub fn shell_command(
+    /// Create a tool result block with a display hint.
+    ///
+    /// Display hints enable per-viewer rendering (e.g., ANSI terminal output,
+    /// table formatting) without baking presentation into content.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tool_result_with_hint(
         id: BlockId,
-        parent_id: Option<BlockId>,
-        content: impl Into<String>,
-        author: PrincipalId,
-    ) -> Self {
-        Self {
-            id,
-            parent_id,
-            role: Role::User,
-            status: Status::Done,
-            kind: BlockKind::ShellCommand,
-            content: content.into(),
-            collapsed: false,
-            author,
-            created_at: Self::now_millis(),
-            tool_name: None,
-            tool_input: None,
-            tool_call_id: None,
-            exit_code: None,
-            is_error: false,
-            display_hint: None,
-            source_context: None,
-            source_model: None,
-            drift_kind: None,
-        }
-    }
-
-    /// Create a new shell output block (kaish execution result).
-    pub fn shell_output(
-        id: BlockId,
-        command_block_id: BlockId,
-        content: impl Into<String>,
-        is_error: bool,
-        exit_code: Option<i32>,
-        author: PrincipalId,
-    ) -> Self {
-        Self {
-            id,
-            parent_id: Some(command_block_id),
-            role: Role::System,
-            status: if is_error { Status::Error } else { Status::Done },
-            kind: BlockKind::ShellOutput,
-            content: content.into(),
-            collapsed: false,
-            author,
-            created_at: Self::now_millis(),
-            tool_name: None,
-            tool_input: None,
-            tool_call_id: None,
-            exit_code,
-            is_error,
-            display_hint: None,
-            source_context: None,
-            source_model: None,
-            drift_kind: None,
-        }
-    }
-
-    /// Create a new shell output block with a display hint.
-    pub fn shell_output_with_hint(
-        id: BlockId,
-        command_block_id: BlockId,
+        tool_call_id: BlockId,
+        tool_kind: ToolKind,
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
@@ -568,17 +577,18 @@ impl BlockSnapshot {
     ) -> Self {
         Self {
             id,
-            parent_id: Some(command_block_id),
-            role: Role::System,
+            parent_id: Some(tool_call_id.clone()),
+            role: Role::Tool,
             status: if is_error { Status::Error } else { Status::Done },
-            kind: BlockKind::ShellOutput,
+            kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
-            tool_call_id: None,
+            tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
             display_hint,
@@ -608,6 +618,7 @@ impl BlockSnapshot {
             collapsed: false,
             author,
             created_at: Self::now_millis(),
+            tool_kind: None,
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
@@ -646,6 +657,11 @@ impl BlockSnapshot {
     /// Check if this block has a parent.
     pub fn has_parent(&self) -> bool {
         self.parent_id.is_some()
+    }
+
+    /// Check if this is a shell tool block (call or result with ToolKind::Shell).
+    pub fn is_shell(&self) -> bool {
+        self.tool_kind == Some(ToolKind::Shell) && self.kind.is_tool()
     }
 }
 
@@ -728,7 +744,6 @@ mod tests {
     fn test_block_id_display() {
         let id = BlockId::new(test_context(), test_agent(), 5);
         let display = id.to_string();
-        // Format: "{short}@{short}#{seq}"
         assert!(display.contains('@'));
         assert!(display.contains('#'));
         assert!(display.ends_with("#5"));
@@ -765,7 +780,6 @@ mod tests {
         assert_eq!(Role::from_str("System"), Some(Role::System));
         assert_eq!(Role::from_str("tool"), Some(Role::Tool));
         assert_eq!(Role::from_str("invalid"), None);
-        // Aliases
         assert_eq!(Role::from_str("human"), Some(Role::User));
         assert_eq!(Role::from_str("assistant"), Some(Role::Model));
         assert_eq!(Role::from_str("agent"), Some(Role::Model));
@@ -783,7 +797,6 @@ mod tests {
         assert!(Status::Error.is_terminal());
         assert!(!Status::Pending.is_terminal());
         assert!(Status::Running.is_active());
-        // Aliases
         assert_eq!(Status::from_str("active"), Some(Status::Running));
         assert_eq!(Status::from_str("complete"), Some(Status::Done));
         assert_eq!(Status::from_str("completed"), Some(Status::Done));
@@ -803,7 +816,39 @@ mod tests {
         assert!(BlockKind::ToolResult.is_tool());
         assert!(!BlockKind::Text.is_tool());
         assert!(BlockKind::Drift.is_drift());
-        assert!(BlockKind::ShellCommand.is_shell());
+        assert!(!BlockKind::Text.is_drift());
+    }
+
+    #[test]
+    fn test_block_kind_no_shell_variants() {
+        // Shell is a ToolKind, not a BlockKind
+        assert_eq!(BlockKind::from_str("shell_command"), None);
+        assert_eq!(BlockKind::from_str("shell_output"), None);
+    }
+
+    // ── ToolKind ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_kind_parsing() {
+        assert_eq!(ToolKind::from_str("shell"), Some(ToolKind::Shell));
+        assert_eq!(ToolKind::from_str("mcp"), Some(ToolKind::Mcp));
+        assert_eq!(ToolKind::from_str("builtin"), Some(ToolKind::Builtin));
+        assert_eq!(ToolKind::from_str("SHELL"), Some(ToolKind::Shell));
+        assert_eq!(ToolKind::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_tool_kind_serde_roundtrip() {
+        let tk = ToolKind::Shell;
+        let json = serde_json::to_string(&tk).unwrap();
+        assert_eq!(json, "\"shell\"");
+        let parsed: ToolKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ToolKind::Shell);
+    }
+
+    #[test]
+    fn test_tool_kind_default_is_shell() {
+        assert_eq!(ToolKind::default(), ToolKind::Shell);
     }
 
     // ── DriftKind ───────────────────────────────────────────────────────
@@ -846,6 +891,8 @@ mod tests {
         assert_eq!(snap.author, author);
         assert!(!snap.is_collapsed());
         assert!(snap.is_root());
+        assert!(!snap.is_shell());
+        assert!(snap.tool_kind.is_none());
     }
 
     #[test]
@@ -863,20 +910,72 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_tool_call() {
+    fn test_block_snapshot_mcp_tool_call() {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 3);
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let snap = BlockSnapshot::tool_call(id.clone(), None, "read_file", input.clone(), author);
+        let snap = BlockSnapshot::tool_call(
+            id.clone(),
+            None,
+            ToolKind::Mcp,
+            "read_file",
+            input.clone(),
+            Role::Model,
+            author,
+        );
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
         assert_eq!(snap.status, Status::Running);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Mcp));
         assert_eq!(snap.tool_name, Some("read_file".to_string()));
-        assert_eq!(
-            snap.tool_input,
-            Some(serde_json::to_string_pretty(&input).unwrap())
+        assert_eq!(snap.role, Role::Model);
+        assert!(!snap.is_shell());
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_call_by_user() {
+        // User typed "ls -la" in kaish — this is a ToolCall with Shell kind
+        let ctx = test_context();
+        let user = test_agent();
+        let id = BlockId::new(ctx, user, 1);
+        let input = serde_json::json!({"command": "ls -la"});
+        let snap = BlockSnapshot::tool_call(
+            id.clone(),
+            None,
+            ToolKind::Shell,
+            "shell",
+            input,
+            Role::User,
+            user,
         );
+
+        assert_eq!(snap.kind, BlockKind::ToolCall);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
+        assert_eq!(snap.role, Role::User);
+        assert!(snap.is_shell());
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_call_by_model() {
+        // Model requested shell execution — same ToolKind, different Role
+        let ctx = test_context();
+        let model = test_agent();
+        let id = BlockId::new(ctx, model, 1);
+        let input = serde_json::json!({"command": "cargo build"});
+        let snap = BlockSnapshot::tool_call(
+            id.clone(),
+            None,
+            ToolKind::Shell,
+            "shell",
+            input,
+            Role::Model,
+            model,
+        );
+
+        assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
+        assert_eq!(snap.role, Role::Model);
+        assert!(snap.is_shell());
     }
 
     #[test]
@@ -888,6 +987,7 @@ mod tests {
         let snap = BlockSnapshot::tool_result(
             id.clone(),
             tool_call_id.clone(),
+            ToolKind::Mcp,
             "file contents here",
             false,
             Some(0),
@@ -896,11 +996,54 @@ mod tests {
 
         assert_eq!(snap.kind, BlockKind::ToolResult);
         assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Mcp));
         assert_eq!(snap.tool_call_id, Some(tool_call_id.clone()));
         assert_eq!(snap.parent_id, Some(tool_call_id));
         assert!(!snap.is_error);
         assert_eq!(snap.exit_code, Some(0));
-        assert_eq!(snap.author, PrincipalId::system());
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_result() {
+        let ctx = test_context();
+        let cmd_id = BlockId::new(ctx, test_agent(), 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap = BlockSnapshot::tool_result(
+            id,
+            cmd_id.clone(),
+            ToolKind::Shell,
+            "total 42\ndrwxr-xr-x ...",
+            false,
+            Some(0),
+            PrincipalId::system(),
+        );
+
+        assert_eq!(snap.kind, BlockKind::ToolResult);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
+        assert!(snap.is_shell());
+        assert_eq!(snap.parent_id, Some(cmd_id));
+    }
+
+    #[test]
+    fn test_block_snapshot_shell_result_with_hint() {
+        let ctx = test_context();
+        let cmd_id = BlockId::new(ctx, test_agent(), 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap = BlockSnapshot::tool_result_with_hint(
+            id,
+            cmd_id,
+            ToolKind::Shell,
+            "output",
+            true,
+            Some(1),
+            PrincipalId::system(),
+            Some("ansi".to_string()),
+        );
+
+        assert!(snap.is_shell());
+        assert!(snap.is_error);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.display_hint, Some("ansi".to_string()));
     }
 
     #[test]
@@ -924,63 +1067,7 @@ mod tests {
         assert_eq!(snap.source_context, Some(source_ctx));
         assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
         assert_eq!(snap.drift_kind, Some(DriftKind::Push));
-    }
-
-    #[test]
-    fn test_block_snapshot_shell_command() {
-        let ctx = test_context();
-        let author = test_agent();
-        let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::shell_command(id.clone(), None, "ls -la", author);
-
-        assert_eq!(snap.kind, BlockKind::ShellCommand);
-        assert_eq!(snap.role, Role::User);
-        assert_eq!(snap.status, Status::Done);
-        assert_eq!(snap.content, "ls -la");
-    }
-
-    #[test]
-    fn test_block_snapshot_shell_output() {
-        let ctx = test_context();
-        let author = PrincipalId::system();
-        let cmd_id = BlockId::new(ctx, test_agent(), 1);
-        let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::shell_output(
-            id.clone(),
-            cmd_id.clone(),
-            "total 42\ndrwxr-xr-x ...",
-            false,
-            Some(0),
-            author,
-        );
-
-        assert_eq!(snap.kind, BlockKind::ShellOutput);
-        assert_eq!(snap.role, Role::System);
-        assert_eq!(snap.parent_id, Some(cmd_id));
-        assert!(!snap.is_error);
-        assert_eq!(snap.exit_code, Some(0));
-    }
-
-    #[test]
-    fn test_block_snapshot_shell_output_with_hint() {
-        let ctx = test_context();
-        let author = PrincipalId::system();
-        let cmd_id = BlockId::new(ctx, test_agent(), 1);
-        let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::shell_output_with_hint(
-            id,
-            cmd_id,
-            "output",
-            true,
-            Some(1),
-            author,
-            Some("ansi".to_string()),
-        );
-
-        assert_eq!(snap.kind, BlockKind::ShellOutput);
-        assert!(snap.is_error);
-        assert_eq!(snap.status, Status::Error);
-        assert_eq!(snap.display_hint, Some("ansi".to_string()));
+        assert!(!snap.is_shell());
     }
 
     #[test]
@@ -997,15 +1084,22 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_partial_eq() {
+    fn test_block_snapshot_tool_kind_serde_roundtrip() {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello", author);
-        let b = BlockSnapshot::text(id, None, Role::User, "hello", author);
-        // created_at will differ by nanoseconds, so we check field equality
-        assert_eq!(a.id, b.id);
-        assert_eq!(a.content, b.content);
-        assert_eq!(a.role, b.role);
+        let input = serde_json::json!({"cmd": "ls"});
+        let snap = BlockSnapshot::tool_call(
+            id,
+            None,
+            ToolKind::Shell,
+            "shell",
+            input,
+            Role::User,
+            author,
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_kind, Some(ToolKind::Shell));
     }
 }
