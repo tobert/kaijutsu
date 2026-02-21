@@ -512,7 +512,7 @@ impl BlockSnapshot {
         content: impl Into<String>,
     ) -> Self {
         debug_assert!(
-            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
         Self {
@@ -545,7 +545,7 @@ impl BlockSnapshot {
         content: impl Into<String>,
     ) -> Self {
         debug_assert!(
-            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
         Self {
@@ -584,7 +584,7 @@ impl BlockSnapshot {
         role: Role,
     ) -> Self {
         debug_assert!(
-            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
         let input_json = serde_json::to_string_pretty(&tool_input).unwrap_or_default();
@@ -697,7 +697,7 @@ impl BlockSnapshot {
         drift_kind: DriftKind,
     ) -> Self {
         debug_assert!(
-            parent_id.map_or(true, |p| p.context_id == id.context_id),
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
         Self {
