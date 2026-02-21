@@ -12,7 +12,46 @@
 
 use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned, Uuid};
 
-use crate::{BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, PrincipalId, Result, Role, Status, ToolKind};
+use crate::{BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, ToolKind};
+
+// =========================================================================
+// CRDT Map Key Constants
+//
+// All string keys used in the diamond-types-extended Document. Centralised
+// here to avoid typos and enable IDE rename-refactoring.
+// =========================================================================
+
+/// Root Set containing block ID keys.
+const KEY_BLOCKS: &str = "blocks";
+/// Prefix for per-block Map keys: `"block:{block_key}"`.
+const PREFIX_BLOCK: &str = "block:";
+/// Prefix for ordering keys: `"order:{block_key}"`.
+const PREFIX_ORDER: &str = "order:";
+
+// Block metadata fields (inside `block:{id}` maps)
+const KEY_KIND: &str = "kind";
+const KEY_ROLE: &str = "role";
+const KEY_STATUS: &str = "status";
+const KEY_CONTENT: &str = "content";
+const KEY_CONTENT_FINAL: &str = "content_final";
+const KEY_COLLAPSED: &str = "collapsed";
+const KEY_COMPACTED: &str = "compacted";
+const KEY_CREATED_AT: &str = "created_at";
+const KEY_PARENT_ID: &str = "parent_id";
+
+// Tool-specific fields
+const KEY_TOOL_KIND: &str = "tool_kind";
+const KEY_TOOL_NAME: &str = "tool_name";
+const KEY_TOOL_INPUT: &str = "tool_input";
+const KEY_TOOL_CALL_ID: &str = "tool_call_id";
+const KEY_EXIT_CODE: &str = "exit_code";
+const KEY_IS_ERROR: &str = "is_error";
+const KEY_DISPLAY_HINT: &str = "display_hint";
+
+// Drift-specific fields
+const KEY_SOURCE_CONTEXT: &str = "source_context";
+const KEY_SOURCE_MODEL: &str = "source_model";
+const KEY_DRIFT_KIND: &str = "drift_kind";
 
 /// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
 /// Lexicographically ordered: '0' < '9' < 'A' < 'Z' < 'a' < 'z'.
@@ -64,6 +103,14 @@ fn order_midpoint(a: &str, b: &str) -> String {
 
 /// Block document backed by diamond-types-extended Document.
 ///
+/// # Single-Writer-Per-Replica Model
+///
+/// Each `BlockDocument` instance is owned by one agent (identified by
+/// `agent_id`). All new blocks created via [`insert_block`], [`insert_tool_call`],
+/// etc. are stamped with this agent's `PrincipalId`. Multi-agent collaboration
+/// happens through CRDT sync — each agent maintains its own `BlockDocument`
+/// instance with a distinct `agent_id`, and operations merge via `merge_ops`.
+///
 /// # Document Structure
 ///
 /// ```text
@@ -76,6 +123,7 @@ fn order_midpoint(a: &str, b: &str) -> String {
 ///     ├── status (Str)              # pending/running/done/error (LWW)
 ///     ├── kind (Str)                # text/thinking/tool_call/tool_result
 ///     ├── content (Text)            # Streamable via Text CRDT
+///     ├── content_final (Str)       # LWW register (sealed via promote_to_register)
 ///     ├── collapsed (Bool)          # LWW - toggleable
 ///     ├── created_at (I64)
 ///     │
@@ -124,7 +172,7 @@ impl BlockDocument {
 
         // Create the blocks Set at ROOT["blocks"]
         doc.transact(agent, |tx| {
-            tx.root().create_set("blocks");
+            tx.root().create_set(KEY_BLOCKS);
         });
 
         Self {
@@ -177,7 +225,7 @@ impl BlockDocument {
 
     /// Get the number of blocks.
     pub fn block_count(&self) -> usize {
-        self.doc.get_set(&["blocks"])
+        self.doc.get_set(&[KEY_BLOCKS])
             .map(|s| s.len())
             .unwrap_or(0)
     }
@@ -190,7 +238,7 @@ impl BlockDocument {
     /// Get block IDs in document order.
     pub fn block_ids_ordered(&self) -> Vec<BlockId> {
         // Get all block IDs from the Set
-        let Some(blocks_set) = self.doc.get_set(&["blocks"]) else {
+        let Some(blocks_set) = self.doc.get_set(&[KEY_BLOCKS]) else {
             return Vec::new();
         };
 
@@ -210,7 +258,7 @@ impl BlockDocument {
             .into_iter()
             .filter_map(|key| {
                 let block_id = BlockId::from_key(&key)?;
-                let order_key = format!("order:{}", key);
+                let order_key = format!("{PREFIX_ORDER}{key}");
 
                 let order_val = self.doc.root().get(&order_key)
                     .and_then(|v| {
@@ -245,109 +293,111 @@ impl BlockDocument {
 
     /// Get a block snapshot by ID.
     pub fn get_block_snapshot(&self, id: &BlockId) -> Option<BlockSnapshot> {
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
         let block_map = self.doc.get_map(&[&block_key])?;
 
-        // Extract fields from the block map
-        let kind_str = block_map.get("kind")
+        // Extract fields from the block map.
+        // Fall back to Text/System for unknown values rather than dropping
+        // the block entirely — keeps blocks visible in UI and DAG.
+        let kind_str = block_map.get(KEY_KIND)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let kind = match &kind_str {
             Some(s) => match BlockKind::from_str(s) {
                 Some(k) => k,
                 None => {
-                    tracing::warn!("block {} has unparseable kind {:?}, skipping", id.to_key(), s);
-                    return None;
+                    tracing::warn!("block {} has unparseable kind {:?}, falling back to Text", id.to_key(), s);
+                    BlockKind::Text
                 }
             },
             None => {
-                tracing::warn!("block {} missing 'kind' field, skipping", id.to_key());
-                return None;
+                tracing::warn!("block {} missing 'kind' field, falling back to Text", id.to_key());
+                BlockKind::Text
             }
         };
 
-        let role_str = block_map.get("role")
+        let role_str = block_map.get(KEY_ROLE)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let role = match &role_str {
             Some(s) => match Role::from_str(s) {
                 Some(r) => r,
                 None => {
-                    tracing::warn!("block {} has unparseable role {:?}, skipping", id.to_key(), s);
-                    return None;
+                    tracing::warn!("block {} has unparseable role {:?}, falling back to System", id.to_key(), s);
+                    Role::System
                 }
             },
             None => {
-                tracing::warn!("block {} missing 'role' field, skipping", id.to_key());
-                return None;
+                tracing::warn!("block {} missing 'role' field, falling back to System", id.to_key());
+                Role::System
             }
         };
 
-        let status_str = block_map.get("status")
+        let status_str = block_map.get(KEY_STATUS)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "done".to_string());
         let status = Status::from_str(&status_str).unwrap_or(Status::Done);
 
-        let created_at = block_map.get("created_at")
+        let created_at = block_map.get(KEY_CREATED_AT)
             .and_then(|v| v.as_int())
             .map(|n| n as u64)
             .unwrap_or(0);
 
         // Prefer content_final (LWW register, 1 LV) over content (Text CRDT, 1 LV/char)
-        let content = block_map.get("content_final")
+        let content = block_map.get(KEY_CONTENT_FINAL)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| {
-                block_map.get_text("content")
+                block_map.get_text(KEY_CONTENT)
                     .map(|t| t.content())
                     .unwrap_or_default()
             });
 
-        let collapsed = block_map.get("collapsed")
+        let collapsed = block_map.get(KEY_COLLAPSED)
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let compacted = block_map.get("compacted")
+        let compacted = block_map.get(KEY_COMPACTED)
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let parent_id = block_map.get("parent_id")
+        let parent_id = block_map.get(KEY_PARENT_ID)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| BlockId::from_key(&s));
 
         // Tool-specific fields
-        let tool_kind = block_map.get("tool_kind")
+        let tool_kind = block_map.get(KEY_TOOL_KIND)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| ToolKind::from_str(&s));
 
-        let tool_name = block_map.get("tool_name")
+        let tool_name = block_map.get(KEY_TOOL_NAME)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-        let tool_input = block_map.get_text("tool_input")
+        let tool_input = block_map.get_text(KEY_TOOL_INPUT)
             .map(|t| t.content())
             .filter(|s| !s.is_empty());
 
-        let tool_call_id = block_map.get("tool_call_id")
+        let tool_call_id = block_map.get(KEY_TOOL_CALL_ID)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| BlockId::from_key(&s));
 
-        let exit_code = block_map.get("exit_code")
+        let exit_code = block_map.get(KEY_EXIT_CODE)
             .and_then(|v| v.as_int())
             .map(|n| n as i32);
 
-        let is_error = block_map.get("is_error")
+        let is_error = block_map.get(KEY_IS_ERROR)
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let display_hint = block_map.get("display_hint")
+        let display_hint = block_map.get(KEY_DISPLAY_HINT)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         // Drift-specific fields
-        let source_context = block_map.get("source_context")
+        let source_context = block_map.get(KEY_SOURCE_CONTEXT)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| ContextId::parse(&s).ok());
 
-        let source_model = block_map.get("source_model")
+        let source_model = block_map.get(KEY_SOURCE_MODEL)
             .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-        let drift_kind = block_map.get("drift_kind")
+        let drift_kind = block_map.get(KEY_DRIFT_KIND)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| crate::DriftKind::from_str(&s));
 
@@ -397,11 +447,17 @@ impl BlockDocument {
     }
 
     /// Get ancestors of a block (walk up the parent chain).
+    ///
+    /// Circuit-breaks at `MAX_DAG_DEPTH` to prevent runaway traversal.
     pub fn get_ancestors(&self, id: &BlockId) -> Vec<BlockId> {
         let mut ancestors = Vec::new();
         let mut current = self.get_block_snapshot(id);
 
         while let Some(block) = current {
+            if ancestors.len() >= MAX_DAG_DEPTH {
+                tracing::warn!("get_ancestors() hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), truncating");
+                break;
+            }
             if let Some(parent_id) = block.parent_id {
                 ancestors.push(parent_id);
                 current = self.get_block_snapshot(&parent_id);
@@ -503,7 +559,7 @@ impl BlockDocument {
 
     /// Check if a block exists in the Set.
     fn block_exists(&self, key: &str) -> bool {
-        self.doc.get_set(&["blocks"])
+        self.doc.get_set(&[KEY_BLOCKS])
             .map(|s| s.contains_str(key))
             .unwrap_or(false)
     }
@@ -629,10 +685,53 @@ impl BlockDocument {
         Ok(id)
     }
 
+    /// Insert a drift block with locally-generated ID.
+    ///
+    /// Preferred over `insert_from_snapshot` with a nil-context_id sentinel.
+    /// Generates the BlockId internally (using this document's context + agent),
+    /// so callers don't need to construct placeholder IDs.
+    pub fn insert_drift_block(
+        &mut self,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        content: impl Into<String>,
+        source_context: ContextId,
+        source_model: Option<String>,
+        drift_kind: crate::DriftKind,
+    ) -> Result<BlockId> {
+        let id = self.new_block_id();
+
+        self.insert_block_with_id(
+            id,
+            parent_id,
+            after,
+            Role::System,
+            BlockKind::Drift,
+            content.into(),
+            None, // tool_kind
+            None, // tool_name
+            None, // tool_input
+            None, // tool_call_id
+            None, // exit_code
+            false, // is_error
+            false, // compacted
+            None, // display_hint
+            Some(source_context),
+            source_model,
+            Some(drift_kind),
+        )?;
+
+        Ok(id)
+    }
+
     /// Insert a block from a complete snapshot (for remote sync).
     ///
     /// This is used when receiving blocks from the server via block events.
     /// The snapshot contains all fields including the pre-assigned block ID.
+    ///
+    /// **Deprecation note:** Passing a snapshot with a nil `context_id` as a
+    /// sentinel for "generate an ID locally" still works but is deprecated.
+    /// Use [`insert_drift_block`] instead for drift blocks.
     pub fn insert_from_snapshot(
         &mut self,
         snapshot: BlockSnapshot,
@@ -641,6 +740,10 @@ impl BlockDocument {
         // Generate a local ID if the snapshot has a placeholder (nil context_id).
         // This happens for drift blocks built by DriftRouter::build_drift_block().
         let block_id = if snapshot.id.context_id.is_nil() {
+            tracing::warn!(
+                "insert_from_snapshot called with nil context_id — \
+                 this is deprecated, use insert_drift_block() instead"
+            );
             self.new_block_id()
         } else {
             // Update next_seq if needed to avoid collisions with remote IDs
@@ -726,12 +829,12 @@ impl BlockDocument {
             .unwrap_or(0);
 
         // All mutations in a single transaction
-        let block_map_key = format!("block:{}", block_key);
-        let order_key = format!("order:{}", block_key);
+        let block_map_key = format!("{PREFIX_BLOCK}{block_key}");
+        let order_key = format!("{PREFIX_ORDER}{block_key}");
 
         self.doc.transact(self.agent, |tx| {
             // Add block ID to the blocks Set
-            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+            if let Some(mut blocks_set) = tx.get_set_mut(&[KEY_BLOCKS]) {
                 blocks_set.add_str(&block_key);
             }
 
@@ -745,65 +848,65 @@ impl BlockDocument {
                 let mut block_map = tx.map_by_id(block_map_id);
 
                 // Store block metadata (no author — derived from id.agent_id)
-                block_map.set("created_at", created_at);
-                block_map.set("kind", kind.as_str());
-                block_map.set("role", role.as_str());
-                block_map.set("status", Status::Done.as_str());
-                block_map.set("collapsed", false);
+                block_map.set(KEY_CREATED_AT, created_at);
+                block_map.set(KEY_KIND, kind.as_str());
+                block_map.set(KEY_ROLE, role.as_str());
+                block_map.set(KEY_STATUS, Status::Done.as_str());
+                block_map.set(KEY_COLLAPSED, false);
 
                 // Store compacted flag (only when true)
                 if compacted {
-                    block_map.set("compacted", true);
+                    block_map.set(KEY_COMPACTED, true);
                 }
 
                 // Store parent_id if present
                 if let Some(parent) = parent_id {
-                    block_map.set("parent_id", parent.to_key().as_str());
+                    block_map.set(KEY_PARENT_ID, parent.to_key().as_str());
                 }
 
                 // Create text CRDTs
-                let text_id = block_map.create_text("content");
+                let text_id = block_map.create_text(KEY_CONTENT);
 
                 // Tool-specific fields
                 if let Some(ref tk) = tool_kind {
-                    block_map.set("tool_kind", tk.as_str());
+                    block_map.set(KEY_TOOL_KIND, tk.as_str());
                 }
 
                 if let Some(ref name) = tool_name {
-                    block_map.set("tool_name", name.as_str());
+                    block_map.set(KEY_TOOL_NAME, name.as_str());
                 }
 
                 let tool_input_id = if tool_input.is_some() {
-                    Some(block_map.create_text("tool_input"))
+                    Some(block_map.create_text(KEY_TOOL_INPUT))
                 } else {
                     None
                 };
 
                 if let Some(ref tcid) = tool_call_id {
-                    block_map.set("tool_call_id", tcid.to_key().as_str());
+                    block_map.set(KEY_TOOL_CALL_ID, tcid.to_key().as_str());
                 }
 
                 if let Some(code) = exit_code {
-                    block_map.set("exit_code", code as i64);
+                    block_map.set(KEY_EXIT_CODE, code as i64);
                 }
 
                 if is_error {
-                    block_map.set("is_error", true);
+                    block_map.set(KEY_IS_ERROR, true);
                 }
 
                 if let Some(ref hint) = display_hint {
-                    block_map.set("display_hint", hint.as_str());
+                    block_map.set(KEY_DISPLAY_HINT, hint.as_str());
                 }
 
                 // Drift-specific fields
                 if let Some(ctx) = source_context {
-                    block_map.set("source_context", ctx.to_hex().as_str());
+                    block_map.set(KEY_SOURCE_CONTEXT, ctx.to_hex().as_str());
                 }
                 if let Some(ref model) = source_model {
-                    block_map.set("source_model", model.as_str());
+                    block_map.set(KEY_SOURCE_MODEL, model.as_str());
                 }
                 if let Some(ref dk) = drift_kind {
-                    block_map.set("drift_kind", dk.as_str());
+                    block_map.set(KEY_DRIFT_KIND, dk.as_str());
                 }
 
                 (text_id, tool_input_id)
@@ -836,11 +939,11 @@ impl BlockDocument {
         let _snapshot = self.get_block_snapshot(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
 
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
         self.doc.transact(self.agent, |tx| {
             if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                block_map.set("status", status.as_str());
+                block_map.set(KEY_STATUS, status.as_str());
             }
         });
 
@@ -848,22 +951,30 @@ impl BlockDocument {
         Ok(())
     }
 
-    /// Promote a block's content from Text CRDT to an LWW register.
+    /// Promote a block's content from Text CRDT to an LWW register ("seal" it).
     ///
     /// Reads the current Text CRDT content and writes it as a `content_final`
     /// map key (LWW string via `map.set()`). This consumes 1 LV total instead
     /// of 1 LV per character, significantly reducing oplog size for finalized blocks.
     ///
+    /// # Sealing behavior
+    ///
+    /// Once promoted, `get_block_snapshot` prefers `content_final` over the
+    /// Text CRDT `content`. This means concurrent Text CRDT edits arriving
+    /// after promotion become invisible — the register value wins. This is
+    /// intentional: promotion should only happen on finalized blocks (Done/Error)
+    /// where further text edits are not expected.
+    ///
     /// Should be called when a block transitions to Done or Error status.
     /// Idempotent — re-promoting overwrites with the same content.
     pub fn promote_to_register(&mut self, id: &BlockId) -> Result<()> {
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
         // Read current text content
         let content = {
             let block_map = self.doc.get_map(&[&block_key])
                 .ok_or(CrdtError::BlockNotFound(*id))?;
-            block_map.get_text("content")
+            block_map.get_text(KEY_CONTENT)
                 .map(|t| t.content())
                 .unwrap_or_default()
         };
@@ -871,7 +982,7 @@ impl BlockDocument {
         // Write as LWW register
         self.doc.transact(self.agent, |tx| {
             if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                block_map.set("content_final", content.as_str());
+                block_map.set(KEY_CONTENT_FINAL, content.as_str());
             }
         });
 
@@ -887,12 +998,12 @@ impl BlockDocument {
         let _snapshot = self.get_block_snapshot(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
 
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
         if let Some(h) = hint {
             self.doc.transact(self.agent, |tx| {
                 if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                    block_map.set("display_hint", h);
+                    block_map.set(KEY_DISPLAY_HINT, h);
                 }
             });
         }
@@ -913,7 +1024,7 @@ impl BlockDocument {
 
         // Remove from blocks Set
         self.doc.transact(self.agent, |tx| {
-            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+            if let Some(mut blocks_set) = tx.get_set_mut(&[KEY_BLOCKS]) {
                 blocks_set.remove_str(&block_key);
             }
         });
@@ -946,7 +1057,7 @@ impl BlockDocument {
         let snapshot = self.get_block_snapshot(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
 
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
         // Validate position
         let len = snapshot.content.chars().count();
@@ -962,7 +1073,7 @@ impl BlockDocument {
 
         // Apply operations
         self.doc.transact(self.agent, |tx| {
-            if let Some(mut text) = tx.get_text_mut(&[&block_key, "content"]) {
+            if let Some(mut text) = tx.get_text_mut(&[&block_key, KEY_CONTENT]) {
                 if delete > 0 {
                     text.delete(pos..pos + delete);
                 }
@@ -997,11 +1108,11 @@ impl BlockDocument {
             return Err(CrdtError::UnsupportedOperation(*id));
         }
 
-        let block_key = format!("block:{}", id.to_key());
+        let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
         self.doc.transact(self.agent, |tx| {
             if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                block_map.set("collapsed", collapsed);
+                block_map.set(KEY_COLLAPSED, collapsed);
             }
         });
 
@@ -1032,7 +1143,7 @@ impl BlockDocument {
         let order_val = self.calc_order_key(after);
 
         // Update order key
-        let order_key = format!("order:{}", block_key);
+        let order_key = format!("{PREFIX_ORDER}{block_key}");
         self.doc.transact(self.agent, |tx| {
             tx.root().set(&order_key, order_val.as_str());
         });
@@ -1095,7 +1206,7 @@ impl BlockDocument {
     fn refresh_after_merge(&mut self) {
         // Collect keys first, then drop the Set iterator before any further queries.
         // Same defensive pattern as block_ids_ordered() — avoids re-entrant lock.
-        if let Some(blocks_set) = self.doc.get_set(&["blocks"]) {
+        if let Some(blocks_set) = self.doc.get_set(&[KEY_BLOCKS]) {
             let keys: Vec<String> = blocks_set
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -1126,70 +1237,48 @@ impl BlockDocument {
     /// Fork the document, creating a copy with a new context ID.
     ///
     /// All blocks and their content are copied to the new document.
-    /// The new document gets a fresh agent ID for future edits.
+    /// The new document gets a fresh agent ID for future edits, but
+    /// existing blocks preserve their original authorship (agent_id + seq).
+    /// Only the context_id changes — a conversation between Alice and Claude
+    /// forked by Charlie still shows Alice and Claude as the authors.
     pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
-        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
-
-        // Copy all blocks in order
-        let blocks = self.blocks_ordered();
-        let mut id_mapping: std::collections::HashMap<BlockId, BlockId> = std::collections::HashMap::new();
-        let mut last_id: Option<BlockId> = None;
-
-        for block in blocks {
-            let new_id = forked.new_block_id();
-            id_mapping.insert(block.id, new_id);
-
-            let new_parent_id = block.parent_id
-                .and_then(|old_pid| id_mapping.get(&old_pid).copied());
-            let new_tool_call_id = block.tool_call_id
-                .and_then(|old_tcid| id_mapping.get(&old_tcid).copied());
-
-            let _ = forked.insert_block_with_id(
-                new_id,
-                new_parent_id.as_ref(),
-                last_id.as_ref(),
-                block.role,
-                block.kind,
-                block.content,
-                block.tool_kind,
-                block.tool_name,
-                block.tool_input,
-                new_tool_call_id,
-                block.exit_code,
-                block.is_error,
-                block.compacted,
-                block.display_hint,
-                block.source_context,
-                block.source_model,
-                block.drift_kind,
-            );
-
-            last_id = Some(new_id);
-        }
-
-        forked
+        Self::fork_blocks(new_context_id, new_agent_id, self.blocks_ordered())
     }
 
     /// Fork the document at a specific version, excluding blocks created after that version.
+    ///
+    /// Preserves original authorship — see [`fork`] for details.
     pub fn fork_at_version(&self, new_context_id: ContextId, new_agent_id: PrincipalId, at_version: u64) -> Self {
-        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
-
         let blocks: Vec<_> = self.blocks_ordered()
             .into_iter()
             .filter(|b| b.created_at <= at_version)
             .collect();
+        Self::fork_blocks(new_context_id, new_agent_id, blocks)
+    }
 
-        let mut id_mapping: std::collections::HashMap<BlockId, BlockId> = std::collections::HashMap::new();
+    /// Internal: copy blocks into a new document, preserving original authorship.
+    ///
+    /// Only context_id changes in each BlockId. Original agent_id and seq are
+    /// preserved so authorship attribution survives forking.
+    fn fork_blocks(new_context_id: ContextId, new_agent_id: PrincipalId, blocks: Vec<BlockSnapshot>) -> Self {
+        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
+
         let mut last_id: Option<BlockId> = None;
 
         for block in blocks {
-            let new_id = forked.new_block_id();
-            id_mapping.insert(block.id, new_id);
+            // Preserve original agent_id + seq, only change context_id
+            let new_id = BlockId::new(new_context_id, block.id.agent_id, block.id.seq);
 
+            // Remap references: same transform (only context_id changes)
             let new_parent_id = block.parent_id
-                .and_then(|old_pid| id_mapping.get(&old_pid).copied());
+                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
             let new_tool_call_id = block.tool_call_id
-                .and_then(|old_tcid| id_mapping.get(&old_tcid).copied());
+                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+
+            // Track max seq per agent to avoid future ID collisions
+            if block.id.agent_id == new_agent_id {
+                forked.next_seq = forked.next_seq.max(block.id.seq + 1);
+            }
 
             let _ = forked.insert_block_with_id(
                 new_id,
@@ -1241,7 +1330,7 @@ impl BlockDocument {
         doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;
 
-        if doc.get_set(&["blocks"]).is_none() {
+        if doc.get_set(&[KEY_BLOCKS]).is_none() {
             return Err(CrdtError::Internal(
                 "oplog missing 'blocks' Set at root".into(),
             ));
@@ -1252,7 +1341,7 @@ impl BlockDocument {
 
         // Calculate next_seq from existing blocks (avoid ID collisions).
         let mut next_seq = 0u64;
-        if let Some(blocks_set) = doc.get_set(&["blocks"]) {
+        if let Some(blocks_set) = doc.get_set(&[KEY_BLOCKS]) {
             let keys: Vec<String> = blocks_set
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -1268,7 +1357,7 @@ impl BlockDocument {
             }
         }
 
-        let block_count = doc.get_set(&["blocks"]).map(|s| s.len()).unwrap_or(0);
+        let block_count = doc.get_set(&[KEY_BLOCKS]).map(|s| s.len()).unwrap_or(0);
         let version = if block_count > 0 { block_count as u64 } else { 0 };
 
         Ok(Self {
@@ -1351,10 +1440,10 @@ impl BlockDocument {
 
         // Write content_final registers for finalized blocks (1 LV each vs 1 LV/char)
         for (id, content) in finalized_content {
-            let block_key = format!("block:{}", id.to_key());
+            let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
             doc.doc.transact(doc.agent, |tx| {
                 if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                    block_map.set("content_final", content.as_str());
+                    block_map.set(KEY_CONTENT_FINAL, content.as_str());
                 }
             });
         }
@@ -1721,6 +1810,7 @@ mod tests {
     #[test]
     fn test_fork_document() {
         let mut original = test_doc();
+        let original_agent = original.agent_id();
 
         let user_msg = original.insert_block(
             None, None, Role::User, BlockKind::Text, "Hello Claude!",
@@ -1749,6 +1839,10 @@ mod tests {
         assert_eq!(forked_blocks[0].id.context_id, fork_ctx);
         assert_eq!(forked_blocks[1].id.context_id, fork_ctx);
 
+        // Authorship preserved — agent_id is original author, NOT the forker
+        assert_eq!(forked_blocks[0].id.agent_id, original_agent);
+        assert_eq!(forked_blocks[1].id.agent_id, original_agent);
+
         // Parent-child preserved with new IDs
         assert!(forked_blocks[0].parent_id.is_none());
         assert!(forked_blocks[1].parent_id.is_some());
@@ -1769,6 +1863,37 @@ mod tests {
 
         let original_content = original.get_block_snapshot(&user_msg).unwrap().content;
         assert_eq!(original_content, "Hello Claude!");
+    }
+
+    #[test]
+    fn test_fork_preserves_multi_author_authorship() {
+        // Simulate Alice and Claude in same document, forked by Charlie
+        let ctx = ContextId::new();
+        let alice = PrincipalId::new();
+        let mut doc = BlockDocument::new(ctx, alice);
+
+        let alice_msg = doc.insert_block(
+            None, None, Role::User, BlockKind::Text, "Alice here",
+        ).unwrap();
+        assert_eq!(alice_msg.agent_id, alice);
+
+        // Simulate Claude's block by using insert_from_snapshot with a different agent
+        let claude = PrincipalId::new();
+        let claude_block_id = BlockId::new(ctx, claude, 0);
+        let claude_snap = BlockSnapshot::text(claude_block_id, Some(alice_msg), Role::Model, "Claude here");
+        doc.insert_from_snapshot(claude_snap, Some(&alice_msg)).unwrap();
+
+        // Charlie forks — should preserve both Alice and Claude as authors
+        let fork_ctx = ContextId::new();
+        let charlie = PrincipalId::new();
+        let forked = doc.fork(fork_ctx, charlie);
+
+        let blocks = forked.blocks_ordered();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].id.agent_id, alice, "Alice's authorship must survive fork");
+        assert_eq!(blocks[1].id.agent_id, claude, "Claude's authorship must survive fork");
+        assert_eq!(blocks[0].id.context_id, fork_ctx);
+        assert_eq!(blocks[1].id.context_id, fork_ctx);
     }
 
     #[test]
@@ -1830,6 +1955,33 @@ mod tests {
         let blocks = doc.blocks_ordered();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Drift);
+    }
+
+    #[test]
+    fn test_insert_drift_block() {
+        let mut doc = test_doc();
+        let source_ctx = ContextId::new();
+
+        let id = doc.insert_drift_block(
+            None,
+            None,
+            "Found a race condition in CAS merge path",
+            source_ctx,
+            Some("claude-opus-4-6".to_string()),
+            crate::DriftKind::Push,
+        ).unwrap();
+
+        let snap = doc.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.kind, BlockKind::Drift);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.source_context, Some(source_ctx));
+        assert_eq!(snap.source_model, Some("claude-opus-4-6".to_string()));
+        assert_eq!(snap.drift_kind, Some(crate::DriftKind::Push));
+        assert_eq!(snap.content, "Found a race condition in CAS merge path");
+
+        // ID should belong to this document's context
+        assert_eq!(snap.id.context_id, doc.context_id());
+        assert_eq!(snap.id.agent_id, doc.agent_id());
     }
 
     #[test]
@@ -1919,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_block_snapshot_missing_kind() {
+    fn test_get_block_snapshot_missing_kind_falls_back_to_text() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
         let mut doc = BlockDocument::new(ctx, agent);
@@ -1928,11 +2080,11 @@ mod tests {
         let block_id = BlockId::new(ctx, agent, 0);
         let block_key = block_id.to_key();
         doc.doc.transact(doc.agent, |tx| {
-            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+            if let Some(mut blocks_set) = tx.get_set_mut(&[KEY_BLOCKS]) {
                 blocks_set.add_str(&block_key);
             }
-            tx.root().set(&format!("order:{}", block_key), "V");
-            let map_id = tx.root().create_map(&format!("block:{}", block_key));
+            tx.root().set(&format!("{PREFIX_ORDER}{block_key}"), "V");
+            let map_id = tx.root().create_map(&format!("{PREFIX_BLOCK}{block_key}"));
             let mut block_map = tx.map_by_id(map_id);
             block_map.set("role", "human");
             block_map.set("status", "done");
@@ -1940,13 +2092,14 @@ mod tests {
         });
         doc.next_seq = 1;
 
-        assert!(doc.get_block_snapshot(&block_id).is_none(),
-            "Block missing 'kind' should return None");
-        assert_eq!(doc.blocks_ordered().len(), 0);
+        let snap = doc.get_block_snapshot(&block_id)
+            .expect("Block missing 'kind' should fall back to Text, not None");
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(doc.blocks_ordered().len(), 1);
     }
 
     #[test]
-    fn test_get_block_snapshot_missing_role() {
+    fn test_get_block_snapshot_missing_role_falls_back_to_system() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
         let mut doc = BlockDocument::new(ctx, agent);
@@ -1954,11 +2107,11 @@ mod tests {
         let block_id = BlockId::new(ctx, agent, 0);
         let block_key = block_id.to_key();
         doc.doc.transact(doc.agent, |tx| {
-            if let Some(mut blocks_set) = tx.get_set_mut(&["blocks"]) {
+            if let Some(mut blocks_set) = tx.get_set_mut(&[KEY_BLOCKS]) {
                 blocks_set.add_str(&block_key);
             }
-            tx.root().set(&format!("order:{}", block_key), "V");
-            let map_id = tx.root().create_map(&format!("block:{}", block_key));
+            tx.root().set(&format!("{PREFIX_ORDER}{block_key}"), "V");
+            let map_id = tx.root().create_map(&format!("{PREFIX_BLOCK}{block_key}"));
             let mut block_map = tx.map_by_id(map_id);
             block_map.set("kind", "text");
             block_map.set("status", "done");
@@ -1966,8 +2119,37 @@ mod tests {
         });
         doc.next_seq = 1;
 
-        assert!(doc.get_block_snapshot(&block_id).is_none(),
-            "Block missing 'role' should return None");
+        let snap = doc.get_block_snapshot(&block_id)
+            .expect("Block missing 'role' should fall back to System, not None");
+        assert_eq!(snap.role, Role::System);
+    }
+
+    #[test]
+    fn test_get_block_snapshot_unknown_kind_falls_back() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut doc = BlockDocument::new(ctx, agent);
+
+        let block_id = BlockId::new(ctx, agent, 0);
+        let block_key = block_id.to_key();
+        doc.doc.transact(doc.agent, |tx| {
+            if let Some(mut blocks_set) = tx.get_set_mut(&[KEY_BLOCKS]) {
+                blocks_set.add_str(&block_key);
+            }
+            tx.root().set(&format!("{PREFIX_ORDER}{block_key}"), "V");
+            let map_id = tx.root().create_map(&format!("{PREFIX_BLOCK}{block_key}"));
+            let mut block_map = tx.map_by_id(map_id);
+            block_map.set("kind", "future_kind_v2"); // unknown kind
+            block_map.set("role", "future_role_v2"); // unknown role
+            block_map.set("status", "done");
+            block_map.create_text("content");
+        });
+        doc.next_seq = 1;
+
+        let snap = doc.get_block_snapshot(&block_id)
+            .expect("Block with unknown kind/role should fall back, not vanish");
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(snap.role, Role::System);
     }
 
     #[test]

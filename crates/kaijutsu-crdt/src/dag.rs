@@ -3,9 +3,9 @@
 //! The ConversationDAG provides efficient tree traversal operations
 //! computed from the flat block list in BlockDocument.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{BlockDocument, BlockId, BlockSnapshot};
+use crate::{BlockDocument, BlockId, BlockSnapshot, MAX_DAG_DEPTH};
 
 /// Computed DAG index from CRDT data.
 ///
@@ -67,11 +67,22 @@ impl ConversationDAG {
     }
 
     /// Get all blocks in a subtree rooted at the given block.
+    ///
+    /// Circuit-breaks at `MAX_DAG_DEPTH` to prevent runaway traversal
+    /// in the presence of cycles or extremely deep trees.
     pub fn subtree(&self, root: &BlockId) -> Vec<&BlockSnapshot> {
         let mut result = Vec::new();
         let mut stack = vec![*root];
+        let mut visited = HashSet::new();
 
         while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue; // cycle detected — skip
+            }
+            if visited.len() > MAX_DAG_DEPTH {
+                tracing::warn!("subtree traversal hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), truncating");
+                break;
+            }
             if let Some(block) = self.blocks.get(&id) {
                 result.push(block);
                 if let Some(children) = self.children.get(&id) {
@@ -87,11 +98,17 @@ impl ConversationDAG {
     }
 
     /// Get the depth of a block (0 for roots).
+    ///
+    /// Circuit-breaks at `MAX_DAG_DEPTH`.
     pub fn depth(&self, id: &BlockId) -> usize {
         let mut depth = 0;
         let mut current = self.blocks.get(id);
 
         while let Some(block) = current {
+            if depth >= MAX_DAG_DEPTH {
+                tracing::warn!("depth() hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), returning capped depth");
+                break;
+            }
             if let Some(parent_id) = block.parent_id {
                 depth += 1;
                 current = self.blocks.get(&parent_id);
@@ -104,11 +121,17 @@ impl ConversationDAG {
     }
 
     /// Get ancestors of a block (from immediate parent to root).
+    ///
+    /// Circuit-breaks at `MAX_DAG_DEPTH`.
     pub fn ancestors(&self, id: &BlockId) -> Vec<&BlockSnapshot> {
         let mut result = Vec::new();
         let mut current = self.blocks.get(id);
 
         while let Some(block) = current {
+            if result.len() >= MAX_DAG_DEPTH {
+                tracing::warn!("ancestors() hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), truncating");
+                break;
+            }
             if let Some(parent_id) = block.parent_id {
                 if let Some(parent) = self.blocks.get(&parent_id) {
                     result.push(parent);
@@ -136,16 +159,20 @@ impl ConversationDAG {
 }
 
 /// Depth-first iterator over DAG blocks.
+///
+/// Tracks visited nodes to protect against cycles. Circuit-breaks at
+/// `MAX_DAG_DEPTH` total visited nodes.
 struct DfsIterator<'a> {
     dag: &'a ConversationDAG,
     stack: Vec<(usize, BlockId)>,
+    visited: HashSet<BlockId>,
 }
 
 impl<'a> DfsIterator<'a> {
     fn new(dag: &'a ConversationDAG) -> Self {
         // Push roots in reverse order to process first root first
         let stack: Vec<_> = dag.roots.iter().rev().map(|id| (0, *id)).collect();
-        Self { dag, stack }
+        Self { dag, stack, visited: HashSet::new() }
     }
 }
 
@@ -154,6 +181,13 @@ impl<'a> Iterator for DfsIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((depth, id)) = self.stack.pop() {
+            if !self.visited.insert(id) {
+                continue; // already visited (cycle)
+            }
+            if self.visited.len() > MAX_DAG_DEPTH {
+                tracing::warn!("DFS iterator hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), stopping");
+                return None;
+            }
             if let Some(block) = self.dag.blocks.get(&id) {
                 // Push children in reverse order
                 if let Some(children) = self.dag.children.get(&id) {
@@ -169,15 +203,19 @@ impl<'a> Iterator for DfsIterator<'a> {
 }
 
 /// Breadth-first iterator over DAG blocks.
+///
+/// Tracks visited nodes to protect against cycles. Circuit-breaks at
+/// `MAX_DAG_DEPTH` total visited nodes.
 struct BfsIterator<'a> {
     dag: &'a ConversationDAG,
     queue: std::collections::VecDeque<(usize, BlockId)>,
+    visited: HashSet<BlockId>,
 }
 
 impl<'a> BfsIterator<'a> {
     fn new(dag: &'a ConversationDAG) -> Self {
         let queue: std::collections::VecDeque<_> = dag.roots.iter().map(|id| (0, *id)).collect();
-        Self { dag, queue }
+        Self { dag, queue, visited: HashSet::new() }
     }
 }
 
@@ -186,6 +224,13 @@ impl<'a> Iterator for BfsIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((depth, id)) = self.queue.pop_front() {
+            if !self.visited.insert(id) {
+                continue; // already visited (cycle)
+            }
+            if self.visited.len() > MAX_DAG_DEPTH {
+                tracing::warn!("BFS iterator hit MAX_DAG_DEPTH ({MAX_DAG_DEPTH}), stopping");
+                return None;
+            }
             if let Some(block) = self.dag.blocks.get(&id) {
                 // Queue children
                 if let Some(children) = self.dag.children.get(&id) {
@@ -264,6 +309,90 @@ mod tests {
         assert_eq!(dfs[1].1.id, child1);
         assert_eq!(dfs[2].0, 2);
         assert_eq!(dfs[2].1.id, grandchild);
+    }
+
+    #[test]
+    fn test_dag_cycle_terminates() {
+        // Manually construct a DAG with a cycle to verify circuit breakers
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+
+        let id_a = BlockId::new(ctx, agent, 0);
+        let id_b = BlockId::new(ctx, agent, 1);
+
+        // A → B → A (cycle via parent_id)
+        let snap_a = BlockSnapshot {
+            id: id_a,
+            parent_id: Some(id_b), // cycle!
+            role: Role::User,
+            status: crate::Status::Done,
+            kind: BlockKind::Text,
+            content: "A".to_string(),
+            collapsed: false,
+            compacted: false,
+            created_at: 0,
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        };
+        let snap_b = BlockSnapshot {
+            id: id_b,
+            parent_id: Some(id_a), // cycle!
+            role: Role::Model,
+            status: crate::Status::Done,
+            kind: BlockKind::Text,
+            content: "B".to_string(),
+            collapsed: false,
+            compacted: false,
+            created_at: 0,
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+        };
+
+        // Build DAG manually (from_document would not create cycles)
+        let mut blocks = HashMap::new();
+        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        blocks.insert(id_a, snap_a);
+        blocks.insert(id_b, snap_b);
+        children.entry(id_b).or_default().push(id_a);
+        children.entry(id_a).or_default().push(id_b);
+
+        let dag = ConversationDAG {
+            roots: vec![id_a],
+            children,
+            blocks,
+        };
+
+        // These should all terminate, not loop forever
+        let depth = dag.depth(&id_a);
+        assert!(depth <= MAX_DAG_DEPTH, "depth should be bounded");
+
+        let ancestors = dag.ancestors(&id_a);
+        assert!(ancestors.len() <= MAX_DAG_DEPTH, "ancestors should be bounded");
+
+        let subtree = dag.subtree(&id_a);
+        assert!(subtree.len() <= MAX_DAG_DEPTH + 1, "subtree should be bounded");
+
+        let dfs: Vec<_> = dag.iter_dfs().collect();
+        assert!(dfs.len() <= MAX_DAG_DEPTH + 1, "DFS should be bounded");
+
+        let bfs: Vec<_> = dag.iter_bfs().collect();
+        assert!(bfs.len() <= MAX_DAG_DEPTH + 1, "BFS should be bounded");
     }
 
     #[test]

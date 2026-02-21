@@ -33,13 +33,13 @@ mod error;
 pub mod ids;
 mod ops;
 
-pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status, ToolKind};
+pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind};
 pub use dag::ConversationDAG;
 pub use document::{BlockDocument, DocumentSnapshot};
 pub use error::CrdtError;
 pub use ids::{
     ContextId, KernelId, PrefixError, PrefixResolvable, PrincipalId, SessionId,
-    context_id_from_document_id, context_id_recover, resolve_context_prefix,
+    resolve_context_prefix,
 };
 pub use ops::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
