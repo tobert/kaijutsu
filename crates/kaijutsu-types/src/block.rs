@@ -31,13 +31,18 @@ use crate::ids::{ContextId, PrincipalId};
 ///
 /// This ensures global uniqueness without coordination.
 /// UUIDs are hex-only, so `to_key()` / `from_key()` need no slash-escaping.
-#[derive(Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct BlockId {
     /// Context (= document) this block belongs to.
     pub context_id: ContextId,
     /// Principal that created this block.
     pub agent_id: PrincipalId,
     /// Agent-local sequence number.
+    ///
+    /// Callers must ensure monotonically increasing values per (context_id, agent_id)
+    /// pair. The types crate does not enforce this — that's BlockDocument's job.
+    /// Violations won't cause incorrect equality, but will confuse debugging
+    /// and may break compaction heuristics.
     pub seq: u64,
 }
 
@@ -545,7 +550,7 @@ impl BlockSnapshot {
     ) -> Self {
         Self {
             id,
-            parent_id: Some(tool_call_id.clone()),
+            parent_id: Some(tool_call_id),
             role: Role::Tool,
             status: if is_error { Status::Error } else { Status::Done },
             kind: BlockKind::ToolResult,
@@ -580,7 +585,7 @@ impl BlockSnapshot {
     ) -> Self {
         Self {
             id,
-            parent_id: Some(tool_call_id.clone()),
+            parent_id: Some(tool_call_id),
             role: Role::Tool,
             status: if is_error { Status::Error } else { Status::Done },
             kind: BlockKind::ToolResult,
@@ -882,8 +887,16 @@ mod tests {
         use std::collections::HashMap;
         let id = BlockId::new(test_context(), test_agent(), 1);
         let mut map = HashMap::new();
-        map.insert(id.clone(), "hello");
+        map.insert(id, "hello");
         assert_eq!(map.get(&id), Some(&"hello"));
+    }
+
+    #[test]
+    fn test_block_id_is_copy() {
+        let id = BlockId::new(test_context(), test_agent(), 1);
+        let a = id; // move
+        let b = id; // copy — would fail without Copy
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -1026,7 +1039,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::text(id.clone(), None, Role::User, "Hello!");
+        let snap = BlockSnapshot::text(id, None, Role::User, "Hello!");
 
         assert_eq!(snap.id, id);
         assert!(snap.parent_id.is_none());
@@ -1047,7 +1060,7 @@ mod tests {
         let author = test_agent();
         let id = BlockId::new(ctx, author, 2);
         let parent = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::thinking(id.clone(), Some(parent), "Let me think...");
+        let snap = BlockSnapshot::thinking(id, Some(parent), "Let me think...");
 
         assert_eq!(snap.kind, BlockKind::Thinking);
         assert_eq!(snap.role, Role::Model);
@@ -1063,11 +1076,11 @@ mod tests {
         let id = BlockId::new(ctx, author, 3);
         let input = serde_json::json!({"path": "/etc/hosts"});
         let snap = BlockSnapshot::tool_call(
-            id.clone(),
+            id,
             None,
             ToolKind::Mcp,
             "read_file",
-            input.clone(),
+            input,
             Role::Model,
         );
 
@@ -1087,7 +1100,7 @@ mod tests {
         let id = BlockId::new(ctx, user, 1);
         let input = serde_json::json!({"command": "ls -la"});
         let snap = BlockSnapshot::tool_call(
-            id.clone(),
+            id,
             None,
             ToolKind::Shell,
             "shell",
@@ -1108,7 +1121,7 @@ mod tests {
         let id = BlockId::new(ctx, model, 1);
         let input = serde_json::json!({"command": "cargo build"});
         let snap = BlockSnapshot::tool_call(
-            id.clone(),
+            id,
             None,
             ToolKind::Shell,
             "shell",
@@ -1128,8 +1141,8 @@ mod tests {
         let tool_call_id = BlockId::new(ctx, author, 3);
         let id = BlockId::new(ctx, PrincipalId::system(), 1);
         let snap = BlockSnapshot::tool_result(
-            id.clone(),
-            tool_call_id.clone(),
+            id,
+            tool_call_id,
             ToolKind::Mcp,
             "file contents here",
             false,
@@ -1139,7 +1152,7 @@ mod tests {
         assert_eq!(snap.kind, BlockKind::ToolResult);
         assert_eq!(snap.status, Status::Done);
         assert_eq!(snap.tool_kind, Some(ToolKind::Mcp));
-        assert_eq!(snap.tool_call_id, Some(tool_call_id.clone()));
+        assert_eq!(snap.tool_call_id, Some(tool_call_id));
         assert_eq!(snap.parent_id, Some(tool_call_id));
         assert_eq!(snap.author(), PrincipalId::system());
         assert!(!snap.is_error);
@@ -1153,7 +1166,7 @@ mod tests {
         let id = BlockId::new(ctx, PrincipalId::system(), 1);
         let snap = BlockSnapshot::tool_result(
             id,
-            cmd_id.clone(),
+            cmd_id,
             ToolKind::Shell,
             "total 42\ndrwxr-xr-x ...",
             false,
@@ -1194,7 +1207,7 @@ mod tests {
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
         let snap = BlockSnapshot::drift(
-            id.clone(),
+            id,
             None,
             "CAS has a race condition",
             source_ctx,
@@ -1272,7 +1285,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::Text).build();
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
 
         assert_eq!(snap.id, id);
         assert_eq!(snap.kind, BlockKind::Text);
@@ -1286,7 +1299,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolCall)
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolCall)
             .role(Role::User)
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
@@ -1347,8 +1360,8 @@ mod tests {
         let call_id = BlockId::new(ctx, author, 2);
         let source = ContextId::new();
 
-        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolResult)
-            .parent_id(parent_id.clone())
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolResult)
+            .parent_id(parent_id)
             .role(Role::Tool)
             .status(Status::Error)
             .content("error output")
@@ -1356,7 +1369,7 @@ mod tests {
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
             .tool_input("{\"cmd\":\"ls\"}")
-            .tool_call_id(call_id.clone())
+            .tool_call_id(call_id)
             .exit_code(127)
             .is_error(true)
             .display_hint("ansi")
@@ -1390,7 +1403,7 @@ mod tests {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
-        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello");
+        let a = BlockSnapshot::text(id, None, Role::User, "hello");
         // Simulate a different timestamp
         let mut b = a.clone();
         b.created_at = a.created_at + 1000;
