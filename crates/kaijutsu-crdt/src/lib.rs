@@ -1,41 +1,50 @@
 //! Block-based CRDT document model for Kaijutsu.
 //!
-//! Uses the unified diamond-types fork with Map, Set, Register, and Text CRDTs.
-//! All CRDT operations go through a single OpLog for guaranteed convergence.
+//! # Architecture
 //!
-//! # Design Philosophy
+//! Two storage models are available:
 //!
-//! Content is structured as blocks, not flat text. This enables:
-//! - Structured streaming (thinking → text → tool_use as separate blocks)
-//! - Collapsible UI elements (thinking blocks collapse when complete)
-//! - Streamable tool blocks (ToolUse/ToolResult content via Text CRDT)
-//! - Clean paragraph-level collaboration
+//! - **`BlockStore`** (new): Per-block DTE instances. Each block owns its own
+//!   diamond-types-extended Document for content. Metadata lives in `BlockHeader`
+//!   (plain data). This is the target architecture.
+//!
+//! - **`BlockDocument`** (legacy): Single shared DTE Document with all blocks as
+//!   paths within it. Still used by downstream crates during migration.
 //!
 //! # Block Types
 //!
 //! All block types support Text CRDT for their primary content, enabling streaming:
 //!
-//! - **Thinking**: Extended reasoning with text CRDT, collapsible
-//! - **Text**: Main response text with text CRDT
-//! - **ToolUse**: Tool invocation with streamable JSON input
+//! - **Text**: Main response text
+//! - **Thinking**: Extended reasoning, collapsible
+//! - **ToolCall**: Tool invocation with streamable JSON input
 //! - **ToolResult**: Tool result with streamable content
-//!
-//! # CRDT Semantics
-//!
-//! - **Maps**: Last-Write-Wins (LWW) - most recent write wins by Lamport timestamp
-//! - **Sets**: OR-Set (add-wins) - concurrent add and remove both succeed, add wins
-//! - **Text**: Sequence CRDT - character-level merging with proper interleaving
+//! - **Drift**: Cross-context content transfer
+//! - **File**: File content tracked in a context
 
 mod block;
+mod block_store;
+pub(crate) mod content;
 mod dag;
 mod document;
 mod error;
 pub mod ids;
 mod ops;
 
-pub use block::{BlockId, BlockKind, BlockSnapshot, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind};
+// Re-export types from kaijutsu-types
+pub use block::{
+    BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, BlockHeader,
+    DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
+};
+
+// New architecture
+pub use block_store::{BlockStore, StoreSnapshot, SyncPayload};
+pub use content::BlockContent;
 pub use dag::ConversationDAG;
+
+// Legacy (still used by downstream crates)
 pub use document::{BlockDocument, DocumentSnapshot};
+
 pub use error::CrdtError;
 pub use ids::{
     ContextId, KernelId, PrefixError, PrefixResolvable, PrincipalId, SessionId,
@@ -53,6 +62,12 @@ mod tests {
     fn test_doc() -> BlockDocument {
         BlockDocument::new(ContextId::new(), PrincipalId::new())
     }
+
+    fn test_store() -> BlockStore {
+        BlockStore::new(ContextId::new(), PrincipalId::new())
+    }
+
+    // ── Legacy BlockDocument tests ──────────────────────────────────────
 
     #[test]
     fn test_document_basic_operations() {
@@ -174,5 +189,37 @@ mod tests {
             assert!(text.contains("bob"));
             assert!(text.contains("hello"));
         }
+    }
+
+    // ── New BlockStore tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_store_basic_operations() {
+        let mut store = test_store();
+
+        let block_id = store.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!").unwrap();
+        assert_eq!(store.full_text(), "Hello, world!");
+
+        store.append_text(&block_id, " How are you?").unwrap();
+        assert_eq!(store.full_text(), "Hello, world! How are you?");
+
+        store.edit_text(&block_id, 7, "CRDT", 5).unwrap();
+        assert_eq!(store.full_text(), "Hello, CRDT! How are you?");
+    }
+
+    #[test]
+    fn test_store_delete_block() {
+        let mut store = test_store();
+
+        let id1 = store.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
+        let id2 = store.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second").unwrap();
+        let _id3 = store.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third").unwrap();
+
+        assert_eq!(store.block_count(), 3);
+
+        store.delete_block(&id2).unwrap();
+
+        assert_eq!(store.block_count(), 2);
+        assert!(!store.full_text().contains("Second"));
     }
 }

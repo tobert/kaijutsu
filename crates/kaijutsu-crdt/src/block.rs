@@ -4,5 +4,6 @@
 //! and re-exported here for backward compatibility.
 
 pub use kaijutsu_types::{
-    BlockId, BlockKind, BlockSnapshot, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
+    BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder,
+    DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
 };

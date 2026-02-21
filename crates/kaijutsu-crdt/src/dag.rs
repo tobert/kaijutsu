@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BlockDocument, BlockId, BlockSnapshot, MAX_DAG_DEPTH};
+use crate::{BlockDocument, BlockId, BlockSnapshot, BlockStore, MAX_DAG_DEPTH};
 
 /// Computed DAG index from CRDT data.
 ///
@@ -22,10 +22,18 @@ pub struct ConversationDAG {
 }
 
 impl ConversationDAG {
-    /// Build a DAG from a BlockDocument.
+    /// Build a DAG from a BlockDocument (legacy).
     pub fn from_document(doc: &BlockDocument) -> Self {
-        let snapshots = doc.blocks_ordered();
+        Self::from_snapshots(doc.blocks_ordered())
+    }
 
+    /// Build a DAG from a BlockStore.
+    pub fn from_store(store: &BlockStore) -> Self {
+        Self::from_snapshots(store.blocks_ordered())
+    }
+
+    /// Build a DAG from an ordered list of block snapshots.
+    fn from_snapshots(snapshots: Vec<BlockSnapshot>) -> Self {
         let mut roots = Vec::new();
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         let mut blocks = HashMap::new();
@@ -341,6 +349,8 @@ mod tests {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         };
         let snap_b = BlockSnapshot {
             id: id_b,
@@ -362,6 +372,8 @@ mod tests {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         };
 
         // Build DAG manually (from_document would not create cycles)

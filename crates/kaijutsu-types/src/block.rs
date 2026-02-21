@@ -31,7 +31,7 @@ use crate::ids::{ContextId, PrincipalId};
 ///
 /// This ensures global uniqueness without coordination.
 /// UUIDs are hex-only, so `to_key()` / `from_key()` need no slash-escaping.
-#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BlockId {
     /// Context (= document) this block belongs to.
     pub context_id: ContextId,
@@ -130,7 +130,19 @@ pub struct BlockHeader {
     pub kind: BlockKind,
     pub status: Status,
     pub compacted: bool,
+    /// Whether this block is collapsed (mutable, LWW via `updated_at`).
+    pub collapsed: bool,
     pub created_at: u64,
+    /// Lamport timestamp for LWW conflict resolution on mutable fields
+    /// (status, collapsed). Highest `updated_at` wins, `agent_id` tiebreaks.
+    /// NOT wall-clock time — use `created_at` for human-visible timestamps.
+    pub updated_at: u64,
+    /// Which execution engine (Shell, Mcp, Builtin). Copy-safe subset of tool metadata.
+    pub tool_kind: Option<ToolKind>,
+    /// Exit code from tool execution.
+    pub exit_code: Option<i32>,
+    /// Whether this is an error result.
+    pub is_error: bool,
 }
 
 impl BlockHeader {
@@ -143,7 +155,12 @@ impl BlockHeader {
             kind: snap.kind,
             status: snap.status,
             compacted: snap.compacted,
+            collapsed: snap.collapsed,
             created_at: snap.created_at,
+            updated_at: 0, // Lamport default: no local mutations yet
+            tool_kind: snap.tool_kind,
+            exit_code: snap.exit_code,
+            is_error: snap.is_error,
         }
     }
 
@@ -182,6 +199,10 @@ pub enum Role {
     System,
     /// Tool execution context (results from tool calls).
     Tool,
+    /// Asset (not a message from anyone — a resource in the context).
+    #[serde(rename = "asset")]
+    #[strum(serialize = "asset")]
+    Asset,
 }
 
 impl Role {
@@ -200,6 +221,7 @@ impl Role {
             Role::Model => "model",
             Role::System => "system",
             Role::Tool => "tool",
+            Role::Asset => "asset",
         }
     }
 }
@@ -291,6 +313,12 @@ pub enum BlockKind {
     #[serde(rename = "drift")]
     #[strum(serialize = "drift")]
     Drift,
+    /// File content tracked in a context.
+    /// Content is the file body (DTE Text CRDT). `file_path` on BlockSnapshot
+    /// records the logical path.
+    #[serde(rename = "file")]
+    #[strum(serialize = "file")]
+    File,
 }
 
 impl BlockKind {
@@ -308,6 +336,7 @@ impl BlockKind {
             BlockKind::ToolCall => "tool_call",
             BlockKind::ToolResult => "tool_result",
             BlockKind::Drift => "drift",
+            BlockKind::File => "file",
         }
     }
 
@@ -324,6 +353,11 @@ impl BlockKind {
     /// Check if this is a drift block (cross-context transfer).
     pub fn is_drift(&self) -> bool {
         matches!(self, BlockKind::Drift)
+    }
+
+    /// Check if this is a file block.
+    pub fn is_file(&self) -> bool {
+        matches!(self, BlockKind::File)
     }
 }
 
@@ -491,6 +525,20 @@ pub struct BlockSnapshot {
     /// How this block arrived from another context (for Drift blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift_kind: Option<DriftKind>,
+
+    // File-specific fields (File)
+
+    /// Logical file path (for File blocks). Not unique — downstream resolves duplicates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+
+    // Ordering
+
+    /// Fractional index for sibling ordering (base-62 lexicographic).
+    /// Set by BlockStore on insertion. Not present on snapshots created
+    /// via named constructors (those get order_key assigned when inserted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_key: Option<String>,
 }
 
 /// Helper for `#[serde(skip_serializing_if)]` on bool fields.
@@ -535,6 +583,8 @@ impl BlockSnapshot {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         }
     }
 
@@ -568,6 +618,8 @@ impl BlockSnapshot {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         }
     }
 
@@ -608,6 +660,8 @@ impl BlockSnapshot {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         }
     }
 
@@ -644,6 +698,8 @@ impl BlockSnapshot {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         }
     }
 
@@ -684,6 +740,8 @@ impl BlockSnapshot {
             source_context: None,
             source_model: None,
             drift_kind: None,
+            file_path: None,
+            order_key: None,
         }
     }
 
@@ -720,12 +778,50 @@ impl BlockSnapshot {
             source_context: Some(source_context),
             source_model,
             drift_kind: Some(drift_kind),
+            file_path: None,
+            order_key: None,
         }
     }
 
-    /// Check if this block is collapsed (only meaningful for Thinking).
+    /// Create a new file block snapshot.
+    pub fn file(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        file_path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        debug_assert!(
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
+            "parent_id must be in same context as block"
+        );
+        Self {
+            id,
+            parent_id,
+            role: Role::Asset,
+            status: Status::Done,
+            kind: BlockKind::File,
+            content: content.into(),
+            collapsed: false,
+            compacted: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            display_hint: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: Some(file_path.into()),
+            order_key: None,
+        }
+    }
+
+    /// Check if this block is collapsed.
     pub fn is_collapsed(&self) -> bool {
-        self.collapsed && self.kind == BlockKind::Thinking
+        self.collapsed
     }
 
     /// Check if this is a root block (no parent).
@@ -766,6 +862,8 @@ impl BlockSnapshot {
             && self.source_context == other.source_context
             && self.source_model == other.source_model
             && self.drift_kind == other.drift_kind
+            && self.file_path == other.file_path
+            && self.order_key == other.order_key
     }
 }
 
@@ -817,6 +915,8 @@ impl BlockSnapshotBuilder {
                 source_context: None,
                 source_model: None,
                 drift_kind: None,
+                file_path: None,
+                order_key: None,
             },
         }
     }
@@ -901,6 +1001,16 @@ impl BlockSnapshotBuilder {
 
     pub fn drift_kind(mut self, kind: DriftKind) -> Self {
         self.snap.drift_kind = Some(kind);
+        self
+    }
+
+    pub fn file_path(mut self, path: impl Into<String>) -> Self {
+        self.snap.file_path = Some(path.into());
+        self
+    }
+
+    pub fn order_key(mut self, key: impl Into<String>) -> Self {
+        self.snap.order_key = Some(key.into());
         self
     }
 
@@ -1036,6 +1146,8 @@ mod tests {
         assert_eq!(Role::from_str("human"), Some(Role::User));
         assert_eq!(Role::from_str("assistant"), Some(Role::Model));
         assert_eq!(Role::from_str("agent"), Some(Role::Model));
+        assert_eq!(Role::from_str("asset"), Some(Role::Asset));
+        assert_eq!(Role::Asset.as_str(), "asset");
     }
 
     // ── Status ──────────────────────────────────────────────────────────
@@ -1070,6 +1182,10 @@ mod tests {
         assert!(!BlockKind::Text.is_tool());
         assert!(BlockKind::Drift.is_drift());
         assert!(!BlockKind::Text.is_drift());
+        assert_eq!(BlockKind::from_str("file"), Some(BlockKind::File));
+        assert!(BlockKind::File.is_file());
+        assert!(!BlockKind::Text.is_file());
+        assert!(BlockKind::File.has_text_crdt());
     }
 
     #[test]
@@ -1319,6 +1435,38 @@ mod tests {
     }
 
     #[test]
+    fn test_block_snapshot_file() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::file(id, None, "/etc/hosts", "127.0.0.1 localhost");
+
+        assert_eq!(snap.kind, BlockKind::File);
+        assert_eq!(snap.role, Role::Asset);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.file_path, Some("/etc/hosts".to_string()));
+        assert_eq!(snap.content, "127.0.0.1 localhost");
+        assert!(snap.is_root());
+        assert!(!snap.is_shell());
+        assert!(snap.tool_kind.is_none());
+    }
+
+    #[test]
+    fn test_block_snapshot_file_serde_roundtrip() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshot::file(id, None, "/src/main.rs", "fn main() {}");
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("file_path"));
+        assert!(json.contains("/src/main.rs"));
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.file_path, Some("/src/main.rs".to_string()));
+        assert_eq!(parsed.kind, BlockKind::File);
+        assert_eq!(parsed.role, Role::Asset);
+    }
+
+    #[test]
     fn test_block_snapshot_serde_roundtrip() {
         let ctx = test_context();
         let author = test_agent();
@@ -1553,6 +1701,25 @@ mod tests {
         assert_eq!(header.status, snap.status);
         assert_eq!(header.compacted, snap.compacted);
         assert_eq!(header.created_at, snap.created_at);
+        assert_eq!(header.updated_at, 0); // Lamport default: no local mutations
+        assert_eq!(header.tool_kind, None);
+        assert_eq!(header.exit_code, None);
+        assert!(!header.is_error);
+    }
+
+    #[test]
+    fn test_block_header_tool_fields() {
+        let ctx = test_context();
+        let author = test_agent();
+        let call_id = BlockId::new(ctx, author, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap = BlockSnapshot::tool_result(
+            id, call_id, ToolKind::Shell, "output", true, Some(127),
+        );
+        let header = BlockHeader::from_snapshot(&snap);
+        assert_eq!(header.tool_kind, Some(ToolKind::Shell));
+        assert_eq!(header.exit_code, Some(127));
+        assert!(header.is_error);
     }
 
     #[test]
