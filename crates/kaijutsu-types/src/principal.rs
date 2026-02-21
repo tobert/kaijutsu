@@ -44,6 +44,12 @@ impl Principal {
     }
 }
 
+impl std::fmt::Display for Principal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.username, self.display_name)
+    }
+}
+
 /// How a principal authenticates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,5 +142,16 @@ mod tests {
             principal_id: s.id,
         };
         assert_eq!(cred.principal_id, PrincipalId::system());
+    }
+
+    #[test]
+    fn test_principal_display() {
+        let p = Principal::new("amy", "Amy Tobey");
+        assert_eq!(p.to_string(), "amy (Amy Tobey)");
+    }
+
+    #[test]
+    fn test_principal_system_display() {
+        assert_eq!(Principal::system().to_string(), "system (System)");
     }
 }

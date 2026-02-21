@@ -108,6 +108,30 @@ macro_rules! impl_typed_id {
             }
         }
 
+        impl From<uuid::Uuid> for $T {
+            fn from(u: uuid::Uuid) -> Self {
+                Self(u)
+            }
+        }
+
+        impl From<$T> for uuid::Uuid {
+            fn from(id: $T) -> uuid::Uuid {
+                id.0
+            }
+        }
+
+        impl From<[u8; 16]> for $T {
+            fn from(b: [u8; 16]) -> Self {
+                Self::from_bytes(b)
+            }
+        }
+
+        impl From<$T> for [u8; 16] {
+            fn from(id: $T) -> [u8; 16] {
+                *id.as_bytes()
+            }
+        }
+
         impl fmt::Display for $T {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 // Full UUID with hyphens for log readability
@@ -491,5 +515,31 @@ mod tests {
         let entries = vec![(a, Some("main-1")), (b, Some("main-2"))];
         let result = resolve_context_prefix(entries.into_iter(), "main");
         assert!(matches!(result, Err(PrefixError::Ambiguous { .. })));
+    }
+
+    // ── From conversions ────────────────────────────────────────────────
+
+    #[test]
+    fn test_from_uuid() {
+        let u = uuid::Uuid::now_v7();
+        let id = ContextId::from(u);
+        let back: uuid::Uuid = id.into();
+        assert_eq!(u, back);
+    }
+
+    #[test]
+    fn test_from_bytes_array() {
+        let bytes: [u8; 16] = *ContextId::new().as_bytes();
+        let id = PrincipalId::from(bytes);
+        let back: [u8; 16] = id.into();
+        assert_eq!(bytes, back);
+    }
+
+    #[test]
+    fn test_from_conversions_preserve_identity() {
+        let original = KernelId::new();
+        let uuid: uuid::Uuid = original.into();
+        let roundtripped = KernelId::from(uuid);
+        assert_eq!(original, roundtripped);
     }
 }

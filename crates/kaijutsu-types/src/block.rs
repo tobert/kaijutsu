@@ -369,7 +369,7 @@ impl std::fmt::Display for DriftKind {
 /// - **Core**: id, parent_id, role, status, kind, content, author, created_at
 /// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, display_hint
 /// - **Drift** (Drift): drift_kind, source_context, source_model
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSnapshot {
     /// Block ID.
     pub id: BlockId,
@@ -662,6 +662,168 @@ impl BlockSnapshot {
     /// Check if this is a shell tool block (call or result with ToolKind::Shell).
     pub fn is_shell(&self) -> bool {
         self.tool_kind == Some(ToolKind::Shell) && self.kind.is_tool()
+    }
+
+    /// Compare two snapshots ignoring timestamp (`created_at`).
+    ///
+    /// Useful in tests where two independently-constructed snapshots
+    /// should be "the same" but have different creation times.
+    pub fn content_eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.parent_id == other.parent_id
+            && self.role == other.role
+            && self.status == other.status
+            && self.kind == other.kind
+            && self.content == other.content
+            && self.collapsed == other.collapsed
+            && self.author == other.author
+            && self.tool_kind == other.tool_kind
+            && self.tool_name == other.tool_name
+            && self.tool_input == other.tool_input
+            && self.tool_call_id == other.tool_call_id
+            && self.exit_code == other.exit_code
+            && self.is_error == other.is_error
+            && self.display_hint == other.display_hint
+            && self.source_context == other.source_context
+            && self.source_model == other.source_model
+            && self.drift_kind == other.drift_kind
+    }
+}
+
+/// Builder for `BlockSnapshot` — reduces boilerplate for the 20-field struct.
+///
+/// Starts with required fields (id, kind, author) and sane defaults for the rest.
+/// Chain setters for optional fields.
+///
+/// ```
+/// # use kaijutsu_types::*;
+/// let ctx = ContextId::new();
+/// let author = PrincipalId::new();
+/// let snap = BlockSnapshotBuilder::new(
+///     BlockId::new(ctx, author, 1),
+///     BlockKind::ToolCall,
+///     author,
+/// )
+///     .role(Role::User)
+///     .tool_kind(ToolKind::Shell)
+///     .tool_name("shell")
+///     .content("ls -la")
+///     .status(Status::Running)
+///     .build();
+/// ```
+pub struct BlockSnapshotBuilder {
+    snap: BlockSnapshot,
+}
+
+impl BlockSnapshotBuilder {
+    /// Start building a snapshot with the three required fields.
+    pub fn new(id: BlockId, kind: BlockKind, author: PrincipalId) -> Self {
+        Self {
+            snap: BlockSnapshot {
+                id,
+                parent_id: None,
+                role: Role::User,
+                status: Status::Done,
+                kind,
+                content: String::new(),
+                collapsed: false,
+                author,
+                created_at: BlockSnapshot::now_millis(),
+                tool_kind: None,
+                tool_name: None,
+                tool_input: None,
+                tool_call_id: None,
+                exit_code: None,
+                is_error: false,
+                display_hint: None,
+                source_context: None,
+                source_model: None,
+                drift_kind: None,
+            },
+        }
+    }
+
+    pub fn parent_id(mut self, parent_id: BlockId) -> Self {
+        self.snap.parent_id = Some(parent_id);
+        self
+    }
+
+    pub fn role(mut self, role: Role) -> Self {
+        self.snap.role = role;
+        self
+    }
+
+    pub fn status(mut self, status: Status) -> Self {
+        self.snap.status = status;
+        self
+    }
+
+    pub fn content(mut self, content: impl Into<String>) -> Self {
+        self.snap.content = content.into();
+        self
+    }
+
+    pub fn collapsed(mut self, collapsed: bool) -> Self {
+        self.snap.collapsed = collapsed;
+        self
+    }
+
+    pub fn tool_kind(mut self, tool_kind: ToolKind) -> Self {
+        self.snap.tool_kind = Some(tool_kind);
+        self
+    }
+
+    pub fn tool_name(mut self, name: impl Into<String>) -> Self {
+        self.snap.tool_name = Some(name.into());
+        self
+    }
+
+    pub fn tool_input(mut self, input: impl Into<String>) -> Self {
+        self.snap.tool_input = Some(input.into());
+        self
+    }
+
+    pub fn tool_call_id(mut self, id: BlockId) -> Self {
+        self.snap.tool_call_id = Some(id);
+        self
+    }
+
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.snap.exit_code = Some(code);
+        self
+    }
+
+    pub fn is_error(mut self, is_error: bool) -> Self {
+        self.snap.is_error = is_error;
+        if is_error {
+            self.snap.status = Status::Error;
+        }
+        self
+    }
+
+    pub fn display_hint(mut self, hint: impl Into<String>) -> Self {
+        self.snap.display_hint = Some(hint.into());
+        self
+    }
+
+    pub fn source_context(mut self, ctx: ContextId) -> Self {
+        self.snap.source_context = Some(ctx);
+        self
+    }
+
+    pub fn source_model(mut self, model: impl Into<String>) -> Self {
+        self.snap.source_model = Some(model.into());
+        self
+    }
+
+    pub fn drift_kind(mut self, kind: DriftKind) -> Self {
+        self.snap.drift_kind = Some(kind);
+        self
+    }
+
+    /// Consume the builder and return the snapshot.
+    pub fn build(self) -> BlockSnapshot {
+        self.snap
     }
 }
 
@@ -1101,5 +1263,92 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_kind, Some(ToolKind::Shell));
+    }
+
+    // ── Builder ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_builder_minimal() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::Text, author).build();
+
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(snap.author, author);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.content, "");
+    }
+
+    #[test]
+    fn test_builder_shell_tool_call() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshotBuilder::new(id.clone(), BlockKind::ToolCall, author)
+            .role(Role::User)
+            .tool_kind(ToolKind::Shell)
+            .tool_name("shell")
+            .content("ls -la")
+            .status(Status::Running)
+            .build();
+
+        assert_eq!(snap.kind, BlockKind::ToolCall);
+        assert_eq!(snap.role, Role::User);
+        assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
+        assert_eq!(snap.tool_name, Some("shell".to_string()));
+        assert_eq!(snap.content, "ls -la");
+        assert_eq!(snap.status, Status::Running);
+        assert!(snap.is_shell());
+    }
+
+    #[test]
+    fn test_builder_drift() {
+        let ctx = test_context();
+        let source = ContextId::new();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Drift, author)
+            .role(Role::System)
+            .content("finding from other context")
+            .source_context(source)
+            .drift_kind(DriftKind::Push)
+            .source_model("claude-opus-4-6")
+            .build();
+
+        assert_eq!(snap.kind, BlockKind::Drift);
+        assert_eq!(snap.source_context, Some(source));
+        assert_eq!(snap.drift_kind, Some(DriftKind::Push));
+    }
+
+    #[test]
+    fn test_builder_is_error_sets_status() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolResult, author)
+            .is_error(true)
+            .exit_code(1)
+            .build();
+
+        assert!(snap.is_error);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.exit_code, Some(1));
+    }
+
+    // ── content_eq ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_content_eq_ignores_timestamp() {
+        let ctx = test_context();
+        let author = test_agent();
+        let id = BlockId::new(ctx, author, 1);
+        let a = BlockSnapshot::text(id.clone(), None, Role::User, "hello", author);
+        // Simulate a different timestamp
+        let mut b = a.clone();
+        b.created_at = a.created_at + 1000;
+        assert_ne!(a, b); // PartialEq sees the difference
+        assert!(a.content_eq(&b)); // content_eq ignores it
     }
 }
