@@ -5236,6 +5236,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-types"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "serde_json",
+ "strum 0.26.3",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "kaish-glob"
 version = "0.3.0"
 dependencies = [

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/kaijutsu-types",
     "crates/kaijutsu-crdt",
     "crates/kaijutsu-kernel",
     "crates/kaijutsu-client",
