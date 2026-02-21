@@ -1607,4 +1607,595 @@ mod tests {
     fn test_max_dag_depth_is_512() {
         assert_eq!(MAX_DAG_DEPTH, 512);
     }
+
+    // ── debug_assert! safety rails ───────────────────────────────────
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "parent_id must be in same context")]
+    fn test_panic_on_cross_context_parent_text() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let agent = test_agent();
+        let parent = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::text(BlockId::new(ctx2, agent, 1), Some(parent), Role::User, "bad");
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "parent_id must be in same context")]
+    fn test_panic_on_cross_context_parent_thinking() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let agent = test_agent();
+        let parent = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::thinking(BlockId::new(ctx2, agent, 1), Some(parent), "bad");
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "parent_id must be in same context")]
+    fn test_panic_on_cross_context_parent_tool_call() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let agent = test_agent();
+        let parent = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::tool_call(
+            BlockId::new(ctx2, agent, 1),
+            Some(parent),
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({}),
+            Role::Model,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "tool_call_id must be in same context")]
+    fn test_panic_on_cross_context_tool_result() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let agent = test_agent();
+        let call_id = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::tool_result(
+            BlockId::new(ctx2, agent, 1),
+            call_id,
+            ToolKind::Shell,
+            "output",
+            false,
+            Some(0),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "tool_call_id must be in same context")]
+    fn test_panic_on_cross_context_tool_result_with_hint() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let agent = test_agent();
+        let call_id = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::tool_result_with_hint(
+            BlockId::new(ctx2, agent, 1),
+            call_id,
+            ToolKind::Shell,
+            "output",
+            false,
+            Some(0),
+            None,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "parent_id must be in same context")]
+    fn test_panic_on_cross_context_parent_drift() {
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let source = ContextId::new();
+        let agent = test_agent();
+        let parent = BlockId::new(ctx1, agent, 0);
+        BlockSnapshot::drift(
+            BlockId::new(ctx2, agent, 1),
+            Some(parent),
+            "bad",
+            source,
+            None,
+            DriftKind::Push,
+        );
+    }
+
+    // ── Fractal / stress tests ─────────────────────────────────────────
+
+    /// Build a linear chain of N blocks, each parented to the previous.
+    /// Returns (all snapshots, all headers indexed by BlockId).
+    fn build_chain(
+        ctx: ContextId,
+        agent: PrincipalId,
+        n: usize,
+    ) -> (Vec<BlockSnapshot>, std::collections::HashMap<BlockId, BlockHeader>) {
+        let mut snaps = Vec::with_capacity(n);
+        let mut index = std::collections::HashMap::with_capacity(n);
+        let mut parent: Option<BlockId> = None;
+
+        for seq in 0..n as u64 {
+            let id = BlockId::new(ctx, agent, seq);
+            let role = if seq % 2 == 0 { Role::User } else { Role::Model };
+            let snap = BlockSnapshot::text(id, parent, role, format!("block {seq}"));
+            index.insert(id, BlockHeader::from_snapshot(&snap));
+            parent = Some(id);
+            snaps.push(snap);
+        }
+        (snaps, index)
+    }
+
+    /// Walk from a leaf back to root via parent_id, counting depth.
+    /// Circuit-breaks at MAX_DAG_DEPTH.
+    ///
+    /// This is a *specification test helper* — it demonstrates how consumers
+    /// of the crate should write traversal loops using MAX_DAG_DEPTH.
+    /// The crate provides the constant; the traversal pattern lives here.
+    fn walk_to_root(
+        start: BlockId,
+        index: &std::collections::HashMap<BlockId, BlockHeader>,
+    ) -> (usize, bool) {
+        let mut current = start;
+        let mut depth = 0;
+        loop {
+            if depth >= MAX_DAG_DEPTH {
+                return (depth, false); // hit circuit breaker
+            }
+            match index.get(&current).and_then(|h| h.parent_id) {
+                Some(parent) => {
+                    current = parent;
+                    depth += 1;
+                }
+                None => return (depth, true), // reached root
+            }
+        }
+    }
+
+    #[test]
+    fn test_deep_chain_traversal() {
+        // Build a chain just under MAX_DAG_DEPTH — should reach root.
+        let ctx = test_context();
+        let agent = test_agent();
+        let n = 256;
+        let (snaps, index) = build_chain(ctx, agent, n);
+
+        let leaf = snaps.last().unwrap().id;
+        let (depth, reached_root) = walk_to_root(leaf, &index);
+        assert!(reached_root, "should reach root in a well-formed chain");
+        assert_eq!(depth, n - 1); // n blocks = n-1 edges
+    }
+
+    #[test]
+    fn test_max_depth_circuit_breaker() {
+        // Build a chain longer than MAX_DAG_DEPTH — circuit breaker should fire.
+        let ctx = test_context();
+        let agent = test_agent();
+        let n = MAX_DAG_DEPTH + 100;
+        let (snaps, index) = build_chain(ctx, agent, n);
+
+        let leaf = snaps.last().unwrap().id;
+        let (depth, reached_root) = walk_to_root(leaf, &index);
+        assert!(!reached_root, "circuit breaker should prevent full traversal");
+        assert_eq!(depth, MAX_DAG_DEPTH);
+    }
+
+    #[test]
+    fn test_wide_fanout_single_root() {
+        // One root, 1000 direct children — the "user asked 1000 models" scenario.
+        let ctx = test_context();
+        let agent = test_agent();
+        let root_id = BlockId::new(ctx, agent, 0);
+        let root = BlockSnapshot::text(root_id, None, Role::User, "prompt");
+
+        let mut children = Vec::with_capacity(1000);
+        for seq in 1..=1000u64 {
+            let child_agent = PrincipalId::new(); // each response from a different model
+            let id = BlockId::new(ctx, child_agent, seq);
+            children.push(BlockSnapshot::text(id, Some(root_id), Role::Model, format!("response {seq}")));
+        }
+
+        // All children point to root
+        assert!(children.iter().all(|c| c.parent_id == Some(root_id)));
+        // All have distinct IDs (different agents)
+        let ids: std::collections::HashSet<_> = children.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 1000);
+        // Root is root
+        assert!(root.is_root());
+    }
+
+    #[test]
+    fn test_realistic_conversation_dag() {
+        // user → model_thinking → model_text → tool_call → tool_result → model_text
+        // This is the shape of a typical Claude interaction.
+        let ctx = test_context();
+        let user = PrincipalId::new();
+        let model = PrincipalId::new();
+        let system = PrincipalId::system();
+
+        let user_msg = BlockSnapshot::text(
+            BlockId::new(ctx, user, 0),
+            None,
+            Role::User,
+            "What's in /etc/hosts?",
+        );
+
+        let thinking = BlockSnapshot::thinking(
+            BlockId::new(ctx, model, 0),
+            Some(user_msg.id),
+            "I should read the file...",
+        );
+
+        let text1 = BlockSnapshot::text(
+            BlockId::new(ctx, model, 1),
+            Some(thinking.id),
+            Role::Model,
+            "Let me check that for you.",
+        );
+
+        let tool_call = BlockSnapshot::tool_call(
+            BlockId::new(ctx, model, 2),
+            Some(text1.id),
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"command": "cat /etc/hosts"}),
+            Role::Model,
+        );
+
+        let tool_result = BlockSnapshot::tool_result(
+            BlockId::new(ctx, system, 0),
+            tool_call.id,
+            ToolKind::Shell,
+            "127.0.0.1 localhost",
+            false,
+            Some(0),
+        );
+
+        let text2 = BlockSnapshot::text(
+            BlockId::new(ctx, model, 3),
+            Some(tool_result.id),
+            Role::Model,
+            "Your /etc/hosts contains...",
+        );
+
+        // Build header index and walk the DAG
+        let all = [&user_msg, &thinking, &text1, &tool_call, &tool_result, &text2];
+        let index: std::collections::HashMap<BlockId, BlockHeader> = all
+            .iter()
+            .map(|s| (s.id, BlockHeader::from_snapshot(s)))
+            .collect();
+
+        // Walk from leaf to root
+        let (depth, reached) = walk_to_root(text2.id, &index);
+        assert!(reached);
+        assert_eq!(depth, 5); // 6 blocks, 5 edges
+
+        // Verify structural properties
+        assert!(user_msg.is_root());
+        assert_eq!(thinking.role, Role::Model);
+        assert_eq!(thinking.parent_id, Some(user_msg.id));
+        assert!(tool_call.is_shell());
+        assert!(tool_result.is_shell());
+        assert_eq!(tool_result.parent_id, Some(tool_call.id));
+        assert_eq!(tool_result.tool_call_id, Some(tool_call.id));
+        assert_eq!(text2.parent_id, Some(tool_result.id));
+        assert_eq!(text2.role, Role::Model);
+
+        // Headers preserve structure
+        let tc_header = index[&tool_call.id];
+        assert!(tc_header.is_tool());
+        assert!(!tc_header.is_root());
+    }
+
+    #[test]
+    fn test_forked_contexts_isolated() {
+        // Two contexts forked from common lineage — blocks don't cross.
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        let agent = test_agent();
+
+        // Build parallel chains in each context
+        let (_, index_a) = build_chain(ctx_a, agent, 50);
+        let (_, index_b) = build_chain(ctx_b, agent, 50);
+
+        // No block from A appears in B's index and vice versa
+        for id in index_a.keys() {
+            assert!(!index_b.contains_key(id), "context isolation violated");
+            assert_eq!(id.context_id, ctx_a);
+        }
+        for id in index_b.keys() {
+            assert!(!index_a.contains_key(id), "context isolation violated");
+            assert_eq!(id.context_id, ctx_b);
+        }
+
+        // Same seq numbers, different contexts → different BlockIds
+        let a0 = BlockId::new(ctx_a, agent, 0);
+        let b0 = BlockId::new(ctx_b, agent, 0);
+        assert_ne!(a0, b0);
+    }
+
+    #[test]
+    fn test_drift_bridges_contexts() {
+        // Context A drifts a finding to context B — the drift block lives in B
+        // but records A as source.
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        let agent = test_agent();
+
+        let finding_in_a = BlockSnapshot::text(
+            BlockId::new(ctx_a, agent, 0),
+            None,
+            Role::Model,
+            "Found a race condition in CAS",
+        );
+
+        let drift_in_b = BlockSnapshot::drift(
+            BlockId::new(ctx_b, agent, 0),
+            None,
+            "Distilled: CAS has a TOCTOU race",
+            ctx_a,
+            Some("claude-opus-4-6".to_string()),
+            DriftKind::Distill,
+        );
+
+        // Drift block lives in B
+        assert_eq!(drift_in_b.id.context_id, ctx_b);
+        // But records A as source
+        assert_eq!(drift_in_b.source_context, Some(ctx_a));
+        // Drift metadata is preserved
+        assert_eq!(drift_in_b.drift_kind, Some(DriftKind::Distill));
+        assert_eq!(drift_in_b.source_model.as_deref(), Some("claude-opus-4-6"));
+        assert!(drift_in_b.tool_kind.is_none(), "drift blocks should not have tool_kind");
+        // Original lives in A
+        assert_eq!(finding_in_a.id.context_id, ctx_a);
+        // Both are roots in their respective contexts
+        assert!(finding_in_a.is_root());
+        assert!(drift_in_b.is_root());
+    }
+
+    #[test]
+    fn test_compaction_filters_old_blocks() {
+        // Simulate compaction: mark old blocks compacted, create summary,
+        // verify filtering by compacted flag.
+        let ctx = test_context();
+        let agent = test_agent();
+
+        // Build 100 blocks, compact the first 80
+        let (mut snaps, _) = build_chain(ctx, agent, 100);
+        for snap in snaps.iter_mut().take(80) {
+            snap.compacted = true;
+        }
+
+        // Create summary block for the compacted range
+        let summary = BlockSnapshot::text(
+            BlockId::new(ctx, PrincipalId::system(), 0),
+            None,
+            Role::System,
+            "Summary of blocks 0-79: user and model discussed...",
+        );
+
+        // Active view: summary + non-compacted blocks
+        let active: Vec<_> = std::iter::once(&summary)
+            .chain(snaps.iter().filter(|s| !s.compacted))
+            .collect();
+
+        assert_eq!(active.len(), 21); // 1 summary + 20 live blocks
+
+        // Headers preserve compacted flag
+        let headers: Vec<_> = snaps.iter().map(|s| BlockHeader::from_snapshot(s)).collect();
+        let compacted_count = headers.iter().filter(|h| h.compacted).count();
+        let live_count = headers.iter().filter(|h| !h.compacted).count();
+        assert_eq!(compacted_count, 80);
+        assert_eq!(live_count, 20);
+    }
+
+    #[test]
+    fn test_multi_agent_interleaved() {
+        // Three agents (user, claude, gemini) interleaving blocks in one context.
+        // This is the kaijutsu multi-model scenario.
+        let ctx = test_context();
+        let user = PrincipalId::new();
+        let claude = PrincipalId::new();
+        let gemini = PrincipalId::new();
+
+        let prompt = BlockSnapshot::text(
+            BlockId::new(ctx, user, 0),
+            None,
+            Role::User,
+            "What's the best approach?",
+        );
+
+        let claude_thinks = BlockSnapshot::thinking(
+            BlockId::new(ctx, claude, 0),
+            Some(prompt.id),
+            "Let me consider the options...",
+        );
+
+        let gemini_thinks = BlockSnapshot::thinking(
+            BlockId::new(ctx, gemini, 0),
+            Some(prompt.id),
+            "I'll analyze the tradeoffs...",
+        );
+
+        let claude_reply = BlockSnapshot::text(
+            BlockId::new(ctx, claude, 1),
+            Some(claude_thinks.id),
+            Role::Model,
+            "Option A: use CRDTs",
+        );
+
+        let gemini_reply = BlockSnapshot::text(
+            BlockId::new(ctx, gemini, 1),
+            Some(gemini_thinks.id),
+            Role::Model,
+            "Option B: use OT",
+        );
+
+        // Both models branch from the same prompt — DAG forks
+        assert_eq!(claude_thinks.parent_id, Some(prompt.id));
+        assert_eq!(gemini_thinks.parent_id, Some(prompt.id));
+
+        // Different authors on the same seq — no collision
+        assert_ne!(claude_thinks.id, gemini_thinks.id);
+        assert_eq!(claude_thinks.id.seq, gemini_thinks.id.seq); // both seq 0
+        assert_ne!(claude_thinks.author(), gemini_thinks.author());
+
+        // Build index and verify both branches walk to root
+        let all = [&prompt, &claude_thinks, &gemini_thinks, &claude_reply, &gemini_reply];
+        let index: std::collections::HashMap<_, _> = all
+            .iter()
+            .map(|s| (s.id, BlockHeader::from_snapshot(s)))
+            .collect();
+
+        let (cd, cr) = walk_to_root(claude_reply.id, &index);
+        let (gd, gr) = walk_to_root(gemini_reply.id, &index);
+        assert!(cr && gr);
+        assert_eq!(cd, 2); // claude_reply → claude_thinks → prompt
+        assert_eq!(gd, 2); // gemini_reply → gemini_thinks → prompt
+    }
+
+    #[test]
+    fn test_tool_call_result_chain() {
+        // Model makes 5 sequential tool calls — the "agentic loop" pattern.
+        let ctx = test_context();
+        let model = PrincipalId::new();
+        let system = PrincipalId::system();
+
+        let prompt = BlockSnapshot::text(
+            BlockId::new(ctx, model, 0),
+            None,
+            Role::User,
+            "Deploy the app",
+        );
+
+        let tools = ["git pull", "cargo build", "cargo test", "docker build", "kubectl apply"];
+        let mut parent = prompt.id;
+        let mut model_seq = 1u64;
+        let mut sys_seq = 0u64;
+        let mut all_blocks: Vec<BlockSnapshot> = vec![prompt];
+
+        for tool_name in &tools {
+            let call = BlockSnapshot::tool_call(
+                BlockId::new(ctx, model, model_seq),
+                Some(parent),
+                ToolKind::Shell,
+                "shell",
+                serde_json::json!({"command": tool_name}),
+                Role::Model,
+            );
+            model_seq += 1;
+
+            let result = BlockSnapshot::tool_result(
+                BlockId::new(ctx, system, sys_seq),
+                call.id,
+                ToolKind::Shell,
+                format!("{tool_name}: ok"),
+                false,
+                Some(0),
+            );
+            sys_seq += 1;
+
+            // Verify call→result linkage at construction time
+            assert_eq!(result.parent_id, Some(call.id), "result parent must be the call");
+            assert_eq!(result.tool_call_id, Some(call.id), "tool_call_id must match");
+            assert_eq!(result.status, Status::Done);
+            assert_eq!(call.status, Status::Running);
+            assert!(call.is_shell());
+            assert!(result.is_shell());
+
+            parent = result.id;
+            all_blocks.push(call);
+            all_blocks.push(result);
+        }
+
+        // 1 prompt + 5*(call+result) = 11 blocks
+        assert_eq!(all_blocks.len(), 11);
+
+        // Build index
+        let index: std::collections::HashMap<_, _> = all_blocks
+            .iter()
+            .map(|s| (s.id, BlockHeader::from_snapshot(s)))
+            .collect();
+
+        // Walk from last result to root
+        let leaf = all_blocks.last().unwrap().id;
+        let (depth, reached) = walk_to_root(leaf, &index);
+        assert!(reached);
+        assert_eq!(depth, 10); // 11 blocks, 10 edges
+
+        // All tool blocks are shell
+        let tool_headers: Vec<_> = index.values().filter(|h| h.is_tool()).collect();
+        assert_eq!(tool_headers.len(), 10); // 5 calls + 5 results
+    }
+
+    #[test]
+    fn test_block_id_copy_in_collections() {
+        // BlockId as HashMap key without any .clone() — Copy makes this clean.
+        use std::collections::HashMap;
+        let ctx = test_context();
+        let agent = test_agent();
+
+        let mut forward: HashMap<BlockId, Vec<BlockId>> = HashMap::new(); // parent → children
+        let n: usize = 200;
+
+        let ids: Vec<BlockId> = (0..n).map(|seq| BlockId::new(ctx, agent, seq as u64)).collect();
+
+        // Build a binary tree: node i has children 2i+1 and 2i+2
+        for i in 0..n {
+            let mut children = Vec::new();
+            if 2 * i + 1 < n {
+                children.push(ids[2 * i + 1]); // Copy, no clone
+            }
+            if 2 * i + 2 < n {
+                children.push(ids[2 * i + 2]); // Copy, no clone
+            }
+            if !children.is_empty() {
+                forward.insert(ids[i], children); // Copy, no clone
+            }
+        }
+
+        // Root has two children
+        assert_eq!(forward[&ids[0]].len(), 2);
+        // Leaves have no entry
+        assert!(!forward.contains_key(&ids[n - 1]));
+        // Count total edges
+        let edges: usize = forward.values().map(|c| c.len()).sum();
+        assert_eq!(edges, n - 1); // binary tree has n-1 edges
+    }
+
+    #[test]
+    fn test_header_index_scales() {
+        // Build a 5000-block index from headers — the scenario that motivated Copy.
+        let ctx = test_context();
+        let agent = test_agent();
+        let n = 5000;
+        let (snaps, index) = build_chain(ctx, agent, n);
+
+        assert_eq!(index.len(), n);
+
+        // Spot-check: every header's id matches the snapshot's id
+        for snap in &snaps {
+            let header = index[&snap.id];
+            assert_eq!(header.id, snap.id);
+            assert_eq!(header.parent_id, snap.parent_id);
+            assert_eq!(header.role, snap.role);
+            assert_eq!(header.kind, snap.kind);
+        }
+
+        // Walk from a block within MAX_DAG_DEPTH — should reach root
+        let mid = snaps[MAX_DAG_DEPTH / 2].id;
+        let (depth, reached) = walk_to_root(mid, &index);
+        assert!(reached);
+        assert_eq!(depth, MAX_DAG_DEPTH / 2);
+
+        // Walk from the leaf — circuit breaker fires (5000 > 512)
+        let leaf = snaps.last().unwrap().id;
+        let (depth, reached) = walk_to_root(leaf, &index);
+        assert!(!reached, "5000-deep chain should hit MAX_DAG_DEPTH circuit breaker");
+        assert_eq!(depth, MAX_DAG_DEPTH);
+    }
 }
