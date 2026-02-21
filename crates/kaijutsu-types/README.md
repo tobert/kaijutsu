@@ -1,36 +1,55 @@
 # kaijutsu-types
 
-Shared identity and block types for Kaijutsu — the relational foundation.
+Shared identity, kernel, and block types for Kaijutsu — the relational foundation.
 
-This crate defines the **typed identity model** that replaces string-based IDs
-scattered across the codebase. It has no internal kaijutsu dependencies — a pure
-leaf crate.
-
-## Why This Crate Exists
-
-The identity model accumulated organically: three separate `Identity` structs with
-inconsistent field names, string-based IDs where UUIDs should be, a `display_name`
-bug that silently drops real names, and a hardcoded `"server"` agent_id on every block.
-
-`kaijutsu-types` provides one vocabulary, one set of types, with full serde and
-postcard support.
+This crate defines the **canonical type vocabulary** that all other kaijutsu crates
+align to. It has no internal kaijutsu dependencies — a pure leaf crate. This is
+未来 (mirai): it defines where we're going, not where we've been.
 
 ## Entity-Relationship Model
 
 ```
-Principal (PrincipalId)  ──── authenticates via ──── Credential
-    │                                                 (SshKey today)
-    ├── owns ──── Kernel (KernelId)
-    │                 │
-    │            contains ──── Context (ContextId)
-    │                              │
-    │                         contains ──── Block (BlockId)
-    │
-    └── opens ──── Session (SessionId)
+Kernel (KernelId)                     ← 会場 the meeting place
+    ├── founded by Principal          ← starts the meeting, not "owner"
+    ├── hosts many Contexts           ← conversations within
+    └── does NOT fork                 ← only contexts fork
+
+Principal (PrincipalId)               ← anyone who acts
+    ├── authenticates via Credential
+    ├── founds Kernel
+    ├── joins Kernel                  ← participant, peer to founder
+    ├── creates Context
+    ├── authors Block (BlockId = ContextId + PrincipalId + seq)
+    └── opens Session (SessionId)
+
+Context (ContextId)                   ← a conversation, a document
+    ├── belongs to a Kernel
+    ├── forks / threads               ← isolated or parallel work
+    └── drifts to other Contexts      ← cross-context knowledge transfer
 ```
+
+**Design note — kernels don't fork.** The kernel is 会場 (kaijou), the meeting
+place where monsters gather. It's singular. The founder starts the meeting;
+participants join as peers. Forking creates complexity without benefit at the
+kernel level — contexts fork for isolated exploration, and drift handles
+cross-context communication. One meeting, many conversations.
 
 **Well-known sentinel:** `PrincipalId::system()` — deterministic UUIDv5 for
 kernel-generated blocks (shell output, system messages).
+
+## Key Types
+
+| Type | Purpose |
+|------|---------|
+| `PrincipalId` | Who (user, model, system) |
+| `KernelId` | Which kernel instance |
+| `ContextId` | Which context (= document) |
+| `SessionId` | Which connection session |
+| `Principal` | Full identity (id + username + display_name) |
+| `Kernel` | Kernel birth certificate (founder + label) |
+| `Context` | Context metadata (kernel + lineage + label) |
+| `BlockId` | Unique block address (context + agent + seq) |
+| `BlockSnapshot` | Serializable block state |
 
 ## BlockKind + ToolKind + DriftKind
 
@@ -64,30 +83,21 @@ as separate variants. In kaijutsu-types, these are unified:
 | `BlockKind::ShellCommand` | `BlockKind::ToolCall` + `ToolKind::Shell` + `Role::User` |
 | `BlockKind::ShellOutput` | `BlockKind::ToolResult` + `ToolKind::Shell` |
 
-The `Role` on the block already captures *who* initiated it (user typed `ls` vs
-model requested shell execution). `ToolKind` captures *which engine*. No separate
-BlockKind variants needed.
-
-**Migration notes for `match block.kind` arms:**
-- `BlockKind::ShellCommand` → `BlockKind::ToolCall` where `tool_kind == Some(ToolKind::Shell)`
-- `BlockKind::ShellOutput` → `BlockKind::ToolResult` where `tool_kind == Some(ToolKind::Shell)`
-- UI rendering that keys off `ShellCommand`/`ShellOutput` (the `$ ` prefix, no-border
-  style, display_hint formatting) should use `BlockSnapshot::is_shell()` instead
-- The `is_shell()` convenience method checks `tool_kind == Some(Shell) && kind.is_tool()`
+`BlockSnapshot::is_shell()` is the convenience check for rendering.
 
 ## Type Mapping: Old → New
 
 | Current Type | Location | Replacement |
 |-------------|----------|-------------|
-| `ssh::Identity { nick, display_name, is_admin }` | kaijutsu-server | `Principal` |
-| `rpc::Identity { username, display_name }` | kaijutsu-kernel | `Principal` |
-| `client::Identity { username, display_name }` | kaijutsu-client | `Principal` |
+| `ssh::Identity` | kaijutsu-server | `Principal` |
+| `rpc::Identity` | kaijutsu-kernel | `Principal` |
+| `client::Identity` | kaijutsu-client | `Principal` |
 | `BlockId.document_id: String` | kaijutsu-crdt | `BlockId.context_id: ContextId` |
 | `BlockId.agent_id: String` | kaijutsu-crdt | `BlockId.agent_id: PrincipalId` |
 | `BlockSnapshot.author: String` | kaijutsu-crdt | `BlockSnapshot.author: PrincipalId` |
 | `BlockKind::ShellCommand` | kaijutsu-crdt | `BlockKind::ToolCall` + `ToolKind::Shell` |
 | `BlockKind::ShellOutput` | kaijutsu-crdt | `BlockKind::ToolResult` + `ToolKind::Shell` |
-| `KernelState.id: String` | kaijutsu-kernel | `KernelId` |
+| `KernelState.id: String` | kaijutsu-kernel | `KernelId` + `Kernel` (metadata) |
 | `ContextManager.kernel_id: String` | kaijutsu-kernel | `KernelId` |
 | `ContextHandle.document_id: String` | kaijutsu-kernel | `ContextId` |
 | `source_context: Option<String>` | kaijutsu-crdt | `source_context: Option<ContextId>` |
@@ -108,9 +118,11 @@ BlockKind variants needed.
 ### kaijutsu-kernel
 
 - [ ] Replace `Identity` struct with `Principal`
-- [ ] Replace `KernelState.id: String` with `KernelId`
+- [ ] Replace `KernelState.id: String` with `KernelId`, add `founder: PrincipalId`
 - [ ] Replace `ContextManager.kernel_id: String` with `KernelId`
 - [ ] Update agent registration to use `PrincipalId`
+- [ ] Remove kernel fork/thread — only context fork/thread remains
+- [ ] Rename runtime `Kernel` struct (e.g. `KernelEngine`) to avoid conflict with `kaijutsu_types::Kernel`
 
 ### kaijutsu-server
 
@@ -119,7 +131,8 @@ BlockKind variants needed.
 - [ ] Map SSH fingerprint → `PrincipalId` at connection time
 - [ ] Replace hardcoded `"server"` agent_id with `PrincipalId::system()`
 - [ ] Update `shell_execute` to create `ToolCall`/`ToolResult` blocks with `ToolKind::Shell`
-- [ ] Remove `ShellCommand`/`ShellOutput` block creation paths
+- [ ] `attach_kernel` populates `Kernel` metadata with authenticated principal as founder
+- [ ] Remove kernel fork/thread RPC methods from schema
 
 ### kaijutsu-client
 
@@ -140,11 +153,9 @@ BlockKind variants needed.
 
 ## Wire Format Changes (kaijutsu.capnp)
 
-The Cap'n Proto schema will need:
-
 ```capnp
 struct Identity {
-  principalId @0 :Data;       # 16-byte PrincipalId (new)
+  principalId @0 :Data;       # 16-byte PrincipalId
   username @1 :Text;
   displayName @2 :Text;
 }
@@ -156,6 +167,8 @@ struct Identity {
 - `seq @N :UInt64;`
 
 Block snapshot gains `toolKind` field, loses `shellCommand`/`shellOutput` kind values.
+
+Remove `fork` and `thread` from `Kernel` interface — contexts handle isolation.
 
 ## Database Schema Changes
 
@@ -174,15 +187,19 @@ is the only persistent state that needs a proper schema migration.
 ## Usage
 
 ```rust
-use kaijutsu_types::{Principal, PrincipalId, BlockId, ContextId, ToolKind};
-use kaijutsu_types::{BlockSnapshot, Role};
+use kaijutsu_types::{Principal, PrincipalId, Kernel, Context, KernelId};
+use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, Role, ToolKind};
 
+// Amy starts a kernel
 let amy = Principal::new("amy", "Amy Tobey");
-let ctx = ContextId::new();
+let kernel = Kernel::new(amy.id, Some("team-dev".into()));
+
+// Create a context within the kernel
+let ctx = Context::new(kernel.id, Some("default".into()), None, amy.id);
 
 // User typed a shell command
 let cmd = BlockSnapshot::tool_call(
-    BlockId::new(ctx, amy.id, 1),
+    BlockId::new(ctx.id, amy.id, 1),
     None,
     ToolKind::Shell,
     "shell",
@@ -194,7 +211,7 @@ assert!(cmd.is_shell());
 
 // Model requested an MCP tool
 let tool = BlockSnapshot::tool_call(
-    BlockId::new(ctx, amy.id, 2),
+    BlockId::new(ctx.id, amy.id, 2),
     None,
     ToolKind::Mcp,
     "read_file",
@@ -205,5 +222,5 @@ let tool = BlockSnapshot::tool_call(
 assert!(!tool.is_shell());
 
 // System-generated content
-let system_block = BlockId::new(ctx, PrincipalId::system(), 1);
+let system_block = BlockId::new(ctx.id, PrincipalId::system(), 1);
 ```
