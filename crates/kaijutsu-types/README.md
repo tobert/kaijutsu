@@ -22,8 +22,9 @@ Principal (PrincipalId)               ← anyone who acts
     ├── authors Block (BlockId = ContextId + PrincipalId + seq)
     └── opens Session (SessionId)
 
-Context (ContextId)                   ← a conversation, a document
+Context (ContextId)                   ← a conversation, NOT a document
     ├── belongs to a Kernel
+    ├── contains Blocks               ← the universal content atom
     ├── forks / threads               ← isolated or parallel work
     └── drifts to other Contexts      ← cross-context knowledge transfer
 ```
@@ -43,7 +44,7 @@ kernel-generated blocks (shell output, system messages).
 |------|---------|
 | `PrincipalId` | Who (user, model, system) |
 | `KernelId` | Which kernel instance |
-| `ContextId` | Which context (= document) |
+| `ContextId` | Which context |
 | `SessionId` | Which connection session |
 | `Principal` | Full identity (id + username + display_name) |
 | `Kernel` | Kernel birth certificate (founder + label) |
@@ -53,17 +54,24 @@ kernel-generated blocks (shell output, system messages).
 | `BlockSnapshot` | Serializable block state |
 | `Session` | Session birth certificate (who + where + when) |
 
-## BlockKind + ToolKind + DriftKind
+## Block Model
 
-`BlockKind` is deliberately small — 5 variants covering *what* a block is:
+### BlockKind + Role
 
-| BlockKind | Purpose |
-|-----------|---------|
-| `Text` | Content (user message, model response) |
-| `Thinking` | Model reasoning (collapsible) |
-| `ToolCall` | Request to execute something |
-| `ToolResult` | Execution response |
-| `Drift` | Cross-context transfer |
+`BlockKind` has 6 variants covering *what* a block is:
+
+| BlockKind | Role | Purpose |
+|-----------|------|---------|
+| `Text` | User/Model | Content (user message, model response) |
+| `Thinking` | Model | Model reasoning (collapsible) |
+| `ToolCall` | User/Model | Request to execute something |
+| `ToolResult` | Tool | Execution response |
+| `Drift` | System | Cross-context transfer |
+| `File` | Asset | File content tracked in a context |
+
+`Role` has 5 variants: `User`, `Model`, `System`, `Tool`, `Asset`.
+
+### Companion Enums
 
 Mechanism metadata lives in companion enums on BlockSnapshot:
 
@@ -75,116 +83,81 @@ Mechanism metadata lives in companion enums on BlockSnapshot:
 - **`DriftKind`** on Drift — how content transferred:
   - `Push` / `Pull` / `Merge` / `Distill` / `Commit`
 
-### Shell → ToolCall migration
+### BlockHeader
 
-The current codebase has `BlockKind::ShellCommand` and `BlockKind::ShellOutput`
-as separate variants. In kaijutsu-types, these are unified:
+Lightweight Copy struct for DAG indexing and LWW conflict resolution:
 
-| Old (kaijutsu-crdt) | New (kaijutsu-types) |
-|---------------------|---------------------|
-| `BlockKind::ShellCommand` | `BlockKind::ToolCall` + `ToolKind::Shell` + `Role::User` |
-| `BlockKind::ShellOutput` | `BlockKind::ToolResult` + `ToolKind::Shell` |
+| Field | Type | Purpose |
+|-------|------|---------|
+| `id` | `BlockId` | Identity |
+| `parent_id` | `Option<BlockId>` | DAG edge |
+| `role` | `Role` | Who |
+| `kind` | `BlockKind` | What |
+| `status` | `Status` | Lifecycle (Pending/Running/Done/Error) |
+| `compacted` | `bool` | Superseded by compaction summary |
+| `collapsed` | `bool` | UI collapse state (LWW mutable) |
+| `created_at` | `u64` | Wall-clock Unix millis |
+| `updated_at` | `u64` | Lamport timestamp for LWW resolution |
+| `tool_kind` | `Option<ToolKind>` | Execution engine |
+| `exit_code` | `Option<i32>` | Tool exit code |
+| `is_error` | `bool` | Error flag |
 
-`BlockSnapshot::is_shell()` is the convenience check for rendering.
+### BlockSnapshot
 
-## Type Mapping: Old → New
+Full serializable block state. Extends BlockHeader with non-Copy fields:
 
-| Current Type | Location | Replacement |
-|-------------|----------|-------------|
-| `ssh::Identity` | kaijutsu-server | `Principal` |
-| `rpc::Identity` | kaijutsu-kernel | `Principal` |
-| `client::Identity` | kaijutsu-client | `Principal` |
-| `BlockId.document_id: String` | kaijutsu-crdt | `BlockId.context_id: ContextId` |
-| `BlockId.agent_id: String` | kaijutsu-crdt | `BlockId.agent_id: PrincipalId` |
-| `BlockSnapshot.author: String` | kaijutsu-crdt | removed — use `author()` method (`id.agent_id`) |
-| `BlockKind::ShellCommand` | kaijutsu-crdt | `BlockKind::ToolCall` + `ToolKind::Shell` |
-| `BlockKind::ShellOutput` | kaijutsu-crdt | `BlockKind::ToolResult` + `ToolKind::Shell` |
-| `KernelState.id: String` | kaijutsu-kernel | `KernelId` + `Kernel` (metadata) |
-| `ContextManager.kernel_id: String` | kaijutsu-kernel | `KernelId` |
-| `ContextHandle.document_id: String` | kaijutsu-kernel | `ContextId` |
-| `source_context: Option<String>` | kaijutsu-crdt | `source_context: Option<ContextId>` |
+- `content: String` — primary text
+- `tool_name`, `tool_input`, `tool_call_id` — tool metadata
+- `display_hint` — per-viewer rendering hint
+- `source_context`, `source_model`, `drift_kind` — drift provenance
+- `file_path` — logical path for File blocks
+- `order_key` — fractional index for sibling ordering (set by BlockStore)
 
-## Per-Crate Migration Checklist
+Named constructors: `text()`, `thinking()`, `tool_call()`, `tool_result()`,
+`tool_result_with_hint()`, `drift()`, `file()`. Also `BlockSnapshotBuilder`.
 
-### kaijutsu-crdt
+`is_shell()` convenience: `tool_kind == Some(Shell) && kind.is_tool()`.
 
-- [ ] Add `kaijutsu-types` dependency
-- [ ] Re-export types from `kaijutsu-types` (or alias)
-- [ ] Keep `ids.rs` with `from_document_id()` and `recover()` as migration shims
-- [ ] Migrate `block.rs` `BlockId` to use `ContextId` + `PrincipalId`
-- [ ] Migrate `BlockSnapshot.author` from `String` to `PrincipalId`
-- [ ] Remove `ShellCommand`/`ShellOutput` from `BlockKind`, add `ToolKind` field
-- [ ] Update `BlockDocument` to use typed `BlockId`
-- [ ] Delete old `KernelId`/`ContextId` once consumers are migrated
+## Per-Crate Migration Status
 
-### kaijutsu-kernel
+### kaijutsu-crdt — done
+
+- [x] Depends on kaijutsu-types, re-exports all block/ID/enum types
+- [x] `block.rs` is a thin re-export module
+- [x] `ids.rs` re-exports + shim functions for legacy compat
+- [x] `BlockId` uses `ContextId` + `PrincipalId`
+- [x] `BlockSnapshot.author` removed — use `author()` method
+- [x] `ShellCommand`/`ShellOutput` unified into `ToolCall`/`ToolResult` + `ToolKind`
+- [x] New `BlockStore` + `BlockContent` (per-block DTE architecture)
+
+### kaijutsu-kernel — pending
 
 - [ ] Replace `Identity` struct with `Principal`
 - [ ] Replace `KernelState.id: String` with `KernelId`, add `founder: PrincipalId`
-- [ ] Replace `ContextManager.kernel_id: String` with `KernelId`
 - [ ] Update agent registration to use `PrincipalId`
-- [ ] Remove kernel fork/thread — only context fork/thread remains
-- [ ] Rename runtime `Kernel` struct (e.g. `KernelEngine`) to avoid conflict with `kaijutsu_types::Kernel`
+- [ ] Migrate from `BlockDocument` to `BlockStore`
 
-### kaijutsu-server
+### kaijutsu-server — pending
 
 - [ ] Replace `ssh::Identity` with `Principal`
-- [ ] Add `uuid` column to `auth.db` (SQLite migration)
 - [ ] Map SSH fingerprint → `PrincipalId` at connection time
 - [ ] Replace hardcoded `"server"` agent_id with `PrincipalId::system()`
-- [ ] Update `shell_execute` to create `ToolCall`/`ToolResult` blocks with `ToolKind::Shell`
-- [ ] `attach_kernel` populates `Kernel` metadata with authenticated principal as founder
-- [ ] Remove kernel fork/thread RPC methods from schema
+- [ ] Update `shell_execute` for `ToolCall`/`ToolResult` + `ToolKind::Shell`
 
-### kaijutsu-client
+### kaijutsu-client — pending
 
 - [ ] Replace `Identity` struct with `Principal`
 - [ ] Store `PrincipalId` from server handshake
 
-### kaijutsu-app
+### kaijutsu-app — pending
 
-- [ ] Update block rendering to use `PrincipalId` for author display
-- [ ] Update constellation to use typed `ContextId` throughout
-- [ ] Replace `BlockKind::ShellCommand`/`ShellOutput` match arms with `is_shell()` checks
-- [ ] Shell rendering ($ prefix, no border, display_hint) keys off `is_shell()`
+- [ ] Use `PrincipalId` for author display
+- [ ] Replace `BlockKind::ShellCommand`/`ShellOutput` match arms with `is_shell()`
+- [ ] Constellation uses typed `ContextId` throughout
 
-### kaijutsu-mcp
+### kaijutsu-mcp — pending
 
 - [ ] Update tool implementations to pass `PrincipalId` for authorship
-- [ ] Replace string-based identity in remote state
-
-## Wire Format Changes (kaijutsu.capnp)
-
-```capnp
-struct Identity {
-  principalId @0 :Data;       # 16-byte PrincipalId
-  username @1 :Text;
-  displayName @2 :Text;
-}
-```
-
-`BlockId` on wire becomes three fields:
-- `contextId @N :Data;` (16 bytes)
-- `agentId @N :Data;` (16 bytes)
-- `seq @N :UInt64;`
-
-Block snapshot gains `toolKind` field, loses `shellCommand`/`shellOutput` kind values.
-
-Remove `fork` and `thread` from `Kernel` interface — contexts handle isolation.
-
-## Database Schema Changes
-
-### auth.db
-
-Add a `uuid BLOB` column to the users table. Backfill existing users with
-`PrincipalId::new()`. The SSH fingerprint → principal mapping becomes:
-fingerprint → row → `PrincipalId`.
-
-### Kernel data (BlockDocument snapshots)
-
-**Clean-break strategy:** Since the kernel data format is still in flux,
-the simplest migration is to wipe kernel data and start fresh. The auth.db
-is the only persistent state that needs a proper schema migration.
 
 ## Usage
 
@@ -211,16 +184,15 @@ let cmd = BlockSnapshot::tool_call(
 assert!(cmd.is_shell());
 assert_eq!(cmd.author(), amy.id);
 
-// Model requested an MCP tool
-let tool = BlockSnapshot::tool_call(
+// Track a file in the context
+let file = BlockSnapshot::file(
     BlockId::new(ctx.id, amy.id, 2),
     None,
-    ToolKind::Mcp,
-    "read_file",
-    serde_json::json!({"path": "/etc/hosts"}),
-    Role::Model,
+    "/src/main.rs",
+    "fn main() {}",
 );
-assert!(!tool.is_shell());
+assert_eq!(file.role, Role::Asset);
+assert_eq!(file.file_path, Some("/src/main.rs".to_string()));
 
 // System-generated content
 let system_block = BlockId::new(ctx.id, PrincipalId::system(), 1);
