@@ -5,14 +5,18 @@
 //! Uses the tiling reconciler's `WidgetPaneText` marker to find and
 //! update MSDF text content in dock widget panes.
 
+use std::collections::VecDeque;
+
 use bevy::prelude::*;
 
-use super::tiling::PaneContent;
+use super::tiling::{DockWidget, PaneContent, TilingTree};
 use super::tiling_reconciler::WidgetPaneText;
 use crate::cell::ContextSwitchRequested;
+use crate::connection::actor_plugin::ServerEventMessage;
 use crate::input::FocusArea;
 use crate::connection::RpcConnectionState;
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
@@ -24,6 +28,60 @@ use crate::ui::theme::Theme;
 #[derive(Component, Debug, Clone)]
 pub struct ContextBadge {
     pub context_name: String,
+}
+
+// ============================================================================
+// DOCK LAYOUT — BRP-mutable dock configuration
+// ============================================================================
+
+/// Declarative dock layout resource.
+///
+/// Source of truth for what widgets appear in the North and South docks.
+/// Mutating this via BRP triggers `sync_dock_layout_to_tiling_tree` which
+/// rebuilds the dock TileNode children and triggers the reconciler.
+#[derive(Resource, Clone, Reflect)]
+#[reflect(Resource)]
+pub struct DockLayout {
+    pub north: Vec<DockWidget>,
+    pub south: Vec<DockWidget>,
+}
+
+impl Default for DockLayout {
+    fn default() -> Self {
+        Self {
+            north: vec![
+                DockWidget::Title,
+                DockWidget::Spacer,
+                DockWidget::EventPulse,
+                DockWidget::Connection,
+            ],
+            south: vec![
+                DockWidget::Mode,
+                DockWidget::ModelBadge,
+                DockWidget::Spacer,
+                DockWidget::AgentActivity,
+                DockWidget::BlockActivity,
+                DockWidget::Spacer,
+                DockWidget::Contexts,
+                DockWidget::Spacer,
+                DockWidget::Hints,
+            ],
+        }
+    }
+}
+
+/// Sync DockLayout changes to the TilingTree.
+///
+/// When DockLayout is mutated (via BRP or internally), rebuilds dock children
+/// in the tiling tree, which triggers the reconciler to respawn dock entities.
+pub fn sync_dock_layout_to_tiling_tree(
+    dock_layout: Res<DockLayout>,
+    mut tree: ResMut<TilingTree>,
+) {
+    if !dock_layout.is_changed() {
+        return;
+    }
+    tree.rebuild_docks(&dock_layout.north, &dock_layout.south);
 }
 
 // ============================================================================
@@ -360,6 +418,256 @@ pub fn update_hints_widget(
     }
 }
 
+// ============================================================================
+// LIVE DATA WIDGET SYSTEMS
+// ============================================================================
+
+/// Rolling event counter state for the EventPulse widget.
+#[derive(Default)]
+pub(crate) struct EventPulseState {
+    /// Timestamps of events within the rolling window.
+    timestamps: VecDeque<f64>,
+}
+
+/// Update EventPulse widget — shows server event rate in a rolling 5s window.
+///
+/// Counts all incoming `ServerEventMessage` and displays `~N ops` when active
+/// or `quiet` when idle.
+pub fn update_event_pulse_widget(
+    mut state: Local<EventPulseState>,
+    time: Res<Time>,
+    mut events: MessageReader<ServerEventMessage>,
+    theme: Res<Theme>,
+    widget_panes: Query<(&WidgetPaneText, &Children)>,
+    mut texts: Query<&mut MsdfUiText>,
+) {
+    let now = time.elapsed_secs_f64();
+    let window = 5.0;
+
+    // Record new events
+    let count = events.read().count();
+    for _ in 0..count {
+        state.timestamps.push_back(now);
+    }
+
+    // Expire old events
+    while let Some(&front) = state.timestamps.front() {
+        if now - front > window {
+            state.timestamps.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    let total = state.timestamps.len();
+    let (text, color) = if total > 0 {
+        (format!("~{} ops", total), theme.accent)
+    } else {
+        ("quiet".to_string(), theme.fg_dim)
+    };
+
+    for (widget, children) in widget_panes.iter() {
+        if !matches!(widget.widget_type, PaneContent::EventPulse) {
+            continue;
+        }
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = texts.get_mut(child) {
+                if msdf_text.text != text {
+                    msdf_text.text = text.clone();
+                    msdf_text.color = bevy_to_rgba8(color);
+                }
+            }
+        }
+    }
+}
+
+/// Update ModelBadge widget — shows active context's model name.
+///
+/// Reads DriftState to find the active context and extracts a shortened
+/// model name (e.g. "opus-4.6" from "claude-opus-4-6").
+pub fn update_model_badge_widget(
+    drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    theme: Res<Theme>,
+    widget_panes: Query<(&WidgetPaneText, &Children)>,
+    mut texts: Query<&mut MsdfUiText>,
+) {
+    if !drift_state.is_changed() && !doc_cache.is_changed() {
+        return;
+    }
+
+    // Find the active context's model from drift state
+    let model_text = if let Some(active_id) = doc_cache.active_id() {
+        // Look up context info from drift_state by matching document_id
+        drift_state
+            .contexts
+            .iter()
+            .find(|ctx| ctx.document_id == active_id)
+            .map(|ctx| {
+                if ctx.model.is_empty() {
+                    "—".to_string()
+                } else {
+                    shorten_model_name(&ctx.model)
+                }
+            })
+            .unwrap_or_else(|| "—".to_string())
+    } else {
+        "—".to_string()
+    };
+
+    for (widget, children) in widget_panes.iter() {
+        if !matches!(widget.widget_type, PaneContent::ModelBadge) {
+            continue;
+        }
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = texts.get_mut(child) {
+                if msdf_text.text != model_text {
+                    msdf_text.text = model_text.clone();
+                    msdf_text.color = bevy_to_rgba8(theme.fg_dim);
+                }
+            }
+        }
+    }
+}
+
+/// Shorten a model name for display (e.g. "claude-opus-4-6" → "opus-4.6").
+fn shorten_model_name(model: &str) -> String {
+    let m = model
+        .strip_prefix("claude-")
+        .unwrap_or(model);
+    // Replace version separator: "opus-4-6" → "opus-4.6"
+    // Find the pattern "X-N-N" at the end and replace last dash with dot
+    if let Some(pos) = m.rfind('-') {
+        if pos > 0 && m[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            return format!("{}.{}", &m[..pos], &m[pos + 1..]);
+        }
+    }
+    m.to_string()
+}
+
+/// Update AgentActivity widget — summarizes non-idle activity across constellation nodes.
+///
+/// Reads the Constellation resource and counts nodes with non-idle activity states.
+/// Shows "streaming" for 1 streaming node, "2 active" for multiple, nothing when idle.
+pub fn update_agent_activity_widget(
+    constellation: Res<Constellation>,
+    theme: Res<Theme>,
+    widget_panes: Query<(&WidgetPaneText, &Children)>,
+    mut texts: Query<&mut MsdfUiText>,
+) {
+    if !constellation.is_changed() {
+        return;
+    }
+
+    let mut streaming = 0u32;
+    let mut waiting = 0u32;
+    let mut active = 0u32;
+
+    for node in &constellation.nodes {
+        match node.activity {
+            ActivityState::Streaming => streaming += 1,
+            ActivityState::Waiting => waiting += 1,
+            ActivityState::Active => active += 1,
+            _ => {}
+        }
+    }
+
+    let total_active = streaming + waiting + active;
+    let (text, color) = if streaming == 1 && total_active == 1 {
+        ("streaming".to_string(), theme.accent)
+    } else if total_active > 0 {
+        (format!("{} active", total_active), theme.accent)
+    } else {
+        (String::new(), theme.fg_dim)
+    };
+
+    for (widget, children) in widget_panes.iter() {
+        if !matches!(widget.widget_type, PaneContent::AgentActivity) {
+            continue;
+        }
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = texts.get_mut(child) {
+                if msdf_text.text != text {
+                    msdf_text.text = text.clone();
+                    msdf_text.color = bevy_to_rgba8(color);
+                }
+            }
+        }
+    }
+}
+
+/// Tracks running block counts for the BlockActivity widget.
+#[derive(Default)]
+pub(crate) struct BlockActivityCounts {
+    /// Running block count for the currently active document.
+    pub(crate) running: u32,
+    /// Last active document ID we were tracking.
+    pub(crate) last_active_doc: Option<String>,
+}
+
+/// Update BlockActivity widget — shows running block count for active document.
+///
+/// Reads `ServerEventMessage::BlockStatusChanged` events and tracks Running vs Done
+/// transitions. Shows "N running" when blocks are executing, empty when all done.
+pub fn update_block_activity_widget(
+    mut state: Local<BlockActivityCounts>,
+    mut events: MessageReader<ServerEventMessage>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    theme: Res<Theme>,
+    widget_panes: Query<(&WidgetPaneText, &Children)>,
+    mut texts: Query<&mut MsdfUiText>,
+) {
+    let active_doc = doc_cache.active_id().map(|s| s.to_string());
+
+    // Reset counts on context switch
+    if active_doc != state.last_active_doc {
+        state.running = 0;
+        state.last_active_doc = active_doc.clone();
+    }
+
+    // Process status change events for the active document
+    for event in events.read() {
+        if let kaijutsu_client::ServerEvent::BlockStatusChanged {
+            document_id,
+            status,
+            ..
+        } = &event.0
+        {
+            if active_doc.as_deref() == Some(document_id.as_str()) {
+                match status {
+                    kaijutsu_crdt::Status::Running => {
+                        state.running = state.running.saturating_add(1);
+                    }
+                    kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
+                        state.running = state.running.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let text = if state.running > 0 {
+        format!("{} running", state.running)
+    } else {
+        String::new()
+    };
+
+    for (widget, children) in widget_panes.iter() {
+        if !matches!(widget.widget_type, PaneContent::BlockActivity) {
+            continue;
+        }
+        for child in children.iter() {
+            if let Ok(mut msdf_text) = texts.get_mut(child) {
+                if msdf_text.text != text {
+                    msdf_text.text = text.clone();
+                    msdf_text.color = bevy_to_rgba8(theme.accent);
+                }
+            }
+        }
+    }
+}
+
 /// Handle clicks on context badges in the South dock strip.
 pub fn handle_context_badge_click(
     badges: Query<(&Interaction, &ContextBadge), Changed<Interaction>>,
@@ -384,16 +692,22 @@ pub struct TilingWidgetsPlugin;
 
 impl Plugin for TilingWidgetsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            (
-                update_mode_widget,
-                update_connection_widget,
-                update_contexts_widget,
-                update_hints_widget,
-                handle_context_badge_click,
-            )
-                .chain(),
-        );
+        app.init_resource::<DockLayout>()
+            .register_type::<DockLayout>()
+            .add_systems(
+                Update,
+                (
+                    sync_dock_layout_to_tiling_tree,
+                    update_mode_widget,
+                    update_connection_widget,
+                    update_contexts_widget,
+                    update_hints_widget,
+                    update_event_pulse_widget,
+                    update_model_badge_widget,
+                    update_agent_activity_widget,
+                    update_block_activity_widget,
+                    handle_context_badge_click,
+                ),
+            );
     }
 }

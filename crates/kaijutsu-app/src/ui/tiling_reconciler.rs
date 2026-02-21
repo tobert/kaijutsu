@@ -459,6 +459,18 @@ fn spawn_dock_child(
         PaneContent::Hints => {
             spawn_widget_text(parent, *id, content, theme, "Enter: submit │ Shift+Enter: newline │ Esc: normal", 11.0, theme.fg_dim, false);
         }
+        PaneContent::EventPulse => {
+            spawn_widget_text(parent, *id, content, theme, "quiet", 11.0, theme.fg_dim, false);
+        }
+        PaneContent::ModelBadge => {
+            spawn_widget_text(parent, *id, content, theme, "—", 11.0, theme.fg_dim, false);
+        }
+        PaneContent::AgentActivity => {
+            spawn_widget_text(parent, *id, content, theme, "", 11.0, theme.fg_dim, false);
+        }
+        PaneContent::BlockActivity => {
+            spawn_widget_text(parent, *id, content, theme, "", 11.0, theme.fg_dim, false);
+        }
         PaneContent::Spacer => {
             parent.spawn((
                 PaneMarker {
@@ -508,6 +520,10 @@ fn spawn_widget_text(
         PaneContent::Connection => (200.0, 20.0),
         PaneContent::Contexts => (200.0, 16.0),
         PaneContent::Hints => (400.0, 16.0),
+        PaneContent::EventPulse => (60.0, 16.0),
+        PaneContent::ModelBadge => (80.0, 16.0),
+        PaneContent::AgentActivity => (60.0, 16.0),
+        PaneContent::BlockActivity => (60.0, 16.0),
         _ => (60.0, 16.0),
     };
 

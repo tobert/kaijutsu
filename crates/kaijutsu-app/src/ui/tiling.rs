@@ -78,10 +78,61 @@ pub enum PaneContent {
     Contexts,
     /// Context-sensitive key hints.
     Hints,
+    /// Server event rate pulse (North dock).
+    EventPulse,
+    /// Active context model name badge (South dock).
+    ModelBadge,
+    /// Agent activity summary across constellation nodes (South dock).
+    AgentActivity,
+    /// Running/pending block count for active document (South dock).
+    BlockActivity,
     /// Static or templated text.
     Text { template: String },
     /// Flexible spacer — grows to fill remaining space.
     Spacer,
+}
+
+// ============================================================================
+// DOCK WIDGET — Declarative dock configuration
+// ============================================================================
+
+/// A widget type for the DockLayout resource.
+///
+/// Maps 1:1 to PaneContent widget variants. Used by `DockLayout` to
+/// declaratively configure what appears in each dock, and by
+/// `TilingTree::rebuild_docks()` to rebuild dock children.
+#[derive(Debug, Clone, PartialEq, Reflect)]
+pub enum DockWidget {
+    Title,
+    Mode,
+    Connection,
+    Contexts,
+    Hints,
+    AgentActivity,
+    BlockActivity,
+    EventPulse,
+    ModelBadge,
+    Text { template: String },
+    Spacer,
+}
+
+impl DockWidget {
+    /// Convert to the corresponding PaneContent variant.
+    pub fn to_pane_content(&self) -> PaneContent {
+        match self {
+            DockWidget::Title => PaneContent::Title,
+            DockWidget::Mode => PaneContent::Mode,
+            DockWidget::Connection => PaneContent::Connection,
+            DockWidget::Contexts => PaneContent::Contexts,
+            DockWidget::Hints => PaneContent::Hints,
+            DockWidget::AgentActivity => PaneContent::AgentActivity,
+            DockWidget::BlockActivity => PaneContent::BlockActivity,
+            DockWidget::EventPulse => PaneContent::EventPulse,
+            DockWidget::ModelBadge => PaneContent::ModelBadge,
+            DockWidget::Text { template } => PaneContent::Text { template: template.clone() },
+            DockWidget::Spacer => PaneContent::Spacer,
+        }
+    }
 }
 
 impl PaneContent {
@@ -383,6 +434,10 @@ impl TilingTree {
                 },
                 TileNode::Leaf {
                     id: next(),
+                    content: PaneContent::EventPulse,
+                },
+                TileNode::Leaf {
+                    id: next(),
                     content: PaneContent::Connection,
                 },
             ],
@@ -420,6 +475,22 @@ impl TilingTree {
                 TileNode::Leaf {
                     id: next(),
                     content: PaneContent::Mode,
+                },
+                TileNode::Leaf {
+                    id: next(),
+                    content: PaneContent::ModelBadge,
+                },
+                TileNode::Leaf {
+                    id: next(),
+                    content: PaneContent::Spacer,
+                },
+                TileNode::Leaf {
+                    id: next(),
+                    content: PaneContent::AgentActivity,
+                },
+                TileNode::Leaf {
+                    id: next(),
+                    content: PaneContent::BlockActivity,
                 },
                 TileNode::Leaf {
                     id: next(),
@@ -865,6 +936,43 @@ impl TilingTree {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // DOCK MANAGEMENT
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Rebuild dock children from DockWidget lists.
+    ///
+    /// Walks the tree to find North and South Dock nodes, replaces their
+    /// children with new leaves built from the provided widget lists,
+    /// and bumps structural_gen to trigger the reconciler.
+    pub fn rebuild_docks(&mut self, north: &[DockWidget], south: &[DockWidget]) {
+        fn rebuild_dock_node(node: &mut TileNode, edge: Edge, widgets: &[DockWidget], next_id: &mut u64) {
+            match node {
+                TileNode::Dock { edge: e, children, .. } if *e == edge => {
+                    children.clear();
+                    for widget in widgets {
+                        let id = PaneId(*next_id);
+                        *next_id += 1;
+                        children.push(TileNode::Leaf {
+                            id,
+                            content: widget.to_pane_content(),
+                        });
+                    }
+                }
+                TileNode::Split { children, .. } => {
+                    for child in children.iter_mut() {
+                        rebuild_dock_node(child, edge, widgets, next_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        rebuild_dock_node(&mut self.root, Edge::North, north, &mut self.next_id);
+        rebuild_dock_node(&mut self.root, Edge::South, south, &mut self.next_id);
+        self.bump_structural();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // HELPERS
     // ════════════════════════════════════════════════════════════════════
 
@@ -1050,6 +1158,7 @@ impl Plugin for TilingPlugin {
             .register_type::<SplitDirection>()
             .register_type::<Edge>()
             .register_type::<WritingDirection>()
+            .register_type::<DockWidget>()
             .register_type::<PaneMarker>()
             .register_type::<PaneFocus>()
             .register_type::<PaneSavedState>()
@@ -1085,7 +1194,7 @@ mod tests {
         let tree = TilingTree::default_layout();
         let mut ids = Vec::new();
         tree.root.collect_ids(&mut ids);
-        assert!(ids.len() >= 10, "Default layout should have many nodes");
+        assert!(ids.len() >= 15, "Default layout should have many nodes");
         // All IDs should be unique
         let deduped: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), deduped.len(), "All PaneIds should be unique");
