@@ -40,7 +40,6 @@ use super::components::{
     ViewingConversation, WorkspaceLayout,
 };
 use super::block_border;
-use super::frame_assembly;
 use super::systems;
 
 /// Plugin that enables cell-based editing in the workspace.
@@ -224,12 +223,6 @@ impl Plugin for CellPlugin {
                 systems::animate_compose_error,
                 block_border::update_block_border_state,
                 block_border::cleanup_block_borders,
-                // 9-slice frame layout
-                frame_assembly::spawn_nine_slice_frames,
-                frame_assembly::layout_nine_slice_frames,
-                frame_assembly::update_nine_slice_state,
-                frame_assembly::sync_frame_visibility,
-                frame_assembly::cleanup_nine_slice_frames,
             )
                 .in_set(CellPhase::Layout),
         );

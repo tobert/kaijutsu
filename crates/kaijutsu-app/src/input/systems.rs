@@ -98,7 +98,6 @@ pub fn handle_unfocus(
     editing_cells: Query<(Entity, &BlockEditCursor), With<EditingBlockCell>>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
-    mut sync_state: ResMut<crate::cell::DocumentSyncState>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     for ActionFired(action) in actions.read() {

@@ -7,7 +7,7 @@ use bevy::ui::measurement::ContentSize;
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
     CellState, ComposeBlock, ContextId, ConversationScrollState, DriftKind, EditingBlockCell,
-    FocusTarget, MainCell, PrincipalId, PromptSubmitted, Role, RoleHeader, RoleHeaderLayout,
+    FocusTarget, MainCell, PromptSubmitted, Role, RoleHeader, RoleHeaderLayout,
     Status, ViewingConversation, WorkspaceLayout,
 };
 use crate::input::FocusArea;

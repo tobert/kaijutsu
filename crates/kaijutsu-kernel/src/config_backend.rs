@@ -37,7 +37,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use kaijutsu_crdt::{BlockId, BlockKind, ContextId, PrincipalId, Role};
+use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role};
 
 use crate::block_store::SharedBlockStore;
 use crate::db::DocumentKind;
@@ -733,6 +733,7 @@ impl ConfigCrdtBackend {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
+    use kaijutsu_crdt::PrincipalId;
     use tempfile::TempDir;
 
     #[tokio::test]

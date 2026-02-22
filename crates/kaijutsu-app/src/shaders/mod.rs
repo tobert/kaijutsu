@@ -6,7 +6,6 @@
 //! - `PulseRingMaterial` - Expanding ring ripple effect
 //! - `ScanlinesMaterial` - Subtle CRT/cyberpunk scanlines
 //! - `HoloBorderMaterial` - Rainbow/gradient animated border
-//! - `CornerMaterial` / `EdgeMaterial` - 9-slice frame system (new)
 //! - `TextGlowMaterial` - Luminous backing for text with theme-reactive effects
 //!
 //! # Theme-Reactive Shaders
@@ -34,19 +33,12 @@
 
 pub mod block_border_material;
 pub mod context;
-pub mod nine_slice;
-
 pub use context::{ShaderEffectContext, ShaderEffectContextPlugin, TextGeometry, TextGlowTarget};
 
 use bevy::{
     prelude::*,
     render::render_resource::AsBindGroup,
     shader::ShaderRef,
-};
-
-use nine_slice::{
-    ChasingBorder, ChasingBorderMaterial, CornerMarker, CornerMaterial, CornerPosition, EdgeMarker,
-    EdgeMaterial, EdgePosition, ErrorFrameMaterial, FramePiece,
 };
 
 /// Plugin that registers all shader effect materials.
@@ -64,12 +56,6 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<ScanlinesMaterial>::default(),
             UiMaterialPlugin::<HoloBorderMaterial>::default(),
             UiMaterialPlugin::<CursorBeamMaterial>::default(),
-            // 9-slice materials
-            UiMaterialPlugin::<CornerMaterial>::default(),
-            UiMaterialPlugin::<EdgeMaterial>::default(),
-            UiMaterialPlugin::<ErrorFrameMaterial>::default(),
-            // Chasing border effect
-            UiMaterialPlugin::<ChasingBorderMaterial>::default(),
         ))
         .add_plugins((
             // Text effects
@@ -85,13 +71,6 @@ impl Plugin for ShaderFxPlugin {
             // Block border material
             UiMaterialPlugin::<block_border_material::BlockBorderMaterial>::default(),
         ))
-        // Register frame types for BRP reflection
-        .register_type::<FramePiece>()
-        .register_type::<CornerMarker>()
-        .register_type::<EdgeMarker>()
-        .register_type::<CornerPosition>()
-        .register_type::<EdgePosition>()
-        .register_type::<ChasingBorder>()
         .add_systems(Update, (
             update_shader_time,
             update_shader_time_effects,
@@ -110,10 +89,6 @@ fn update_shader_time(
     mut scanline_materials: ResMut<Assets<ScanlinesMaterial>>,
     mut holo_materials: ResMut<Assets<HoloBorderMaterial>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
-    mut corner_materials: ResMut<Assets<CornerMaterial>>,
-    mut edge_materials: ResMut<Assets<EdgeMaterial>>,
-    mut error_materials: ResMut<Assets<ErrorFrameMaterial>>,
-    mut chasing_materials: ResMut<Assets<ChasingBorderMaterial>>,
     mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
 ) {
     let t = time.elapsed_secs();
@@ -135,20 +110,6 @@ fn update_shader_time(
         mat.time.x = t;
     }
     for (_, mat) in cursor_materials.iter_mut() {
-        mat.time.x = t;
-    }
-
-    // 9-slice materials
-    for (_, mat) in corner_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in edge_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in error_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in chasing_materials.iter_mut() {
         mat.time.x = t;
     }
 

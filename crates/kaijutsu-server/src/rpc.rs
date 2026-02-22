@@ -8,7 +8,6 @@
 #![allow(refining_impl_trait)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};

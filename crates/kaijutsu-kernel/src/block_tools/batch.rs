@@ -39,8 +39,6 @@ impl Default for BatchConfig {
 struct AppendBuffer {
     /// The context containing this block.
     context_id: ContextId,
-    /// The block being appended to.
-    block_id: BlockId,
     /// Buffered text waiting to be flushed.
     buffer: String,
     /// When the buffer was created or last flushed.
@@ -48,10 +46,9 @@ struct AppendBuffer {
 }
 
 impl AppendBuffer {
-    fn new(context_id: ContextId, block_id: BlockId) -> Self {
+    fn new(context_id: ContextId) -> Self {
         Self {
             context_id,
-            block_id,
             buffer: String::new(),
             last_flush: Instant::now(),
         }
@@ -117,7 +114,7 @@ impl AppendBatcher {
             let mut buffers = self.buffers.lock();
             let buffer = buffers
                 .entry(*block_id)
-                .or_insert_with(|| AppendBuffer::new(context_id, *block_id));
+                .or_insert_with(|| AppendBuffer::new(context_id));
 
             buffer.buffer.push_str(text);
             should_flush = buffer.should_flush(&self.config);

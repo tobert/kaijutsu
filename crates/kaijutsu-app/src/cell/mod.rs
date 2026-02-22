@@ -9,15 +9,8 @@
 //! - A cosmic-text Editor for text manipulation
 //! - A position in the workspace grid
 //!
-//! ## 9-Slice Frame System
-//!
-//! Cells are rendered with a 9-slice frame system that uses procedural shaders
-//! for ornate cyberpunk borders. Frame configuration (colors, sizes, shader params)
-//! comes from the Theme resource, loaded from ~/.config/kaijutsu/theme.rhai.
-
 pub mod block_border;
 mod components;
-pub mod frame_assembly;
 mod measure;
 pub mod plugin;
 mod systems;
