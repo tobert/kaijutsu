@@ -867,12 +867,15 @@ fn despawn_removed_connections(
             continue;
         }
 
-        // Verify ancestry relationship is still valid (parent_id may change)
+        // Verify ancestry relationship is still valid (parent_id may change).
+        // Parse marker strings to ContextId once to avoid per-context String allocations.
         if marker.kind == DriftConnectionKind::Ancestry {
-            let still_valid = drift_state.contexts.iter().any(|ctx| {
-                ctx.parent_id.as_ref().map(|p| p.to_string()).as_deref() == Some(marker.from.as_str())
-                    && ctx.id.to_string() == marker.to
-            });
+            let from_id = kaijutsu_types::ContextId::parse(&marker.from).ok();
+            let to_id = kaijutsu_types::ContextId::parse(&marker.to).ok();
+            let still_valid = from_id.is_some() && to_id.is_some()
+                && drift_state.contexts.iter().any(|ctx| {
+                    ctx.parent_id == from_id && Some(ctx.id) == to_id
+                });
             if !still_valid {
                 commands.entity(entity).despawn();
                 info!("Despawned stale ancestry line: {} -> {}", marker.from, marker.to);
@@ -881,9 +884,12 @@ fn despawn_removed_connections(
         }
 
         if marker.kind == DriftConnectionKind::StagedDrift {
-            let still_staged = drift_state.staged.iter().any(|s| {
-                s.source_ctx.to_string() == marker.from && s.target_ctx.to_string() == marker.to
-            });
+            let from_id = kaijutsu_types::ContextId::parse(&marker.from).ok();
+            let to_id = kaijutsu_types::ContextId::parse(&marker.to).ok();
+            let still_staged = from_id.is_some() && to_id.is_some()
+                && drift_state.staged.iter().any(|s| {
+                    Some(s.source_ctx) == from_id && Some(s.target_ctx) == to_id
+                });
             if !still_staged {
                 commands.entity(entity).despawn();
                 info!("Despawned flushed drift line: {} -> {}", marker.from, marker.to);
