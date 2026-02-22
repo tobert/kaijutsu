@@ -44,6 +44,7 @@ enum Role {
   model @1;
   system @2;
   tool @3;
+  asset @4;
 }
 
 # Execution/processing status
@@ -54,7 +55,7 @@ enum Status {
   error @3;
 }
 
-# Block content type — 5 variants covering what a block *is*.
+# Block content type — 6 variants covering what a block *is*.
 # Mechanism metadata lives in companion enums:
 # - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
 # - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
@@ -64,6 +65,7 @@ enum BlockKind {
   toolCall @2;
   toolResult @3;
   drift @4;
+  file @5;
 }
 
 # Which execution engine handled a tool call/result.
@@ -123,6 +125,9 @@ struct BlockSnapshot {
   # Tool mechanism metadata (ToolCall / ToolResult)
   toolKind @20 :ToolKind;     # Which execution engine (shell/mcp/builtin)
   hasToolKind @21 :Bool;      # True if toolKind is set (enum default 0=shell is valid)
+
+  # File metadata (File blocks)
+  filePath @22 :Text;         # Path for file-kind blocks (e.g. "/src/main.rs")
 }
 
 # Operations on block documents

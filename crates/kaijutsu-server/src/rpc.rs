@@ -17,7 +17,7 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use crate::kaijutsu_capnp::*;
-use crate::context_engine::{ContextEngine, ContextManager};
+use crate::context_engine::ContextEngine;
 use crate::embedded_kaish::EmbeddedKaish;
 
 use kaijutsu_kernel::{
@@ -44,8 +44,8 @@ use kaijutsu_kernel::{
     // Tool filtering
     ToolFilter,
 };
-use kaijutsu_crdt::{BlockKind, ContextId, Role, Status};
-use kaijutsu_types::{Principal, PrincipalId, KernelId};
+use kaijutsu_crdt::{BlockKind, Role, Status};
+use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId};
 use serde_json;
 use tracing::Instrument;
 
@@ -77,12 +77,12 @@ fn extract_rpc_trace(trace: capnp::Result<trace_context::Reader<'_>>, name: &'st
 async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
-    context_manager: Arc<ContextManager>,
     context_id: ContextId,
 ) {
+    let current = crate::context_engine::current_context();
     kernel.register_tool_with_engine(
-        ToolInfo::new("context", "Manage conversation contexts (new, switch, list)", "kernel"),
-        Arc::new(ContextEngine::new(context_manager)),
+        ToolInfo::new("context", "Manage conversation contexts (switch, list)", "kernel"),
+        Arc::new(ContextEngine::new(kernel.drift().clone(), current)),
     ).await;
 
     kernel.register_tool_with_engine(
@@ -481,8 +481,6 @@ pub struct KernelState {
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
     pub documents: SharedBlockStore,
-    /// Thread-safe context manager for shell access
-    pub context_manager: Arc<ContextManager>,
     /// Config CRDT backend (manages theme.rhai, seats/*.rhai)
     pub config_backend: Arc<ConfigCrdtBackend>,
     /// Config watcher handle (stops when kernel is dropped)
@@ -607,21 +605,9 @@ impl world::Server for WorldImpl {
                 create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
             // Get identity for context manager
-            let nick = {
-                let state_ref = state.borrow();
-                state_ref.principal.username.clone()
-            };
-
-            // Create context manager for this kernel
-            let context_manager = Arc::new(ContextManager::new(
-                nick,
-                id,
-                uuid::Uuid::new_v4().to_string(), // instance ID
-            ));
-
             // Register block tools (including context engine + drift)
             let kernel_arc = Arc::new(kernel);
-            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone(), ctx_id).await;
+            register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
 
             // Recover contexts from persisted document IDs.
             // Documents are keyed by ContextId directly; register each in the drift router.
@@ -662,7 +648,6 @@ impl world::Server for WorldImpl {
                     kaish: None, // Spawned lazily
                     kernel: kernel_arc,
                     documents,
-                    context_manager,
                     config_backend,
                     config_watcher,
                     conversation_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -892,19 +877,6 @@ impl kernel::Server for KernelImpl {
             let (config_backend, config_watcher) =
                 create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
 
-            // Get identity for context manager
-            let nick = {
-                let state_ref = state.borrow();
-                state_ref.principal.username.clone()
-            };
-
-            // Create context manager for forked kernel
-            let context_manager = Arc::new(ContextManager::new(
-                nick,
-                id,
-                uuid::Uuid::new_v4().to_string(),
-            ));
-
             let parent_ctx_id = {
                 let state_ref = state.borrow();
                 state_ref.kernels.get(&parent_kernel_id)
@@ -913,7 +885,7 @@ impl kernel::Server for KernelImpl {
 
             // Register block tools on forked kernel (including drift)
             let kernel_arc = Arc::new(forked_kernel);
-            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone(), ctx_id).await;
+            register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
 
             // LLM registry is inherited from parent via Kernel::fork()
             // (includes runtime setDefaultProvider/setDefaultModel changes)
@@ -947,8 +919,7 @@ impl kernel::Server for KernelImpl {
                         kaish: None,
                         kernel: kernel_arc,
                         documents,
-                        context_manager,
-                        config_backend,
+                            config_backend,
                         config_watcher,
                         conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
@@ -998,19 +969,6 @@ impl kernel::Server for KernelImpl {
                 .create_document(ctx_id, DocumentKind::Conversation, None)
                 .map_err(|e| capnp::Error::failed(e))?;
 
-            // Get identity for context manager
-            let nick = {
-                let state_ref = state.borrow();
-                state_ref.principal.username.clone()
-            };
-
-            // Create context manager for threaded kernel
-            let context_manager = Arc::new(ContextManager::new(
-                nick,
-                id,
-                uuid::Uuid::new_v4().to_string(),
-            ));
-
             let parent_ctx_id = {
                 let state_ref = state.borrow();
                 state_ref.kernels.get(&parent_kernel_id)
@@ -1019,7 +977,7 @@ impl kernel::Server for KernelImpl {
 
             // Register block tools on threaded kernel (including drift)
             let kernel_arc = Arc::new(threaded_kernel);
-            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone(), ctx_id).await;
+            register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
 
             // LLM registry is inherited from parent via Kernel::thread()
             // (includes runtime setDefaultProvider/setDefaultModel changes)
@@ -1053,8 +1011,7 @@ impl kernel::Server for KernelImpl {
                         kaish: None,
                         kernel: kernel_arc,
                         documents,
-                        context_manager,
-                        config_backend: parent_config_backend,
+                            config_backend: parent_config_backend,
                         config_watcher: None, // Thread doesn't own the watcher
                         conversation_cache: Rc::new(RefCell::new(HashMap::new())),
                     },
@@ -3186,13 +3143,13 @@ impl kernel::Server for KernelImpl {
         );
 
         // Extract everything we need from state, then drop borrow
-        let (documents, context_manager, parent_ctx_id, kernel_arc) = {
+        let (documents, parent_ctx_id, kernel_arc) = {
             let state_ref = self.state.borrow();
             let kernel_state = match state_ref.kernels.get(&kernel_id) {
                 Some(ks) => ks,
                 None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
             };
-            (kernel_state.documents.clone(), kernel_state.context_manager.clone(),
+            (kernel_state.documents.clone(),
              kernel_state.context_id, kernel_state.kernel.clone())
         };
 
@@ -3214,10 +3171,7 @@ impl kernel::Server for KernelImpl {
             return Promise::err(capnp::Error::failed(format!("Fork failed: {}", e)));
         }
 
-        // Register in context manager
         let label_owned = if context_label.is_empty() { None } else { Some(context_label.clone()) };
-        let ctx_name = new_ctx_id.to_string();
-        let _seat_info = context_manager.join_context(&ctx_name);
 
         let span = extract_rpc_trace(params_reader.get_trace(), "fork_from_version");
         Promise::from_future(async move {
@@ -4857,7 +4811,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::Role::Model => crate::kaijutsu_capnp::Role::Model,
         kaijutsu_crdt::Role::System => crate::kaijutsu_capnp::Role::System,
         kaijutsu_crdt::Role::Tool => crate::kaijutsu_capnp::Role::Tool,
-        kaijutsu_crdt::Role::Asset => crate::kaijutsu_capnp::Role::System, // Asset maps to System on wire
+        kaijutsu_crdt::Role::Asset => crate::kaijutsu_capnp::Role::Asset,
     });
 
     // Set status
@@ -4875,7 +4829,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
         kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
         kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
-        kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::Text, // File maps to Text on wire
+        kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
     });
 
     // Set basic fields (no author — derived from id.agent_id)
@@ -4905,6 +4859,17 @@ fn set_block_snapshot(
         builder.set_display_hint(hint);
     }
 
+    // Set tool mechanism metadata
+    if let Some(tk) = block.tool_kind {
+        builder.set_has_tool_kind(true);
+        builder.set_tool_kind(tool_kind_to_capnp(tk));
+    }
+
+    // Set file metadata
+    if let Some(ref path) = block.file_path {
+        builder.set_file_path(path);
+    }
+
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
         builder.set_source_context(ctx.as_bytes());
@@ -4915,6 +4880,24 @@ fn set_block_snapshot(
     if let Some(dk) = block.drift_kind {
         builder.set_has_drift_kind(true);
         builder.set_drift_kind(drift_kind_to_capnp(dk));
+    }
+}
+
+/// Convert a Cap'n Proto ToolKind to CRDT ToolKind.
+fn capnp_tool_kind_to_crdt(tk: Option<crate::kaijutsu_capnp::ToolKind>) -> Option<kaijutsu_crdt::ToolKind> {
+    match tk? {
+        crate::kaijutsu_capnp::ToolKind::Shell => Some(kaijutsu_crdt::ToolKind::Shell),
+        crate::kaijutsu_capnp::ToolKind::Mcp => Some(kaijutsu_crdt::ToolKind::Mcp),
+        crate::kaijutsu_capnp::ToolKind::Builtin => Some(kaijutsu_crdt::ToolKind::Builtin),
+    }
+}
+
+/// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
+fn tool_kind_to_capnp(tk: kaijutsu_crdt::ToolKind) -> crate::kaijutsu_capnp::ToolKind {
+    match tk {
+        kaijutsu_crdt::ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
+        kaijutsu_crdt::ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
+        kaijutsu_crdt::ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
     }
 }
 
@@ -4969,6 +4952,7 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::Role::Model => kaijutsu_crdt::Role::Model,
         crate::kaijutsu_capnp::Role::System => kaijutsu_crdt::Role::System,
         crate::kaijutsu_capnp::Role::Tool => kaijutsu_crdt::Role::Tool,
+        crate::kaijutsu_capnp::Role::Asset => kaijutsu_crdt::Role::Asset,
     };
 
     let status = match reader.get_status()? {
@@ -4984,6 +4968,7 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
         crate::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
         crate::kaijutsu_capnp::BlockKind::Drift => kaijutsu_crdt::BlockKind::Drift,
+        crate::kaijutsu_capnp::BlockKind::File => kaijutsu_crdt::BlockKind::File,
     };
 
     let tool_call_id = if reader.has_tool_call_id() {
@@ -5020,14 +5005,21 @@ fn parse_block_snapshot(
         collapsed: reader.get_collapsed(),
         compacted: false,
         created_at: reader.get_created_at(),
-        tool_kind: None, // TODO: parse from wire when schema supports it
+        tool_kind: if reader.get_has_tool_kind() {
+            capnp_tool_kind_to_crdt(reader.get_tool_kind().ok())
+        } else { None },
         tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
         tool_input,
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
         display_hint,
-        file_path: None,
+        file_path: if reader.has_file_path() {
+            reader.get_file_path().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+        } else { None },
         order_key: None,
         source_context: if reader.has_source_context() {
             reader.get_source_context().ok()

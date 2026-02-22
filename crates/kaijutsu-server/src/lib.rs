@@ -19,7 +19,7 @@ pub mod kaijutsu_capnp {
 
 pub use auth_db::{AuthDb, SshKeyRecord};
 pub use kaijutsu_kernel::{DriftRouter, ContextHandle, StagedDrift, DriftError};
-pub use context_engine::{ContextEngine, ContextManager};
+pub use context_engine::ContextEngine;
 pub use docs_filesystem::KaijutsuFilesystem;
 pub use embedded_kaish::EmbeddedKaish;
 pub use kaish_backend::KaijutsuBackend;

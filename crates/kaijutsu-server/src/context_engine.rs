@@ -1,15 +1,12 @@
 //! Context management engine for kaish shell.
 //!
 //! Provides the `context` command for creating and switching contexts from
-//! the shell interface. This bridges the kaish tool dispatch with the server's
-//! context management.
+//! the shell interface. Delegates all context state to the kernel's DriftRouter
+//! (the single source of truth for context labels and metadata).
 //!
 //! # Usage
 //!
 //! ```kaish
-//! # Create or join a context
-//! context new planning
-//!
 //! # Switch to an existing context
 //! context switch default
 //!
@@ -17,105 +14,29 @@
 //! context list
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kaijutsu_types::{ContextId, KernelId};
-use parking_lot::RwLock;
+use kaijutsu_types::ContextId;
+use tokio::sync::RwLock;
 
+use kaijutsu_kernel::drift::SharedDriftRouter;
 use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
 
 // ============================================================================
-// Context Manager - Thread-safe state for context operations
+// Shell Context State - per-connection "current context" tracking
 // ============================================================================
 
-/// Thread-safe context state shared between RPC handlers and ContextEngine.
+/// Per-connection state tracking which context the shell is currently in.
 ///
-/// Tracks which contexts exist and which one is currently active for this
-/// connection. Lightweight context membership tracking.
-#[derive(Debug)]
-pub struct ContextManager {
-    inner: RwLock<ContextManagerInner>,
-}
+/// All context listing, label resolution, and metadata live in the kernel's
+/// DriftRouter. This struct only tracks which context is "active" for this
+/// particular shell session.
+pub type CurrentContext = Arc<RwLock<Option<ContextId>>>;
 
-#[derive(Debug, Default)]
-#[allow(dead_code)] // nick/kernel_id/instance used by constructor, useful for future presence
-struct ContextManagerInner {
-    /// All known context labels
-    context_labels: HashMap<ContextId, String>,
-    /// Current user identity (username)
-    nick: String,
-    /// Kernel ID this manager belongs to
-    kernel_id: KernelId,
-    /// Current instance ID for this connection
-    instance: String,
-    /// Currently active context
-    current_context: Option<ContextId>,
-}
-
-impl ContextManager {
-    /// Create a new context manager.
-    pub fn new(nick: String, kernel_id: KernelId, instance: String) -> Self {
-        Self {
-            inner: RwLock::new(ContextManagerInner {
-                context_labels: HashMap::new(),
-                nick,
-                kernel_id,
-                instance,
-                current_context: None,
-            }),
-        }
-    }
-
-    /// Register a context label.
-    pub fn register_context(&self, id: ContextId, label: &str) {
-        let mut inner = self.inner.write();
-        inner.context_labels.insert(id, label.to_string());
-    }
-
-    /// Join a context by label, returning the label.
-    pub fn join_context(&self, label: &str) -> String {
-        let mut inner = self.inner.write();
-
-        // Find context by label
-        let ctx_id = inner
-            .context_labels
-            .iter()
-            .find(|(_, l)| l.as_str() == label)
-            .map(|(id, _)| *id);
-
-        if let Some(id) = ctx_id {
-            inner.current_context = Some(id);
-        }
-
-        label.to_string()
-    }
-
-    /// Leave the current context.
-    pub fn leave_context(&self) -> Option<String> {
-        let mut inner = self.inner.write();
-        let old = inner.current_context.take();
-        old.and_then(|id| inner.context_labels.get(&id).cloned())
-    }
-
-    /// Get the current context label.
-    pub fn current_context(&self) -> Option<String> {
-        let inner = self.inner.read();
-        inner
-            .current_context
-            .and_then(|id| inner.context_labels.get(&id).cloned())
-    }
-
-    /// List all context labels.
-    pub fn list_contexts(&self) -> Vec<String> {
-        self.inner
-            .read()
-            .context_labels
-            .values()
-            .cloned()
-            .collect()
-    }
+/// Create a new current-context tracker.
+pub fn current_context() -> CurrentContext {
+    Arc::new(RwLock::new(None))
 }
 
 // ============================================================================
@@ -125,56 +46,92 @@ impl ContextManager {
 /// Execution engine for the `context` shell command.
 ///
 /// Provides commands:
-/// - `context new <name>` - Create or join a context
-/// - `context switch <name>` - Switch to a context (same as new)
+/// - `context switch <name>` - Switch to a context
 /// - `context list` - List all contexts
 /// - `context current` - Show current context
 pub struct ContextEngine {
-    manager: Arc<ContextManager>,
+    drift: SharedDriftRouter,
+    current: CurrentContext,
 }
 
 impl ContextEngine {
     /// Create a new context engine.
-    pub fn new(manager: Arc<ContextManager>) -> Self {
-        Self { manager }
+    pub fn new(drift: SharedDriftRouter, current: CurrentContext) -> Self {
+        Self { drift, current }
     }
 
-    fn execute_inner(&self, args: Vec<String>) -> Result<String, String> {
+    async fn execute_inner(&self, args: Vec<String>) -> Result<String, String> {
         if args.is_empty() {
             return self.show_help();
         }
 
         match args[0].as_str() {
-            "new" | "switch" | "join" => {
+            "switch" | "join" => {
                 if args.len() < 2 {
-                    return Err("Usage: context new <name>".to_string());
+                    return Err("Usage: context switch <name>".to_string());
                 }
-                let name = &args[1];
-                let ctx = self.manager.join_context(name);
-                Ok(format!("Joined context '{}'", ctx))
+                let query = &args[1];
+                let router = self.drift.read().await;
+                match router.resolve_context(query) {
+                    Ok(ctx_id) => {
+                        let label = router.get(ctx_id)
+                            .and_then(|h| h.label.as_deref())
+                            .unwrap_or("(unlabeled)");
+                        let label_owned = label.to_string();
+                        drop(router);
+                        *self.current.write().await = Some(ctx_id);
+                        Ok(format!("Switched to context '{}'", label_owned))
+                    }
+                    Err(e) => Err(format!("Failed to resolve context '{}': {}", query, e)),
+                }
             }
             "list" | "ls" => {
-                let contexts = self.manager.list_contexts();
-                let current = self.manager.current_context();
+                let router = self.drift.read().await;
+                let current_id = *self.current.read().await;
+                let contexts = router.list_contexts();
 
                 let mut output = String::new();
-                for ctx in contexts {
-                    if Some(&ctx) == current.as_ref() {
-                        output.push_str(&format!("* {} (current)\n", ctx));
+                for handle in contexts {
+                    let label = handle.label.as_deref().unwrap_or("(unlabeled)");
+                    let short = handle.id.short();
+                    let is_current = current_id == Some(handle.id);
+                    if is_current {
+                        output.push_str(&format!("* {} [{}] (current)\n", label, short));
                     } else {
-                        output.push_str(&format!("  {}\n", ctx));
+                        output.push_str(&format!("  {} [{}]\n", label, short));
                     }
+                }
+                if output.is_empty() {
+                    output.push_str("No contexts registered.\n");
                 }
                 Ok(output)
             }
-            "current" | "show" => match self.manager.current_context() {
-                Some(ctx) => Ok(format!("Current context: {}", ctx)),
-                None => Ok("No active context".to_string()),
-            },
-            "leave" => match self.manager.leave_context() {
-                Some(ctx) => Ok(format!("Left context '{}'", ctx)),
-                None => Ok("No active context to leave".to_string()),
-            },
+            "current" | "show" => {
+                let current_id = *self.current.read().await;
+                match current_id {
+                    Some(id) => {
+                        let router = self.drift.read().await;
+                        let label = router.get(id)
+                            .and_then(|h| h.label.as_deref())
+                            .unwrap_or("(unlabeled)");
+                        Ok(format!("Current context: {} [{}]", label, id.short()))
+                    }
+                    None => Ok("No active context".to_string()),
+                }
+            }
+            "leave" => {
+                let old = self.current.write().await.take();
+                match old {
+                    Some(id) => {
+                        let router = self.drift.read().await;
+                        let label = router.get(id)
+                            .and_then(|h| h.label.as_deref())
+                            .unwrap_or("(unlabeled)");
+                        Ok(format!("Left context '{}' [{}]", label, id.short()))
+                    }
+                    None => Ok("No active context to leave".to_string()),
+                }
+            }
             "help" | "-h" | "--help" => self.show_help(),
             other => Err(format!(
                 "Unknown subcommand: {}. Use 'context help' for usage.",
@@ -190,16 +147,15 @@ USAGE:
     context <command> [args]
 
 COMMANDS:
-    new <name>      Create or join a context
-    switch <name>   Switch to a context (alias for new)
+    switch <name>   Switch to a context (by label or ID prefix)
     list            List all contexts
     current         Show current context
     leave           Leave current context
     help            Show this help
 
 EXAMPLES:
-    context new planning
-    context switch default
+    context switch planning
+    context switch def        # prefix match
     context list
 "#
         .to_string())
@@ -213,7 +169,7 @@ impl ExecutionEngine for ContextEngine {
     }
 
     fn description(&self) -> &str {
-        "Manage conversation contexts (new, switch, list, current, leave)"
+        "Manage conversation contexts (switch, list, current, leave)"
     }
 
     fn schema(&self) -> Option<serde_json::Value> {
@@ -223,7 +179,7 @@ impl ExecutionEngine for ContextEngine {
                 "_positional": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Subcommand and arguments: new|switch|list|current|leave [name]"
+                    "description": "Subcommand and arguments: switch|list|current|leave [name]"
                 }
             },
             "required": []
@@ -250,7 +206,7 @@ impl ExecutionEngine for ContextEngine {
             })
             .unwrap_or_default();
 
-        match self.execute_inner(args) {
+        match self.execute_inner(args).await {
             Ok(output) => Ok(ExecResult::success(output)),
             Err(e) => Ok(ExecResult::failure(1, e)),
         }
@@ -264,44 +220,16 @@ impl ExecutionEngine for ContextEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_context_manager_basic() {
-        let manager = ContextManager::new(
-            "alice".to_string(),
-            KernelId::new(),
-            "instance-1".to_string(),
-        );
-
-        // Register a context
-        let default_id = ContextId::new();
-        manager.register_context(default_id, "default");
-
-        // Should have default context
-        assert!(manager.list_contexts().contains(&"default".to_string()));
-
-        // Register and join a new context
-        let planning_id = ContextId::new();
-        manager.register_context(planning_id, "planning");
-        let ctx = manager.join_context("planning");
-        assert_eq!(ctx, "planning");
-        assert_eq!(manager.current_context(), Some("planning".to_string()));
-
-        // List should include both
-        let contexts = manager.list_contexts();
-        assert!(contexts.contains(&"default".to_string()));
-        assert!(contexts.contains(&"planning".to_string()));
-    }
+    use kaijutsu_kernel::drift::shared_drift_router;
 
     #[tokio::test]
     async fn test_context_engine_list() {
-        let manager = Arc::new(ContextManager::new(
-            "bob".to_string(),
-            KernelId::new(),
-            "instance-2".to_string(),
-        ));
-        manager.register_context(ContextId::new(), "default");
-        let engine = ContextEngine::new(manager);
+        let drift = shared_drift_router();
+        let ctx_id = ContextId::new();
+        drift.write().await.register(ctx_id, Some("default"), None);
+
+        let current = current_context();
+        let engine = ContextEngine::new(drift, current);
 
         let result = engine
             .execute(r#"{"_positional": ["list"]}"#)
@@ -312,13 +240,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_context_engine_switch() {
+        let drift = shared_drift_router();
+        let ctx_id = ContextId::new();
+        drift.write().await.register(ctx_id, Some("planning"), None);
+
+        let current = current_context();
+        let engine = ContextEngine::new(drift, current.clone());
+
+        let result = engine
+            .execute(r#"{"_positional": ["switch", "planning"]}"#)
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.stdout.contains("planning"));
+        assert_eq!(*current.read().await, Some(ctx_id));
+    }
+
+    #[tokio::test]
     async fn test_context_engine_help() {
-        let manager = Arc::new(ContextManager::new(
-            "dave".to_string(),
-            KernelId::new(),
-            "instance-4".to_string(),
-        ));
-        let engine = ContextEngine::new(manager);
+        let drift = shared_drift_router();
+        let current = current_context();
+        let engine = ContextEngine::new(drift, current);
 
         let result = engine
             .execute(r#"{"_positional": ["help"]}"#)
