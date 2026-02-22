@@ -174,10 +174,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             kaijutsu_mcp::Backend::Local(store) => {
                 // Local mode: hooks write to the same in-memory store
                 let doc_ids = store.list_ids();
-                let doc_id = doc_ids.first()
-                    .cloned()
-                    .unwrap_or_else(|| "hook-local".to_string());
-                Arc::new(HookListener::local(store.clone(), doc_id))
+                let ctx_id = doc_ids.first()
+                    .copied()
+                    .unwrap_or_else(kaijutsu_crdt::ContextId::new);
+                Arc::new(HookListener::local(store.clone(), ctx_id))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
                 Arc::new(HookListener::remote(

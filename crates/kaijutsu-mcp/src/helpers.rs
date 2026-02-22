@@ -3,7 +3,7 @@
 //! Parsing functions delegate to strum-derived FromStr implementations on the
 //! enums in kaijutsu-crdt and kaijutsu-kernel.
 
-use kaijutsu_crdt::{BlockId, BlockKind, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore};
 
 // ============================================================================
@@ -39,21 +39,27 @@ pub fn parse_block_id(s: &str) -> Option<BlockId> {
 // Block Lookup
 // ============================================================================
 
-/// Find a block across all documents, returning (document_id, BlockId).
+/// Find a block across all documents, returning (ContextId, BlockId).
 ///
-/// TODO(perf): O(D×B) lookup - iterates all documents and blocks.
-/// BlockId already contains document_id, so we could extract it directly.
-/// Better: add reverse index HashMap<BlockId, DocumentId> to SharedBlockStore.
-pub fn find_block(store: &SharedBlockStore, block_id_str: &str) -> Option<(String, BlockId)> {
+/// Since BlockId contains context_id, we first check that document directly.
+/// Falls back to scanning all documents if the context isn't found.
+pub fn find_block(store: &SharedBlockStore, block_id_str: &str) -> Option<(ContextId, BlockId)> {
     let block_id = parse_block_id(block_id_str)?;
 
-    for document_id in store.list_ids() {
-        if let Some(entry) = store.get(&document_id) {
-            for snapshot in entry.doc.blocks_ordered() {
-                if snapshot.id == block_id {
-                    return Some((document_id.clone(), block_id));
-                }
-            }
+    // Fast path: BlockId contains context_id, check directly
+    let ctx = block_id.context_id;
+    if let Some(entry) = store.get(ctx)
+        && entry.doc.get_block_snapshot(&block_id).is_some()
+    {
+        return Some((ctx, block_id));
+    }
+
+    // Slow fallback: scan all documents
+    for context_id in store.list_ids() {
+        if let Some(entry) = store.get(context_id)
+            && entry.doc.get_block_snapshot(&block_id).is_some()
+        {
+            return Some((context_id, block_id));
         }
     }
     None

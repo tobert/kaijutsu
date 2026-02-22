@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{ConversationDAG, Frontier};
+use kaijutsu_crdt::{ContextId, ConversationDAG, Frontier, PrincipalId};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -129,8 +129,6 @@ pub enum Backend {
 /// MCP tools.
 #[derive(Clone)]
 pub struct RemoteState {
-    /// The document ID for our context
-    pub document_id: String,
     /// Kernel ID we connected to
     pub kernel_id: kaijutsu_crdt::KernelId,
     /// Context ID we joined
@@ -213,7 +211,7 @@ impl KaijutsuMcp {
 
     /// Create a new MCP server with an in-memory store.
     pub fn new() -> Self {
-        Self::with_store(shared_block_store("mcp-server"))
+        Self::with_store(shared_block_store(PrincipalId::system()))
     }
 
     /// Connect to a running kaijutsu-server via SSH.
@@ -229,7 +227,7 @@ impl KaijutsuMcp {
     pub async fn connect(
         host: &str,
         port: u16,
-        kernel_id: &str,
+        _kernel_id: &str,
         context_name: &str,
         cc_session_id: Option<&str>,
     ) -> Result<Self, anyhow::Error> {
@@ -261,41 +259,40 @@ impl KaijutsuMcp {
         };
 
         // joinContext auto-creates if the context doesn't exist
-        let document_id = kernel.join_context(context_id, "mcp-server").await?;
+        let _joined_ctx = kernel.join_context(context_id, "mcp-server").await?;
 
         tracing::info!(
             kernel = %kernel_id_typed,
             context_id = %context_id,
             context_label = %context_name,
-            document_id = %document_id,
             "Connected to server"
         );
 
         // Create store with FlowBus for local event tracking
         let block_flows = shared_block_flow_bus(1024);
         let store = std::sync::Arc::new(
-            kaijutsu_kernel::BlockStore::with_flows("mcp-remote", block_flows.clone())
+            kaijutsu_kernel::BlockStore::with_flows(PrincipalId::system(), block_flows.clone())
         );
 
         // Sync document state from server
-        let doc_state = kernel.get_document_state(&document_id).await?;
+        let doc_state = kernel.get_context_state(context_id).await?;
 
         // Populate the store — single source of truth for all MCP reads
         let frontier = if !doc_state.ops.is_empty() {
             store.create_document_from_oplog(
-                doc_state.document_id.clone(),
+                doc_state.context_id,
                 DocumentKind::Conversation,
                 None,
                 &doc_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
 
             // Extract frontier from the store's document
-            store.get(&doc_state.document_id)
+            store.get(doc_state.context_id)
                 .map(|entry| entry.doc.frontier())
                 .unwrap_or_default()
         } else {
             store.create_document(
-                doc_state.document_id.clone(),
+                doc_state.context_id,
                 DocumentKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
@@ -304,16 +301,16 @@ impl KaijutsuMcp {
         };
 
         let sync = SyncManager::with_state(
-            Some(doc_state.document_id.clone()),
+            Some(doc_state.context_id),
             Some(frontier),
         );
 
-        let block_count = store.get(&doc_state.document_id)
+        let block_count = store.get(doc_state.context_id)
             .map(|e| e.doc.block_count())
             .unwrap_or(0);
 
         tracing::debug!(
-            doc = %doc_state.document_id,
+            ctx = %doc_state.context_id,
             blocks = block_count,
             "Initial sync complete, SyncManager initialized"
         );
@@ -323,7 +320,7 @@ impl KaijutsuMcp {
         // Spawn actor with the existing connection (no double-connect)
         let actor = spawn_actor(
             config,
-            kernel_id.to_string(),
+            kernel_id_typed,
             Some(context_id),
             "mcp-server".to_string(),
             Some((client, kernel)),
@@ -336,13 +333,13 @@ impl KaijutsuMcp {
             let mut event_rx = actor.subscribe_events();
             let store_bg = Arc::clone(&store);
             let sync_bg = Arc::clone(&sync_arc);
-            let doc_id_bg = document_id.clone();
+            let ctx_id_bg = context_id;
 
             let bg_handle = tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            apply_server_event(&store_bg, &sync_bg, &doc_id_bg, event);
+                            apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Missed {n} events, forcing full resync");
@@ -357,7 +354,6 @@ impl KaijutsuMcp {
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
-                document_id,
                 kernel_id: kernel_id_typed,
                 context_id,
                 store,
@@ -414,7 +410,7 @@ impl KaijutsuMcp {
             sync.frontier().cloned().unwrap_or_default()
         };
 
-        let ops = remote.store.ops_since(&remote.document_id, &frontier)
+        let ops = remote.store.ops_since(remote.context_id, &frontier)
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Serialize ops for transmission
@@ -427,16 +423,16 @@ impl KaijutsuMcp {
         }
 
         tracing::debug!(
-            doc = %remote.document_id,
+            ctx = %remote.context_id,
             ops_bytes = ops_bytes.len(),
             "Pushing ops to server"
         );
 
         // Push via persistent actor (no reconnect dance)
-        let ack_version = remote.actor.push_ops(&remote.document_id, &ops_bytes).await
+        let ack_version = remote.actor.push_ops(remote.context_id, &ops_bytes).await
             .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
-        tracing::info!(doc = %remote.document_id, ack_version, "Pushed ops");
+        tracing::info!(ctx = %remote.context_id, ack_version, "Pushed ops");
 
         let ops_count = ops_bytes.len() / 50; // Rough estimate
         Ok((ops_count.max(1), ack_version))
@@ -487,10 +483,15 @@ impl KaijutsuMcp {
             None => return format!("Error: invalid document kind '{}'. Use: conversation, code, text, or git", req.kind),
         };
 
-        match self.store().create_document(req.id.clone(), kind, req.language) {
+        let context_id = match ContextId::parse(&req.id) {
+            Ok(id) => id,
+            Err(_) => ContextId::new(), // Generate fresh ID if not a valid UUID
+        };
+
+        match self.store().create_document(context_id, kind, req.language) {
             Ok(()) => serde_json::json!({
                 "success": true,
-                "document_id": req.id,
+                "document_id": context_id.to_hex(),
                 "kind": req.kind
             }).to_string(),
             Err(e) => format!("Error: {}", e),
@@ -501,7 +502,7 @@ impl KaijutsuMcp {
     #[tracing::instrument(skip(self), name = "mcp.doc_list")]
     fn doc_list(&self) -> String {
         let docs: Vec<DocumentInfo> = self.store().list_ids().iter().map(|id| {
-            let (kind, language, block_count) = self.store().get(id)
+            let (kind, language, block_count) = self.store().get(*id)
                 .map(|entry| {
                     let kind = entry.kind.as_str().to_string();
                     let lang = entry.language.clone();
@@ -511,7 +512,7 @@ impl KaijutsuMcp {
                 .unwrap_or_else(|| ("unknown".to_string(), None, 0));
 
             DocumentInfo {
-                id: id.clone(),
+                id: id.to_hex(),
                 kind,
                 language,
                 block_count,
@@ -527,7 +528,12 @@ impl KaijutsuMcp {
     #[tool(description = "Delete a document and all its blocks.")]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_delete")]
     fn doc_delete(&self, Parameters(req): Parameters<DocDeleteRequest>) -> String {
-        match self.store().delete_document(&req.id) {
+        let context_id = match ContextId::parse(&req.id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid document ID '{}': {}", req.id, e),
+        };
+
+        match self.store().delete_document(context_id) {
             Ok(()) => serde_json::json!({
                 "success": true,
                 "deleted": req.id
@@ -543,6 +549,11 @@ impl KaijutsuMcp {
     #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_create")]
     fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
+        let context_id = match ContextId::parse(&req.document_id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
+        };
+
         let role = match parse_role(&req.role) {
             Some(r) => r,
             None => return format!("Error: invalid role '{}'. Use: user, model, system, or tool", req.role),
@@ -559,7 +570,7 @@ impl KaijutsuMcp {
         let content = req.content.unwrap_or_default();
 
         match self.store().insert_block(
-            &req.document_id,
+            context_id,
             parent_id.as_ref(),
             after_id.as_ref(),
             role,
@@ -567,7 +578,7 @@ impl KaijutsuMcp {
             &content,
         ) {
             Ok(block_id) => {
-                let version = self.store().get(&req.document_id)
+                let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
@@ -584,12 +595,12 @@ impl KaijutsuMcp {
     #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
     fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(&document_id) {
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document not found"),
         };
@@ -655,14 +666,14 @@ impl KaijutsuMcp {
     #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_append")]
     fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        match self.store().append_text(&document_id, &block_id, &req.text) {
+        match self.store().append_text(context_id, &block_id, &req.text) {
             Ok(()) => {
-                let version = self.store().get(&document_id)
+                let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
@@ -678,14 +689,14 @@ impl KaijutsuMcp {
     #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_edit")]
     fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
         for (idx, op) in req.operations.into_iter().enumerate() {
             // Get current content
-            let content = match self.store().get(&document_id) {
+            let content = match self.store().get(context_id) {
                 Some(entry) => {
                     entry.doc.get_block_snapshot(&block_id)
                         .map(|s| s.content.clone())
@@ -703,7 +714,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text(&document_id, &block_id, pos, &text_with_newline, 0)
+                        self.store().edit_text(context_id, &block_id, pos, &text_with_newline, 0)
                     } else {
                         Err(format!(
                             "Invalid line number {}: block has {} line{} (valid range: 0-{})",
@@ -715,7 +726,7 @@ impl KaijutsuMcp {
                     let total_lines = line_count(&content);
                     if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
                         if start < end {
-                            self.store().edit_text(&document_id, &block_id, start, "", end - start)
+                            self.store().edit_text(context_id, &block_id, start, "", end - start)
                         } else {
                             Ok(())
                         }
@@ -749,7 +760,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text(&document_id, &block_id, start, &text_with_newline, end - start)
+                        self.store().edit_text(context_id, &block_id, start, &text_with_newline, end - start)
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
@@ -765,7 +776,7 @@ impl KaijutsuMcp {
             }
         }
 
-        let version = self.store().get(&document_id)
+        let version = self.store().get(context_id)
             .map(|e| e.version())
             .unwrap_or(0);
 
@@ -784,18 +795,17 @@ impl KaijutsuMcp {
 
         let mut blocks = Vec::new();
 
-        let document_ids: Vec<String> = if let Some(ref doc_id) = req.document_id {
-            if self.store().contains(doc_id) {
-                vec![doc_id.clone()]
-            } else {
-                vec![]
+        let context_ids: Vec<ContextId> = if let Some(ref doc_id) = req.document_id {
+            match ContextId::parse(doc_id) {
+                Ok(id) if self.store().contains(id) => vec![id],
+                _ => vec![],
             }
         } else {
             self.store().list_ids()
         };
 
-        for document_id in document_ids {
-            if let Some(entry) = self.store().get(&document_id) {
+        for context_id in context_ids {
+            if let Some(entry) = self.store().get(context_id) {
                 for snapshot in entry.doc.blocks_ordered() {
                     // Apply filters
                     if let Some(kind) = kind_filter {
@@ -856,7 +866,7 @@ impl KaijutsuMcp {
     #[tool(description = "Set the status of a block: pending, running, done, or error.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_status")]
     fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
@@ -866,9 +876,9 @@ impl KaijutsuMcp {
             None => return format!("Error: invalid status '{}'. Use: pending, running, done, or error", req.status),
         };
 
-        match self.store().set_status(&document_id, &block_id, status) {
+        match self.store().set_status(context_id, &block_id, status) {
             Ok(()) => {
-                let version = self.store().get(&document_id)
+                let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
@@ -898,18 +908,17 @@ impl KaijutsuMcp {
 
         let mut matches = Vec::new();
 
-        let document_ids: Vec<String> = if let Some(ref doc_id) = req.document_id {
-            if self.store().contains(doc_id) {
-                vec![doc_id.clone()]
-            } else {
-                vec![]
+        let context_ids: Vec<ContextId> = if let Some(ref doc_id) = req.document_id {
+            match ContextId::parse(doc_id) {
+                Ok(id) if self.store().contains(id) => vec![id],
+                _ => vec![],
             }
         } else {
             self.store().list_ids()
         };
 
-        'outer: for document_id in document_ids {
-            let snapshots = match self.store().block_snapshots(&document_id) {
+        'outer: for context_id in context_ids {
+            let snapshots = match self.store().block_snapshots(context_id) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -952,7 +961,7 @@ impl KaijutsuMcp {
                             .collect();
 
                         matches.push(SearchMatch {
-                            document_id: document_id.clone(),
+                            document_id: context_id.to_hex(),
                             block_id: snapshot.id.to_key(),
                             line: line_idx as u32,
                             content: line.to_string(),
@@ -982,7 +991,12 @@ impl KaijutsuMcp {
     #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.")]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_tree")]
     fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
-        let entry = match self.store().get(&req.document_id) {
+        let context_id = match ContextId::parse(&req.document_id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
+        };
+
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document '{}' not found", req.document_id),
         };
@@ -1010,12 +1024,12 @@ impl KaijutsuMcp {
     #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
     fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(&document_id) {
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document not found"),
         };
@@ -1035,7 +1049,7 @@ impl KaijutsuMcp {
 
         serde_json::json!({
             "block_id": req.block_id,
-            "document_id": document_id,
+            "document_id": context_id.to_hex(),
             "version": version,
             "frontier": frontier,
             "content_length": content_length,
@@ -1046,7 +1060,7 @@ impl KaijutsuMcp {
                 "status": snapshot.status.as_str(),
                 "parent_id": snapshot.parent_id.map(|id| id.to_key()),
                 "created_at": snapshot.created_at,
-                "author": snapshot.author,
+                "author": snapshot.author().to_hex(),
                 "collapsed": snapshot.collapsed,
                 "tool_name": snapshot.tool_name,
                 "tool_call_id": snapshot.tool_call_id.map(|id| id.to_key()),
@@ -1059,12 +1073,12 @@ impl KaijutsuMcp {
     #[tool(description = "Get version history information for a block. Shows creation time and current version details.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
     fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(&document_id) {
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document not found"),
         };
@@ -1089,7 +1103,7 @@ impl KaijutsuMcp {
             "unknown".to_string()
         };
 
-        output.push_str(&format!("created: {} by {}\n", created_time, snapshot.author));
+        output.push_str(&format!("created: {} by {}\n", created_time, snapshot.author().to_hex()));
         output.push_str(&format!("version: {} (document version)\n", version));
         output.push_str(&format!("content: {} line{}, {} byte{}\n",
             content_lines, if content_lines == 1 { "" } else { "s" },
@@ -1103,12 +1117,12 @@ impl KaijutsuMcp {
     #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
     fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
-        let (document_id, block_id) = match find_block(self.store(), &req.block_id) {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(&document_id) {
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document not found"),
         };
@@ -1316,7 +1330,7 @@ impl KaijutsuMcp {
         match actor.drift_pull(source_id, req.prompt.as_deref()).await {
             Ok(block_id) => serde_json::json!({
                 "success": true,
-                "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
+                "block_id": block_id.to_key(),
                 "source_ctx": req.source_ctx,
             }).to_string(),
             Err(e) => format!("Error: {e}"),
@@ -1339,7 +1353,7 @@ impl KaijutsuMcp {
         match actor.drift_merge(source_id).await {
             Ok(block_id) => serde_json::json!({
                 "success": true,
-                "block_id": format!("{}/{}/{}", block_id.document_id, block_id.agent_id, block_id.seq),
+                "block_id": block_id.to_key(),
                 "source_ctx": req.source_ctx,
             }).to_string(),
             Err(e) => format!("Error: {e}"),
@@ -1379,12 +1393,12 @@ impl KaijutsuMcp {
         };
 
         let actor = &remote.actor;
-        let doc_id = &remote.document_id;
+        let ctx_id = remote.context_id;
 
-        // Execute command — creates ShellCommand + ShellOutput blocks in the document.
+        // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
         // when execution completes.
-        let cmd_block_id = match actor.shell_execute(&req.command, doc_id).await {
+        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id).await {
             Ok(id) => id,
             Err(e) => return format!("Error starting command: {e}"),
         };
@@ -1392,7 +1406,7 @@ impl KaijutsuMcp {
         tracing::info!(
             command = %req.command,
             cmd_block = %cmd_block_id.to_key(),
-            doc = %doc_id,
+            ctx = %ctx_id,
             "Shell command dispatched"
         );
 
@@ -1422,10 +1436,11 @@ impl KaijutsuMcp {
                     // Check if this status change is for a child of our command block
                     if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) {
                         // Read from store (single source of truth, kept in sync by background listener)
-                        if let Some(entry) = remote.store.get(doc_id) {
+                        if let Some(entry) = remote.store.get(ctx_id) {
                             if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
                                 b.parent_id.as_ref() == Some(&cmd_block_id)
-                                    && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
+                                    && b.is_shell()
+                                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
                                     && b.id == block_id
                             }) {
                                 tracing::info!(
@@ -1449,10 +1464,11 @@ impl KaijutsuMcp {
                 }
                 _ => {
                     // Timeout or other event — fallback: check store state
-                    if let Some(entry) = remote.store.get(doc_id) {
+                    if let Some(entry) = remote.store.get(ctx_id) {
                         if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
                             b.parent_id.as_ref() == Some(&cmd_block_id)
-                                && b.kind == kaijutsu_crdt::BlockKind::ShellOutput
+                                && b.is_shell()
+                                && b.kind == kaijutsu_crdt::BlockKind::ToolResult
                         }) {
                             match output.status {
                                 kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
@@ -1528,7 +1544,12 @@ impl KaijutsuMcp {
     #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.")]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_undo")]
     fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {
-        let entry = match self.store().get(&req.document_id) {
+        let context_id = match ContextId::parse(&req.document_id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
+        };
+
+        let entry = match self.store().get(context_id) {
             Some(e) => e,
             None => return format!("Error: document '{}' not found", req.document_id),
         };
@@ -1558,7 +1579,7 @@ impl KaijutsuMcp {
 
             output.push_str(&format!("  {}. [{}] {} \"{}\" at pos {}\n",
                 idx + 1,
-                snapshot.author,
+                snapshot.author().to_hex(),
                 snapshot.kind.as_str(),
                 content_preview,
                 snapshot.id.seq
@@ -1590,7 +1611,13 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<AnalyzeDocumentArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let entry = self.store().get(&args.document_id)
+        let context_id = ContextId::parse(&args.document_id)
+            .map_err(|e| McpError::invalid_params(
+                format!("Invalid document ID '{}': {}", args.document_id, e),
+                None
+            ))?;
+
+        let entry = self.store().get(context_id)
             .ok_or_else(|| McpError::invalid_params(
                 format!("Document '{}' not found", args.document_id),
                 None
@@ -1644,11 +1671,13 @@ impl KaijutsuMcp {
         // Activity/metadata
         if focus == "all" || focus == "activity" {
             content.push_str("## Activity\n\n");
-            let mut authors: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut authors: std::collections::HashSet<String> = std::collections::HashSet::new();
             for block in &blocks {
-                authors.insert(&block.author);
+                authors.insert(block.author().to_hex());
             }
-            content.push_str(&format!("**Authors:** {}\n", authors.into_iter().collect::<Vec<_>>().join(", ")));
+            let mut authors_sorted: Vec<_> = authors.into_iter().collect();
+            authors_sorted.sort();
+            content.push_str(&format!("**Authors:** {}\n", authors_sorted.join(", ")));
 
             // Count by role
             let mut role_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -1690,9 +1719,14 @@ impl KaijutsuMcp {
                 None
             ))?;
 
-        let document_ids: Vec<String> = if let Some(ref doc_id) = args.document_id {
-            if self.store().contains(doc_id) {
-                vec![doc_id.clone()]
+        let context_ids: Vec<ContextId> = if let Some(ref doc_id) = args.document_id {
+            let id = ContextId::parse(doc_id)
+                .map_err(|e| McpError::invalid_params(
+                    format!("Invalid document ID '{}': {}", doc_id, e),
+                    None
+                ))?;
+            if self.store().contains(id) {
+                vec![id]
             } else {
                 return Err(McpError::invalid_params(
                     format!("Document '{}' not found", doc_id),
@@ -1709,8 +1743,8 @@ impl KaijutsuMcp {
         let mut total_matches = 0;
         let context_lines = 3;
 
-        for document_id in document_ids {
-            let snapshots = match self.store().block_snapshots(&document_id) {
+        for context_id in context_ids {
+            let snapshots = match self.store().block_snapshots(context_id) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -1723,7 +1757,7 @@ impl KaijutsuMcp {
 
                         content.push_str(&format!(
                             "## Match in `{}`:{} [{}/{}]\n",
-                            document_id,
+                            context_id.to_hex(),
                             snapshot.id.to_key(),
                             snapshot.role.as_str(),
                             snapshot.kind.as_str()
@@ -1785,13 +1819,13 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<EditingAssistantArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let (document_id, block_id) = find_block(self.store(), &args.block_id)
+        let (context_id, block_id) = find_block(self.store(), &args.block_id)
             .ok_or_else(|| McpError::invalid_params(
                 format!("Block '{}' not found", args.block_id),
                 None
             ))?;
 
-        let entry = self.store().get(&document_id)
+        let entry = self.store().get(context_id)
             .ok_or_else(|| McpError::invalid_params("Document not found", None))?;
 
         let snapshot = entry.doc.get_block_snapshot(&block_id)
@@ -1802,7 +1836,7 @@ impl KaijutsuMcp {
         let mut content = String::new();
 
         content.push_str(&format!("# Editing Assistant: {}\n\n", args.block_id));
-        content.push_str(&format!("**Document:** {}\n", document_id));
+        content.push_str(&format!("**Document:** {}\n", context_id.to_hex()));
         content.push_str(&format!("**Role:** {}\n", snapshot.role.as_str()));
         content.push_str(&format!("**Kind:** {}\n", snapshot.kind.as_str()));
         content.push_str(&format!("**Edit type:** {}\n\n", edit_type));
@@ -1892,46 +1926,46 @@ impl KaijutsuMcp {
 fn apply_server_event(
     store: &SharedBlockStore,
     sync: &Arc<Mutex<SyncManager>>,
-    document_id: &str,
+    context_id: ContextId,
     event: ServerEvent,
 ) {
     match event {
-        ServerEvent::BlockInserted { document_id: event_doc_id, block, ops, .. } => {
-            if event_doc_id != document_id {
+        ServerEvent::BlockInserted { context_id: event_ctx_id, block, ops, .. } => {
+            if event_ctx_id != context_id {
                 return;
             }
             let mut s = sync.lock().expect("sync mutex poisoned");
-            if let Some(mut entry) = store.get_mut(document_id) {
-                match s.apply_block_inserted(&mut entry.doc, &event_doc_id, &block, &ops) {
+            if let Some(mut entry) = store.get_mut(context_id) {
+                match s.apply_block_inserted(&mut entry.doc, event_ctx_id, &block, &ops) {
                     Ok(_) => {
-                        entry.touch("mcp-sync");
+                        entry.touch(PrincipalId::system());
                         tracing::trace!(block = ?block.id, "Applied BlockInserted");
                     }
                     Err(e) => tracing::warn!(block = ?block.id, "BlockInserted sync error: {e}"),
                 }
             }
         }
-        ServerEvent::BlockTextOps { document_id: event_doc_id, ops, .. } => {
-            if event_doc_id != document_id {
+        ServerEvent::BlockTextOps { context_id: event_ctx_id, ops, .. } => {
+            if event_ctx_id != context_id {
                 return;
             }
             let mut s = sync.lock().expect("sync mutex poisoned");
-            if let Some(mut entry) = store.get_mut(document_id) {
-                match s.apply_text_ops(&mut entry.doc, &event_doc_id, &ops) {
+            if let Some(mut entry) = store.get_mut(context_id) {
+                match s.apply_text_ops(&mut entry.doc, event_ctx_id, &ops) {
                     Ok(_) => {
-                        entry.touch("mcp-sync");
+                        entry.touch(PrincipalId::system());
                         tracing::trace!("Applied BlockTextOps");
                     }
                     Err(e) => tracing::warn!("BlockTextOps sync error: {e}"),
                 }
             }
         }
-        ServerEvent::BlockStatusChanged { document_id: event_doc_id, block_id, status } => {
-            if event_doc_id != document_id {
+        ServerEvent::BlockStatusChanged { context_id: event_ctx_id, block_id, status } => {
+            if event_ctx_id != context_id {
                 return;
             }
             // Use store's set_status — handles version bump and flow events
-            if let Err(e) = store.set_status(document_id, &block_id, status) {
+            if let Err(e) = store.set_status(context_id, &block_id, status) {
                 tracing::warn!("BlockStatusChanged error: {e}");
             }
         }
@@ -1993,11 +2027,12 @@ impl ServerHandler for KaijutsuMcp {
 
             // Add each document as a resource
             for doc_id in self.store().list_ids() {
-                if let Some(entry) = self.store().get(&doc_id) {
+                if let Some(entry) = self.store().get(doc_id) {
+                    let doc_hex = doc_id.to_hex();
                     resources.push(RawResource {
-                        uri: format!("kaijutsu://docs/{}", doc_id),
-                        name: doc_id.clone(),
-                        title: Some(format!("Document: {}", doc_id)),
+                        uri: format!("kaijutsu://docs/{}", doc_hex),
+                        name: doc_hex.clone(),
+                        title: Some(format!("Document: {}", doc_hex)),
                         description: Some(format!(
                             "{} document with {} blocks",
                             entry.kind.as_str(),
@@ -2013,7 +2048,7 @@ impl ServerHandler for KaijutsuMcp {
                     for snapshot in entry.doc.blocks_ordered() {
                         let block_key = snapshot.id.to_key();
                         resources.push(RawResource {
-                            uri: format!("kaijutsu://blocks/{}/{}", doc_id, block_key),
+                            uri: format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
                             name: block_key.clone(),
                             title: Some(format!("[{}/{}]", snapshot.role.as_str(), snapshot.kind.as_str())),
                             description: Some(format!(
@@ -2051,11 +2086,11 @@ impl ServerHandler for KaijutsuMcp {
             if uri == "kaijutsu://docs" {
                 // Return list of all documents
                 let docs: Vec<serde_json::Value> = self.store().list_ids().iter().map(|id| {
-                    let (kind, block_count) = self.store().get(id)
+                    let (kind, block_count) = self.store().get(*id)
                         .map(|e| (e.kind.as_str().to_string(), e.doc.blocks_ordered().len()))
                         .unwrap_or(("unknown".to_string(), 0));
                     serde_json::json!({
-                        "id": id,
+                        "id": id.to_hex(),
                         "kind": kind,
                         "block_count": block_count
                     })
@@ -2069,11 +2104,16 @@ impl ServerHandler for KaijutsuMcp {
                 });
             }
 
-            if let Some(doc_id) = uri.strip_prefix("kaijutsu://docs/") {
+            if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
+                let doc_ctx_id = ContextId::parse(doc_id_str)
+                    .map_err(|e| McpError::invalid_params(
+                        format!("Invalid document ID '{}': {}", doc_id_str, e),
+                        None
+                    ))?;
                 // Return document metadata and block list
-                let entry = self.store().get(doc_id)
+                let entry = self.store().get(doc_ctx_id)
                     .ok_or_else(|| McpError::invalid_params(
-                        format!("Document '{}' not found", doc_id),
+                        format!("Document '{}' not found", doc_id_str),
                         None
                     ))?;
 
@@ -2092,7 +2132,7 @@ impl ServerHandler for KaijutsuMcp {
                 }).collect();
 
                 let result = serde_json::json!({
-                    "id": doc_id,
+                    "id": doc_id_str,
                     "kind": entry.kind.as_str(),
                     "language": entry.language,
                     "version": entry.version(),
@@ -2117,18 +2157,18 @@ impl ServerHandler for KaijutsuMcp {
                     ));
                 }
 
-                let doc_id = parts[0];
+                let doc_id_str = parts[0];
                 let block_key = parts[1];
 
-                let (_, block_id) = find_block(self.store(), block_key)
+                let (found_ctx_id, block_id) = find_block(self.store(), block_key)
                     .ok_or_else(|| McpError::invalid_params(
-                        format!("Block '{}' not found in document '{}'", block_key, doc_id),
+                        format!("Block '{}' not found in document '{}'", block_key, doc_id_str),
                         None
                     ))?;
 
-                let entry = self.store().get(doc_id)
+                let entry = self.store().get(found_ctx_id)
                     .ok_or_else(|| McpError::invalid_params(
-                        format!("Document '{}' not found", doc_id),
+                        format!("Document '{}' not found", doc_id_str),
                         None
                     ))?;
 
@@ -2194,6 +2234,7 @@ impl ServerHandler for KaijutsuMcp {
                             if request.argument.name == "document_id" || request.argument.name == "block_id" {
                                 // Complete document IDs
                                 self.store().list_ids().into_iter()
+                                    .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
                                     .take(10)
                                     .collect()
@@ -2218,6 +2259,7 @@ impl ServerHandler for KaijutsuMcp {
                         "search_context" => {
                             if request.argument.name == "document_id" {
                                 self.store().list_ids().into_iter()
+                                    .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
                                     .take(10)
                                     .collect()
@@ -2233,7 +2275,7 @@ impl ServerHandler for KaijutsuMcp {
                     let prefix = &resource_ref.uri;
                     if prefix.starts_with("kaijutsu://docs") {
                         self.store().list_ids().into_iter()
-                            .map(|id| format!("kaijutsu://docs/{}", id))
+                            .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
                             .filter(|uri| uri.contains(&request.argument.value))
                             .take(10)
                             .collect()
@@ -2297,22 +2339,28 @@ impl ServerHandler for KaijutsuMcp {
 mod tests {
     use super::*;
 
+    /// Helper: create a doc via MCP and return the generated document_id hex string.
+    fn create_test_doc(mcp: &KaijutsuMcp, kind: &str) -> String {
+        let result = mcp.doc_create(Parameters(DocCreateRequest {
+            id: ContextId::new().to_hex(),
+            kind: kind.to_string(),
+            language: None,
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["success"].as_bool().unwrap_or(false), "doc_create failed: {result}");
+        parsed["document_id"].as_str().unwrap().to_string()
+    }
+
     #[test]
     fn test_doc_create_and_list() {
         let mcp = KaijutsuMcp::new();
 
         // Create a document
-        let result = mcp.doc_create(Parameters(DocCreateRequest {
-            id: "test-doc".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
-        assert!(result.contains("success"));
-        assert!(result.contains("test-doc"));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         // List documents
         let result = mcp.doc_list();
-        assert!(result.contains("test-doc"));
+        assert!(result.contains(&doc_id));
         assert!(result.contains("conversation"));
     }
 
@@ -2321,15 +2369,11 @@ mod tests {
         let mcp = KaijutsuMcp::new();
 
         // Create document first
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "test-doc".to_string(),
-            kind: "code".to_string(),
-            language: Some("rust".to_string()),
-        }));
+        let doc_id = create_test_doc(&mcp, "code");
 
         // Create a block
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "test-doc".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2358,14 +2402,10 @@ mod tests {
     fn test_block_append() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "test-doc".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "test-doc".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "model".to_string(),
@@ -2396,14 +2436,10 @@ mod tests {
     fn test_kernel_search() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "doc1".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "doc1".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2412,7 +2448,7 @@ mod tests {
         }));
 
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "doc1".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "model".to_string(),
@@ -2438,15 +2474,11 @@ mod tests {
     fn test_doc_tree() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "tree-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         // Create a simple conversation structure
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "tree-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2457,7 +2489,7 @@ mod tests {
         let user_block_id = parsed["block_id"].as_str().unwrap().to_string();
 
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "tree-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: Some(user_block_id.clone()),
             after_id: Some(user_block_id),
             role: "model".to_string(),
@@ -2467,12 +2499,11 @@ mod tests {
 
         // Test doc_tree output
         let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: "tree-test".to_string(),
+            document_id: doc_id,
             max_depth: None,
             expand_tools: false,
         }));
 
-        assert!(result.contains("tree-test"));
         assert!(result.contains("conversation"));
         assert!(result.contains("2 blocks"));
         assert!(result.contains("[user/text]"));
@@ -2483,15 +2514,11 @@ mod tests {
     fn test_doc_tree_with_tools() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "tool-tree-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         // Create a tool call
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "tool-tree-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "model".to_string(),
@@ -2503,7 +2530,7 @@ mod tests {
 
         // Create a tool result as child
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "tool-tree-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: Some(tool_call_id.clone()),
             after_id: Some(tool_call_id),
             role: "tool".to_string(),
@@ -2513,7 +2540,7 @@ mod tests {
 
         // Test collapsed format (default)
         let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: "tool-tree-test".to_string(),
+            document_id: doc_id.clone(),
             max_depth: None,
             expand_tools: false,
         }));
@@ -2523,7 +2550,7 @@ mod tests {
 
         // Test expanded format
         let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: "tool-tree-test".to_string(),
+            document_id: doc_id,
             max_depth: None,
             expand_tools: true,
         }));
@@ -2537,14 +2564,10 @@ mod tests {
     fn test_block_inspect() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "inspect-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "inspect-test".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2572,14 +2595,10 @@ mod tests {
     fn test_block_history() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "history-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "history-test".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "model".to_string(),
@@ -2606,14 +2625,10 @@ mod tests {
     fn test_improved_error_messages() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "error-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "error-test".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2642,14 +2657,10 @@ mod tests {
     fn test_block_diff() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "diff-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "diff-test".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2684,15 +2695,11 @@ mod tests {
     fn test_doc_undo() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "undo-test".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         // Create a few blocks
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "undo-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2701,7 +2708,7 @@ mod tests {
         }));
 
         mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "undo-test".to_string(),
+            document_id: doc_id.clone(),
             parent_id: None,
             after_id: None,
             role: "model".to_string(),
@@ -2711,7 +2718,7 @@ mod tests {
 
         // Test doc_undo dry-run
         let result = mcp.doc_undo(Parameters(DocUndoRequest {
-            document_id: "undo-test".to_string(),
+            document_id: doc_id,
             steps: 2,
         }));
 
@@ -2726,14 +2733,10 @@ mod tests {
     fn test_block_diff_no_changes() {
         let mcp = KaijutsuMcp::new();
 
-        mcp.doc_create(Parameters(DocCreateRequest {
-            id: "diff-same".to_string(),
-            kind: "conversation".to_string(),
-            language: None,
-        }));
+        let doc_id = create_test_doc(&mcp, "conversation");
 
         let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: "diff-same".to_string(),
+            document_id: doc_id,
             parent_id: None,
             after_id: None,
             role: "user".to_string(),
@@ -2756,45 +2759,46 @@ mod tests {
     // apply_server_event tests — exercises the store-based sync path
     // =========================================================================
 
-    use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, Role, Status};
+    use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
     /// Helper: create a store with an initial document populated from a server doc's oplog.
-    /// Returns (store, sync, server_doc) for further manipulation.
-    fn setup_synced_store(doc_id: &str) -> (SharedBlockStore, Arc<Mutex<SyncManager>>, BlockDocument) {
-        let mut server = BlockDocument::new(doc_id, "server");
-        server.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server", "server")
+    /// Returns (store, sync, server_doc, context_id) for further manipulation.
+    fn setup_synced_store() -> (SharedBlockStore, Arc<Mutex<SyncManager>>, BlockDocument, ContextId) {
+        let context_id = ContextId::new();
+        let agent_id = PrincipalId::new();
+        let mut server = BlockDocument::new(context_id, agent_id);
+        server.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server")
             .expect("insert block");
 
         let oplog = server.oplog_bytes().unwrap();
 
-        let store = shared_block_store("test-mcp");
+        let store = shared_block_store(PrincipalId::system());
         store.create_document_from_oplog(
-            doc_id.to_string(),
+            context_id,
             DocumentKind::Conversation,
             None,
             &oplog,
         ).expect("create from oplog");
 
-        let frontier = store.get(doc_id)
+        let frontier = store.get(context_id)
             .map(|e| e.doc.frontier())
             .unwrap_or_default();
 
         let sync = Arc::new(Mutex::new(
-            SyncManager::with_state(Some(doc_id.to_string()), Some(frontier)),
+            SyncManager::with_state(Some(context_id), Some(frontier)),
         ));
 
-        (store, sync, server)
+        (store, sync, server, context_id)
     }
 
     #[test]
     fn test_apply_block_inserted_updates_store() {
-        let doc_id = "sync-test-1";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
         // Server inserts a new block
         let pre_frontier = server.frontier();
         let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "New block from server", "server",
+            None, None, Role::Model, BlockKind::Text, "New block from server",
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
@@ -2802,22 +2806,22 @@ mod tests {
 
         // Before applying: store should have 1 block
         assert_eq!(
-            store.get(doc_id).unwrap().doc.block_count(), 1,
+            store.get(ctx_id).unwrap().doc.block_count(), 1,
             "Store should have 1 block before event"
         );
 
         // Apply the event through our function
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockInserted {
-                document_id: doc_id.to_string(),
+                context_id: ctx_id,
                 block: Box::new(block),
                 ops: ops_bytes,
             },
         );
 
         // After: store should have 2 blocks
-        let entry = store.get(doc_id).expect("doc exists");
+        let entry = store.get(ctx_id).expect("doc exists");
         assert_eq!(entry.doc.block_count(), 2, "Store should have 2 blocks after BlockInserted");
         assert!(
             entry.doc.full_text().contains("New block from server"),
@@ -2827,11 +2831,10 @@ mod tests {
 
     #[test]
     fn test_apply_text_ops_updates_store() {
-        let doc_id = "sync-test-2";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
         // Get the block ID of the existing block on the server
-        let block_id = server.blocks_ordered()[0].id.clone();
+        let block_id = server.blocks_ordered()[0].id;
 
         // Server edits the block's text
         let pre_frontier = server.frontier();
@@ -2841,21 +2844,21 @@ mod tests {
 
         // Before: store has original text
         assert!(
-            store.get(doc_id).unwrap().doc.full_text().contains("Hello from server"),
+            store.get(ctx_id).unwrap().doc.full_text().contains("Hello from server"),
             "Store should have original text"
         );
 
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockTextOps {
-                document_id: doc_id.to_string(),
-                block_id: block_id.clone(),
+                context_id: ctx_id,
+                block_id,
                 ops: ops_bytes,
             },
         );
 
         // After: store should have updated text
-        let entry = store.get(doc_id).expect("doc exists");
+        let entry = store.get(ctx_id).expect("doc exists");
         assert!(
             entry.doc.full_text().contains("— updated!"),
             "Store should contain the edited text, got: {}",
@@ -2865,52 +2868,51 @@ mod tests {
 
     #[test]
     fn test_apply_status_changed_updates_store() {
-        let doc_id = "sync-test-3";
-        let (store, sync, server) = setup_synced_store(doc_id);
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
-        let block_id = server.blocks_ordered()[0].id.clone();
+        let block_id = server.blocks_ordered()[0].id;
 
         // The block starts as Done (from BlockSnapshot::text constructor)
         assert_eq!(
-            store.get(doc_id).unwrap().doc.get_block_snapshot(&block_id).unwrap().status,
+            store.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap().status,
             Status::Done,
         );
 
         // Apply status change to Error
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockStatusChanged {
-                document_id: doc_id.to_string(),
-                block_id: block_id.clone(),
+                context_id: ctx_id,
+                block_id,
                 status: Status::Error,
             },
         );
 
         // Store should reflect the new status
-        let entry = store.get(doc_id).expect("doc exists");
+        let entry = store.get(ctx_id).expect("doc exists");
         let snap = entry.doc.get_block_snapshot(&block_id).expect("block exists");
         assert_eq!(snap.status, Status::Error, "Status should be Error after event");
     }
 
     #[test]
     fn test_apply_event_wrong_document_ignored() {
-        let doc_id = "sync-test-4";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
         // Server inserts a new block
         let pre_frontier = server.frontier();
         let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "Should not appear", "server",
+            None, None, Role::Model, BlockKind::Text, "Should not appear",
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
         let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
-        // Apply with WRONG document_id — should be silently ignored
+        // Apply with WRONG context_id — should be silently ignored
+        let wrong_ctx = ContextId::new();
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockInserted {
-                document_id: "wrong-doc-id".to_string(),
+                context_id: wrong_ctx,
                 block: Box::new(block),
                 ops: ops_bytes,
             },
@@ -2918,37 +2920,36 @@ mod tests {
 
         // Store should still have only 1 block
         assert_eq!(
-            store.get(doc_id).unwrap().doc.block_count(), 1,
+            store.get(ctx_id).unwrap().doc.block_count(), 1,
             "Store should not be affected by events for other documents"
         );
     }
 
     #[test]
     fn test_apply_event_bumps_store_version() {
-        let doc_id = "sync-test-5";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
-        let version_before = store.get(doc_id).unwrap().version();
+        let version_before = store.get(ctx_id).unwrap().version();
 
         // Apply a block insert
         let pre_frontier = server.frontier();
         let block_id = server.insert_block(
-            None, None, Role::User, BlockKind::Text, "Version bump test", "server",
+            None, None, Role::User, BlockKind::Text, "Version bump test",
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
         let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockInserted {
-                document_id: doc_id.to_string(),
+                context_id: ctx_id,
                 block: Box::new(block),
                 ops: ops_bytes,
             },
         );
 
-        let version_after = store.get(doc_id).unwrap().version();
+        let version_after = store.get(ctx_id).unwrap().version();
         assert!(
             version_after > version_before,
             "Store version should increase after event: before={version_before}, after={version_after}"
@@ -2957,21 +2958,20 @@ mod tests {
 
     #[test]
     fn test_store_reads_consistent_after_multiple_events() {
-        let doc_id = "sync-test-6";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
         // Simulate a burst of events: 3 block inserts + a text edit + a status change
         for i in 0..3 {
             let pre = server.frontier();
             let bid = server.insert_block(
                 None, None, Role::Model, BlockKind::Text,
-                &format!("Block {i}"), "server",
+                &format!("Block {i}"),
             ).expect("insert");
             let block = server.get_block_snapshot(&bid).expect("snap");
             let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
 
-            apply_server_event(&store, &sync, doc_id, ServerEvent::BlockInserted {
-                document_id: doc_id.to_string(),
+            apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockInserted {
+                context_id: ctx_id,
                 block: Box::new(block),
                 ops,
             });
@@ -2979,28 +2979,28 @@ mod tests {
 
         // Now edit the last-inserted block's text ("Block 2" → "Block 2 — edited")
         let blocks = server.blocks_ordered();
-        let last_block_id = blocks.last().unwrap().id.clone();
+        let last_block_id = blocks.last().unwrap().id;
         let last_content_len = blocks.last().unwrap().content.len();
         let pre = server.frontier();
         server.edit_text(&last_block_id, last_content_len, " — edited", 0).expect("edit");
         let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
 
-        apply_server_event(&store, &sync, doc_id, ServerEvent::BlockTextOps {
-            document_id: doc_id.to_string(),
-            block_id: last_block_id.clone(),
+        apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockTextOps {
+            context_id: ctx_id,
+            block_id: last_block_id,
             ops,
         });
 
         // Status change on the first inserted block
-        let first_new_block = blocks[1].id.clone(); // blocks[0] is the original
-        apply_server_event(&store, &sync, doc_id, ServerEvent::BlockStatusChanged {
-            document_id: doc_id.to_string(),
-            block_id: first_new_block.clone(),
+        let first_new_block = blocks[1].id; // blocks[0] is the original
+        apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockStatusChanged {
+            context_id: ctx_id,
+            block_id: first_new_block,
             status: Status::Running,
         });
 
         // Verify everything is visible through store.get() — the path MCP tools use
-        let entry = store.get(doc_id).expect("doc exists");
+        let entry = store.get(ctx_id).expect("doc exists");
         let text = entry.doc.full_text();
         let block_count = entry.doc.block_count();
 
@@ -3016,23 +3016,23 @@ mod tests {
 
     #[test]
     fn test_corrupted_ops_dont_corrupt_store() {
-        let doc_id = "sync-test-corrupt";
-        let (store, sync, server) = setup_synced_store(doc_id);
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
-        let original_block_count = store.get(doc_id).unwrap().doc.block_count();
-        let original_version = store.get(doc_id).unwrap().version();
-        let block_id = server.blocks_ordered()[0].id.clone();
+        let original_block_count = store.get(ctx_id).unwrap().doc.block_count();
+        let original_version = store.get(ctx_id).unwrap().version();
+        let block_id = server.blocks_ordered()[0].id;
 
         // Apply BlockInserted with garbage ops
+        let evil_agent = PrincipalId::new();
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockInserted {
-                document_id: doc_id.to_string(),
+                context_id: ctx_id,
                 // This block already exists (idempotent skip), but let's also test garbage ops
                 // with a "new" block that doesn't exist yet
                 block: Box::new(BlockSnapshot::text(
-                    BlockId { document_id: doc_id.to_string(), agent_id: "evil".to_string(), seq: 99 },
-                    None, Role::User, "corrupted block", "evil",
+                    BlockId::new(ctx_id, evil_agent, 99),
+                    None, Role::User, "corrupted block",
                 )),
                 ops: vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF],
             },
@@ -3040,23 +3040,23 @@ mod tests {
 
         // Store should be unchanged — no corruption
         {
-            let entry = store.get(doc_id).unwrap();
+            let entry = store.get(ctx_id).unwrap();
             assert_eq!(entry.doc.block_count(), original_block_count, "Block count unchanged after corrupt ops");
             assert_eq!(entry.version(), original_version, "Version unchanged — touch() not called on error");
         } // Drop DashMap Ref before next event needs get_mut()
 
         // Apply BlockTextOps with garbage ops
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockTextOps {
-                document_id: doc_id.to_string(),
-                block_id: block_id.clone(),
+                context_id: ctx_id,
+                block_id,
                 ops: vec![0xBA, 0xAD, 0xF0, 0x0D],
             },
         );
 
         // Store content should be unchanged
-        let entry = store.get(doc_id).unwrap();
+        let entry = store.get(ctx_id).unwrap();
         assert!(
             entry.doc.full_text().contains("Hello from server"),
             "Original content preserved after corrupt text ops"
@@ -3065,19 +3065,15 @@ mod tests {
 
     #[test]
     fn test_status_change_for_nonexistent_block() {
-        let doc_id = "sync-test-ghost";
-        let (store, sync, _server) = setup_synced_store(doc_id);
+        let (store, sync, _server, ctx_id) = setup_synced_store();
 
         // Send status change for a block that doesn't exist
+        let ghost_agent = PrincipalId::new();
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockStatusChanged {
-                document_id: doc_id.to_string(),
-                block_id: BlockId {
-                    document_id: doc_id.to_string(),
-                    agent_id: "ghost".to_string(),
-                    seq: 999,
-                },
+                context_id: ctx_id,
+                block_id: BlockId::new(ctx_id, ghost_agent, 999),
                 status: Status::Done,
             },
         );
@@ -3085,18 +3081,17 @@ mod tests {
         // Store should not crash, version might or might not change depending on
         // whether set_status errors before or after touch. The important thing
         // is no panic and no corruption.
-        let entry = store.get(doc_id).unwrap();
+        let entry = store.get(ctx_id).unwrap();
         assert_eq!(entry.doc.block_count(), 1, "Block count unchanged");
         assert!(entry.doc.full_text().contains("Hello from server"), "Content unchanged");
     }
 
     #[test]
     fn test_reset_then_incremental_event_preserves_blocks() {
-        let doc_id = "sync-test-reset";
-        let (store, sync, mut server) = setup_synced_store(doc_id);
+        let (store, sync, mut server, ctx_id) = setup_synced_store();
 
         // Verify initial state
-        assert_eq!(store.get(doc_id).unwrap().doc.block_count(), 1);
+        assert_eq!(store.get(ctx_id).unwrap().doc.block_count(), 1);
 
         // Simulate Lagged — reset SyncManager (sets needs_full_sync = true)
         sync.lock().unwrap().reset();
@@ -3105,16 +3100,16 @@ mod tests {
         // this is what would arrive after missing some events.
         let pre_frontier = server.frontier();
         let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "Post-reset block", "server",
+            None, None, Role::Model, BlockKind::Text, "Post-reset block",
         ).expect("insert");
         let block = server.get_block_snapshot(&block_id).expect("snapshot");
         let ops = server.ops_since(&pre_frontier);
         let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
 
         apply_server_event(
-            &store, &sync, doc_id,
+            &store, &sync, ctx_id,
             ServerEvent::BlockInserted {
-                document_id: doc_id.to_string(),
+                context_id: ctx_id,
                 block: Box::new(block),
                 ops: ops_bytes,
             },
@@ -3124,7 +3119,7 @@ mod tests {
         // SyncManager should try incremental merge first (doc is not empty).
         // If incremental succeeds, both blocks are preserved.
         // If it falls through to do_full_sync with incremental ops, we lose block 1.
-        let entry = store.get(doc_id).unwrap();
+        let entry = store.get(ctx_id).unwrap();
         assert_eq!(
             entry.doc.block_count(), 2,
             "Both original and new block should be preserved after reset + incremental event"

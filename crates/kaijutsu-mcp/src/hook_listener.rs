@@ -29,14 +29,12 @@ const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 pub struct HookListener {
     /// Block store — shared with the MCP server.
     store: SharedBlockStore,
-    /// Document ID for the active context.
-    document_id: String,
+    /// Context ID for the active context.
+    context_id: ContextId,
     /// Remote state for push_ops + drift (None in local mode).
     remote: Option<RemoteState>,
     /// Max content size per block.
     max_block_size: usize,
-    /// Context ID for drift filtering.
-    context_id: ContextId,
     /// Serializes push_ops to avoid concurrent pushes sending duplicate ops.
     push_lock: TokioMutex<()>,
     /// Shared session ID — updated from hook events when detected.
@@ -45,13 +43,12 @@ pub struct HookListener {
 
 impl HookListener {
     /// Create a listener backed by a local-only store.
-    pub fn local(store: SharedBlockStore, document_id: String) -> Self {
+    pub fn local(store: SharedBlockStore, context_id: ContextId) -> Self {
         Self {
             store,
-            document_id,
+            context_id,
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            context_id: ContextId::nil(),
             push_lock: TokioMutex::new(()),
             session_id: Arc::new(Mutex::new(None)),
         }
@@ -65,10 +62,9 @@ impl HookListener {
     ) -> Self {
         Self {
             store: remote.store.clone(),
-            document_id: remote.document_id.clone(),
+            context_id,
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            context_id,
             push_lock: TokioMutex::new(()),
             session_id,
         }
@@ -139,7 +135,7 @@ impl HookListener {
                 pid: std::process::id(),
                 cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
                 context_name: Some(self.context_id.short()),
-                document_id: Some(self.document_id.clone()),
+                document_id: Some(self.context_id.to_hex()),
                 session_id,
                 pending_drifts: pending,
             };
@@ -267,7 +263,7 @@ impl HookListener {
 
     fn insert_text_block(&self, role: Role, content: &str) {
         if let Err(e) = self.store.insert_block(
-            &self.document_id,
+            self.context_id,
             None,  // parent
             None,  // after (append)
             role,
@@ -282,7 +278,7 @@ impl HookListener {
         // Insert tool call block
         let input = tool.input.clone();
         let call_id = match self.store.insert_tool_call(
-            &self.document_id,
+            self.context_id,
             None,
             None,
             &tool.name,
@@ -304,7 +300,7 @@ impl HookListener {
         let truncated = truncate(content, self.max_block_size);
 
         if let Err(e) = self.store.insert_tool_result(
-            &self.document_id,
+            self.context_id,
             &call_id,
             None,
             &truncated,
@@ -377,7 +373,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
         sync.frontier().cloned().unwrap_or_default()
     };
 
-    let ops = remote.store.ops_since(&remote.document_id, &frontier)
+    let ops = remote.store.ops_since(remote.context_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let ops_bytes = postcard::to_stdvec(&ops)
@@ -387,7 +383,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
         return Ok(()); // No ops
     }
 
-    remote.actor.push_ops(&remote.document_id, &ops_bytes).await
+    remote.actor.push_ops(remote.context_id, &ops_bytes).await
         .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
     Ok(())
