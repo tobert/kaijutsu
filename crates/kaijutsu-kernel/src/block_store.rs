@@ -6,7 +6,7 @@
 //! # Concurrency Model
 //!
 //! - DashMap for per-document concurrent access
-//! - Event broadcasting for real-time updates
+//! - FlowBus for typed pub/sub real-time updates
 //! - parking_lot for efficient locking
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
 
 use kaijutsu_crdt::{
     BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Frontier, Role,
@@ -27,28 +26,6 @@ use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
 
 /// Thread-safe database handle.
 type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
-
-/// Events broadcast when documents change.
-#[derive(Clone, Debug)]
-pub enum BlockEvent {
-    /// Operations applied to a document's OpLog.
-    OpsApplied {
-        context_id: ContextId,
-        ops: SerializedOpsOwned,
-        agent_id: PrincipalId,
-    },
-    /// A new document was created.
-    DocumentCreated {
-        context_id: ContextId,
-        kind: DocumentKind,
-        agent_id: PrincipalId,
-    },
-    /// A document was deleted.
-    DocumentDeleted {
-        context_id: ContextId,
-        agent_id: PrincipalId,
-    },
-}
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
@@ -132,45 +109,37 @@ pub struct BlockStore {
     db: Option<DbHandle>,
     /// Default agent ID for this store.
     agent_id: RwLock<PrincipalId>,
-    /// Event broadcaster (legacy, kept for backwards compat).
-    event_tx: broadcast::Sender<BlockEvent>,
-    /// FlowBus for typed pub/sub (preferred for new code).
+    /// FlowBus for typed pub/sub.
     block_flows: Option<SharedBlockFlowBus>,
 }
 
 impl BlockStore {
     /// Create a new in-memory block store.
     pub fn new(agent_id: PrincipalId) -> Self {
-        let (event_tx, _) = broadcast::channel(1024);
         Self {
             documents: DashMap::new(),
             db: None,
             agent_id: RwLock::new(agent_id),
-            event_tx,
             block_flows: None,
         }
     }
 
     /// Create a new in-memory block store with FlowBus.
     pub fn with_flows(agent_id: PrincipalId, block_flows: SharedBlockFlowBus) -> Self {
-        let (event_tx, _) = broadcast::channel(1024);
         Self {
             documents: DashMap::new(),
             db: None,
             agent_id: RwLock::new(agent_id),
-            event_tx,
             block_flows: Some(block_flows),
         }
     }
 
     /// Create a block store with SQLite persistence.
     pub fn with_db(db: DocumentDb, agent_id: PrincipalId) -> Self {
-        let (event_tx, _) = broadcast::channel(1024);
         Self {
             documents: DashMap::new(),
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id),
-            event_tx,
             block_flows: None,
         }
     }
@@ -181,19 +150,12 @@ impl BlockStore {
         agent_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(1024);
         Self {
             documents: DashMap::new(),
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id),
-            event_tx,
             block_flows: Some(block_flows),
         }
-    }
-
-    /// Get the event receiver for subscribing to changes (legacy API).
-    pub fn subscribe(&self) -> broadcast::Receiver<BlockEvent> {
-        self.event_tx.subscribe()
     }
 
     /// Get the FlowBus for typed pub/sub.
@@ -264,13 +226,6 @@ impl BlockStore {
                 let entry = DocumentEntry::new(context_id, kind, language, agent_id);
                 vacant.insert(entry);
 
-                // Broadcast event
-                let _ = self.event_tx.send(BlockEvent::DocumentCreated {
-                    context_id,
-                    kind,
-                    agent_id,
-                });
-
                 Ok(())
             }
         }
@@ -306,13 +261,6 @@ impl BlockStore {
         };
         self.documents.insert(context_id, entry);
 
-        // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
-            context_id,
-            kind,
-            agent_id,
-        });
-
         Ok(())
     }
 
@@ -346,12 +294,6 @@ impl BlockStore {
         }
 
         self.documents.remove(&context_id);
-
-        // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::DocumentDeleted {
-            context_id,
-            agent_id: self.agent_id(),
-        });
 
         Ok(())
     }
@@ -419,13 +361,6 @@ impl BlockStore {
             sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
-
-        // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
-            context_id: new_id,
-            kind,
-            agent_id,
-        });
 
         Ok(())
     }
@@ -499,13 +434,6 @@ impl BlockStore {
             sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
-
-        // Broadcast event
-        let _ = self.event_tx.send(BlockEvent::DocumentCreated {
-            context_id: new_id,
-            kind,
-            agent_id,
-        });
 
         Ok(())
     }
@@ -1378,27 +1306,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_subscription() {
-        let agent = test_agent();
-        let store = BlockStore::new(agent);
-        let mut rx = store.subscribe();
-        let ctx = ContextId::new();
-
-        store.create_document(ctx, DocumentKind::Code, None).unwrap();
-
-        // Should receive DocumentCreated event
-        let event = rx.try_recv().unwrap();
-        match event {
-            BlockEvent::DocumentCreated { context_id, kind, agent_id } => {
-                assert_eq!(context_id, ctx);
-                assert_eq!(kind, DocumentKind::Code);
-                assert_eq!(agent_id, agent);
-            }
-            _ => panic!("Expected DocumentCreated event"),
-        }
-    }
-
-    #[tokio::test]
     async fn test_concurrent_document_access() {
         use std::sync::Arc;
         use tokio::task::JoinSet;
@@ -1538,41 +1445,6 @@ mod tests {
         // Content should still be valid
         let content = store.get_content(ctx).unwrap();
         assert!(content.starts_with("initial content"));
-    }
-
-    #[tokio::test]
-    async fn test_event_subscription_concurrent() {
-        use std::sync::Arc;
-        use tokio::task::JoinSet;
-
-        let store = Arc::new(BlockStore::new(test_agent()));
-        let mut rx = store.subscribe();
-
-        let mut tasks = JoinSet::new();
-
-        // Create multiple documents concurrently
-        for _ in 0..10 {
-            let store_clone = Arc::clone(&store);
-            tasks.spawn(async move {
-                store_clone
-                    .create_document(ContextId::new(), DocumentKind::Code, None)
-                    .unwrap();
-            });
-        }
-
-        // Wait for all tasks
-        while let Some(result) = tasks.join_next().await {
-            result.expect("Task panicked");
-        }
-
-        // Collect events (may not get all due to broadcast channel)
-        let mut events_received = 0;
-        while rx.try_recv().is_ok() {
-            events_received += 1;
-        }
-
-        // Should have received at least some events
-        assert!(events_received > 0, "Should have received some events");
     }
 
     // ============================================================================
