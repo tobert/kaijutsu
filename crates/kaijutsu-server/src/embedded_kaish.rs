@@ -14,12 +14,11 @@
 //!             ├── kaish::Kernel (in-process)
 //!             │       │
 //!             │       ├── /v/docs → KaijutsuFilesystem (CRDT blocks)
-//!             │       ├── /v/g   → GitFilesystem (CRDT git)
 //!             │       ├── /v/jobs, /v/blobs → kaish builtins
 //!             │       └── everything else → MountBackend
 //!             │               │
 //!             │               ├── File ops → MountTable → LocalBackend
-//!             │               └── Tool calls → KaijutsuBackend / GitCrdtBackend
+//!             │               └── Tool calls → KaijutsuBackend
 //!             │
 //!             └── Shared state with kaijutsu kernel
 //! ```
@@ -41,8 +40,6 @@ use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 
 use crate::docs_filesystem::KaijutsuFilesystem;
-use crate::git_backend::GitCrdtBackend;
-use crate::git_filesystem::GitFilesystem;
 use crate::kaish_backend::KaijutsuBackend;
 use crate::mount_backend::MountBackend;
 
@@ -55,8 +52,6 @@ pub struct EmbeddedKaish {
     kernel: KaishKernel,
     /// Kernel name/id.
     name: String,
-    /// Git backend for repo management (if git support enabled).
-    git_backend: Option<Arc<GitCrdtBackend>>,
 }
 
 impl EmbeddedKaish {
@@ -86,7 +81,7 @@ impl EmbeddedKaish {
         let mount_table = kernel.vfs().clone();
 
         let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
-            mount_table, docs_backend.clone(), None,
+            mount_table, docs_backend.clone(),
         ));
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
@@ -111,149 +106,7 @@ impl EmbeddedKaish {
         Ok(Self {
             kernel: kaish_kernel,
             name: name.to_string(),
-            git_backend: None,
         })
-    }
-
-    /// Create a new embedded kaish executor with git support.
-    ///
-    /// This variant includes the `/v/g` namespace for CRDT-backed git worktrees.
-    /// Use `register_repo()` to add repositories.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Name for this kaish kernel
-    /// * `blocks` - Shared block store for CRDT operations (docs)
-    /// * `git_blocks` - Shared block store for git CRDT operations
-    /// * `kernel` - Kaijutsu kernel for tool dispatch and VFS mounts
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let blocks = shared_block_store(PrincipalId::system());
-    /// let git_blocks = shared_block_store(PrincipalId::system());
-    /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
-    /// let kaish = EmbeddedKaish::with_git("my-kernel", blocks, git_blocks, kernel, None)?;
-    /// kaish.register_repo("myproject", "/home/user/src/myproject")?;
-    /// ```
-    pub fn with_git(
-        name: &str,
-        blocks: SharedBlockStore,
-        git_blocks: SharedBlockStore,
-        kernel: Arc<KaijutsuKernel>,
-        project_root: Option<PathBuf>,
-    ) -> Result<Self> {
-        let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
-        let git_backend = Arc::new(GitCrdtBackend::new(git_blocks));
-        let mount_table = kernel.vfs().clone();
-
-        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
-            mount_table, docs_backend.clone(), Some(git_backend.clone()),
-        ));
-
-        let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
-        let git_fs = Arc::new(GitFilesystem::new(git_backend.clone()));
-
-        // See comment in `new()` — config sets cwd/name, MountTable handles VFS
-        let config = match project_root {
-            Some(root) => KaishConfig::mcp_with_root(root),
-            None => KaishConfig::named(name),
-        };
-
-        let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
-            vfs.mount_arc("/v/docs", docs_fs);
-            vfs.mount_arc("/v/g", git_fs);
-        })?;
-
-        Ok(Self {
-            kernel: kaish_kernel,
-            name: name.to_string(),
-            git_backend: Some(git_backend),
-        })
-    }
-
-    /// Register a git repository for CRDT-backed access.
-    ///
-    /// Only available if created with `with_git()`.
-    pub fn register_repo(&self, name: &str, path: impl Into<std::path::PathBuf>) -> Result<()> {
-        let git = self.git_backend.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("git support not enabled - use with_git()"))?;
-        git.register_repo(name, path)
-            .map_err(|e| anyhow::anyhow!(e))
-    }
-
-    /// Unregister a git repository.
-    pub fn unregister_repo(&self, name: &str) -> Result<()> {
-        let git = self.git_backend.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("git support not enabled"))?;
-        git.unregister_repo(name)
-            .map_err(|e| anyhow::anyhow!(e))
-    }
-
-    /// List registered git repositories.
-    pub fn list_repos(&self) -> Vec<String> {
-        self.git_backend.as_ref()
-            .map(|g| g.list_repos())
-            .unwrap_or_default()
-    }
-
-    /// Get the git backend (if available).
-    pub fn git_backend(&self) -> Option<&Arc<GitCrdtBackend>> {
-        self.git_backend.as_ref()
-    }
-
-    /// Start the file watcher for external change detection.
-    ///
-    /// The watcher monitors registered repositories for changes made by
-    /// external tools (cargo, clippy, go fmt, etc.) and syncs them to CRDT.
-    ///
-    /// Returns a handle that can be used to stop the watcher.
-    pub fn start_watcher(&self) -> Result<crate::git_backend::WatcherHandle> {
-        let git = self.git_backend.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("git support not enabled - use with_git()"))?;
-        git.start_watcher()
-            .map_err(|e| anyhow::anyhow!(e))
-    }
-
-    /// Set attribution for the next external command.
-    ///
-    /// Call this before running an external command (e.g., `cargo clippy --fix`)
-    /// so that resulting file changes can be attributed.
-    pub fn set_pending_attribution(&self, source: &str, command: Option<&str>) {
-        if let Some(git) = self.git_backend.as_ref() {
-            git.set_pending_attribution(source, command);
-        }
-    }
-
-    /// Flush all dirty CRDT files to disk.
-    pub async fn flush_git(&self) -> Result<()> {
-        if let Some(git) = self.git_backend.as_ref() {
-            git.flush_all().await
-                .map_err(|e| anyhow::anyhow!("failed to flush: {}", e))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Switch to a different branch for a repository.
-    pub async fn switch_branch(&self, repo: &str, branch: &str) -> Result<()> {
-        let git = self.git_backend.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("git support not enabled"))?;
-        git.switch_branch(repo, branch).await
-            .map_err(|e| anyhow::anyhow!("failed to switch branch: {}", e))
-    }
-
-    /// Get the current branch for a repository.
-    pub fn get_current_branch(&self, repo: &str) -> Option<String> {
-        self.git_backend.as_ref()?.get_current_branch(repo)
-    }
-
-    /// List all branches for a repository.
-    pub fn list_branches(&self, repo: &str) -> Result<Vec<String>> {
-        let git = self.git_backend.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("git support not enabled"))?;
-        git.list_branches(repo)
-            .map_err(|e| anyhow::anyhow!("failed to list branches: {}", e))
     }
 
     /// Execute kaish code and return the result.

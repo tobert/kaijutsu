@@ -749,47 +749,37 @@ interface Kernel {
   deleteBlob @32 (id :Text) -> (success :Bool);
   listBlobs @33 () -> (refs :List(BlobRef));
 
-  # Git repository management (CRDT-backed worktrees)
-  registerRepo @34 (name :Text, path :Text) -> (success :Bool, error :Text);
-  unregisterRepo @35 (name :Text) -> (success :Bool, error :Text);
-  listRepos @36 () -> (repos :List(Text));
-  switchBranch @37 (repo :Text, branch :Text) -> (success :Bool, error :Text);
-  listBranches @38 (repo :Text) -> (branches :List(Text), error :Text);
-  getCurrentBranch @39 (repo :Text) -> (branch :Text);
-  flushGit @40 () -> (success :Bool, error :Text);
-  setAttribution @41 (source :Text, command :Text);
-
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
-  pushOps @42 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  pushOps @34 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
-  listMcpResources @43 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
-  readMcpResource @44 (server :Text, uri :Text, trace :TraceContext) -> (contents :McpResourceContents, hasContents :Bool);
-  subscribeMcpResources @45 (callback :ResourceEvents);
+  listMcpResources @35 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
+  readMcpResource @36 (server :Text, uri :Text, trace :TraceContext) -> (contents :McpResourceContents, hasContents :Bool);
+  subscribeMcpResources @37 (callback :ResourceEvents);
 
   # MCP Roots (client advertises workspaces to servers)
-  setMcpRoots @46 (roots :List(McpRoot));
+  setMcpRoots @38 (roots :List(McpRoot));
 
   # MCP Prompts (poll-based with optional caching)
-  listMcpPrompts @47 (server :Text) -> (prompts :List(McpPrompt));
-  getMcpPrompt @48 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+  listMcpPrompts @39 (server :Text) -> (prompts :List(McpPrompt));
+  getMcpPrompt @40 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
 
   # MCP Progress (push-based streaming)
-  subscribeMcpProgress @49 (callback :ProgressEvents);
+  subscribeMcpProgress @41 (callback :ProgressEvents);
 
   # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @50 (callback :ElicitationEvents);
+  subscribeMcpElicitations @42 (callback :ElicitationEvents);
 
   # MCP Completion (request/response)
-  completeMcp @51 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+  completeMcp @43 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
 
   # MCP Logging
-  setMcpLogLevel @52 (server :Text, level :Text);
-  subscribeMcpLogs @53 (callback :LoggingEvents);
+  setMcpLogLevel @44 (server :Text, level :Text);
+  subscribeMcpLogs @45 (callback :LoggingEvents);
 
   # MCP Cancellation
-  cancelMcpRequest @54 (server :Text, requestId :Text);
+  cancelMcpRequest @46 (server :Text, requestId :Text);
 
   # ============================================================================
   # Agent Attachment
@@ -797,22 +787,22 @@ interface Kernel {
   # Agents are autonomous participants that can edit content alongside humans.
 
   # Attach an agent to this kernel
-  attachAgent @55 (config :AgentConfig) -> (info :AgentInfo);
+  attachAgent @47 (config :AgentConfig) -> (info :AgentInfo);
 
   # List all attached agents on this kernel
-  listAgents @56 () -> (agents :List(AgentInfo));
+  listAgents @48 () -> (agents :List(AgentInfo));
 
   # Detach an agent from this kernel
-  detachAgent @57 (nick :Text);
+  detachAgent @49 (nick :Text);
 
   # Update agent capabilities
-  setAgentCapabilities @58 (nick :Text, capabilities :List(AgentCapability));
+  setAgentCapabilities @50 (nick :Text, capabilities :List(AgentCapability));
 
   # Invoke an agent on a specific block (e.g., spell-check focused content)
-  invokeAgent @59 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
+  invokeAgent @51 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
 
   # Subscribe to agent activity events
-  subscribeAgentEvents @60 (callback :AgentEvents);
+  subscribeAgentEvents @52 (callback :AgentEvents);
 
   # ============================================================================
   # Timeline Navigation (Fork-First Temporal Model)
@@ -821,13 +811,13 @@ interface Kernel {
   # The past is read-only, but forking is ubiquitous.
 
   # Fork from a specific context version
-  forkFromVersion @61 (contextId :Data, version :UInt64, contextLabel :Text, trace :TraceContext) -> (newContextId :Data);
+  forkFromVersion @53 (contextId :Data, version :UInt64, contextLabel :Text, trace :TraceContext) -> (newContextId :Data);
 
   # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @62 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
+  cherryPickBlock @54 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
 
   # Get context version history for timeline scrubber
-  getContextHistory @63 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
+  getContextHistory @55 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
 
   # ============================================================================
   # Configuration (Config as CRDT)
@@ -835,16 +825,16 @@ interface Kernel {
   # Config files (theme.rhai) are managed as CRDT documents.
 
   # List loaded config documents
-  listConfigs @64 () -> (configs :List(Text));
+  listConfigs @56 () -> (configs :List(Text));
 
   # Reload a config file from disk, discarding CRDT changes (safety valve)
-  reloadConfig @65 (path :Text) -> (success :Bool, error :Text);
+  reloadConfig @57 (path :Text) -> (success :Bool, error :Text);
 
   # Reset a config file to embedded default
-  resetConfig @66 (path :Text) -> (success :Bool, error :Text);
+  resetConfig @58 (path :Text) -> (success :Bool, error :Text);
 
   # Get config content (from CRDT)
-  getConfig @67 (path :Text) -> (content :Text, error :Text);
+  getConfig @59 (path :Text) -> (content :Text, error :Text);
 
   # ============================================================================
   # Multi-Context Drifting (Cross-Context Communication)
@@ -852,71 +842,71 @@ interface Kernel {
   # Drift enables content transfer between kernel contexts with provenance tracking.
 
   # Get this kernel's context ID and label
-  getContextId @68 (trace :TraceContext) -> (id :Data, label :Text);
+  getContextId @60 (trace :TraceContext) -> (id :Data, label :Text);
 
   # Configure LLM provider/model on an existing kernel
-  configureLlm @69 (provider :Text, model :Text, trace :TraceContext) -> (success :Bool, error :Text);
+  configureLlm @61 (provider :Text, model :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
-  driftPush @70 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
+  driftPush @62 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
 
   # Flush all staged drifts (inject into target kernels)
-  driftFlush @71 (trace :TraceContext) -> (count :UInt32);
+  driftFlush @63 (trace :TraceContext) -> (count :UInt32);
 
   # List staged drifts pending flush
-  driftQueue @72 () -> (staged :List(StagedDriftInfo));
+  driftQueue @64 () -> (staged :List(StagedDriftInfo));
 
   # Cancel a staged drift by ID
-  driftCancel @73 (stagedId :UInt64) -> (success :Bool);
+  driftCancel @65 (stagedId :UInt64) -> (success :Bool);
 
   # Pull summarized content from another context
-  driftPull @74 (sourceCtx :Data, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
+  driftPull @66 (sourceCtx :Data, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
 
   # Merge a forked context back into its parent
-  driftMerge @75 (sourceCtx :Data, trace :TraceContext) -> (blockId :BlockId);
+  driftMerge @67 (sourceCtx :Data, trace :TraceContext) -> (blockId :BlockId);
 
   # Rename a context's label
-  renameContext @76 (contextId :Data, label :Text);
+  renameContext @68 (contextId :Data, label :Text);
 
   # ============================================================================
   # LLM Configuration (Per-Kernel Multi-Provider LLM)
   # ============================================================================
 
   # Get current LLM configuration for this kernel
-  getLlmConfig @77 (trace :TraceContext) -> (config :LlmConfigInfo);
+  getLlmConfig @69 (trace :TraceContext) -> (config :LlmConfigInfo);
 
   # Set default LLM provider
-  setDefaultProvider @78 (provider :Text) -> (success :Bool, error :Text);
+  setDefaultProvider @70 (provider :Text) -> (success :Bool, error :Text);
 
   # Set default model for a provider
-  setDefaultModel @79 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  setDefaultModel @71 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # ============================================================================
   # Tool Filter Configuration
   # ============================================================================
 
   # Get current tool filter configuration
-  getToolFilter @80 () -> (filter :ToolFilterConfig);
+  getToolFilter @72 () -> (filter :ToolFilterConfig);
 
   # Set tool filter configuration
-  setToolFilter @81 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
+  setToolFilter @73 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
 
   # ============================================================================
   # Shell Variable Introspection (kaish scope)
   # ============================================================================
 
   # Get a shell variable by name
-  getShellVar @82 (name :Text) -> (value :ShellValue, found :Bool);
+  getShellVar @74 (name :Text) -> (value :ShellValue, found :Bool);
 
   # Set a shell variable
-  setShellVar @83 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+  setShellVar @75 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
 
   # List all shell variables
-  listShellVars @84 () -> (vars :List(ShellVar));
+  listShellVars @76 () -> (vars :List(ShellVar));
 
   # Compact a context's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
-  compactContext @85 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
+  compactContext @77 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
 }
 
 # ============================================================================

@@ -9,7 +9,7 @@
 //! ```text
 //! MountBackend (implements kaish KernelBackend)
 //! ├── File ops → MountTable → LocalBackend → real filesystem
-//! └── Tool calls → docs_tools → git_tools → ToolNotFound
+//! └── Tool calls → docs_tools → ToolNotFound
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,6 @@ use kaijutsu_kernel::vfs::{
     FileType, MountTable, VfsError, VfsOps,
 };
 
-use crate::git_backend::GitCrdtBackend;
 use crate::kaish_backend::KaijutsuBackend;
 
 /// Routes file operations through kaijutsu's `MountTable` and tool
@@ -39,8 +38,6 @@ pub struct MountBackend {
     mount_table: Arc<MountTable>,
     /// CRDT backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
-    /// CRDT backend for git tool dispatch (optional).
-    git_tools: Option<Arc<GitCrdtBackend>>,
 }
 
 impl MountBackend {
@@ -48,17 +45,14 @@ impl MountBackend {
     pub fn new(
         mount_table: Arc<MountTable>,
         docs_tools: Arc<KaijutsuBackend>,
-        git_tools: Option<Arc<GitCrdtBackend>>,
     ) -> Self {
         Self {
             mount_table,
             docs_tools,
-            git_tools,
         }
     }
 }
 
-// TODO(dedup): entry_info_to_dir_entry below is identical to git_filesystem.rs — extract shared helper
 /// Convert a `VfsError` to a `BackendError`.
 fn vfs_to_backend(err: VfsError) -> BackendError {
     match err {
@@ -412,37 +406,15 @@ impl KernelBackend for MountBackend {
         args: ToolArgs,
         ctx: &mut ExecContext,
     ) -> BackendResult<ToolResult> {
-        // Try docs backend first (has kaijutsu tools)
-        match self.docs_tools.call_tool(name, args.clone(), ctx).await {
-            Ok(result) => return Ok(result),
-            Err(BackendError::ToolNotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-
-        // Try git backend
-        if let Some(git) = &self.git_tools {
-            return git.call_tool(name, args, ctx).await;
-        }
-
-        Err(BackendError::ToolNotFound(name.into()))
+        self.docs_tools.call_tool(name, args, ctx).await
     }
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolInfo>> {
-        let mut tools = self.docs_tools.list_tools().await?;
-        if let Some(git) = &self.git_tools {
-            tools.extend(git.list_tools().await?);
-        }
-        Ok(tools)
+        self.docs_tools.list_tools().await
     }
 
     async fn get_tool(&self, name: &str) -> BackendResult<Option<ToolInfo>> {
-        if let Some(tool) = self.docs_tools.get_tool(name).await? {
-            return Ok(Some(tool));
-        }
-        if let Some(git) = &self.git_tools {
-            return git.get_tool(name).await;
-        }
-        Ok(None)
+        self.docs_tools.get_tool(name).await
     }
 
     // =========================================================================
@@ -458,12 +430,7 @@ impl KernelBackend for MountBackend {
     }
 
     fn mounts(&self) -> Vec<kaish_kernel::vfs::MountInfo> {
-        // We can't async here, so return the tool mounts from CRDT backends
-        let mut mounts = self.docs_tools.mounts();
-        if let Some(git) = &self.git_tools {
-            mounts.extend(git.mounts());
-        }
-        mounts
+        self.docs_tools.mounts()
     }
 
     fn resolve_real_path(&self, _path: &Path) -> Option<PathBuf> {
@@ -513,7 +480,7 @@ mod tests {
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;
 
-        MountBackend::new(mount_table, docs, None)
+        MountBackend::new(mount_table, docs)
     }
 
     #[tokio::test]

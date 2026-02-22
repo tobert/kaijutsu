@@ -36,9 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 kaijutsu-telemetry = { workspace = true }
 
-# File watching for external tool changes (cargo, clippy, etc.)
-notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
-
 # Hostname detection
 hostname = "0.3"
 
