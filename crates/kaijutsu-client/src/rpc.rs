@@ -4,7 +4,8 @@
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
-use kaijutsu_crdt::{ContextId, DriftKind, KernelId};
+use kaijutsu_crdt::{ContextId, KernelId};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, DriftKind, PrincipalId, Role, Status, ToolKind};
 use russh::client::Msg;
 use russh::ChannelStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -159,14 +160,6 @@ pub struct ContextMembership {
     pub instance: String,
 }
 
-/// Document attached to a context
-#[derive(Debug, Clone)]
-pub struct ContextDocument {
-    pub id: String,
-    pub attached_by: String,
-    pub attached_at: u64,
-}
-
 /// Context within a kernel (rich info from ContextHandleInfo wire type)
 #[derive(Debug, Clone)]
 pub struct ContextInfo {
@@ -176,7 +169,6 @@ pub struct ContextInfo {
     pub provider: String,
     pub model: String,
     pub created_at: u64,
-    pub document_id: String,
     /// Long-running OTel trace ID for this context (16 bytes, or zeros if unavailable).
     pub trace_id: [u8; 16],
 }
@@ -264,7 +256,7 @@ impl KernelHandle {
     /// Returns the document_id for the joined context. The `instance` param
     /// identifies which client connected (for logging/debugging).
     #[tracing::instrument(skip(self), name = "rpc_client.join_context")]
-    pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<String, RpcError> {
+    pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.join_context_request();
         request.get().set_context_id(context_id.as_bytes());
         request.get().set_instance(instance);
@@ -275,28 +267,7 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        let document_id = response.get()?.get_document_id()?.to_string()?;
-        Ok(document_id)
-    }
-
-    /// Attach a document to a context
-    #[tracing::instrument(skip(self), name = "rpc_client.attach_document")]
-    pub async fn attach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
-        let mut request = self.kernel.attach_document_request();
-        request.get().set_context_id(context_id.as_bytes());
-        request.get().set_document_id(document_id);
-        request.send().promise.await?;
-        Ok(())
-    }
-
-    /// Detach a document from a context
-    #[tracing::instrument(skip(self), name = "rpc_client.detach_document")]
-    pub async fn detach_document(&self, context_id: ContextId, document_id: &str) -> Result<(), RpcError> {
-        let mut request = self.kernel.detach_document_request();
-        request.get().set_context_id(context_id.as_bytes());
-        request.get().set_document_id(document_id);
-        request.send().promise.await?;
-        Ok(())
+        parse_context_id(response.get()?.get_context_id()?)
     }
 
     // kaish execution methods
@@ -325,11 +296,11 @@ impl KernelHandle {
     pub async fn shell_execute(
         &self,
         code: &str,
-        cell_id: &str,
-    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+        context_id: ContextId,
+    ) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.shell_execute_request();
         request.get().set_code(code);
-        request.get().set_document_id(cell_id);
+        request.get().set_context_id(context_id.as_bytes());
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -338,11 +309,7 @@ impl KernelHandle {
         }
         let response = request.send().promise.await?;
         let block_id = response.get()?.get_command_block_id()?;
-        Ok(kaijutsu_crdt::BlockId {
-            document_id: block_id.get_document_id()?.to_string()?,
-            agent_id: block_id.get_agent_id()?.to_string()?,
-            seq: block_id.get_seq(),
-        })
+        parse_block_id(&block_id)
     }
 
     /// Interrupt an execution
@@ -431,9 +398,9 @@ impl KernelHandle {
     /// Returns the acknowledged version so the client knows ops were accepted.
     /// The ops should be serialized using serde_json from SerializedOpsOwned.
     #[tracing::instrument(skip(self, ops), name = "rpc_client.push_ops")]
-    pub async fn push_ops(&self, document_id: &str, ops: &[u8]) -> Result<u64, RpcError> {
+    pub async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, RpcError> {
         let mut request = self.kernel.push_ops_request();
-        request.get().set_document_id(document_id);
+        request.get().set_context_id(context_id.as_bytes());
         request.get().set_ops(ops);
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
@@ -446,13 +413,13 @@ impl KernelHandle {
     }
 
     /// Get document state (blocks and CRDT oplog)
-    #[tracing::instrument(skip(self), name = "rpc_client.get_document_state")]
-    pub async fn get_document_state(
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_state")]
+    pub async fn get_context_state(
         &self,
-        document_id: &str,
+        context_id: ContextId,
     ) -> Result<DocumentState, RpcError> {
-        let mut request = self.kernel.get_document_state_request();
-        request.get().set_document_id(document_id);
+        let mut request = self.kernel.get_context_state_request();
+        request.get().set_context_id(context_id.as_bytes());
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -462,7 +429,7 @@ impl KernelHandle {
         let response = request.send().promise.await?;
         let state = response.get()?.get_state()?;
 
-        let document_id = state.get_document_id()?.to_string()?;
+        let context_id = parse_context_id(state.get_context_id()?)?;
         let version = state.get_version();
         let blocks_reader = state.get_blocks()?;
         let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
@@ -476,7 +443,7 @@ impl KernelHandle {
         let ops = state.get_ops().map(|d| d.to_vec()).unwrap_or_default();
 
         Ok(DocumentState {
-            document_id,
+            context_id,
             blocks,
             version,
             ops,
@@ -484,13 +451,13 @@ impl KernelHandle {
     }
 
     /// Compact a document's oplog, returning new size and sync generation.
-    #[tracing::instrument(skip(self), name = "rpc_client.compact_document")]
-    pub async fn compact_document(
+    #[tracing::instrument(skip(self), name = "rpc_client.compact_context")]
+    pub async fn compact_context(
         &self,
-        document_id: &str,
+        context_id: ContextId,
     ) -> Result<(u64, u64), RpcError> {
-        let mut request = self.kernel.compact_document_request();
-        request.get().set_document_id(document_id);
+        let mut request = self.kernel.compact_context_request();
+        request.get().set_context_id(context_id.as_bytes());
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -515,7 +482,7 @@ impl KernelHandle {
         &self,
         content: &str,
         model: Option<&str>,
-        cell_id: &str,
+        context_id: ContextId,
     ) -> Result<String, RpcError> {
         let mut request = self.kernel.prompt_request();
         {
@@ -524,7 +491,7 @@ impl KernelHandle {
             if let Some(m) = model {
                 req.set_model(m);
             }
-            req.set_document_id(cell_id);
+            req.set_context_id(context_id.as_bytes());
         }
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
@@ -613,7 +580,6 @@ impl KernelHandle {
         let result = response.get()?.get_result()?;
 
         Ok(McpToolResult {
-            success: result.get_success(),
             content: result.get_content()?.to_string()?,
             is_error: result.get_is_error(),
         })
@@ -753,14 +719,14 @@ impl KernelHandle {
     #[tracing::instrument(skip(self), name = "rpc_client.fork_from_version")]
     pub async fn fork_from_version(
         &self,
-        document_id: &str,
+        context_id: ContextId,
         version: u64,
         label: &str,
     ) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.fork_from_version_request();
         {
             let mut params = request.get();
-            params.set_document_id(document_id);
+            params.set_context_id(context_id.as_bytes());
             params.set_version(version);
             params.set_context_label(label);
         }
@@ -771,7 +737,7 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        parse_context_id(response.get()?.get_context_id()?)
+        parse_context_id(response.get()?.get_new_context_id()?)
     }
 
     /// Cherry-pick a block from one context into another.
@@ -780,15 +746,15 @@ impl KernelHandle {
     #[tracing::instrument(skip(self), name = "rpc_client.cherry_pick_block")]
     pub async fn cherry_pick_block(
         &self,
-        block_id: &kaijutsu_crdt::BlockId,
+        block_id: &BlockId,
         target_context: ContextId,
-    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+    ) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.cherry_pick_block_request();
         {
             let mut params = request.get();
             let mut source = params.reborrow().init_source_block_id();
-            source.set_document_id(&block_id.document_id);
-            source.set_agent_id(&block_id.agent_id);
+            source.set_context_id(block_id.context_id.as_bytes());
+            source.set_agent_id(block_id.agent_id.as_bytes());
             source.set_seq(block_id.seq);
             params.set_target_context_id(target_context.as_bytes());
         }
@@ -806,16 +772,16 @@ impl KernelHandle {
     /// Get document history (version snapshots).
     ///
     /// Returns a list of version snapshots for timeline navigation.
-    #[tracing::instrument(skip(self), name = "rpc_client.get_document_history")]
-    pub async fn get_document_history(
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_history")]
+    pub async fn get_context_history(
         &self,
-        document_id: &str,
+        context_id: ContextId,
         limit: u32,
     ) -> Result<Vec<VersionSnapshot>, RpcError> {
-        let mut request = self.kernel.get_document_history_request();
+        let mut request = self.kernel.get_context_history_request();
         {
             let mut params = request.get();
-            params.set_document_id(document_id);
+            params.set_context_id(context_id.as_bytes());
             params.set_limit(limit);
         }
         {
@@ -833,7 +799,12 @@ impl KernelHandle {
                 version: snap.get_version(),
                 timestamp: snap.get_timestamp(),
                 block_count: snap.get_block_count(),
-                change_kind: snap.get_change_kind()?.to_string()?,
+                change_kind: match snap.get_change_kind()? {
+                    crate::kaijutsu_capnp::ChangeKind::BlockAdded => "block_added".to_string(),
+                    crate::kaijutsu_capnp::ChangeKind::BlockDeleted => "block_deleted".to_string(),
+                    crate::kaijutsu_capnp::ChangeKind::Edit => "edit".to_string(),
+                    crate::kaijutsu_capnp::ChangeKind::StatusChange => "status_change".to_string(),
+                },
             });
         }
         Ok(result)
@@ -937,13 +908,20 @@ impl KernelHandle {
 
         let mut result = Vec::with_capacity(staged.len() as usize);
         for entry in staged.iter() {
+            let dk = match entry.get_drift_kind()? {
+                crate::kaijutsu_capnp::DriftKind::Push => DriftKind::Push,
+                crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
+                crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
+                crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
+                crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
+            };
             result.push(StagedDriftInfo {
                 id: entry.get_id(),
                 source_ctx: parse_context_id(entry.get_source_ctx()?)?,
                 target_ctx: parse_context_id(entry.get_target_ctx()?)?,
                 content: entry.get_content()?.to_string()?,
                 source_model: entry.get_source_model()?.to_string()?,
-                drift_kind: entry.get_drift_kind()?.to_string()?,
+                drift_kind: dk,
                 created_at: entry.get_created_at(),
             });
         }
@@ -968,7 +946,7 @@ impl KernelHandle {
         &self,
         source_ctx: ContextId,
         prompt: Option<&str>,
-    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+    ) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.drift_pull_request();
         request.get().set_source_ctx(source_ctx.as_bytes());
         if let Some(p) = prompt {
@@ -993,7 +971,7 @@ impl KernelHandle {
     pub async fn drift_merge(
         &self,
         source_ctx: ContextId,
-    ) -> Result<kaijutsu_crdt::BlockId, RpcError> {
+    ) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.drift_merge_request();
         request.get().set_source_ctx(source_ctx.as_bytes());
         {
@@ -1290,7 +1268,6 @@ fn parse_context_info(
         provider: reader.get_provider()?.to_string()?,
         model: reader.get_model()?.to_string()?,
         created_at: reader.get_created_at(),
-        document_id: reader.get_document_id()?.to_string()?,
         trace_id,
     })
 }
@@ -1315,32 +1292,39 @@ fn parse_kernel_info(
     })
 }
 
-/// Helper to parse block ID from Cap'n Proto
+/// Helper to parse block ID from Cap'n Proto (binary 16-byte UUIDs).
 pub(crate) fn parse_block_id(
     reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
-) -> Result<kaijutsu_crdt::BlockId, RpcError> {
-    Ok(kaijutsu_crdt::BlockId {
-        document_id: reader.get_document_id()?.to_string()?,
-        agent_id: reader.get_agent_id()?.to_string()?,
-        seq: reader.get_seq(),
-    })
+) -> Result<BlockId, RpcError> {
+    let context_id = ContextId::try_from_slice(reader.get_context_id()?)
+        .ok_or_else(|| RpcError::ServerError("invalid context_id in BlockId".into()))?;
+    let agent_id = PrincipalId::try_from_slice(reader.get_agent_id()?)
+        .ok_or_else(|| RpcError::ServerError("invalid agent_id in BlockId".into()))?;
+    Ok(BlockId::new(context_id, agent_id, reader.get_seq()))
 }
 
-/// Helper to parse a flat BlockSnapshot from Cap'n Proto
+/// Helper to parse a flat BlockSnapshot from Cap'n Proto using BlockSnapshotBuilder.
 pub(crate) fn parse_block_snapshot(
     reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
-) -> Result<kaijutsu_crdt::BlockSnapshot, RpcError> {
-    use kaijutsu_crdt::{BlockKind, BlockSnapshot, Role, Status};
-
+) -> Result<BlockSnapshot, RpcError> {
     // Parse block ID
     let id = parse_block_id(&reader.get_id()?)?;
 
-    // Parse parent_id if present
-    let parent_id = if reader.get_has_parent_id() {
-        Some(parse_block_id(&reader.get_parent_id()?)?)
-    } else {
-        None
+    // Parse kind (5 variants — no ShellCommand/ShellOutput)
+    let kind = match reader.get_kind()? {
+        crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+        crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+        crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+        crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+        crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
     };
+
+    let mut builder = BlockSnapshotBuilder::new(id, kind);
+
+    // Parse parent_id if present
+    if reader.get_has_parent_id() {
+        builder = builder.parent_id(parse_block_id(&reader.get_parent_id()?)?);
+    }
 
     // Parse role
     let role = match reader.get_role()? {
@@ -1349,6 +1333,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::Role::System => Role::System,
         crate::kaijutsu_capnp::Role::Tool => Role::Tool,
     };
+    builder = builder.role(role);
 
     // Parse status
     let status = match reader.get_status()? {
@@ -1357,97 +1342,97 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::Status::Done => Status::Done,
         crate::kaijutsu_capnp::Status::Error => Status::Error,
     };
+    builder = builder.status(status);
 
-    // Parse kind
-    let kind = match reader.get_kind()? {
-        crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
-        crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
-        crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
-        crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
-        crate::kaijutsu_capnp::BlockKind::ShellCommand => BlockKind::ShellCommand,
-        crate::kaijutsu_capnp::BlockKind::ShellOutput => BlockKind::ShellOutput,
-        crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
-    };
+    // Content
+    builder = builder.content(reader.get_content()?.to_str()?);
+    builder = builder.collapsed(reader.get_collapsed());
 
-    // Parse content
-    let content = reader.get_content()?.to_string()?;
-    let collapsed = reader.get_collapsed();
-    let author = reader.get_author()?.to_string()?;
-    let created_at = reader.get_created_at();
+    // Tool-specific fields
+    if reader.has_tool_name() {
+        let name = reader.get_tool_name()?.to_str()?;
+        if !name.is_empty() {
+            builder = builder.tool_name(name);
+        }
+    }
 
-    // Parse tool-specific fields
-    let tool_name = if reader.has_tool_name() {
-        Some(reader.get_tool_name()?.to_string()?)
-    } else {
-        None
-    };
+    if reader.has_tool_input() {
+        let input = reader.get_tool_input()?.to_str()?;
+        if !input.is_empty() {
+            builder = builder.tool_input(input);
+        }
+    }
 
-    let tool_input = if reader.has_tool_input() {
-        let input_str = reader.get_tool_input()?.to_string()?;
-        if input_str.is_empty() { None } else { Some(input_str) }
-    } else {
-        None
-    };
+    if reader.has_tool_call_id() {
+        builder = builder.tool_call_id(parse_block_id(&reader.get_tool_call_id()?)?);
+    }
 
-    let tool_call_id = if reader.get_has_tool_call_id() {
-        Some(parse_block_id(&reader.get_tool_call_id()?)?)
-    } else {
-        None
-    };
+    if reader.get_has_exit_code() {
+        builder = builder.exit_code(reader.get_exit_code());
+    }
 
-    let exit_code = if reader.get_has_exit_code() {
-        Some(reader.get_exit_code())
-    } else {
-        None
-    };
+    if reader.get_is_error() {
+        builder = builder.is_error(true);
+    }
 
-    let is_error = reader.get_is_error();
+    // Display hint
+    if reader.has_display_hint() {
+        if let Ok(hint) = reader.get_display_hint() {
+            if let Ok(s) = hint.to_str() {
+                if !s.is_empty() {
+                    builder = builder.display_hint(s);
+                }
+            }
+        }
+    }
 
-    // Read display hint from wire protocol
-    let display_hint = if reader.get_has_display_hint() {
-        reader.get_display_hint()
-            .ok()
-            .and_then(|s| s.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned())
-    } else {
-        None
-    };
+    // Drift-specific fields — source_context is now binary Data (16-byte ContextId)
+    let source_data = reader.get_source_context()?;
+    if source_data.len() == 16 {
+        if let Some(ctx) = ContextId::try_from_slice(source_data) {
+            if !ctx.is_nil() {
+                builder = builder.source_context(ctx);
+            }
+        }
+    }
 
-    Ok(BlockSnapshot {
-        id,
-        parent_id,
-        role,
-        status,
-        kind,
-        content,
-        collapsed,
-        author,
-        created_at,
-        tool_name,
-        tool_input,
-        tool_call_id,
-        exit_code,
-        is_error,
-        display_hint,
-        source_context: if reader.get_has_source_context() {
-            reader.get_source_context().ok()
-                .and_then(|s| s.to_str().ok())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned())
-        } else { None },
-        source_model: if reader.get_has_source_model() {
-            reader.get_source_model().ok()
-                .and_then(|s| s.to_str().ok())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned())
-        } else { None },
-        drift_kind: if reader.get_has_drift_kind() {
-            reader.get_drift_kind().ok()
-                .and_then(|s| s.to_str().ok())
-                .and_then(|s| DriftKind::from_str(s))
-        } else { None },
-    })
+    if reader.has_source_model() {
+        if let Ok(model) = reader.get_source_model() {
+            if let Ok(s) = model.to_str() {
+                if !s.is_empty() {
+                    builder = builder.source_model(s);
+                }
+            }
+        }
+    }
+
+    // DriftKind — wire is now an enum, not a string
+    if reader.get_has_drift_kind() {
+        if let Ok(dk) = reader.get_drift_kind() {
+            let drift_kind = match dk {
+                crate::kaijutsu_capnp::DriftKind::Push => DriftKind::Push,
+                crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
+                crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
+                crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
+                crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
+            };
+            builder = builder.drift_kind(drift_kind);
+        }
+    }
+
+    // ToolKind — wire enum
+    if reader.get_has_tool_kind() {
+        if let Ok(tk) = reader.get_tool_kind() {
+            let tool_kind = match tk {
+                crate::kaijutsu_capnp::ToolKind::Shell => ToolKind::Shell,
+                crate::kaijutsu_capnp::ToolKind::Mcp => ToolKind::Mcp,
+                crate::kaijutsu_capnp::ToolKind::Builtin => ToolKind::Builtin,
+            };
+            builder = builder.tool_kind(tool_kind);
+        }
+    }
+
+    Ok(builder.build())
 }
 
 #[derive(Debug, Clone)]
@@ -1512,7 +1497,7 @@ pub struct StagedDriftInfo {
     pub target_ctx: ContextId,
     pub content: String,
     pub source_model: String,
-    pub drift_kind: String,
+    pub drift_kind: DriftKind,
     pub created_at: u64,
 }
 
@@ -1568,8 +1553,8 @@ pub enum ShellValue {
 /// Full document state with blocks
 #[derive(Debug, Clone)]
 pub struct DocumentState {
-    pub document_id: String,
-    pub blocks: Vec<kaijutsu_crdt::BlockSnapshot>,
+    pub context_id: ContextId,
+    pub blocks: Vec<BlockSnapshot>,
     pub version: u64,
     /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
     pub ops: Vec<u8>,
@@ -1586,7 +1571,6 @@ pub struct ToolResult {
 /// Result from an MCP tool call
 #[derive(Debug, Clone)]
 pub struct McpToolResult {
-    pub success: bool,
     pub content: String,
     pub is_error: bool,
 }

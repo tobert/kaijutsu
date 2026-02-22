@@ -4,7 +4,8 @@
 //! CRDT internals (Frontier, oplog bytes, SerializedOpsOwned) behind a clean API.
 //! Both the Bevy app and MCP server consume this instead of duplicating sync logic.
 
-use kaijutsu_crdt::{BlockDocument, BlockId, BlockSnapshot};
+use kaijutsu_crdt::{BlockDocument, ContextId};
+use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId};
 use tracing::{info, warn};
 
 use crate::rpc::DocumentState;
@@ -32,28 +33,28 @@ pub enum SyncEffect {
 pub struct SyncedDocument {
     doc: BlockDocument,
     sync: SyncManager,
-    document_id: String,
+    context_id: ContextId,
 }
 
 impl SyncedDocument {
     /// Create a new, empty synced document.
-    pub fn new(document_id: &str, agent_id: &str) -> Self {
+    pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
         Self {
-            doc: BlockDocument::new(document_id, agent_id),
+            doc: BlockDocument::new(context_id, agent_id),
             sync: SyncManager::new(),
-            document_id: document_id.to_string(),
+            context_id,
         }
     }
 
     /// Create from a full [`DocumentState`] (e.g., from `get_document_state` RPC).
     pub fn from_document_state(
         state: &DocumentState,
-        agent_id: &str,
+        agent_id: PrincipalId,
     ) -> Result<Self, SyncError> {
-        let mut sd = Self::new(&state.document_id, agent_id);
+        let mut sd = Self::new(state.context_id, agent_id);
         if !state.ops.is_empty() {
             sd.sync
-                .apply_initial_state(&mut sd.doc, &state.document_id, &state.ops)?;
+                .apply_initial_state(&mut sd.doc, state.context_id, &state.ops)?;
         }
         Ok(sd)
     }
@@ -62,9 +63,9 @@ impl SyncedDocument {
     // Read accessors — no CRDT types exposed
     // =========================================================================
 
-    /// The document ID this synced document tracks.
-    pub fn document_id(&self) -> &str {
-        &self.document_id
+    /// The context ID this synced document tracks.
+    pub fn context_id(&self) -> ContextId {
+        self.context_id
     }
 
     /// All blocks in document order.
@@ -89,7 +90,7 @@ impl SyncedDocument {
 
     /// Whether we're in a synced state (not waiting for full resync).
     pub fn is_synced(&self) -> bool {
-        !self.sync.needs_full_sync(&self.document_id)
+        !self.sync.needs_full_sync(self.context_id)
     }
 
     // =========================================================================
@@ -110,16 +111,16 @@ impl SyncedDocument {
     pub fn apply_event(&mut self, event: &ServerEvent) -> SyncEffect {
         match event {
             ServerEvent::BlockInserted {
-                document_id,
+                context_id,
                 block,
                 ops,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 match self
                     .sync
-                    .apply_block_inserted(&mut self.doc, document_id, block, ops)
+                    .apply_block_inserted(&mut self.doc, *context_id, block, ops)
                 {
                     Ok(crate::sync::SyncResult::FullSync { block_count }) => {
                         SyncEffect::FullSync { block_count }
@@ -137,12 +138,12 @@ impl SyncedDocument {
             }
 
             ServerEvent::BlockTextOps {
-                document_id, ops, ..
+                context_id, ops, ..
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                match self.sync.apply_text_ops(&mut self.doc, document_id, ops) {
+                match self.sync.apply_text_ops(&mut self.doc, *context_id, ops) {
                     Ok(_) => SyncEffect::Updated {
                         block_count: self.doc.block_count(),
                     },
@@ -156,11 +157,11 @@ impl SyncedDocument {
             }
 
             ServerEvent::BlockStatusChanged {
-                document_id,
+                context_id,
                 block_id,
                 status,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 if let Err(e) = self.doc.set_status(block_id, *status) {
@@ -172,10 +173,10 @@ impl SyncedDocument {
             }
 
             ServerEvent::BlockDeleted {
-                document_id,
+                context_id,
                 block_id,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 if let Err(e) = self.doc.delete_block(block_id) {
@@ -187,11 +188,11 @@ impl SyncedDocument {
             }
 
             ServerEvent::BlockCollapsedChanged {
-                document_id,
+                context_id,
                 block_id,
                 collapsed,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 if let Err(e) = self.doc.set_collapsed(block_id, *collapsed) {
@@ -203,11 +204,11 @@ impl SyncedDocument {
             }
 
             ServerEvent::BlockMoved {
-                document_id,
+                context_id,
                 block_id,
                 after_id,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 if let Err(e) = self.doc.move_block(block_id, after_id.as_ref()) {
@@ -219,15 +220,15 @@ impl SyncedDocument {
             }
 
             ServerEvent::SyncReset {
-                document_id,
+                context_id,
                 generation,
             } => {
-                if document_id != &self.document_id {
+                if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 info!(
                     "SyncedDocument: sync reset for {}, generation {}",
-                    document_id, generation
+                    context_id, generation
                 );
                 self.sync.reset_frontier();
                 SyncEffect::NeedsResync
@@ -250,10 +251,10 @@ impl SyncedDocument {
         }
         let result = self
             .sync
-            .apply_initial_state(&mut self.doc, &state.document_id, &state.ops)?;
+            .apply_initial_state(&mut self.doc, state.context_id, &state.ops)?;
         match result {
             crate::sync::SyncResult::FullSync { block_count } => {
-                self.document_id = state.document_id.clone();
+                self.context_id = state.context_id;
                 Ok(SyncEffect::FullSync { block_count })
             }
             _ => Ok(SyncEffect::Updated {
@@ -304,17 +305,24 @@ impl SyncedDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::{BlockKind, Role};
+    use kaijutsu_types::{BlockKind, Role};
 
-    fn create_server_doc(document_id: &str) -> BlockDocument {
-        let mut doc = BlockDocument::new(document_id, "server-agent");
+    fn test_context_id() -> ContextId {
+        ContextId::new()
+    }
+
+    fn test_agent_id() -> PrincipalId {
+        PrincipalId::new()
+    }
+
+    fn create_server_doc(context_id: ContextId) -> BlockDocument {
+        let mut doc = BlockDocument::new(context_id, test_agent_id());
         doc.insert_block(
             None,
             None,
             Role::User,
             BlockKind::Text,
             "Hello from server",
-            "server",
         )
         .expect("insert block");
         doc
@@ -322,34 +330,36 @@ mod tests {
 
     #[test]
     fn test_new_and_from_document_state() {
-        let server = create_server_doc("doc-1");
+        let ctx = test_context_id();
+        let server = create_server_doc(ctx);
         let oplog = server.oplog_bytes().unwrap();
 
         let state = DocumentState {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
             ops: oplog,
         };
 
-        let sd = SyncedDocument::from_document_state(&state, "client").unwrap();
-        assert_eq!(sd.document_id(), "doc-1");
+        let sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
+        assert_eq!(sd.context_id(), ctx);
         assert_eq!(sd.block_count(), 1);
         assert!(sd.is_synced());
     }
 
     #[test]
     fn test_apply_event_block_inserted() {
-        let mut server = create_server_doc("doc-1");
+        let ctx = test_context_id();
+        let mut server = create_server_doc(ctx);
         let initial_oplog = server.oplog_bytes().unwrap();
 
         let state = DocumentState {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
             ops: initial_oplog,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, "client").unwrap();
+        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
 
         // Add a new block on the server
         let frontier_before = server.frontier();
@@ -360,14 +370,13 @@ mod tests {
                 Role::Model,
                 BlockKind::Text,
                 "Response",
-                "server",
             )
             .unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
         let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
         let effect = sd.apply_event(&ServerEvent::BlockInserted {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             block: Box::new(block),
             ops,
         });
@@ -378,15 +387,13 @@ mod tests {
 
     #[test]
     fn test_apply_event_wrong_document_ignored() {
-        let mut sd = SyncedDocument::new("doc-1", "client");
+        let ctx = test_context_id();
+        let other_ctx = test_context_id();
+        let mut sd = SyncedDocument::new(ctx, test_agent_id());
 
         let effect = sd.apply_event(&ServerEvent::BlockDeleted {
-            document_id: "doc-2".to_string(),
-            block_id: BlockId {
-                document_id: "doc-2".to_string(),
-                agent_id: "x".to_string(),
-                seq: 0,
-            },
+            context_id: other_ctx,
+            block_id: BlockId::new(other_ctx, PrincipalId::new(), 0),
         });
 
         assert_eq!(effect, SyncEffect::Ignored);
@@ -394,19 +401,20 @@ mod tests {
 
     #[test]
     fn test_apply_event_sync_reset() {
-        let server = create_server_doc("doc-1");
+        let ctx = test_context_id();
+        let server = create_server_doc(ctx);
         let oplog = server.oplog_bytes().unwrap();
         let state = DocumentState {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
             ops: oplog,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, "client").unwrap();
+        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
         assert!(sd.is_synced());
 
         let effect = sd.apply_event(&ServerEvent::SyncReset {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             generation: 1,
         });
 
@@ -416,26 +424,27 @@ mod tests {
 
     #[test]
     fn test_apply_event_text_streaming() {
-        let mut server = create_server_doc("doc-1");
+        let ctx = test_context_id();
+        let mut server = create_server_doc(ctx);
         let initial_oplog = server.oplog_bytes().unwrap();
         let state = DocumentState {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
             ops: initial_oplog,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, "client").unwrap();
+        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
 
         // Create a streaming block
         let frontier_before = server.frontier();
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "", "server")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "")
             .unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
         let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
         sd.apply_event(&ServerEvent::BlockInserted {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             block: Box::new(block),
             ops,
         });
@@ -446,8 +455,8 @@ mod tests {
         let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
         let effect = sd.apply_event(&ServerEvent::BlockTextOps {
-            document_id: "doc-1".to_string(),
-            block_id: block_id.clone(),
+            context_id: ctx,
+            block_id,
             ops,
         });
 
@@ -458,13 +467,14 @@ mod tests {
 
     #[test]
     fn test_apply_document_state() {
-        let mut sd = SyncedDocument::new("doc-1", "client");
+        let ctx = test_context_id();
+        let mut sd = SyncedDocument::new(ctx, test_agent_id());
         assert!(!sd.is_synced());
 
-        let server = create_server_doc("doc-1");
+        let server = create_server_doc(ctx);
         let oplog = server.oplog_bytes().unwrap();
         let state = DocumentState {
-            document_id: "doc-1".to_string(),
+            context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
             ops: oplog,
@@ -478,7 +488,8 @@ mod tests {
 
     #[test]
     fn test_resource_events_ignored() {
-        let mut sd = SyncedDocument::new("doc-1", "client");
+        let ctx = test_context_id();
+        let mut sd = SyncedDocument::new(ctx, test_agent_id());
 
         let effect = sd.apply_event(&ServerEvent::ResourceUpdated {
             server: "test".to_string(),

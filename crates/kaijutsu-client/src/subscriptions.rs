@@ -11,7 +11,8 @@
 use std::rc::Rc;
 
 use capnp::capability::Promise;
-use kaijutsu_crdt::{BlockId, BlockSnapshot};
+use kaijutsu_crdt::ContextId;
+use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
 use crate::kaijutsu_capnp::{block_events, resource_events};
@@ -29,42 +30,42 @@ use crate::rpc::{parse_block_id, parse_block_snapshot};
 pub enum ServerEvent {
     /// A new block was inserted into a document.
     BlockInserted {
-        document_id: String,
+        context_id: ContextId,
         block: Box<BlockSnapshot>,
         ops: Vec<u8>,
     },
     /// CRDT text operations applied to a block's content.
     BlockTextOps {
-        document_id: String,
+        context_id: ContextId,
         block_id: BlockId,
         ops: Vec<u8>,
     },
     /// A block's execution status changed (Pending → Running → Done/Error).
     BlockStatusChanged {
-        document_id: String,
+        context_id: ContextId,
         block_id: BlockId,
-        status: kaijutsu_crdt::Status,
+        status: kaijutsu_types::Status,
     },
     /// A block was deleted from a document.
     BlockDeleted {
-        document_id: String,
+        context_id: ContextId,
         block_id: BlockId,
     },
     /// A block's collapsed state changed.
     BlockCollapsedChanged {
-        document_id: String,
+        context_id: ContextId,
         block_id: BlockId,
         collapsed: bool,
     },
     /// A block was moved to a new position in the document.
     BlockMoved {
-        document_id: String,
+        context_id: ContextId,
         block_id: BlockId,
         after_id: Option<BlockId>,
     },
     /// Document was compacted — client must re-sync from full oplog.
     SyncReset {
-        document_id: String,
+        context_id: ContextId,
         generation: u64,
     },
     /// An MCP resource's content was updated.
@@ -83,7 +84,7 @@ pub enum ServerEvent {
 /// Subscribe via [`ActorHandle::subscribe_status()`](crate::ActorHandle::subscribe_status).
 #[derive(Clone, Debug)]
 pub enum ConnectionStatus {
-    Connected { document_id: Option<String> },
+    Connected { context_id: Option<ContextId> },
     Disconnected,
     Reconnecting { attempt: u32 },
     Error(String),
@@ -110,18 +111,25 @@ fn read_text(reader: capnp::text::Reader<'_>) -> Result<String, capnp::Error> {
     reader.to_str().map(|s| s.to_owned()).map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
+/// Parse contextId binary data (16-byte UUID) into ContextId at the wire boundary.
+fn parse_context_id_data(data: &[u8]) -> Result<ContextId, capnp::Error> {
+    ContextId::try_from_slice(data).ok_or_else(|| {
+        capnp::Error::failed(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
+    })
+}
+
 /// Convert an RpcError from our parsing helpers into a capnp::Error.
 fn rpc_to_capnp(e: crate::rpc::RpcError) -> capnp::Error {
     capnp::Error::failed(e.to_string())
 }
 
 /// Parse a Status enum from capnp.
-fn parse_status(status: crate::kaijutsu_capnp::Status) -> kaijutsu_crdt::Status {
+fn parse_status(status: crate::kaijutsu_capnp::Status) -> kaijutsu_types::Status {
     match status {
-        crate::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
-        crate::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
-        crate::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
-        crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
+        crate::kaijutsu_capnp::Status::Pending => kaijutsu_types::Status::Pending,
+        crate::kaijutsu_capnp::Status::Running => kaijutsu_types::Status::Running,
+        crate::kaijutsu_capnp::Status::Done => kaijutsu_types::Status::Done,
+        crate::kaijutsu_capnp::Status::Error => kaijutsu_types::Status::Error,
     }
 }
 
@@ -137,9 +145,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -155,7 +163,7 @@ impl block_events::Server for BlockEventsForwarder {
 
         let ops = params.get_ops().map(|d| d.to_vec()).unwrap_or_default();
 
-        let _ = self.event_tx.send(ServerEvent::BlockInserted { document_id, block, ops });
+        let _ = self.event_tx.send(ServerEvent::BlockInserted { context_id, block, ops });
         Promise::ok(())
     }
 
@@ -169,9 +177,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -185,7 +193,7 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockDeleted { document_id, block_id });
+        let _ = self.event_tx.send(ServerEvent::BlockDeleted { context_id, block_id });
         Promise::ok(())
     }
 
@@ -199,9 +207,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -216,7 +224,7 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let _ = self.event_tx.send(ServerEvent::BlockCollapsedChanged {
-            document_id,
+            context_id,
             block_id,
             collapsed: params.get_collapsed(),
         });
@@ -233,9 +241,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -261,7 +269,7 @@ impl block_events::Server for BlockEventsForwarder {
             None
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockMoved { document_id, block_id, after_id });
+        let _ = self.event_tx.send(ServerEvent::BlockMoved { context_id, block_id, after_id });
         Promise::ok(())
     }
 
@@ -275,9 +283,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -297,7 +305,7 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let _ = self.event_tx.send(ServerEvent::BlockStatusChanged {
-            document_id,
+            context_id,
             block_id,
             status,
         });
@@ -314,9 +322,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -335,7 +343,7 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockTextOps { document_id, block_id, ops });
+        let _ = self.event_tx.send(ServerEvent::BlockTextOps { context_id, block_id, ops });
         Promise::ok(())
     }
 
@@ -349,9 +357,9 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let document_id = match params.get_document_id() {
-            Ok(s) => match read_text(s) {
-                Ok(s) => s,
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
                 Err(e) => return Promise::err(e),
             },
             Err(e) => return Promise::err(e),
@@ -359,7 +367,7 @@ impl block_events::Server for BlockEventsForwarder {
 
         let generation = params.get_generation();
 
-        let _ = self.event_tx.send(ServerEvent::SyncReset { document_id, generation });
+        let _ = self.event_tx.send(ServerEvent::SyncReset { context_id, generation });
         Promise::ok(())
     }
 }

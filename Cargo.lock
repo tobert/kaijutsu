@@ -5098,6 +5098,7 @@ dependencies = [
  "futures",
  "kaijutsu-crdt",
  "kaijutsu-telemetry",
+ "kaijutsu-types",
  "log",
  "postcard",
  "rand 0.8.5",

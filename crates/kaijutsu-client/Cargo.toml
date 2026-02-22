@@ -22,6 +22,7 @@ kaijutsu-telemetry = { workspace = true }
 
 # Shared CRDT types
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
+kaijutsu-types = { path = "../kaijutsu-types" }
 
 [build-dependencies]
 capnpc.workspace = true
