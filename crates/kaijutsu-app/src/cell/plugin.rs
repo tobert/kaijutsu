@@ -116,8 +116,9 @@ impl Plugin for CellPlugin {
                 systems::handle_block_events,
                 // Context switching (reads ContextSwitchRequested, swaps active cache entry)
                 systems::handle_context_switch.after(systems::handle_block_events),
-                // Handle prompt submission
-                systems::handle_prompt_submitted,
+                // Handle prompt submission (after context switch to avoid routing to wrong context)
+                systems::handle_prompt_submitted
+                    .after(systems::handle_context_switch),
                 // Restore text + flash border on submit failure
                 systems::handle_submit_failed
                     .after(systems::handle_prompt_submitted),

@@ -2064,7 +2064,7 @@ pub fn sync_block_cell_buffers(
     mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
-    drift_state: Res<crate::ui::drift::DriftState>,
+    doc_cache: Res<super::components::DocumentCache>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -2125,7 +2125,7 @@ pub fn sync_block_cell_buffers(
         // Format and update the buffer
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
-        let local_ctx = drift_state.local_context_id;
+        let local_ctx = doc_cache.active_id();
         let text = format_single_block(block, local_ctx);
 
         // Debounce large blocks: skip reshape if text grew by < DEBOUNCE_CHARS.
