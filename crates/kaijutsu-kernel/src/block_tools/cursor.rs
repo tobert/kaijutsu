@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kaijutsu_crdt::BlockId;
+use kaijutsu_types::PrincipalId;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
@@ -75,7 +76,7 @@ fn transform_offset(offset: usize, edit_offset: usize, deleted: usize, inserted:
 #[derive(Debug, Clone)]
 pub struct CursorEvent {
     /// The agent whose cursor moved.
-    pub agent_id: String,
+    pub agent_id: PrincipalId,
     /// The new cursor position (None if cursor removed).
     pub position: Option<CursorPosition>,
 }
@@ -83,7 +84,7 @@ pub struct CursorEvent {
 /// Tracks cursor positions for all agents.
 pub struct CursorTracker {
     /// Current cursor positions by agent ID.
-    cursors: Arc<RwLock<HashMap<String, CursorPosition>>>,
+    cursors: Arc<RwLock<HashMap<PrincipalId, CursorPosition>>>,
     /// Broadcast channel for cursor updates.
     sender: broadcast::Sender<CursorEvent>,
 }
@@ -104,11 +105,10 @@ impl CursorTracker {
     }
 
     /// Set an agent's cursor position.
-    pub fn set_cursor(&self, agent_id: impl Into<String>, position: CursorPosition) {
-        let agent_id = agent_id.into();
+    pub fn set_cursor(&self, agent_id: PrincipalId, position: CursorPosition) {
         {
             let mut cursors = self.cursors.write();
-            cursors.insert(agent_id.clone(), position.clone());
+            cursors.insert(agent_id, position.clone());
         }
         let _ = self.sender.send(CursorEvent {
             agent_id,
@@ -117,36 +117,36 @@ impl CursorTracker {
     }
 
     /// Remove an agent's cursor.
-    pub fn remove_cursor(&self, agent_id: &str) {
+    pub fn remove_cursor(&self, agent_id: PrincipalId) {
         {
             let mut cursors = self.cursors.write();
-            cursors.remove(agent_id);
+            cursors.remove(&agent_id);
         }
         let _ = self.sender.send(CursorEvent {
-            agent_id: agent_id.to_string(),
+            agent_id,
             position: None,
         });
     }
 
     /// Get an agent's current cursor position.
-    pub fn get_cursor(&self, agent_id: &str) -> Option<CursorPosition> {
+    pub fn get_cursor(&self, agent_id: PrincipalId) -> Option<CursorPosition> {
         let cursors = self.cursors.read();
-        cursors.get(agent_id).cloned()
+        cursors.get(&agent_id).cloned()
     }
 
     /// Get all cursor positions.
-    pub fn all_cursors(&self) -> HashMap<String, CursorPosition> {
+    pub fn all_cursors(&self) -> HashMap<PrincipalId, CursorPosition> {
         let cursors = self.cursors.read();
         cursors.clone()
     }
 
     /// Get cursors in a specific block.
-    pub fn cursors_in_block(&self, block_id: &BlockId) -> Vec<(String, CursorPosition)> {
+    pub fn cursors_in_block(&self, block_id: &BlockId) -> Vec<(PrincipalId, CursorPosition)> {
         let cursors = self.cursors.read();
         cursors
             .iter()
             .filter(|(_, pos)| &pos.block_id == block_id)
-            .map(|(agent, pos)| (agent.clone(), pos.clone()))
+            .map(|(agent, pos)| (*agent, pos.clone()))
             .collect()
     }
 
@@ -167,7 +167,7 @@ impl CursorTracker {
             for (agent_id, position) in cursors.iter_mut() {
                 if &position.block_id == block_id {
                     position.transform(edit_offset, deleted, inserted);
-                    updated.push((agent_id.clone(), position.clone()));
+                    updated.push((*agent_id, position.clone()));
                 }
             }
         }
@@ -182,12 +182,12 @@ impl CursorTracker {
     }
 
     /// Move a cursor by a relative delta.
-    pub fn move_cursor(&self, agent_id: &str, delta: isize) -> Option<CursorPosition> {
+    pub fn move_cursor(&self, agent_id: PrincipalId, delta: isize) -> Option<CursorPosition> {
         let mut result = None;
 
         {
             let mut cursors = self.cursors.write();
-            if let Some(position) = cursors.get_mut(agent_id) {
+            if let Some(position) = cursors.get_mut(&agent_id) {
                 let new_offset = if delta < 0 {
                     position.offset.saturating_sub((-delta) as usize)
                 } else {
@@ -201,7 +201,7 @@ impl CursorTracker {
 
         if let Some(ref pos) = result {
             let _ = self.sender.send(CursorEvent {
-                agent_id: agent_id.to_string(),
+                agent_id,
                 position: Some(pos.clone()),
             });
         }
@@ -287,36 +287,47 @@ mod tests {
         assert_eq!(cursor.offset, 12, "cursor should account for net change");
     }
 
+    fn test_agent(n: u64) -> PrincipalId {
+        // Deterministic agents for tests
+        PrincipalId::from_bytes(*uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("test-agent-{}", n).as_bytes(),
+        ).as_bytes())
+    }
+
     #[test]
     fn test_cursor_tracker_basic() {
         let tracker = CursorTracker::new();
         let block_id = test_block_id();
+        let agent1 = test_agent(1);
 
         // Set cursor
-        tracker.set_cursor("agent1", CursorPosition::new(block_id.clone(), 10));
+        tracker.set_cursor(agent1, CursorPosition::new(block_id, 10));
 
         // Get cursor
-        let pos = tracker.get_cursor("agent1").unwrap();
+        let pos = tracker.get_cursor(agent1).unwrap();
         assert_eq!(pos.offset, 10);
 
         // Remove cursor
-        tracker.remove_cursor("agent1");
-        assert!(tracker.get_cursor("agent1").is_none());
+        tracker.remove_cursor(agent1);
+        assert!(tracker.get_cursor(agent1).is_none());
     }
 
     #[test]
     fn test_cursor_tracker_transform() {
         let tracker = CursorTracker::new();
         let block_id = test_block_id();
+        let agent1 = test_agent(1);
+        let agent2 = test_agent(2);
 
-        tracker.set_cursor("agent1", CursorPosition::new(block_id.clone(), 10));
-        tracker.set_cursor("agent2", CursorPosition::new(block_id.clone(), 20));
+        tracker.set_cursor(agent1, CursorPosition::new(block_id, 10));
+        tracker.set_cursor(agent2, CursorPosition::new(block_id, 20));
 
         // Simulate insert at position 5
         tracker.transform_cursors(&block_id, 5, 0, 5);
 
-        let pos1 = tracker.get_cursor("agent1").unwrap();
-        let pos2 = tracker.get_cursor("agent2").unwrap();
+        let pos1 = tracker.get_cursor(agent1).unwrap();
+        let pos2 = tracker.get_cursor(agent2).unwrap();
         assert_eq!(pos1.offset, 15);
         assert_eq!(pos2.offset, 25);
     }
@@ -326,15 +337,17 @@ mod tests {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
         let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
+        let agent1 = test_agent(1);
+        let agent2 = test_agent(2);
 
-        tracker.set_cursor("agent1", CursorPosition::new(block1.clone(), 10));
-        tracker.set_cursor("agent2", CursorPosition::new(block2.clone(), 10));
+        tracker.set_cursor(agent1, CursorPosition::new(block1, 10));
+        tracker.set_cursor(agent2, CursorPosition::new(block2, 10));
 
         // Transform only affects block1
         tracker.transform_cursors(&block1, 5, 0, 5);
 
-        let pos1 = tracker.get_cursor("agent1").unwrap();
-        let pos2 = tracker.get_cursor("agent2").unwrap();
+        let pos1 = tracker.get_cursor(agent1).unwrap();
+        let pos2 = tracker.get_cursor(agent2).unwrap();
         assert_eq!(pos1.offset, 15, "block1 cursor should transform");
         assert_eq!(pos2.offset, 10, "block2 cursor should not transform");
     }
@@ -343,19 +356,20 @@ mod tests {
     fn test_move_cursor() {
         let tracker = CursorTracker::new();
         let block_id = test_block_id();
+        let agent1 = test_agent(1);
 
-        tracker.set_cursor("agent1", CursorPosition::new(block_id, 10));
+        tracker.set_cursor(agent1, CursorPosition::new(block_id, 10));
 
         // Move forward
-        let pos = tracker.move_cursor("agent1", 5).unwrap();
+        let pos = tracker.move_cursor(agent1, 5).unwrap();
         assert_eq!(pos.offset, 15);
 
         // Move backward
-        let pos = tracker.move_cursor("agent1", -3).unwrap();
+        let pos = tracker.move_cursor(agent1, -3).unwrap();
         assert_eq!(pos.offset, 12);
 
         // Move backward past start
-        let pos = tracker.move_cursor("agent1", -100).unwrap();
+        let pos = tracker.move_cursor(agent1, -100).unwrap();
         assert_eq!(pos.offset, 0, "should saturate at 0");
     }
 
@@ -364,10 +378,13 @@ mod tests {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
         let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
+        let agent1 = test_agent(1);
+        let agent2 = test_agent(2);
+        let agent3 = test_agent(3);
 
-        tracker.set_cursor("agent1", CursorPosition::new(block1.clone(), 10));
-        tracker.set_cursor("agent2", CursorPosition::new(block1.clone(), 20));
-        tracker.set_cursor("agent3", CursorPosition::new(block2, 30));
+        tracker.set_cursor(agent1, CursorPosition::new(block1, 10));
+        tracker.set_cursor(agent2, CursorPosition::new(block1, 20));
+        tracker.set_cursor(agent3, CursorPosition::new(block2, 30));
 
         let cursors = tracker.cursors_in_block(&block1);
         assert_eq!(cursors.len(), 2);
@@ -378,11 +395,12 @@ mod tests {
         let tracker = CursorTracker::new();
         let block_id = test_block_id();
         let mut rx = tracker.subscribe();
+        let agent1 = test_agent(1);
 
-        tracker.set_cursor("agent1", CursorPosition::new(block_id, 10));
+        tracker.set_cursor(agent1, CursorPosition::new(block_id, 10));
 
         let event = rx.recv().await.unwrap();
-        assert_eq!(event.agent_id, "agent1");
+        assert_eq!(event.agent_id, agent1);
         assert!(event.position.is_some());
         assert_eq!(event.position.unwrap().offset, 10);
     }
