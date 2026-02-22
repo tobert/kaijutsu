@@ -19,7 +19,7 @@ use kaijutsu_kernel::drift::{DriftLsEngine, DriftPushEngine, DriftFlushEngine};
 use kaijutsu_kernel::git_engine::GitEngine;
 use kaijutsu_kernel::tools::{EngineArgs, ExecutionEngine, ToolInfo};
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
-use kaijutsu_crdt::ContextId;
+use kaijutsu_crdt::{ContextId, PrincipalId};
 use kaijutsu_server::EmbeddedKaish;
 
 // ============================================================================
@@ -33,14 +33,14 @@ use kaijutsu_server::EmbeddedKaish;
 /// KaijutsuBackend.call_tool() → individual drift engines.
 async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
     let kernel = Arc::new(Kernel::new("e2e-drift").await);
-    let documents = shared_block_store("e2e-drift");
-
-    documents
-        .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
-        .unwrap();
+    let documents = shared_block_store(PrincipalId::system());
 
     // Generate a ContextId for the default context
     let ctx_id = ContextId::new();
+
+    documents
+        .create_document(ctx_id, DocumentKind::Conversation, None)
+        .unwrap();
 
     // Register individual drift engines
     kernel.register_tool_with_engine(
@@ -59,7 +59,7 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
     // Register "default" context in drift router
     {
         let mut router = kernel.drift().write().await;
-        router.register(ctx_id, Some("default"), "doc-default", None);
+        router.register(ctx_id, Some("default"), None);
     }
 
     let kaish = EmbeddedKaish::new("e2e-drift", documents.clone(), kernel.clone(), None)
@@ -73,10 +73,12 @@ async fn setup_git(
     repo_dir: &std::path::Path,
 ) -> (Arc<GitEngine>, Arc<Kernel>, SharedBlockStore) {
     let kernel = Arc::new(Kernel::new("e2e-git-test").await);
-    let documents = shared_block_store("e2e-git-test");
+    let documents = shared_block_store(PrincipalId::system());
+
+    let ctx_id = ContextId::new();
 
     documents
-        .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
+        .create_document(ctx_id, DocumentKind::Conversation, None)
         .unwrap();
 
     // Mount the tempdir at /mnt/repo in the VFS
@@ -85,7 +87,6 @@ async fn setup_git(
         .mount("/mnt/repo", LocalBackend::new(repo_dir))
         .await;
 
-    let ctx_id = ContextId::new();
     let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), ctx_id));
 
     kernel
@@ -98,7 +99,7 @@ async fn setup_git(
     // Register context with pwd pointing at the VFS mount
     {
         let mut router = kernel.drift().write().await;
-        router.register(ctx_id, Some("default"), "doc-default", None);
+        router.register(ctx_id, Some("default"), None);
         router
             .set_pwd(ctx_id, Some("/mnt/repo".to_string()))
             .unwrap();
@@ -218,11 +219,6 @@ async fn drift_ls_shows_default_context() {
         result.out
     );
     assert!(
-        result.out.contains("doc-default"),
-        "expected 'doc-default' document, got: {}",
-        result.out
-    );
-    assert!(
         result.out.contains("* "),
         "expected '* ' marker for current context, got: {}",
         result.out
@@ -241,11 +237,11 @@ async fn drift_push_flush_lifecycle() {
     let target_ctx_id = ContextId::new();
     {
         let mut router = kernel.drift().write().await;
-        router.register(target_ctx_id, Some("target"), "doc-target", None);
+        router.register(target_ctx_id, Some("target"), None);
     }
 
     documents
-        .create_document("doc-target".to_string(), DocumentKind::Conversation, None)
+        .create_document(target_ctx_id, DocumentKind::Conversation, None)
         .unwrap();
 
     // Stage a drift push via DriftPushEngine through kaish dispatch.
@@ -272,7 +268,7 @@ async fn drift_push_flush_lifecycle() {
     assert!(flush_result.out.contains("Flushed 1 drifts"));
 
     // Verify block was injected into target document
-    let blocks = documents.block_snapshots("doc-target").unwrap();
+    let blocks = documents.block_snapshots(target_ctx_id).unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].kind, kaijutsu_crdt::BlockKind::Drift);
     assert_eq!(blocks[0].content, "hello from e2e test");
@@ -405,13 +401,14 @@ async fn git_log_with_numeric_count_flag() {
 async fn git_status_without_pwd_gives_guidance() {
     // Kernel WITHOUT setting pwd
     let kernel = Arc::new(Kernel::new("e2e-no-pwd").await);
-    let documents = shared_block_store("e2e-no-pwd");
-
-    documents
-        .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
-        .unwrap();
+    let documents = shared_block_store(PrincipalId::system());
 
     let ctx_id = ContextId::new();
+
+    documents
+        .create_document(ctx_id, DocumentKind::Conversation, None)
+        .unwrap();
+
     let engine = Arc::new(GitEngine::new(&kernel, documents.clone(), ctx_id));
 
     kernel
@@ -424,7 +421,7 @@ async fn git_status_without_pwd_gives_guidance() {
     // Register context but don't set pwd
     {
         let mut router = kernel.drift().write().await;
-        router.register(ctx_id, Some("default"), "doc-default", None);
+        router.register(ctx_id, Some("default"), None);
     }
 
     let result = engine.execute(&kaish_json(&["status"], &[])).await.unwrap();
@@ -512,10 +509,10 @@ impl TestFs {
 /// against the tempdir, not the host system.
 async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) -> EmbeddedKaish {
     let kernel = Arc::new(Kernel::new("e2e-shell").await);
-    let documents = shared_block_store("e2e-shell");
+    let documents = shared_block_store(PrincipalId::system());
 
     documents
-        .create_document("doc-default".to_string(), DocumentKind::Conversation, None)
+        .create_document(ContextId::new(), DocumentKind::Conversation, None)
         .unwrap();
 
     // Mount the test filesystem — mirrors real server setup but rooted in tempdir

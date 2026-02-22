@@ -9,9 +9,9 @@
 //! kaijutsu-server [port]
 //!
 //! # Key management
-//! kaijutsu-server add-key <pubkey-file> [--nick NAME] [--admin]
+//! kaijutsu-server add-key <pubkey-file> [--nick NAME]
 //! kaijutsu-server list-users
-//! kaijutsu-server list-keys [nick]
+//! kaijutsu-server list-keys [username]
 //! kaijutsu-server import <authorized_keys_file>
 //! kaijutsu-server set-nick <old> <new>
 //! ```
@@ -35,22 +35,21 @@ USAGE:
 COMMANDS:
     (default)                     Run the SSH server
     add-key <file> [OPTIONS]      Add an SSH public key
-    remove-user <nick>            Remove a user and all their keys
+    remove-user <username>        Remove a user and all their keys
     list-users                    List all users
-    list-keys [nick]              List keys (all or for a specific user)
+    list-keys [username]          List keys (all or for a specific user)
     import <file>                 Import keys from authorized_keys file
     set-nick <old> <new>          Rename a user
 
 OPTIONS:
     --port <PORT>                 SSH port (default: {port})
-    --nick <NAME>                 Nickname for the key (default: derived from fingerprint)
-    --admin                       Grant admin privileges
+    --nick <NAME>                 Username for the key (default: derived from fingerprint)
     --help, -h                    Show this help
 
 EXAMPLES:
     kaijutsu-server                           # Run server on port {port}
     kaijutsu-server --port 2222               # Run server on port 2222
-    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --nick amy --admin
+    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --nick amy
     kaijutsu-server import ~/.ssh/authorized_keys
     kaijutsu-server list-users
     kaijutsu-server list-keys amy
@@ -134,13 +133,12 @@ async fn run_server(port: u16) -> ExitCode {
 /// Add a public key to the database
 fn cmd_add_key(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("Usage: kaijutsu-server add-key <pubkey-file> [--nick NAME] [--admin]");
+        eprintln!("Usage: kaijutsu-server add-key <pubkey-file> [--nick NAME]");
         return ExitCode::FAILURE;
     }
 
     let key_file = &args[0];
     let mut nick: Option<&str> = None;
-    let mut is_admin = false;
 
     // Parse options
     let mut i = 1;
@@ -154,10 +152,6 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
                     eprintln!("--nick requires a value");
                     return ExitCode::FAILURE;
                 }
-            }
-            "--admin" => {
-                is_admin = true;
-                i += 1;
             }
             other => {
                 eprintln!("Unknown option: {}", other);
@@ -204,8 +198,8 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
     match db.get_key(&fingerprint) {
         Ok(Some(existing)) => {
             eprintln!("Key already exists: {}", fingerprint);
-            if let Ok(Some(user)) = db.get_user(existing.user_id) {
-                eprintln!("  User: {} ({})", user.nick, user.display_name);
+            if let Ok(Some(principal)) = db.get_principal(existing.principal_id) {
+                eprintln!("  User: {} ({})", principal.username, principal.display_name);
             }
             return ExitCode::FAILURE;
         }
@@ -217,13 +211,13 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
     }
 
     // Add the key
-    match db.add_key_auto_user(&key, comment.as_deref(), nick, is_admin) {
-        Ok((user_id, _key_id)) => {
-            if let Ok(Some(user)) = db.get_user(user_id) {
-                println!("Added key for user '{}':", user.nick);
+    match db.add_key_auto_principal(&key, comment.as_deref(), nick) {
+        Ok((principal_id, _fingerprint)) => {
+            if let Ok(Some(principal)) = db.get_principal(principal_id) {
+                println!("Added key for user '{}':", principal.username);
                 println!("  Fingerprint: {}", fingerprint);
-                println!("  Display name: {}", user.display_name);
-                println!("  Admin: {}", user.is_admin);
+                println!("  Display name: {}", principal.display_name);
+                println!("  Principal ID: {}", principal.id.short());
             } else {
                 println!("Added key: {}", fingerprint);
             }
@@ -239,11 +233,11 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
 /// Remove a user and all their keys
 fn cmd_remove_user(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("Usage: kaijutsu-server remove-user <nick>");
+        eprintln!("Usage: kaijutsu-server remove-user <username>");
         return ExitCode::FAILURE;
     }
 
-    let nick = &args[0];
+    let username = &args[0];
 
     let db = match AuthDb::open(AuthDb::default_path()) {
         Ok(db) => db,
@@ -254,21 +248,23 @@ fn cmd_remove_user(args: &[String]) -> ExitCode {
     };
 
     // Check if user exists first
-    match db.get_user_by_nick(nick) {
-        Ok(Some(user)) => {
-            // Get key count for confirmation message
-            let key_count = db.list_keys(user.id).map(|k| k.len()).unwrap_or(0);
+    match db.get_principal_by_username(username) {
+        Ok(Some(principal)) => {
+            let key_count = db
+                .list_keys(principal.id)
+                .map(|k| k.len())
+                .unwrap_or(0);
 
-            match db.remove_user(nick) {
+            match db.remove_principal(username) {
                 Ok(true) => {
                     println!(
                         "Removed user '{}' ({}) and {} key(s)",
-                        nick, user.display_name, key_count
+                        username, principal.display_name, key_count
                     );
                     ExitCode::SUCCESS
                 }
                 Ok(false) => {
-                    eprintln!("User not found: {}", nick);
+                    eprintln!("User not found: {}", username);
                     ExitCode::FAILURE
                 }
                 Err(e) => {
@@ -278,7 +274,7 @@ fn cmd_remove_user(args: &[String]) -> ExitCode {
             }
         }
         Ok(None) => {
-            eprintln!("User not found: {}", nick);
+            eprintln!("User not found: {}", username);
             ExitCode::FAILURE
         }
         Err(e) => {
@@ -298,27 +294,28 @@ fn cmd_list_users() -> ExitCode {
         }
     };
 
-    let users = match db.list_users() {
-        Ok(users) => users,
+    let principals = match db.list_principals() {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to list users: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
-    if users.is_empty() {
+    if principals.is_empty() {
         println!("No users found. Add keys with: kaijutsu-server add-key <pubkey>");
         return ExitCode::SUCCESS;
     }
 
-    println!("{:<16} {:<24} {:>5}", "NICK", "DISPLAY NAME", "ADMIN");
-    println!("{}", "-".repeat(48));
+    println!("{:<16} {:<24} {:>10}", "USERNAME", "DISPLAY NAME", "ID");
+    println!("{}", "-".repeat(52));
 
-    for user in users {
-        let admin_str = if user.is_admin { "yes" } else { "" };
+    for p in principals {
         println!(
-            "{:<16} {:<24} {:>5}",
-            user.nick, user.display_name, admin_str
+            "{:<16} {:<24} {:>10}",
+            p.username,
+            p.display_name,
+            p.id.short()
         );
     }
 
@@ -335,12 +332,12 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
         }
     };
 
-    if let Some(nick) = args.first() {
+    if let Some(username) = args.first() {
         // List keys for specific user
-        let user = match db.get_user_by_nick(nick) {
-            Ok(Some(user)) => user,
+        let principal = match db.get_principal_by_username(username) {
+            Ok(Some(p)) => p,
             Ok(None) => {
-                eprintln!("User not found: {}", nick);
+                eprintln!("User not found: {}", username);
                 return ExitCode::FAILURE;
             }
             Err(e) => {
@@ -349,7 +346,7 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
             }
         };
 
-        let keys = match db.list_keys(user.id) {
+        let keys = match db.list_keys(principal.id) {
             Ok(keys) => keys,
             Err(e) => {
                 eprintln!("Failed to list keys: {}", e);
@@ -357,7 +354,7 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
             }
         };
 
-        println!("Keys for {} ({}):", user.nick, user.display_name);
+        println!("Keys for {} ({}):", principal.username, principal.display_name);
         println!();
 
         for key in keys {
@@ -390,11 +387,11 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
         );
         println!("{}", "-".repeat(90));
 
-        for (user, key) in all_keys {
+        for (principal, key) in all_keys {
             let comment = key.comment.as_deref().unwrap_or("");
             println!(
                 "{:<16} {:<12} {:<48} {}",
-                user.nick, key.key_type, key.fingerprint, comment
+                principal.username, key.key_type, key.fingerprint, comment
             );
         }
     }
@@ -420,15 +417,9 @@ fn cmd_import(args: &[String]) -> ExitCode {
         }
     };
 
-    // First key becomes admin if database is empty
-    let first_is_admin = db.is_empty().unwrap_or(false);
-
-    match db.import_authorized_keys(&path, first_is_admin) {
+    match db.import_authorized_keys(&path) {
         Ok(count) => {
             println!("Imported {} key(s) from {}", count, path.display());
-            if first_is_admin && count > 0 {
-                println!("First key was granted admin privileges.");
-            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -441,12 +432,12 @@ fn cmd_import(args: &[String]) -> ExitCode {
 /// Rename a user
 fn cmd_set_nick(args: &[String]) -> ExitCode {
     if args.len() < 2 {
-        eprintln!("Usage: kaijutsu-server set-nick <old-nick> <new-nick>");
+        eprintln!("Usage: kaijutsu-server set-nick <old-username> <new-username>");
         return ExitCode::FAILURE;
     }
 
-    let old_nick = &args[0];
-    let new_nick = &args[1];
+    let old_username = &args[0];
+    let new_username = &args[1];
 
     let db = match AuthDb::open(AuthDb::default_path()) {
         Ok(db) => db,
@@ -456,13 +447,13 @@ fn cmd_set_nick(args: &[String]) -> ExitCode {
         }
     };
 
-    match db.set_nick(old_nick, new_nick) {
+    match db.set_username(old_username, new_username) {
         Ok(true) => {
-            println!("Renamed user '{}' to '{}'", old_nick, new_nick);
+            println!("Renamed user '{}' to '{}'", old_username, new_username);
             ExitCode::SUCCESS
         }
         Ok(false) => {
-            eprintln!("User not found: {}", old_nick);
+            eprintln!("User not found: {}", old_username);
             ExitCode::FAILURE
         }
         Err(e) => {

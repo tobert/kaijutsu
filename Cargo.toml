@@ -19,6 +19,9 @@ license = "MIT"
 repository = "https://github.com/atobey/kaijutsu"
 
 [workspace.dependencies]
+# Kaijutsu types (shared identity + block types — leaf crate, no internal deps)
+kaijutsu-types = { path = "crates/kaijutsu-types" }
+
 # Kaijutsu CRDT (block-based document model)
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 

@@ -45,6 +45,7 @@ use kaijutsu_kernel::{
     ToolFilter,
 };
 use kaijutsu_crdt::{BlockKind, ContextId, Role, Status};
+use kaijutsu_types::{Principal, PrincipalId, KernelId};
 use serde_json;
 use tracing::Instrument;
 
@@ -189,39 +190,10 @@ async fn register_block_tools(
     ).await;
 }
 
-// ============================================================================
-// Context Types (Rust-side mirrors of Cap'n Proto types)
-// ============================================================================
-
-/// A document attached to a context
-#[derive(Debug, Clone)]
-pub struct ContextDocument {
-    pub id: String,
-    pub attached_by: String,  // nick:instance
-    pub attached_at: u64,     // Unix timestamp ms
-}
-
-/// A context within a kernel
-#[derive(Debug, Clone)]
-pub struct ContextState {
-    pub name: String,
-    pub documents: Vec<ContextDocument>,
-}
-
-impl ContextState {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            documents: Vec::new(),
-        }
-    }
-}
-
 /// Server state shared across all capabilities
 pub struct ServerState {
-    pub identity: Identity,
-    pub kernels: HashMap<String, KernelState>,
-    next_kernel_id: AtomicU64,
+    pub principal: Principal,
+    pub kernels: HashMap<KernelId, KernelState>,
     next_exec_id: AtomicU64,
     /// Shared MCP server pool
     pub mcp_pool: Arc<McpServerPool>,
@@ -232,18 +204,11 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub fn new(username: String, config_dir: Option<std::path::PathBuf>) -> Self {
-        // If config_dir is overridden (test mode), also use a tempdir for data
-        // to avoid loading stale config from the persistent database.
+    pub fn new(principal: Principal, config_dir: Option<std::path::PathBuf>) -> Self {
         let data_dir = config_dir.as_ref().map(|c| c.join("data"));
-
         Self {
-            identity: Identity {
-                username: username.clone(),
-                display_name: username,
-            },
+            principal,
             kernels: HashMap::new(),
-            next_kernel_id: AtomicU64::new(1),
             next_exec_id: AtomicU64::new(1),
             mcp_pool: Arc::new(McpServerPool::new()),
             config_dir,
@@ -251,29 +216,19 @@ impl ServerState {
         }
     }
 
-    fn next_kernel_id(&self) -> String {
-        format!("kernel-{}", self.next_kernel_id.fetch_add(1, Ordering::SeqCst))
-    }
-
     fn next_exec_id(&self) -> u64 {
         self.next_exec_id.fetch_add(1, Ordering::SeqCst)
     }
 }
 
-#[derive(Clone)]
-pub struct Identity {
-    pub username: String,
-    pub display_name: String,
-}
-
 /// Get the data directory for a kernel's persistent storage.
 /// Creates the directory if it doesn't exist.
-/// Returns: ~/.local/share/kaijutsu/kernels/{kernel_id}/
-fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
+/// Returns: ~/.local/share/kaijutsu/kernels/{kernel_id_hex}/
+fn kernel_data_dir(kernel_id: KernelId) -> std::path::PathBuf {
     let dir = kaish_kernel::xdg_data_home()
         .join("kaijutsu")
         .join("kernels")
-        .join(kernel_id);
+        .join(kernel_id.to_hex());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("Failed to create kernel data dir {:?}: {}", dir, e);
     }
@@ -283,11 +238,11 @@ fn kernel_data_dir(kernel_id: &str) -> std::path::PathBuf {
 /// Open or create a BlockStore with database persistence for a kernel.
 ///
 /// If `data_dir_override` is set, uses that directory for the database.
-/// Otherwise uses the XDG default (~/.local/share/kaijutsu/kernels/{kernel_id}/).
-fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
+/// Otherwise uses the XDG default (~/.local/share/kaijutsu/kernels/{kernel_id_hex}/).
+fn create_block_store_with_db(kernel_id: KernelId, agent_id: PrincipalId, block_flows: SharedBlockFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
     let db_dir = match data_dir_override {
         Some(dir) => {
-            let d = dir.join(kernel_id);
+            let d = dir.join(kernel_id.to_hex());
             if let Err(e) = std::fs::create_dir_all(&d) {
                 log::warn!("Failed to create data dir {:?}: {}", d, e);
             }
@@ -299,7 +254,7 @@ fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus, 
     match DocumentDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened document database at {:?}", db_path);
-            let store = Arc::new(BlockStore::with_db_and_flows(db, "server", block_flows));
+            let store = Arc::new(BlockStore::with_db_and_flows(db, agent_id, block_flows));
             if let Err(e) = store.load_from_db() {
                 log::warn!("Failed to load documents from DB: {}", e);
             } else {
@@ -309,25 +264,9 @@ fn create_block_store_with_db(kernel_id: &str, block_flows: SharedBlockFlowBus, 
         }
         Err(e) => {
             log::warn!("Failed to open document database at {:?}: {}, using in-memory", db_path, e);
-            Arc::new(BlockStore::with_flows("server", block_flows))
+            Arc::new(BlockStore::with_flows(agent_id, block_flows))
         }
     }
-}
-
-/// Ensure main document exists for a kernel. Returns the main document ID.
-/// Uses `@` separator (invalid in UUIDs, unlikely in kernel names) for clear visual distinction.
-fn ensure_main_document(
-    documents: &SharedBlockStore,
-    kernel_id: &str,
-) -> Result<String, capnp::Error> {
-    let main_document_id = format!("{}@main", kernel_id);
-    if !documents.contains(&main_document_id) {
-        log::info!("Creating main document {} for kernel {}", main_document_id, kernel_id);
-        documents
-            .create_document(main_document_id.clone(), DocumentKind::Conversation, None)
-            .map_err(|e| capnp::Error::failed(e))?;
-    }
-    Ok(main_document_id)
 }
 
 /// Get the config directory path.
@@ -532,15 +471,15 @@ async fn initialize_kernel_mcp(
     futures::future::join_all(futs).await;
 }
 
-/// Per-document LLM conversation cache.
+/// Per-context LLM conversation cache.
 ///
 /// Stores the exact `Vec<LlmMessage>` sent to the API so subsequent turns
 /// replay byte-for-byte identical prefixes for KV cache performance.
-/// Keyed by document_id (cell_id).
-pub type ConversationCache = Rc<RefCell<HashMap<String, Vec<LlmMessage>>>>;
+/// Keyed by ContextId.
+pub type ConversationCache = Rc<RefCell<HashMap<ContextId, Vec<LlmMessage>>>>;
 
 pub struct KernelState {
-    pub id: String,
+    pub id: KernelId,
     pub name: String,
     /// The ContextId for this kernel's default context.
     pub context_id: ContextId,
@@ -552,17 +491,13 @@ pub struct KernelState {
     pub kernel: Arc<Kernel>,
     /// Block-based CRDT store (wrapped for sharing with tools)
     pub documents: SharedBlockStore,
-    /// Main document ID for this kernel (convention: {kernel_id}@main)
-    pub main_document_id: String,
-    /// Contexts within this kernel
-    pub contexts: HashMap<String, ContextState>,
     /// Thread-safe context manager for shell access
     pub context_manager: Arc<ContextManager>,
     /// Config CRDT backend (manages theme.rhai, seats/*.rhai)
     pub config_backend: Arc<ConfigCrdtBackend>,
     /// Config watcher handle (stops when kernel is dropped)
     pub config_watcher: Option<ConfigWatcherHandle>,
-    /// Cached LLM conversation history per document (ephemeral, not persisted).
+    /// Cached LLM conversation history per context (ephemeral, not persisted).
     pub conversation_cache: ConversationCache,
 }
 
@@ -594,8 +529,8 @@ impl WorldImpl {
     }
 
     /// Create a new World capability for use in RPC
-    pub fn new_client(username: String) -> world::Client {
-        let state = Rc::new(RefCell::new(ServerState::new(username, None)));
+    pub fn new_client(principal: Principal) -> world::Client {
+        let state = Rc::new(RefCell::new(ServerState::new(principal, None)));
         capnp_rpc::new_client(WorldImpl::new(state))
     }
 }
@@ -608,8 +543,8 @@ impl world::Server for WorldImpl {
     ) -> Promise<(), capnp::Error> {
         let state = self.state.borrow();
         let mut identity = results.get().init_identity();
-        identity.set_username(&state.identity.username);
-        identity.set_display_name(&state.identity.display_name);
+        identity.set_username(&state.principal.username);
+        identity.set_display_name(&state.principal.display_name);
         Promise::ok(())
     }
 
@@ -622,7 +557,7 @@ impl world::Server for WorldImpl {
         let mut kernels = results.get().init_kernels(state.kernels.len() as u32);
         for (i, kernel) in state.kernels.values().enumerate() {
             let mut k = kernels.reborrow().get(i as u32);
-            k.set_id(kernel.context_id.as_bytes());
+            k.set_id(kernel.id.as_bytes());
             k.set_name(&kernel.name);
             k.set_user_count(1);
             k.set_agent_count(0);
@@ -639,153 +574,115 @@ impl world::Server for WorldImpl {
         let span = tracing::info_span!("rpc", method = "attach_kernel");
         // Schema: attachKernel(trace) -> (kernel, kernelId :Data)
         // Server generates the kernel ID; client receives it.
-        let id = {
-            let state = self.state.borrow();
-            state.next_kernel_id()
-        };
+        let id = KernelId::new();
 
         let state = self.state.clone();
 
         Promise::from_future(async move {
-            // Create kernel entry if it doesn't exist
-            let needs_create = {
+            // Create shared FlowBus first - shared between Kernel and BlockStore
+            let block_flows = shared_block_flow_bus(1024);
+            let config_flows = shared_config_flow_bus(256);
+
+            // Create the kaijutsu kernel with shared FlowBus
+            let id_str = id.to_hex();
+            let kernel = Kernel::with_flows(&id_str, block_flows.clone()).await;
+
+            // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
+            kernel.mount("/", LocalBackend::read_only("/")).await;
+
+            // Read-write ~/src (longest-prefix wins over /)
+            let home = kaish_kernel::home_dir();
+            let src_dir = home.join("src");
+            kernel
+                .mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir))
+                .await;
+
+            // Read-write /tmp for scratch/interop with external tools
+            kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
+
+            // Create block store with database persistence and shared FlowBus
+            let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, state.borrow().data_dir.as_deref());
+
+            // Create default context
+            let ctx_id = ContextId::new();
+            if !documents.contains(ctx_id) {
+                log::info!("Creating default context document for kernel {}", id_str);
+                documents
+                    .create_document(ctx_id, DocumentKind::Conversation, None)
+                    .map_err(|e| capnp::Error::failed(e))?;
+            }
+
+            // Create config backend
+            let (config_backend, config_watcher) =
+                create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
+
+            // Get identity for context manager
+            let nick = {
                 let state_ref = state.borrow();
-                !state_ref.kernels.contains_key(&id)
+                state_ref.principal.username.clone()
             };
 
-            let context_id = if needs_create {
-                // Create shared FlowBus first - shared between Kernel and BlockStore
-                let block_flows = shared_block_flow_bus(1024);
-                let config_flows = shared_config_flow_bus(256);
+            // Create context manager for this kernel
+            let context_manager = Arc::new(ContextManager::new(
+                nick,
+                id,
+                uuid::Uuid::new_v4().to_string(), // instance ID
+            ));
 
-                // Create the kaijutsu kernel with shared FlowBus
-                let kernel = Kernel::with_flows(&id, block_flows.clone()).await;
+            // Register block tools (including context engine + drift)
+            let kernel_arc = Arc::new(kernel);
+            register_block_tools(&kernel_arc, documents.clone(), context_manager.clone(), ctx_id).await;
 
-                // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
-                kernel.mount("/", LocalBackend::read_only("/")).await;
+            // Recover contexts from persisted document IDs.
+            // Documents are keyed by ContextId directly; register each in the drift router.
+            let recovered_ids: Vec<ContextId> = documents.list_ids()
+                .into_iter()
+                .filter(|cid| *cid != ctx_id)
+                .collect();
 
-                // Read-write ~/src (longest-prefix wins over /)
-                let home = kaish_kernel::home_dir();
-                let src_dir = home.join("src");
-                kernel
-                    .mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir))
-                    .await;
+            // Register "default" context in kernel's own DriftRouter
+            {
+                let mut drift = kernel_arc.drift().write().await;
+                drift.register(ctx_id, Some("default"), None);
 
-                // Read-write /tmp for scratch/interop with external tools
-                kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
-
-                // Create block store with database persistence and shared FlowBus
-                let documents = create_block_store_with_db(&id, block_flows, state.borrow().data_dir.as_deref());
-
-                // Ensure main document exists (convention ID)
-                let main_document_id = ensure_main_document(&documents, &id)?;
-
-                // Create config backend
-                let (config_backend, config_watcher) =
-                    create_config_backend(documents.clone(), config_flows, state.borrow().config_dir.as_deref()).await;
-
-                // Get identity for context manager
-                let nick = {
-                    let state_ref = state.borrow();
-                    state_ref.identity.username.clone()
-                };
-
-                // Create context manager for this kernel
-                let context_manager = Arc::new(ContextManager::new(
-                    nick,
-                    id.clone(),
-                    uuid::Uuid::new_v4().to_string(), // instance ID
-                ));
-
-                // Derive a stable ContextId for the default context from its document ID.
-                // This ensures the same kernel always gets the same default ContextId
-                // across server restarts.
-                let ctx_id = ContextId::from_document_id(&main_document_id);
-
-                // Register block tools (including context engine + drift)
-                let kernel_arc = Arc::new(kernel);
-                register_block_tools(&kernel_arc, documents.clone(), context_manager.clone(), ctx_id).await;
-
-                // Recover contexts from persisted document IDs.
-                // Documents use the convention {kernel_id}@{context_name}, so we
-                // scan for the prefix and reconstruct the contexts HashMap.
-                let mut contexts = HashMap::new();
-                let prefix = format!("{}@", id);
-                for doc_id in documents.list_ids() {
-                    if let Some(ctx_name) = doc_id.strip_prefix(&prefix) {
-                        if ctx_name == "main" {
-                            // @main is the "default" context's document
-                            contexts.entry("default".to_string())
-                                .or_insert_with(|| ContextState::new("default".to_string()));
-                        } else {
-                            contexts.entry(ctx_name.to_string())
-                                .or_insert_with(|| ContextState::new(ctx_name.to_string()));
-                        }
-                    }
+                // Register recovered non-default contexts
+                for recovered_ctx_id in &recovered_ids {
+                    drift.register(*recovered_ctx_id, None, Some(ctx_id));
+                    log::info!("Recovered context {} in kernel DriftRouter", recovered_ctx_id.short());
                 }
-                // Ensure "default" always exists even if @main doc was missing
-                contexts.entry("default".to_string())
-                    .or_insert_with(|| ContextState::new("default".to_string()));
+            }
 
-                // Collect non-default context names for drift registration below
-                let recovered_contexts: Vec<(String, String)> = contexts.keys()
-                    .filter(|name| *name != "default")
-                    .map(|name| (name.clone(), format!("{}@{}", id, name)))
-                    .collect();
+            // Initialize LLM registry from llm.rhai config
+            initialize_kernel_llm(&kernel_arc, &config_backend).await;
 
-                // Register "default" context in kernel's own DriftRouter
-                {
-                    let mut drift = kernel_arc.drift().write().await;
-                    drift.register(ctx_id, Some("default"), &main_document_id, None);
+            // Initialize MCP servers from mcp.rhai config
+            let mcp_pool = state.borrow().mcp_pool.clone();
+            initialize_kernel_mcp(&kernel_arc, &config_backend, &mcp_pool).await;
 
-                    // Register recovered non-default contexts with stable IDs.
-                    // If the context name is a UUID (e.g. CC session), parse it back.
-                    // Otherwise derive a deterministic UUIDv5 from the document ID.
-                    for (ctx_name, doc_id) in &recovered_contexts {
-                        let recovered_ctx_id = ContextId::recover(ctx_name, doc_id);
-                        drift.register(recovered_ctx_id, Some(ctx_name), doc_id, Some(ctx_id));
-                        log::info!("Recovered context '{}' (doc: {}, id: {}) in kernel DriftRouter",
-                            ctx_name, doc_id, recovered_ctx_id.short());
-                    }
-                }
+            let mut state_ref = state.borrow_mut();
 
-                // Initialize LLM registry from llm.rhai config
-                initialize_kernel_llm(&kernel_arc, &config_backend).await;
-
-                // Initialize MCP servers from mcp.rhai config
-                let mcp_pool = state.borrow().mcp_pool.clone();
-                initialize_kernel_mcp(&kernel_arc, &config_backend, &mcp_pool).await;
-
-                let mut state_ref = state.borrow_mut();
-
-                state_ref.kernels.insert(
-                    id.clone(),
-                    KernelState {
-                        id: id.clone(),
-                        name: id.clone(),
-                        context_id: ctx_id,
-                        consent_mode: ConsentMode::Collaborative,
-                        command_history: Vec::new(),
-                        kaish: None, // Spawned lazily
-                        kernel: kernel_arc,
-                        documents,
-                        main_document_id,
-                        contexts,
-                        context_manager,
-                        config_backend,
-                        config_watcher,
-                        conversation_cache: Rc::new(RefCell::new(HashMap::new())),
-                    },
-                );
-                ctx_id
-            } else {
-                let state_ref = state.borrow();
-                state_ref.kernels.get(&id).map(|k| k.context_id).unwrap_or_else(ContextId::new)
-            };
+            state_ref.kernels.insert(
+                id,
+                KernelState {
+                    id,
+                    name: id_str,
+                    context_id: ctx_id,
+                    consent_mode: ConsentMode::Collaborative,
+                    command_history: Vec::new(),
+                    kaish: None, // Spawned lazily
+                    kernel: kernel_arc,
+                    documents,
+                    context_manager,
+                    config_backend,
+                    config_watcher,
+                    conversation_cache: Rc::new(RefCell::new(HashMap::new())),
+                },
+            );
+            drop(state_ref);
 
             let kernel_impl = KernelImpl::new(state.clone(), id);
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
-            results.get().set_kernel_id(context_id.as_bytes());
+            results.get().set_kernel_id(id.as_bytes());
             Ok(())
         }.instrument(span))
     }
@@ -799,11 +696,11 @@ impl world::Server for WorldImpl {
 
 struct KernelImpl {
     state: Rc<RefCell<ServerState>>,
-    kernel_id: String,
+    kernel_id: KernelId,
 }
 
 impl KernelImpl {
-    fn new(state: Rc<RefCell<ServerState>>, kernel_id: String) -> Self {
+    fn new(state: Rc<RefCell<ServerState>>, kernel_id: KernelId) -> Self {
         Self { state, kernel_id }
     }
 }
@@ -819,7 +716,7 @@ impl kernel::Server for KernelImpl {
         let state = self.state.borrow();
         if let Some(kernel) = state.kernels.get(&self.kernel_id) {
             let mut info = results.get().init_info();
-            info.set_id(kernel.context_id.as_bytes());
+            info.set_id(kernel.id.as_bytes());
             info.set_name(&kernel.name);
             info.set_user_count(1);
             info.set_agent_count(0);
@@ -838,7 +735,7 @@ impl kernel::Server for KernelImpl {
         let trace_span = extract_rpc_trace(p.get_trace(), "execute");
         let code = pry!(pry!(p.get_code()).to_str()).to_owned();
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         // Use Promise::from_future for async execution
 
@@ -850,9 +747,9 @@ impl kernel::Server for KernelImpl {
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
 
                 if kernel.kaish.is_none() {
-                    log::info!("Creating embedded kaish for kernel {}", kernel_id);
+                    log::info!("Creating embedded kaish for kernel {}", kernel_id.to_hex());
                     match EmbeddedKaish::new(
-                        &kernel_id,
+                        &kernel.name,
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
@@ -968,7 +865,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ForkResults,
     ) -> Promise<(), capnp::Error> {
         let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
-        let parent_kernel_id = self.kernel_id.clone();
+        let parent_kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         let span = tracing::info_span!("rpc", method = "fork");
@@ -985,20 +882,21 @@ impl kernel::Server for KernelImpl {
             let forked_kernel = parent_kernel.fork(&name).await;
 
             // Generate new kernel ID
-            let id = {
-                let state_ref = state.borrow();
-                state_ref.next_kernel_id()
-            };
+            let id = KernelId::new();
+            let id_str = id.to_hex();
 
             // Create shared FlowBus for the new kernel
             let block_flows = shared_block_flow_bus(1024);
             let config_flows = shared_config_flow_bus(256);
 
             // Create block store with database persistence
-            let documents = create_block_store_with_db(&id, block_flows, state.borrow().data_dir.as_deref());
+            let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, state.borrow().data_dir.as_deref());
 
-            // Ensure main document exists
-            let main_document_id = ensure_main_document(&documents, &id)?;
+            // Create default context document
+            let ctx_id = ContextId::new();
+            documents
+                .create_document(ctx_id, DocumentKind::Conversation, None)
+                .map_err(|e| capnp::Error::failed(e))?;
 
             // Create config backend
             let (config_backend, config_watcher) =
@@ -1007,18 +905,16 @@ impl kernel::Server for KernelImpl {
             // Get identity for context manager
             let nick = {
                 let state_ref = state.borrow();
-                state_ref.identity.username.clone()
+                state_ref.principal.username.clone()
             };
 
             // Create context manager for forked kernel
             let context_manager = Arc::new(ContextManager::new(
                 nick,
-                id.clone(),
+                id,
                 uuid::Uuid::new_v4().to_string(),
             ));
 
-            // Generate ContextId for the forked kernel's default context
-            let ctx_id = ContextId::new();
             let parent_ctx_id = {
                 let state_ref = state.borrow();
                 state_ref.kernels.get(&parent_kernel_id)
@@ -1035,12 +931,8 @@ impl kernel::Server for KernelImpl {
             // Register "default" context in kernel's own DriftRouter
             {
                 let mut drift = kernel_arc.drift().write().await;
-                drift.register(ctx_id, Some("default"), &main_document_id, parent_ctx_id);
+                drift.register(ctx_id, Some("default"), parent_ctx_id);
             }
-
-            // Create default context
-            let mut contexts = HashMap::new();
-            contexts.insert("default".to_string(), ContextState::new("default".to_string()));
 
             // Get parent's consent mode
             let consent_mode = {
@@ -1055,9 +947,9 @@ impl kernel::Server for KernelImpl {
                 let mut state_ref = state.borrow_mut();
 
                 state_ref.kernels.insert(
-                    id.clone(),
+                    id,
                     KernelState {
-                        id: id.clone(),
+                        id,
                         name,
                         context_id: ctx_id,
                         consent_mode,
@@ -1065,8 +957,6 @@ impl kernel::Server for KernelImpl {
                         kaish: None,
                         kernel: kernel_arc,
                         documents,
-                        main_document_id,
-                        contexts,
                         context_manager,
                         config_backend,
                         config_watcher,
@@ -1075,7 +965,7 @@ impl kernel::Server for KernelImpl {
                 );
             }
 
-            log::info!("Forked kernel {} from {}", id, parent_kernel_id);
+            log::info!("Forked kernel {} from {}", id_str, parent_kernel_id.to_hex());
 
             let kernel_impl = KernelImpl::new(state.clone(), id);
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
@@ -1089,7 +979,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ThreadResults,
     ) -> Promise<(), capnp::Error> {
         let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
-        let parent_kernel_id = self.kernel_id.clone();
+        let parent_kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         let span = tracing::info_span!("rpc", method = "thread");
@@ -1106,32 +996,31 @@ impl kernel::Server for KernelImpl {
             let threaded_kernel = parent_kernel.thread(&name).await;
 
             // Generate new kernel ID
-            let id = {
-                let state_ref = state.borrow();
-                state_ref.next_kernel_id()
-            };
+            let id = KernelId::new();
+            let id_str = id.to_hex();
 
             // Thread shares the parent's documents (same block store)
             let documents = parent_documents;
 
-            // Create main document for this thread (separate conversation)
-            let main_document_id = ensure_main_document(&documents, &id)?;
+            // Create context document for this thread (separate conversation)
+            let ctx_id = ContextId::new();
+            documents
+                .create_document(ctx_id, DocumentKind::Conversation, None)
+                .map_err(|e| capnp::Error::failed(e))?;
 
             // Get identity for context manager
             let nick = {
                 let state_ref = state.borrow();
-                state_ref.identity.username.clone()
+                state_ref.principal.username.clone()
             };
 
             // Create context manager for threaded kernel
             let context_manager = Arc::new(ContextManager::new(
                 nick,
-                id.clone(),
+                id,
                 uuid::Uuid::new_v4().to_string(),
             ));
 
-            // Generate ContextId for the threaded kernel's default context
-            let ctx_id = ContextId::new();
             let parent_ctx_id = {
                 let state_ref = state.borrow();
                 state_ref.kernels.get(&parent_kernel_id)
@@ -1148,12 +1037,8 @@ impl kernel::Server for KernelImpl {
             // Register "default" context in kernel's own DriftRouter
             {
                 let mut drift = kernel_arc.drift().write().await;
-                drift.register(ctx_id, Some("default"), &main_document_id, parent_ctx_id);
+                drift.register(ctx_id, Some("default"), parent_ctx_id);
             }
-
-            // Create default context
-            let mut contexts = HashMap::new();
-            contexts.insert("default".to_string(), ContextState::new("default".to_string()));
 
             // Get parent's consent mode
             let consent_mode = {
@@ -1168,9 +1053,9 @@ impl kernel::Server for KernelImpl {
                 let mut state_ref = state.borrow_mut();
 
                 state_ref.kernels.insert(
-                    id.clone(),
+                    id,
                     KernelState {
-                        id: id.clone(),
+                        id,
                         name,
                         context_id: ctx_id,
                         consent_mode,
@@ -1178,8 +1063,6 @@ impl kernel::Server for KernelImpl {
                         kaish: None,
                         kernel: kernel_arc,
                         documents,
-                        main_document_id,
-                        contexts,
                         context_manager,
                         config_backend: parent_config_backend,
                         config_watcher: None, // Thread doesn't own the watcher
@@ -1188,7 +1071,7 @@ impl kernel::Server for KernelImpl {
                 );
             }
 
-            log::info!("Threaded kernel {} from {}", id, parent_kernel_id);
+            log::info!("Threaded kernel {} from {}", id_str, parent_kernel_id.to_hex());
 
             let kernel_impl = KernelImpl::new(state.clone(), id);
             results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
@@ -1436,10 +1319,12 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let _span = tracing::info_span!("sync.apply_block_op").entered();
         let params = pry!(params.get());
-        let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
+        let context_id_bytes = pry!(params.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
         let op = pry!(params.get_op());
 
-        log::debug!("apply_block_op called for cell {}", cell_id);
+        log::debug!("apply_block_op called for context {}", context_id);
 
         let mut state = self.state.borrow_mut();
         let kernel = match state.kernels.get_mut(&self.kernel_id) {
@@ -1453,20 +1338,16 @@ impl kernel::Server for KernelImpl {
             Which::InsertBlock(group) => {
                 let block_reader = pry!(group.get_block());
                 let block = pry!(parse_block_snapshot(&block_reader));
-                let after_id = if group.get_has_after_id() {
+                let after_id = if group.has_after_id() {
                     let after_reader = pry!(group.get_after_id());
-                    Some(kaijutsu_crdt::BlockId {
-                        document_id: pry!(pry!(after_reader.get_document_id()).to_str()).to_owned(),
-                        agent_id: pry!(pry!(after_reader.get_agent_id()).to_str()).to_owned(),
-                        seq: after_reader.get_seq(),
-                    })
+                    Some(pry!(parse_block_id_from_reader(&after_reader)))
                 } else {
                     None
                 };
 
                 // Insert block using the snapshot data
                 if let Err(e) = kernel.documents.insert_block(
-                    &cell_id,
+                    context_id,
                     block.parent_id.as_ref(),
                     after_id.as_ref(),
                     block.role,
@@ -1478,12 +1359,8 @@ impl kernel::Server for KernelImpl {
             }
             Which::DeleteBlock(id_result) => {
                 let id_reader = pry!(id_result);
-                let block_id = kaijutsu_crdt::BlockId {
-                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
-                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
-                    seq: id_reader.get_seq(),
-                };
-                if let Err(e) = kernel.documents.delete_block(&cell_id, &block_id) {
+                let block_id = pry!(parse_block_id_from_reader(&id_reader));
+                if let Err(e) = kernel.documents.delete_block(context_id, &block_id) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -1492,30 +1369,22 @@ impl kernel::Server for KernelImpl {
             }
             Which::SetCollapsed(group) => {
                 let id_reader = pry!(group.get_id());
-                let block_id = kaijutsu_crdt::BlockId {
-                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
-                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
-                    seq: id_reader.get_seq(),
-                };
+                let block_id = pry!(parse_block_id_from_reader(&id_reader));
                 let collapsed = group.get_collapsed();
-                if let Err(e) = kernel.documents.set_collapsed(&cell_id, &block_id, collapsed) {
+                if let Err(e) = kernel.documents.set_collapsed(context_id, &block_id, collapsed) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
             Which::SetStatus(group) => {
                 let id_reader = pry!(group.get_id());
-                let block_id = kaijutsu_crdt::BlockId {
-                    document_id: pry!(pry!(id_reader.get_document_id()).to_str()).to_owned(),
-                    agent_id: pry!(pry!(id_reader.get_agent_id()).to_str()).to_owned(),
-                    seq: id_reader.get_seq(),
-                };
+                let block_id = pry!(parse_block_id_from_reader(&id_reader));
                 let status = match pry!(group.get_status()) {
                     crate::kaijutsu_capnp::Status::Pending => kaijutsu_crdt::Status::Pending,
                     crate::kaijutsu_capnp::Status::Running => kaijutsu_crdt::Status::Running,
                     crate::kaijutsu_capnp::Status::Done => kaijutsu_crdt::Status::Done,
                     crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
                 };
-                if let Err(e) = kernel.documents.set_status(&cell_id, &block_id, status) {
+                if let Err(e) = kernel.documents.set_status(context_id, &block_id, status) {
                     return Promise::err(capnp::Error::failed(e));
                 }
             }
@@ -1526,7 +1395,7 @@ impl kernel::Server for KernelImpl {
         };
 
         // Return the new version
-        let new_version = kernel.documents.get(&cell_id)
+        let new_version = kernel.documents.get(context_id)
             .map(|entry| entry.version())
             .unwrap_or(0);
         results.get().set_new_version(new_version);
@@ -1545,29 +1414,26 @@ impl kernel::Server for KernelImpl {
         if let Some(kernel_state) = state.kernels.get(&self.kernel_id) {
             // Get the FlowBus from the kernel
             let block_flows = kernel_state.kernel.block_flows().clone();
-            let kernel_id = self.kernel_id.clone();
+            let kernel_id = self.kernel_id;
             drop(state);
 
             // Spawn a bridge task that forwards FlowBus events to the callback
             // Use spawn_local because Cap'n Proto callbacks are not Send
             tokio::task::spawn_local(async move {
                 let mut sub = block_flows.subscribe("block.*");
-                log::debug!("Started FlowBus subscription for kernel {}", kernel_id);
+                log::debug!("Started FlowBus subscription for kernel {}", kernel_id.to_hex());
 
                 while let Some(msg) = sub.recv().await {
                     // Each branch sends its own request type; we convert the result to bool
                     let success = match msg.payload {
-                        BlockFlow::Inserted { ref document_id, ref block, ref after_id, ref ops, .. } => {
+                        BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
                             let mut req = callback.on_block_inserted_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
+                                params.set_context_id(context_id.as_bytes());
                                 params.set_has_after_id(after_id.is_some());
                                 if let Some(after) = after_id {
-                                    let mut aid = params.reborrow().init_after_id();
-                                    aid.set_document_id(&after.document_id);
-                                    aid.set_agent_id(&after.agent_id);
-                                    aid.set_seq(after.seq);
+                                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
                                 }
                                 // Include CRDT ops for proper sync
                                 params.set_ops(ops);
@@ -1576,81 +1442,63 @@ impl kernel::Server for KernelImpl {
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Deleted { ref document_id, ref block_id, .. } => {
+                        BlockFlow::Deleted { context_id, ref block_id, .. } => {
                             let mut req = callback.on_block_deleted_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_document_id(&block_id.document_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
+                                params.set_context_id(context_id.as_bytes());
+                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::StatusChanged { ref document_id, ref block_id, status, .. } => {
+                        BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
                             let mut req = callback.on_block_status_changed_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_document_id(&block_id.document_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
+                                params.set_context_id(context_id.as_bytes());
+                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                 params.set_status(status_to_capnp(status));
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::CollapsedChanged { ref document_id, ref block_id, collapsed, .. } => {
+                        BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
                             let mut req = callback.on_block_collapsed_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_document_id(&block_id.document_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
+                                params.set_context_id(context_id.as_bytes());
+                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                 params.set_collapsed(collapsed);
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::Moved { ref document_id, ref block_id, ref after_id, .. } => {
+                        BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
                             let mut req = callback.on_block_moved_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_document_id(&block_id.document_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
+                                params.set_context_id(context_id.as_bytes());
+                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                 params.set_has_after_id(after_id.is_some());
                                 if let Some(after) = after_id {
-                                    let mut aid = params.reborrow().init_after_id();
-                                    aid.set_document_id(&after.document_id);
-                                    aid.set_agent_id(&after.agent_id);
-                                    aid.set_seq(after.seq);
+                                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
                                 }
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::TextOps { ref document_id, ref block_id, ref ops, .. } => {
+                        BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
                             let mut req = callback.on_block_text_ops_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
-                                let mut id = params.reborrow().init_block_id();
-                                id.set_document_id(&block_id.document_id);
-                                id.set_agent_id(&block_id.agent_id);
-                                id.set_seq(block_id.seq);
+                                params.set_context_id(context_id.as_bytes());
+                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                 params.set_ops(ops);
                             }
                             req.send().promise.await.is_ok()
                         }
-                        BlockFlow::SyncReset { ref document_id, generation } => {
+                        BlockFlow::SyncReset { context_id, generation } => {
                             let mut req = callback.on_sync_reset_request();
                             {
                                 let mut params = req.get();
-                                params.set_document_id(document_id);
+                                params.set_context_id(context_id.as_bytes());
                                 params.set_generation(generation);
                             }
                             req.send().promise.await.is_ok()
@@ -1673,16 +1521,18 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn get_document_state(
+    fn get_context_state(
         self: Rc<Self>,
-        params: kernel::GetDocumentStateParams,
-        mut results: kernel::GetDocumentStateResults,
+        params: kernel::GetContextStateParams,
+        mut results: kernel::GetContextStateResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "get_document_state").entered();
-        let cell_id = pry!(pry!(p.get_document_id()).to_str()).to_owned();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
 
-        log::debug!("get_document_state called for cell {}", cell_id);
+        log::debug!("get_document_state called for context {}", context_id);
 
         let state = self.state.borrow();
         let kernel = match state.kernels.get(&self.kernel_id) {
@@ -1690,23 +1540,23 @@ impl kernel::Server for KernelImpl {
             None => {
                 return Promise::err(capnp::Error::failed(format!(
                     "kernel '{}' not found",
-                    self.kernel_id
+                    self.kernel_id.to_hex()
                 )));
             }
         };
         let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_document(&cell_id).unwrap_or([0u8; 16]);
+            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
             Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_state").entered())
         } else {
             None
         };
 
-        let doc = match kernel.documents.get(&cell_id) {
+        let doc = match kernel.documents.get(context_id) {
             Some(d) => d,
             None => {
                 return Promise::err(capnp::Error::failed(format!(
-                    "cell '{}' not found in kernel '{}'",
-                    cell_id, self.kernel_id
+                    "context '{}' not found in kernel '{}'",
+                    context_id, self.kernel_id.to_hex()
                 )));
             }
         };
@@ -1717,24 +1567,24 @@ impl kernel::Server for KernelImpl {
         drop(doc); // Release read ref before potential compaction
 
         if needs_compaction {
-            if let Err(e) = kernel.documents.compact_document_silent(&cell_id) {
-                log::warn!("Failed to compact document {}: {}", cell_id, e);
+            if let Err(e) = kernel.documents.compact_document_silent(context_id) {
+                log::warn!("Failed to compact context {}: {}", context_id, e);
             }
         }
 
         // Re-acquire read ref (post-compaction if it happened)
-        let doc = match kernel.documents.get(&cell_id) {
+        let doc = match kernel.documents.get(context_id) {
             Some(d) => d,
             None => {
                 return Promise::err(capnp::Error::failed(format!(
-                    "cell '{}' not found in kernel '{}'",
-                    cell_id, self.kernel_id
+                    "context '{}' not found in kernel '{}'",
+                    context_id, self.kernel_id.to_hex()
                 )));
             }
         };
 
         let mut cell_state = results.get().init_state();
-        cell_state.set_document_id(&cell_id);
+        cell_state.set_context_id(context_id.as_bytes());
         cell_state.reborrow().set_version(doc.version());
 
         // Get actual blocks from BlockDocument
@@ -1750,8 +1600,8 @@ impl kernel::Server for KernelImpl {
         let oplog_bytes = doc.doc.oplog_bytes().unwrap_or_default();
         cell_state.set_ops(&oplog_bytes);
         log::debug!(
-            "Sending DocumentState for cell {} with {} blocks, {} bytes oplog",
-            cell_id,
+            "Sending DocumentState for context {} with {} blocks, {} bytes oplog",
+            context_id,
             blocks.len(),
             oplog_bytes.len()
         );
@@ -1773,21 +1623,23 @@ impl kernel::Server for KernelImpl {
         let trace_span = extract_rpc_trace(params.get_trace(), "prompt");
         let request = pry!(params.get_request());
         let content = pry!(pry!(request.get_content()).to_str()).to_owned();
-        log::info!("Received prompt request: cell_id={}, content_len={}",
-            pry!(request.get_document_id()).to_str().unwrap_or("?"), content.len());
+        let context_id_bytes = pry!(request.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        log::info!("Received prompt request: context_id={}, content_len={}",
+            context_id, content.len());
         // Note: Cap'n Proto defaults unset Text fields to "", so we filter empty strings
         let model = request.get_model().ok()
             .and_then(|m| m.to_str().ok())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
-        let cell_id = pry!(pry!(request.get_document_id()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
 
         Promise::from_future(async move {
-            log::debug!("prompt future started for cell_id={}", cell_id);
+            log::debug!("prompt future started for context_id={}", context_id);
 
             // Get LLM provider and kernel references from the kernel's own registry
             let (documents, kernel_arc, config_backend, conversation_cache) = {
@@ -1848,16 +1700,16 @@ impl kernel::Server for KernelImpl {
             log::debug!("Generated prompt_id={}", prompt_id);
 
             // Document must exist — join_context is the sole creator
-            if documents.get(&cell_id).is_none() {
+            if documents.get(context_id).is_none() {
                 return Err(capnp::Error::failed(
-                    format!("document {} not found — call join_context first", cell_id)
+                    format!("context {} not found — call join_context first", context_id)
                 ));
             }
 
             // Create user message block at the end of the document
-            let last_block = documents.last_block_id(&cell_id);
-            log::info!("Inserting user block into document {}, after={:?}", cell_id, last_block);
-            let user_block_id = documents.insert_block(&cell_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content)
+            let last_block = documents.last_block_id(context_id);
+            log::info!("Inserting user block into context {}, after={:?}", context_id, last_block);
+            let user_block_id = documents.insert_block(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content)
                 .map_err(|e| {
                     log::error!("Failed to insert user block: {}", e);
                     capnp::Error::failed(format!("failed to insert user block: {}", e))
@@ -1872,7 +1724,7 @@ impl kernel::Server for KernelImpl {
             tokio::task::spawn_local(process_llm_stream(
                 provider,
                 documents,
-                cell_id,
+                context_id,
                 content,
                 model_name,
                 kernel_arc,
@@ -1922,7 +1774,6 @@ impl kernel::Server for KernelImpl {
                 c.set_provider(ctx.provider.as_deref().unwrap_or(""));
                 c.set_model(ctx.model.as_deref().unwrap_or(""));
                 c.set_created_at(ctx.created_at);
-                c.set_document_id(&ctx.document_id);
                 c.set_trace_id(&ctx.trace_id);
             }
 
@@ -1930,9 +1781,9 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
-    /// Join a context, returning its document_id.
+    /// Join a context, returning its context_id.
     ///
-    /// Creates the context and document if they don't exist. Registers in
+    /// Creates the context document if it doesn't exist. Registers in
     /// the kernel-level drift router. The `instance` param identifies which
     /// client connected (for logging/debugging).
     fn join_context(
@@ -1941,50 +1792,37 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::JoinContextResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
-        // Schema: joinContext(contextId :Data, instance :Text) -> (documentId :Text)
+        // Schema: joinContext(contextId :Data, instance :Text) -> (contextId :Data)
         let context_id_bytes = pry!(params.get_context_id());
-        let context_id = ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID (expected 16 bytes)".into()));
-        let context_id = pry!(context_id);
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID (expected 16 bytes)".into())));
         let instance = pry!(pry!(params.get_instance()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         log::info!("join_context: context_id={} instance='{}' kernel='{}'",
-            context_id, instance, kernel_id);
-
-        let state2 = state.clone();
-        let kernel_id2 = kernel_id.clone();
+            context_id, instance, kernel_id.to_hex());
 
         let span = extract_rpc_trace(params.get_trace(), "join_context");
         Promise::from_future(async move {
-            // Full context UUID as part of document ID for persistence
-            let doc_id = format!("{}@{}", kernel_id2, context_id);
-
             // Update state — grab kernel Arc, then drop borrow before async drift registration
             let kernel_arc = {
-                let mut state_ref = state2.borrow_mut();
+                let state_ref = state.borrow();
 
-                // Ensure context exists (create if not)
-                if let Some(kernel) = state_ref.kernels.get_mut(&kernel_id2) {
-                    let ctx_name = context_id.to_string();
-                    kernel.contexts
-                        .entry(ctx_name.clone())
-                        .or_insert_with(|| ContextState::new(ctx_name));
-
+                if let Some(kernel) = state_ref.kernels.get(&kernel_id) {
                     // Create the document for this context (join_context is the sole creator)
-                    if !kernel.documents.contains(&doc_id) {
-                        log::info!("Creating document {} for context {}", doc_id, context_id);
+                    if !kernel.documents.contains(context_id) {
+                        log::info!("Creating document for context {}", context_id);
                         if let Err(e) = kernel.documents.create_document(
-                            doc_id.clone(),
+                            context_id,
                             DocumentKind::Conversation,
                             None,
                         ) {
-                            log::error!("Failed to create document {}: {}", doc_id, e);
+                            log::error!("Failed to create document for context {}: {}", context_id, e);
                         }
                     } else {
-                        log::debug!("Re-joining existing context document {}", doc_id);
+                        log::debug!("Re-joining existing context {}", context_id);
                     }
 
                     Some(kernel.kernel.clone())
@@ -2000,19 +1838,18 @@ impl kernel::Server for KernelImpl {
                 if drift.get(context_id).is_none() {
                     // Get the default context ID as parent
                     let parent_id = {
-                        let state_ref = state2.borrow();
-                        state_ref.kernels.get(&kernel_id2).map(|k| k.context_id)
+                        let state_ref = state.borrow();
+                        state_ref.kernels.get(&kernel_id).map(|k| k.context_id)
                     };
-                    drift.register(context_id, None, &doc_id, parent_id);
-                    log::info!("Registered context {} (doc: {}) in kernel DriftRouter",
-                        context_id, doc_id);
+                    drift.register(context_id, None, parent_id);
+                    log::info!("Registered context {} in kernel DriftRouter", context_id);
                 }
                 let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
                 let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
             }
 
-            // Return the document_id
-            results.get().set_document_id(&doc_id);
+            // Return the context_id
+            results.get().set_context_id(context_id.as_bytes());
 
             Ok(())
         }.instrument(span))
@@ -2233,7 +2070,6 @@ impl kernel::Server for KernelImpl {
                 Ok(v) => v,
                 Err(e) => {
                     let mut result_builder = results.get().init_result();
-                    result_builder.set_success(false);
                     result_builder.set_is_error(true);
                     result_builder.set_content(&format!("Invalid JSON arguments: {}", e));
                     return Promise::ok(());
@@ -2251,14 +2087,12 @@ impl kernel::Server for KernelImpl {
             match mcp_result {
                 Ok(r) => {
                     let is_error = r.is_error.unwrap_or(false);
-                    result_builder.set_success(!is_error);
                     result_builder.set_is_error(is_error);
 
                     let content = extract_tool_result_text(&r);
                     result_builder.set_content(&content);
                 }
                 Err(e) => {
-                    result_builder.set_success(false);
                     result_builder.set_is_error(true);
                     result_builder.set_content(&e.to_string());
                 }
@@ -2277,15 +2111,17 @@ impl kernel::Server for KernelImpl {
         params: kernel::ShellExecuteParams,
         mut results: kernel::ShellExecuteResults,
     ) -> Promise<(), capnp::Error> {
-        log::debug!("shell_execute() called for kernel {}", self.kernel_id);
+        log::debug!("shell_execute() called for kernel {}", self.kernel_id.to_hex());
         let params = pry!(params.get());
         let trace_span = extract_rpc_trace(params.get_trace(), "shell_execute");
         let code = pry!(pry!(params.get_code()).to_str()).to_owned();
-        let cell_id = pry!(pry!(params.get_document_id()).to_str()).to_owned();
-        log::info!("Shell execute: cell_id={}, code={}", cell_id, code);
+        let context_id_bytes = pry!(params.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        log::info!("Shell execute: context_id={}, code={}", context_id, code);
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
 
         Promise::from_future(async move {
@@ -2299,9 +2135,9 @@ impl kernel::Server for KernelImpl {
                     })?;
 
                 if kernel.kaish.is_none() {
-                    log::info!("Creating embedded kaish for kernel {}", kernel_id);
+                    log::info!("Creating embedded kaish for kernel {}", kernel_id.to_hex());
                     match EmbeddedKaish::new(
-                        &kernel_id,
+                        &kernel.name,
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
@@ -2322,44 +2158,40 @@ impl kernel::Server for KernelImpl {
             // Link to context's long-running trace
             let trace_id = {
                 let drift = kernel_arc.drift().read().await;
-                drift.trace_id_for_document(&cell_id).unwrap_or([0u8; 16])
+                drift.trace_id_for_context(context_id).unwrap_or([0u8; 16])
             };
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute").entered();
 
             // Document must exist — join_context is the sole creator
-            if documents.get(&cell_id).is_none() {
+            if documents.get(context_id).is_none() {
                 return Err(capnp::Error::failed(
-                    format!("document {} not found — call join_context first", cell_id)
+                    format!("context {} not found — call join_context first", context_id)
                 ));
             }
 
-            // Create ShellCommand block at the end of the document
-            let last_block = documents.last_block_id(&cell_id);
-            log::info!("Inserting shell command into document {}, after={:?}", cell_id, last_block);
-            let command_block_id = documents.insert_block(
-                &cell_id, None, last_block.as_ref(),
-                Role::User, BlockKind::ShellCommand,
-                &code
+            // Create ToolCall block for the shell command
+            let last_block = documents.last_block_id(context_id);
+            log::info!("Inserting shell command into context {}, after={:?}", context_id, last_block);
+            let command_block_id = documents.insert_tool_call(
+                context_id, None, last_block.as_ref(),
+                "shell", serde_json::json!({"code": code}),
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
             log::info!("Created shell command block: {:?}", command_block_id);
 
-            // Create ShellOutput block (empty, will be filled by execution)
-            // Note: after = command_block_id ensures output appears after command in order
-            let output_block_id = documents.insert_block(
-                &cell_id, Some(&command_block_id), Some(&command_block_id),
-                Role::System, BlockKind::ShellOutput,
-                ""
+            // Create ToolResult block (empty, will be filled by execution)
+            let output_block_id = documents.insert_tool_result(
+                context_id, &command_block_id, Some(&command_block_id),
+                "", false, None,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
             // Mark output block as Running — clients poll this to detect completion
-            if let Err(e) = documents.set_status(&cell_id, &output_block_id, Status::Running) {
+            if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
                 log::warn!("Failed to set output block to Running: {}", e);
             }
 
             // Spawn execution in background
-            let cell_id_clone = cell_id.clone();
-            let output_block_id_clone = output_block_id.clone();
+            let output_block_id_clone = output_block_id;
             let documents_clone = documents.clone();
 
             tokio::task::spawn_local(async move {
@@ -2393,20 +2225,20 @@ impl kernel::Server for KernelImpl {
                             output.len(), result.code, hint_json.is_some());
 
                         // Update output block with result text
-                        if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &output, 0) {
+                        if let Err(e) = documents_clone.edit_text(context_id, &output_block_id_clone, 0, &output, 0) {
                             log::error!("Failed to update shell output: {}", e);
                         }
 
                         // Store display hint if present
                         if let Some(hint) = hint_json.as_deref() {
-                            if let Err(e) = documents_clone.set_display_hint(&cell_id_clone, &output_block_id_clone, Some(hint)) {
+                            if let Err(e) = documents_clone.set_display_hint(context_id, &output_block_id_clone, Some(hint)) {
                                 log::error!("Failed to set display hint: {}", e);
                             }
                         }
 
                         // Mark complete — status reflects exit code
                         let final_status = if result.code == 0 { Status::Done } else { Status::Error };
-                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, final_status) {
+                        if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
                             log::error!("Failed to set output block status: {}", e);
                         }
                     }
@@ -2414,11 +2246,11 @@ impl kernel::Server for KernelImpl {
                         let error_msg = format!("Error: {}", e);
                         log::error!("Shell execution failed: {}", e);
                         // Write error to output block
-                        if let Err(e) = documents_clone.edit_text(&cell_id_clone, &output_block_id_clone, 0, &error_msg, 0) {
+                        if let Err(e) = documents_clone.edit_text(context_id, &output_block_id_clone, 0, &error_msg, 0) {
                             log::error!("Failed to update shell output with error: {}", e);
                         }
                         // Mark as error
-                        if let Err(e) = documents_clone.set_status(&cell_id_clone, &output_block_id_clone, Status::Error) {
+                        if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
                             log::error!("Failed to set output block error status: {}", e);
                         }
                     }
@@ -2427,9 +2259,7 @@ impl kernel::Server for KernelImpl {
 
             // Return command block ID
             let mut block_id_builder = results.get().init_command_block_id();
-            block_id_builder.set_document_id(&command_block_id.document_id);
-            block_id_builder.set_agent_id(&command_block_id.agent_id);
-            block_id_builder.set_seq(command_block_id.seq);
+            set_block_id_builder(&mut block_id_builder, &command_block_id);
 
             log::debug!("shell_execute() returning command_block_id={:?}", command_block_id);
             Ok(())
@@ -2446,7 +2276,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetCwdResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "get_cwd");
         Promise::from_future(async move {
@@ -2482,7 +2312,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "set_cwd");
         Promise::from_future(async move {
@@ -2509,7 +2339,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetLastResultResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "get_last_result");
         Promise::from_future(async move {
@@ -2573,7 +2403,7 @@ impl kernel::Server for KernelImpl {
         let content_type = pry!(pry!(params_reader.get_content_type()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "write_blob");
         Promise::from_future(async move {
@@ -2611,7 +2441,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "read_blob");
         Promise::from_future(async move {
@@ -2645,7 +2475,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "delete_blob");
         Promise::from_future(async move {
@@ -2671,7 +2501,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListBlobsResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "list_blobs");
         Promise::from_future(async move {
@@ -2712,7 +2542,7 @@ impl kernel::Server for KernelImpl {
         let path = pry!(pry!(params_reader.get_path()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "register_repo");
         Promise::from_future(async move {
@@ -2747,7 +2577,7 @@ impl kernel::Server for KernelImpl {
         let name = pry!(pry!(params_reader.get_name()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "unregister_repo");
         Promise::from_future(async move {
@@ -2779,7 +2609,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListReposResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "list_repos");
         Promise::from_future(async move {
@@ -2811,7 +2641,7 @@ impl kernel::Server for KernelImpl {
         let branch = pry!(pry!(params_reader.get_branch()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "switch_branch");
         Promise::from_future(async move {
@@ -2846,7 +2676,7 @@ impl kernel::Server for KernelImpl {
         let repo = pry!(pry!(params_reader.get_repo()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "list_branches");
         Promise::from_future(async move {
@@ -2884,7 +2714,7 @@ impl kernel::Server for KernelImpl {
         let repo = pry!(pry!(params_reader.get_repo()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "get_current_branch");
         Promise::from_future(async move {
@@ -2908,7 +2738,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::FlushGitResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "flush_git");
         Promise::from_future(async move {
@@ -2944,7 +2774,7 @@ impl kernel::Server for KernelImpl {
         let command = pry!(pry!(params_reader.get_command()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "set_attribution");
         Promise::from_future(async move {
@@ -2970,10 +2800,12 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let _trace_guard = extract_rpc_trace(params_reader.get_trace(), "push_ops").entered();
-        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
         let ops_data = pry!(params_reader.get_ops()).to_vec();
 
-        log::debug!("push_ops called for document {} with {} bytes", document_id, ops_data.len());
+        log::debug!("push_ops called for context {} with {} bytes", context_id, ops_data.len());
 
         let state = self.state.borrow();
         let kernel = match state.kernels.get(&self.kernel_id) {
@@ -2981,12 +2813,12 @@ impl kernel::Server for KernelImpl {
             None => {
                 return Promise::err(capnp::Error::failed(format!(
                     "kernel '{}' not found",
-                    self.kernel_id
+                    self.kernel_id.to_hex()
                 )));
             }
         };
         let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
             Some(kaijutsu_telemetry::context_root_span(&trace_id, "push_ops").entered())
         } else {
             None
@@ -3004,7 +2836,7 @@ impl kernel::Server for KernelImpl {
         };
 
         // Merge the ops into the document
-        let ack_version = match kernel.documents.merge_ops_owned(&document_id, serialized_ops) {
+        let ack_version = match kernel.documents.merge_ops_owned(context_id, serialized_ops) {
             Ok(version) => version,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
@@ -3127,7 +2959,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         let mcp_pool = state.mcp_pool.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         drop(state);
 
         // Get the resource flow bus from the MCP pool
@@ -3202,7 +3034,7 @@ impl kernel::Server for KernelImpl {
 
         let state = self.state.borrow();
         let mcp_pool = state.mcp_pool.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         drop(state);
 
         // Get the elicitation flow bus from the MCP pool
@@ -3339,7 +3171,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "attach_agent");
         Promise::from_future(async move {
@@ -3371,7 +3203,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListAgentsResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "list_agents");
         Promise::from_future(async move {
@@ -3403,7 +3235,7 @@ impl kernel::Server for KernelImpl {
         let nick = pry!(pry!(pry!(params.get()).get_nick()).to_str()).to_owned();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "detach_agent");
         Promise::from_future(async move {
@@ -3437,7 +3269,7 @@ impl kernel::Server for KernelImpl {
             .collect();
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "set_agent_capabilities");
         Promise::from_future(async move {
@@ -3470,14 +3302,10 @@ impl kernel::Server for KernelImpl {
         let action = pry!(pry!(params_reader.get_action()).to_str()).to_owned();
 
         // Parse block ID
-        let block_id = kaijutsu_crdt::BlockId {
-            document_id: pry!(block_id_reader.get_document_id()).to_str().unwrap_or("").to_owned(),
-            agent_id: pry!(block_id_reader.get_agent_id()).to_str().unwrap_or("").to_owned(),
-            seq: block_id_reader.get_seq(),
-        };
+        let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "invoke_agent");
         Promise::from_future(async move {
@@ -3526,7 +3354,7 @@ impl kernel::Server for KernelImpl {
         let callback = pry!(pry!(params.get()).get_callback());
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         // Spawn a bridge task that forwards AgentActivityEvent to the callback
         tokio::task::spawn_local(async move {
@@ -3617,17 +3445,19 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ForkFromVersionResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
-        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let source_context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
         let version = params_reader.get_version();
-        // Schema: forkFromVersion(documentId, version, contextLabel) -> (contextId :Data)
+        // Schema: forkFromVersion(contextId, version, contextLabel) -> (newContextId :Data)
         let context_label = pry!(pry!(params_reader.get_context_label()).to_str()).to_owned();
 
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         let new_ctx_id = ContextId::new();
 
         log::info!(
-            "Fork request: document={}, version={}, label='{}', new_ctx={}",
-            document_id, version, context_label, new_ctx_id
+            "Fork request: context={}, version={}, label='{}', new_ctx={}",
+            source_context_id, version, context_label, new_ctx_id
         );
 
         // Extract everything we need from state, then drop borrow
@@ -3642,7 +3472,7 @@ impl kernel::Server for KernelImpl {
         };
 
         // Validate document and version (DashMap access is sync)
-        let doc_entry = match documents.get(&document_id) {
+        let doc_entry = match documents.get(source_context_id) {
             Some(entry) => entry,
             None => return Promise::err(capnp::Error::failed("Document not found".into())),
         };
@@ -3654,11 +3484,8 @@ impl kernel::Server for KernelImpl {
         }
         drop(doc_entry);
 
-        // Generate new document ID for the fork
-        let new_doc_id = format!("{}@{}", kernel_id, new_ctx_id);
-
         // Fork the document at the specified version
-        if let Err(e) = documents.fork_document_at_version(&document_id, new_doc_id.clone(), version) {
+        if let Err(e) = documents.fork_document_at_version(source_context_id, new_ctx_id, version) {
             return Promise::err(capnp::Error::failed(format!("Fork failed: {}", e)));
         }
 
@@ -3666,24 +3493,23 @@ impl kernel::Server for KernelImpl {
         let label_owned = if context_label.is_empty() { None } else { Some(context_label.clone()) };
         let ctx_name = new_ctx_id.to_string();
         let _seat_info = context_manager.join_context(&ctx_name);
-        context_manager.attach_document(&ctx_name, &new_doc_id, "server");
 
         let span = extract_rpc_trace(params_reader.get_trace(), "fork_from_version");
         Promise::from_future(async move {
             // Register in drift router
             let label = label_owned.as_deref();
             let mut drift = kernel_arc.drift().write().await;
-            drift.register(new_ctx_id, label, &new_doc_id, Some(parent_ctx_id));
+            drift.register(new_ctx_id, label, Some(parent_ctx_id));
             // Link to the parent context's long-running trace
             let trace_id = drift.get(parent_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_from_version").entered();
 
             // Return the new context ID
-            results.get().set_context_id(new_ctx_id.as_bytes());
+            results.get().set_new_context_id(new_ctx_id.as_bytes());
 
             log::info!(
-                "Fork created: ctx={} (label={:?}) from document {} at version {}, new document {}",
-                new_ctx_id, label, document_id, version, new_doc_id
+                "Fork created: ctx={} (label={:?}) from context {} at version {}",
+                new_ctx_id, label, source_context_id, version
             );
             Ok(())
         }.instrument(span))
@@ -3695,18 +3521,16 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::CherryPickBlockResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
-        let source_block_id = pry!(params_reader.get_source_block_id());
-        let source_doc_id = pry!(pry!(source_block_id.get_document_id()).to_str()).to_owned();
-        let source_agent_id = pry!(pry!(source_block_id.get_agent_id()).to_str()).to_owned();
-        let source_seq = source_block_id.get_seq();
+        let source_block_id_reader = pry!(params_reader.get_source_block_id());
+        let source_block_id = pry!(parse_block_id_from_reader(&source_block_id_reader));
         // Schema: cherryPickBlock(sourceBlockId, targetContextId :Data)
         let target_ctx_bytes = pry!(params_reader.get_target_context_id());
         let target_ctx_id = pry!(ContextId::try_from_slice(target_ctx_bytes)
             .ok_or_else(|| capnp::Error::failed("invalid target context ID (expected 16 bytes)".into())));
 
         log::info!(
-            "Cherry-pick request: block={}/{}/{} to context={}",
-            source_doc_id, source_agent_id, source_seq, target_ctx_id
+            "Cherry-pick request: block={} to context={}",
+            source_block_id.to_key(), target_ctx_id
         );
 
         // Extract what we need from state, then drop borrow
@@ -3719,12 +3543,11 @@ impl kernel::Server for KernelImpl {
         };
 
         // Get the source document and extract block snapshot (DashMap access is sync)
-        let doc_entry = match documents.get(&source_doc_id) {
+        let doc_entry = match documents.get(source_block_id.context_id) {
             Some(entry) => entry,
             None => return Promise::err(capnp::Error::failed("Source document not found".into())),
         };
-        let block_id = kaijutsu_crdt::BlockId::new(&source_doc_id, &source_agent_id, source_seq);
-        let block_snapshot = match doc_entry.doc.get_block_snapshot(&block_id) {
+        let block_snapshot = match doc_entry.doc.get_block_snapshot(&source_block_id) {
             Some(snapshot) => snapshot,
             None => return Promise::err(capnp::Error::failed("Block not found".into())),
         };
@@ -3732,28 +3555,27 @@ impl kernel::Server for KernelImpl {
 
         let span = extract_rpc_trace(params_reader.get_trace(), "cherry_pick_block");
         Promise::from_future(async move {
-            // Look up target context's document ID from drift router
+            // Look up target context in drift router for trace linkage
             let drift = kernel_arc.drift().read().await;
             let target_handle = drift.get(target_ctx_id)
                 .ok_or_else(|| capnp::Error::failed(
                     format!("target context {} not found", target_ctx_id)
                 ))?;
-            let target_doc_id = target_handle.document_id.clone();
             let trace_id = target_handle.trace_id;
             drop(drift);
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "cherry_pick_block").entered();
 
             // Target document must exist
-            if !documents.contains(&target_doc_id) {
+            if !documents.contains(target_ctx_id) {
                 return Err(capnp::Error::failed(
-                    format!("target document {} not found — join target context first", target_doc_id)
+                    format!("target context {} not found — join target context first", target_ctx_id)
                 ));
             }
 
             // Insert the block into target document
-            let after_id = documents.last_block_id(&target_doc_id);
+            let after_id = documents.last_block_id(target_ctx_id);
             let new_block_id = documents.insert_block(
-                &target_doc_id,
+                target_ctx_id,
                 None,
                 after_id.as_ref(),
                 block_snapshot.role,
@@ -3763,26 +3585,26 @@ impl kernel::Server for KernelImpl {
 
             // Build result
             let mut new_block_builder = results.get().init_new_block_id();
-            new_block_builder.set_document_id(&new_block_id.document_id);
-            new_block_builder.set_agent_id(&new_block_id.agent_id);
-            new_block_builder.set_seq(new_block_id.seq);
+            set_block_id_builder(&mut new_block_builder, &new_block_id);
 
-            log::info!("Cherry-pick complete: {} -> {}", block_id.to_key(), new_block_id.to_key());
+            log::info!("Cherry-pick complete: {} -> {}", source_block_id.to_key(), new_block_id.to_key());
             Ok(())
         }.instrument(span))
     }
 
-    fn get_document_history(
+    fn get_context_history(
         self: Rc<Self>,
-        params: kernel::GetDocumentHistoryParams,
-        mut results: kernel::GetDocumentHistoryResults,
+        params: kernel::GetContextHistoryParams,
+        mut results: kernel::GetContextHistoryResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
-        let _span = extract_rpc_trace(params_reader.get_trace(), "get_document_history").entered();
-        let document_id = pry!(pry!(params_reader.get_document_id()).to_str()).to_owned();
+        let _span = extract_rpc_trace(params_reader.get_trace(), "get_context_history").entered();
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
         let limit = params_reader.get_limit() as usize;
 
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         // Get kernel state synchronously
         let state_ref = self.state.borrow();
@@ -3791,14 +3613,14 @@ impl kernel::Server for KernelImpl {
             None => return Promise::err(capnp::Error::failed("Kernel not found".into())),
         };
         let _ctx_span = if let Ok(drift) = kernel_state.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
             Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_history").entered())
         } else {
             None
         };
 
         // Get the document (DashMap access is sync)
-        let doc_entry = kernel_state.documents.get(&document_id);
+        let doc_entry = kernel_state.documents.get(context_id);
         let doc_entry = match doc_entry {
             Some(entry) => entry,
             None => return Promise::err(capnp::Error::failed("Document not found".into())),
@@ -3818,12 +3640,10 @@ impl kernel::Server for KernelImpl {
             snapshot.set_version(i as u64 + 1);
             snapshot.set_timestamp(block.created_at);
             snapshot.set_block_count((i + 1) as u32);
-            snapshot.set_change_kind("block_added");
+            snapshot.set_change_kind(crate::kaijutsu_capnp::ChangeKind::BlockAdded);
 
-            let mut block_id = snapshot.init_changed_block_id();
-            block_id.set_document_id(&block.id.document_id);
-            block_id.set_agent_id(&block.id.agent_id);
-            block_id.set_seq(block.id.seq);
+            let mut block_id_builder = snapshot.init_changed_block_id();
+            set_block_id_builder(&mut block_id_builder, &block.id);
         }
 
         log::debug!(
@@ -3865,7 +3685,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "reload_config");
         Promise::from_future(async move {
@@ -3900,7 +3720,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "reset_config");
         Promise::from_future(async move {
@@ -3994,7 +3814,7 @@ impl kernel::Server for KernelImpl {
         let params_reader = pry!(params.get());
         let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
         let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
@@ -4051,17 +3871,17 @@ impl kernel::Server for KernelImpl {
         let content = pry!(pry!(params_reader.get_content()).to_str()).to_owned();
         let summarize = params_reader.get_summarize();
 
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         // Extract what we need from state before going async
-        let (source_ctx, kernel_arc, documents, main_doc_id) = {
+        let (source_ctx, kernel_arc, documents) = {
             let state_ref = state.borrow();
             let ks = match state_ref.kernels.get(&kernel_id) {
                 Some(ks) => ks,
                 None => return Promise::err(capnp::Error::failed("kernel not found".into())),
             };
-            (ks.context_id, ks.kernel.clone(), ks.documents.clone(), ks.main_document_id.clone())
+            (ks.context_id, ks.kernel.clone(), ks.documents.clone())
         };
 
         Promise::from_future(async move {
@@ -4103,7 +3923,7 @@ impl kernel::Server for KernelImpl {
                 })?
             };
 
-            let blocks = documents.block_snapshots(&main_doc_id)
+            let blocks = documents.block_snapshots(source_ctx)
                 .map_err(|e| capnp::Error::failed(format!("failed to read blocks: {}", e)))?;
 
             let user_prompt = kaijutsu_kernel::build_distillation_prompt(&blocks, None);
@@ -4172,20 +3992,24 @@ impl kernel::Server for KernelImpl {
             let mut failed: Vec<kaijutsu_kernel::StagedDrift> = Vec::new();
 
             for drift_item in staged {
-                let target_doc_id = match drift.get(drift_item.target_ctx) {
-                    Some(h) => h.document_id.clone(),
-                    None => {
-                        log::warn!("Drift flush: target context {} not found, re-queuing", drift_item.target_ctx);
-                        failed.push(drift_item);
-                        continue;
-                    }
-                };
+                if drift.get(drift_item.target_ctx).is_none() {
+                    log::warn!("Drift flush: target context {} not found, re-queuing", drift_item.target_ctx);
+                    failed.push(drift_item);
+                    continue;
+                }
 
-                let author = format!("drift:{}", drift_item.source_ctx);
-                let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&drift_item, &author);
-                let after = documents.last_block_id(&target_doc_id);
+                let target_ctx = drift_item.target_ctx;
+                let after = documents.last_block_id(target_ctx);
 
-                match documents.insert_from_snapshot(&target_doc_id, snapshot, after.as_ref()) {
+                match documents.insert_drift_block(
+                    target_ctx,
+                    None,
+                    after.as_ref(),
+                    drift_item.content.clone(),
+                    drift_item.source_ctx,
+                    drift_item.source_model.clone(),
+                    drift_item.drift_kind,
+                ) {
                     Ok(block_id) => {
                         log::info!("Drift flushed: {} → {} (block={})",
                             drift_item.source_ctx, drift_item.target_ctx, block_id.to_key());
@@ -4234,7 +4058,7 @@ impl kernel::Server for KernelImpl {
                 entry.set_target_ctx(drift_item.target_ctx.as_bytes());
                 entry.set_content(&drift_item.content);
                 entry.set_source_model(drift_item.source_model.as_deref().unwrap_or(""));
-                entry.set_drift_kind(&drift_item.drift_kind.to_string());
+                entry.set_drift_kind(drift_kind_to_capnp(drift_item.drift_kind));
                 entry.set_created_at(drift_item.created_at);
             }
 
@@ -4281,13 +4105,13 @@ impl kernel::Server for KernelImpl {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
 
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
-            let (kernel_arc, source_doc_id, source_model,
-                 target_docs, target_main_doc, target_ctx_id, trace_id) = {
+            let (kernel_arc, source_model,
+                 target_docs, target_ctx_id, trace_id) = {
                 let state_ref = state.borrow();
                 let ks = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
@@ -4295,14 +4119,13 @@ impl kernel::Server for KernelImpl {
                 let drift = ks.kernel.drift().read().await;
                 let source_handle = drift.get(source_ctx_id)
                     .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
-                let source_doc_id = source_handle.document_id.clone();
                 let source_model = source_handle.model.clone();
 
                 let target_ctx_id = ks.context_id;
                 let trace_id = drift.get(target_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
 
-                (ks.kernel.clone(), source_doc_id, source_model,
-                 ks.documents.clone(), ks.main_document_id.clone(), target_ctx_id, trace_id)
+                (ks.kernel.clone(), source_model,
+                 ks.documents.clone(), target_ctx_id, trace_id)
             };
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_pull").entered();
 
@@ -4318,7 +4141,7 @@ impl kernel::Server for KernelImpl {
             let state_ref = state.borrow();
             let ks = state_ref.kernels.get(&kernel_id)
                 .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
-            let blocks = ks.documents.block_snapshots(&source_doc_id)
+            let blocks = ks.documents.block_snapshots(source_ctx_id)
                 .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
             drop(state_ref);
 
@@ -4343,33 +4166,23 @@ impl kernel::Server for KernelImpl {
                 .await
                 .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
 
-            // Build drift block and inject directly into target (caller's) document
-            let staged = kaijutsu_kernel::StagedDrift {
-                id: 0,
-                source_ctx: source_ctx_id,
-                target_ctx: target_ctx_id,
-                content: summary,
-                source_model: Some(model.to_string()),
-                drift_kind: kaijutsu_crdt::DriftKind::Pull,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            };
+            // Insert drift block directly into target (caller's) document
+            let after = target_docs.last_block_id(target_ctx_id);
 
-            let author = format!("drift:{}", source_ctx_id);
-            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&staged, &author);
-            let after = target_docs.last_block_id(&target_main_doc);
-
-            let block_id = target_docs.insert_from_snapshot(&target_main_doc, snapshot, after.as_ref())
-                .map_err(|e| capnp::Error::failed(format!("failed to inject drift block: {}", e)))?;
+            let block_id = target_docs.insert_drift_block(
+                target_ctx_id,
+                None,
+                after.as_ref(),
+                summary,
+                source_ctx_id,
+                Some(model.to_string()),
+                kaijutsu_crdt::DriftKind::Pull,
+            ).map_err(|e| capnp::Error::failed(format!("failed to inject drift block: {}", e)))?;
 
             log::info!("Drift pulled: {} → {} (block={})", source_ctx_id, target_ctx_id, block_id.to_key());
 
             let mut result_block_id = results.get().init_block_id();
-            result_block_id.set_document_id(&block_id.document_id);
-            result_block_id.set_agent_id(&block_id.agent_id);
-            result_block_id.set_seq(block_id.seq);
+            set_block_id_builder(&mut result_block_id, &block_id);
 
             Ok(())
         }.instrument(trace_span))
@@ -4387,13 +4200,13 @@ impl kernel::Server for KernelImpl {
         let source_ctx_id = pry!(ContextId::try_from_slice(source_ctx_bytes)
             .ok_or_else(|| capnp::Error::failed("invalid source context ID".into())));
 
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
         let state = self.state.clone();
 
         Promise::from_future(async move {
             // Extract everything from state (inside async block so ? works)
-            let (kernel_arc, source_doc_id, source_model,
-                 parent_ctx_id, parent_doc_id, trace_id) = {
+            let (kernel_arc, source_model,
+                 parent_ctx_id, trace_id) = {
                 let state_ref = state.borrow();
                 let ks = state_ref.kernels.get(&kernel_id)
                     .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
@@ -4407,16 +4220,15 @@ impl kernel::Server for KernelImpl {
                         format!("context {} has no parent — cannot merge", source_ctx_id)
                     ))?;
 
-                let source_doc_id = source_handle.document_id.clone();
                 let source_model = source_handle.model.clone();
                 let trace_id = source_handle.trace_id;
 
-                let parent_handle = drift.get(parent_ctx_id)
-                    .ok_or_else(|| capnp::Error::failed(format!("parent context {} not found", parent_ctx_id)))?;
-                let parent_doc_id = parent_handle.document_id.clone();
+                if drift.get(parent_ctx_id).is_none() {
+                    return Err(capnp::Error::failed(format!("parent context {} not found", parent_ctx_id)));
+                }
 
-                (ks.kernel.clone(), source_doc_id, source_model,
-                 parent_ctx_id, parent_doc_id, trace_id)
+                (ks.kernel.clone(), source_model,
+                 parent_ctx_id, trace_id)
             };
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_merge").entered();
 
@@ -4432,7 +4244,7 @@ impl kernel::Server for KernelImpl {
             let state_ref = state.borrow();
             let ks = state_ref.kernels.get(&kernel_id)
                 .ok_or_else(|| capnp::Error::failed("kernel not found".into()))?;
-            let blocks = ks.documents.block_snapshots(&source_doc_id)
+            let blocks = ks.documents.block_snapshots(source_ctx_id)
                 .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
             let documents = ks.documents.clone();
             drop(state_ref);
@@ -4455,34 +4267,24 @@ impl kernel::Server for KernelImpl {
                 .await
                 .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
 
-            // Build drift block and inject into parent document
-            let staged = kaijutsu_kernel::StagedDrift {
-                id: 0,
-                source_ctx: source_ctx_id,
-                target_ctx: parent_ctx_id,
-                content: summary,
-                source_model: Some(model.to_string()),
-                drift_kind: kaijutsu_crdt::DriftKind::Merge,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            };
+            // Insert drift block into parent document
+            let after = documents.last_block_id(parent_ctx_id);
 
-            let author = format!("drift:{}", source_ctx_id);
-            let snapshot = kaijutsu_kernel::DriftRouter::build_drift_block(&staged, &author);
-            let after = documents.last_block_id(&parent_doc_id);
-
-            let block_id = documents.insert_from_snapshot(&parent_doc_id, snapshot, after.as_ref())
-                .map_err(|e| capnp::Error::failed(format!("failed to inject merge block: {}", e)))?;
+            let block_id = documents.insert_drift_block(
+                parent_ctx_id,
+                None,
+                after.as_ref(),
+                summary,
+                source_ctx_id,
+                Some(model.to_string()),
+                kaijutsu_crdt::DriftKind::Merge,
+            ).map_err(|e| capnp::Error::failed(format!("failed to inject merge block: {}", e)))?;
 
             log::info!("Drift merged: {} → parent {} (block={})",
                 source_ctx_id, parent_ctx_id, block_id.to_key());
 
             let mut result_block_id = results.get().init_block_id();
-            result_block_id.set_document_id(&block_id.document_id);
-            result_block_id.set_agent_id(&block_id.agent_id);
-            result_block_id.set_seq(block_id.seq);
+            set_block_id_builder(&mut result_block_id, &block_id);
 
             Ok(())
         }.instrument(trace_span))
@@ -4711,7 +4513,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "get_shell_var");
         Promise::from_future(async move {
@@ -4754,7 +4556,7 @@ impl kernel::Server for KernelImpl {
         };
 
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "set_shell_var");
         Promise::from_future(async move {
@@ -4779,7 +4581,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListShellVarsResults,
     ) -> Promise<(), capnp::Error> {
         let state = self.state.clone();
-        let kernel_id = self.kernel_id.clone();
+        let kernel_id = self.kernel_id;
 
         let span = tracing::info_span!("rpc", method = "list_shell_vars");
         Promise::from_future(async move {
@@ -4808,14 +4610,16 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
-    fn compact_document(
+    fn compact_context(
         self: Rc<Self>,
-        params: kernel::CompactDocumentParams,
-        mut results: kernel::CompactDocumentResults,
+        params: kernel::CompactContextParams,
+        mut results: kernel::CompactContextResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _span = extract_rpc_trace(p.get_trace(), "compact_document").entered();
-        let document_id = pry!(pry!(p.get_document_id()).to_str()).to_string();
+        let _span = extract_rpc_trace(p.get_trace(), "compact_context").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
 
         let state = self.state.borrow();
         let kernel = match state.kernels.get(&self.kernel_id) {
@@ -4823,21 +4627,21 @@ impl kernel::Server for KernelImpl {
             None => {
                 return Promise::err(capnp::Error::failed(format!(
                     "kernel '{}' not found",
-                    self.kernel_id
+                    self.kernel_id.to_hex()
                 )));
             }
         };
         let _ctx_span = if let Ok(drift) = kernel.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_document(&document_id).unwrap_or([0u8; 16]);
+            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
             Some(kaijutsu_telemetry::context_root_span(&trace_id, "compact_document").entered())
         } else {
             None
         };
 
-        match kernel.documents.compact_document(&document_id) {
+        match kernel.documents.compact_document(context_id) {
             Ok(new_size) => {
                 let generation = kernel.documents
-                    .get(&document_id)
+                    .get(context_id)
                     .map(|e| e.sync_generation())
                     .unwrap_or(0);
                 let mut r = results.get();
@@ -5008,7 +4812,7 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
 async fn process_llm_stream(
     provider: Arc<RigProvider>,
     documents: SharedBlockStore,
-    cell_id: String,
+    cell_id: ContextId,
     content: String,
     model_name: String,
     kernel: Arc<Kernel>,
@@ -5040,7 +4844,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
+            let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
             break;
         }
 
@@ -5060,7 +4864,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
+                let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
                 return;
             }
         };
@@ -5079,7 +4883,7 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "") {
+                    match documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "") {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5090,7 +4894,7 @@ async fn process_llm_stream(
 
                 StreamEvent::ThinkingDelta(text) => {
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text(cell_id, block_id, &text) {
                             log::error!("Failed to append thinking text: {}", e);
                         }
                     }
@@ -5101,7 +4905,7 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "") {
+                    match documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "") {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5115,7 +4919,7 @@ async fn process_llm_stream(
                     assistant_text.push_str(&text);
 
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text(&cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text(cell_id, block_id, &text) {
                             log::error!("Failed to append text: {}", e);
                         }
                     }
@@ -5130,7 +4934,7 @@ async fn process_llm_stream(
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
 
                     // Insert block and track it
-                    match documents.insert_tool_call(&cell_id, None, Some(&last_block_id), &name, input.clone()) {
+                    match documents.insert_tool_call(cell_id, None, Some(&last_block_id), &name, input.clone()) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), block_id);
@@ -5153,7 +4957,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block(&cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
+                    let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
                     return;
                 }
             }
@@ -5190,7 +4994,7 @@ async fn process_llm_stream(
             .map(|(tool_use_id, tool_name, input)| {
                 let kernel = kernel.clone();
                 let documents = documents.clone();
-                let cell_id = cell_id.clone();
+                let cell_id = cell_id;
                 let tool_call_block_id = tool_call_blocks.get(&tool_use_id).cloned();
                 async move {
                     let params = input.to_string();
@@ -5217,7 +5021,7 @@ async fn process_llm_stream(
                     let mut result_block_id = None;
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result(
-                            &cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None,
+                            cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None,
                         ) {
                             Ok(id) => result_block_id = Some(id),
                             Err(e) => log::error!("Failed to insert tool result block: {}", e),
@@ -5263,10 +5067,10 @@ async fn process_llm_stream(
     // Persist conversation history for next turn — byte-for-byte identical
     // prefix on the next prompt() call gives us KV cache hits.
     log::info!("Saving {} conversation messages for cell {}", messages.len(), cell_id);
-    conversation_cache.borrow_mut().insert(cell_id.clone(), messages);
+    conversation_cache.borrow_mut().insert(cell_id, messages);
 
     // Save final state after streaming completes
-    if let Err(e) = documents.save_snapshot(&cell_id) {
+    if let Err(e) = documents.save_snapshot(cell_id) {
         log::warn!("Failed to save snapshot for cell {}: {}", cell_id, e);
     }
 
@@ -5277,6 +5081,31 @@ async fn process_llm_stream(
 // Utility Functions
 // ============================================================================
 
+/// Parse a BlockId from a Cap'n Proto BlockId reader (binary format).
+fn parse_block_id_from_reader(
+    reader: &crate::kaijutsu_capnp::block_id::Reader<'_>,
+) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
+    let context_id = ContextId::try_from_slice(reader.get_context_id()?)
+        .ok_or_else(|| capnp::Error::failed("invalid context_id in BlockId".into()))?;
+    let agent_id = PrincipalId::try_from_slice(reader.get_agent_id()?)
+        .ok_or_else(|| capnp::Error::failed("invalid agent_id in BlockId".into()))?;
+    Ok(kaijutsu_crdt::BlockId {
+        context_id,
+        agent_id,
+        seq: reader.get_seq(),
+    })
+}
+
+/// Set BlockId fields on a Cap'n Proto builder (binary format).
+fn set_block_id_builder(
+    builder: &mut crate::kaijutsu_capnp::block_id::Builder,
+    block_id: &kaijutsu_crdt::BlockId,
+) {
+    builder.set_context_id(block_id.context_id.as_bytes());
+    builder.set_agent_id(block_id.agent_id.as_bytes());
+    builder.set_seq(block_id.seq);
+}
+
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
 fn set_block_snapshot(
     builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
@@ -5285,18 +5114,14 @@ fn set_block_snapshot(
     // Set ID
     {
         let mut id = builder.reborrow().init_id();
-        id.set_document_id(&block.id.document_id);
-        id.set_agent_id(&block.id.agent_id);
-        id.set_seq(block.id.seq);
+        set_block_id_builder(&mut id, &block.id);
     }
 
     // Set parent_id if present
     if let Some(ref parent) = block.parent_id {
         builder.set_has_parent_id(true);
         let mut pid = builder.reborrow().init_parent_id();
-        pid.set_document_id(&parent.document_id);
-        pid.set_agent_id(&parent.agent_id);
-        pid.set_seq(parent.seq);
+        set_block_id_builder(&mut pid, parent);
     } else {
         builder.set_has_parent_id(false);
     }
@@ -5307,6 +5132,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::Role::Model => crate::kaijutsu_capnp::Role::Model,
         kaijutsu_crdt::Role::System => crate::kaijutsu_capnp::Role::System,
         kaijutsu_crdt::Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+        kaijutsu_crdt::Role::Asset => crate::kaijutsu_capnp::Role::System, // Asset maps to System on wire
     });
 
     // Set status
@@ -5323,15 +5149,13 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
         kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
         kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-        kaijutsu_crdt::BlockKind::ShellCommand => crate::kaijutsu_capnp::BlockKind::ShellCommand,
-        kaijutsu_crdt::BlockKind::ShellOutput => crate::kaijutsu_capnp::BlockKind::ShellOutput,
         kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+        kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::Text, // File maps to Text on wire
     });
 
-    // Set basic fields
+    // Set basic fields (no author — derived from id.agent_id)
     builder.set_content(&block.content);
     builder.set_collapsed(block.collapsed);
-    builder.set_author(&block.author);
     builder.set_created_at(block.created_at);
 
     // Set tool-specific fields
@@ -5342,48 +5166,52 @@ fn set_block_snapshot(
         builder.set_tool_input(input);
     }
     if let Some(ref tc_id) = block.tool_call_id {
-        builder.set_has_tool_call_id(true);
         let mut tcid = builder.reborrow().init_tool_call_id();
-        tcid.set_document_id(&tc_id.document_id);
-        tcid.set_agent_id(&tc_id.agent_id);
-        tcid.set_seq(tc_id.seq);
-    } else {
-        builder.set_has_tool_call_id(false);
+        set_block_id_builder(&mut tcid, tc_id);
     }
     if let Some(code) = block.exit_code {
         builder.set_has_exit_code(true);
         builder.set_exit_code(code);
-    } else {
-        builder.set_has_exit_code(false);
     }
     builder.set_is_error(block.is_error);
 
     // Set display hint if present
     if let Some(ref hint) = block.display_hint {
-        builder.set_has_display_hint(true);
         builder.set_display_hint(hint);
-    } else {
-        builder.set_has_display_hint(false);
     }
 
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
-        builder.set_has_source_context(true);
-        builder.set_source_context(ctx);
-    } else {
-        builder.set_has_source_context(false);
+        builder.set_source_context(ctx.as_bytes());
     }
     if let Some(ref model) = block.source_model {
-        builder.set_has_source_model(true);
         builder.set_source_model(model);
-    } else {
-        builder.set_has_source_model(false);
     }
-    if let Some(ref dk) = block.drift_kind {
+    if let Some(dk) = block.drift_kind {
         builder.set_has_drift_kind(true);
-        builder.set_drift_kind(dk.as_str());
-    } else {
-        builder.set_has_drift_kind(false);
+        builder.set_drift_kind(drift_kind_to_capnp(dk));
+    }
+}
+
+/// Convert a Cap'n Proto DriftKind to CRDT DriftKind.
+fn capnp_drift_kind_to_crdt(dk: Option<crate::kaijutsu_capnp::DriftKind>) -> Option<kaijutsu_crdt::DriftKind> {
+    match dk? {
+        crate::kaijutsu_capnp::DriftKind::Push => Some(kaijutsu_crdt::DriftKind::Push),
+        crate::kaijutsu_capnp::DriftKind::Pull => Some(kaijutsu_crdt::DriftKind::Pull),
+        crate::kaijutsu_capnp::DriftKind::Merge => Some(kaijutsu_crdt::DriftKind::Merge),
+        crate::kaijutsu_capnp::DriftKind::Distill => Some(kaijutsu_crdt::DriftKind::Distill),
+        crate::kaijutsu_capnp::DriftKind::Commit => Some(kaijutsu_crdt::DriftKind::Commit),
+    }
+}
+
+/// Convert a CRDT DriftKind to Cap'n Proto DriftKind.
+fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::DriftKind {
+    match dk {
+        kaijutsu_crdt::DriftKind::Push => crate::kaijutsu_capnp::DriftKind::Push,
+        kaijutsu_crdt::DriftKind::Pull => crate::kaijutsu_capnp::DriftKind::Pull,
+        kaijutsu_crdt::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
+        kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
+        kaijutsu_crdt::DriftKind::Commit => crate::kaijutsu_capnp::DriftKind::Commit,
     }
 }
 
@@ -5402,19 +5230,11 @@ fn parse_block_snapshot(
     reader: &crate::kaijutsu_capnp::block_snapshot::Reader<'_>,
 ) -> Result<kaijutsu_crdt::BlockSnapshot, capnp::Error> {
     let id_reader = reader.get_id()?;
-    let id = kaijutsu_crdt::BlockId {
-        document_id: id_reader.get_document_id()?.to_str()?.to_owned(),
-        agent_id: id_reader.get_agent_id()?.to_str()?.to_owned(),
-        seq: id_reader.get_seq(),
-    };
+    let id = parse_block_id_from_reader(&id_reader)?;
 
     let parent_id = if reader.get_has_parent_id() {
         let pid_reader = reader.get_parent_id()?;
-        Some(kaijutsu_crdt::BlockId {
-            document_id: pid_reader.get_document_id()?.to_str()?.to_owned(),
-            agent_id: pid_reader.get_agent_id()?.to_str()?.to_owned(),
-            seq: pid_reader.get_seq(),
-        })
+        Some(parse_block_id_from_reader(&pid_reader)?)
     } else {
         None
     };
@@ -5438,18 +5258,12 @@ fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Thinking => kaijutsu_crdt::BlockKind::Thinking,
         crate::kaijutsu_capnp::BlockKind::ToolCall => kaijutsu_crdt::BlockKind::ToolCall,
         crate::kaijutsu_capnp::BlockKind::ToolResult => kaijutsu_crdt::BlockKind::ToolResult,
-        crate::kaijutsu_capnp::BlockKind::ShellCommand => kaijutsu_crdt::BlockKind::ShellCommand,
-        crate::kaijutsu_capnp::BlockKind::ShellOutput => kaijutsu_crdt::BlockKind::ShellOutput,
         crate::kaijutsu_capnp::BlockKind::Drift => kaijutsu_crdt::BlockKind::Drift,
     };
 
-    let tool_call_id = if reader.get_has_tool_call_id() {
+    let tool_call_id = if reader.has_tool_call_id() {
         let tc_reader = reader.get_tool_call_id()?;
-        Some(kaijutsu_crdt::BlockId {
-            document_id: tc_reader.get_document_id()?.to_str()?.to_owned(),
-            agent_id: tc_reader.get_agent_id()?.to_str()?.to_owned(),
-            seq: tc_reader.get_seq(),
-        })
+        Some(parse_block_id_from_reader(&tc_reader)?)
     } else {
         None
     };
@@ -5461,7 +5275,7 @@ fn parse_block_snapshot(
         .map(|s| s.to_owned());
 
     // Read display hint from wire protocol
-    let display_hint = if reader.get_has_display_hint() {
+    let display_hint = if reader.has_display_hint() {
         reader.get_display_hint()
             .ok()
             .and_then(|s| s.to_str().ok())
@@ -5479,30 +5293,29 @@ fn parse_block_snapshot(
         kind,
         content: reader.get_content()?.to_str()?.to_owned(),
         collapsed: reader.get_collapsed(),
-        author: reader.get_author()?.to_str()?.to_owned(),
+        compacted: false,
         created_at: reader.get_created_at(),
+        tool_kind: None, // TODO: parse from wire when schema supports it
         tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
         tool_input,
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
         display_hint,
-        source_context: if reader.get_has_source_context() {
+        file_path: None,
+        order_key: None,
+        source_context: if reader.has_source_context() {
             reader.get_source_context().ok()
-                .and_then(|s| s.to_str().ok())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned())
+                .and_then(|bytes| ContextId::try_from_slice(bytes))
         } else { None },
-        source_model: if reader.get_has_source_model() {
+        source_model: if reader.has_source_model() {
             reader.get_source_model().ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())
         } else { None },
         drift_kind: if reader.get_has_drift_kind() {
-            reader.get_drift_kind().ok()
-                .and_then(|s| s.to_str().ok())
-                .and_then(|s| kaijutsu_crdt::DriftKind::from_str(s))
+            capnp_drift_kind_to_crdt(reader.get_drift_kind().ok())
         } else { None },
     })
 }

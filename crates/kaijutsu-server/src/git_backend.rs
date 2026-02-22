@@ -40,6 +40,7 @@
 //! When external tools (cargo, clippy, etc.) modify files, the watcher
 //! detects the changes and syncs them back to CRDT with attribution.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +62,10 @@ use kaish_kernel::vfs::{EntryType as VfsEntryType, Filesystem, MountInfo};
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::db::DocumentKind;
+use kaijutsu_types::{ContextId, PrincipalId};
+
+/// Fixed namespace UUID for deriving deterministic ContextIds from git doc strings.
+const GIT_DOC_NS: uuid::Uuid = uuid::uuid!("a7c3e1f9-4b2d-4e80-b5f8-2c9d1e3b5a68");
 
 /// Configuration for a managed git repository.
 #[derive(Debug, Clone)]
@@ -78,7 +83,7 @@ pub struct RepoConfig {
 /// Tracks dirty files that need flushing to disk.
 struct DirtyTracker {
     /// Files marked dirty, with timestamp of last modification.
-    files: DashMap<(String, String), Instant>, // (doc_id, file_path) -> last_modified
+    files: DashMap<(ContextId, String), Instant>, // (context_id, file_path) -> last_modified
     /// Debounce duration.
     debounce: Duration,
 }
@@ -91,11 +96,11 @@ impl DirtyTracker {
         }
     }
 
-    fn mark_dirty(&self, doc_id: &str, file_path: &str) {
-        self.files.insert((doc_id.to_string(), file_path.to_string()), Instant::now());
+    fn mark_dirty(&self, ctx_id: ContextId, file_path: &str) {
+        self.files.insert((ctx_id, file_path.to_string()), Instant::now());
     }
 
-    fn get_flushable(&self) -> Vec<(String, String)> {
+    fn get_flushable(&self) -> Vec<(ContextId, String)> {
         let now = Instant::now();
         self.files
             .iter()
@@ -104,8 +109,8 @@ impl DirtyTracker {
             .collect()
     }
 
-    fn mark_flushed(&self, doc_id: &str, file_path: &str) {
-        self.files.remove(&(doc_id.to_string(), file_path.to_string()));
+    fn mark_flushed(&self, ctx_id: ContextId, file_path: &str) {
+        self.files.remove(&(ctx_id, file_path.to_string()));
     }
 }
 
@@ -392,15 +397,17 @@ impl GitCrdtBackend {
     }
 
     /// Get or create the document ID for a repo:branch.
-    fn doc_id(&self, repo: &str, branch: &str) -> String {
-        format!("{}:{}", repo, branch)
+    /// Derive a deterministic ContextId from repo:branch.
+    fn doc_id(&self, repo: &str, branch: &str) -> ContextId {
+        let key = format!("{}:{}", repo, branch);
+        let uuid = uuid::Uuid::new_v5(&GIT_DOC_NS, key.as_bytes());
+        ContextId::from(uuid)
     }
 
     /// Get or create a block ID from a file path.
     ///
     /// Uses a stable hash of the file path to generate a predictable block ID.
-    fn block_id_for_path(&self, doc_id: &str, file_path: &str) -> BlockId {
-        // Use a stable hash of the file path for the sequence number
+    fn block_id_for_path(&self, ctx_id: ContextId, file_path: &str) -> BlockId {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -408,19 +415,22 @@ impl GitCrdtBackend {
         file_path.hash(&mut hasher);
         let hash = hasher.finish();
 
-        // Use "git" as the agent ID for file blocks
-        BlockId::new(doc_id, "git", hash)
+        BlockId {
+            context_id: ctx_id,
+            agent_id: PrincipalId::system(),
+            seq: hash,
+        }
     }
 
     /// Ensure a document exists for a repo:branch.
-    fn ensure_document(&self, repo: &str, branch: &str) -> Result<String, String> {
-        let doc_id = self.doc_id(repo, branch);
+    fn ensure_document(&self, repo: &str, branch: &str) -> Result<ContextId, String> {
+        let ctx_id = self.doc_id(repo, branch);
 
-        if !self.blocks.contains(&doc_id) {
-            self.blocks.create_document(doc_id.clone(), DocumentKind::Git, None)?;
+        if !self.blocks.contains(ctx_id) {
+            self.blocks.create_document(ctx_id, DocumentKind::Git, None)?;
         }
 
-        Ok(doc_id)
+        Ok(ctx_id)
     }
 
     /// Get or open a GitVfs handle for a repository.
@@ -453,13 +463,13 @@ impl GitCrdtBackend {
     /// Load a file from disk into CRDT (lazy loading).
     async fn load_file_to_crdt(&self, repo: &str, file_path: &str) -> BackendResult<BlockId> {
         let branch = self.current_branch(repo)?;
-        let doc_id = self.ensure_document(repo, &branch)
+        let ctx_id = self.ensure_document(repo, &branch)
             .map_err(|e| BackendError::Io(e))?;
 
-        let block_id = self.block_id_for_path(&doc_id, file_path);
+        let block_id = self.block_id_for_path(ctx_id, file_path);
 
         // Check if block already exists
-        if let Some(entry) = self.blocks.get(&doc_id) {
+        if let Some(entry) = self.blocks.get(ctx_id) {
             let blocks = entry.doc.blocks_ordered();
             if blocks.iter().any(|b| b.id == block_id) {
                 return Ok(block_id);
@@ -474,7 +484,7 @@ impl GitCrdtBackend {
 
         // Create block with content
         self.blocks.insert_block(
-            &doc_id,
+            ctx_id,
             None, // no parent
             None, // at end
             kaijutsu_crdt::Role::System,
@@ -488,13 +498,13 @@ impl GitCrdtBackend {
     /// Flush a file from CRDT to disk.
     async fn flush_file_to_disk(&self, repo: &str, file_path: &str) -> BackendResult<()> {
         let branch = self.current_branch(repo)?;
-        let doc_id = self.doc_id(repo, &branch);
-        let block_id = self.block_id_for_path(&doc_id, file_path);
+        let ctx_id = self.doc_id(repo, &branch);
+        let block_id = self.block_id_for_path(ctx_id, file_path);
 
         // Get block content
         let content = {
-            let entry = self.blocks.get(&doc_id)
-                .ok_or_else(|| BackendError::NotFound(format!("document not found: {}", doc_id)))?;
+            let entry = self.blocks.get(ctx_id)
+                .ok_or_else(|| BackendError::NotFound(format!("document not found: {}", ctx_id)))?;
             let blocks = entry.doc.blocks_ordered();
             let block = blocks.iter()
                 .find(|b| b.id == block_id)
@@ -511,7 +521,7 @@ impl GitCrdtBackend {
         tokio::fs::write(&disk_path, &content).await
             .map_err(|e| BackendError::Io(format!("failed to write {}: {}", disk_path.display(), e)))?;
 
-        self.dirty.mark_flushed(&doc_id, file_path);
+        self.dirty.mark_flushed(ctx_id, file_path);
         Ok(())
     }
 
@@ -523,10 +533,17 @@ impl GitCrdtBackend {
         let flushable = self.dirty.get_flushable();
         let mut errors: Vec<String> = Vec::new();
 
-        for (doc_id, file_path) in flushable {
-            // Parse doc_id to get repo
-            let parts: Vec<&str> = doc_id.split(':').collect();
-            if let [repo, _branch] = parts.as_slice() {
+        // Build reverse index: ContextId → repo name
+        let ctx_to_repo: HashMap<ContextId, String> = self.repos.iter()
+            .map(|entry| {
+                let repo = entry.key().clone();
+                let branch = entry.value().branch.clone();
+                (self.doc_id(&repo, &branch), repo)
+            })
+            .collect();
+
+        for (ctx_id, file_path) in flushable {
+            if let Some(repo) = ctx_to_repo.get(&ctx_id) {
                 if let Err(e) = self.flush_file_to_disk(repo, &file_path).await {
                     tracing::warn!(repo = %repo, file = %file_path, error = %e, "failed to flush file");
                     errors.push(format!("{}:{}: {}", repo, file_path, e));
@@ -684,9 +701,9 @@ impl GitCrdtBackend {
     /// Called when the file watcher detects a change from an external tool.
     pub async fn sync_external_change(&self, event: &FileChangeEvent) -> BackendResult<()> {
         let branch = self.current_branch(&event.repo)?;
-        let doc_id = self.ensure_document(&event.repo, &branch)
+        let ctx_id = self.ensure_document(&event.repo, &branch)
             .map_err(|e| BackendError::Io(e))?;
-        let block_id = self.block_id_for_path(&doc_id, &event.file_path);
+        let block_id = self.block_id_for_path(ctx_id, &event.file_path);
 
         match event.kind {
             FileChangeKind::Created | FileChangeKind::Modified => {
@@ -708,7 +725,7 @@ impl GitCrdtBackend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
 
                 // Check if block exists
-                let block_exists = if let Some(entry) = self.blocks.get(&doc_id) {
+                let block_exists = if let Some(entry) = self.blocks.get(ctx_id) {
                     entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
                 } else {
                     false
@@ -717,17 +734,17 @@ impl GitCrdtBackend {
                 if block_exists {
                     // Replace content
                     let current_len = {
-                        let entry = self.blocks.get(&doc_id).unwrap();
+                        let entry = self.blocks.get(ctx_id).unwrap();
                         let blocks = entry.doc.blocks_ordered();
                         blocks.iter().find(|b| b.id == block_id).map(|b| b.content.len()).unwrap_or(0)
                     };
 
-                    self.blocks.edit_text(&doc_id, &block_id, 0, content_str, current_len)
+                    self.blocks.edit_text(ctx_id, &block_id, 0, content_str, current_len)
                         .map_err(|e| BackendError::Io(e))?;
                 } else {
                     // Create new block
                     self.blocks.insert_block(
-                        &doc_id,
+                        ctx_id,
                         None,
                         None,
                         kaijutsu_crdt::Role::System,
@@ -738,7 +755,7 @@ impl GitCrdtBackend {
             }
             FileChangeKind::Deleted => {
                 // Delete the block
-                let _ = self.blocks.delete_block(&doc_id, &block_id);
+                let _ = self.blocks.delete_block(ctx_id, &block_id);
             }
         }
 
@@ -888,10 +905,10 @@ impl KernelBackend for GitCrdtBackend {
                 // Read from CRDT (loading from disk if needed)
                 let block_id = self.load_file_to_crdt(&repo, &file_path).await?;
                 let branch = self.current_branch(&repo)?;
-                let doc_id = self.doc_id(&repo, &branch);
+                let ctx_id = self.doc_id(&repo, &branch);
 
-                let entry = self.blocks.get(&doc_id)
-                    .ok_or_else(|| BackendError::NotFound(doc_id.clone()))?;
+                let entry = self.blocks.get(ctx_id)
+                    .ok_or_else(|| BackendError::NotFound(ctx_id.to_hex()))?;
                 let blocks = entry.doc.blocks_ordered();
                 let block = blocks.iter()
                     .find(|b| b.id == block_id)
@@ -925,12 +942,12 @@ impl KernelBackend for GitCrdtBackend {
         match self.resolve_path(path) {
             PathResolution::WorktreeFile(repo, file_path) => {
                 let branch = self.current_branch(&repo)?;
-                let doc_id = self.ensure_document(&repo, &branch)
+                let ctx_id = self.ensure_document(&repo, &branch)
                     .map_err(|e| BackendError::Io(e))?;
-                let block_id = self.block_id_for_path(&doc_id, &file_path);
+                let block_id = self.block_id_for_path(ctx_id, &file_path);
 
                 // Check if block exists
-                let block_exists = if let Some(entry) = self.blocks.get(&doc_id) {
+                let block_exists = if let Some(entry) = self.blocks.get(ctx_id) {
                     entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
                 } else {
                     false
@@ -939,17 +956,17 @@ impl KernelBackend for GitCrdtBackend {
                 if block_exists {
                     // Replace content
                     let current_len = {
-                        let entry = self.blocks.get(&doc_id).unwrap();
+                        let entry = self.blocks.get(ctx_id).unwrap();
                         let blocks = entry.doc.blocks_ordered();
                         blocks.iter().find(|b| b.id == block_id).map(|b| b.content.len()).unwrap_or(0)
                     };
 
-                    self.blocks.edit_text(&doc_id, &block_id, 0, content_str, current_len)
+                    self.blocks.edit_text(ctx_id, &block_id, 0, content_str, current_len)
                         .map_err(|e| BackendError::Io(e))?;
                 } else {
                     // Create new block
                     self.blocks.insert_block(
-                        &doc_id,
+                        ctx_id,
                         None,
                         None,
                         kaijutsu_crdt::Role::System,
@@ -959,7 +976,7 @@ impl KernelBackend for GitCrdtBackend {
                 }
 
                 // Mark dirty for flush
-                self.dirty.mark_dirty(&doc_id, &file_path);
+                self.dirty.mark_dirty(ctx_id, &file_path);
 
                 Ok(())
             }
@@ -985,12 +1002,12 @@ impl KernelBackend for GitCrdtBackend {
                 // Ensure file is loaded
                 let block_id = self.load_file_to_crdt(&repo, &file_path).await?;
                 let branch = self.current_branch(&repo)?;
-                let doc_id = self.doc_id(&repo, &branch);
+                let ctx_id = self.doc_id(&repo, &branch);
 
-                self.blocks.append_text(&doc_id, &block_id, content_str)
+                self.blocks.append_text(ctx_id, &block_id, content_str)
                     .map_err(|e| BackendError::Io(e))?;
 
-                self.dirty.mark_dirty(&doc_id, &file_path);
+                self.dirty.mark_dirty(ctx_id, &file_path);
                 Ok(())
             }
             _ => Err(BackendError::InvalidOperation("can only append to worktree files".into())),
@@ -1129,10 +1146,10 @@ impl KernelBackend for GitCrdtBackend {
             PathResolution::WorktreeFile(repo, file_path) => {
                 // Remove from CRDT
                 let branch = self.current_branch(&repo)?;
-                let doc_id = self.doc_id(&repo, &branch);
-                let block_id = self.block_id_for_path(&doc_id, &file_path);
+                let ctx_id = self.doc_id(&repo, &branch);
+                let block_id = self.block_id_for_path(ctx_id, &file_path);
 
-                let _ = self.blocks.delete_block(&doc_id, &block_id);
+                let _ = self.blocks.delete_block(ctx_id, &block_id);
 
                 // Remove from disk
                 let disk_path = self.worktrees_root.join(&repo).join(&file_path);
@@ -1270,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_path_resolution() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let backend = GitCrdtBackend::new(blocks);
 
         // Test /g paths
@@ -1288,35 +1305,41 @@ mod tests {
 
     #[test]
     fn test_block_id_for_path() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let backend = GitCrdtBackend::new(blocks);
 
-        let doc_id = "test:main";
+        let ctx_id = backend.doc_id("test", "main");
 
         // Same path should always produce same block ID
-        let id1 = backend.block_id_for_path(doc_id, "src/main.rs");
-        let id2 = backend.block_id_for_path(doc_id, "src/main.rs");
+        let id1 = backend.block_id_for_path(ctx_id, "src/main.rs");
+        let id2 = backend.block_id_for_path(ctx_id, "src/main.rs");
         assert_eq!(id1, id2);
 
         // Different paths should produce different IDs
-        let id3 = backend.block_id_for_path(doc_id, "src/lib.rs");
+        let id3 = backend.block_id_for_path(ctx_id, "src/lib.rs");
         assert_ne!(id1, id3);
     }
 
     #[test]
     fn test_doc_id() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let backend = GitCrdtBackend::new(blocks);
 
-        assert_eq!(backend.doc_id("kaijutsu", "main"), "kaijutsu:main");
-        assert_eq!(backend.doc_id("myrepo", "feat/foo"), "myrepo:feat/foo");
+        // doc_id returns deterministic ContextIds (UUIDv5 from repo:branch)
+        let id1 = backend.doc_id("kaijutsu", "main");
+        let id2 = backend.doc_id("kaijutsu", "main");
+        assert_eq!(id1, id2, "same repo:branch should produce same ContextId");
+
+        // Different repo:branch pairs should produce different IDs
+        let id3 = backend.doc_id("myrepo", "feat/foo");
+        assert_ne!(id1, id3, "different repo:branch should produce different ContextIds");
     }
 
     // Part 4a: Path security tests
 
     #[test]
     fn test_resolve_path_rejects_parent_dir() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let backend = GitCrdtBackend::new(blocks);
 
         // Path with .. should be rejected as Outside
@@ -1334,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_normal_paths_work() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let backend = GitCrdtBackend::new(blocks);
 
         // Normal paths should resolve correctly

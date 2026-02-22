@@ -8,6 +8,7 @@ description = "SSH + Cap'n Proto server for kaijutsu"
 # Kaijutsu kernel (VFS + state + control plane)
 kaijutsu-kernel.workspace = true
 kaijutsu-crdt.workspace = true
+kaijutsu-types.workspace = true
 
 # Kaish execution engine (spawned as subprocess, connected via IPC)
 kaish-kernel.workspace = true

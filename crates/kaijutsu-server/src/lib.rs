@@ -19,7 +19,7 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
-pub use auth_db::{AuthDb, User, SshKey};
+pub use auth_db::{AuthDb, SshKeyRecord};
 pub use kaijutsu_kernel::{DriftRouter, ContextHandle, StagedDrift, DriftError};
 pub use context_engine::{ContextEngine, ContextManager};
 pub use docs_filesystem::KaijutsuFilesystem;

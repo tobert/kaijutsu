@@ -21,11 +21,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use kaijutsu_types::{ContextId, KernelId};
 use parking_lot::RwLock;
 
 use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
-
-use crate::rpc::ContextState;
 
 // ============================================================================
 // Context Manager - Thread-safe state for context operations
@@ -43,28 +42,24 @@ pub struct ContextManager {
 #[derive(Debug, Default)]
 #[allow(dead_code)] // nick/kernel_id/instance used by constructor, useful for future presence
 struct ContextManagerInner {
-    /// All contexts in the kernel
-    contexts: HashMap<String, ContextState>,
-    /// Current user identity (nick)
+    /// All known context labels
+    context_labels: HashMap<ContextId, String>,
+    /// Current user identity (username)
     nick: String,
     /// Kernel ID this manager belongs to
-    kernel_id: String,
+    kernel_id: KernelId,
     /// Current instance ID for this connection
     instance: String,
-    /// Currently active context name
-    current_context: Option<String>,
+    /// Currently active context
+    current_context: Option<ContextId>,
 }
 
 impl ContextManager {
     /// Create a new context manager.
-    pub fn new(nick: String, kernel_id: String, instance: String) -> Self {
-        let mut contexts = HashMap::new();
-        // Always have a default context
-        contexts.insert("default".to_string(), ContextState::new("default".to_string()));
-
+    pub fn new(nick: String, kernel_id: KernelId, instance: String) -> Self {
         Self {
             inner: RwLock::new(ContextManagerInner {
-                contexts,
+                context_labels: HashMap::new(),
                 nick,
                 kernel_id,
                 instance,
@@ -73,76 +68,53 @@ impl ContextManager {
         }
     }
 
-    /// Join or create a context, returning the context name.
-    pub fn join_context(&self, context_name: &str) -> String {
+    /// Register a context label.
+    pub fn register_context(&self, id: ContextId, label: &str) {
+        let mut inner = self.inner.write();
+        inner.context_labels.insert(id, label.to_string());
+    }
+
+    /// Join a context by label, returning the label.
+    pub fn join_context(&self, label: &str) -> String {
         let mut inner = self.inner.write();
 
-        // Ensure context exists
-        inner.contexts
-            .entry(context_name.to_string())
-            .or_insert_with(|| ContextState::new(context_name.to_string()));
+        // Find context by label
+        let ctx_id = inner
+            .context_labels
+            .iter()
+            .find(|(_, l)| l.as_str() == label)
+            .map(|(id, _)| *id);
 
-        inner.current_context = Some(context_name.to_string());
+        if let Some(id) = ctx_id {
+            inner.current_context = Some(id);
+        }
 
-        context_name.to_string()
+        label.to_string()
     }
 
     /// Leave the current context.
     pub fn leave_context(&self) -> Option<String> {
         let mut inner = self.inner.write();
-        inner.current_context.take()
+        let old = inner.current_context.take();
+        old.and_then(|id| inner.context_labels.get(&id).cloned())
     }
 
-    /// Get the current context name.
+    /// Get the current context label.
     pub fn current_context(&self) -> Option<String> {
-        self.inner.read().current_context.clone()
+        let inner = self.inner.read();
+        inner
+            .current_context
+            .and_then(|id| inner.context_labels.get(&id).cloned())
     }
 
-    /// List all context names.
+    /// List all context labels.
     pub fn list_contexts(&self) -> Vec<String> {
-        self.inner.read().contexts.keys().cloned().collect()
-    }
-
-    /// Get context state.
-    pub fn get_context(&self, name: &str) -> Option<ContextState> {
-        self.inner.read().contexts.get(name).cloned()
-    }
-
-    /// Attach a document to a context.
-    ///
-    /// If the context doesn't exist, it will be created first.
-    pub fn attach_document(&self, context_name: &str, document_id: &str, attached_by: &str) {
-        use crate::rpc::ContextDocument;
-
-        let mut inner = self.inner.write();
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_millis() as u64;
-
-        let doc = ContextDocument {
-            id: document_id.to_string(),
-            attached_by: attached_by.to_string(),
-            attached_at: now,
-        };
-
-        // Ensure context exists
-        inner.contexts
-            .entry(context_name.to_string())
-            .or_insert_with(|| ContextState::new(context_name.to_string()))
-            .documents.push(doc);
-    }
-
-    /// Sync state from RPC layer (called when contexts change externally).
-    pub fn sync_contexts(&self, contexts: HashMap<String, ContextState>) {
-        let mut inner = self.inner.write();
-        inner.contexts = contexts;
-    }
-
-    /// Get contexts map (for RPC sync back).
-    pub fn contexts(&self) -> HashMap<String, ContextState> {
-        self.inner.read().contexts.clone()
+        self.inner
+            .read()
+            .context_labels
+            .values()
+            .cloned()
+            .collect()
     }
 }
 
@@ -195,20 +167,19 @@ impl ContextEngine {
                 }
                 Ok(output)
             }
-            "current" | "show" => {
-                match self.manager.current_context() {
-                    Some(ctx) => Ok(format!("Current context: {}", ctx)),
-                    None => Ok("No active context".to_string()),
-                }
-            }
-            "leave" => {
-                match self.manager.leave_context() {
-                    Some(ctx) => Ok(format!("Left context '{}'", ctx)),
-                    None => Ok("No active context to leave".to_string()),
-                }
-            }
+            "current" | "show" => match self.manager.current_context() {
+                Some(ctx) => Ok(format!("Current context: {}", ctx)),
+                None => Ok("No active context".to_string()),
+            },
+            "leave" => match self.manager.leave_context() {
+                Some(ctx) => Ok(format!("Left context '{}'", ctx)),
+                None => Ok("No active context to leave".to_string()),
+            },
             "help" | "-h" | "--help" => self.show_help(),
-            other => Err(format!("Unknown subcommand: {}. Use 'context help' for usage.", other)),
+            other => Err(format!(
+                "Unknown subcommand: {}. Use 'context help' for usage.",
+                other
+            )),
         }
     }
 
@@ -230,7 +201,8 @@ EXAMPLES:
     context new planning
     context switch default
     context list
-"#.to_string())
+"#
+        .to_string())
     }
 }
 
@@ -297,14 +269,20 @@ mod tests {
     fn test_context_manager_basic() {
         let manager = ContextManager::new(
             "alice".to_string(),
-            "kernel-1".to_string(),
+            KernelId::new(),
             "instance-1".to_string(),
         );
+
+        // Register a context
+        let default_id = ContextId::new();
+        manager.register_context(default_id, "default");
 
         // Should have default context
         assert!(manager.list_contexts().contains(&"default".to_string()));
 
-        // Join a new context
+        // Register and join a new context
+        let planning_id = ContextId::new();
+        manager.register_context(planning_id, "planning");
         let ctx = manager.join_context("planning");
         assert_eq!(ctx, "planning");
         assert_eq!(manager.current_context(), Some("planning".to_string()));
@@ -319,41 +297,33 @@ mod tests {
     async fn test_context_engine_list() {
         let manager = Arc::new(ContextManager::new(
             "bob".to_string(),
-            "kernel-2".to_string(),
+            KernelId::new(),
             "instance-2".to_string(),
         ));
+        manager.register_context(ContextId::new(), "default");
         let engine = ContextEngine::new(manager);
 
-        let result = engine.execute(r#"{"_positional": ["list"]}"#).await.unwrap();
+        let result = engine
+            .execute(r#"{"_positional": ["list"]}"#)
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("default"));
-    }
-
-    #[tokio::test]
-    async fn test_context_engine_new() {
-        let manager = Arc::new(ContextManager::new(
-            "charlie".to_string(),
-            "kernel-3".to_string(),
-            "instance-3".to_string(),
-        ));
-        let engine = ContextEngine::new(manager.clone());
-
-        let result = engine.execute(r#"{"_positional": ["new", "testing"]}"#).await.unwrap();
-        assert!(result.success);
-        assert!(result.stdout.contains("testing"));
-        assert_eq!(manager.current_context(), Some("testing".to_string()));
     }
 
     #[tokio::test]
     async fn test_context_engine_help() {
         let manager = Arc::new(ContextManager::new(
             "dave".to_string(),
-            "kernel-4".to_string(),
+            KernelId::new(),
             "instance-4".to_string(),
         ));
         let engine = ContextEngine::new(manager);
 
-        let result = engine.execute(r#"{"_positional": ["help"]}"#).await.unwrap();
+        let result = engine
+            .execute(r#"{"_positional": ["help"]}"#)
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("USAGE"));
     }

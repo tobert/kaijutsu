@@ -170,10 +170,11 @@ mod tests {
     use super::*;
     use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_kernel::Kernel as KaijutsuKernel;
+    use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
     async fn test_docs_filesystem_read_only() {
-        let blocks = shared_block_store("test-docs-fs");
+        let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs").await);
         let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
         let fs = KaijutsuFilesystem::new(backend);
@@ -182,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docs_filesystem_real_path() {
-        let blocks = shared_block_store("test-docs-fs-rp");
+        let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-rp").await);
         let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
         let fs = KaijutsuFilesystem::new(backend);
@@ -191,7 +192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_docs_filesystem_list_root() {
-        let blocks = shared_block_store("test-docs-fs-list");
+        let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-list").await);
         let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
         let fs = KaijutsuFilesystem::new(backend);

@@ -71,7 +71,7 @@ impl EmbeddedKaish {
     /// # Example
     ///
     /// ```ignore
-    /// let blocks = shared_block_store("agent-1");
+    /// let blocks = shared_block_store(PrincipalId::system());
     /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
     /// let kaish = EmbeddedKaish::new("my-kernel", blocks, kernel, None)?;
     /// let result = kaish.execute("echo hello").await?;
@@ -130,8 +130,8 @@ impl EmbeddedKaish {
     /// # Example
     ///
     /// ```ignore
-    /// let blocks = shared_block_store("agent-1");
-    /// let git_blocks = shared_block_store("agent-1-git");
+    /// let blocks = shared_block_store(PrincipalId::system());
+    /// let git_blocks = shared_block_store(PrincipalId::system());
     /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
     /// let kaish = EmbeddedKaish::with_git("my-kernel", blocks, git_blocks, kernel, None)?;
     /// kaish.register_repo("myproject", "/home/user/src/myproject")?;
@@ -493,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedded_kaish_creation() {
-        let blocks = shared_block_store("test-agent");
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-agent").await);
 
         let kaish = EmbeddedKaish::new("test-kernel", blocks, kernel, None);
@@ -506,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedded_kaish_variables() {
-        let blocks = shared_block_store("test-vars");
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-vars").await);
         let kaish = EmbeddedKaish::new("test-vars", blocks, kernel, None).unwrap();
 
@@ -523,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_named_config_cwd_is_home() {
-        let blocks = shared_block_store("test-cwd-home");
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-cwd-home").await);
         let kaish = EmbeddedKaish::new("test-cwd-home", blocks, kernel, None).unwrap();
 
@@ -537,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_config_cwd_is_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let blocks = shared_block_store("test-cwd-project");
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-cwd-project").await);
         let kaish = EmbeddedKaish::new(
             "test-cwd-project",

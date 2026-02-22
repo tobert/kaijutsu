@@ -502,10 +502,11 @@ mod tests {
     use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_kernel::Kernel as KaijutsuKernel;
     use kaijutsu_kernel::vfs::backends::MemoryBackend;
+    use kaijutsu_types::PrincipalId;
 
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
     async fn test_mount_backend() -> MountBackend {
-        let blocks = shared_block_store("test-mount");
+        let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-mount").await);
         let docs = Arc::new(KaijutsuBackend::new(blocks, kernel));
 

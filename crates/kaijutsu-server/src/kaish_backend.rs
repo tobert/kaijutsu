@@ -19,11 +19,11 @@
 //!
 //! VFS paths map to blocks as follows:
 //!
-//! - `/docs/{doc_id}` - List blocks in a document
-//! - `/docs/{doc_id}/{block_key}` - Access a specific block's content
-//! - `/docs/{doc_id}/_meta` - Document metadata (kind, language)
+//! - `/docs/{ctx_hex}` - List blocks in a document
+//! - `/docs/{ctx_hex}/{block_key}` - Access a specific block's content
+//! - `/docs/{ctx_hex}/_meta` - Document metadata (kind, language)
 //!
-//! This allows kaish to navigate documents like directories and blocks like files.
+//! Where `ctx_hex` is the 32-char hex representation of a ContextId.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::db::DocumentKind;
 use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
+use kaijutsu_types::ContextId;
 
 use kaish_kernel::{
     BackendError, BackendResult, EntryInfo, KernelBackend, PatchOp, ReadRange, ToolInfo,
@@ -47,8 +48,8 @@ use kaish_kernel::vfs::MountInfo;
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
 ///
 /// File operations become block operations:
-/// - `cat /docs/conv-123/block-1` → read block content
-/// - `echo "text" >> /docs/conv-123/block-1` → append to block
+/// - `cat /docs/{ctx_hex}/block-key` → read block content
+/// - `echo "text" >> /docs/{ctx_hex}/block-key` → append to block
 /// - `ls /docs/` → list documents
 ///
 /// Tool calls route through kaijutsu's Kernel which includes:
@@ -67,13 +68,13 @@ impl KaijutsuBackend {
         Self { blocks, kernel }
     }
 
-    /// Resolve a VFS path to a document ID and optional block ID.
+    /// Resolve a VFS path to a ContextId and optional block ID.
     ///
     /// Path formats:
     /// - `/docs` → (None, None) - docs root
-    /// - `/docs/{doc_id}` → (Some(doc_id), None) - document directory
-    /// - `/docs/{doc_id}/{block_key}` → (Some(doc_id), Some(block_id))
-    /// - `/docs/{doc_id}/_meta` → document metadata (special case)
+    /// - `/docs/{ctx_hex}` → (Some(ctx_id), None) - document directory
+    /// - `/docs/{ctx_hex}/{block_key}` → (Some(ctx_id), Some(block_id))
+    /// - `/docs/{ctx_hex}/_meta` → document metadata (special case)
     fn resolve_path(&self, path: &Path) -> PathResolution {
         let path_str = path.to_string_lossy();
         let components: Vec<&str> = path_str
@@ -85,13 +86,28 @@ impl KaijutsuBackend {
         match components.as_slice() {
             [] => PathResolution::Root,
             ["docs"] => PathResolution::DocsRoot,
-            ["docs", doc_id] => PathResolution::Document(doc_id.to_string()),
-            ["docs", doc_id, "_meta"] => PathResolution::DocumentMeta(doc_id.to_string()),
-            ["docs", doc_id, block_key] => {
-                if let Some(block_id) = BlockId::from_key(block_key) {
-                    PathResolution::Block(doc_id.to_string(), block_id)
-                } else {
-                    PathResolution::Invalid(format!("invalid block key: {}", block_key))
+            ["docs", ctx_hex] => {
+                match ContextId::parse(ctx_hex) {
+                    Ok(ctx_id) => PathResolution::Document(ctx_id),
+                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
+                }
+            }
+            ["docs", ctx_hex, "_meta"] => {
+                match ContextId::parse(ctx_hex) {
+                    Ok(ctx_id) => PathResolution::DocumentMeta(ctx_id),
+                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
+                }
+            }
+            ["docs", ctx_hex, block_key] => {
+                match ContextId::parse(ctx_hex) {
+                    Ok(ctx_id) => {
+                        if let Some(block_id) = BlockId::from_key(block_key) {
+                            PathResolution::Block(ctx_id, block_id)
+                        } else {
+                            PathResolution::Invalid(format!("invalid block key: {}", block_key))
+                        }
+                    }
+                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
                 }
             }
             _ => PathResolution::Invalid(format!("unsupported path: {}", path_str)),
@@ -176,12 +192,12 @@ enum PathResolution {
     Root,
     /// Documents root (`/docs`)
     DocsRoot,
-    /// A specific document (`/docs/{doc_id}`)
-    Document(String),
-    /// Document metadata (`/docs/{doc_id}/_meta`)
-    DocumentMeta(String),
-    /// A specific block (`/docs/{doc_id}/{block_key}`)
-    Block(String, BlockId),
+    /// A specific document (`/docs/{ctx_hex}`)
+    Document(ContextId),
+    /// Document metadata (`/docs/{ctx_hex}/_meta`)
+    DocumentMeta(ContextId),
+    /// A specific block (`/docs/{ctx_hex}/{block_key}`)
+    Block(ContextId, BlockId),
     /// Invalid or unsupported path
     Invalid(String),
 }
@@ -200,26 +216,26 @@ impl KernelBackend for KaijutsuBackend {
             }
             PathResolution::DocsRoot => {
                 // List all documents
-                let doc_ids = self.blocks.list_ids();
-                let listing = doc_ids.join("\n") + "\n";
+                let ctx_ids = self.blocks.list_ids();
+                let listing: String = ctx_ids.iter().map(|id| format!("{}\n", id.to_hex())).collect();
                 Ok(listing.into_bytes())
             }
-            PathResolution::Document(doc_id) => {
+            PathResolution::Document(ctx_id) => {
                 // List blocks in document
-                let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                    BackendError::NotFound(format!("document not found: {}", doc_id))
+                let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                    BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
                 let blocks = entry.doc.blocks_ordered();
                 let listing: Vec<String> = blocks.iter().map(|b| b.id.to_key()).collect();
                 Ok((listing.join("\n") + "\n").into_bytes())
             }
-            PathResolution::DocumentMeta(doc_id) => {
+            PathResolution::DocumentMeta(ctx_id) => {
                 // Return document metadata as JSON
-                let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                    BackendError::NotFound(format!("document not found: {}", doc_id))
+                let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                    BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
                 let meta = serde_json::json!({
-                    "id": doc_id,
+                    "id": ctx_id.to_hex(),
                     "kind": format!("{:?}", entry.kind),
                     "language": entry.language,
                     "version": entry.version(),
@@ -228,10 +244,10 @@ impl KernelBackend for KaijutsuBackend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(json.into_bytes())
             }
-            PathResolution::Block(doc_id, block_id) => {
+            PathResolution::Block(ctx_id, block_id) => {
                 // Read block content
-                let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                    BackendError::NotFound(format!("document not found: {}", doc_id))
+                let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                    BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
 
                 // Find the block and get its content
@@ -260,48 +276,47 @@ impl KernelBackend for KaijutsuBackend {
             std::str::from_utf8(content).map_err(|e| BackendError::Io(e.to_string()))?;
 
         match self.resolve_path(path) {
-            PathResolution::Document(doc_id) => {
+            PathResolution::Document(ctx_id) => {
                 // Create document if CreateNew or Overwrite
                 match mode {
                     WriteMode::CreateNew => {
-                        if self.blocks.contains(&doc_id) {
-                            return Err(BackendError::AlreadyExists(doc_id));
+                        if self.blocks.contains(ctx_id) {
+                            return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                         }
                         self.blocks
-                            .create_document(doc_id.clone(), DocumentKind::Code, None)
+                            .create_document(ctx_id, DocumentKind::Code, None)
                             .map_err(|e| BackendError::Io(e))?;
                     }
                     WriteMode::UpdateOnly => {
-                        if !self.blocks.contains(&doc_id) {
-                            return Err(BackendError::NotFound(doc_id));
+                        if !self.blocks.contains(ctx_id) {
+                            return Err(BackendError::NotFound(ctx_id.to_hex()));
                         }
                     }
                     WriteMode::Overwrite | WriteMode::Truncate => {
-                        if !self.blocks.contains(&doc_id) {
+                        if !self.blocks.contains(ctx_id) {
                             self.blocks
-                                .create_document(doc_id.clone(), DocumentKind::Code, None)
+                                .create_document(ctx_id, DocumentKind::Code, None)
                                 .map_err(|e| BackendError::Io(e))?;
                         }
-                        // For truncate/overwrite, we'd need to clear existing blocks
-                        // For now, just ensure the document exists
                     }
                 }
+                let _ = content_str; // content unused for document-level writes
                 Ok(())
             }
-            PathResolution::Block(doc_id, block_id) => {
+            PathResolution::Block(ctx_id, block_id) => {
                 // Write to block content
-                if !self.blocks.contains(&doc_id) {
+                if !self.blocks.contains(ctx_id) {
                     return Err(BackendError::NotFound(format!(
                         "document not found: {}",
-                        doc_id
+                        ctx_id.to_hex()
                     )));
                 }
 
                 // For blocks, we need to replace the content
                 // First get current content length, then edit
                 let current_len = {
-                    let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                        BackendError::NotFound(format!("document not found: {}", doc_id))
+                    let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                        BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                     })?;
                     let blocks = entry.doc.blocks_ordered();
                     blocks
@@ -315,7 +330,7 @@ impl KernelBackend for KaijutsuBackend {
 
                 // Delete all content then insert new content
                 self.blocks
-                    .edit_text(&doc_id, &block_id, 0, content_str, current_len)
+                    .edit_text(ctx_id, &block_id, 0, content_str, current_len)
                     .map_err(|e| BackendError::Io(e))?;
 
                 Ok(())
@@ -335,9 +350,9 @@ impl KernelBackend for KaijutsuBackend {
             std::str::from_utf8(content).map_err(|e| BackendError::Io(e.to_string()))?;
 
         match self.resolve_path(path) {
-            PathResolution::Block(doc_id, block_id) => {
+            PathResolution::Block(ctx_id, block_id) => {
                 self.blocks
-                    .append_text(&doc_id, &block_id, content_str)
+                    .append_text(ctx_id, &block_id, content_str)
                     .map_err(|e| BackendError::Io(e))?;
                 Ok(())
             }
@@ -353,11 +368,11 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
         match self.resolve_path(path) {
-            PathResolution::Block(doc_id, block_id) => {
+            PathResolution::Block(ctx_id, block_id) => {
                 // Get current content for offset calculations
                 let content = {
-                    let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                        BackendError::NotFound(format!("document not found: {}", doc_id))
+                    let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                        BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                     })?;
                     let blocks = entry.doc.blocks_ordered();
                     blocks
@@ -370,10 +385,9 @@ impl KernelBackend for KaijutsuBackend {
                 };
 
                 // Apply patch operations in order
-                // Note: We apply each op sequentially, adjusting for prior changes
                 let mut current_content = content;
                 for op in ops {
-                    current_content = apply_patch_op(&self.blocks, &doc_id, &block_id, op, &current_content)?;
+                    current_content = apply_patch_op(&self.blocks, ctx_id, &block_id, op, &current_content)?;
                 }
 
                 Ok(())
@@ -402,13 +416,13 @@ impl KernelBackend for KaijutsuBackend {
                     .blocks
                     .list_ids()
                     .into_iter()
-                    .map(|id| EntryInfo::directory(id))
+                    .map(|id| EntryInfo::directory(id.to_hex()))
                     .collect();
                 Ok(entries)
             }
-            PathResolution::Document(doc_id) => {
-                let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                    BackendError::NotFound(format!("document not found: {}", doc_id))
+            PathResolution::Document(ctx_id) => {
+                let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                    BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
                 let blocks = entry.doc.blocks_ordered();
                 let mut entries: Vec<EntryInfo> = blocks
@@ -430,23 +444,23 @@ impl KernelBackend for KaijutsuBackend {
         match self.resolve_path(path) {
             PathResolution::Root => Ok(EntryInfo::directory("/")),
             PathResolution::DocsRoot => Ok(EntryInfo::directory("docs")),
-            PathResolution::Document(doc_id) => {
-                if self.blocks.contains(&doc_id) {
-                    Ok(EntryInfo::directory(&doc_id))
+            PathResolution::Document(ctx_id) => {
+                if self.blocks.contains(ctx_id) {
+                    Ok(EntryInfo::directory(ctx_id.to_hex()))
                 } else {
-                    Err(BackendError::NotFound(doc_id))
+                    Err(BackendError::NotFound(ctx_id.to_hex()))
                 }
             }
-            PathResolution::DocumentMeta(doc_id) => {
-                if self.blocks.contains(&doc_id) {
+            PathResolution::DocumentMeta(ctx_id) => {
+                if self.blocks.contains(ctx_id) {
                     Ok(EntryInfo::file("_meta", 0))
                 } else {
-                    Err(BackendError::NotFound(doc_id))
+                    Err(BackendError::NotFound(ctx_id.to_hex()))
                 }
             }
-            PathResolution::Block(doc_id, block_id) => {
-                let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                    BackendError::NotFound(format!("document not found: {}", doc_id))
+            PathResolution::Block(ctx_id, block_id) => {
+                let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                    BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
                 let blocks = entry.doc.blocks_ordered();
                 let block = blocks.iter().find(|b| b.id == block_id).ok_or_else(|| {
@@ -460,12 +474,12 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {
         match self.resolve_path(path) {
-            PathResolution::Document(doc_id) => {
-                if self.blocks.contains(&doc_id) {
-                    return Err(BackendError::AlreadyExists(doc_id));
+            PathResolution::Document(ctx_id) => {
+                if self.blocks.contains(ctx_id) {
+                    return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                 }
                 self.blocks
-                    .create_document(doc_id, DocumentKind::Code, None)
+                    .create_document(ctx_id, DocumentKind::Code, None)
                     .map_err(|e| BackendError::Io(e))?;
                 Ok(())
             }
@@ -481,14 +495,14 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn remove(&self, path: &Path, recursive: bool) -> BackendResult<()> {
         match self.resolve_path(path) {
-            PathResolution::Document(doc_id) => {
-                if !self.blocks.contains(&doc_id) {
-                    return Err(BackendError::NotFound(doc_id));
+            PathResolution::Document(ctx_id) => {
+                if !self.blocks.contains(ctx_id) {
+                    return Err(BackendError::NotFound(ctx_id.to_hex()));
                 }
                 // Check if document has blocks and recursive is false
                 if !recursive {
-                    let entry = self.blocks.get(&doc_id).ok_or_else(|| {
-                        BackendError::NotFound(format!("document not found: {}", doc_id))
+                    let entry = self.blocks.get(ctx_id).ok_or_else(|| {
+                        BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                     })?;
                     if !entry.doc.blocks_ordered().is_empty() {
                         return Err(BackendError::InvalidOperation(
@@ -497,13 +511,13 @@ impl KernelBackend for KaijutsuBackend {
                     }
                 }
                 self.blocks
-                    .delete_document(&doc_id)
+                    .delete_document(ctx_id)
                     .map_err(|e| BackendError::Io(e))?;
                 Ok(())
             }
-            PathResolution::Block(doc_id, block_id) => {
+            PathResolution::Block(ctx_id, block_id) => {
                 self.blocks
-                    .delete_block(&doc_id, &block_id)
+                    .delete_block(ctx_id, &block_id)
                     .map_err(|e| BackendError::Io(e))?;
                 Ok(())
             }
@@ -520,10 +534,10 @@ impl KernelBackend for KaijutsuBackend {
     async fn exists(&self, path: &Path) -> bool {
         match self.resolve_path(path) {
             PathResolution::Root | PathResolution::DocsRoot => true,
-            PathResolution::Document(doc_id) => self.blocks.contains(&doc_id),
-            PathResolution::DocumentMeta(doc_id) => self.blocks.contains(&doc_id),
-            PathResolution::Block(doc_id, block_id) => {
-                if let Some(entry) = self.blocks.get(&doc_id) {
+            PathResolution::Document(ctx_id) => self.blocks.contains(ctx_id),
+            PathResolution::DocumentMeta(ctx_id) => self.blocks.contains(ctx_id),
+            PathResolution::Block(ctx_id, block_id) => {
+                if let Some(entry) = self.blocks.get(ctx_id) {
                     entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
                 } else {
                     false
@@ -534,13 +548,10 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> BackendResult<()> {
-        // For blocks: rename is conceptually a copy + delete
-        // For now, return InvalidOperation since block IDs are immutable
         match (self.resolve_path(from), self.resolve_path(to)) {
-            (PathResolution::Block(from_doc, _from_id), PathResolution::Block(to_doc, _to_id))
-                if from_doc == to_doc =>
+            (PathResolution::Block(from_ctx, _from_id), PathResolution::Block(to_ctx, _to_id))
+                if from_ctx == to_ctx =>
             {
-                // Same document: could implement as copy content + delete old block
                 Err(BackendError::InvalidOperation(
                     "block rename not supported - use block_create + block_delete".into(),
                 ))
@@ -552,7 +563,6 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     async fn read_link(&self, _path: &Path) -> BackendResult<std::path::PathBuf> {
-        // CRDT blocks don't have symlinks
         Err(BackendError::InvalidOperation(
             "symlinks not supported in CRDT blocks".into(),
         ))
@@ -565,7 +575,6 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     fn resolve_real_path(&self, _path: &Path) -> Option<std::path::PathBuf> {
-        // CRDT blocks have no filesystem path
         None
     }
 
@@ -579,19 +588,16 @@ impl KernelBackend for KaijutsuBackend {
         args: ToolArgs,
         _ctx: &mut ExecContext,
     ) -> BackendResult<ToolResult> {
-        // Convert ToolArgs to JSON for the execution engine
         let params_json = tool_args_to_json(&args);
         let params_str = serde_json::to_string(&params_json)
             .map_err(|e| BackendError::Io(e.to_string()))?;
 
-        // Look up the engine from the kaijutsu kernel's tool registry
         let engine = self
             .kernel
             .get_engine(name)
             .await
             .ok_or_else(|| BackendError::ToolNotFound(name.to_string()))?;
 
-        // Execute the tool
         let result = engine
             .execute(&params_str)
             .await
@@ -642,7 +648,6 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     fn mounts(&self) -> Vec<MountInfo> {
-        // Report the docs namespace as a single mount
         vec![MountInfo {
             path: std::path::PathBuf::from("/docs"),
             read_only: false,
@@ -656,7 +661,6 @@ impl KernelBackend for KaijutsuBackend {
 
 /// Apply a read range to content, returning the subset.
 fn apply_read_range(content: &str, range: ReadRange) -> String {
-    // Handle line-based ranges
     if range.start_line.is_some() || range.end_line.is_some() {
         let lines: Vec<&str> = content.lines().collect();
         let start = range.start_line.unwrap_or(1).saturating_sub(1);
@@ -667,7 +671,6 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
             .unwrap_or_default();
     }
 
-    // Handle byte-based ranges
     if range.offset.is_some() || range.limit.is_some() {
         let offset = range.offset.unwrap_or(0) as usize;
         let limit = range.limit.unwrap_or(content.len() as u64) as usize;
@@ -681,7 +684,7 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
 /// Apply a single patch operation to a block.
 fn apply_patch_op(
     blocks: &SharedBlockStore,
-    doc_id: &str,
+    ctx_id: ContextId,
     block_id: &BlockId,
     op: &PatchOp,
     current_content: &str,
@@ -689,15 +692,13 @@ fn apply_patch_op(
     match op {
         PatchOp::Insert { offset, content } => {
             blocks
-                .edit_text(doc_id, block_id, *offset, content, 0)
+                .edit_text(ctx_id, block_id, *offset, content, 0)
                 .map_err(|e| BackendError::Io(e))?;
-            // Reconstruct content after edit
             let mut result = current_content.to_string();
             result.insert_str(*offset, content);
             Ok(result)
         }
         PatchOp::Delete { offset, len, expected } => {
-            // CAS check if expected is provided
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
@@ -709,14 +710,13 @@ fn apply_patch_op(
                 }
             }
             blocks
-                .edit_text(doc_id, block_id, *offset, "", *len)
+                .edit_text(ctx_id, block_id, *offset, "", *len)
                 .map_err(|e| BackendError::Io(e))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, "");
             Ok(result)
         }
         PatchOp::Replace { offset, len, content, expected } => {
-            // CAS check if expected is provided
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
@@ -728,7 +728,7 @@ fn apply_patch_op(
                 }
             }
             blocks
-                .edit_text(doc_id, block_id, *offset, content, *len)
+                .edit_text(ctx_id, block_id, *offset, content, *len)
                 .map_err(|e| BackendError::Io(e))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, content);
@@ -737,7 +737,7 @@ fn apply_patch_op(
         PatchOp::InsertLine { line, content } => {
             let line_offset = line_to_byte_offset(current_content, *line);
             blocks
-                .edit_text(doc_id, block_id, line_offset, &format!("{}\n", content), 0)
+                .edit_text(ctx_id, block_id, line_offset, &format!("{}\n", content), 0)
                 .map_err(|e| BackendError::Io(e))?;
             let mut result = current_content.to_string();
             result.insert_str(line_offset, &format!("{}\n", content));
@@ -747,7 +747,6 @@ fn apply_patch_op(
             let (start, end) = line_range(current_content, *line);
             let actual_line = current_content.get(start..end).unwrap_or("");
 
-            // CAS check
             if let Some(exp) = expected {
                 if actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n') {
                     return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
@@ -759,7 +758,7 @@ fn apply_patch_op(
             }
 
             blocks
-                .edit_text(doc_id, block_id, start, "", end - start)
+                .edit_text(ctx_id, block_id, start, "", end - start)
                 .map_err(|e| BackendError::Io(e))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, "");
@@ -769,7 +768,6 @@ fn apply_patch_op(
             let (start, end) = line_range(current_content, *line);
             let actual_line = current_content.get(start..end).unwrap_or("");
 
-            // CAS check
             if let Some(exp) = expected {
                 if actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n') {
                     return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
@@ -782,7 +780,7 @@ fn apply_patch_op(
 
             let replacement = format!("{}\n", content);
             blocks
-                .edit_text(doc_id, block_id, start, &replacement, end - start)
+                .edit_text(ctx_id, block_id, start, &replacement, end - start)
                 .map_err(|e| BackendError::Io(e))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, &replacement);
@@ -790,7 +788,7 @@ fn apply_patch_op(
         }
         PatchOp::Append { content } => {
             blocks
-                .append_text(doc_id, block_id, content)
+                .append_text(ctx_id, block_id, content)
                 .map_err(|e| BackendError::Io(e))?;
             Ok(format!("{}{}", current_content, content))
         }
@@ -836,7 +834,6 @@ fn line_range(content: &str, line: usize) -> (usize, usize) {
 fn tool_args_to_json(args: &ToolArgs) -> JsonValue {
     let mut obj = serde_json::Map::new();
 
-    // Add positional args as "_positional"
     if !args.positional.is_empty() {
         let positional: Vec<JsonValue> = args
             .positional
@@ -846,12 +843,10 @@ fn tool_args_to_json(args: &ToolArgs) -> JsonValue {
         obj.insert("_positional".to_string(), JsonValue::Array(positional));
     }
 
-    // Add named args
     for (key, value) in &args.named {
         obj.insert(key.clone(), kaish_value_to_json(value));
     }
 
-    // Add flags as booleans
     for flag in &args.flags {
         obj.insert(flag.clone(), JsonValue::Bool(true));
     }
@@ -870,9 +865,7 @@ pub fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
             .unwrap_or(JsonValue::Null),
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::Null => JsonValue::Null,
-        // Pass through Json values directly
         Value::Json(json) => json.clone(),
-        // Serialize Blob references as JSON object
         Value::Blob(blob_ref) => serde_json::json!({
             "_type": "blob",
             "id": blob_ref.id,
@@ -904,10 +897,11 @@ fn json_to_kaish_value(json: JsonValue) -> kaish_kernel::ast::Value {
 mod tests {
     use super::*;
     use kaijutsu_kernel::block_store::shared_block_store;
+    use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
     async fn test_path_resolution() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test").await);
         let backend = KaijutsuBackend::new(blocks, kernel);
 
@@ -921,16 +915,19 @@ mod tests {
             PathResolution::DocsRoot
         ));
 
-        // Test document paths
-        match backend.resolve_path(Path::new("/docs/my-doc")) {
-            PathResolution::Document(id) => assert_eq!(id, "my-doc"),
-            _ => panic!("Expected Document"),
+        // Test document paths with a valid ContextId hex
+        let ctx_id = ContextId::new();
+        let path_str = format!("/docs/{}", ctx_id.to_hex());
+        match backend.resolve_path(Path::new(&path_str)) {
+            PathResolution::Document(id) => assert_eq!(id, ctx_id),
+            other => panic!("Expected Document, got {:?}", other),
         }
 
         // Test meta paths
-        match backend.resolve_path(Path::new("/docs/my-doc/_meta")) {
-            PathResolution::DocumentMeta(id) => assert_eq!(id, "my-doc"),
-            _ => panic!("Expected DocumentMeta"),
+        let meta_path = format!("/docs/{}/_meta", ctx_id.to_hex());
+        match backend.resolve_path(Path::new(&meta_path)) {
+            PathResolution::DocumentMeta(id) => assert_eq!(id, ctx_id),
+            other => panic!("Expected DocumentMeta, got {:?}", other),
         }
     }
 
@@ -956,7 +953,6 @@ mod tests {
     fn test_apply_read_range_lines() {
         let content = "line 1\nline 2\nline 3\nline 4";
 
-        // end_line is inclusive (per kaish ReadRange documentation)
         let range = ReadRange {
             start_line: Some(2),
             end_line: Some(3),

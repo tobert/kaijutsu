@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use kaijutsu_kernel::McpServerPool;
+use kaijutsu_types::Principal;
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
@@ -344,20 +345,12 @@ impl server::Server for Server {
     }
 }
 
-/// Authenticated user identity
-#[derive(Debug, Clone)]
-pub struct Identity {
-    pub nick: String,
-    pub display_name: String,
-    pub is_admin: bool,
-}
-
 /// Handler for a single SSH connection
 struct ConnectionHandler {
     auth_db: Arc<Mutex<AuthDb>>,
     peer_addr: Option<SocketAddr>,
     allow_anonymous: bool,
-    identity: Option<Identity>,
+    identity: Option<Principal>,
     config_dir: Option<PathBuf>,
     /// Shared MCP server pool (pre-initialized at server startup)
     mcp_pool: Arc<McpServerPool>,
@@ -388,15 +381,14 @@ impl ConnectionHandler {
 /// Run Cap'n Proto RPC over an SSH channel stream
 async fn run_rpc(
     stream: russh::ChannelStream<Msg>,
-    identity: Identity,
+    principal: Principal,
     config_dir: Option<PathBuf>,
     mcp_pool: Arc<McpServerPool>,
 ) {
     let stream = stream.compat();
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
-    // Use nick as the username for RPC state
-    let mut server_state = ServerState::new(identity.nick.clone(), config_dir);
+    let mut server_state = ServerState::new(principal.clone(), config_dir);
     server_state.mcp_pool = mcp_pool;
     let state = Rc::new(RefCell::new(server_state));
     let world = WorldImpl::new(state);
@@ -412,13 +404,13 @@ async fn run_rpc(
 
     log::info!(
         "RPC session started for {} ({})",
-        identity.nick,
-        identity.display_name
+        principal.username,
+        principal.display_name
     );
     if let Err(e) = rpc_system.await {
-        log::error!("RPC system error for {}: {}", identity.nick, e);
+        log::error!("RPC system error for {}: {}", principal.username, e);
     }
-    log::info!("RPC session ended for {}", identity.nick);
+    log::info!("RPC session ended for {}", principal.username);
 }
 
 /// Sanitize a username for use in anonymous mode.
@@ -440,7 +432,7 @@ impl server::Handler for ConnectionHandler {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let identity = match &self.identity {
+        let principal = match &self.identity {
             Some(id) => id.clone(),
             None => {
                 log::warn!("Channel open without authentication");
@@ -455,8 +447,8 @@ impl server::Handler for ConnectionHandler {
             "Channel {} (index {}) opened for {} ({})",
             channel.id(),
             channel_index,
-            identity.nick,
-            identity.display_name
+            principal.username,
+            principal.display_name
         );
 
         // Only channel 1 (RPC) gets a handler thread. Channels 0 (control)
@@ -484,7 +476,7 @@ impl server::Handler for ConnectionHandler {
                 .expect("Failed to create tokio runtime for RPC");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                run_rpc(stream, identity, config_dir, mcp_pool).await;
+                run_rpc(stream, principal, config_dir, mcp_pool).await;
             });
         });
 
@@ -525,7 +517,7 @@ impl server::Handler for ConnectionHandler {
         })?;
 
         match auth_result {
-            Ok(Some(db_user)) => {
+            Ok(Some(principal)) => {
                 // Update last_used timestamp (fire and forget, non-blocking)
                 let db = self.auth_db.clone();
                 let fp = fingerprint.clone();
@@ -537,17 +529,13 @@ impl server::Handler for ConnectionHandler {
 
                 log::info!(
                     "Auth accepted: {} ({}) from {} [{}]",
-                    db_user.nick,
-                    db_user.display_name,
+                    principal.username,
+                    principal.display_name,
                     peer,
                     fingerprint
                 );
 
-                self.identity = Some(Identity {
-                    nick: db_user.nick,
-                    display_name: db_user.display_name,
-                    is_admin: db_user.is_admin,
-                });
+                self.identity = Some(principal);
 
                 Ok(Auth::Accept)
             }
@@ -585,7 +573,7 @@ impl server::Handler for ConnectionHandler {
                                 std::io::Error::other(format!("Failed to parse key: {}", e))
                             )))?;
                         let mut db = db.lock();
-                        db.add_key_auto_user(&key, Some(&safe_user_clone), Some(&safe_user_clone), false)
+                        db.add_key_auto_principal(&key, Some(&safe_user_clone), Some(&safe_user_clone))
                     })
                     .await
                     .map_err(|e| {
@@ -594,26 +582,22 @@ impl server::Handler for ConnectionHandler {
                     })?;
 
                     match result {
-                        Ok((user_id, _key_id)) => {
+                        Ok((principal_id, _fingerprint)) => {
                             let db = self.auth_db.clone();
-                            let user_result = tokio::task::spawn_blocking(move || {
-                                db.lock().get_user(user_id)
+                            let principal_result = tokio::task::spawn_blocking(move || {
+                                db.lock().get_principal(principal_id)
                             })
                             .await
                             .map_err(|_| russh::Error::Disconnect)?;
 
-                            if let Ok(Some(db_user)) = user_result {
-                                self.identity = Some(Identity {
-                                    nick: db_user.nick.clone(),
-                                    display_name: db_user.display_name.clone(),
-                                    is_admin: db_user.is_admin,
-                                });
+                            if let Ok(Some(principal)) = principal_result {
                                 log::info!(
                                     "Auth accepted (anonymous): {} from {} [{}]",
-                                    db_user.nick,
+                                    principal.username,
                                     peer,
                                     fingerprint
                                 );
+                                self.identity = Some(principal);
                                 return Ok(Auth::Accept);
                             }
                         }
