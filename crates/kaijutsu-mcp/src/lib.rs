@@ -210,6 +210,9 @@ impl KaijutsuMcp {
     }
 
     /// Create a new MCP server with an in-memory store.
+    // TODO: consider per-session or per-system (mcp, app, etc.) PrincipalId
+    // instead of system() — multiple clients sharing a context could collide
+    // on BlockId sequences.
     pub fn new() -> Self {
         Self::with_store(shared_block_store(PrincipalId::system()))
     }
@@ -485,7 +488,7 @@ impl KaijutsuMcp {
 
         let context_id = match ContextId::parse(&req.id) {
             Ok(id) => id,
-            Err(_) => ContextId::new(), // Generate fresh ID if not a valid UUID
+            Err(e) => return format!("Error: invalid document ID '{}': {}. Must be a hex UUID.", req.id, e),
         };
 
         match self.store().create_document(context_id, kind, req.language) {

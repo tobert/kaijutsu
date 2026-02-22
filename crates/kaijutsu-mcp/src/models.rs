@@ -57,8 +57,8 @@ pub struct BlockCreateRequest {
 /// Read block content.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockReadRequest {
-    /// Block ID to read (format: document_id/agent_id/seq)
-    #[schemars(description = "Block ID to read (format: document_id/agent_id/seq)")]
+    /// Block ID to read (format: context_id:agent_id:seq)
+    #[schemars(description = "Block ID to read (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Include line numbers in output
     #[schemars(description = "Include line numbers in output (default: true)")]
@@ -77,7 +77,7 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockAppendRequest {
     /// Block ID to append to
-    #[schemars(description = "Block ID to append to (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to append to (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Text to append
     #[schemars(description = "Text to append")]
@@ -121,7 +121,7 @@ pub enum EditOp {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockEditRequest {
     /// Block ID to edit
-    #[schemars(description = "Block ID to edit (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to edit (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Edit operations to apply atomically
     #[schemars(description = "Edit operations to apply atomically")]
@@ -149,7 +149,7 @@ pub struct BlockListRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockStatusRequest {
     /// Block ID to update
-    #[schemars(description = "Block ID to update (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to update (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// New status: pending, running, done, or error
     #[schemars(description = "New status: pending, running, done, or error")]
@@ -208,7 +208,7 @@ pub struct DocTreeRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockInspectRequest {
     /// Block ID to inspect
-    #[schemars(description = "Block ID to inspect (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to inspect (format: context_id:agent_id:seq)")]
     pub block_id: String,
 }
 
@@ -216,7 +216,7 @@ pub struct BlockInspectRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockHistoryRequest {
     /// Block ID to get history for
-    #[schemars(description = "Block ID to get history for (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to get history for (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Maximum number of versions to show
     #[schemars(description = "Maximum number of versions to show (default: all)")]
@@ -227,7 +227,7 @@ pub struct BlockHistoryRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlockDiffRequest {
     /// Block ID to compare
-    #[schemars(description = "Block ID to compare (format: document_id/agent_id/seq)")]
+    #[schemars(description = "Block ID to compare (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Text to compare against current content
     #[schemars(description = "Original text to diff against (if not provided, shows current content summary)")]

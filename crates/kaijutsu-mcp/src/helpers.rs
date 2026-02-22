@@ -39,30 +39,19 @@ pub fn parse_block_id(s: &str) -> Option<BlockId> {
 // Block Lookup
 // ============================================================================
 
-/// Find a block across all documents, returning (ContextId, BlockId).
+/// Find a block by its key string, returning (ContextId, BlockId).
 ///
-/// Since BlockId contains context_id, we first check that document directly.
-/// Falls back to scanning all documents if the context isn't found.
+/// BlockId contains context_id, so we look up the document directly.
 pub fn find_block(store: &SharedBlockStore, block_id_str: &str) -> Option<(ContextId, BlockId)> {
     let block_id = parse_block_id(block_id_str)?;
-
-    // Fast path: BlockId contains context_id, check directly
     let ctx = block_id.context_id;
-    if let Some(entry) = store.get(ctx)
-        && entry.doc.get_block_snapshot(&block_id).is_some()
-    {
-        return Some((ctx, block_id));
-    }
 
-    // Slow fallback: scan all documents
-    for context_id in store.list_ids() {
-        if let Some(entry) = store.get(context_id)
-            && entry.doc.get_block_snapshot(&block_id).is_some()
-        {
-            return Some((context_id, block_id));
-        }
+    let entry = store.get(ctx)?;
+    if entry.doc.get_block_snapshot(&block_id).is_some() {
+        Some((ctx, block_id))
+    } else {
+        None
     }
-    None
 }
 
 // ============================================================================
