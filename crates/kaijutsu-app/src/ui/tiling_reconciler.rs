@@ -766,15 +766,14 @@ pub fn handle_pane_focus_change(
             }) = tree.root.find(current)
             {
                 if !document_id.is_empty() {
-                    let ctx_id = kaijutsu_types::ContextId::parse(document_id)
-                        .unwrap_or_else(|_| kaijutsu_types::ContextId::new());
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_id: ctx_id,
-                    });
-                    info!(
-                        "Pane focus change: switching context to '{}'",
-                        document_id
-                    );
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(document_id) {
+                        switch_writer.write(crate::cell::ContextSwitchRequested {
+                            context_id: ctx_id,
+                        });
+                        info!("Pane focus change: switching context to '{}'", document_id);
+                    } else {
+                        warn!("Pane focus change: invalid context ID '{}'", document_id);
+                    }
                 }
             }
         }

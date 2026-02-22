@@ -9,6 +9,20 @@ use bevy::prelude::*;
 pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
+/// Session-scoped agent identity for CRDT operations.
+///
+/// Created once at startup, reused for all BlockDocument/SyncedDocument
+/// construction. Without this, each frame or context switch would generate
+/// a fresh PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
+#[derive(Resource)]
+pub struct SessionAgent(pub PrincipalId);
+
+impl Default for SessionAgent {
+    fn default() -> Self {
+        Self(PrincipalId::new())
+    }
+}
+
 /// Unique identifier for a cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect)]
 pub struct CellId(pub String);

@@ -417,13 +417,13 @@ fn handle_node_click(
         if *interaction == Interaction::Pressed {
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
-            let ctx_id = kaijutsu_types::ContextId::parse(&node.context_id)
-                    .unwrap_or_else(|_| kaijutsu_types::ContextId::new());
-            switch_writer.write(crate::cell::ContextSwitchRequested {
-                context_id: ctx_id,
-            });
-            // enforce_constellation_focus_sync handles visibility
-            *focus = crate::input::focus::FocusArea::Compose;
+            if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&node.context_id) {
+                switch_writer.write(crate::cell::ContextSwitchRequested {
+                    context_id: ctx_id,
+                });
+                // enforce_constellation_focus_sync handles visibility
+                *focus = crate::input::focus::FocusArea::Compose;
+            }
         }
     }
 }

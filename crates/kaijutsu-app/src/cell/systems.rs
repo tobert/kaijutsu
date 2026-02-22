@@ -1274,6 +1274,7 @@ pub fn handle_block_events(
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
     mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
+    session_agent: Res<super::components::SessionAgent>,
 ) {
     use kaijutsu_client::ServerEvent;
     use super::components::CachedDocument;
@@ -1281,8 +1282,7 @@ pub fn handle_block_events(
     // Check if we're at the bottom before processing events (for auto-scroll)
     let was_at_bottom = scroll_state.is_at_bottom();
 
-    // Get agent ID for creating documents
-    let agent_id = PrincipalId::new();
+    let agent_id = session_agent.0;
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
@@ -1483,6 +1483,7 @@ pub fn handle_context_switch(
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
+    session_agent: Res<super::components::SessionAgent>,
 ) {
     for event in switch_events.read() {
         let ctx_id = event.context_id;
@@ -1530,7 +1531,7 @@ pub fn handle_context_switch(
 
         // Mirror cached document to DocumentSyncState
         if let Some(cached) = doc_cache.get(ctx_id) {
-            let agent_id = PrincipalId::new();
+            let agent_id = session_agent.0;
 
             // Rebuild DocumentSyncState from cached document's oplog
             let oplog_bytes = cached.synced.doc().oplog_bytes().unwrap_or_default();
