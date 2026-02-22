@@ -257,10 +257,12 @@ impl ConfigCrdtBackend {
         ctx
     }
 
-    /// Block ID for a config file (one block per config file).
-    fn block_id(&self) -> BlockId {
-        // Config blocks use nil context + system principal — they aren't real context blocks
-        BlockId::new(ContextId::nil(), PrincipalId::system(), 0)
+    /// Get the first (and only) block ID from a config document.
+    ///
+    /// Config documents have exactly one block. Returns None if the document
+    /// doesn't exist or has no blocks yet.
+    fn first_block_id(&self, ctx: ContextId) -> Option<BlockId> {
+        self.blocks.get(ctx)?.doc.blocks_ordered().first().map(|b| b.id)
     }
 
     /// Emit a ConfigFlow event.
@@ -362,26 +364,11 @@ impl ConfigCrdtBackend {
                 .map_err(|e| ConfigError::Crdt(e))?;
         }
 
-        let block_id = self.block_id();
-
-        // Check if block exists
-        let block_exists = if let Some(entry) = self.blocks.get(ctx) {
-            entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
-        } else {
-            false
-        };
-
-        if block_exists {
-            // Replace content
-            let current_len = {
-                let entry = self.blocks.get(ctx).unwrap();
-                let blocks = entry.doc.blocks_ordered();
-                blocks
-                    .iter()
-                    .find(|b| b.id == block_id)
-                    .map(|b| b.content.len())
-                    .unwrap_or(0)
-            };
+        if let Some(block_id) = self.first_block_id(ctx) {
+            // Replace content of existing block
+            let current_len = self.blocks.get(ctx)
+                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+                .unwrap_or(0);
 
             self.blocks
                 .edit_text(ctx, &block_id, 0, &content, current_len)
@@ -411,7 +398,6 @@ impl ConfigCrdtBackend {
             .ok_or_else(|| ConfigError::NotFound(format!("no default for {}", path)))?;
 
         let ctx = self.context_id(path);
-        let block_id = self.block_id();
 
         // Get or create document
         if !self.blocks.contains(ctx) {
@@ -420,24 +406,11 @@ impl ConfigCrdtBackend {
                 .map_err(|e| ConfigError::Crdt(e))?;
         }
 
-        // Check if block exists
-        let block_exists = if let Some(entry) = self.blocks.get(ctx) {
-            entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
-        } else {
-            false
-        };
-
-        if block_exists {
-            // Replace content
-            let current_len = {
-                let entry = self.blocks.get(ctx).unwrap();
-                let blocks = entry.doc.blocks_ordered();
-                blocks
-                    .iter()
-                    .find(|b| b.id == block_id)
-                    .map(|b| b.content.len())
-                    .unwrap_or(0)
-            };
+        if let Some(block_id) = self.first_block_id(ctx) {
+            // Replace content of existing block
+            let current_len = self.blocks.get(ctx)
+                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+                .unwrap_or(0);
 
             self.blocks
                 .edit_text(ctx, &block_id, 0, &default_content, current_len)
@@ -703,7 +676,6 @@ impl ConfigCrdtBackend {
     /// Sync an external config file change to CRDT.
     async fn sync_external_change(&self, event: &ConfigFileChange) -> Result<(), ConfigError> {
         let ctx = self.context_id(&event.path);
-        let block_id = self.block_id();
 
         match event.kind {
             ConfigChangeKind::Created | ConfigChangeKind::Modified => {
@@ -722,24 +694,11 @@ impl ConfigCrdtBackend {
                         .map_err(|e| ConfigError::Crdt(e))?;
                 }
 
-                // Check if block exists
-                let block_exists = if let Some(entry) = self.blocks.get(ctx) {
-                    entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
-                } else {
-                    false
-                };
-
-                if block_exists {
-                    // Replace content
-                    let current_len = {
-                        let entry = self.blocks.get(ctx).unwrap();
-                        let blocks = entry.doc.blocks_ordered();
-                        blocks
-                            .iter()
-                            .find(|b| b.id == block_id)
-                            .map(|b| b.content.len())
-                            .unwrap_or(0)
-                    };
+                if let Some(block_id) = self.first_block_id(ctx) {
+                    // Replace content of existing block
+                    let current_len = self.blocks.get(ctx)
+                        .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+                        .unwrap_or(0);
 
                     self.blocks
                         .edit_text(ctx, &block_id, 0, &content, current_len)
