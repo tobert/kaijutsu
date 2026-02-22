@@ -59,8 +59,6 @@ pub struct ContextHandle {
     pub id: ContextId,
     /// Optional human-friendly label (mutable, not an identifier).
     pub label: Option<String>,
-    /// Primary document ID in the shared BlockStore.
-    pub document_id: String,
     /// Working directory in VFS (e.g., "/mnt/kaijutsu").
     pub pwd: Option<String>,
     /// Provider name if configured (e.g., "anthropic", "gemini").
@@ -131,8 +129,6 @@ pub struct DriftRouter {
     next_staged_id: u64,
     /// Reverse lookup: label → ContextId (for prefix matching).
     label_to_id: HashMap<String, ContextId>,
-    /// Reverse lookup: document_id → ContextId (for document-keyed RPCs).
-    doc_to_context: HashMap<String, ContextId>,
 }
 
 impl Default for DriftRouter {
@@ -149,30 +145,26 @@ impl DriftRouter {
             staging: Vec::new(),
             next_staged_id: 1,
             label_to_id: HashMap::new(),
-            doc_to_context: HashMap::new(),
         }
     }
 
     /// Register a context with a pre-assigned ContextId.
     ///
     /// The caller (server RPC) creates the ContextId and passes it in.
-    #[tracing::instrument(skip(self, document_id), name = "drift.register")]
+    #[tracing::instrument(skip(self), name = "drift.register")]
     pub fn register(
         &mut self,
         id: ContextId,
         label: Option<&str>,
-        document_id: &str,
         parent_id: Option<ContextId>,
     ) {
         if let Some(l) = label {
             self.label_to_id.insert(l.to_string(), id);
         }
-        self.doc_to_context.insert(document_id.to_string(), id);
 
         let handle = ContextHandle {
             id,
             label: label.map(|s| s.to_string()),
-            document_id: document_id.to_string(),
             pwd: None,
             provider: None,
             model: None,
@@ -191,7 +183,6 @@ impl DriftRouter {
             if let Some(label) = &handle.label {
                 self.label_to_id.remove(label);
             }
-            self.doc_to_context.remove(&handle.document_id);
         }
     }
 
@@ -278,15 +269,9 @@ impl DriftRouter {
         contexts
     }
 
-    /// Look up the ContextId for a document ID.
-    pub fn context_for_document(&self, document_id: &str) -> Option<ContextId> {
-        self.doc_to_context.get(document_id).copied()
-    }
-
-    /// Look up the trace_id for a document ID (convenience for document-keyed RPCs).
-    pub fn trace_id_for_document(&self, document_id: &str) -> Option<[u8; 16]> {
-        let ctx_id = self.doc_to_context.get(document_id)?;
-        self.contexts.get(ctx_id).map(|h| h.trace_id)
+    /// Look up the trace_id for a context.
+    pub fn trace_id_for_context(&self, id: ContextId) -> Option<[u8; 16]> {
+        self.contexts.get(&id).map(|h| h.trace_id)
     }
 
     /// Stage a drift operation for later flush.
@@ -605,8 +590,8 @@ impl ExecutionEngine for DriftLsEngine {
                 .map(|p| format!(" [parent: {}]", p.short()))
                 .unwrap_or_default();
             output.push_str(&format!(
-                "{}{} {} [doc: {}]{}{}\n",
-                marker, ctx.id.short(), display, ctx.document_id, provider_info, parent_info,
+                "{}{} {}{}{}\n",
+                marker, ctx.id.short(), display, provider_info, parent_info,
             ));
         }
 
@@ -1105,11 +1090,10 @@ mod tests {
     fn test_register_and_lookup() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("main-session"), "doc-abc", None);
+        router.register(id, Some("main-session"), None);
 
         let handle = router.get(id).unwrap();
         assert_eq!(handle.label.as_deref(), Some("main-session"));
-        assert_eq!(handle.document_id, "doc-abc");
         assert!(handle.parent_id.is_none());
     }
 
@@ -1118,8 +1102,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let parent_id = ContextId::new();
         let child_id = ContextId::new();
-        router.register(parent_id, Some("main"), "doc-1", None);
-        router.register(child_id, Some("fork-debug"), "doc-2", Some(parent_id));
+        router.register(parent_id, Some("main"), None);
+        router.register(child_id, Some("fork-debug"), Some(parent_id));
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.parent_id, Some(parent_id));
@@ -1129,7 +1113,7 @@ mod tests {
     fn test_resolve_by_label() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("test-ctx"), "doc-42", None);
+        router.register(id, Some("test-ctx"), None);
         assert_eq!(router.resolve_context("test-ctx").unwrap(), id);
     }
 
@@ -1137,9 +1121,9 @@ mod tests {
     fn test_resolve_by_label_prefix() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("test-ctx"), "doc-42", None);
+        router.register(id, Some("test-ctx"), None);
         let other_id = ContextId::new();
-        router.register(other_id, Some("debug"), "doc-43", None);
+        router.register(other_id, Some("debug"), None);
         assert_eq!(router.resolve_context("test").unwrap(), id);
     }
 
@@ -1147,7 +1131,7 @@ mod tests {
     fn test_resolve_by_hex_prefix() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, None, "doc-42", None);
+        router.register(id, None, None);
         let hex_prefix = &id.to_hex()[..8];
         // Should match by hex prefix
         let result = router.resolve_context(hex_prefix);
@@ -1162,7 +1146,7 @@ mod tests {
     fn test_resolve_unknown() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("main"), "doc-1", None);
+        router.register(id, Some("main"), None);
         assert!(router.resolve_context("nonexistent").is_err());
     }
 
@@ -1170,7 +1154,7 @@ mod tests {
     fn test_configure_llm() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("test"), "doc-1", None);
+        router.register(id, Some("test"), None);
 
         router
             .configure_llm(id, "gemini", "gemini-2.0-flash")
@@ -1193,8 +1177,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let tgt = ContextId::new();
-        router.register(src, Some("source"), "doc-1", None);
-        router.register(tgt, Some("target"), "doc-2", None);
+        router.register(src, Some("source"), None);
+        router.register(tgt, Some("target"), None);
 
         let id = router
             .stage(src, tgt, "hello from source".into(), None, DriftKind::Push)
@@ -1209,7 +1193,7 @@ mod tests {
     fn test_stage_unknown_target() {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
-        router.register(src, Some("source"), "doc-1", None);
+        router.register(src, Some("source"), None);
 
         let result = router.stage(src, ContextId::new(), "nope".into(), None, DriftKind::Push);
         assert!(result.is_err());
@@ -1220,8 +1204,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let tgt = ContextId::new();
-        router.register(src, Some("src"), "doc-1", None);
-        router.register(tgt, Some("tgt"), "doc-2", None);
+        router.register(src, Some("src"), None);
+        router.register(tgt, Some("tgt"), None);
 
         let id1 = router
             .stage(src, tgt, "one".into(), None, DriftKind::Push)
@@ -1241,8 +1225,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let tgt = ContextId::new();
-        router.register(src, Some("src"), "doc-1", None);
-        router.register(tgt, Some("tgt"), "doc-2", None);
+        router.register(src, Some("src"), None);
+        router.register(tgt, Some("tgt"), None);
 
         router
             .stage(src, tgt, "a".into(), None, DriftKind::Push)
@@ -1260,7 +1244,7 @@ mod tests {
     fn test_unregister() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("test"), "doc-1", None);
+        router.register(id, Some("test"), None);
 
         assert!(router.get(id).is_some());
         router.unregister(id);
@@ -1274,9 +1258,9 @@ mod tests {
         let a = ContextId::new();
         let b = ContextId::new();
         let c = ContextId::new();
-        router.register(a, Some("alpha"), "doc-1", None);
-        router.register(b, Some("beta"), "doc-2", None);
-        router.register(c, Some("gamma"), "doc-3", None);
+        router.register(a, Some("alpha"), None);
+        router.register(b, Some("beta"), None);
+        router.register(c, Some("gamma"), None);
 
         let list = router.list_contexts();
         assert_eq!(list.len(), 3);
@@ -1291,9 +1275,9 @@ mod tests {
         let a = ContextId::new();
         let b = ContextId::new();
         let c = ContextId::new();
-        router.register(a, Some("alpha"), "doc-1", None);
-        router.register(b, Some("beta"), "doc-2", None);
-        router.register(c, Some("gamma"), "doc-3", None);
+        router.register(a, Some("alpha"), None);
+        router.register(b, Some("beta"), None);
+        router.register(c, Some("gamma"), None);
 
         // Stage: a→b and c→b
         router
@@ -1316,7 +1300,7 @@ mod tests {
     fn test_rename() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("old-name"), "doc-1", None);
+        router.register(id, Some("old-name"), None);
 
         assert!(router.resolve_context("old-name").is_ok());
         router.rename(id, Some("new-name")).unwrap();
@@ -1431,8 +1415,8 @@ mod tests {
         let debug_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            r.register(main_id, Some("main"), "doc-main", None);
-            r.register(debug_id, Some("debug"), "doc-debug", None);
+            r.register(main_id, Some("main"), None);
+            r.register(debug_id, Some("debug"), None);
         }
 
         let engine = DriftLsEngine::new(&kernel, main_id);
@@ -1450,8 +1434,8 @@ mod tests {
         let tgt_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            r.register(src_id, Some("source"), "doc-src", None);
-            r.register(tgt_id, Some("target"), "doc-tgt", None);
+            r.register(src_id, Some("source"), None);
+            r.register(tgt_id, Some("target"), None);
         }
 
         let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
@@ -1499,7 +1483,7 @@ mod tests {
         let parent_id = ContextId::new();
         {
             let mut r = router.write().await;
-            r.register(parent_id, Some("main"), "doc-main", None);
+            r.register(parent_id, Some("main"), None);
         }
 
         // Clone the Arc (simulating what fork/thread does)
@@ -1516,7 +1500,7 @@ mod tests {
         let child_id = ContextId::new();
         {
             let mut r = child_router.write().await;
-            r.register(child_id, Some("debug-fork"), "doc-debug", Some(parent_id));
+            r.register(child_id, Some("debug-fork"), Some(parent_id));
         }
 
         // Parent should see the child's context
@@ -1532,8 +1516,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let tgt = ContextId::new();
-        router.register(src, Some("source"), "doc-src", None);
-        router.register(tgt, Some("target"), "doc-tgt", None);
+        router.register(src, Some("source"), None);
+        router.register(tgt, Some("target"), None);
 
         let staged_id = router
             .stage(src, tgt, "test content".into(), None, DriftKind::Push)
@@ -1561,8 +1545,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let src = ContextId::new();
         let tgt = ContextId::new();
-        router.register(src, Some("source"), "doc-src", None);
-        router.register(tgt, Some("target"), "doc-tgt", None);
+        router.register(src, Some("source"), None);
+        router.register(tgt, Some("target"), None);
 
         let id1 = router
             .stage(src, tgt, "first".into(), None, DriftKind::Push)
@@ -1587,7 +1571,7 @@ mod tests {
     fn test_trace_id_generated() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("traced"), "doc-traced", None);
+        router.register(id, Some("traced"), None);
 
         let handle = router.get(id).unwrap();
         // trace_id should be non-zero (generated from UUIDv4)
@@ -1599,8 +1583,8 @@ mod tests {
         let mut router = DriftRouter::new();
         let a = ContextId::new();
         let b = ContextId::new();
-        router.register(a, Some("alpha"), "doc-a", None);
-        router.register(b, Some("beta"), "doc-b", None);
+        router.register(a, Some("alpha"), None);
+        router.register(b, Some("beta"), None);
 
         let ta = router.get(a).unwrap().trace_id;
         let tb = router.get(b).unwrap().trace_id;
@@ -1608,36 +1592,27 @@ mod tests {
     }
 
     #[test]
-    fn test_doc_to_context_reverse_lookup() {
+    fn test_trace_id_for_context() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("main"), "doc-main", None);
+        router.register(id, Some("test"), None);
 
-        assert_eq!(router.context_for_document("doc-main"), Some(id));
-        assert_eq!(router.context_for_document("doc-nonexistent"), None);
-    }
-
-    #[test]
-    fn test_trace_id_for_document() {
-        let mut router = DriftRouter::new();
-        let id = ContextId::new();
-        router.register(id, Some("test"), "doc-test", None);
-
-        let trace_id = router.trace_id_for_document("doc-test");
+        let trace_id = router.trace_id_for_context(id);
         assert!(trace_id.is_some());
         assert_eq!(trace_id.unwrap(), router.get(id).unwrap().trace_id);
 
-        assert!(router.trace_id_for_document("doc-missing").is_none());
+        assert!(router.trace_id_for_context(ContextId::new()).is_none());
     }
 
     #[test]
-    fn test_unregister_cleans_doc_index() {
+    fn test_unregister_cleans_label_index() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
-        router.register(id, Some("ephemeral"), "doc-eph", None);
-        assert!(router.context_for_document("doc-eph").is_some());
+        router.register(id, Some("ephemeral"), None);
 
+        assert!(router.get(id).is_some());
         router.unregister(id);
-        assert!(router.context_for_document("doc-eph").is_none());
+        assert!(router.get(id).is_none());
+        assert!(router.resolve_context("ephemeral").is_err());
     }
 }

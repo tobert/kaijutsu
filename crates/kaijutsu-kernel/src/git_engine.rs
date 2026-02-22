@@ -627,7 +627,7 @@ mod tests {
         let ctx_id = ContextId::new();
         {
             let mut r = kernel.drift().write().await;
-            r.register(ctx_id, Some("default"), "doc-test", None);
+            r.register(ctx_id, Some("default"), None);
         }
         let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
         let engine = GitEngine::new(&kernel, documents, ctx_id);

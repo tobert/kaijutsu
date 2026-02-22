@@ -32,7 +32,7 @@ impl ExecutionEngine for WhoamiEngine {
     }
 
     fn description(&self) -> &str {
-        "Show current context identity: ID, label, model, parent, document"
+        "Show current context identity: ID, label, model, parent"
     }
 
     fn schema(&self) -> Option<serde_json::Value> {
@@ -53,7 +53,6 @@ impl ExecutionEngine for WhoamiEngine {
             "context_id": self.context_id.to_hex(),
             "context_id_short": self.context_id.short(),
             "label": handle.and_then(|h| h.label.as_deref()),
-            "document_id": handle.map(|h| h.document_id.as_str()),
             "model": handle.and_then(|h| h.model.as_deref()),
             "provider": handle.and_then(|h| h.provider.as_deref()),
             "parent_id": handle.and_then(|h| h.parent_id.map(|p| p.short())),
