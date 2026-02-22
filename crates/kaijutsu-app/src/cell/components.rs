@@ -473,6 +473,9 @@ pub struct BlockEditCursor {
     pub offset: usize,
     /// Selection anchor (byte offset). When Some, selection spans anchor..offset.
     pub selection_anchor: Option<usize>,
+    /// CRDT frontier captured when editing started.
+    /// Used to extract ops_since() for push to server on exit.
+    pub edit_frontier: Option<kaijutsu_crdt::Frontier>,
 }
 
 /// Resource tracking CRDT sync state and owning the authoritative BlockDocument.

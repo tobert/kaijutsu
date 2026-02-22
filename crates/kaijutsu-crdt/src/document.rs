@@ -1163,6 +1163,16 @@ impl BlockDocument {
         self.doc.ops_since_owned(frontier)
     }
 
+    /// Get operations since a frontier as postcard-serialized bytes.
+    ///
+    /// Convenience wrapper so callers don't need a direct postcard dependency.
+    /// Mirrors the `oplog_bytes()` pattern.
+    pub fn ops_since_bytes(&self, frontier: &Frontier) -> Result<Vec<u8>> {
+        let ops = self.ops_since(frontier);
+        postcard::to_stdvec(&ops)
+            .map_err(|e| CrdtError::Serialization(e.to_string()))
+    }
+
     /// Merge remote operations.
     ///
     /// Use `ops_since()` to get operations, and pass them directly here.

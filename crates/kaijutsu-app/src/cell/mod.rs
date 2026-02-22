@@ -27,7 +27,7 @@ mod systems;
 pub use components::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
     CellState, ComposeBlock, ComposeError, ContextSwitchRequested, ConversationContainer,
-    ConversationScrollState, DocumentCache, EditingBlockCell,
+    ConversationScrollState, DocumentCache, DocumentSyncState, EditingBlockCell,
     FocusTarget, FocusedBlockCell, MainCell, PromptSubmitted, SubmitFailed,
     ViewingConversation,
 };

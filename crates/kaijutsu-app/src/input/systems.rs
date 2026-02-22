@@ -95,7 +95,11 @@ pub fn handle_unfocus(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut view_stack: ResMut<ViewStack>,
-    editing_cells: Query<Entity, With<EditingBlockCell>>,
+    editing_cells: Query<(Entity, &BlockEditCursor), With<EditingBlockCell>>,
+    entities: Res<EditorEntities>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    mut sync_state: ResMut<crate::cell::DocumentSyncState>,
+    actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Unfocus) {
@@ -117,8 +121,47 @@ pub fn handle_unfocus(
         // 3. Normal focus transitions
         match focus.as_ref() {
             FocusArea::EditingBlock => {
+                // Extract ops and push to server before cleanup
+                if let Some(main_ent) = entities.main_cell {
+                    if let Ok(editor) = main_cells.get(main_ent) {
+                        for (_, cursor) in editing_cells.iter() {
+                            if let Some(ref frontier) = cursor.edit_frontier {
+                                // 1. Merge local ops into DocumentSyncState so the
+                                //    full-replace path doesn't lose them this frame
+                                if let Some(ref mut sync_doc) = sync_state.doc {
+                                    let local_ops = editor.doc.ops_since(&sync_doc.frontier());
+                                    if let Err(e) = sync_doc.merge_ops_owned(local_ops) {
+                                        warn!("Failed to merge local ops into sync state: {}", e);
+                                    }
+                                }
+
+                                // 2. Push ops to server (async, fire-and-forget)
+                                if let Some(ref actor) = actor {
+                                    match editor.doc.ops_since_bytes(frontier) {
+                                        Ok(ops_bytes) if !ops_bytes.is_empty() => {
+                                            let ctx_id = editor.doc.context_id();
+                                            let handle = actor.handle.clone();
+                                            info!("Pushing {} bytes of edit ops for {}", ops_bytes.len(), ctx_id);
+                                            bevy::tasks::IoTaskPool::get()
+                                                .spawn(async move {
+                                                    match handle.push_ops(ctx_id, &ops_bytes).await {
+                                                        Ok(v) => log::info!("Edit ops pushed, ack version: {v}"),
+                                                        Err(e) => log::error!("Failed to push edit ops: {e}"),
+                                                    }
+                                                })
+                                                .detach();
+                                        }
+                                        Ok(_) => {} // empty ops, no edit happened
+                                        Err(e) => warn!("Failed to serialize edit ops: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // ECS Cleanup
-                for entity in editing_cells.iter() {
+                for (entity, _) in editing_cells.iter() {
                     commands.entity(entity).remove::<EditingBlockCell>();
                     commands.entity(entity).remove::<BlockEditCursor>();
                 }
@@ -177,10 +220,15 @@ pub fn handle_activate_navigation(
 
         if let Some(entity) = container.get_entity(block_id) {
             info!("Entering edit mode for block {:?}", block_id);
-            
+
+            let edit_frontier = editor.doc.frontier();
             commands.entity(entity).insert((
                 EditingBlockCell,
-                BlockEditCursor { offset: block.content.len(), selection_anchor: None },
+                BlockEditCursor {
+                    offset: block.content.len(),
+                    selection_anchor: None,
+                    edit_frontier: Some(edit_frontier),
+                },
             ));
 
             *focus = FocusArea::EditingBlock;

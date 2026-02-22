@@ -1169,6 +1169,7 @@ pub fn sync_main_cell_to_conversation(
     entities: Res<EditorEntities>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
+    focus_area: Res<crate::input::focus::FocusArea>,
 ) {
     // Need both a current conversation and sync state document
     let Some(conv_id) = current_conv.id() else {
@@ -1210,16 +1211,32 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
-    // Copy from authoritative source
-    let agent_id = editor.doc.agent_id();
-    let snapshot = source_doc.snapshot();
-    let new_doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
-    editor.doc = new_doc;
+    if matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
+        // CRDT merge: preserve local edits, incorporate remote changes
+        let local_frontier = editor.doc.frontier();
+        let remote_ops = source_doc.ops_since(&local_frontier);
+        match editor.doc.merge_ops_owned(remote_ops) {
+            Ok(()) => trace!("Merged remote ops into editing doc"),
+            Err(e) => {
+                // Fallback to full replace on merge failure
+                warn!("CRDT merge failed during editing, full sync: {e}");
+                let agent_id = editor.doc.agent_id();
+                let snapshot = source_doc.snapshot();
+                editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
+            }
+        }
+        // Don't reposition cursor during editing
+    } else {
+        // Normal path: full document replacement
+        let agent_id = editor.doc.agent_id();
+        let snapshot = source_doc.snapshot();
+        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
 
-    // Update cursor to end of document
-    if let Some(last_block) = editor.blocks().last() {
-        let len = last_block.content.len();
-        editor.cursor = super::components::BlockCursor::at(last_block.id, len);
+        // Update cursor to end of document
+        if let Some(last_block) = editor.blocks().last() {
+            let len = last_block.content.len();
+            editor.cursor = super::components::BlockCursor::at(last_block.id, len);
+        }
     }
 
     // Update or insert the ViewingConversation component
