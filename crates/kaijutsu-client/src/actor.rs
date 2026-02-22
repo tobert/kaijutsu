@@ -18,7 +18,7 @@
 //! when the actor is saturated — `.send().await` blocks until commands complete
 //! and slots free up. The system recovers as in-flight RPCs finish.
 
-use kaijutsu_crdt::ContextId;
+use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::BlockId;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::Instrument;
@@ -602,8 +602,7 @@ const BASE_BACKOFF_SECS: f64 = 1.0;
 /// The actual actor that holds !Send Cap'n Proto types.
 struct RpcActor {
     config: SshConfig,
-    #[allow(dead_code)] // Phase 5: used for logging/display
-    kernel_id: String,
+    kernel_id: KernelId,
     context_id: Option<ContextId>,
     instance: String,
     /// Live connection state (None = disconnected, will reconnect)
@@ -630,7 +629,7 @@ struct ConnectionState {
 impl RpcActor {
     fn new(
         config: SshConfig,
-        kernel_id: String,
+        kernel_id: KernelId,
         context_id: Option<ContextId>,
         instance: String,
         existing: Option<(RpcClient, KernelHandle)>,
@@ -1058,7 +1057,7 @@ async fn dispatch_command(
 /// must stay on the spawning thread.
 pub fn spawn_actor(
     config: SshConfig,
-    kernel_id: String,
+    kernel_id: KernelId,
     context_id: Option<ContextId>,
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,
