@@ -1663,16 +1663,15 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_json_roundtrip() {
+    fn test_snapshot_postcard_roundtrip() {
         let mut store = test_store();
         store
             .insert_block(None, None, Role::User, BlockKind::Text, "Hello")
             .unwrap();
 
         let snapshot = store.snapshot();
-        // Use JSON (not postcard) because BlockSnapshot has skip_serializing_if
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize");
-        let restored: StoreSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
+        let bytes = postcard::to_allocvec(&snapshot).expect("serialize");
+        let restored: StoreSnapshot = postcard::from_bytes(&bytes).expect("deserialize");
 
         assert_eq!(restored.blocks.len(), 1);
         assert_eq!(restored.blocks[0].content, "Hello");

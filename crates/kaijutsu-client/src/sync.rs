@@ -8,8 +8,8 @@
 //!
 //! The server uses `BlockStore` (per-block DTE instances). Sync payloads are:
 //!
-//! - **Initial state**: `StoreSnapshot` (JSON-encoded) — full block store snapshot
-//! - **Incremental sync**: `SyncPayload` (JSON-encoded) — per-block deltas,
+//! - **Initial state**: `StoreSnapshot` (postcard-encoded) — full block store snapshot
+//! - **Incremental sync**: `SyncPayload` (postcard-encoded) — per-block deltas,
 //!   new block snapshots, header updates, and tombstone deletions
 //! - **Frontier**: `HashMap<BlockId, Frontier>` — per-block CRDT versions
 //!
@@ -280,7 +280,7 @@ impl SyncManager {
             snapshot_bytes.len()
         );
 
-        let snapshot: StoreSnapshot = match serde_json::from_slice(snapshot_bytes) {
+        let snapshot: StoreSnapshot = match postcard::from_bytes(snapshot_bytes) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -496,7 +496,7 @@ impl SyncManager {
             self.context_id
         );
 
-        let snapshot: StoreSnapshot = match serde_json::from_slice(snapshot_bytes) {
+        let snapshot: StoreSnapshot = match postcard::from_bytes(snapshot_bytes) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -538,7 +538,7 @@ impl SyncManager {
         block_id: Option<&BlockId>,
     ) -> Result<SyncResult, SyncError> {
         // Deserialize SyncPayload
-        let payload: SyncPayload = match serde_json::from_slice(ops) {
+        let payload: SyncPayload = match postcard::from_bytes(ops) {
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to deserialize SyncPayload: {}", e);
@@ -610,14 +610,14 @@ mod tests {
         CrdtBlockStore::new(context_id, client_agent())
     }
 
-    /// Helper: serialize a StoreSnapshot to JSON bytes.
+    /// Helper: serialize a StoreSnapshot to postcard bytes.
     fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
-        serde_json::to_vec(&store.snapshot()).expect("serialize snapshot")
+        postcard::to_allocvec(&store.snapshot()).expect("serialize snapshot")
     }
 
-    /// Helper: serialize a SyncPayload to JSON bytes.
+    /// Helper: serialize a SyncPayload to postcard bytes.
     fn sync_payload_bytes(store: &CrdtBlockStore, frontiers: &HashMap<BlockId, Frontier>) -> Vec<u8> {
-        serde_json::to_vec(&store.ops_since(frontiers)).expect("serialize sync payload")
+        postcard::to_allocvec(&store.ops_since(frontiers)).expect("serialize sync payload")
     }
 
     // =========================================================================

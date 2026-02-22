@@ -379,12 +379,15 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let ops = remote.store.ops_since(remote.context_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let ops_bytes = serde_json::to_vec(&ops)
-        .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
-
-    if ops_bytes.len() <= 2 {
+    // Check for empty payload before serializing
+    if ops.block_ops.is_empty() && ops.new_blocks.is_empty()
+        && ops.updated_headers.is_empty() && ops.deleted_blocks.is_empty()
+    {
         return Ok(()); // No ops
     }
+
+    let ops_bytes = postcard::to_allocvec(&ops)
+        .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
     remote.actor.push_ops(remote.context_id, &ops_bytes).await
         .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;

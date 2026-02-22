@@ -469,7 +469,7 @@ pub struct BlockSnapshot {
     /// Block ID (includes context_id, agent_id/author, and seq).
     pub id: BlockId,
     /// Parent block ID (DAG edge — None for root blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub parent_id: Option<BlockId>,
     /// Role of the block author (user, model, system, tool).
     pub role: Role,
@@ -480,11 +480,11 @@ pub struct BlockSnapshot {
     /// Primary text content.
     pub content: String,
     /// Whether this block is collapsed (only meaningful for Thinking).
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub collapsed: bool,
     /// Whether this block has been superseded by a compaction summary.
     /// Compacted blocks are retained for history but excluded from active views.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub compacted: bool,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
@@ -492,44 +492,44 @@ pub struct BlockSnapshot {
     // Tool-specific fields (ToolCall / ToolResult)
 
     /// Which execution engine (Shell, Mcp, Builtin). Present on ToolCall/ToolResult.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_kind: Option<ToolKind>,
     /// Tool name (for ToolCall blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_name: Option<String>,
     /// Tool input as JSON string (for ToolCall blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_input: Option<String>,
     /// Reference to parent ToolCall block (for ToolResult blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<BlockId>,
     /// Exit code from tool execution (for ToolResult blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub exit_code: Option<i32>,
     /// Whether this is an error result (for ToolResult blocks).
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     pub is_error: bool,
     /// Display hint for richer output formatting (JSON-serialized).
     /// Used for shell output blocks to enable per-viewer rendering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub display_hint: Option<String>,
 
     // Drift-specific fields (Drift)
 
     /// Originating context (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_context: Option<ContextId>,
     /// Model that produced this content (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_model: Option<String>,
     /// How this block arrived from another context (for Drift blocks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub drift_kind: Option<DriftKind>,
 
     // File-specific fields (File)
 
     /// Logical file path (for File blocks). Not unique — downstream resolves duplicates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub file_path: Option<String>,
 
     // Ordering
@@ -537,13 +537,8 @@ pub struct BlockSnapshot {
     /// Fractional index for sibling ordering (base-62 lexicographic).
     /// Set by BlockStore on insertion. Not present on snapshots created
     /// via named constructors (those get order_key assigned when inserted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub order_key: Option<String>,
-}
-
-/// Helper for `#[serde(skip_serializing_if)]` on bool fields.
-fn is_false(v: &bool) -> bool {
-    !v
 }
 
 impl BlockSnapshot {
@@ -1480,22 +1475,15 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_skip_serializing_none_fields() {
+    fn test_block_snapshot_postcard_roundtrip() {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
         let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        let json = serde_json::to_string(&snap).unwrap();
-        // None fields should be absent, not "null"
-        assert!(!json.contains("tool_kind"));
-        assert!(!json.contains("tool_name"));
-        assert!(!json.contains("drift_kind"));
-        assert!(!json.contains("parent_id"));
-        // false bools should be absent too
-        assert!(!json.contains("collapsed"));
-        assert!(!json.contains("is_error"));
-        // Deserialize back — defaults fill in
-        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.id, snap.id);
+        assert_eq!(parsed.content, "hello");
         assert_eq!(parsed.tool_kind, None);
         assert!(!parsed.collapsed);
         assert!(!parsed.is_error);
@@ -1665,11 +1653,13 @@ mod tests {
     }
 
     #[test]
-    fn test_compacted_skipped_in_json_when_false() {
+    fn test_compacted_postcard_roundtrip_false() {
         let id = BlockId::new(test_context(), test_agent(), 1);
         let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(!json.contains("compacted"));
+        assert!(!snap.compacted);
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert!(!parsed.compacted);
     }
 
     #[test]

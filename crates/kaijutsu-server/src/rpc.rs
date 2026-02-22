@@ -1309,10 +1309,8 @@ impl kernel::Server for KernelImpl {
         }
 
         // Send store snapshot for CRDT sync (replaces oplog_bytes).
-        // Uses JSON because StoreSnapshot contains BlockSnapshot with
-        // skip_serializing_if attributes (incompatible with postcard).
         let snapshot = doc.doc.snapshot();
-        let snapshot_bytes = match serde_json::to_vec(&snapshot) {
+        let snapshot_bytes = match postcard::to_allocvec(&snapshot) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
@@ -2225,7 +2223,7 @@ impl kernel::Server for KernelImpl {
         let documents = &self.kernel.documents;
 
         // Deserialize the sync payload
-        let payload: kaijutsu_crdt::block_store::SyncPayload = match serde_json::from_slice(&ops_data) {
+        let payload: kaijutsu_crdt::block_store::SyncPayload = match postcard::from_bytes(&ops_data) {
             Ok(p) => p,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(

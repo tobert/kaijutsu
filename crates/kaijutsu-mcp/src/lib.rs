@@ -61,7 +61,6 @@ use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId};
-use kaijutsu_crdt::block_store::SyncPayload;
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -414,14 +413,16 @@ impl KaijutsuMcp {
         let ops = remote.store.ops_since(remote.context_id, &frontier)
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        // Serialize ops for transmission
-        let ops_bytes = serde_json::to_vec(&ops)
-            .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
-
-        if ops_bytes.len() <= 2 {
+        // Check for empty payload before serializing
+        if ops.block_ops.is_empty() && ops.new_blocks.is_empty()
+            && ops.updated_headers.is_empty() && ops.deleted_blocks.is_empty()
+        {
             tracing::debug!("No ops to push");
             return Ok((0, 0));
         }
+
+        let ops_bytes = postcard::to_allocvec(&ops)
+            .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         tracing::debug!(
             ctx = %remote.context_id,
@@ -2783,7 +2784,7 @@ mod tests {
     // apply_server_event tests — exercises the store-based sync path
     //
     // Uses kernel BlockStore as both "server" and "client" to generate proper
-    // SyncPayload (JSON-serialized) ops, matching the real sync protocol.
+    // SyncPayload (postcard-serialized) ops, matching the real sync protocol.
     // =========================================================================
 
     use std::collections::HashMap;
@@ -2821,14 +2822,14 @@ mod tests {
         (client, sync, server, context_id)
     }
 
-    /// Helper: get SyncPayload from server as JSON bytes.
+    /// Helper: get SyncPayload from server as postcard bytes.
     fn server_ops_bytes(
         server: &SharedBlockStore,
         ctx_id: ContextId,
         frontier: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
     ) -> Vec<u8> {
         let payload = server.ops_since(ctx_id, frontier).expect("ops_since");
-        serde_json::to_vec(&payload).expect("serialize SyncPayload to JSON")
+        postcard::to_allocvec(&payload).expect("serialize SyncPayload")
     }
 
     #[test]
