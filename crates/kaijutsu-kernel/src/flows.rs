@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Status};
+use kaijutsu_types::ContextId;
 
 // ============================================================================
 // Origin Tracking
@@ -167,8 +168,8 @@ impl<T: HasSubject> FlowMessage<T> {
 pub enum BlockFlow {
     /// A new block was inserted.
     Inserted {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// Full snapshot of the inserted block.
         block: BlockSnapshot,
         /// Block to insert after (None = beginning).
@@ -184,8 +185,8 @@ pub enum BlockFlow {
     /// CRDT operations for a block's text content.
     /// Clients should use merge_ops() to apply these.
     TextOps {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// The block that was edited.
         block_id: BlockId,
         /// Serialized CRDT operations (diamond-types format).
@@ -197,8 +198,8 @@ pub enum BlockFlow {
 
     /// A block was deleted.
     Deleted {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// The block that was deleted.
         block_id: BlockId,
         /// Origin of this operation (Local or Remote).
@@ -208,8 +209,8 @@ pub enum BlockFlow {
 
     /// Block status changed.
     StatusChanged {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// The block whose status changed.
         block_id: BlockId,
         /// The new status.
@@ -221,8 +222,8 @@ pub enum BlockFlow {
 
     /// Block collapsed state changed (for thinking blocks).
     CollapsedChanged {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// The block whose collapsed state changed.
         block_id: BlockId,
         /// New collapsed state.
@@ -234,8 +235,8 @@ pub enum BlockFlow {
 
     /// Block was moved to a new position.
     Moved {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// The block that was moved.
         block_id: BlockId,
         /// New position (after this block, None = beginning).
@@ -247,8 +248,8 @@ pub enum BlockFlow {
 
     /// Document was compacted — clients must re-sync from full oplog.
     SyncReset {
-        /// The document ID.
-        document_id: String,
+        /// The context ID.
+        context_id: ContextId,
         /// New sync generation after compaction.
         generation: u64,
     },
@@ -268,16 +269,16 @@ impl BlockFlow {
         }
     }
 
-    /// Get the document ID for this event.
-    pub fn document_id(&self) -> &str {
+    /// Get the context ID for this event.
+    pub fn context_id(&self) -> ContextId {
         match self {
-            Self::Inserted { document_id, .. }
-            | Self::TextOps { document_id, .. }
-            | Self::Deleted { document_id, .. }
-            | Self::StatusChanged { document_id, .. }
-            | Self::CollapsedChanged { document_id, .. }
-            | Self::Moved { document_id, .. }
-            | Self::SyncReset { document_id, .. } => document_id,
+            Self::Inserted { context_id, .. }
+            | Self::TextOps { context_id, .. }
+            | Self::Deleted { context_id, .. }
+            | Self::StatusChanged { context_id, .. }
+            | Self::CollapsedChanged { context_id, .. }
+            | Self::Moved { context_id, .. }
+            | Self::SyncReset { context_id, .. } => *context_id,
         }
     }
 
@@ -947,6 +948,7 @@ pub fn shared_config_flow_bus(capacity: usize) -> SharedConfigFlowBus {
 mod tests {
     use super::*;
     use kaijutsu_crdt::Role;
+    use kaijutsu_types::PrincipalId;
 
     #[test]
     fn test_pattern_matching_exact() {
@@ -983,12 +985,13 @@ mod tests {
 
     #[test]
     fn test_block_flow_subjects() {
-        let id = BlockId::new("doc-1", "agent", 1);
-        let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let block = BlockSnapshot::text(id, None, Role::User, "test");
 
         assert_eq!(
             BlockFlow::Inserted {
-                document_id: "doc-1".into(),
+                context_id: ctx,
                 block,
                 after_id: None,
                 ops: vec![],
@@ -1000,8 +1003,8 @@ mod tests {
 
         assert_eq!(
             BlockFlow::Deleted {
-                document_id: "doc-1".into(),
-                block_id: id.clone(),
+                context_id: ctx,
+                block_id: id,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1010,8 +1013,8 @@ mod tests {
 
         assert_eq!(
             BlockFlow::StatusChanged {
-                document_id: "doc-1".into(),
-                block_id: id.clone(),
+                context_id: ctx,
+                block_id: id,
                 status: Status::Done,
                 source: OpSource::Local,
             }
@@ -1021,8 +1024,8 @@ mod tests {
 
         assert_eq!(
             BlockFlow::CollapsedChanged {
-                document_id: "doc-1".into(),
-                block_id: id.clone(),
+                context_id: ctx,
+                block_id: id,
                 collapsed: true,
                 source: OpSource::Local,
             }
@@ -1032,7 +1035,7 @@ mod tests {
 
         assert_eq!(
             BlockFlow::Moved {
-                document_id: "doc-1".into(),
+                context_id: ctx,
                 block_id: id,
                 after_id: None,
                 source: OpSource::Local,
@@ -1047,8 +1050,9 @@ mod tests {
         let bus: FlowBus<BlockFlow> = FlowBus::new(16);
         let mut sub = bus.subscribe("block.*");
 
-        let id = BlockId::new("doc-1", "agent", 1);
-        let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let block = BlockSnapshot::text(id, None, Role::User, "test");
 
         // Publish in background task
         let bus_clone = bus.clone();
@@ -1056,7 +1060,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             bus_clone.publish(BlockFlow::Inserted {
-                document_id: "doc-1".into(),
+                context_id: ctx,
                 block: block_clone,
                 after_id: None,
                 ops: vec![],
@@ -1072,7 +1076,7 @@ mod tests {
 
         assert_eq!(msg.subject, "block.inserted");
         match msg.payload {
-            BlockFlow::Inserted { document_id, .. } => assert_eq!(document_id, "doc-1"),
+            BlockFlow::Inserted { context_id, .. } => assert_eq!(context_id, ctx),
             _ => panic!("wrong event type"),
         }
     }
@@ -1086,12 +1090,13 @@ mod tests {
         // Subscribe only to status changes
         let mut status_sub = bus.subscribe("block.status");
 
-        let id = BlockId::new("doc-1", "agent", 1);
-        let block = BlockSnapshot::text(id.clone(), None, Role::User, "test", "author");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let block = BlockSnapshot::text(id, None, Role::User, "test");
 
         // Publish an insertion
         bus.publish(BlockFlow::Inserted {
-            document_id: "doc-1".into(),
+            context_id: ctx,
             block,
             after_id: None,
             ops: vec![],
@@ -1100,7 +1105,7 @@ mod tests {
 
         // Publish a status change
         bus.publish(BlockFlow::StatusChanged {
-            document_id: "doc-1".into(),
+            context_id: ctx,
             block_id: id,
             status: Status::Done,
             source: OpSource::Local,

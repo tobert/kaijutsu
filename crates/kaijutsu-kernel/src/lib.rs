@@ -37,7 +37,7 @@ pub use agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
     AgentStatus, SharedAgentRegistry, shared_agent_registry,
 };
-pub use block_store::{BlockEvent, BlockStore, DocumentEntry, DocumentId, SharedBlockStore, shared_block_store, shared_block_store_with_db};
+pub use block_store::{BlockEvent, BlockStore, DocumentEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
 pub use block_tools::{
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,

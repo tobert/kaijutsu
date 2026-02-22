@@ -21,7 +21,7 @@
 //! drift flush
 //!       │
 //!       ▼
-//! DriftRouter.flush() → insert_from_snapshot() on target document
+//! DriftRouter.flush() → insert_drift_block() on target document
 //! ```
 
 use std::collections::HashMap;
@@ -363,19 +363,6 @@ impl DriftRouter {
     pub fn requeue(&mut self, items: Vec<StagedDrift>) {
         self.staging.extend(items);
     }
-
-    /// Build a BlockSnapshot for a staged drift, ready for insertion.
-    pub fn build_drift_block(drift: &StagedDrift, author: &str) -> BlockSnapshot {
-        BlockSnapshot::drift(
-            kaijutsu_crdt::BlockId::new("", "", 0), // ID assigned by document
-            None,                                     // parent set during insertion
-            drift.content.clone(),
-            author,
-            drift.source_ctx.short(),
-            drift.source_model.clone(),
-            drift.drift_kind.clone(),
-        )
-    }
 }
 
 // ============================================================================
@@ -425,15 +412,15 @@ pub fn build_distillation_prompt(
             Role::Model => "Assistant",
             Role::System => "System",
             Role::Tool => "Tool",
+            Role::Asset => "Asset",
         };
 
         let kind_suffix = match block.kind {
             BlockKind::Thinking => " (thinking)",
             BlockKind::ToolCall => " (tool call)",
             BlockKind::ToolResult => " (tool result)",
-            BlockKind::ShellCommand => " (shell)",
-            BlockKind::ShellOutput => " (output)",
             BlockKind::Drift => " (drift)",
+            BlockKind::File => " (file)",
             BlockKind::Text => "",
         };
 
@@ -522,6 +509,7 @@ pub fn build_commit_prompt(diff: &str, context_blocks: &[BlockSnapshot]) -> Stri
             Role::Model => "Assistant",
             Role::System => "System",
             Role::Tool => "Tool",
+            Role::Asset => "Asset",
         };
 
         if block.content.is_empty() {
@@ -712,16 +700,15 @@ impl ExecutionEngine for DriftPushEngine {
         };
 
         if p.summarize {
-            let (source_doc_id, source_model) = {
+            let source_model = {
                 let router = kernel.drift().read().await;
-                let source_handle = match router.get(self.context_id) {
-                    Some(h) => h,
+                match router.get(self.context_id) {
+                    Some(h) => h.model.clone(),
                     None => return Ok(ExecResult::failure(1, format!("caller context {} not found", self.context_id.short()))),
-                };
-                (source_handle.document_id.clone(), source_handle.model.clone())
+                }
             };
 
-            let blocks = match self.documents.block_snapshots(&source_doc_id) {
+            let blocks = match self.documents.block_snapshots(self.context_id) {
                 Ok(b) => b,
                 Err(e) => return Ok(ExecResult::failure(1, format!("failed to read blocks: {}", e))),
             };
@@ -831,17 +818,17 @@ impl ExecutionEngine for DriftPullEngine {
         };
 
         // Resolve source by label or hex prefix
-        let (source_id, source_doc_id, source_model) = {
+        let (source_id, source_model) = {
             let router = kernel.drift().read().await;
             let source_id = match router.resolve_context(&p.source_ctx) {
                 Ok(id) => id,
                 Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
             let h = router.get(source_id).unwrap();
-            (source_id, h.document_id.clone(), h.model.clone())
+            (source_id, h.model.clone())
         };
 
-        let blocks = match self.documents.block_snapshots(&source_doc_id) {
+        let blocks = match self.documents.block_snapshots(source_id) {
             Ok(b) => b,
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to read source blocks: {}", e))),
         };
@@ -868,29 +855,17 @@ impl ExecutionEngine for DriftPullEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("distillation LLM call failed: {}", e))),
         };
 
-        let caller_doc_id = {
-            let router = kernel.drift().read().await;
-            match router.get(self.context_id) {
-                Some(h) => h.document_id.clone(),
-                None => return Ok(ExecResult::failure(1, format!("caller context {} not found", self.context_id.short()))),
-            }
-        };
+        let after = self.documents.last_block_id(self.context_id);
 
-        let staged = StagedDrift {
-            id: 0,
-            source_ctx: source_id,
-            target_ctx: self.context_id,
-            content: summary,
-            source_model: Some(model.to_string()),
-            drift_kind: DriftKind::Pull,
-            created_at: now_epoch(),
-        };
-
-        let author = format!("drift:{}", source_id.short());
-        let snapshot = DriftRouter::build_drift_block(&staged, &author);
-        let after = self.documents.last_block_id(&caller_doc_id);
-
-        let block_id = match self.documents.insert_from_snapshot(&caller_doc_id, snapshot, after.as_ref()) {
+        let block_id = match self.documents.insert_drift_block(
+            self.context_id,
+            None,
+            after.as_ref(),
+            summary,
+            source_id,
+            Some(model.to_string()),
+            DriftKind::Pull,
+        ) {
             Ok(id) => id,
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject drift block: {}", e))),
         };
@@ -954,23 +929,17 @@ impl ExecutionEngine for DriftFlushEngine {
         let mut failed: Vec<StagedDrift> = Vec::new();
 
         for drift in staged {
-            let target_doc_id = {
-                let router = kernel.drift().read().await;
-                match router.get(drift.target_ctx) {
-                    Some(h) => h.document_id.clone(),
-                    None => {
-                        tracing::warn!("Drift flush: target context {} not found, re-queuing", drift.target_ctx.short());
-                        failed.push(drift);
-                        continue;
-                    }
-                }
-            };
+            let after = self.documents.last_block_id(drift.target_ctx);
 
-            let author = format!("drift:{}", drift.source_ctx.short());
-            let snapshot = DriftRouter::build_drift_block(&drift, &author);
-            let after = self.documents.last_block_id(&target_doc_id);
-
-            match self.documents.insert_from_snapshot(&target_doc_id, snapshot, after.as_ref()) {
+            match self.documents.insert_drift_block(
+                drift.target_ctx,
+                None,
+                after.as_ref(),
+                drift.content.clone(),
+                drift.source_ctx,
+                drift.source_model.clone(),
+                drift.drift_kind,
+            ) {
                 Ok(block_id) => {
                     tracing::info!("Drift flushed: {} → {} (block={})", drift.source_ctx.short(), drift.target_ctx.short(), block_id.to_key());
                     injected += 1;
@@ -1052,7 +1021,7 @@ impl ExecutionEngine for DriftMergeEngine {
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let (source_id, source_doc_id, source_model, parent_ctx_id) = {
+        let (source_id, source_model, parent_ctx_id) = {
             let router = kernel.drift().read().await;
             let source_id = match router.resolve_context(&p.source_ctx) {
                 Ok(id) => id,
@@ -1063,18 +1032,10 @@ impl ExecutionEngine for DriftMergeEngine {
                 Some(p) => p,
                 None => return Ok(ExecResult::failure(1, format!("context {} has no parent — cannot merge", source_id.short()))),
             };
-            (source_id, source_handle.document_id.clone(), source_handle.model.clone(), parent)
+            (source_id, source_handle.model.clone(), parent)
         };
 
-        let parent_doc_id = {
-            let router = kernel.drift().read().await;
-            match router.get(parent_ctx_id) {
-                Some(h) => h.document_id.clone(),
-                None => return Ok(ExecResult::failure(1, format!("parent context {} not found", parent_ctx_id.short()))),
-            }
-        };
-
-        let blocks = match self.documents.block_snapshots(&source_doc_id) {
+        let blocks = match self.documents.block_snapshots(source_id) {
             Ok(b) => b,
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to read source blocks: {}", e))),
         };
@@ -1101,21 +1062,17 @@ impl ExecutionEngine for DriftMergeEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("distillation LLM call failed: {}", e))),
         };
 
-        let staged = StagedDrift {
-            id: 0,
-            source_ctx: source_id,
-            target_ctx: parent_ctx_id,
-            content: summary,
-            source_model: Some(model.to_string()),
-            drift_kind: DriftKind::Merge,
-            created_at: now_epoch(),
-        };
+        let after = self.documents.last_block_id(parent_ctx_id);
 
-        let author = format!("drift:{}", source_id.short());
-        let snapshot = DriftRouter::build_drift_block(&staged, &author);
-        let after = self.documents.last_block_id(&parent_doc_id);
-
-        let block_id = match self.documents.insert_from_snapshot(&parent_doc_id, snapshot, after.as_ref()) {
+        let block_id = match self.documents.insert_drift_block(
+            parent_ctx_id,
+            None,
+            after.as_ref(),
+            summary,
+            source_id,
+            Some(model.to_string()),
+            DriftKind::Merge,
+        ) {
             Ok(id) => id,
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject merge block: {}", e))),
         };
@@ -1300,36 +1257,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_drift_block() {
-        let mut router = DriftRouter::new();
-        let src = ContextId::new();
-        let tgt = ContextId::new();
-        router.register(src, Some("src"), "doc-1", None);
-        router.register(tgt, Some("tgt"), "doc-2", None);
-
-        let id = router
-            .stage(
-                src,
-                tgt,
-                "important finding".into(),
-                Some("claude-opus-4-6".into()),
-                DriftKind::Distill,
-            )
-            .unwrap();
-
-        let staged = &router.queue()[0];
-        assert_eq!(staged.id, id);
-
-        let block = DriftRouter::build_drift_block(staged, &format!("drift:{}", src.short()));
-        assert_eq!(block.kind, BlockKind::Drift);
-        assert_eq!(block.role, Role::System);
-        assert_eq!(block.content, "important finding");
-        assert_eq!(block.source_context.as_deref(), Some(src.short().as_str()));
-        assert_eq!(block.source_model.as_deref(), Some("claude-opus-4-6"));
-        assert_eq!(block.drift_kind, Some(DriftKind::Distill));
-    }
-
-    #[test]
     fn test_unregister() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
@@ -1403,21 +1330,22 @@ mod tests {
     #[test]
     fn test_build_distillation_prompt_basic() {
         use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::PrincipalId;
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
 
         let blocks = vec![
             BlockSnapshot::text(
-                BlockId::new("doc", "agent", 0),
+                BlockId::new(ctx, agent, 0),
                 None,
                 Role::User,
                 "How do I fix the auth bug?",
-                "user",
             ),
             BlockSnapshot::text(
-                BlockId::new("doc", "agent", 1),
+                BlockId::new(ctx, agent, 1),
                 None,
                 Role::Model,
                 "The auth bug is caused by a race condition in the session handler.",
-                "model",
             ),
         ];
 
@@ -1431,13 +1359,15 @@ mod tests {
     #[test]
     fn test_build_distillation_prompt_with_directed_focus() {
         use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::PrincipalId;
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
 
         let blocks = vec![BlockSnapshot::text(
-            BlockId::new("doc", "agent", 0),
+            BlockId::new(ctx, agent, 0),
             None,
             Role::User,
             "Let's discuss auth and caching.",
-            "user",
         )];
 
         let prompt =
@@ -1448,15 +1378,18 @@ mod tests {
     #[test]
     fn test_build_distillation_prompt_truncates_long_blocks() {
         use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::{PrincipalId, ToolKind};
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
 
         let long_content = "x".repeat(3000);
         let blocks = vec![BlockSnapshot::tool_result(
-            BlockId::new("doc", "agent", 0),
-            BlockId::new("doc", "agent", 99),
+            BlockId::new(ctx, agent, 0),
+            BlockId::new(ctx, agent, 99),
+            ToolKind::Builtin,
             &long_content,
             false,
             None,
-            "tool",
         )];
 
         let prompt = build_distillation_prompt(&blocks, None);
@@ -1467,21 +1400,22 @@ mod tests {
     #[test]
     fn test_build_distillation_prompt_skips_empty() {
         use kaijutsu_crdt::BlockId;
+        use kaijutsu_types::PrincipalId;
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
 
         let blocks = vec![
             BlockSnapshot::text(
-                BlockId::new("doc", "agent", 0),
+                BlockId::new(ctx, agent, 0),
                 None,
                 Role::User,
                 "",
-                "user",
             ),
             BlockSnapshot::text(
-                BlockId::new("doc", "agent", 1),
+                BlockId::new(ctx, agent, 1),
                 None,
                 Role::Model,
                 "Only this should appear.",
-                "model",
             ),
         ];
 
@@ -1520,10 +1454,10 @@ mod tests {
             r.register(tgt_id, Some("target"), "doc-tgt", None);
         }
 
-        let documents = crate::block_store::shared_block_store("test");
-        // Create target document so flush can inject
+        let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
+        // Create target document so flush can inject — keyed by ContextId
         documents
-            .create_document("doc-tgt".to_string(), crate::db::DocumentKind::Conversation, None)
+            .create_document(tgt_id, crate::db::DocumentKind::Conversation, None)
             .unwrap();
 
         // Push via DriftPushEngine (target_ctx accepts label prefix)
@@ -1549,8 +1483,8 @@ mod tests {
         assert!(flush_result.success, "flush failed: {}", flush_result.stderr);
         assert!(flush_result.stdout.contains("Flushed 1 drifts"));
 
-        // Verify block was injected into target document
-        let blocks = documents.block_snapshots("doc-tgt").unwrap();
+        // Verify block was injected into target document — keyed by ContextId
+        let blocks = documents.block_snapshots(tgt_id).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Drift);
         assert_eq!(blocks[0].content, "hello from source");

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine};
 use kaijutsu_crdt::{BlockId, BlockKind, Role, Status};
+use kaijutsu_types::ContextId;
 
 use super::error::{EditError, Result};
 use super::translate::{
@@ -160,7 +161,7 @@ pub struct BlockStatusParams {
 // Helper Functions
 // ============================================================================
 
-/// Parse a block ID from string key format (document_id/agent_id/seq).
+/// Parse a block ID from string key format (context_hex:agent_hex:seq).
 fn parse_block_id(s: &str) -> Result<BlockId> {
     BlockId::from_key(s).ok_or_else(|| {
         EditError::InvalidParams(format!("invalid block_id format: {}", s))
@@ -201,15 +202,15 @@ fn parse_status(s: &str) -> Result<Status> {
 }
 
 /// Find a block by ID string, checking all documents.
-/// Returns (document_id, BlockId) if found.
-fn find_block(documents: &SharedBlockStore, block_id_str: &str) -> Result<(String, BlockId)> {
+/// Returns (ContextId, BlockId) if found.
+fn find_block(documents: &SharedBlockStore, block_id_str: &str) -> Result<(ContextId, BlockId)> {
     let block_id = parse_block_id(block_id_str)?;
 
-    for document_id in documents.list_ids() {
-        if let Some(entry) = documents.get(&document_id) {
+    for context_id in documents.list_ids() {
+        if let Some(entry) = documents.get(context_id) {
             for snapshot in entry.doc.blocks_ordered() {
                 if snapshot.id == block_id {
-                    return Ok((document_id.to_string(), block_id));
+                    return Ok((context_id, block_id));
                 }
             }
         }
@@ -275,14 +276,14 @@ impl BlockCreateEngine {
             .transpose()?;
 
         // For now, create blocks in a default document or first available document
-        let document_id = self.documents.list_ids().into_iter().next().ok_or_else(|| {
+        let context_id = self.documents.list_ids().into_iter().next().ok_or_else(|| {
             EditError::StoreError("no documents available, create a document first".into())
         })?;
 
         let block_id = self
             .documents
             .insert_block(
-                &document_id,
+                context_id,
                 parent_id.as_ref(),
                 None, // after
                 role,
@@ -293,7 +294,7 @@ impl BlockCreateEngine {
 
         let version = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -372,15 +373,15 @@ impl BlockAppendEngine {
     }
 
     fn execute_inner(&self, params: BlockAppendParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         self.documents
-            .append_text(&document_id, &block_id, &params.text)
+            .append_text(context_id, &block_id, &params.text)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -491,12 +492,12 @@ impl BlockEditEngine {
     }
 
     fn execute_inner(&self, params: BlockEditParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         // Pre-validate CAS checks before applying any operations.
         // This prevents partial application when a later CAS check would fail.
         {
-            let content = self.documents.get(&document_id)
+            let content = self.documents.get(context_id)
                 .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|s| s.content.clone()))
                 .unwrap_or_default();
 
@@ -510,13 +511,13 @@ impl BlockEditEngine {
 
         // Apply operations sequentially (offsets depend on prior edits).
         for (idx, op) in params.operations.into_iter().enumerate() {
-            self.apply_op(&document_id, &block_id, op)
+            self.apply_op(context_id, &block_id, op)
                 .map_err(|e| e.in_batch(idx))?;
         }
 
         let version = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -525,12 +526,12 @@ impl BlockEditEngine {
         }))
     }
 
-    fn apply_op(&self, document_id: &str, block_id: &BlockId, op: EditOp) -> Result<()> {
+    fn apply_op(&self, context_id: ContextId, block_id: &BlockId, op: EditOp) -> Result<()> {
         // Get current content
         let content = {
             let entry = self
                 .documents
-                .get(document_id)
+                .get(context_id)
                 .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
             // Find the block and get its content
@@ -550,7 +551,7 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text(document_id, block_id, pos, &text_with_newline, 0)
+                    .edit_text(context_id, block_id, pos, &text_with_newline, 0)
                     .map_err(|e| EditError::StoreError(e))?;
             }
             EditOp::Delete {
@@ -560,7 +561,7 @@ impl BlockEditEngine {
                 let (start, end) = line_range_to_byte_range(&content, start_line, end_line)?;
                 if start < end {
                     self.documents
-                        .edit_text(document_id, block_id, start, "", end - start)
+                        .edit_text(context_id, block_id, start, "", end - start)
                         .map_err(|e| EditError::StoreError(e))?;
                 }
             }
@@ -582,7 +583,7 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text(document_id, block_id, start, &text_with_newline, end - start)
+                    .edit_text(context_id, block_id, start, &text_with_newline, end - start)
                     .map_err(|e| EditError::StoreError(e))?;
             }
         }
@@ -669,17 +670,17 @@ impl BlockSpliceEngine {
     }
 
     fn execute_inner(&self, params: BlockSpliceParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let insert = params.insert.unwrap_or_default();
 
         self.documents
-            .edit_text(&document_id, &block_id, params.offset, &insert, params.delete_count)
+            .edit_text(context_id, &block_id, params.offset, &insert, params.delete_count)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -763,11 +764,11 @@ impl BlockReadEngine {
     }
 
     fn execute_inner(&self, params: BlockReadParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let entry = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
         let snapshot = entry
@@ -898,11 +899,11 @@ impl BlockSearchEngine {
     }
 
     fn execute_inner(&self, params: BlockSearchParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let entry = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .ok_or_else(|| EditError::StoreError("document not found".into()))?;
 
         let snapshot = entry
@@ -1044,12 +1045,12 @@ impl BlockListEngine {
 
         let mut blocks = Vec::new();
 
-        let document_ids = self.documents.list_ids();
-        tracing::debug!("block_list: found {} documents", document_ids.len());
-        for document_id in document_ids {
-            if let Some(entry) = self.documents.get(&document_id) {
+        let context_ids = self.documents.list_ids();
+        tracing::debug!("block_list: found {} documents", context_ids.len());
+        for context_id in context_ids {
+            if let Some(entry) = self.documents.get(context_id) {
                 let doc_blocks = entry.doc.blocks_ordered();
-                tracing::debug!("block_list: document {} has {} blocks", document_id, doc_blocks.len());
+                tracing::debug!("block_list: document {} has {} blocks", context_id.to_hex(), doc_blocks.len());
                 for snapshot in doc_blocks {
                     // Apply filters
                     if let Some(ref parent_id) = parent_id_filter {
@@ -1168,17 +1169,17 @@ impl BlockStatusEngine {
     }
 
     fn execute_inner(&self, params: BlockStatusParams) -> Result<serde_json::Value> {
-        let (document_id, block_id) = find_block(&self.documents, &params.block_id)?;
+        let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let status = parse_status(&params.status)?;
 
         self.documents
-            .set_status(&document_id, &block_id, status)
+            .set_status(context_id, &block_id, status)
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
             .documents
-            .get(&document_id)
+            .get(context_id)
             .map(|c| c.version())
             .unwrap_or(0);
 
@@ -1317,18 +1318,18 @@ impl KernelSearchEngine {
         let mut matches = Vec::new();
 
         // Get documents to search
-        let document_ids: Vec<String> = if let Some(ref document_id) = params.document_id {
-            if self.documents.contains(document_id) {
-                vec![document_id.clone()]
-            } else {
-                vec![]
+        let context_ids: Vec<ContextId> = if let Some(ref doc_id_str) = params.document_id {
+            // Parse string to ContextId for filtering
+            match ContextId::parse(doc_id_str) {
+                Ok(ctx) if self.documents.contains(ctx) => vec![ctx],
+                _ => vec![],
             }
         } else {
             self.documents.list_ids()
         };
 
-        'outer: for document_id in document_ids {
-            let snapshots = match self.documents.block_snapshots(&document_id) {
+        'outer: for context_id in context_ids {
+            let snapshots = match self.documents.block_snapshots(context_id) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -1371,7 +1372,7 @@ impl KernelSearchEngine {
                             .collect();
 
                         matches.push(KernelSearchMatch {
-                            document_id: document_id.clone(),
+                            document_id: context_id.to_hex(),
                             block_id: snapshot.id.to_key(),
                             line: line_idx as u32,
                             content: line.to_string(),
@@ -1434,16 +1435,23 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
     use crate::db::DocumentKind;
+    use kaijutsu_types::PrincipalId;
 
-    fn setup_test_store() -> SharedBlockStore {
-        let store = shared_block_store("test-agent");
-        store.create_document("test-doc".into(), DocumentKind::Code, Some("rust".into())).unwrap();
-        store
+    /// Test context ID, deterministic for test reproducibility.
+    fn test_context_id() -> ContextId {
+        ContextId::new()
+    }
+
+    fn setup_test_store() -> (SharedBlockStore, ContextId) {
+        let store = shared_block_store(PrincipalId::new());
+        let ctx = test_context_id();
+        store.create_document(ctx, DocumentKind::Code, Some("rust".into())).unwrap();
+        (store, ctx)
     }
 
     #[tokio::test]
     async fn test_block_create() {
-        let store = setup_test_store();
+        let (store, _ctx) = setup_test_store();
         let engine = BlockCreateEngine::new(store.clone(), "test-agent");
 
         let params = r#"{"role": "user", "kind": "text", "content": "hello world"}"#;
@@ -1457,10 +1465,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_append() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
         // Create a block first
-        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello").unwrap();
 
         let engine = BlockAppendEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
@@ -1469,15 +1477,15 @@ mod tests {
         assert!(result.success, "append failed: {}", result.stderr);
 
         // Verify content
-        let content = store.get_content("test-doc").unwrap();
+        let content = store.get_content(ctx).unwrap();
         assert_eq!(content, "hello world");
     }
 
     #[tokio::test]
     async fn test_block_edit_insert() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
 
         let engine = BlockEditEngine::new(store.clone(), "test-agent");
         let params = format!(
@@ -1489,16 +1497,16 @@ mod tests {
         assert!(result.success, "edit insert failed: {}", result.stderr);
 
         // Verify content
-        let entry = store.get("test-doc").unwrap();
+        let entry = store.get(ctx).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "line1\nline2\nline3\n");
     }
 
     #[tokio::test]
     async fn test_block_edit_replace_with_cas() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
 
         let engine = BlockEditEngine::new(store.clone(), "test-agent");
 
@@ -1522,9 +1530,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_read() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
@@ -1538,9 +1546,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_search() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        let block_id = store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
 
         let engine = BlockSearchEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#, block_id.to_key());
@@ -1554,10 +1562,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_list() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
@@ -1570,10 +1578,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_list_with_filter() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
@@ -1586,9 +1594,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_status() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
-        let block_id = store.insert_block("test-doc", None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
 
         let engine = BlockStatusEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "status": "running"}}"#, block_id.to_key());
@@ -1597,21 +1605,22 @@ mod tests {
         assert!(result.success, "status update failed: {}", result.stderr);
 
         // Verify status
-        let entry = store.get("test-doc").unwrap();
+        let entry = store.get(ctx).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.status, Status::Running);
     }
 
     #[tokio::test]
     async fn test_kernel_search() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
 
         // Create blocks in different documents
-        store.create_document("doc2".into(), DocumentKind::Code, Some("rust".into())).unwrap();
+        let ctx2 = ContextId::new();
+        store.create_document(ctx2, DocumentKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_block("test-doc", None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz").unwrap();
-        store.insert_block("test-doc", None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux").unwrap();
-        store.insert_block("doc2", None, None, Role::User, BlockKind::Text, "hello python\nbar baz").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz").unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux").unwrap();
+        store.insert_block(ctx2, None, None, Role::User, BlockKind::Text, "hello python\nbar baz").unwrap();
 
         let engine = KernelSearchEngine::new(store.clone());
 
@@ -1623,11 +1632,11 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 3, "should find 3 matches for 'hello'");
 
-        // Search with document filter
-        let params = r#"{"query": "hello", "document_id": "test-doc"}"#;
-        let result = engine.execute(params).await.unwrap();
+        // Search with document filter (using hex ContextId)
+        let params = format!(r#"{{"query": "hello", "document_id": "{}"}}"#, ctx.to_hex());
+        let result = engine.execute(&params).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-        assert_eq!(response["total"], 2, "should find 2 matches in test-doc");
+        assert_eq!(response["total"], 2, "should find 2 matches in ctx");
 
         // Search with role filter
         let params = r#"{"query": "hello", "role": "model"}"#;
@@ -1646,9 +1655,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_edit_cas_pre_validation_rejects_whole_batch() {
-        let store = setup_test_store();
+        let (store, ctx) = setup_test_store();
         let block_id = store
-            .insert_block("test-doc", None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n")
+            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n")
             .unwrap();
         let engine = BlockEditEngine::new(store.clone(), "test-agent");
 
@@ -1670,7 +1679,7 @@ mod tests {
 
         // Verify no operations were applied — content unchanged
         {
-            let entry = store.get("test-doc").unwrap();
+            let entry = store.get(ctx).unwrap();
             let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
             assert_eq!(snapshot.content, "aaa\nbbb\nccc\n", "content must be unchanged after rejected batch");
         } // drop DashMap Ref before next execute (avoids read/write deadlock)
@@ -1689,7 +1698,7 @@ mod tests {
         let result = engine.execute(&params).await.unwrap();
         assert!(result.success, "valid batch should succeed: {}", result.stderr);
 
-        let entry = store.get("test-doc").unwrap();
+        let entry = store.get(ctx).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         // After replacing line 0 with "AAA" and line 1 with "BBB":
         assert!(snapshot.content.contains("AAA"), "first replace should be applied");

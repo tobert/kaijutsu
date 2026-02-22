@@ -5137,6 +5137,7 @@ dependencies = [
  "futures",
  "git2",
  "kaijutsu-crdt",
+ "kaijutsu-types",
  "kaish-glob",
  "notify 7.0.0",
  "parking_lot",

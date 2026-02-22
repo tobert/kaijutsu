@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kaijutsu_crdt::{BlockId, BlockSnapshot, ContextId, DriftKind};
+use kaijutsu_crdt::{ContextId, DriftKind};
 
 use crate::block_store::SharedBlockStore;
 use crate::drift::{build_commit_prompt, COMMIT_SYSTEM_PROMPT};
@@ -287,18 +287,10 @@ impl GitEngine {
         }
 
         // Phase 2 (async): get conversation context + LLM call
-        let blocks = {
-            let router = kernel.drift().read().await;
-            let doc_id = router
-                .get(self.context_id)
-                .map(|h| h.document_id.clone())
-                .ok_or_else(|| format!("context {} not found", self.context_id.short()))?;
-            drop(router);
-
-            self.documents
-                .block_snapshots(&doc_id)
-                .unwrap_or_default()
-        };
+        let blocks = self
+            .documents
+            .block_snapshots(self.context_id)
+            .unwrap_or_default();
 
         let user_prompt = build_commit_prompt(&diff, &blocks);
 
@@ -446,27 +438,17 @@ EXAMPLES:
         message: &str,
         model: &str,
     ) -> Result<(), String> {
-        let kernel = self.kernel()?;
-        let router = kernel.drift().read().await;
-        let doc_id = router
-            .get(self.context_id)
-            .map(|h| h.document_id.clone())
-            .ok_or_else(|| format!("context {} not found", self.context_id.short()))?;
-        drop(router);
-
-        let snapshot = BlockSnapshot::drift(
-            BlockId::new("", "", 0),
-            None,
-            message,
-            "git",
-            self.context_id.short(),
-            Some(model.to_string()),
-            DriftKind::Commit,
-        );
-
-        let after = self.documents.last_block_id(&doc_id);
+        let after = self.documents.last_block_id(self.context_id);
         self.documents
-            .insert_from_snapshot(&doc_id, snapshot, after.as_ref())
+            .insert_drift_block(
+                self.context_id,
+                None,
+                after.as_ref(),
+                message,
+                self.context_id,
+                Some(model.to_string()),
+                DriftKind::Commit,
+            )
             .map_err(|e| format!("failed to record commit drift: {}", e))?;
 
         Ok(())
@@ -612,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn test_git_engine_help() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
-        let documents = crate::block_store::shared_block_store("test");
+        let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
         let ctx_id = ContextId::new();
         let engine = GitEngine::new(&kernel, documents, ctx_id);
 
@@ -627,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn test_git_engine_unknown_subcommand() {
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
-        let documents = crate::block_store::shared_block_store("test");
+        let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
         let ctx_id = ContextId::new();
         let engine = GitEngine::new(&kernel, documents, ctx_id);
 
@@ -647,7 +629,7 @@ mod tests {
             let mut r = kernel.drift().write().await;
             r.register(ctx_id, Some("default"), "doc-test", None);
         }
-        let documents = crate::block_store::shared_block_store("test");
+        let documents = crate::block_store::shared_block_store(kaijutsu_types::PrincipalId::new());
         let engine = GitEngine::new(&kernel, documents, ctx_id);
 
         let result = engine

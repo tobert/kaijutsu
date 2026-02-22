@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
 use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Role, Status};
+use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Database handle for conversation persistence.
 pub struct ConversationDb {
@@ -115,7 +116,6 @@ struct BlockRow {
     kind: String,
     content: String,
     collapsed: bool,
-    author: String,
     created_at: u64,
 }
 
@@ -143,33 +143,44 @@ struct ToolResultRow {
 /// Convert a BlockSnapshot to a BlockRow for insertion.
 fn block_to_row(block: &BlockSnapshot, order_idx: usize) -> BlockRow {
     BlockRow {
-        cell_id: block.id.document_id.clone(),
-        agent_id: block.id.agent_id.clone(),
+        cell_id: block.id.context_id.to_hex(),
+        agent_id: block.id.agent_id.to_hex(),
         seq: block.id.seq,
         order_idx: order_idx as i64,
-        parent_cell_id: block.parent_id.as_ref().map(|p| p.document_id.clone()),
-        parent_agent_id: block.parent_id.as_ref().map(|p| p.agent_id.clone()),
+        parent_cell_id: block.parent_id.as_ref().map(|p| p.context_id.to_hex()),
+        parent_agent_id: block.parent_id.as_ref().map(|p| p.agent_id.to_hex()),
         parent_seq: block.parent_id.as_ref().map(|p| p.seq),
         role: block.role.as_str().to_string(),
         status: block.status.as_str().to_string(),
         kind: block.kind.as_str().to_string(),
         content: block.content.clone(),
         collapsed: block.collapsed,
-        author: block.author.clone(),
         created_at: block.created_at,
     }
 }
 
 /// Convert a BlockRow (with optional extension data) back to a BlockSnapshot.
+///
+/// Returns `Err` if hex IDs in the row can't be parsed (corrupt DB data).
 fn row_to_block(
     row: BlockRow,
     tool_call: Option<ToolCallRow>,
     tool_result: Option<ToolResultRow>,
-) -> BlockSnapshot {
-    let id = BlockId::new(&row.cell_id, &row.agent_id, row.seq);
+) -> Result<BlockSnapshot, rusqlite::Error> {
+    let context_id = ContextId::parse(&row.cell_id)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let agent_id = PrincipalId::parse(&row.agent_id)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = BlockId::new(context_id, agent_id, row.seq);
 
     let parent_id = match (&row.parent_cell_id, &row.parent_agent_id, row.parent_seq) {
-        (Some(cell), Some(agent), Some(seq)) => Some(BlockId::new(cell, agent, seq)),
+        (Some(cell), Some(agent), Some(seq)) => {
+            let p_ctx = ContextId::parse(cell)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+            let p_agent = PrincipalId::parse(agent)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
+            Some(BlockId::new(p_ctx, p_agent, seq))
+        }
         _ => None,
     };
 
@@ -185,14 +196,19 @@ fn row_to_block(
         })
         .unwrap_or((None, None));
 
-    let (tool_call_id, exit_code, is_error) = tool_result
-        .map(|tr| {
-            let call_id = BlockId::new(&tr.call_cell_id, &tr.call_agent_id, tr.call_seq);
+    let (tool_call_id, exit_code, is_error) = match tool_result {
+        Some(tr) => {
+            let call_ctx = ContextId::parse(&tr.call_cell_id)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+            let call_agent = PrincipalId::parse(&tr.call_agent_id)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+            let call_id = BlockId::new(call_ctx, call_agent, tr.call_seq);
             (Some(call_id), tr.exit_code, tr.is_error)
-        })
-        .unwrap_or((None, None, false));
+        }
+        None => (None, None, false),
+    };
 
-    BlockSnapshot {
+    Ok(BlockSnapshot {
         id,
         parent_id,
         role,
@@ -200,8 +216,9 @@ fn row_to_block(
         kind,
         content: row.content,
         collapsed: row.collapsed,
-        author: row.author,
+        compacted: false,
         created_at: row.created_at,
+        tool_kind: None,
         tool_name,
         tool_input,
         tool_call_id,
@@ -211,7 +228,9 @@ fn row_to_block(
         source_context: None, // TODO: persist drift metadata to DB if needed
         source_model: None,
         drift_kind: None,
-    }
+        file_path: None,
+        order_key: None,
+    })
 }
 
 impl ConversationDb {
@@ -244,7 +263,7 @@ impl ConversationDb {
         let (cell_id, version) = match doc {
             Some(d) => {
                 let snapshot = d.snapshot();
-                (snapshot.document_id.clone(), snapshot.version)
+                (snapshot.context_id.to_hex(), snapshot.version)
             }
             None => (conv.id.clone(), 0),
         };
@@ -337,7 +356,7 @@ impl ConversationDb {
     ) -> SqliteResult<()> {
         let row = block_to_row(block, order_idx);
 
-        // Insert base block row
+        // Insert base block row (author column = agent_id, derived from block.id.agent_id)
         tx.execute(
             "INSERT INTO blocks (
                 cell_id, agent_id, seq, order_idx,
@@ -357,7 +376,7 @@ impl ConversationDb {
                 row.kind,
                 row.content,
                 row.collapsed as i32,
-                row.author,
+                row.agent_id, // author = agent_id (no separate author field in BlockSnapshot)
                 row.created_at as i64,
             ],
         )?;
@@ -392,8 +411,8 @@ impl ConversationDb {
                             row.cell_id,
                             row.agent_id,
                             row.seq as i64,
-                            call_id.document_id,
-                            call_id.agent_id,
+                            call_id.context_id.to_hex(),
+                            call_id.agent_id.to_hex(),
                             call_id.seq as i64,
                             block.exit_code,
                             block.is_error as i32,
@@ -434,12 +453,14 @@ impl ConversationDb {
         let doc = if blocks.is_empty() {
             None
         } else {
+            let context_id = ContextId::parse(&cell_id)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
             let snapshot = DocumentSnapshot {
-                document_id: cell_id,
+                context_id,
                 blocks,
                 version: version as u64,
             };
-            Some(BlockDocument::from_snapshot(snapshot, "server"))
+            Some(BlockDocument::from_snapshot(snapshot, PrincipalId::system()))
         };
 
         // Load participants
@@ -483,7 +504,7 @@ impl ConversationDb {
                 kind: row.get(9)?,
                 content: row.get(10)?,
                 collapsed: row.get::<_, i32>(11)? != 0,
-                author: row.get(12)?,
+                // column 12 is `author` — skipped, derived from agent_id
                 created_at: row.get::<_, i64>(13)? as u64,
             })
         })?;
@@ -506,7 +527,7 @@ impl ConversationDb {
                 None
             };
 
-            blocks.push(row_to_block(row, tool_call, tool_result));
+            blocks.push(row_to_block(row, tool_call, tool_result)?);
         }
 
         Ok(blocks)
@@ -685,9 +706,9 @@ mod tests {
     use super::*;
 
     /// Helper: create a document with some messages.
-    fn create_test_doc(doc_id: &str) -> BlockDocument {
-        let mut doc = BlockDocument::new(doc_id, "test-agent");
-        doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!", "user:amy")
+    fn create_test_doc() -> BlockDocument {
+        let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
+        doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!")
             .unwrap();
         doc
     }
@@ -709,7 +730,7 @@ mod tests {
         let id = conv.id.clone();
 
         // Create a document with a message
-        let doc = create_test_doc(&id);
+        let doc = create_test_doc();
 
         // Save
         db.save(&conv, Some(&doc)).unwrap();
@@ -772,7 +793,7 @@ mod tests {
         conv.name = "Updated".to_string();
 
         // Create a document with a message
-        let doc = create_test_doc(&id);
+        let doc = create_test_doc();
         db.save(&conv, Some(&doc)).unwrap();
 
         let (loaded_conv, loaded_doc) = db.load(&id).unwrap().unwrap();
@@ -810,9 +831,9 @@ mod tests {
         let id = conv.id.clone();
 
         // Create document with a tool call
-        let mut doc = BlockDocument::new(&id, "test-agent");
+        let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"path": "/etc/hosts", "recursive": true});
-        doc.insert_tool_call(None, None, "read_file", tool_input.clone(), "model:claude")
+        doc.insert_tool_call(None, None, "read_file", tool_input.clone())
             .unwrap();
 
         db.save(&conv, Some(&doc)).unwrap();
@@ -837,10 +858,10 @@ mod tests {
         let id = conv.id.clone();
 
         // Create document with tool call and result
-        let mut doc = BlockDocument::new(&id, "test-agent");
+        let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"command": "ls -la"});
         let call_id = doc
-            .insert_tool_call(None, None, "bash", tool_input, "model:claude")
+            .insert_tool_call(None, None, "bash", tool_input)
             .unwrap();
         doc.insert_tool_result_block(
             &call_id,
@@ -848,7 +869,6 @@ mod tests {
             "total 4\ndrwxr-xr-x 2 user user 4096 Jan 1 00:00 .",
             false,
             Some(0),
-            "system",
         )
         .unwrap();
 
@@ -875,10 +895,10 @@ mod tests {
         let id = conv.id.clone();
 
         // Create document with tool call and error result
-        let mut doc = BlockDocument::new(&id, "test-agent");
+        let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"command": "cat /nonexistent"});
         let call_id = doc
-            .insert_tool_call(None, None, "bash", tool_input, "model:claude")
+            .insert_tool_call(None, None, "bash", tool_input)
             .unwrap();
         doc.insert_tool_result_block(
             &call_id,
@@ -886,7 +906,6 @@ mod tests {
             "cat: /nonexistent: No such file or directory",
             true,
             Some(1),
-            "system",
         )
         .unwrap();
 
@@ -911,14 +930,14 @@ mod tests {
         let id = conv.id.clone();
 
         // Create document with multiple blocks
-        let mut doc = BlockDocument::new(&id, "test-agent");
-        doc.insert_block(None, None, Role::User, BlockKind::Text, "First", "user:amy")
+        let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
+        doc.insert_block(None, None, Role::User, BlockKind::Text, "First")
             .unwrap();
-        let last = doc.blocks_ordered().last().map(|b| b.id.clone());
-        doc.insert_block(None, last.as_ref(), Role::Model, BlockKind::Text, "Second", "model:claude")
+        let last = doc.blocks_ordered().last().map(|b| b.id);
+        doc.insert_block(None, last.as_ref(), Role::Model, BlockKind::Text, "Second")
             .unwrap();
-        let last = doc.blocks_ordered().last().map(|b| b.id.clone());
-        doc.insert_block(None, last.as_ref(), Role::User, BlockKind::Text, "Third", "user:amy")
+        let last = doc.blocks_ordered().last().map(|b| b.id);
+        doc.insert_block(None, last.as_ref(), Role::User, BlockKind::Text, "Third")
             .unwrap();
 
         db.save(&conv, Some(&doc)).unwrap();

@@ -76,7 +76,7 @@ impl ExecutionEngine for EditEngine {
             return Ok(ExecResult::failure(1, "old_string and new_string are identical"));
         }
 
-        let (doc_id, block_id) = match self.cache.get_or_load(&p.path).await {
+        let (ctx_id, block_id) = match self.cache.get_or_load(&p.path).await {
             Ok(ids) => ids,
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
@@ -122,7 +122,7 @@ impl ExecutionEngine for EditEngine {
                 break;
             }
             if let Err(e) = store.edit_text(
-                &doc_id,
+                ctx_id,
                 &block_id,
                 offset,
                 &p.new_string,

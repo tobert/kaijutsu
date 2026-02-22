@@ -221,7 +221,8 @@ mod tests {
     use super::*;
 
     fn test_block_id() -> BlockId {
-        BlockId::new("test-doc", "test-agent", 1)
+        use kaijutsu_types::{ContextId, PrincipalId};
+        BlockId::new(ContextId::nil(), PrincipalId::system(), 1)
     }
 
     #[test]
@@ -324,7 +325,7 @@ mod tests {
     fn test_cursor_tracker_different_blocks() {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
-        let block2 = BlockId::new("other-cell", "test-agent", 2);
+        let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
 
         tracker.set_cursor("agent1", CursorPosition::new(block1.clone(), 10));
         tracker.set_cursor("agent2", CursorPosition::new(block2.clone(), 10));
@@ -362,7 +363,7 @@ mod tests {
     fn test_cursors_in_block() {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
-        let block2 = BlockId::new("other-cell", "test-agent", 2);
+        let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
 
         tracker.set_cursor("agent1", CursorPosition::new(block1.clone(), 10));
         tracker.set_cursor("agent2", CursorPosition::new(block1.clone(), 20));

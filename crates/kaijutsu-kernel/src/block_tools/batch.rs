@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kaijutsu_crdt::BlockId;
+use kaijutsu_crdt::{BlockId, ContextId};
 use parking_lot::Mutex;
 
 use crate::block_store::SharedBlockStore;
@@ -37,8 +37,8 @@ impl Default for BatchConfig {
 /// Buffer for a single block's pending appends.
 #[derive(Debug)]
 struct AppendBuffer {
-    /// The cell containing this block.
-    cell_id: String,
+    /// The context containing this block.
+    context_id: ContextId,
     /// The block being appended to.
     block_id: BlockId,
     /// Buffered text waiting to be flushed.
@@ -48,9 +48,9 @@ struct AppendBuffer {
 }
 
 impl AppendBuffer {
-    fn new(cell_id: String, block_id: BlockId) -> Self {
+    fn new(context_id: ContextId, block_id: BlockId) -> Self {
         Self {
-            cell_id,
+            context_id,
             block_id,
             buffer: String::new(),
             last_flush: Instant::now(),
@@ -110,7 +110,7 @@ impl AppendBatcher {
     /// Append text to a block, potentially batching it.
     ///
     /// Returns `true` if text was flushed to the CRDT, `false` if buffered.
-    pub async fn append(&self, cell_id: &str, block_id: &BlockId, text: &str) -> bool {
+    pub async fn append(&self, context_id: ContextId, block_id: &BlockId, text: &str) -> bool {
         let key = block_id.to_key();
         let should_flush;
 
@@ -118,7 +118,7 @@ impl AppendBatcher {
             let mut buffers = self.buffers.lock();
             let buffer = buffers
                 .entry(key.clone())
-                .or_insert_with(|| AppendBuffer::new(cell_id.to_string(), block_id.clone()));
+                .or_insert_with(|| AppendBuffer::new(context_id, block_id.clone()));
 
             buffer.buffer.push_str(text);
             should_flush = buffer.should_flush(&self.config);
@@ -138,21 +138,21 @@ impl AppendBatcher {
             let mut buffers = self.buffers.lock();
             if let Some(buffer) = buffers.get_mut(block_key) {
                 let content = buffer.take();
-                let cell_id = buffer.cell_id.clone();
+                let context_id = buffer.context_id;
                 let block_id = buffer.block_id.clone();
                 if content.is_empty() {
                     None
                 } else {
-                    Some((cell_id, block_id, content))
+                    Some((context_id, block_id, content))
                 }
             } else {
                 None
             }
         };
 
-        if let Some((cell_id, block_id, content)) = buffer_content {
+        if let Some((context_id, block_id, content)) = buffer_content {
             // Append to the CRDT
-            let _ = self.documents.append_text(&cell_id, &block_id, &content);
+            let _ = self.documents.append_text(context_id, &block_id, &content);
         }
     }
 
@@ -214,44 +214,51 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
     use crate::db::DocumentKind;
-    use kaijutsu_crdt::{BlockKind, Role};
+    use kaijutsu_crdt::{BlockKind, PrincipalId, Role};
 
-    fn setup_test_store() -> SharedBlockStore {
-        let store = shared_block_store("test-agent");
-        store.create_document("test-doc".into(), DocumentKind::Code, Some("rust".into())).unwrap();
-        store
+    fn test_context_id() -> ContextId {
+        let uuid = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            b"kaijutsu:test:batch",
+        );
+        ContextId::from_bytes(*uuid.as_bytes())
+    }
+
+    fn setup_test_store() -> (SharedBlockStore, ContextId) {
+        let store = shared_block_store(PrincipalId::system());
+        let ctx_id = test_context_id();
+        store.create_document(ctx_id, DocumentKind::Code, Some("rust".into())).unwrap();
+        (store, ctx_id)
     }
 
     #[tokio::test]
     async fn test_batch_on_newline() {
-        let cells = setup_test_store();
-        let cell_id = "test-doc";
+        let (cells, ctx_id) = setup_test_store();
 
         // Create a block
-        let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 
         let batcher = AppendBatcher::new(cells.clone());
 
         // Append without newline - should buffer
-        let flushed = batcher.append(cell_id, &block_id, "hello ").await;
+        let flushed = batcher.append(ctx_id, &block_id, "hello ").await;
         assert!(!flushed, "should buffer without newline");
 
         // Append with newline - should flush
-        let flushed = batcher.append(cell_id, &block_id, "world\n").await;
+        let flushed = batcher.append(ctx_id, &block_id, "world\n").await;
         assert!(flushed, "should flush on newline");
 
         // Check content was written
-        let entry = cells.get(cell_id).unwrap();
+        let entry = cells.get(ctx_id).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "hello world\n");
     }
 
     #[tokio::test]
     async fn test_batch_on_size() {
-        let cells = setup_test_store();
-        let cell_id = "test-doc";
+        let (cells, ctx_id) = setup_test_store();
 
-        let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 
         // Config with small buffer, no newline flush
         let config = BatchConfig {
@@ -262,25 +269,24 @@ mod tests {
         let batcher = AppendBatcher::with_config(cells.clone(), config);
 
         // Append small text - should buffer
-        let flushed = batcher.append(cell_id, &block_id, "12345").await;
+        let flushed = batcher.append(ctx_id, &block_id, "12345").await;
         assert!(!flushed);
 
         // Append more to exceed limit - should flush
-        let flushed = batcher.append(cell_id, &block_id, "67890").await;
+        let flushed = batcher.append(ctx_id, &block_id, "67890").await;
         assert!(flushed);
 
-        let entry = cells.get(cell_id).unwrap();
+        let entry = cells.get(ctx_id).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "1234567890");
     }
 
     #[tokio::test]
     async fn test_flush_all() {
-        let cells = setup_test_store();
-        let cell_id = "test-doc";
+        let (cells, ctx_id) = setup_test_store();
 
-        let block1 = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
-        let block2 = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block1 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block2 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 
         // Config that never auto-flushes
         let config = BatchConfig {
@@ -291,12 +297,12 @@ mod tests {
         let batcher = AppendBatcher::with_config(cells.clone(), config);
 
         // Buffer to both blocks
-        batcher.append(cell_id, &block1, "block1 content").await;
-        batcher.append(cell_id, &block2, "block2 content").await;
+        batcher.append(ctx_id, &block1, "block1 content").await;
+        batcher.append(ctx_id, &block2, "block2 content").await;
 
         // Check nothing written yet
         {
-            let entry = cells.get(cell_id).unwrap();
+            let entry = cells.get(ctx_id).unwrap();
             let snap1 = entry.doc.get_block_snapshot(&block1).unwrap();
             let snap2 = entry.doc.get_block_snapshot(&block2).unwrap();
             assert_eq!(snap1.content, "");
@@ -308,7 +314,7 @@ mod tests {
 
         // Now content should be there
         {
-            let entry = cells.get(cell_id).unwrap();
+            let entry = cells.get(ctx_id).unwrap();
             let snap1 = entry.doc.get_block_snapshot(&block1).unwrap();
             let snap2 = entry.doc.get_block_snapshot(&block2).unwrap();
             assert_eq!(snap1.content, "block1 content");
@@ -318,15 +324,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_removes_buffer() {
-        let cells = setup_test_store();
-        let cell_id = "test-doc";
+        let (cells, ctx_id) = setup_test_store();
 
-        let block_id = cells.insert_block(cell_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
 
         let batcher = AppendBatcher::new(cells.clone());
 
         // Buffer some content
-        batcher.append(cell_id, &block_id, "content").await;
+        batcher.append(ctx_id, &block_id, "content").await;
         assert_eq!(batcher.stats().active_buffers, 1);
 
         // Finalize
@@ -334,14 +339,14 @@ mod tests {
         assert_eq!(batcher.stats().active_buffers, 0);
 
         // Content should be written
-        let entry = cells.get(cell_id).unwrap();
+        let entry = cells.get(ctx_id).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "content");
     }
 
     #[test]
     fn test_stats() {
-        let cells = shared_block_store("test-agent");
+        let cells = shared_block_store(PrincipalId::system());
         let batcher = AppendBatcher::new(cells);
 
         let stats = batcher.stats();

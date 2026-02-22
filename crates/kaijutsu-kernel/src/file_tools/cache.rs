@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kaijutsu_crdt::{BlockId, BlockKind, Role};
+use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;
@@ -20,8 +20,10 @@ const DEFAULT_MAX_CACHED: usize = 64;
 
 /// A cached file backed by a CRDT document.
 struct CachedFileDoc {
-    /// Document ID in the BlockStore (format: "file:{path}").
-    document_id: String,
+    /// Deterministic ContextId derived from the file path.
+    context_id: ContextId,
+    /// Original file path (needed for flushing back to VFS).
+    path: String,
     /// The single block holding file content.
     block_id: BlockId,
     /// Whether this file has been edited since last flush.
@@ -36,7 +38,7 @@ struct CachedFileDoc {
 /// `BlockKind::Text` block. Edits go through the CRDT, enabling
 /// concurrent modification with proper conflict resolution.
 pub struct FileDocumentCache {
-    cache: RwLock<HashMap<String, CachedFileDoc>>,
+    cache: RwLock<HashMap<ContextId, CachedFileDoc>>,
     block_store: SharedBlockStore,
     vfs: Arc<MountTable>,
     max_cached: usize,
@@ -53,16 +55,16 @@ impl FileDocumentCache {
         }
     }
 
-    /// Get the document_id and block_id for a path, loading from VFS on cache miss.
-    pub async fn get_or_load(&self, path: &str) -> Result<(String, BlockId), String> {
-        let doc_id = file_doc_id(path);
+    /// Get the context_id and block_id for a path, loading from VFS on cache miss.
+    pub async fn get_or_load(&self, path: &str) -> Result<(ContextId, BlockId), String> {
+        let ctx_id = file_context_id(path);
 
         // Fast path: already cached
         {
             let mut cache = self.cache.write();
-            if let Some(entry) = cache.get_mut(&doc_id) {
+            if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.last_access = Instant::now();
-                return Ok((entry.document_id.clone(), entry.block_id.clone()));
+                return Ok((entry.context_id, entry.block_id.clone()));
             }
         }
 
@@ -83,11 +85,11 @@ impl FileDocumentCache {
         // Create CRDT document — handle race where another thread loaded it first
         let block_id = match self
             .block_store
-            .create_document(doc_id.clone(), DocumentKind::Code, language)
+            .create_document(ctx_id, DocumentKind::Code, language)
         {
             Ok(()) => {
                 self.block_store
-                    .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, text)
+                    .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, text)
                     .map_err(|e| format!("failed to insert block for {}: {}", path, e))?
             }
             Err(_) => {
@@ -95,15 +97,15 @@ impl FileDocumentCache {
                 // then fall back to fetching the existing block from the store.
                 {
                     let mut cache = self.cache.write();
-                    if let Some(entry) = cache.get_mut(&doc_id) {
+                    if let Some(entry) = cache.get_mut(&ctx_id) {
                         entry.last_access = Instant::now();
-                        return Ok((entry.document_id.clone(), entry.block_id.clone()));
+                        return Ok((entry.context_id, entry.block_id.clone()));
                     }
                 }
                 // Not in cache yet — the other thread hasn't inserted. Grab from store.
                 let snapshots = self
                     .block_store
-                    .block_snapshots(&doc_id)
+                    .block_snapshots(ctx_id)
                     .map_err(|e| format!("failed to read existing doc {}: {}", path, e))?;
                 snapshots
                     .first()
@@ -117,9 +119,10 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             self.evict_if_needed(&mut cache);
             cache.insert(
-                doc_id.clone(),
+                ctx_id,
                 CachedFileDoc {
-                    document_id: doc_id.clone(),
+                    context_id: ctx_id,
+                    path: path.to_string(),
                     block_id: block_id.clone(),
                     dirty: false,
                     last_access: Instant::now(),
@@ -127,16 +130,16 @@ impl FileDocumentCache {
             );
         }
 
-        Ok((doc_id, block_id))
+        Ok((ctx_id, block_id))
     }
 
     /// Read the current content of a file (reflects any CRDT edits).
     pub async fn read_content(&self, path: &str) -> Result<String, String> {
-        let (doc_id, block_id) = self.get_or_load(path).await?;
+        let (ctx_id, block_id) = self.get_or_load(path).await?;
 
         let snapshots = self
             .block_store
-            .block_snapshots(&doc_id)
+            .block_snapshots(ctx_id)
             .map_err(|e| format!("failed to read {}: {}", path, e))?;
 
         snapshots
@@ -151,16 +154,16 @@ impl FileDocumentCache {
         &self,
         path: &str,
         content: &str,
-    ) -> Result<(String, BlockId), String> {
-        let doc_id = file_doc_id(path);
+    ) -> Result<(ContextId, BlockId), String> {
+        let ctx_id = file_context_id(path);
 
         // If doc exists, replace its content with a full splice
         {
             let cache = self.cache.read();
-            if let Some(entry) = cache.get(&doc_id) {
+            if let Some(entry) = cache.get(&ctx_id) {
                 let old_content = self
                     .block_store
-                    .block_snapshots(&doc_id)
+                    .block_snapshots(ctx_id)
                     .ok()
                     .and_then(|snaps| {
                         snaps
@@ -171,14 +174,14 @@ impl FileDocumentCache {
                     .unwrap_or_default();
 
                 self.block_store.edit_text(
-                    &doc_id,
+                    ctx_id,
                     &entry.block_id,
                     0,
                     content,
                     old_content.len(),
                 )?;
 
-                return Ok((entry.document_id.clone(), entry.block_id.clone()));
+                return Ok((entry.context_id, entry.block_id.clone()));
             }
         }
 
@@ -188,35 +191,32 @@ impl FileDocumentCache {
 
     /// Mark a file as dirty (needs flush to VFS).
     pub fn mark_dirty(&self, path: &str) {
-        let doc_id = file_doc_id(path);
+        let ctx_id = file_context_id(path);
         let mut cache = self.cache.write();
-        if let Some(entry) = cache.get_mut(&doc_id) {
+        if let Some(entry) = cache.get_mut(&ctx_id) {
             entry.dirty = true;
         }
     }
 
     /// Flush all dirty files back to the VFS.
     pub async fn flush_dirty(&self) -> Result<usize, String> {
-        let dirty_paths: Vec<(String, String, BlockId)> = {
+        let dirty_entries: Vec<(String, ContextId, BlockId)> = {
             let cache = self.cache.read();
             cache
                 .values()
                 .filter(|e| e.dirty)
-                .map(|e| {
-                    let path = e.document_id.strip_prefix("file:").unwrap_or(&e.document_id);
-                    (path.to_string(), e.document_id.clone(), e.block_id.clone())
-                })
+                .map(|e| (e.path.clone(), e.context_id, e.block_id.clone()))
                 .collect()
         };
 
         let mut flushed = 0;
         let mut errors: Vec<String> = Vec::new();
-        let mut succeeded_doc_ids: Vec<String> = Vec::new();
+        let mut succeeded_ctx_ids: Vec<ContextId> = Vec::new();
 
-        for (path, doc_id, block_id) in &dirty_paths {
+        for (path, ctx_id, block_id) in &dirty_entries {
             let content = self
                 .block_store
-                .block_snapshots(doc_id)
+                .block_snapshots(*ctx_id)
                 .ok()
                 .and_then(|snaps| {
                     snaps
@@ -232,7 +232,7 @@ impl FileDocumentCache {
             {
                 Ok(()) => {
                     flushed += 1;
-                    succeeded_doc_ids.push(doc_id.clone());
+                    succeeded_ctx_ids.push(*ctx_id);
                 }
                 Err(e) => {
                     errors.push(format!("failed to flush {}: {}", path, e));
@@ -243,8 +243,8 @@ impl FileDocumentCache {
         // Only clear dirty flags for files that were successfully flushed
         {
             let mut cache = self.cache.write();
-            for doc_id in &succeeded_doc_ids {
-                if let Some(entry) = cache.get_mut(doc_id) {
+            for ctx_id in &succeeded_ctx_ids {
+                if let Some(entry) = cache.get_mut(ctx_id) {
                     entry.dirty = false;
                 }
             }
@@ -253,16 +253,16 @@ impl FileDocumentCache {
         if errors.is_empty() {
             Ok(flushed)
         } else {
-            Err(format!("flush_dirty: {}/{} failed: {}", errors.len(), dirty_paths.len(), errors.join("; ")))
+            Err(format!("flush_dirty: {}/{} failed: {}", errors.len(), dirty_entries.len(), errors.join("; ")))
         }
     }
 
     /// Flush a single file back to the VFS.
     pub async fn flush_one(&self, path: &str) -> Result<(), String> {
-        let doc_id = file_doc_id(path);
+        let ctx_id = file_context_id(path);
         let block_id = {
             let cache = self.cache.read();
-            match cache.get(&doc_id) {
+            match cache.get(&ctx_id) {
                 Some(entry) if entry.dirty => entry.block_id.clone(),
                 Some(_) => return Ok(()), // not dirty
                 None => return Ok(()),    // not cached
@@ -271,7 +271,7 @@ impl FileDocumentCache {
 
         let content = self
             .block_store
-            .block_snapshots(&doc_id)
+            .block_snapshots(ctx_id)
             .ok()
             .and_then(|snaps| {
                 snaps
@@ -288,7 +288,7 @@ impl FileDocumentCache {
 
         {
             let mut cache = self.cache.write();
-            if let Some(entry) = cache.get_mut(&doc_id) {
+            if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.dirty = false;
             }
         }
@@ -311,26 +311,27 @@ impl FileDocumentCache {
         &self,
         path: &str,
         content: &str,
-    ) -> Result<(String, BlockId), String> {
-        let doc_id = file_doc_id(path);
+    ) -> Result<(ContextId, BlockId), String> {
+        let ctx_id = file_context_id(path);
         let language = detect_language(path);
 
         self.block_store
-            .create_document(doc_id.clone(), DocumentKind::Code, language)
+            .create_document(ctx_id, DocumentKind::Code, language)
             .map_err(|e| format!("failed to create document for {}: {}", path, e))?;
 
         let block_id = self
             .block_store
-            .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, content)
+            .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, content)
             .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
 
         {
             let mut cache = self.cache.write();
             self.evict_if_needed(&mut cache);
             cache.insert(
-                doc_id.clone(),
+                ctx_id,
                 CachedFileDoc {
-                    document_id: doc_id.clone(),
+                    context_id: ctx_id,
+                    path: path.to_string(),
                     block_id: block_id.clone(),
                     dirty: false,
                     last_access: Instant::now(),
@@ -338,12 +339,12 @@ impl FileDocumentCache {
             );
         }
 
-        Ok((doc_id, block_id))
+        Ok((ctx_id, block_id))
     }
 
     /// Evict oldest clean entries if cache exceeds max size.
     /// Dirty entries are never evicted — they must be flushed first.
-    fn evict_if_needed(&self, cache: &mut HashMap<String, CachedFileDoc>) {
+    fn evict_if_needed(&self, cache: &mut HashMap<ContextId, CachedFileDoc>) {
         while cache.len() >= self.max_cached {
             // Find oldest non-dirty entry
             let oldest_clean = cache
@@ -368,9 +369,16 @@ impl FileDocumentCache {
     }
 }
 
-/// Build the document ID for a file path.
-fn file_doc_id(path: &str) -> String {
-    format!("file:{}", path)
+/// Derive a deterministic ContextId from a file path.
+///
+/// File documents aren't real contexts, but BlockStore is keyed by ContextId.
+/// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
+fn file_context_id(path: &str) -> ContextId {
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("kaijutsu:file:{}", path).as_bytes(),
+    );
+    ContextId::from_bytes(*uuid.as_bytes())
 }
 
 /// Detect programming language from file extension.
@@ -414,9 +422,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_file_doc_id() {
-        assert_eq!(file_doc_id("src/main.rs"), "file:src/main.rs");
-        assert_eq!(file_doc_id("/mnt/project/lib.rs"), "file:/mnt/project/lib.rs");
+    fn test_file_context_id_deterministic() {
+        let id1 = file_context_id("src/main.rs");
+        let id2 = file_context_id("src/main.rs");
+        assert_eq!(id1, id2, "same path should produce same ContextId");
+
+        let id3 = file_context_id("/mnt/project/lib.rs");
+        assert_ne!(id1, id3, "different paths should produce different ContextIds");
     }
 
     #[test]

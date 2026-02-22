@@ -25,9 +25,9 @@
 //!
 //! # Document Naming
 //!
-//! Config documents use the prefix `config:`:
-//! - `config:theme.rhai` — Base theme
-//! - `config:llm.rhai` — LLM provider configuration
+//! Config documents are keyed by deterministic `ContextId`s derived from config
+//! paths via UUIDv5 (e.g., `"theme.rhai"` -> stable ContextId). These are not
+//! real contexts but use the same storage infrastructure.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -37,11 +37,20 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use kaijutsu_crdt::{BlockId, BlockKind, Role};
+use kaijutsu_crdt::{BlockId, BlockKind, ContextId, PrincipalId, Role};
 
 use crate::block_store::SharedBlockStore;
 use crate::db::DocumentKind;
 use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
+
+/// Derive a deterministic ContextId from a config path.
+///
+/// Config documents aren't real contexts, but BlockStore is keyed by ContextId.
+/// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
+fn config_context_id(path: &str) -> ContextId {
+    let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, format!("kaijutsu:config:{}", path).as_bytes());
+    ContextId::from_bytes(*uuid.as_bytes())
+}
 
 /// Embedded default theme content.
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.rhai");
@@ -190,6 +199,8 @@ pub struct ConfigCrdtBackend {
     config_flows: Option<SharedConfigFlowBus>,
     /// In-progress flush paths (to prevent echo loops).
     flushing: DashMap<String, ()>,
+    /// Reverse map: config path -> ContextId (for list_configs).
+    config_paths: DashMap<String, ContextId>,
 }
 
 impl ConfigCrdtBackend {
@@ -205,6 +216,7 @@ impl ConfigCrdtBackend {
             watcher_event_rx: RwLock::new(Some(rx)),
             config_flows: None,
             flushing: DashMap::new(),
+            config_paths: DashMap::new(),
         }
     }
 
@@ -224,6 +236,7 @@ impl ConfigCrdtBackend {
             watcher_event_rx: RwLock::new(Some(rx)),
             config_flows: Some(config_flows),
             flushing: DashMap::new(),
+            config_paths: DashMap::new(),
         }
     }
 
@@ -232,15 +245,22 @@ impl ConfigCrdtBackend {
         &self.config_root
     }
 
-    /// Document ID for a config path.
-    fn doc_id(&self, path: &str) -> String {
-        format!("config:{}", path)
+    /// Deterministic ContextId for a config path.
+    ///
+    /// Config documents aren't real contexts, but BlockStore is keyed by ContextId.
+    /// Returns a deterministic UUID derived from the path so the same config file
+    /// always maps to the same ID.
+    fn context_id(&self, path: &str) -> ContextId {
+        let ctx = config_context_id(path);
+        // Record the mapping for list_configs()
+        self.config_paths.insert(path.to_string(), ctx);
+        ctx
     }
 
     /// Block ID for a config file (one block per config file).
-    fn block_id(&self, doc_id: &str) -> BlockId {
-        // Use a stable identifier - config files have a single block
-        BlockId::new(doc_id, "config", 0)
+    fn block_id(&self) -> BlockId {
+        // Config blocks use nil context + system principal — they aren't real context blocks
+        BlockId::new(ContextId::nil(), PrincipalId::system(), 0)
     }
 
     /// Emit a ConfigFlow event.
@@ -254,10 +274,10 @@ impl ConfigCrdtBackend {
     ///
     /// Returns the source from which the config was loaded.
     pub async fn ensure_config(&self, path: &str) -> Result<ConfigSource, ConfigError> {
-        let doc_id = self.doc_id(path);
+        let ctx = self.context_id(path);
 
         // Check if already loaded in CRDT
-        if self.blocks.contains(&doc_id) {
+        if self.blocks.contains(ctx) {
             tracing::debug!(path = %path, "config already loaded");
             return Ok(ConfigSource::Crdt);
         }
@@ -285,13 +305,13 @@ impl ConfigCrdtBackend {
 
         // Create CRDT document with content
         self.blocks
-            .create_document(doc_id.clone(), DocumentKind::Config, None)
+            .create_document(ctx, DocumentKind::Config, None)
             .map_err(|e| ConfigError::Crdt(e))?;
 
         // Insert content as a single block
         self.blocks
             .insert_block(
-                &doc_id,
+                ctx,
                 None, // no parent
                 None, // at end
                 Role::System,
@@ -326,7 +346,7 @@ impl ConfigCrdtBackend {
     ///
     /// This is the safety valve for when CRDT gets into a bad state.
     pub async fn reload_from_disk(&self, path: &str) -> Result<(), ConfigError> {
-        let doc_id = self.doc_id(path);
+        let ctx = self.context_id(path);
         let disk_path = self.config_root.join(path);
 
         if !disk_path.exists() {
@@ -336,16 +356,16 @@ impl ConfigCrdtBackend {
         let content = tokio::fs::read_to_string(&disk_path).await?;
 
         // Get or create document
-        if !self.blocks.contains(&doc_id) {
+        if !self.blocks.contains(ctx) {
             self.blocks
-                .create_document(doc_id.clone(), DocumentKind::Config, None)
+                .create_document(ctx, DocumentKind::Config, None)
                 .map_err(|e| ConfigError::Crdt(e))?;
         }
 
-        let block_id = self.block_id(&doc_id);
+        let block_id = self.block_id();
 
         // Check if block exists
-        let block_exists = if let Some(entry) = self.blocks.get(&doc_id) {
+        let block_exists = if let Some(entry) = self.blocks.get(ctx) {
             entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
         } else {
             false
@@ -354,7 +374,7 @@ impl ConfigCrdtBackend {
         if block_exists {
             // Replace content
             let current_len = {
-                let entry = self.blocks.get(&doc_id).unwrap();
+                let entry = self.blocks.get(ctx).unwrap();
                 let blocks = entry.doc.blocks_ordered();
                 blocks
                     .iter()
@@ -364,12 +384,12 @@ impl ConfigCrdtBackend {
             };
 
             self.blocks
-                .edit_text(&doc_id, &block_id, 0, &content, current_len)
+                .edit_text(ctx, &block_id, 0, &content, current_len)
                 .map_err(|e| ConfigError::Crdt(e))?;
         } else {
             // Create new block
             self.blocks
-                .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, &content)
+                .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content)
                 .map_err(|e| ConfigError::Crdt(e))?;
         }
 
@@ -390,18 +410,18 @@ impl ConfigCrdtBackend {
             .get_default_content(path)
             .ok_or_else(|| ConfigError::NotFound(format!("no default for {}", path)))?;
 
-        let doc_id = self.doc_id(path);
-        let block_id = self.block_id(&doc_id);
+        let ctx = self.context_id(path);
+        let block_id = self.block_id();
 
         // Get or create document
-        if !self.blocks.contains(&doc_id) {
+        if !self.blocks.contains(ctx) {
             self.blocks
-                .create_document(doc_id.clone(), DocumentKind::Config, None)
+                .create_document(ctx, DocumentKind::Config, None)
                 .map_err(|e| ConfigError::Crdt(e))?;
         }
 
         // Check if block exists
-        let block_exists = if let Some(entry) = self.blocks.get(&doc_id) {
+        let block_exists = if let Some(entry) = self.blocks.get(ctx) {
             entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
         } else {
             false
@@ -410,7 +430,7 @@ impl ConfigCrdtBackend {
         if block_exists {
             // Replace content
             let current_len = {
-                let entry = self.blocks.get(&doc_id).unwrap();
+                let entry = self.blocks.get(ctx).unwrap();
                 let blocks = entry.doc.blocks_ordered();
                 blocks
                     .iter()
@@ -420,13 +440,13 @@ impl ConfigCrdtBackend {
             };
 
             self.blocks
-                .edit_text(&doc_id, &block_id, 0, &default_content, current_len)
+                .edit_text(ctx, &block_id, 0, &default_content, current_len)
                 .map_err(|e| ConfigError::Crdt(e))?;
         } else {
             // Create new block
             self.blocks
                 .insert_block(
-                    &doc_id,
+                    ctx,
                     None,
                     None,
                     Role::System,
@@ -456,11 +476,11 @@ impl ConfigCrdtBackend {
     ///
     /// Config documents have a single block containing the entire file content.
     pub fn get_content(&self, path: &str) -> Result<String, ConfigError> {
-        let doc_id = self.doc_id(path);
+        let ctx = self.context_id(path);
 
         let entry = self
             .blocks
-            .get(&doc_id)
+            .get(ctx)
             .ok_or_else(|| ConfigError::NotFound(path.to_string()))?;
 
         // Config documents have a single block - get the first one
@@ -555,16 +575,10 @@ impl ConfigCrdtBackend {
 
     /// List all loaded config documents.
     pub fn list_configs(&self) -> Vec<String> {
-        self.blocks
-            .list_ids()
-            .into_iter()
-            .filter_map(|id| {
-                if id.starts_with("config:") {
-                    Some(id.strip_prefix("config:").unwrap().to_string())
-                } else {
-                    None
-                }
-            })
+        self.config_paths
+            .iter()
+            .filter(|entry| self.blocks.contains(*entry.value()))
+            .map(|entry| entry.key().clone())
             .collect()
     }
 
@@ -688,8 +702,8 @@ impl ConfigCrdtBackend {
 
     /// Sync an external config file change to CRDT.
     async fn sync_external_change(&self, event: &ConfigFileChange) -> Result<(), ConfigError> {
-        let doc_id = self.doc_id(&event.path);
-        let block_id = self.block_id(&doc_id);
+        let ctx = self.context_id(&event.path);
+        let block_id = self.block_id();
 
         match event.kind {
             ConfigChangeKind::Created | ConfigChangeKind::Modified => {
@@ -702,14 +716,14 @@ impl ConfigCrdtBackend {
                 };
 
                 // Get or create document
-                if !self.blocks.contains(&doc_id) {
+                if !self.blocks.contains(ctx) {
                     self.blocks
-                        .create_document(doc_id.clone(), DocumentKind::Config, None)
+                        .create_document(ctx, DocumentKind::Config, None)
                         .map_err(|e| ConfigError::Crdt(e))?;
                 }
 
                 // Check if block exists
-                let block_exists = if let Some(entry) = self.blocks.get(&doc_id) {
+                let block_exists = if let Some(entry) = self.blocks.get(ctx) {
                     entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
                 } else {
                     false
@@ -718,7 +732,7 @@ impl ConfigCrdtBackend {
                 if block_exists {
                     // Replace content
                     let current_len = {
-                        let entry = self.blocks.get(&doc_id).unwrap();
+                        let entry = self.blocks.get(ctx).unwrap();
                         let blocks = entry.doc.blocks_ordered();
                         blocks
                             .iter()
@@ -728,12 +742,12 @@ impl ConfigCrdtBackend {
                     };
 
                     self.blocks
-                        .edit_text(&doc_id, &block_id, 0, &content, current_len)
+                        .edit_text(ctx, &block_id, 0, &content, current_len)
                         .map_err(|e| ConfigError::Crdt(e))?;
                 } else {
                     // Create new block
                     self.blocks
-                        .insert_block(&doc_id, None, None, Role::System, BlockKind::Text, &content)
+                        .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content)
                         .map_err(|e| ConfigError::Crdt(e))?;
                 }
 
@@ -764,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_config_creates_default() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks.clone(), temp_dir.path().to_path_buf());
 
@@ -775,9 +789,9 @@ mod tests {
         assert_eq!(source, ConfigSource::Default);
 
         // Check if document was created
-        let doc_id = backend.doc_id("theme.rhai");
-        println!("doc_id: {}", doc_id);
-        println!("documents exist: {}", blocks.contains(&doc_id));
+        let ctx = backend.context_id("theme.rhai");
+        println!("context_id: {}", ctx.to_hex());
+        println!("documents exist: {}", blocks.contains(ctx));
 
         // Should now be in CRDT
         let content_result = backend.get_content("theme.rhai");
@@ -791,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_from_disk() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
@@ -811,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_to_default() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
@@ -830,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_validation_rhai() {
-        let blocks = shared_block_store("test");
+        let blocks = shared_block_store(PrincipalId::system());
         let temp_dir = tempfile::TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
@@ -845,16 +859,15 @@ mod tests {
     }
 
     #[test]
-    fn test_doc_id() {
-        let blocks = shared_block_store("test");
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
+    fn test_context_id_deterministic() {
+        // Same path always produces the same ContextId
+        let id1 = config_context_id("theme.rhai");
+        let id2 = config_context_id("theme.rhai");
+        assert_eq!(id1, id2);
 
-        assert_eq!(backend.doc_id("theme.rhai"), "config:theme.rhai");
-        assert_eq!(
-            backend.doc_id("seats/amy-desktop.rhai"),
-            "config:seats/amy-desktop.rhai"
-        );
+        // Different paths produce different ContextIds
+        let id3 = config_context_id("llm.rhai");
+        assert_ne!(id1, id3);
     }
 
     #[test]

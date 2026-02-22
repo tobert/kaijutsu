@@ -25,6 +25,7 @@ use crate::db::DocumentKind;
 use crate::tools::{ExecResult, ExecutionEngine};
 use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role};
+use kaijutsu_types::ContextId;
 use rhai::{Dynamic, Engine, Scope};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,12 +93,12 @@ impl RhaiEngine {
                 _ => DocumentKind::Code,
             };
 
-            let id = uuid::Uuid::new_v4().to_string();
+            let ctx = ContextId::new();
 
-            match store_create.create_document(id.clone(), doc_kind, None) {
+            match store_create.create_document(ctx, doc_kind, None) {
                 Ok(_) => {
-                    debug!("Rhai: created document {} ({:?})", id, doc_kind);
-                    id
+                    debug!("Rhai: created document {} ({:?})", ctx, doc_kind);
+                    ctx.to_string()
                 }
                 Err(e) => {
                     warn!("Rhai: failed to create document: {}", e);
@@ -108,7 +109,11 @@ impl RhaiEngine {
 
         // get_content(cell_id: &str) -> String
         engine.register_fn("get_content", move |cell_id: String| -> String {
-            match store_get.get(&cell_id) {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: get_content invalid cell_id: {}", cell_id);
+                return String::new();
+            };
+            match store_get.get(ctx) {
                 Some(doc) => {
                     let content = doc.content();
                     debug!("Rhai: get_content({}) -> {} chars", cell_id, content.len());
@@ -123,9 +128,14 @@ impl RhaiEngine {
 
         // set_content(cell_id: &str, content: &str)
         engine.register_fn("set_content", move |cell_id: String, content: String| {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: set_content invalid cell_id: {}", cell_id);
+                return;
+            };
+
             // Get block IDs to delete
             let block_ids: Vec<_> = store_set
-                .get(&cell_id)
+                .get(ctx)
                 .map(|cell| {
                     cell.doc
                         .blocks_ordered()
@@ -137,12 +147,12 @@ impl RhaiEngine {
 
             // Delete all existing blocks
             for id in block_ids {
-                let _ = store_set.delete_block(&cell_id, &id);
+                let _ = store_set.delete_block(ctx, &id);
             }
 
             // Insert new content as a single text block
             if !content.is_empty() {
-                match store_set.insert_block(&cell_id, None, None, Role::User, BlockKind::Text, &content) {
+                match store_set.insert_block(ctx, None, None, Role::User, BlockKind::Text, &content) {
                     Ok(_) => {
                         debug!("Rhai: set_content({}, {} chars)", cell_id, content.len());
                     }
@@ -158,7 +168,7 @@ impl RhaiEngine {
             let ids: rhai::Array = store_list
                 .list_ids()
                 .into_iter()
-                .map(Dynamic::from)
+                .map(|ctx| Dynamic::from(ctx.to_string()))
                 .collect();
             debug!("Rhai: cells() -> {} cells", ids.len());
             ids
@@ -167,7 +177,11 @@ impl RhaiEngine {
         // delete_cell(cell_id: &str) -> bool
         // Note: Keeps old function name for Rhai script compatibility
         engine.register_fn("delete_cell", move |cell_id: String| -> bool {
-            match store_delete.delete_document(&cell_id) {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: delete_cell invalid cell_id: {}", cell_id);
+                return false;
+            };
+            match store_delete.delete_document(ctx) {
                 Ok(()) => {
                     debug!("Rhai: delete_cell({}) -> success", cell_id);
                     true
@@ -181,7 +195,11 @@ impl RhaiEngine {
 
         // get_kind(cell_id) -> String
         engine.register_fn("get_kind", move |cell_id: String| -> String {
-            match store_kind.get(&cell_id) {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: get_kind invalid cell_id: {}", cell_id);
+                return String::new();
+            };
+            match store_kind.get(ctx) {
                 Some(doc) => doc.kind.as_str().to_string(),
                 None => String::new(),
             }
@@ -189,7 +207,11 @@ impl RhaiEngine {
 
         // cell_len(cell_id) -> i64
         engine.register_fn("cell_len", move |cell_id: String| -> i64 {
-            match store_len.get(&cell_id) {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: cell_len invalid cell_id: {}", cell_id);
+                return -1;
+            };
+            match store_len.get(ctx) {
                 Some(doc) => doc.content().len() as i64,
                 None => -1,
             }
@@ -211,6 +233,11 @@ impl RhaiEngine {
         engine.register_fn(
             "insert_block",
             move |cell_id: String, after_id: String, kind: String, content: String| -> String {
+                let Ok(ctx) = ContextId::parse(&cell_id) else {
+                    warn!("Rhai: insert_block invalid cell_id: {}", cell_id);
+                    return String::new();
+                };
+
                 // Parse after_id string to BlockId
                 let after = if after_id.is_empty() {
                     None
@@ -220,24 +247,24 @@ impl RhaiEngine {
                 let after_ref = after.as_ref();
 
                 let result = match kind.as_str() {
-                    "text" => store_insert.insert_block(&cell_id, None, after_ref, Role::User, BlockKind::Text, &content),
-                    "thinking" => store_insert.insert_block(&cell_id, None, after_ref, Role::Model, BlockKind::Thinking, &content),
+                    "text" => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content),
+                    "thinking" => store_insert.insert_block(ctx, None, after_ref, Role::Model, BlockKind::Thinking, &content),
                     "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
                         let input = serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
-                        store_insert.insert_tool_call(&cell_id, None, after_ref, "unknown", input)
+                        store_insert.insert_tool_call(ctx, None, after_ref, "unknown", input)
                     }
                     "tool_result" => {
                         // For tool_result, we need a tool_call_id. Use after_ref if available.
                         let tool_call_id = after.as_ref();
                         if let Some(tc_id) = tool_call_id {
-                            store_insert.insert_tool_result(&cell_id, tc_id, after_ref, &content, false, None)
+                            store_insert.insert_tool_result(ctx, tc_id, after_ref, &content, false, None)
                         } else {
                             // Fallback to text if no tool_call_id
-                            store_insert.insert_block(&cell_id, None, after_ref, Role::Tool, BlockKind::Text, &content)
+                            store_insert.insert_block(ctx, None, after_ref, Role::Tool, BlockKind::Text, &content)
                         }
                     }
-                    _ => store_insert.insert_block(&cell_id, None, after_ref, Role::User, BlockKind::Text, &content),
+                    _ => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content),
                 };
 
                 match result {
@@ -271,13 +298,18 @@ impl RhaiEngine {
                     return;
                 }
 
+                let Ok(ctx) = ContextId::parse(&cell_id) else {
+                    warn!("Rhai: edit_text invalid cell_id: {}", cell_id);
+                    return;
+                };
+
                 // Parse block_id string to BlockId
                 let Some(bid) = kaijutsu_crdt::BlockId::from_key(&block_id) else {
                     warn!("Rhai: edit_text invalid block_id format: {}", block_id);
                     return;
                 };
 
-                match store_edit.edit_text(&cell_id, &bid, pos as usize, &insert, delete as usize) {
+                match store_edit.edit_text(ctx, &bid, pos as usize, &insert, delete as usize) {
                     Ok(_) => {
                         debug!(
                             "Rhai: edit_text({}, {}, pos={}, del={}, ins={})",
@@ -301,13 +333,18 @@ impl RhaiEngine {
         engine.register_fn(
             "append_text",
             move |cell_id: String, block_id: String, text: String| {
+                let Ok(ctx) = ContextId::parse(&cell_id) else {
+                    warn!("Rhai: append_text invalid cell_id: {}", cell_id);
+                    return;
+                };
+
                 // Parse block_id string to BlockId
                 let Some(bid) = kaijutsu_crdt::BlockId::from_key(&block_id) else {
                     warn!("Rhai: append_text invalid block_id format: {}", block_id);
                     return;
                 };
 
-                match store_append.append_text(&cell_id, &bid, &text) {
+                match store_append.append_text(ctx, &bid, &text) {
                     Ok(_) => {
                         debug!(
                             "Rhai: append_text({}, {}, {} chars)",
@@ -328,13 +365,18 @@ impl RhaiEngine {
         engine.register_fn(
             "delete_block",
             move |cell_id: String, block_id: String| -> bool {
+                let Ok(ctx) = ContextId::parse(&cell_id) else {
+                    warn!("Rhai: delete_block invalid cell_id: {}", cell_id);
+                    return false;
+                };
+
                 // Parse block_id string to BlockId
                 let Some(bid) = kaijutsu_crdt::BlockId::from_key(&block_id) else {
                     warn!("Rhai: delete_block invalid block_id format: {}", block_id);
                     return false;
                 };
 
-                match store_delete.delete_block(&cell_id, &bid) {
+                match store_delete.delete_block(ctx, &bid) {
                     Ok(_) => {
                         debug!("Rhai: delete_block({}, {}) -> success", cell_id, block_id);
                         true
@@ -350,7 +392,11 @@ impl RhaiEngine {
         // list_blocks(cell_id: &str) -> Array
         // Returns an array of block IDs in order (as strings in BlockId.to_key() format).
         engine.register_fn("list_blocks", move |cell_id: String| -> rhai::Array {
-            match store_list.get(&cell_id) {
+            let Ok(ctx) = ContextId::parse(&cell_id) else {
+                warn!("Rhai: list_blocks invalid cell_id: {}", cell_id);
+                return rhai::Array::new();
+            };
+            match store_list.get(ctx) {
                 Some(cell) => cell
                     .doc
                     .blocks_ordered()
@@ -367,12 +413,17 @@ impl RhaiEngine {
         engine.register_fn(
             "get_block_content",
             move |cell_id: String, block_id: String| -> String {
+                let Ok(ctx) = ContextId::parse(&cell_id) else {
+                    warn!("Rhai: get_block_content invalid cell_id: {}", cell_id);
+                    return String::new();
+                };
+
                 // Parse block_id string to BlockId
                 let Some(target_bid) = kaijutsu_crdt::BlockId::from_key(&block_id) else {
                     return String::new();
                 };
 
-                match store_get.get(&cell_id) {
+                match store_get.get(ctx) {
                     Some(cell) => cell
                         .doc
                         .blocks_ordered()
@@ -538,10 +589,11 @@ impl ExecutionEngine for RhaiEngine {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
+    use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
     async fn test_basic_execution() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         let result = engine.execute("40 + 2").await.unwrap();
@@ -551,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_string_result() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         let result = engine.execute(r#""hello" + " " + "world""#).await.unwrap();
@@ -561,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_cell() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
         let result = engine.execute(r#"create_cell("markdown")"#).await.unwrap();
@@ -575,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cell_content_roundtrip() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
         let result = engine
@@ -595,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_operations() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
         let result = engine
@@ -617,7 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_text() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
         let result = engine
@@ -638,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_block() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
         let result = engine
@@ -660,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execution_error() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         let result = engine.execute("undefined_function()").await.unwrap();
@@ -670,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupt() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         // Interrupt before execution
@@ -696,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_safety_limits() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         // This should hit the operation limit
@@ -725,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_completions() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
         let completions = engine.complete("create_", 7).await;
@@ -739,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_engine_debug() {
-        let store = shared_block_store("test");
+        let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
         let debug_str = format!("{:?}", engine);
         assert!(debug_str.contains("RhaiEngine"));
