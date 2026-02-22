@@ -6,9 +6,9 @@ use bevy::ui::measurement::ContentSize;
 
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
-    CellState, ComposeBlock, ConversationScrollState, DriftKind, EditingBlockCell,
-    FocusTarget, MainCell, PromptSubmitted, RoleHeader, RoleHeaderLayout,
-    ViewingConversation, WorkspaceLayout,
+    CellState, ComposeBlock, ContextId, ConversationScrollState, DriftKind, EditingBlockCell,
+    FocusTarget, MainCell, PrincipalId, PromptSubmitted, Role, RoleHeader, RoleHeaderLayout,
+    Status, ViewingConversation, WorkspaceLayout,
 };
 use crate::input::FocusArea;
 use crate::conversation::CurrentConversation;
@@ -18,7 +18,6 @@ use crate::text::{
     msdf::SdfTextEffects,
 };
 use crate::text::markdown::{self, MarkdownColors};
-use crate::ui::format::format_for_display;
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -53,24 +52,21 @@ const ROLE_HEADER_SPACING: f32 = 4.0;
 /// - Tool results: green (error: red)
 /// - Shell: cyan for commands, gray for output
 pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color {
-    use kaijutsu_crdt::Role;
-
     match block.kind {
-        BlockKind::Text => {
-            // Text blocks colored by role
+        BlockKind::Text | BlockKind::File => {
             match block.role {
                 Role::User => theme.block_user,
-                Role::Model => theme.block_assistant,  // Model/AI responses
-                Role::System => theme.fg_dim,          // System messages are dim
-                Role::Tool => theme.block_tool_result, // Tool context
+                Role::Model => theme.block_assistant,
+                Role::System => theme.fg_dim,
+                Role::Tool | Role::Asset => theme.block_tool_result,
             }
         }
         BlockKind::Thinking => theme.block_thinking,
         BlockKind::ToolCall => {
-            if block.status == kaijutsu_crdt::Status::Done {
-                theme.fg  // Completed tool calls: plain foreground
+            if block.status == Status::Done {
+                theme.fg
             } else {
-                theme.block_tool_call  // Running/pending: amber
+                theme.block_tool_call
             }
         }
         BlockKind::ToolResult => {
@@ -80,8 +76,6 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
                 theme.block_tool_result
             }
         }
-        BlockKind::ShellCommand => theme.block_shell_cmd,
-        BlockKind::ShellOutput => theme.block_shell_output,
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
@@ -206,14 +200,14 @@ fn draw_box(header: &str, content: &str, width: usize) -> String {
 /// Format a drift block with variant-specific visual treatment.
 ///
 /// `local_ctx`: if provided, determines push direction arrow (→ outgoing, ← incoming).
-fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
-    let ctx = block.source_context.as_deref().unwrap_or("?");
+fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
+    let ctx_short = block.source_context.map(|c| c.short()).unwrap_or_else(|| "?".to_string());
     let model = block.source_model.as_deref().map(truncate_model).unwrap_or("unknown");
-    let ctx_label = format!("@{}", ctx);
+    let ctx_label = format!("@{}", ctx_short);
 
     // Determine direction arrow: → if we sent it, ← if we received it
-    let arrow = match local_ctx {
-        Some(local) if ctx == local => "\u{2192}",
+    let arrow = match (local_ctx, block.source_context) {
+        (Some(local), Some(source)) if source == local => "\u{2192}",
         _ => "\u{2190}",
     };
 
@@ -643,13 +637,11 @@ pub fn handle_prompt_submitted(
         warn!("No document in sync state");
         return;
     };
-    let doc_cell_id = doc.document_id().to_string();
+    let ctx_id = doc.context_id();
 
     for event in submit_events.read() {
         if let Some(ref actor) = actor {
             let handle = actor.handle.clone();
-            let cell_id = doc_cell_id.clone();
-            let conv = conv_id.to_string();
             let tx = channel.sender();
 
             // Auto-detect shell vs chat from text prefix
@@ -658,7 +650,7 @@ pub fn handle_prompt_submitted(
                 // Shell: fire-and-forget, results via ServerEvent broadcast
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        if let Err(e) = handle.shell_execute(&text, &cell_id).await {
+                        if let Err(e) = handle.shell_execute(&text, ctx_id).await {
                             log::error!("shell_execute failed: {e}");
                             let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
                                 operation: "shell_execute".into(),
@@ -667,13 +659,13 @@ pub fn handle_prompt_submitted(
                         }
                     })
                     .detach();
-                info!("Sent shell command to server (conv={}, cell_id={})", conv, doc_cell_id);
+                info!("Sent shell command to server (conv={}, ctx={})", conv_id, ctx_id);
             } else {
                 let text = event.text.clone();
                 // Chat: fire-and-forget, results via ServerEvent broadcast
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        if let Err(e) = handle.prompt(&text, None, &cell_id).await {
+                        if let Err(e) = handle.prompt(&text, None, ctx_id).await {
                             log::error!("prompt failed: {e}");
                             let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
                                 operation: "prompt".into(),
@@ -682,7 +674,7 @@ pub fn handle_prompt_submitted(
                         }
                     })
                     .detach();
-                info!("Sent prompt to server (conv={}, cell_id={})", conv, doc_cell_id);
+                info!("Sent prompt to server (conv={}, ctx={})", conv_id, ctx_id);
             }
             // Enable follow mode to smoothly track streaming response
             scroll_state.start_following();
@@ -1192,9 +1184,10 @@ pub fn sync_main_cell_to_conversation(
         return;
     };
 
-    // Verify document ID matches
-    if source_doc.document_id() != conv_id {
-        debug!("sync_main_cell: document ID mismatch ({} vs {})", source_doc.document_id(), conv_id);
+    // Verify context ID matches
+    let ctx_id = source_doc.context_id();
+    if ctx_id.to_string() != *conv_id {
+        debug!("sync_main_cell: context ID mismatch ({} vs {})", ctx_id, conv_id);
         return;
     }
 
@@ -1208,7 +1201,7 @@ pub fn sync_main_cell_to_conversation(
     let sync_version = sync_state.version();
     let needs_sync = match viewing_opt {
         Some(ref viewing) => {
-            viewing.conversation_id != conv_id || viewing.last_sync_version != sync_version
+            viewing.conversation_id != ctx_id || viewing.last_sync_version != sync_version
         }
         None => true,
     };
@@ -1218,35 +1211,32 @@ pub fn sync_main_cell_to_conversation(
     }
 
     // Copy from authoritative source
-    let agent_id = editor.doc.agent_id().to_string();
+    let agent_id = editor.doc.agent_id();
     let snapshot = source_doc.snapshot();
-    let new_doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, &agent_id);
+    let new_doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
     editor.doc = new_doc;
 
     // Update cursor to end of document
     if let Some(last_block) = editor.blocks().last() {
         let len = last_block.content.len();
-        editor.cursor = super::components::BlockCursor::at(last_block.id.clone(), len);
+        editor.cursor = super::components::BlockCursor::at(last_block.id, len);
     }
 
     // Update or insert the ViewingConversation component
     match viewing_opt {
         Some(mut viewing) => {
-            viewing.conversation_id = conv_id.to_string();
+            viewing.conversation_id = ctx_id;
             viewing.last_sync_version = sync_version;
         }
         None => {
             commands.entity(entity).insert(ViewingConversation {
-                conversation_id: conv_id.to_string(),
+                conversation_id: ctx_id,
                 last_sync_version: sync_version,
             });
         }
     }
 
-    trace!(
-        "Synced MainCell to conversation {} (version {})",
-        conv_id, sync_version
-    );
+    trace!("Synced MainCell to conversation {} (version {})", ctx_id, sync_version);
 }
 
 // ============================================================================
@@ -1292,83 +1282,76 @@ pub fn handle_block_events(
     let was_at_bottom = scroll_state.is_at_bottom();
 
     // Get agent ID for creating documents
-    let agent_id = format!("user:{}", whoami::username());
+    let agent_id = PrincipalId::new();
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
-        if let RpcResultMessage::ContextJoined { membership, document_id, initial_state } = result {
-            let context_name = membership.context_id.to_string();
+        if let RpcResultMessage::ContextJoined { membership, initial_state } = result {
+            let ctx_id = membership.context_id;
 
             // Create or update cache entry
-            if !doc_cache.contains(document_id) {
-                let mut synced = kaijutsu_client::SyncedDocument::new(document_id, &agent_id);
+            if !doc_cache.contains(ctx_id) {
+                let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, agent_id);
 
                 // Apply initial state if provided
                 if let Some(state) = initial_state {
                     match synced.apply_document_state(state) {
                         Ok(effect) => {
-                            info!("Cache: initial sync for '{}' ({}) effect: {:?}", context_name, document_id, effect);
+                            info!("Cache: initial sync for {} effect: {:?}", ctx_id, effect);
                         }
                         Err(e) => {
-                            error!("Cache: initial sync error for '{}' ({}): {}", context_name, document_id, e);
+                            error!("Cache: initial sync error for {}: {}", ctx_id, e);
                         }
                     }
                 }
 
                 let cached = CachedDocument {
                     synced,
-                    context_name: context_name.clone(),
+                    context_name: membership.context_id.short(),
                     synced_at_generation: sync_gen.0,
                     last_accessed: std::time::Instant::now(),
                     scroll_offset: 0.0,
                 };
-                doc_cache.insert(document_id.clone(), cached);
+                doc_cache.insert(ctx_id, cached);
             } else if let Some(state) = initial_state {
                 // Reconnect case: cache entry exists but server has authoritative state
-                if let Some(cached) = doc_cache.get_mut(document_id) {
+                if let Some(cached) = doc_cache.get_mut(ctx_id) {
                     match cached.synced.apply_document_state(state) {
                         Ok(effect) => {
-                            info!("Cache: reconnect refresh for '{}' ({}) effect: {:?}", context_name, document_id, effect);
+                            info!("Cache: reconnect refresh for {} effect: {:?}", ctx_id, effect);
                             cached.synced_at_generation = sync_gen.0;
                         }
                         Err(e) => {
-                            error!("Cache: reconnect refresh error for '{}' ({}): {}", context_name, document_id, e);
+                            error!("Cache: reconnect refresh error for {}: {}", ctx_id, e);
                         }
                     }
                 }
             }
 
             // If this is the first context or no active doc yet, make it active
-            let is_first = doc_cache.active_id().is_none();
-            if is_first {
-                doc_cache.set_active(document_id);
+            if doc_cache.active_id().is_none() {
+                doc_cache.set_active(ctx_id);
             }
 
             // Check if this ContextJoined satisfies a pending context switch
-            if let Some(ref pending_ctx) = pending_switch.0 {
-                if pending_ctx == &context_name {
-                    info!("Pending context switch satisfied: '{}' joined, auto-switching", context_name);
-                    pending_switch.0 = None;
-                    switch_writer.write(super::components::ContextSwitchRequested {
-                        context_name: context_name.clone(),
-                    });
-                }
+            if pending_switch.0 == Some(ctx_id) {
+                info!("Pending context switch satisfied: {} joined, auto-switching", ctx_id);
+                pending_switch.0 = None;
+                switch_writer.write(super::components::ContextSwitchRequested {
+                    context_id: ctx_id,
+                });
             }
 
             // Mirror to DocumentSyncState for the active document
-            let is_active = doc_cache.active_id() == Some(document_id.as_str());
-            if is_active {
-                if current_conv.id() != Some(document_id) {
-                    info!(
-                        "Updating current_conv to server's document_id: {} (was {:?})",
-                        document_id,
-                        current_conv.id()
-                    );
-                    current_conv.0 = Some(document_id.clone());
+            if doc_cache.active_id() == Some(ctx_id) {
+                let ctx_str = ctx_id.to_string();
+                if current_conv.id() != Some(&ctx_str) {
+                    info!("Updating current_conv to context_id: {} (was {:?})", ctx_id, current_conv.id());
+                    current_conv.0 = Some(ctx_str);
                 }
 
                 if let Some(state) = initial_state {
-                    match sync_state.apply_initial_state(&state.document_id, &agent_id, &state.ops) {
+                    match sync_state.apply_initial_state(state.context_id, agent_id, &state.ops) {
                         Ok(result) => {
                             info!("Initial state sync result: {:?}", result);
                         }
@@ -1381,25 +1364,25 @@ pub fn handle_block_events(
         }
     }
 
-    let active_doc_id = doc_cache.active_id().map(|s| s.to_string());
+    let active_ctx_id = doc_cache.active_id();
 
-    // Handle streamed block events — route by document_id through DocumentCache
+    // Handle streamed block events — route by context_id through DocumentCache
     for ServerEventMessage(event) in server_events.read() {
-        // Extract document_id from event for routing
-        let event_doc_id = match event {
-            ServerEvent::BlockInserted { document_id, .. }
-            | ServerEvent::BlockTextOps { document_id, .. }
-            | ServerEvent::BlockStatusChanged { document_id, .. }
-            | ServerEvent::BlockDeleted { document_id, .. }
-            | ServerEvent::BlockCollapsedChanged { document_id, .. }
-            | ServerEvent::BlockMoved { document_id, .. }
-            | ServerEvent::SyncReset { document_id, .. } => Some(document_id.as_str()),
+        // Extract context_id from event for routing
+        let event_ctx_id = match event {
+            ServerEvent::BlockInserted { context_id, .. }
+            | ServerEvent::BlockTextOps { context_id, .. }
+            | ServerEvent::BlockStatusChanged { context_id, .. }
+            | ServerEvent::BlockDeleted { context_id, .. }
+            | ServerEvent::BlockCollapsedChanged { context_id, .. }
+            | ServerEvent::BlockMoved { context_id, .. }
+            | ServerEvent::SyncReset { context_id, .. } => Some(*context_id),
             _ => None,
         };
 
         // Route to cache entry via SyncedDocument.apply_event
-        if let Some(doc_id) = event_doc_id {
-            if let Some(cached) = doc_cache.get_mut(doc_id) {
+        if let Some(ctx_id) = event_ctx_id {
+            if let Some(cached) = doc_cache.get_mut(ctx_id) {
                 let effect = cached.synced.apply_event(event);
                 match &effect {
                     kaijutsu_client::SyncEffect::Updated { .. }
@@ -1412,60 +1395,60 @@ pub fn handle_block_events(
                     }
                     kaijutsu_client::SyncEffect::Ignored => {}
                 }
-                trace!("Cache: event for {}: {:?}", doc_id, effect);
+                trace!("Cache: event for {}: {:?}", ctx_id, effect);
             }
         }
 
         // Mirror to DocumentSyncState if active (legacy path — will be removed
         // when DocumentSyncState is fully replaced by DocumentCache)
         match event {
-            ServerEvent::BlockInserted { document_id, block, ops } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    match sync_state.apply_block_inserted(document_id, &agent_id, block, ops) {
+            ServerEvent::BlockInserted { context_id, block, ops } => {
+                if active_ctx_id == Some(*context_id) {
+                    match sync_state.apply_block_inserted(*context_id, agent_id, block, ops) {
                         Ok(result) => trace!("Block insert sync: {:?}", result),
                         Err(e) => trace!("Block insert sync error: {}", e),
                     }
                 }
             }
-            ServerEvent::BlockTextOps { document_id, ops, .. } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
-                    match sync_state.apply_text_ops(document_id, &agent_id, ops) {
+            ServerEvent::BlockTextOps { context_id, ops, .. } => {
+                if active_ctx_id == Some(*context_id) {
+                    match sync_state.apply_text_ops(*context_id, agent_id, ops) {
                         Ok(result) => trace!("Text ops sync: {:?}", result),
                         Err(e) => trace!("Text ops sync error: {}", e),
                     }
                 }
             }
-            ServerEvent::BlockStatusChanged { document_id, block_id, status } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+            ServerEvent::BlockStatusChanged { context_id, block_id, status } => {
+                if active_ctx_id == Some(*context_id) {
                     if let Some(ref mut doc) = sync_state.doc {
-                        if document_id == doc.document_id() {
+                        if *context_id == doc.context_id() {
                             let _ = doc.set_status(block_id, *status);
                         }
                     }
                 }
             }
-            ServerEvent::BlockDeleted { document_id, block_id } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+            ServerEvent::BlockDeleted { context_id, block_id } => {
+                if active_ctx_id == Some(*context_id) {
                     if let Some(ref mut doc) = sync_state.doc {
-                        if document_id == doc.document_id() {
+                        if *context_id == doc.context_id() {
                             let _ = doc.delete_block(block_id);
                         }
                     }
                 }
             }
-            ServerEvent::BlockCollapsedChanged { document_id, block_id, collapsed } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+            ServerEvent::BlockCollapsedChanged { context_id, block_id, collapsed } => {
+                if active_ctx_id == Some(*context_id) {
                     if let Some(ref mut doc) = sync_state.doc {
-                        if document_id == doc.document_id() {
+                        if *context_id == doc.context_id() {
                             let _ = doc.set_collapsed(block_id, *collapsed);
                         }
                     }
                 }
             }
-            ServerEvent::BlockMoved { document_id, block_id, after_id } => {
-                if active_doc_id.as_deref() == Some(document_id.as_str()) {
+            ServerEvent::BlockMoved { context_id, block_id, after_id } => {
+                if active_ctx_id == Some(*context_id) {
                     if let Some(ref mut doc) = sync_state.doc {
-                        if document_id == doc.document_id() {
+                        if *context_id == doc.context_id() {
                             let _ = doc.move_block(block_id, after_id.as_ref());
                         }
                     }
@@ -1502,88 +1485,74 @@ pub fn handle_context_switch(
     conn_state: Res<crate::connection::RpcConnectionState>,
 ) {
     for event in switch_events.read() {
-        let context_name = &event.context_name;
+        let ctx_id = event.context_id;
 
-        // Look up document_id for this context
-        let target_doc_id = match doc_cache.document_id_for_context(context_name) {
-            Some(id) => id.to_string(),
-            None => {
-                // Already pending for this context? Skip duplicate spawn.
-                if pending_switch.0.as_deref() == Some(context_name.as_str()) {
-                    continue;
-                }
-
-                // Cache miss — spawn a new actor to join the context, then auto-switch
-                info!(
-                    "Context switch: cache miss for '{}', spawning actor to join",
-                    context_name
-                );
-                pending_switch.0 = Some(context_name.clone());
-
-                let kernel_id = conn_state
-                    .current_kernel
-                    .as_ref()
-                    .map(|k| k.id.to_string())
-                    .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
-
-                let instance = uuid::Uuid::new_v4().to_string();
-                // Context switch to a known context — parse the string context_name
-                // back to ContextId. If it doesn't parse, create a new one.
-                let ctx_id = kaijutsu_crdt::ContextId::parse(&context_name)
-                    .unwrap_or_else(|_| kaijutsu_crdt::ContextId::new());
-                let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
-                    config: conn_state.ssh_config.clone(),
-                    kernel_id,
-                    context_id: Some(ctx_id),
-                    instance,
-                });
+        if !doc_cache.contains(ctx_id) {
+            // Already pending for this context? Skip duplicate spawn.
+            if pending_switch.0 == Some(ctx_id) {
                 continue;
             }
-        };
+
+            // Cache miss — spawn a new actor to join the context, then auto-switch
+            info!("Context switch: cache miss for {}, spawning actor to join", ctx_id);
+            pending_switch.0 = Some(ctx_id);
+
+            let kernel_id = conn_state
+                .current_kernel
+                .as_ref()
+                .map(|k| k.id.to_string())
+                .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+
+            let instance = uuid::Uuid::new_v4().to_string();
+            let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
+                config: conn_state.ssh_config.clone(),
+                kernel_id,
+                context_id: Some(ctx_id),
+                instance,
+            });
+            continue;
+        }
 
         // Skip if already active
-        if doc_cache.active_id() == Some(target_doc_id.as_str()) {
+        if doc_cache.active_id() == Some(ctx_id) {
             continue;
         }
 
         // Save current scroll offset to outgoing cache entry
-        if let Some(active_id) = doc_cache.active_id().map(|s| s.to_string())
-            && let Some(cached) = doc_cache.get_mut(&active_id)
+        if let Some(active_id) = doc_cache.active_id()
+            && let Some(cached) = doc_cache.get_mut(active_id)
         {
             cached.scroll_offset = scroll_state.offset;
         }
 
         // Switch active document
-        doc_cache.set_active(&target_doc_id);
+        doc_cache.set_active(ctx_id);
 
         // Mirror cached document to DocumentSyncState
-        if let Some(cached) = doc_cache.get(&target_doc_id) {
-            let agent_id = format!("user:{}", whoami::username());
+        if let Some(cached) = doc_cache.get(ctx_id) {
+            let agent_id = PrincipalId::new();
 
             // Rebuild DocumentSyncState from cached document's oplog
             let oplog_bytes = cached.synced.doc().oplog_bytes().unwrap_or_default();
             sync_state.reset();
-            match sync_state.apply_initial_state(&target_doc_id, &agent_id, &oplog_bytes) {
+            match sync_state.apply_initial_state(ctx_id, agent_id, &oplog_bytes) {
                 Ok(_) => {
-                    info!("Context switch: mirrored '{}' ({}) to DocumentSyncState", context_name, target_doc_id);
+                    info!("Context switch: mirrored {} to DocumentSyncState", ctx_id);
                 }
                 Err(e) => {
-                    error!("Context switch: failed to mirror '{}' to DocumentSyncState: {}", context_name, e);
+                    error!("Context switch: failed to mirror {} to DocumentSyncState: {}", ctx_id, e);
                 }
             }
 
-            // Update CurrentConversation
-            current_conv.0 = Some(target_doc_id.clone());
+            // Update CurrentConversation (string bridge to legacy DB)
+            current_conv.0 = Some(ctx_id.to_string());
 
             // Restore scroll offset
             scroll_state.offset = cached.scroll_offset;
             scroll_state.target_offset = cached.scroll_offset;
             scroll_state.following = false; // Don't auto-scroll on switch
 
-            info!(
-                "Context switch complete: '{}' → document '{}' (scroll: {:.0})",
-                context_name, target_doc_id, cached.scroll_offset
-            );
+            info!("Context switch complete: {} (scroll: {:.0})", ctx_id, cached.scroll_offset);
         }
     }
 }
@@ -1605,11 +1574,11 @@ pub fn check_cache_staleness(
     }
     *checked_gen = sync_gen.0;
 
-    let Some(active_id) = doc_cache.active_id().map(|s| s.to_string()) else {
+    let Some(active_id) = doc_cache.active_id() else {
         return;
     };
 
-    let Some(cached) = doc_cache.get(&active_id) else {
+    let Some(cached) = doc_cache.get(active_id) else {
         return;
     };
 
@@ -1620,35 +1589,29 @@ pub fn check_cache_staleness(
         };
 
         info!(
-            "Staleness detected: active doc '{}' synced_at={} < current={}",
+            "Staleness detected: active doc {} synced_at={} < current={}",
             active_id, cached.synced_at_generation, sync_gen.0
         );
 
         let handle = actor.handle.clone();
-        let doc_id = active_id.clone();
+        let ctx_id = active_id;
 
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                match handle.get_document_state(&doc_id).await {
+                match handle.get_context_state(ctx_id).await {
                     Ok(state) => {
                         info!(
                             "Staleness re-fetch complete for {}: {} bytes oplog",
-                            doc_id,
+                            ctx_id,
                             state.ops.len()
                         );
-                        // The re-fetched state will arrive as a ContextJoined-like event
-                        // through the normal sync path. The actor's subscription system
-                        // handles the replay.
                     }
                     Err(e) => {
-                        warn!("Staleness re-fetch failed for {}: {}", doc_id, e);
+                        warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);
                     }
                 }
             })
             .detach();
-
-        // Mark as checked to avoid re-triggering until next generation bump
-        // The actual resync will update synced_at_generation when events arrive
     }
 }
 
@@ -1769,7 +1732,7 @@ fn format_tool_args(value: &serde_json::Value) -> String {
 ///
 /// Returns the formatted text for one block, including visual markers.
 /// `local_ctx`: optional local context ID for drift push direction.
-pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> String {
+pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
@@ -1782,8 +1745,8 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
         BlockKind::ToolCall => {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
             let status_tag = match block.status {
-                kaijutsu_crdt::Status::Running => " [running]",
-                kaijutsu_crdt::Status::Pending => " [pending]",
+                Status::Running => " [running]",
+                Status::Pending => " [pending]",
                 _ => "",
             };
             let mut output = format!("{}{}", name, status_tag);
@@ -1819,13 +1782,9 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<&str>) -> St
                 }
             }
         }
-        BlockKind::ShellCommand => {
-            format!("$ {}", block.content)
-        }
-        BlockKind::ShellOutput => {
-            // Use display hint for richer formatting (tables, trees)
-            let formatted = format_for_display(&block.content, block.display_hint.as_deref());
-            formatted.text
+        BlockKind::File => {
+            let path = block.file_path.as_deref().unwrap_or("file");
+            format!("{}\n{}", path, block.content)
         }
         BlockKind::Drift => format_drift_block(block, local_ctx),
     }
@@ -1966,8 +1925,8 @@ pub fn sync_role_headers(
 
     // Compute expected role transitions: Vec<(role, block_id)>
     let blocks = editor.blocks();
-    let mut expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = Vec::new();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut expected: Vec<(Role, kaijutsu_crdt::BlockId)> = Vec::new();
+    let mut prev_role: Option<Role> = None;
     for block in &blocks {
         if prev_role != Some(block.role) {
             expected.push((block.role, block.id.clone()));
@@ -1997,10 +1956,10 @@ pub fn sync_role_headers(
 
     for (role, block_id) in expected {
         let color = match role {
-            kaijutsu_crdt::Role::User => theme.block_user,
-            kaijutsu_crdt::Role::Model => theme.block_assistant,
-            kaijutsu_crdt::Role::System => theme.fg_dim,
-            kaijutsu_crdt::Role::Tool => theme.block_tool_call,
+            Role::User => theme.block_user,
+            Role::Model => theme.block_assistant,
+            Role::System => theme.fg_dim,
+            Role::Tool | Role::Asset => theme.block_tool_call,
         };
 
         let mut config = MsdfTextAreaConfig::default();
@@ -2054,10 +2013,11 @@ pub fn init_role_header_buffers(
 
         // Set header text based on role
         let text = match header.role {
-            kaijutsu_crdt::Role::User => "── USER ──────────────────────",
-            kaijutsu_crdt::Role::Model => "── ASSISTANT ─────────────────",
-            kaijutsu_crdt::Role::System => "── SYSTEM ────────────────────",
-            kaijutsu_crdt::Role::Tool => "── TOOL ──────────────────────",
+            Role::User => "── USER ──────────────────────",
+            Role::Model => "── ASSISTANT ─────────────────",
+            Role::System => "── SYSTEM ────────────────────",
+            Role::Tool => "── TOOL ──────────────────────",
+            Role::Asset => "── ASSET ─────────────────────",
         };
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
         buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
@@ -2164,7 +2124,7 @@ pub fn sync_block_cell_buffers(
         // Format and update the buffer
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
-        let local_ctx = drift_state.local_context_id.as_deref();
+        let local_ctx = drift_state.local_context_id;
         let text = format_single_block(block, local_ctx);
 
         // Debounce large blocks: skip reshape if text grew by < DEBOUNCE_CHARS.
@@ -2185,7 +2145,7 @@ pub fn sync_block_cell_buffers(
 
         // Set per-vertex effects: rainbow for user text only.
         // Only insert when changed to avoid triggering Bevy change detection.
-        let rainbow = block.kind == BlockKind::Text && block.role == kaijutsu_crdt::Role::User;
+        let rainbow = block.kind == BlockKind::Text && block.role == Role::User;
         if block_cell.last_rainbow != rainbow {
             commands.entity(*entity).insert(SdfTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
@@ -2196,7 +2156,7 @@ pub fn sync_block_cell_buffers(
         if block.kind == BlockKind::Text {
             // Skip expensive markdown parse for huge blocks still streaming —
             // markdown re-parse happens once when block finishes (status → Done)
-            if text.len() > 50_000 && block.status == kaijutsu_crdt::Status::Running {
+            if text.len() > 50_000 && block.status == Status::Running {
                 buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
             } else {
                 // Build markdown colors from theme, with base block color as default
@@ -2325,7 +2285,7 @@ pub fn layout_block_cells(
         blocks_ordered.iter().map(|b| (&b.id, b)).collect();
 
     // Track role transitions for inline headers
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut prev_role: Option<Role> = None;
     let mut block_is_role_transition: std::collections::HashMap<&kaijutsu_crdt::BlockId, bool> =
         std::collections::HashMap::new();
     for block in &blocks_ordered {
@@ -2505,7 +2465,7 @@ pub fn reorder_conversation_children(
 
     // Build ordered child list: role headers interleaved with blocks
     let blocks = editor.blocks();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut prev_role: Option<Role> = None;
     let mut ordered_children = Vec::new();
 
     // Build block_id → role header entity map
@@ -2923,14 +2883,10 @@ pub fn update_compose_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_crdt::{BlockId, Role, Status};
+    use kaijutsu_types::{BlockId, ContextId, PrincipalId, ToolKind};
 
     fn test_block_id() -> BlockId {
-        BlockId {
-            document_id: "test-doc".to_string(),
-            agent_id: "test-agent".to_string(),
-            seq: 0,
-        }
+        BlockId::new(ContextId::new(), PrincipalId::new(), 0)
     }
 
     #[test]
@@ -2992,9 +2948,10 @@ mod tests {
         let block = BlockSnapshot::tool_call(
             test_block_id(),
             None,
+            ToolKind::Mcp,
             "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
-            "test",
+            Role::Model,
         );
         let result = format_single_block(&block, None);
         // Shader borders handle visual framing — text is plain
@@ -3011,9 +2968,10 @@ mod tests {
         let mut block = BlockSnapshot::tool_call(
             test_block_id(),
             None,
+            ToolKind::Mcp,
             "list_all",
             serde_json::json!(null),
-            "test",
+            Role::Model,
         );
         block.status = Status::Done;
         let result = format_single_block(&block, None);
@@ -3022,13 +2980,16 @@ mod tests {
 
     #[test]
     fn test_tool_result_success_empty() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
         let result_block = BlockSnapshot::tool_result(
-            test_block_id(),
-            test_block_id(),
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Mcp,
             "",
             false,
             Some(0),
-            "test",
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "done");
@@ -3036,13 +2997,16 @@ mod tests {
 
     #[test]
     fn test_tool_result_success_short() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
         let result_block = BlockSnapshot::tool_result(
-            test_block_id(),
-            test_block_id(),
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Mcp,
             "file contents here",
             false,
             Some(0),
-            "test",
         );
         let result = format_single_block(&result_block, None);
         assert!(result.starts_with("done\n"));
@@ -3052,13 +3016,16 @@ mod tests {
     #[test]
     fn test_tool_result_success_long() {
         let content = "line1\nline2\nline3\nline4\nline5";
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
         let result_block = BlockSnapshot::tool_result(
-            test_block_id(),
-            test_block_id(),
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Mcp,
             content,
             false,
             Some(0),
-            "test",
         );
         let result = format_single_block(&result_block, None);
         assert!(!result.contains('┌'));
@@ -3067,13 +3034,16 @@ mod tests {
 
     #[test]
     fn test_tool_result_error() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
         let result_block = BlockSnapshot::tool_result(
-            test_block_id(),
-            test_block_id(),
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Mcp,
             "permission denied",
             true,
             Some(1),
-            "test",
         );
         let result = format_single_block(&result_block, None);
         assert!(result.contains("error \u{2717}"));
@@ -3082,13 +3052,16 @@ mod tests {
 
     #[test]
     fn test_tool_result_error_empty() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
         let result_block = BlockSnapshot::tool_result(
-            test_block_id(),
-            test_block_id(),
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Mcp,
             "",
             true,
             Some(1),
-            "test",
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "error");
@@ -3096,7 +3069,7 @@ mod tests {
 
     #[test]
     fn test_thinking_no_emoji() {
-        let block = BlockSnapshot::thinking(test_block_id(), None, "reasoning here", "test");
+        let block = BlockSnapshot::thinking(test_block_id(), None, "reasoning here");
         let result = format_single_block(&block, None);
         assert!(!result.contains('💭'));
         assert!(result.starts_with("Thinking\n"));
@@ -3105,7 +3078,7 @@ mod tests {
 
     #[test]
     fn test_thinking_collapsed_no_emoji() {
-        let mut block = BlockSnapshot::thinking(test_block_id(), None, "reasoning", "test");
+        let mut block = BlockSnapshot::thinking(test_block_id(), None, "reasoning");
         block.collapsed = true;
         let result = format_single_block(&block, None);
         assert!(!result.contains('💭'));
@@ -3115,8 +3088,8 @@ mod tests {
     #[test]
     fn test_format_blocks_delegates_to_format_single_block() {
         let blocks = vec![
-            BlockSnapshot::text(test_block_id(), None, Role::User, "hello", "test"),
-            BlockSnapshot::text(test_block_id(), None, Role::Model, "world", "test"),
+            BlockSnapshot::text(test_block_id(), None, Role::User, "hello"),
+            BlockSnapshot::text(test_block_id(), None, Role::Model, "world"),
         ];
         let result = format_blocks_for_display(&blocks);
         assert_eq!(result, "hello\n\nworld");
@@ -3129,35 +3102,35 @@ mod tests {
 
     #[test]
     fn test_drift_commit_no_emoji() {
+        let source_ctx = ContextId::new();
         let block = BlockSnapshot::drift(
             test_block_id(),
             None,
             "checkpoint summary",
-            "test",
-            "ctx-abc",
+            source_ctx,
             None,
             DriftKind::Commit,
         );
         let result = format_single_block(&block, None);
         assert!(!result.contains('📝'));
-        assert!(result.starts_with("# @ctx-abc"));
+        assert!(result.starts_with(&format!("# @{}", source_ctx.short())));
     }
 
     #[test]
     fn test_drift_none_no_emoji() {
+        let source_ctx = ContextId::new();
         let mut block = BlockSnapshot::drift(
             test_block_id(),
             None,
             "some drift content",
-            "test",
-            "ctx-xyz",
+            source_ctx,
             Some("claude".to_string()),
-            DriftKind::Push, // We'll override drift_kind
+            DriftKind::Push,
         );
         block.drift_kind = None;
         let result = format_single_block(&block, None);
         assert!(!result.contains('🌊'));
-        assert!(result.starts_with("~ @ctx-xyz"));
+        assert!(result.starts_with(&format!("~ @{}", source_ctx.short())));
     }
 
     #[test]

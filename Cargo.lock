@@ -5065,6 +5065,7 @@ dependencies = [
  "kaijutsu-crdt",
  "kaijutsu-kernel",
  "kaijutsu-telemetry",
+ "kaijutsu-types",
  "kaish-kernel",
  "log",
  "logos",

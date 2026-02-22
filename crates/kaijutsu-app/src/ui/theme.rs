@@ -100,10 +100,6 @@ pub struct Theme {
     pub block_tool_result: Color,
     /// Tool error block text color (red)
     pub block_tool_error: Color,
-    /// Shell command block text color (cyan)
-    pub block_shell_cmd: Color,
-    /// Shell output block text color (light gray)
-    pub block_shell_output: Color,
     /// Drift push block text color (cyan — conversational)
     pub block_drift_push: Color,
     /// Drift pull/distill block text color (blue — substantive)
@@ -367,8 +363,6 @@ impl Default for Theme {
             block_tool_call: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
             block_tool_result: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             block_tool_error: Color::srgb(0.969, 0.463, 0.557), // #f7768e red
-            block_shell_cmd: Color::srgb(0.490, 0.812, 1.00),   // #7dcfff cyan
-            block_shell_output: Color::srgb(0.663, 0.694, 0.839), // #a9b1d6
             block_drift_push: Color::srgb(0.490, 0.812, 1.00),  // #7dcfff cyan
             block_drift_pull: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple

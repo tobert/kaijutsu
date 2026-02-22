@@ -122,9 +122,11 @@ fn bootstrap_thread(
                             // SSH handshake is ~10-50ms localhost, ~100-300ms remote.
                             // Future optimization: coordinate handoff locally within
                             // this LocalSet if latency becomes an issue.
+                            let kid = kaijutsu_types::KernelId::parse(&kernel_id)
+                                .unwrap_or_else(|_| kaijutsu_types::KernelId::new());
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
-                                kernel_id.clone(),
+                                kid,
                                 context_id,
                                 instance,
                                 None,

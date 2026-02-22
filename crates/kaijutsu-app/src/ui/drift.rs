@@ -8,6 +8,7 @@ use bevy::prelude::*;
 
 use kaijutsu_client::{ContextInfo, StagedDriftInfo};
 use kaijutsu_crdt::BlockKind;
+use kaijutsu_types::ContextId;
 
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 
@@ -28,10 +29,8 @@ pub struct DriftState {
     pub contexts: Vec<ContextInfo>,
     /// Staged (pending) drift operations.
     pub staged: Vec<StagedDriftInfo>,
-    /// Our own context short ID (for determining push direction).
-    pub local_context_id: Option<String>,
-    /// The context name from our membership (used to resolve local_context_id).
-    pub local_context_name: Option<String>,
+    /// Our own context ID (for determining push direction).
+    pub local_context_id: Option<ContextId>,
     /// Last poll timestamp (from `Time::elapsed_secs_f64()`).
     pub last_poll: f64,
     /// Whether we've received at least one successful poll.
@@ -162,27 +161,12 @@ fn update_drift_state(
             RpcResultMessage::DriftContextsReceived { contexts } => {
                 drift_state.contexts = contexts.clone();
                 drift_state.loaded = true;
-
-                // Resolve local_context_id to short_id now that we have context data.
-                // local_context_name is the membership's context name (e.g. kernel_id);
-                // we need the short_id that drift blocks use in source_context.
-                if let Some(ref name) = drift_state.local_context_name {
-                    if let Some(ctx) = contexts.iter().find(|c| c.label == *name || c.id.to_string() == *name || c.id.short() == *name) {
-                        let short = ctx.id.short();
-                        if drift_state.local_context_id.as_deref() != Some(short.as_str()) {
-                            log::info!("DriftState: resolved local context → @{}", short);
-                            drift_state.local_context_id = Some(short);
-                        }
-                    }
-                }
             }
             RpcResultMessage::DriftQueueReceived { staged } => {
                 drift_state.staged = staged.clone();
             }
             RpcResultMessage::ContextJoined { membership, .. } => {
-                // Store context name — will be resolved to short_id
-                // when contexts arrive from the next poll.
-                drift_state.local_context_name = Some(membership.context_id.to_string());
+                drift_state.local_context_id = Some(membership.context_id);
                 log::info!("DriftState: joined context = {}", membership.context_id);
             }
             _ => {}
@@ -200,7 +184,7 @@ fn detect_drift_arrival(
         if let kaijutsu_client::ServerEvent::BlockInserted { block, .. } = event
             && block.kind == BlockKind::Drift
         {
-            let source_ctx = block.source_context.as_deref().unwrap_or("?").to_string();
+            let source_ctx = block.source_context.map(|c| c.short()).unwrap_or_else(|| "?".to_string());
             let preview: String = block.content.chars().take(40).collect();
 
             drift_state.notification = Some(DriftNotification {

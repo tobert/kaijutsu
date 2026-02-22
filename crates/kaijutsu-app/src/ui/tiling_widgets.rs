@@ -28,6 +28,7 @@ use crate::ui::theme::Theme;
 #[derive(Component, Debug, Clone)]
 pub struct ContextBadge {
     pub context_name: String,
+    pub context_id: kaijutsu_types::ContextId,
 }
 
 // ============================================================================
@@ -228,22 +229,22 @@ pub fn update_contexts_widget(
 
         let max_display = 5;
 
-        // Build desired badge list: (context_name, short_label, is_active)
-        let desired: Vec<(String, String, bool)> = mru_ids
+        // Build desired badge list: (context_id, context_name, short_label, is_active)
+        let desired: Vec<(kaijutsu_types::ContextId, String, String, bool)> = mru_ids
             .iter()
             .take(max_display)
             .map(|doc_id| {
                 let ctx_name = doc_cache
-                    .get(doc_id)
+                    .get(*doc_id)
                     .map(|c| c.context_name.clone())
                     .unwrap_or_else(|| "?".to_string());
-                let is_active = active_doc_id == Some(doc_id.as_str());
+                let is_active = active_doc_id == Some(*doc_id);
                 let short = if ctx_name.len() > 12 {
                     ctx_name[..12].to_string()
                 } else {
                     ctx_name.clone()
                 };
-                (ctx_name, short, is_active)
+                (*doc_id, ctx_name, short, is_active)
             })
             .collect();
 
@@ -256,7 +257,7 @@ pub fn update_contexts_widget(
             if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
 
-        for (ctx_name, short, is_active) in &desired {
+        for (ctx_id, ctx_name, short, is_active) in &desired {
             let label = if *is_active {
                 format!("[{}]", short)
             } else {
@@ -268,6 +269,7 @@ pub fn update_contexts_widget(
                 .spawn((
                     ContextBadge {
                         context_name: ctx_name.clone(),
+                        context_id: *ctx_id,
                     },
                     Node {
                         padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
@@ -502,7 +504,7 @@ pub fn update_model_badge_widget(
         drift_state
             .contexts
             .iter()
-            .find(|ctx| ctx.document_id == active_id)
+            .find(|ctx| ctx.id == active_id)
             .map(|ctx| {
                 if ctx.model.is_empty() {
                     "—".to_string()
@@ -628,12 +630,12 @@ pub fn update_block_activity_widget(
     // Process status change events for the active document
     for event in events.read() {
         if let kaijutsu_client::ServerEvent::BlockStatusChanged {
-            document_id,
+            context_id,
             status,
             ..
         } = &event.0
         {
-            if active_doc.as_deref() == Some(document_id.as_str()) {
+            if active_doc.as_deref() == Some(&context_id.to_string()) {
                 match status {
                     kaijutsu_crdt::Status::Running => {
                         state.running = state.running.saturating_add(1);
@@ -677,7 +679,7 @@ pub fn handle_context_badge_click(
         if *interaction == Interaction::Pressed {
             info!("Context badge clicked: {}", badge.context_name);
             switch_writer.write(ContextSwitchRequested {
-                context_name: badge.context_name.clone(),
+                context_id: badge.context_id,
             });
         }
     }

@@ -595,9 +595,9 @@ fn update_node_visuals(
     for (marker, mut node_style, material_node) in nodes.iter_mut() {
         if let Some(ctx_node) = constellation.node_by_id(&marker.context_id) {
             let is_focused = constellation.focus_id.as_deref() == Some(&ctx_node.context_id);
-            let is_in_cache = doc_cache
-                .document_id_for_context(&ctx_node.context_id)
-                .is_some();
+            let is_in_cache = kaijutsu_types::ContextId::parse(&ctx_node.context_id)
+                .map(|cid| doc_cache.contains(cid))
+                .unwrap_or(false);
 
             // Size: focused nodes are scaled up
             let scale = if is_focused {

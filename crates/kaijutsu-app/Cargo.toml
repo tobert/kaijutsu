@@ -8,6 +8,7 @@ description = "Bevy GUI client for kaijutsu"
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-client = { path = "../kaijutsu-client" }
 kaijutsu-kernel = { path = "../kaijutsu-kernel" }
+kaijutsu-types = { path = "../kaijutsu-types" }
 
 # kaish (for syntax validation)
 kaish-kernel.workspace = true

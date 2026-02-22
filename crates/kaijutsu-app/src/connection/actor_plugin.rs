@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use bevy::prelude::*;
 use kaijutsu_client::{ActorHandle, ContextMembership, Identity, KernelInfo, SshConfig};
+use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
 
 use super::bootstrap::{self, BootstrapChannel, BootstrapCommand};
@@ -42,8 +43,8 @@ pub struct RpcConnectionState {
     pub ssh_config: SshConfig,
     /// Reconnect attempt counter (0 = connected or idle)
     pub reconnect_attempt: u32,
-    /// Document ID returned by server's join_context (server-authoritative)
-    pub document_id: Option<String>,
+    /// Context ID from server's join_context (server-authoritative)
+    pub context_id: Option<ContextId>,
 }
 
 /// Channel for async tasks to send results back to Bevy systems.
@@ -102,7 +103,6 @@ pub enum RpcResultMessage {
     /// Context joined — includes membership info and initial document state.
     ContextJoined {
         membership: ContextMembership,
-        document_id: String,
         initial_state: Option<kaijutsu_client::DocumentState>,
     },
     /// Context left.
@@ -110,8 +110,7 @@ pub enum RpcResultMessage {
     /// Fork completed.
     Forked {
         success: bool,
-        context_name: Option<String>,
-        document_id: Option<String>,
+        context_id: Option<ContextId>,
         error: Option<String>,
     },
     /// Cherry-pick completed.
@@ -229,25 +228,13 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 2. If we joined a context, fetch its document state
+                        // 2. If we joined a context, fetch its state
                         let Some(ctx_id) = ctx_id else { return };
 
-                        // Get server-authoritative document_id (set during join_context)
-                        let document_id = match h.document_id().await {
-                            Ok(Some(doc_id)) => doc_id,
-                            Ok(None) => {
-                                log::warn!("No document_id after join_context");
-                                return;
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to get document_id: {e}");
-                                return;
-                            }
-                        };
-                        let initial_state = match h.get_document_state(&document_id).await {
+                        let initial_state = match h.get_context_state(ctx_id).await {
                             Ok(state) => Some(state),
                             Err(e) => {
-                                log::warn!("Initial get_document_state failed: {e}");
+                                log::warn!("Initial get_context_state failed: {e}");
                                 None
                             }
                         };
@@ -256,15 +243,14 @@ fn poll_bootstrap_results(
                         let nick = identity.map(|id| id.username).unwrap_or_default();
                         let membership = ContextMembership {
                             context_id: ctx_id,
-                            kernel_id: kaijutsu_crdt::KernelId::parse(&kernel_id_str)
-                                .unwrap_or_else(|_| kaijutsu_crdt::KernelId::nil()),
+                            kernel_id: KernelId::parse(&kernel_id_str)
+                                .unwrap_or_else(|_| KernelId::nil()),
                             nick,
                             instance: "bevy-client".to_string(),
                         };
 
                         let _ = tx.send(RpcResultMessage::ContextJoined {
                             membership,
-                            document_id,
                             initial_state,
                         });
                     })
@@ -379,10 +365,10 @@ fn update_connection_state(
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
-            kaijutsu_client::ConnectionStatus::Connected { document_id } => {
+            kaijutsu_client::ConnectionStatus::Connected { context_id } => {
                 state.connected = true;
                 state.reconnect_attempt = 0;
-                state.document_id = document_id.clone();
+                state.context_id = *context_id;
             }
             kaijutsu_client::ConnectionStatus::Disconnected => {
                 state.connected = false;

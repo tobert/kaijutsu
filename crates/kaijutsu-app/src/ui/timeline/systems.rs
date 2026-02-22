@@ -100,29 +100,22 @@ pub fn process_fork_requests(
         let handle = actor.handle.clone();
         let tx = channel.sender();
         let version = request.from_version;
-        let doc_id = document_id.clone();
+        let doc_id = document_id;
         let ctx_name = context_name.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                match handle.fork_from_version(&doc_id, version, &ctx_name).await {
+                match handle.fork_from_version(doc_id, version, &ctx_name).await {
                     Ok(ctx_id) => {
-                        let new_doc_id = format!(
-                            "{}@{}",
-                            doc_id.split('@').next().unwrap_or(&doc_id),
-                            ctx_id
-                        );
                         let _ = tx.send(RpcResultMessage::Forked {
                             success: true,
-                            context_name: Some(ctx_id.to_string()),
-                            document_id: Some(new_doc_id),
+                            context_id: Some(ctx_id),
                             error: None,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(RpcResultMessage::Forked {
                             success: false,
-                            context_name: None,
-                            document_id: None,
+                            context_id: None,
                             error: Some(e.to_string()),
                         });
                     }
@@ -138,10 +131,10 @@ pub fn handle_fork_complete(
     mut result_writer: MessageWriter<ForkResult>,
 ) {
     for event in events.read() {
-        if let RpcResultMessage::Forked { success, context_name, error, .. } = event {
+        if let RpcResultMessage::Forked { success, context_id, error, .. } = event {
             result_writer.write(ForkResult {
                 success: *success,
-                context_id: context_name.clone(),
+                context_id: context_id.map(|c| c.to_string()),
                 error: error.clone(),
             });
         }

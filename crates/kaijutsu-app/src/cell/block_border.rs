@@ -257,7 +257,7 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                 animation: BorderAnimation::None,
             })
         }
-        // ShellCommand, ShellOutput, Drift Push/Commit — no border
+        // File, Drift Push/Commit — no border
         _ => None,
     }
 }

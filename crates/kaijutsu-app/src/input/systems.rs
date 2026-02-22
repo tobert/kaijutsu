@@ -610,7 +610,6 @@ pub fn handle_constellation_nav(
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
-    doc_cache: Res<crate::cell::DocumentCache>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
     new_ctx_config: Res<NewContextConfig>,
@@ -642,50 +641,57 @@ pub fn handle_constellation_nav(
             Action::Activate => {
                 // Enter → switch context and dismiss constellation
                 if let Some(ref focus_id) = constellation.focus_id {
-                    info!("Constellation: switching to {}", focus_id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: focus_id.clone(),
-                    });
-                    // enforce_constellation_focus_sync handles visibility
-                    *focus = FocusArea::Compose;
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
+                        info!("Constellation: switching to {}", focus_id);
+                        switch_writer.write(crate::cell::ContextSwitchRequested {
+                            context_id: ctx_id,
+                        });
+                        *focus = FocusArea::Compose;
+                    }
                 }
             }
             Action::NextContext => {
                 if let Some(id) = constellation.next_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: id,
-                    });
-                    *focus = FocusArea::Compose;
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&id) {
+                        switch_writer.write(crate::cell::ContextSwitchRequested {
+                            context_id: ctx_id,
+                        });
+                        *focus = FocusArea::Compose;
+                    }
                 }
             }
             Action::PrevContext => {
                 if let Some(id) = constellation.prev_context_id().map(|s| s.to_string()) {
                     constellation.focus(&id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: id,
-                    });
-                    *focus = FocusArea::Compose;
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&id) {
+                        switch_writer.write(crate::cell::ContextSwitchRequested {
+                            context_id: ctx_id,
+                        });
+                        *focus = FocusArea::Compose;
+                    }
                 }
             }
             Action::ToggleAlternate => {
                 if let Some(alt_id) = constellation.alternate_id.clone() {
                     constellation.focus(&alt_id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: alt_id,
-                    });
-                    *focus = FocusArea::Compose;
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&alt_id) {
+                        switch_writer.write(crate::cell::ContextSwitchRequested {
+                            context_id: ctx_id,
+                        });
+                        *focus = FocusArea::Compose;
+                    }
                 }
             }
             Action::ConstellationFork => {
                 if let Some(ref focus_id) = constellation.focus_id {
-                    if let Some(doc_id) = doc_cache.document_id_for_context(focus_id) {
+                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
                         dialog_writer.write(OpenContextDialog(DialogMode::ForkContext {
                             source_context: focus_id.clone(),
-                            source_document_id: doc_id.to_string(),
+                            source_context_id: ctx_id,
                         }));
                     } else {
-                        warn!("Cannot fork '{}': not in document cache", focus_id);
+                        warn!("Cannot fork '{}': invalid context ID", focus_id);
                     }
                 }
             }
@@ -696,7 +702,6 @@ pub fn handle_constellation_nav(
                     &bootstrap,
                     &conn_state,
                     actor.as_deref(),
-                    &doc_cache,
                 );
             }
             Action::ConstellationModelPicker => {

@@ -6,8 +6,8 @@
 use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
-// NOTE: BlockContentSnapshot was replaced with flat BlockSnapshot in the DAG migration
-pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DriftKind, Role};
+pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
+pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Unique identifier for a cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Reflect)]
@@ -54,8 +54,9 @@ pub enum CellKind {
 #[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component)]
 pub struct ViewingConversation {
-    /// ID of the conversation this cell is viewing.
-    pub conversation_id: String,
+    /// Context ID of the conversation this cell is viewing.
+    #[reflect(ignore)]
+    pub conversation_id: ContextId,
     /// Last sync version to detect changes.
     pub last_sync_version: u64,
 }
@@ -150,10 +151,8 @@ impl Default for CellEditor {
 impl CellEditor {
     /// Create a new editor with a random agent ID.
     pub fn new() -> Self {
-        let agent_id = uuid::Uuid::new_v4().to_string();
-        let cell_id = uuid::Uuid::new_v4().to_string();
         Self {
-            doc: BlockDocument::new(&cell_id, &agent_id),
+            doc: BlockDocument::new(ContextId::new(), PrincipalId::new()),
             cursor: BlockCursor::default(),
             cursor_cache: CursorCache::default(),
         }
@@ -163,7 +162,7 @@ impl CellEditor {
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         if !text.is_empty()
-            && let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, &text, "user") {
+            && let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, &text) {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
         self
@@ -211,7 +210,7 @@ impl CellEditor {
         // Ensure we have a block to insert into
         if self.cursor.block_id.is_none() {
             // Create a new text block
-            if let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, "", "user") {
+            if let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, "") {
                 self.cursor.block_id = Some(block_id);
                 self.cursor.offset = 0;
             } else {
@@ -469,8 +468,8 @@ pub struct BlockEditCursor {
 /// eliminating the dual-path sync issues between ConversationRegistry and sync state.
 ///
 /// **Sync protocol:**
-/// - `doc = None` or `document_id` changed → full sync (from_oplog)
-/// - `doc = Some(_)` and matching document_id → incremental merge (merge_ops_owned)
+/// - `doc = None` or `context_id` changed → full sync (from_oplog)
+/// - `doc = Some(_)` and matching context_id → incremental merge (merge_ops_owned)
 ///
 /// The sync manager handles frontier tracking internally. Systems should use
 /// the convenience methods on this resource rather than accessing the manager directly.
@@ -497,14 +496,14 @@ impl DocumentSyncState {
         self.manager.version()
     }
 
-    /// Check if we need a full sync for the given document.
-    pub fn needs_full_sync(&self, document_id: &str) -> bool {
-        self.doc.is_none() || self.manager.needs_full_sync(document_id)
+    /// Check if we need a full sync for the given context.
+    pub fn needs_full_sync(&self, context_id: ContextId) -> bool {
+        self.doc.is_none() || self.manager.needs_full_sync(context_id)
     }
 
-    /// Get the current document_id (for testing/debugging).
-    pub fn document_id(&self) -> Option<&str> {
-        self.manager.document_id()
+    /// Get the current context_id (for testing/debugging).
+    pub fn context_id(&self) -> Option<ContextId> {
+        self.manager.context_id()
     }
 
     /// Apply initial state from server (BlockCellInitialState event).
@@ -513,15 +512,14 @@ impl DocumentSyncState {
     /// Creates the BlockDocument if it doesn't exist.
     pub fn apply_initial_state(
         &mut self,
-        document_id: &str,
-        agent_id: &str,
+        context_id: ContextId,
+        agent_id: PrincipalId,
         oplog_bytes: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
-        // Create document if needed, or get existing
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(document_id, agent_id)
+            BlockDocument::new(context_id, agent_id)
         });
-        self.manager.apply_initial_state(doc, document_id, oplog_bytes)
+        self.manager.apply_initial_state(doc, context_id, oplog_bytes)
     }
 
     /// Apply a block insertion event (BlockInserted).
@@ -532,15 +530,15 @@ impl DocumentSyncState {
     /// - Otherwise → incremental merge
     pub fn apply_block_inserted(
         &mut self,
-        document_id: &str,
-        agent_id: &str,
+        context_id: ContextId,
+        agent_id: PrincipalId,
         block: &BlockSnapshot,
         ops: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(document_id, agent_id)
+            BlockDocument::new(context_id, agent_id)
         });
-        self.manager.apply_block_inserted(doc, document_id, block, ops)
+        self.manager.apply_block_inserted(doc, context_id, block, ops)
     }
 
     /// Apply text ops event (BlockTextOps).
@@ -549,14 +547,14 @@ impl DocumentSyncState {
     /// On failure, resets frontier to trigger full sync on next block event.
     pub fn apply_text_ops(
         &mut self,
-        document_id: &str,
-        agent_id: &str,
+        context_id: ContextId,
+        agent_id: PrincipalId,
         ops: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(document_id, agent_id)
+            BlockDocument::new(context_id, agent_id)
         });
-        self.manager.apply_text_ops(doc, document_id, ops)
+        self.manager.apply_text_ops(doc, context_id, ops)
     }
 
     /// Reset sync state, forcing full sync on next event.
@@ -598,7 +596,7 @@ pub struct CachedDocument {
 ///
 /// Holds `BlockDocument` + `SyncManager` per joined context, enabling:
 /// - Instant context switching (cache hit → snapshot swap)
-/// - Background sync for inactive contexts (events route by document_id)
+/// - Background sync for inactive contexts (events route by context_id)
 /// - LRU eviction when too many contexts are cached
 ///
 /// `DocumentSyncState` becomes a thin proxy to the active cache entry
@@ -606,12 +604,12 @@ pub struct CachedDocument {
 #[derive(Resource)]
 #[allow(dead_code)]
 pub struct DocumentCache {
-    /// Map from document_id → cached document state.
-    documents: std::collections::HashMap<String, CachedDocument>,
-    /// Currently active (rendered) document_id.
-    active_id: Option<String>,
-    /// Most-recently-used document IDs (front = most recent).
-    mru: Vec<String>,
+    /// Map from context_id → cached document state.
+    documents: std::collections::HashMap<ContextId, CachedDocument>,
+    /// Currently active (rendered) context_id.
+    active_id: Option<ContextId>,
+    /// Most-recently-used context IDs (front = most recent).
+    mru: Vec<ContextId>,
     /// Maximum number of cached documents before LRU eviction.
     max_cached: usize,
 }
@@ -629,62 +627,51 @@ impl Default for DocumentCache {
 
 #[allow(dead_code)]
 impl DocumentCache {
-    /// Get the active document ID.
-    pub fn active_id(&self) -> Option<&str> {
-        self.active_id.as_deref()
+    /// Get the active context ID.
+    pub fn active_id(&self) -> Option<ContextId> {
+        self.active_id
     }
 
-    /// Get a reference to a cached document by document_id.
-    pub fn get(&self, document_id: &str) -> Option<&CachedDocument> {
-        self.documents.get(document_id)
+    /// Get a reference to a cached document by context_id.
+    pub fn get(&self, context_id: ContextId) -> Option<&CachedDocument> {
+        self.documents.get(&context_id)
     }
 
-    /// Get a mutable reference to a cached document by document_id.
-    pub fn get_mut(&mut self, document_id: &str) -> Option<&mut CachedDocument> {
-        self.documents.get_mut(document_id)
+    /// Get a mutable reference to a cached document by context_id.
+    pub fn get_mut(&mut self, context_id: ContextId) -> Option<&mut CachedDocument> {
+        self.documents.get_mut(&context_id)
     }
 
     /// Check if a document is cached.
-    pub fn contains(&self, document_id: &str) -> bool {
-        self.documents.contains_key(document_id)
+    pub fn contains(&self, context_id: ContextId) -> bool {
+        self.documents.contains_key(&context_id)
     }
 
     /// Insert a new cached document. Evicts LRU entry if at capacity.
-    pub fn insert(&mut self, document_id: String, cached: CachedDocument) {
-        // Evict LRU if at capacity (never evict the active document)
+    pub fn insert(&mut self, context_id: ContextId, cached: CachedDocument) {
         if self.documents.len() >= self.max_cached {
             self.evict_lru();
         }
-
-        self.documents.insert(document_id.clone(), cached);
-        self.touch_mru(&document_id);
+        self.documents.insert(context_id, cached);
+        self.touch_mru(context_id);
     }
 
     /// Set the active document. Returns the previous active_id if changed.
-    pub fn set_active(&mut self, document_id: &str) -> Option<String> {
+    pub fn set_active(&mut self, context_id: ContextId) -> Option<ContextId> {
         let previous = self.active_id.take();
-        self.active_id = Some(document_id.to_string());
-        self.touch_mru(document_id);
+        self.active_id = Some(context_id);
+        self.touch_mru(context_id);
 
-        // Update last_accessed timestamp
-        if let Some(doc) = self.documents.get_mut(document_id) {
+        if let Some(doc) = self.documents.get_mut(&context_id) {
             doc.last_accessed = std::time::Instant::now();
         }
 
         previous
     }
 
-    /// Get MRU-ordered document IDs (most recent first).
-    pub fn mru_ids(&self) -> &[String] {
+    /// Get MRU-ordered context IDs (most recent first).
+    pub fn mru_ids(&self) -> &[ContextId] {
         &self.mru
-    }
-
-    /// Find document_id by context_name.
-    pub fn document_id_for_context(&self, context_name: &str) -> Option<&str> {
-        self.documents
-            .iter()
-            .find(|(_, cached)| cached.context_name == context_name)
-            .map(|(id, _)| id.as_str())
     }
 
     /// Number of cached documents.
@@ -694,29 +681,28 @@ impl DocumentCache {
     }
 
     /// Iterate over all cached documents.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &CachedDocument)> {
-        self.documents.iter().map(|(k, v)| (k.as_str(), v))
+    pub fn iter(&self) -> impl Iterator<Item = (ContextId, &CachedDocument)> {
+        self.documents.iter().map(|(&k, v)| (k, v))
     }
 
-    /// Move a document_id to the front of the MRU list.
-    fn touch_mru(&mut self, document_id: &str) {
-        self.mru.retain(|id| id != document_id);
-        self.mru.insert(0, document_id.to_string());
+    /// Move a context_id to the front of the MRU list.
+    fn touch_mru(&mut self, context_id: ContextId) {
+        self.mru.retain(|&id| id != context_id);
+        self.mru.insert(0, context_id);
     }
 
     /// Evict the least-recently-used document (never the active one).
     fn evict_lru(&mut self) {
-        // Find the last MRU entry that isn't the active document
         let evict_id = self
             .mru
             .iter()
             .rev()
-            .find(|id| self.active_id.as_deref() != Some(id.as_str()))
-            .cloned();
+            .find(|&&id| self.active_id != Some(id))
+            .copied();
 
         if let Some(id) = evict_id {
             self.documents.remove(&id);
-            self.mru.retain(|mid| mid != &id);
+            self.mru.retain(|&mid| mid != id);
             log::info!("DocumentCache: evicted LRU document {}", id);
         }
     }
@@ -958,8 +944,8 @@ pub struct ComposeError {
 /// this to swap documents from the DocumentCache.
 #[derive(Message, Clone, Debug)]
 pub struct ContextSwitchRequested {
-    /// The context_name to switch to (matches constellation node context_id).
-    pub context_name: String,
+    /// The context to switch to.
+    pub context_id: ContextId,
 }
 
 /// Resource tracking a pending context switch for cache-miss handling.
@@ -968,7 +954,7 @@ pub struct ContextSwitchRequested {
 /// we spawn a new actor to join the context and store the target here.
 /// Once `ContextJoined` arrives for the matching context, we auto-switch.
 #[derive(Resource, Default)]
-pub struct PendingContextSwitch(pub Option<String>);
+pub struct PendingContextSwitch(pub Option<ContextId>);
 
 /// Resource tracking the conversation scroll position.
 ///

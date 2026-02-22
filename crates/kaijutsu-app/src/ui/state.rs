@@ -173,15 +173,16 @@ fn handle_context_joined(
     mut current_conv: ResMut<crate::conversation::CurrentConversation>,
 ) {
     for result in result_events.read() {
-        if let crate::connection::RpcResultMessage::ContextJoined { document_id, .. } = result {
+        if let crate::connection::RpcResultMessage::ContextJoined { membership, .. } = result {
+            let document_id = membership.context_id.to_string();
             // Create conversation metadata if it doesn't exist (idempotent)
-            if registry.get(document_id).is_none() {
-                let conv = kaijutsu_kernel::Conversation::with_id(document_id, document_id);
+            if registry.get(&document_id).is_none() {
+                let conv = kaijutsu_kernel::Conversation::with_id(&document_id, &document_id);
                 registry.add(conv);
                 info!("Created conversation metadata for {}", document_id);
             }
 
-            current_conv.0 = Some(document_id.clone());
+            current_conv.0 = Some(document_id);
         }
     }
 }

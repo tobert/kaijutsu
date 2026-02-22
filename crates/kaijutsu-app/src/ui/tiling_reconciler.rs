@@ -766,8 +766,10 @@ pub fn handle_pane_focus_change(
             }) = tree.root.find(current)
             {
                 if !document_id.is_empty() {
+                    let ctx_id = kaijutsu_types::ContextId::parse(document_id)
+                        .unwrap_or_else(|_| kaijutsu_types::ContextId::new());
                     switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_name: document_id.clone(),
+                        context_id: ctx_id,
                     });
                     info!(
                         "Pane focus change: switching context to '{}'",
@@ -837,14 +839,18 @@ pub fn sync_unfocused_pane_summaries(
                 let doc_id = &saved.document_id;
                 let (context_label, block_count) = if doc_id.is_empty() {
                     ("No context".to_string(), 0)
-                } else if let Some(cached) = doc_cache.get(doc_id) {
-                    let name = if cached.context_name.is_empty() {
-                        short_id(doc_id)
+                } else if let Some(ctx_id) = kaijutsu_types::ContextId::parse(doc_id).ok() {
+                    if let Some(cached) = doc_cache.get(ctx_id) {
+                        let name = if cached.context_name.is_empty() {
+                            short_id(doc_id)
+                        } else {
+                            cached.context_name.clone()
+                        };
+                        let count = cached.synced.block_count();
+                        (name, count)
                     } else {
-                        cached.context_name.clone()
-                    };
-                    let count = cached.synced.block_count();
-                    (name, count)
+                        (short_id(doc_id), 0)
+                    }
                 } else {
                     (short_id(doc_id), 0)
                 };
@@ -920,23 +926,23 @@ pub fn assign_mru_to_empty_panes(
         .collect();
 
     // Find next MRU context not already visible
-    let available: Vec<&str> = doc_cache
+    let available: Vec<String> = doc_cache
         .mru_ids()
         .iter()
-        .map(|s| s.as_str())
-        .filter(|id| !assigned.contains(*id))
+        .map(|s| s.to_string())
+        .filter(|id| !assigned.contains(id.as_str()))
         .collect();
 
     for (i, pane_id) in empty_panes.iter().enumerate() {
-        if let Some(&doc_id) = available.get(i) {
+        if let Some(doc_id) = available.get(i) {
             // Update the tiling tree
             tree.set_conversation_document(*pane_id, doc_id);
 
             // Update PaneMarker.content and PaneSavedState
             for (mut marker, mut saved) in saved_states.iter_mut() {
                 if marker.pane_id == *pane_id {
-                    marker.content = PaneContent::Conversation { document_id: doc_id.to_string() };
-                    saved.document_id = doc_id.to_string();
+                    marker.content = PaneContent::Conversation { document_id: doc_id.clone() };
+                    saved.document_id = doc_id.clone();
                     break;
                 }
             }
