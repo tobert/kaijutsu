@@ -441,6 +441,20 @@ impl KaijutsuMcp {
         Ok((ops_count.max(1), ack_version))
     }
 
+    /// Push local ops after a tool mutation. Logs errors but doesn't propagate —
+    /// the mutation already succeeded locally and the server echo will eventually
+    /// converge via the background event listener.
+    async fn push_after_mutation(&self) {
+        if self.remote().is_none() {
+            return; // Local mode, no server to push to
+        }
+        match self.push_to_server().await {
+            Ok((0, _)) => {} // No ops (shouldn't happen right after mutation, but harmless)
+            Ok((n, v)) => tracing::debug!(ops = n, ack = v, "Pushed mutation ops"),
+            Err(e) => tracing::warn!("Failed to push mutation ops: {e}"),
+        }
+    }
+
     /// Get the actor handle for direct RPC operations.
     fn actor(&self) -> Option<&ActorHandle> {
         match &self.backend {
@@ -551,7 +565,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_create")]
-    fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
+    async fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
             Ok(id) => id,
             Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
@@ -584,6 +598,8 @@ impl KaijutsuMcp {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
+
+                self.push_after_mutation().await;
 
                 serde_json::json!({
                     "success": true,
@@ -668,7 +684,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_append")]
-    fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
+    async fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
@@ -679,6 +695,8 @@ impl KaijutsuMcp {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
+
+                self.push_after_mutation().await;
 
                 serde_json::json!({
                     "success": true,
@@ -691,7 +709,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_edit")]
-    fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
+    async fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
@@ -783,6 +801,8 @@ impl KaijutsuMcp {
             .map(|e| e.version())
             .unwrap_or(0);
 
+        self.push_after_mutation().await;
+
         serde_json::json!({
             "success": true,
             "version": version
@@ -868,7 +888,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "Set the status of a block: pending, running, done, or error.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_status")]
-    fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
+    async fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
@@ -884,6 +904,8 @@ impl KaijutsuMcp {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
+
+                self.push_after_mutation().await;
 
                 serde_json::json!({
                     "success": true,
@@ -2367,8 +2389,8 @@ mod tests {
         assert!(result.contains("conversation"));
     }
 
-    #[test]
-    fn test_block_create_and_read() {
+    #[tokio::test]
+    async fn test_block_create_and_read() {
         let mcp = KaijutsuMcp::new();
 
         // Create document first
@@ -2382,7 +2404,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Hello, world!".to_string()),
-        }));
+        })).await;
         assert!(result.contains("success"));
         assert!(result.contains("block_id"));
 
@@ -2401,8 +2423,8 @@ mod tests {
         assert!(result.contains("text"));
     }
 
-    #[test]
-    fn test_block_append() {
+    #[tokio::test]
+    async fn test_block_append() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2414,7 +2436,7 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("Hello".to_string()),
-        }));
+        })).await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
@@ -2423,7 +2445,7 @@ mod tests {
         let result = mcp.block_append(Parameters(BlockAppendRequest {
             block_id: block_id.to_string(),
             text: ", world!".to_string(),
-        }));
+        })).await;
         assert!(result.contains("success"));
 
         // Verify content
@@ -2435,8 +2457,8 @@ mod tests {
         assert!(result.contains("Hello, world!"));
     }
 
-    #[test]
-    fn test_kernel_search() {
+    #[tokio::test]
+    async fn test_kernel_search() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2448,7 +2470,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("The quick brown fox".to_string()),
-        }));
+        })).await;
 
         mcp.block_create(Parameters(BlockCreateRequest {
             document_id: doc_id,
@@ -2457,7 +2479,7 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("The lazy dog".to_string()),
-        }));
+        })).await;
 
         // Search for "The"
         let result = mcp.kernel_search(Parameters(KernelSearchRequest {
@@ -2473,8 +2495,8 @@ mod tests {
         assert_eq!(parsed["total"], 2);
     }
 
-    #[test]
-    fn test_doc_tree() {
+    #[tokio::test]
+    async fn test_doc_tree() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2487,7 +2509,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Hello!".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let user_block_id = parsed["block_id"].as_str().unwrap().to_string();
 
@@ -2498,7 +2520,7 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("Hi there!".to_string()),
-        }));
+        })).await;
 
         // Test doc_tree output
         let result = mcp.doc_tree(Parameters(DocTreeRequest {
@@ -2513,8 +2535,8 @@ mod tests {
         assert!(result.contains("[model/text]"));
     }
 
-    #[test]
-    fn test_doc_tree_with_tools() {
+    #[tokio::test]
+    async fn test_doc_tree_with_tools() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2527,7 +2549,7 @@ mod tests {
             role: "model".to_string(),
             kind: "tool_call".to_string(),
             content: Some("{\"path\": \"/test\"}".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let tool_call_id = parsed["block_id"].as_str().unwrap().to_string();
 
@@ -2539,7 +2561,7 @@ mod tests {
             role: "tool".to_string(),
             kind: "tool_result".to_string(),
             content: Some("File contents".to_string()),
-        }));
+        })).await;
 
         // Test collapsed format (default)
         let result = mcp.doc_tree(Parameters(DocTreeRequest {
@@ -2563,8 +2585,8 @@ mod tests {
         assert!(result.contains("[tool/tool_result]"));
     }
 
-    #[test]
-    fn test_block_inspect() {
+    #[tokio::test]
+    async fn test_block_inspect() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2576,7 +2598,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Test content".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
@@ -2594,8 +2616,8 @@ mod tests {
         assert_eq!(parsed["metadata"]["kind"], "text");
     }
 
-    #[test]
-    fn test_block_history() {
+    #[tokio::test]
+    async fn test_block_history() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2607,7 +2629,7 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("Initial content".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
@@ -2624,8 +2646,8 @@ mod tests {
         assert!(result.contains("status:"));
     }
 
-    #[test]
-    fn test_improved_error_messages() {
+    #[tokio::test]
+    async fn test_improved_error_messages() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2637,7 +2659,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Single line".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
@@ -2648,7 +2670,7 @@ mod tests {
                 start_line: 5,
                 end_line: 10,
             }],
-        }));
+        })).await;
 
         // Should have improved error message
         assert!(result.contains("Invalid line range 5-10"));
@@ -2656,8 +2678,8 @@ mod tests {
         assert!(result.contains("valid range: 0-1"));
     }
 
-    #[test]
-    fn test_block_diff() {
+    #[tokio::test]
+    async fn test_block_diff() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2669,7 +2691,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Hello\nWorld\nFoo".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
@@ -2694,8 +2716,8 @@ mod tests {
         assert!(result.contains("3 lines"));
     }
 
-    #[test]
-    fn test_doc_undo() {
+    #[tokio::test]
+    async fn test_doc_undo() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2708,7 +2730,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("First block".to_string()),
-        }));
+        })).await;
 
         mcp.block_create(Parameters(BlockCreateRequest {
             document_id: doc_id.clone(),
@@ -2717,7 +2739,7 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("Second block".to_string()),
-        }));
+        })).await;
 
         // Test doc_undo dry-run
         let result = mcp.doc_undo(Parameters(DocUndoRequest {
@@ -2732,8 +2754,8 @@ mod tests {
         assert!(result.contains("not yet implemented"));
     }
 
-    #[test]
-    fn test_block_diff_no_changes() {
+    #[tokio::test]
+    async fn test_block_diff_no_changes() {
         let mcp = KaijutsuMcp::new();
 
         let doc_id = create_test_doc(&mcp, "conversation");
@@ -2745,7 +2767,7 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("Same content".to_string()),
-        }));
+        })).await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
