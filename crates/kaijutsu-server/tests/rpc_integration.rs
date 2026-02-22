@@ -3,7 +3,6 @@
 //! Uses ephemeral SSH keys generated in memory for testing.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use tokio::task::LocalSet;
 
@@ -20,25 +19,27 @@ fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     rt.block_on(local.run_until(f));
 }
 
-/// Start an SSH server on an ephemeral port and return the address
+/// Start an SSH server on an ephemeral port and return the address.
+///
+/// Passes the pre-bound listener to the server so connections queue in
+/// the OS backlog during kernel initialization — no port gap, no race.
 async fn start_server() -> SocketAddr {
-    // Bind to port 0 to get an ephemeral port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener); // Release so server can bind
 
     let config = SshServerConfig::ephemeral(addr.port());
 
-    // Spawn server in background
+    // Spawn server with the already-bound listener
     tokio::task::spawn_local(async move {
         let server = SshServer::new(config);
-        if let Err(e) = server.run().await {
+        if let Err(e) = server.run_on_listener(listener).await {
             log::error!("Server error: {}", e);
         }
     });
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Yield so the server task starts (listener is already bound, so
+    // connections will queue even if init isn't finished yet)
+    tokio::task::yield_now().await;
 
     addr
 }

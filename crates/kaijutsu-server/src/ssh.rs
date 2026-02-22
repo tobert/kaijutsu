@@ -253,8 +253,19 @@ impl SshServer {
         });
     }
 
-    /// Run the SSH server
+    /// Run the SSH server, binding to the configured address.
     pub async fn run(&self) -> Result<(), std::io::Error> {
+        let socket = TcpListener::bind(self.config.bind_addr).await?;
+        log::info!("Starting SSH server on {}", self.config.bind_addr);
+        self.run_on_listener(socket).await
+    }
+
+    /// Run the SSH server on a pre-bound listener.
+    ///
+    /// Useful for tests: bind port 0 first to get the address, then pass the
+    /// listener here. The listener stays bound during initialization, so
+    /// incoming connections queue in the OS backlog instead of getting refused.
+    pub async fn run_on_listener(&self, socket: TcpListener) -> Result<(), std::io::Error> {
         // Load or generate the host key
         let host_key = self.config.key_source.load_or_generate()?;
         log::info!(
@@ -291,8 +302,6 @@ impl SshServer {
             ..Default::default()
         };
 
-        log::info!("Starting SSH server on {}", self.config.bind_addr);
-
         let allow_anonymous = self.config.allow_anonymous;
         if allow_anonymous {
             log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
@@ -323,7 +332,6 @@ impl SshServer {
             allow_anonymous,
             registry,
         };
-        let socket = TcpListener::bind(self.config.bind_addr).await?;
 
         server
             .run_on_socket(Arc::new(config), &socket)
