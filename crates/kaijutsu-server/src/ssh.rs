@@ -24,7 +24,7 @@ use kaijutsu_types::Principal;
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
-use crate::rpc::{ServerState, WorldImpl};
+use crate::rpc::{ConnectionState, ServerRegistry, WorldImpl};
 
 /// Source for the SSH host key.
 #[derive(Clone)]
@@ -299,15 +299,29 @@ impl SshServer {
         }
 
         // Create shared MCP server pool and pre-initialize from config.
-        // This avoids blocking each client's attach_kernel on MCP server startup.
+        // This avoids blocking kernel creation on slow MCP servers.
         let mcp_pool = Arc::new(McpServerPool::new());
         Self::start_mcp_initialization(mcp_pool.clone(), self.config.config_dir.clone());
+
+        // Create the shared kernel at server startup — 会の場所 (the meeting place).
+        // All connections share this single kernel.
+        let shared_kernel = crate::rpc::create_shared_kernel(
+            &mcp_pool,
+            self.config.config_dir.as_deref(),
+            None, // data_dir: use XDG default
+        ).await.map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
+
+        let registry = Arc::new(ServerRegistry {
+            kernel: shared_kernel,
+            mcp_pool,
+        });
+
+        log::info!("Shared kernel created: {}", registry.kernel.name);
 
         let mut server = Server {
             auth_db: Arc::new(Mutex::new(auth_db)),
             allow_anonymous,
-            config_dir: self.config.config_dir.clone(),
-            mcp_pool,
+            registry,
         };
         let socket = TcpListener::bind(self.config.bind_addr).await?;
 
@@ -322,9 +336,8 @@ impl SshServer {
 struct Server {
     auth_db: Arc<Mutex<AuthDb>>,
     allow_anonymous: bool,
-    config_dir: Option<PathBuf>,
-    /// Shared MCP server pool (pre-initialized at server startup)
-    mcp_pool: Arc<McpServerPool>,
+    /// Shared kernel and MCP pool (created at server startup)
+    registry: Arc<ServerRegistry>,
 }
 
 impl server::Server for Server {
@@ -335,8 +348,7 @@ impl server::Server for Server {
             self.auth_db.clone(),
             peer_addr,
             self.allow_anonymous,
-            self.config_dir.clone(),
-            self.mcp_pool.clone(),
+            self.registry.clone(),
         )
     }
 
@@ -351,9 +363,8 @@ struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     allow_anonymous: bool,
     identity: Option<Principal>,
-    config_dir: Option<PathBuf>,
-    /// Shared MCP server pool (pre-initialized at server startup)
-    mcp_pool: Arc<McpServerPool>,
+    /// Shared kernel and MCP pool (created at server startup)
+    registry: Arc<ServerRegistry>,
     /// Channel index counter — only channel 1 (RPC) gets a handler thread
     channel_count: u32,
 }
@@ -363,35 +374,32 @@ impl ConnectionHandler {
         auth_db: Arc<Mutex<AuthDb>>,
         peer_addr: Option<SocketAddr>,
         allow_anonymous: bool,
-        config_dir: Option<PathBuf>,
-        mcp_pool: Arc<McpServerPool>,
+        registry: Arc<ServerRegistry>,
     ) -> Self {
         Self {
             auth_db,
             peer_addr,
             allow_anonymous,
             identity: None,
-            config_dir,
-            mcp_pool,
+            registry,
             channel_count: 0,
         }
     }
 }
 
-/// Run Cap'n Proto RPC over an SSH channel stream
+/// Run Cap'n Proto RPC over an SSH channel stream.
+///
+/// Creates per-connection state and hands out a capability to the shared kernel.
 async fn run_rpc(
     stream: russh::ChannelStream<Msg>,
     principal: Principal,
-    config_dir: Option<PathBuf>,
-    mcp_pool: Arc<McpServerPool>,
+    registry: Arc<ServerRegistry>,
 ) {
     let stream = stream.compat();
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
-    let mut server_state = ServerState::new(principal.clone(), config_dir);
-    server_state.mcp_pool = mcp_pool;
-    let state = Rc::new(RefCell::new(server_state));
-    let world = WorldImpl::new(state);
+    let connection = Rc::new(RefCell::new(ConnectionState::new(principal.clone())));
+    let world = WorldImpl::new(registry, connection);
     let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
 
     let network = twoparty::VatNetwork::new(
@@ -465,8 +473,7 @@ impl server::Handler for ConnectionHandler {
         }
 
         let stream = channel.into_stream();
-        let config_dir = self.config_dir.clone();
-        let mcp_pool = self.mcp_pool.clone();
+        let registry = self.registry.clone();
 
         // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet)
         std::thread::spawn(move || {
@@ -476,7 +483,7 @@ impl server::Handler for ConnectionHandler {
                 .expect("Failed to create tokio runtime for RPC");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                run_rpc(stream, principal, config_dir, mcp_pool).await;
+                run_rpc(stream, principal, registry).await;
             });
         });
 

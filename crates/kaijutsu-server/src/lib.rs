@@ -24,5 +24,5 @@ pub use docs_filesystem::KaijutsuFilesystem;
 pub use embedded_kaish::EmbeddedKaish;
 pub use kaish_backend::KaijutsuBackend;
 pub use mount_backend::MountBackend;
-pub use rpc::WorldImpl;
+pub use rpc::{WorldImpl, SharedKernel, SharedKernelState, ServerRegistry, ConnectionState};
 pub use ssh::{KeySource, SshServer, SshServerConfig};

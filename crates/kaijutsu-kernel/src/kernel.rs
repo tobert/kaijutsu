@@ -483,85 +483,6 @@ impl Kernel {
     }
 
     // ========================================================================
-    // Fork / Thread
-    // ========================================================================
-
-    /// Fork the kernel (deep copy, isolated).
-    pub async fn fork(&self, new_name: impl Into<String>) -> Self {
-        let new_name = new_name.into();
-        let state = self.state.read().await.fork(&new_name);
-
-        // Create new VFS (backends would need Clone impl for real mount copying)
-        let vfs = Arc::new(MountTable::new());
-
-        // Copy mount info (but not backends - they'd need Clone impl)
-        // This is a limitation - real fork would need backend cloning
-
-        // Copy tool config - forked kernels inherit parent's tool filtering
-        let tool_config = self.tool_config.read().await.clone();
-
-        // Copy LLM registry - forked kernels inherit runtime provider/model config
-        // (provider Arc<RigProvider>s are shared, settings are independent)
-        let llm_registry = self.llm.read().await.clone_state();
-
-        // Note: FlowBus is independent - forked kernels have their own event streams
-
-        // Note: Agents are not copied - forked kernels start fresh
-
-        // Share DriftRouter - forked kernels participate in drift with parent
-        let drift = Arc::clone(&self.drift);
-
-        Self {
-            vfs,
-            state: RwLock::new(state),
-            tools: RwLock::new(ToolRegistry::new()),
-            tool_config: RwLock::new(tool_config),
-            llm: RwLock::new(llm_registry),
-            agents: RwLock::new(AgentRegistry::new()),
-            consent_mode: RwLock::new(ConsentMode::default()),
-            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
-            drift,
-        }
-    }
-
-    /// Thread the kernel (light copy, shared VFS refs).
-    pub async fn thread(&self, new_name: impl Into<String>) -> Self {
-        let new_name = new_name.into();
-        let state = self.state.read().await.thread(&new_name);
-
-        // Share the VFS
-        let vfs = Arc::clone(&self.vfs);
-
-        // Copy tool config - threaded kernels inherit parent's tool filtering
-        // (they can modify independently)
-        let tool_config = self.tool_config.read().await.clone();
-
-        // Copy LLM registry - threaded kernels inherit runtime provider/model config
-        // (provider Arc<RigProvider>s are shared, settings are independent)
-        let llm_registry = self.llm.read().await.clone_state();
-
-        // Note: Agents are not shared - threaded kernels get fresh registry
-
-        // Share the FlowBus - threaded kernels share event streams
-        let block_flows = Arc::clone(&self.block_flows);
-
-        // Share DriftRouter - threaded kernels participate in drift with parent
-        let drift = Arc::clone(&self.drift);
-
-        Self {
-            vfs,
-            state: RwLock::new(state),
-            tools: RwLock::new(ToolRegistry::new()),
-            tool_config: RwLock::new(tool_config),
-            llm: RwLock::new(llm_registry),
-            agents: RwLock::new(AgentRegistry::new()),
-            consent_mode: RwLock::new(ConsentMode::default()),
-            block_flows,
-            drift,
-        }
-    }
-
-    // ========================================================================
     // Tool Configuration
     // ========================================================================
 
@@ -703,44 +624,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thread() {
-        use crate::vfs::backends::MemoryBackend;
-
-        let kernel = Kernel::new("parent").await;
-        kernel.set_var("FOO", "bar").await;
-        kernel.mount("/mem", MemoryBackend::new()).await;
-        kernel.create(Path::new("/mem/test.txt"), 0o644).await.unwrap();
-
-        let threaded = kernel.thread("worker").await;
-
-        // Should inherit vars
-        assert_eq!(threaded.get_var("FOO").await, Some("bar".to_string()));
-
-        // Should share VFS (same mount visible)
-        let attr = threaded.getattr(Path::new("/mem/test.txt")).await;
-        assert!(attr.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_fork() {
-        let kernel = Kernel::new("parent").await;
-        kernel.set_var("FOO", "bar").await;
-        kernel.add_history("cmd1").await;
-
-        let forked = kernel.fork("child").await;
-
-        // Should have copied vars
-        assert_eq!(forked.get_var("FOO").await, Some("bar".to_string()));
-
-        // Should have copied history
-        let history = forked.recent_history(10).await;
-        assert_eq!(history.len(), 1);
-
-        // VFS is independent (no shared mounts)
-        assert!(forked.list_mounts().await.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_llm_provider() {
         let kernel = Kernel::new("test").await;
 
@@ -765,51 +648,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_fork_inherits_llm_config() {
-        let parent = Kernel::new("parent").await;
-
-        // Set up parent's LLM registry
-        let provider = Arc::new(RigProvider::Anthropic(
-            rig::providers::anthropic::Client::new("fake-key").unwrap(),
-        ));
-        parent.register_llm("anthropic", provider).await;
-        parent.set_default_llm("anthropic").await;
-        parent.llm().write().await.set_default_model("claude-sonnet-4-5-20250929");
-
-        // Fork
-        let child = parent.fork("child").await;
-
-        // Child inherits provider, default provider name, and default model
-        let child_reg = child.llm().read().await;
-        assert!(child_reg.get("anthropic").is_some());
-        assert_eq!(child_reg.default_provider_name(), Some("anthropic"));
-        assert_eq!(child_reg.default_model(), Some("claude-sonnet-4-5-20250929"));
-        drop(child_reg);
-
-        // Child can change model independently
-        child.llm().write().await.set_default_model("claude-haiku-4-5-20251001");
-        assert_eq!(child.llm().read().await.default_model(), Some("claude-haiku-4-5-20251001"));
-
-        // Parent is unaffected
-        assert_eq!(parent.llm().read().await.default_model(), Some("claude-sonnet-4-5-20250929"));
-    }
-
-    #[tokio::test]
-    async fn test_thread_inherits_llm_config() {
-        let parent = Kernel::new("parent").await;
-
-        let provider = Arc::new(RigProvider::Anthropic(
-            rig::providers::anthropic::Client::new("fake-key").unwrap(),
-        ));
-        parent.register_llm("anthropic", provider).await;
-        parent.set_default_llm("anthropic").await;
-
-        let child = parent.thread("worker").await;
-
-        // Thread inherits LLM config
-        let child_reg = child.llm().read().await;
-        assert!(child_reg.get("anthropic").is_some());
-        assert_eq!(child_reg.default_provider_name(), Some("anthropic"));
-    }
 }

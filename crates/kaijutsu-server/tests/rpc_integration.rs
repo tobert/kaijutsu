@@ -72,13 +72,14 @@ fn test_whoami() {
 }
 
 #[test]
-fn test_list_kernels_empty() {
+fn test_list_kernels_shows_shared_kernel() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
+        // The shared kernel is created at server startup — always one kernel
         let kernels = client.list_kernels().await.unwrap();
-        assert!(kernels.is_empty(), "Expected no kernels initially");
+        assert_eq!(kernels.len(), 1, "Expected one shared kernel");
     });
 }
 

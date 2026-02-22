@@ -202,35 +202,6 @@ impl KernelState {
         }
     }
 
-    // ========================================================================
-    // Fork/Thread
-    // ========================================================================
-
-    /// Create a deep copy for forking.
-    pub fn fork(&self, new_name: impl Into<String>) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            name: new_name.into(),
-            vars: self.vars.clone(),
-            history: self.history.clone(),
-            checkpoints: Vec::new(), // Checkpoints don't carry over
-            next_history_id: self.next_history_id,
-        }
-    }
-
-    /// Create a lightweight copy for threading.
-    ///
-    /// Shares the same ID lineage but starts fresh.
-    pub fn thread(&self, new_name: impl Into<String>) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            name: new_name.into(),
-            vars: self.vars.clone(), // Inherit vars
-            history: Vec::new(),     // Fresh history
-            checkpoints: Vec::new(),
-            next_history_id: 1,
-        }
-    }
 }
 
 /// A command history entry.
@@ -330,31 +301,4 @@ mod tests {
         assert_eq!(state.history().len(), 1);
     }
 
-    #[test]
-    fn test_fork() {
-        let mut state = KernelState::new("parent");
-        state.set_var("FOO", "bar");
-        state.add_history("cmd1");
-
-        let forked = state.fork("child");
-
-        assert_ne!(forked.id, state.id);
-        assert_eq!(forked.name, "child");
-        assert_eq!(forked.get_var("FOO"), Some("bar"));
-        assert_eq!(forked.history().len(), 1);
-    }
-
-    #[test]
-    fn test_thread() {
-        let mut state = KernelState::new("parent");
-        state.set_var("FOO", "bar");
-        state.add_history("cmd1");
-
-        let threaded = state.thread("worker");
-
-        assert_ne!(threaded.id, state.id);
-        assert_eq!(threaded.name, "worker");
-        assert_eq!(threaded.get_var("FOO"), Some("bar")); // Inherits vars
-        assert_eq!(threaded.history().len(), 0); // Fresh history
-    }
 }
