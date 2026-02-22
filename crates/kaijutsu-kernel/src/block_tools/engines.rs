@@ -201,18 +201,17 @@ fn parse_status(s: &str) -> Result<Status> {
     }
 }
 
-/// Find a block by ID string, checking all documents.
-/// Returns (ContextId, BlockId) if found.
+/// Find a block by ID string via O(1) context lookup.
+///
+/// BlockId embeds the ContextId, so we can look up the document directly
+/// instead of scanning all documents.
 fn find_block(documents: &SharedBlockStore, block_id_str: &str) -> Result<(ContextId, BlockId)> {
     let block_id = parse_block_id(block_id_str)?;
+    let context_id = block_id.context_id;
 
-    for context_id in documents.list_ids() {
-        if let Some(entry) = documents.get(context_id) {
-            for snapshot in entry.doc.blocks_ordered() {
-                if snapshot.id == block_id {
-                    return Ok((context_id, block_id));
-                }
-            }
+    if let Some(entry) = documents.get(context_id) {
+        if entry.doc.get_block_snapshot(&block_id).is_some() {
+            return Ok((context_id, block_id));
         }
     }
     Err(EditError::BlockNotFound(block_id_str.to_string()))
