@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as TokioMutex;
 
-use kaijutsu_crdt::{BlockKind, ContextId, Role};
+use kaijutsu_crdt::{BlockKind, ContextId, PrincipalId, Role};
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::hook_types::{HookEvent, HookResponse, PingResponse, KAIJUTSU_MCP_TOOLS};
@@ -262,13 +262,14 @@ impl HookListener {
     // -- Block insertion helpers --
 
     fn insert_text_block(&self, role: Role, content: &str) {
-        if let Err(e) = self.store.insert_block(
+        if let Err(e) = self.store.insert_block_as(
             self.context_id,
             None,  // parent
             None,  // after (append)
             role,
             BlockKind::Text,
             content,
+            Some(PrincipalId::system()),
         ) {
             tracing::warn!("Hook insert_block error: {e}");
         }
@@ -277,12 +278,13 @@ impl HookListener {
     fn insert_tool_blocks(&self, tool: &crate::hook_types::ToolInfo, is_error: bool) {
         // Insert tool call block
         let input = tool.input.clone();
-        let call_id = match self.store.insert_tool_call(
+        let call_id = match self.store.insert_tool_call_as(
             self.context_id,
             None,
             None,
             &tool.name,
             input,
+            Some(PrincipalId::system()),
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -299,13 +301,14 @@ impl HookListener {
         };
         let truncated = truncate(content, self.max_block_size);
 
-        if let Err(e) = self.store.insert_tool_result(
+        if let Err(e) = self.store.insert_tool_result_as(
             self.context_id,
             &call_id,
             None,
             &truncated,
             is_error,
             None,
+            Some(PrincipalId::system()),
         ) {
             tracing::warn!("Hook insert_tool_result error: {e}");
         }
@@ -376,7 +379,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let ops = remote.store.ops_since(remote.context_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let ops_bytes = postcard::to_stdvec(&ops)
+    let ops_bytes = serde_json::to_vec(&ops)
         .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
     if ops_bytes.len() <= 2 {

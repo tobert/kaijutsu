@@ -160,6 +160,40 @@ impl BlockContent {
         block
     }
 
+    /// Create from a BlockSnapshot with a **bare** DTE Document (no structure).
+    ///
+    /// Used during sync: metadata comes from the snapshot, but the DTE Document
+    /// is completely empty — no `create_text("content")` op. The sender's full
+    /// DTE ops (including the structure creation) will be merged in, preserving
+    /// causal history so subsequent incremental DTE ops can merge successfully.
+    pub fn from_snapshot_for_sync(snap: &BlockSnapshot, agent_id: PrincipalId, fallback_order_key: String) -> Self {
+        let header = BlockHeader::from_snapshot(snap);
+        let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
+
+        // Bare DTE Document — no create_text, no content. Sender's ops provide everything.
+        let mut doc = Document::new();
+        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let agent = doc.create_agent(dte_uuid);
+
+        let block = Self {
+            header,
+            doc,
+            agent,
+            order_key,
+            tool_name: snap.tool_name.clone(),
+            tool_input: snap.tool_input.clone(),
+            tool_call_id: snap.tool_call_id,
+            display_hint: snap.display_hint.clone(),
+            source_context: snap.source_context,
+            source_model: snap.source_model.clone(),
+            drift_kind: snap.drift_kind,
+            file_path: snap.file_path.clone(),
+            collapsed: snap.collapsed,
+            deleted: false,
+        };
+        block
+    }
+
     // ── Content access ──────────────────────────────────────────────────
 
     /// Get the current text content.

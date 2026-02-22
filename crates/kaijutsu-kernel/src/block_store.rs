@@ -1,7 +1,7 @@
 //! Block-based CRDT storage using kaijutsu-crdt.
 //!
-//! Each document has a BlockDocument backed by diamond-types OpLog.
-//! Multi-client sync is handled via SerializedOps exchange.
+//! Each document wraps a `kaijutsu_crdt::block_store::BlockStore` (per-block DTE).
+//! Multi-client sync uses `SyncPayload` exchange.
 //!
 //! # Concurrency Model
 //!
@@ -9,16 +9,16 @@
 //! - FlowBus for typed pub/sub real-time updates
 //! - parking_lot for efficient locking
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use diamond_types_extended::Frontier;
 use parking_lot::RwLock;
 
-use kaijutsu_crdt::{
-    BlockDocument, BlockId, BlockKind, BlockSnapshot, DocumentSnapshot, Frontier, Role,
-    SerializedOps, SerializedOpsOwned, Status,
-};
+use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, StoreSnapshot, SyncPayload};
+use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status};
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
@@ -29,8 +29,8 @@ type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
-    /// The block document (owns OpLog).
-    pub doc: BlockDocument,
+    /// Per-block CRDT store (each block owns its own DTE Document).
+    pub doc: CrdtBlockStore,
     /// Document metadata.
     pub kind: DocumentKind,
     /// Programming language (if code).
@@ -39,7 +39,7 @@ pub struct DocumentEntry {
     version: AtomicU64,
     /// Last agent to modify.
     last_agent: RwLock<PrincipalId>,
-    /// Sync generation — bumped on compaction to force client re-sync.
+    /// Sync generation — bumped on reset to force client re-sync.
     sync_generation: AtomicU64,
 }
 
@@ -47,7 +47,7 @@ impl DocumentEntry {
     /// Create a new document entry.
     fn new(context_id: ContextId, kind: DocumentKind, language: Option<String>, agent_id: PrincipalId) -> Self {
         Self {
-            doc: BlockDocument::new(context_id, agent_id),
+            doc: CrdtBlockStore::new(context_id, agent_id),
             kind,
             language,
             version: AtomicU64::new(0),
@@ -56,16 +56,17 @@ impl DocumentEntry {
         }
     }
 
-    /// Create a document entry from a snapshot.
-    fn from_snapshot(
-        snapshot: DocumentSnapshot,
+    /// Create a document entry from a store snapshot.
+    fn from_store_snapshot(
+        snapshot: StoreSnapshot,
         kind: DocumentKind,
         language: Option<String>,
         agent_id: PrincipalId,
     ) -> Self {
-        let version = snapshot.version;
+        let store = CrdtBlockStore::from_snapshot(snapshot, agent_id);
+        let version = store.version();
         Self {
-            doc: BlockDocument::from_snapshot(snapshot, agent_id),
+            doc: store,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -231,34 +232,26 @@ impl BlockStore {
         }
     }
 
-    /// Create a document from serialized oplog bytes (for sync from server).
+    /// Create a document from a serialized store snapshot (for sync from server).
     ///
-    /// This reconstructs a document's full CRDT history from the server's oplog.
+    /// Reconstructs the document from a postcard-encoded `StoreSnapshot`.
     /// Used for initial sync when connecting to a kaijutsu-server.
-    pub fn create_document_from_oplog(
+    pub fn create_document_from_snapshot(
         &self,
         context_id: ContextId,
         kind: DocumentKind,
         language: Option<String>,
-        oplog_bytes: &[u8],
+        snapshot_bytes: &[u8],
     ) -> Result<(), String> {
         if self.documents.contains_key(&context_id) {
             return Err(format!("Document {} already exists", context_id.to_hex()));
         }
 
-        let agent_id = self.agent_id();
-        let doc = BlockDocument::from_oplog(context_id, agent_id, oplog_bytes)
-            .map_err(|e| format!("Failed to create document from oplog: {}", e))?;
+        let snapshot: StoreSnapshot = serde_json::from_slice(snapshot_bytes)
+            .map_err(|e| format!("Failed to deserialize store snapshot: {}", e))?;
 
-        let version = doc.version();
-        let entry = DocumentEntry {
-            doc,
-            kind,
-            language,
-            version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
-            sync_generation: AtomicU64::new(0),
-        };
+        let agent_id = self.agent_id();
+        let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, agent_id);
         self.documents.insert(context_id, entry);
 
         Ok(())
@@ -329,7 +322,7 @@ impl BlockStore {
             .ok_or_else(|| format!("Source document {} not found", source_id.to_hex()))?;
 
         let agent_id = self.agent_id();
-        let forked_doc = source_entry.doc.fork(new_id, agent_id);
+        let forked_store = source_entry.doc.fork(new_id, agent_id);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
@@ -351,9 +344,9 @@ impl BlockStore {
                 .map_err(|e| format!("DB error: {}", e))?;
         }
 
-        let version = forked_doc.version();
+        let version = forked_store.version();
         let entry = DocumentEntry {
-            doc: forked_doc,
+            doc: forked_store,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -402,7 +395,7 @@ impl BlockStore {
         }
 
         let agent_id = self.agent_id();
-        let forked_doc = source_entry.doc.fork_at_version(new_id, agent_id, at_version);
+        let forked_store = source_entry.doc.fork_at_version(new_id, agent_id, at_version);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
@@ -424,9 +417,9 @@ impl BlockStore {
                 .map_err(|e| format!("DB error: {}", e))?;
         }
 
-        let version = forked_doc.version();
+        let version = forked_store.version();
         let entry = DocumentEntry {
-            doc: forked_doc,
+            doc: forked_store,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -484,10 +477,30 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
     ) -> Result<BlockId, String> {
+        self.insert_block_as(context_id, parent_id, after, role, kind, content, None)
+    }
+
+    /// Insert a block with an explicit author identity.
+    ///
+    /// If `agent_id` is `Some`, the block will be stamped with that principal.
+    /// If `None`, the store's default agent_id is used (backwards compat).
+    pub fn insert_block_as(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        role: Role,
+        kind: BlockKind,
+        content: impl Into<String>,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+
+            // Set the agent for this operation so BlockId gets the right author
+            entry.doc.set_agent_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops.
             // Clients that are in sync can merge these directly.
@@ -501,8 +514,8 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
-            entry.touch(agent_id);
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
         self.auto_save(context_id);
@@ -528,10 +541,24 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
+        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, None)
+    }
+
+    /// Insert a tool call block with an explicit author identity.
+    pub fn insert_tool_call_as(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        tool_name: impl Into<String>,
+        tool_input: serde_json::Value,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
@@ -543,8 +570,8 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
-            entry.touch(agent_id);
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
         self.auto_save(context_id);
@@ -571,10 +598,25 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
+        self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, None)
+    }
+
+    /// Insert a tool result block with an explicit author identity.
+    pub fn insert_tool_result_as(
+        &self,
+        context_id: ContextId,
+        tool_call_id: &BlockId,
+        after: Option<&BlockId>,
+        content: impl Into<String>,
+        is_error: bool,
+        exit_code: Option<i32>,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
@@ -586,8 +628,8 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
-            entry.touch(agent_id);
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
         self.auto_save(context_id);
@@ -614,11 +656,23 @@ impl BlockStore {
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId, String> {
+        self.insert_from_snapshot_as(context_id, snapshot, after, None)
+    }
+
+    /// Insert a block from a snapshot with an explicit author identity.
+    pub fn insert_from_snapshot_as(
+        &self,
+        context_id: ContextId,
+        snapshot: BlockSnapshot,
+        after: Option<&BlockId>,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, final_snapshot, ops) = {
             let mut entry = self.get_mut(context_id)
                 .ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -628,8 +682,8 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
-            entry.touch(agent_id);
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            entry.touch(effective_agent);
             (block_id, final_snapshot, ops_bytes)
         };
         self.auto_save(context_id);
@@ -656,10 +710,6 @@ impl BlockStore {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
             let agent_id = self.agent_id();
             entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
-            // Promote finalized blocks to LWW register (1 LV vs 1 LV/char)
-            if matches!(status, Status::Done | Status::Error) {
-                let _ = entry.doc.promote_to_register(block_id);
-            }
             entry.touch(agent_id);
         }
         self.auto_save(context_id);
@@ -687,16 +737,30 @@ impl BlockStore {
         insert: &str,
         delete: usize,
     ) -> Result<(), String> {
+        self.edit_text_as(context_id, block_id, pos, insert, delete, None)
+    }
+
+    /// Edit text within a block with an explicit author identity.
+    pub fn edit_text_as(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<(), String> {
         let ops = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
             // Capture frontier before edit
             let frontier = entry.doc.frontier();
             entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
-            entry.touch(agent_id);
+            entry.touch(effective_agent);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text edits (high frequency during streaming)
 
@@ -734,16 +798,22 @@ impl BlockStore {
     /// Note: Does not auto-save to avoid excessive I/O during streaming.
     /// Call `save_snapshot()` explicitly when streaming is complete.
     pub fn append_text(&self, context_id: ContextId, block_id: &BlockId, text: &str) -> Result<(), String> {
+        self.append_text_as(context_id, block_id, text, None)
+    }
+
+    /// Append text to a block with an explicit author identity.
+    pub fn append_text_as(&self, context_id: ContextId, block_id: &BlockId, text: &str, agent_id: Option<PrincipalId>) -> Result<(), String> {
         let ops = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
             // Capture frontier before append
             let frontier = entry.doc.frontier();
             entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
-            entry.touch(agent_id);
+            entry.touch(effective_agent);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
@@ -803,46 +873,23 @@ impl BlockStore {
     // Sync Operations
     // =========================================================================
 
-    /// Get operations since a frontier for a document.
-    pub fn ops_since(&self, context_id: ContextId, frontier: &Frontier) -> Result<SerializedOpsOwned, String> {
+    /// Get sync payload since a frontier for a document.
+    pub fn ops_since(&self, context_id: ContextId, frontier: &HashMap<BlockId, Frontier>) -> Result<SyncPayload, String> {
         let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
         Ok(entry.doc.ops_since(frontier))
     }
 
-    /// Merge remote operations into a document.
-    pub fn merge_ops(&self, context_id: ContextId, ops: SerializedOps<'_>) -> Result<u64, String> {
+    /// Merge a sync payload into a document.
+    pub fn merge_ops(&self, context_id: ContextId, payload: SyncPayload) -> Result<u64, String> {
         let (version, events) = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
             let before = entry.doc.blocks_ordered();
             let frontier_before = entry.doc.frontier();
-            entry.doc.merge_ops(ops).map_err(|e| e.to_string())?;
+            entry.doc.merge_ops(payload).map_err(|e| e.to_string())?;
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
-            let ops_bytes = postcard::to_stdvec(&entry.doc.ops_since(&frontier_before))
-                .unwrap_or_default();
-            (version, Self::diff_block_events(context_id, &before, &after, ops_bytes))
-        };
-        for event in events {
-            self.emit(event);
-        }
-        Ok(version)
-    }
-
-    /// Merge remote operations into a document (owned variant).
-    ///
-    /// Use this when receiving serialized ops that have been deserialized
-    /// into the owned form (e.g., from network RPC via pushOps).
-    pub fn merge_ops_owned(&self, context_id: ContextId, ops: SerializedOpsOwned) -> Result<u64, String> {
-        let (version, events) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let before = entry.doc.blocks_ordered();
-            let frontier_before = entry.doc.frontier();
-            entry.doc.merge_ops_owned(ops).map_err(|e| e.to_string())?;
-            let version = entry.doc.version();
-            entry.version.store(version, Ordering::SeqCst);
-            let after = entry.doc.blocks_ordered();
-            let ops_bytes = postcard::to_stdvec(&entry.doc.ops_since(&frontier_before))
+            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
                 .unwrap_or_default();
             (version, Self::diff_block_events(context_id, &before, &after, ops_bytes))
         };
@@ -930,8 +977,8 @@ impl BlockStore {
         events
     }
 
-    /// Get the current frontier for a document.
-    pub fn frontier(&self, context_id: ContextId) -> Result<Frontier, String> {
+    /// Get the current frontier for a document (per-block frontiers).
+    pub fn frontier(&self, context_id: ContextId) -> Result<HashMap<BlockId, Frontier>, String> {
         let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
         Ok(entry.doc.frontier())
     }
@@ -973,7 +1020,7 @@ impl BlockStore {
     /// Load documents from database on startup.
     ///
     /// For each document, loads both metadata and content from the snapshot table.
-    /// The `oplog_bytes` column stores postcard-encoded DocumentSnapshot.
+    /// The `oplog_bytes` column stores postcard-encoded StoreSnapshot.
     pub fn load_from_db(&self) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
         let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
@@ -999,22 +1046,21 @@ impl BlockStore {
 
             // Try to load snapshot for this document
             let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
-                // oplog_bytes contains postcard-encoded DocumentSnapshot
                 if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
-                    match postcard::from_bytes::<DocumentSnapshot>(&oplog_bytes) {
-                        Ok(doc_snapshot) => {
+                    match serde_json::from_slice::<StoreSnapshot>(&oplog_bytes) {
+                        Ok(store_snapshot) => {
                             tracing::debug!(
                                 document_id = %meta.id,
-                                blocks = doc_snapshot.blocks.len(),
-                                "Restored document from snapshot"
+                                blocks = store_snapshot.blocks.len(),
+                                "Restored document from store snapshot"
                             );
-                            DocumentEntry::from_snapshot(doc_snapshot, meta.kind, meta.language.clone(), agent_id)
+                            DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
                         }
                         Err(e) => {
                             tracing::error!(
                                 document_id = %meta.id,
                                 error = %e,
-                                "Failed to deserialize snapshot, skipping corrupted document"
+                                "Failed to deserialize store snapshot, skipping corrupted document"
                             );
                             continue;
                         }
@@ -1034,64 +1080,9 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Compact a document's oplog silently (no SyncReset event).
-    ///
-    /// Used by `get_document_state` auto-compaction where the client already
-    /// receives the compacted oplog in the same response.
-    pub fn compact_document_silent(&self, context_id: ContextId) -> Result<usize, String> {
-        let mut entry = self.documents.get_mut(&context_id)
-            .ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-
-        let old_size = entry.doc.oplog_bytes().map(|b| b.len()).unwrap_or(0);
-        entry.doc.compact()
-            .map_err(|e| format!("Compact failed: {}", e))?;
-        let new_size = entry.doc.oplog_bytes().map(|b| b.len()).unwrap_or(0);
-
-        tracing::info!(
-            context_id = %context_id.to_hex(),
-            old_bytes = old_size,
-            new_bytes = new_size,
-            reduction_pct = %((1.0 - new_size as f64 / old_size.max(1) as f64) * 100.0),
-            "Compacted document oplog (silent)"
-        );
-
-        drop(entry);
-
-        // Save compacted state to DB
-        if self.db.is_some() {
-            self.save_snapshot(context_id)?;
-        }
-
-        Ok(new_size)
-    }
-
-    /// Compact a document's oplog and notify connected clients.
-    ///
-    /// Bumps sync generation and emits `SyncReset` so clients re-fetch
-    /// the full state. Use this for explicit compaction requests (RPC).
-    /// For auto-compaction during `get_document_state`, use
-    /// `compact_document_silent` instead.
-    pub fn compact_document(&self, context_id: ContextId) -> Result<usize, String> {
-        let new_size = self.compact_document_silent(context_id)?;
-
-        // Bump sync generation and notify clients
-        let generation = if let Some(entry) = self.documents.get(&context_id) {
-            entry.sync_generation.fetch_add(1, Ordering::SeqCst) + 1
-        } else {
-            0
-        };
-
-        self.emit(BlockFlow::SyncReset {
-            context_id,
-            generation,
-        });
-
-        Ok(new_size)
-    }
-
     /// Save a document's content to the database as a snapshot.
     ///
-    /// Stores the DocumentSnapshot as postcard binary in the `oplog_bytes` column.
+    /// Stores the StoreSnapshot as postcard binary in the `oplog_bytes` column.
     pub fn save_snapshot(&self, context_id: ContextId) -> Result<(), String> {
         let db = self.db.as_ref().ok_or("No database configured")?;
 
@@ -1100,15 +1091,16 @@ impl BlockStore {
         let version = entry.version() as i64;
         let content = entry.content();
 
-        // Serialize snapshot as binary (postcard)
-        let oplog_bytes = postcard::to_stdvec(&snapshot)
-            .map_err(|e| format!("Failed to serialize snapshot: {}", e))?;
+        // Serialize snapshot as JSON (StoreSnapshot contains BlockSnapshot
+        // with skip_serializing_if, which requires a self-describing format)
+        let snapshot_bytes = serde_json::to_vec(&snapshot)
+            .map_err(|e| format!("Failed to serialize store snapshot: {}", e))?;
 
         drop(entry); // Release the read lock before acquiring DB lock
 
         let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
         db_guard
-            .save_snapshot(&context_id.to_hex(), version, &content, Some(&oplog_bytes))
+            .save_snapshot(&context_id.to_hex(), version, &content, Some(&snapshot_bytes))
             .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(())
@@ -1116,7 +1108,7 @@ impl BlockStore {
 
     /// Insert a drift block into a document.
     ///
-    /// Wraps `BlockDocument::insert_drift_block()` with FlowBus emission,
+    /// Wraps `CrdtBlockStore::insert_drift_block()` with FlowBus emission,
     /// auto-save, and frontier tracking.
     pub fn insert_drift_block(
         &self,
@@ -1128,10 +1120,26 @@ impl BlockStore {
         source_model: Option<String>,
         drift_kind: kaijutsu_crdt::DriftKind,
     ) -> Result<BlockId, String> {
+        self.insert_drift_block_as(context_id, parent_id, after, content, source_context, source_model, drift_kind, None)
+    }
+
+    /// Insert a drift block with an explicit author identity.
+    pub fn insert_drift_block_as(
+        &self,
+        context_id: ContextId,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        content: impl Into<String>,
+        source_context: ContextId,
+        source_model: Option<String>,
+        drift_kind: kaijutsu_crdt::DriftKind,
+        agent_id: Option<PrincipalId>,
+    ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
             let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -1141,8 +1149,8 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_stdvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
-            entry.touch(agent_id);
+            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
         self.auto_save(context_id);
@@ -1448,12 +1456,12 @@ mod tests {
     }
 
     // ============================================================================
-    // FRONTIER-BASED INCREMENTAL SYNC TESTS
+    // SYNC PAYLOAD TESTS
     // ============================================================================
     //
-    // These tests verify Phase 2 of the frontier-based CRDT sync:
-    // - Server sends incremental ops (not full oplog) for block insertions
-    // - Client can merge these ops after initial full sync
+    // These tests verify SyncPayload-based sync:
+    // - Server sends incremental SyncPayload for block insertions
+    // - Client (CrdtBlockStore) can merge these payloads after initial snapshot sync
 
     use crate::flows::{BlockFlow, FlowBus, SharedBlockFlowBus};
     use std::sync::Arc;
@@ -1465,39 +1473,23 @@ mod tests {
         (store, bus)
     }
 
-    /// Test that insert_block emits incremental ops that can be merged
-    /// by a client that already has the base document state.
+    /// Test that insert_block emits SyncPayload that can be merged by a client store.
     #[tokio::test]
-    async fn test_insert_block_emits_incremental_ops() {
-        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
-
+    async fn test_insert_block_emits_sync_payload() {
         let (store, bus) = store_with_flows();
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
-        let client_agent = PrincipalId::new();
 
-        // Create document on server
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Get full oplog for client initial sync (simulates get_block_cell_state)
-        let full_oplog = {
-            let entry = store.get(ctx).unwrap();
-            entry.doc.oplog_bytes().unwrap()
-        };
-
-        // Client creates document from full oplog (initial sync)
-        let mut client = BlockDocument::from_oplog(ctx, client_agent, &full_oplog)
-            .expect("client should sync from oplog");
-        assert_eq!(client.block_count(), 0, "initially empty");
+        // Client syncs from snapshot
+        let snapshot = store.get(ctx).unwrap().doc.snapshot();
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
+        assert_eq!(client.block_count(), 0);
 
         // Server inserts a block
         let block_id = store.insert_block(
-            ctx,
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello from server"
+            ctx, None, None, Role::User, BlockKind::Text, "Hello from server"
         ).unwrap();
 
         // Get the BlockInserted event with ops
@@ -1507,12 +1499,9 @@ mod tests {
             _ => panic!("expected BlockInserted event"),
         };
 
-        // Deserialize and merge incremental ops on client
-        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops)
-            .expect("should deserialize ops");
-
-        client.merge_ops_owned(serialized_ops)
-            .expect("client should merge incremental ops without DataMissing error");
+        // Deserialize SyncPayload and merge on client
+        let payload: SyncPayload = serde_json::from_slice(&ops).expect("should deserialize SyncPayload");
+        client.merge_ops(payload).expect("client should merge sync payload");
 
         // Verify client has the block
         assert_eq!(client.block_count(), 1);
@@ -1520,134 +1509,51 @@ mod tests {
         assert_eq!(snapshot.content, "Hello from server");
     }
 
-    /// Test that insert_tool_call emits incremental ops that can be merged.
+    /// Test that insert_tool_call emits mergeable SyncPayload.
     #[tokio::test]
-    async fn test_insert_tool_call_emits_incremental_ops() {
-        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
-
+    async fn test_insert_tool_call_emits_sync_payload() {
         let (store, bus) = store_with_flows();
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
-        let client_agent = PrincipalId::new();
 
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Full sync
-        let full_oplog = store.get(ctx).unwrap().doc.oplog_bytes().unwrap();
-        let mut client = BlockDocument::from_oplog(ctx, client_agent, &full_oplog)
-            .expect("initial sync");
+        let snapshot = store.get(ctx).unwrap().doc.snapshot();
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
 
-        // Server inserts tool call
         let block_id = store.insert_tool_call(
-            ctx,
-            None,
-            None,
-            "bash",
-            serde_json::json!({"command": "ls -la"})
+            ctx, None, None, "bash", serde_json::json!({"command": "ls -la"})
         ).unwrap();
 
-        // Get incremental ops from event
         let msg = sub.try_recv().expect("should receive event");
         let ops = match msg.payload {
             BlockFlow::Inserted { ops, .. } => ops,
             _ => panic!("expected BlockInserted"),
         };
 
-        // Client merges incremental ops
-        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
-        client.merge_ops_owned(serialized_ops)
-            .expect("should merge tool_call incremental ops");
+        let payload: SyncPayload = serde_json::from_slice(&ops).unwrap();
+        client.merge_ops(payload).expect("should merge tool_call sync payload");
 
-        // Verify
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.kind, BlockKind::ToolCall);
         assert_eq!(snapshot.tool_name.as_deref(), Some("bash"));
     }
 
-    /// Test that insert_tool_result emits incremental ops that can be merged.
-    #[tokio::test]
-    async fn test_insert_tool_result_emits_incremental_ops() {
-        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
-
-        let (store, bus) = store_with_flows();
-        let mut sub = bus.subscribe("block.>");
-        let ctx = ContextId::new();
-        let client_agent = PrincipalId::new();
-
-        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-
-        // Insert a tool call first (parent for tool result)
-        let tool_call_id = store.insert_tool_call(
-            ctx,
-            None,
-            None,
-            "bash",
-            serde_json::json!({"command": "echo hello"})
-        ).unwrap();
-        let _ = sub.try_recv(); // drain tool call event
-
-        // Full sync (after tool call exists)
-        let full_oplog = store.get(ctx).unwrap().doc.oplog_bytes().unwrap();
-        let mut client = BlockDocument::from_oplog(ctx, client_agent, &full_oplog)
-            .expect("initial sync");
-        assert_eq!(client.block_count(), 1, "should have tool call");
-
-        // Server inserts tool result
-        let result_id = store.insert_tool_result(
-            ctx,
-            &tool_call_id,
-            None,
-            "hello\n",
-            false,
-            Some(0)
-        ).unwrap();
-
-        // Get incremental ops
-        let msg = sub.try_recv().expect("should receive event");
-        let ops = match msg.payload {
-            BlockFlow::Inserted { ops, .. } => ops,
-            _ => panic!("expected BlockInserted"),
-        };
-
-        // Client merges
-        let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
-        client.merge_ops_owned(serialized_ops)
-            .expect("should merge tool_result incremental ops");
-
-        // Verify
-        assert_eq!(client.block_count(), 2);
-        let snapshot = client.get_block_snapshot(&result_id).unwrap();
-        assert_eq!(snapshot.kind, BlockKind::ToolResult);
-        assert_eq!(snapshot.content, "hello\n");
-        assert_eq!(snapshot.exit_code, Some(0));
-    }
-
-    /// Test multiple sequential block inserts all produce mergeable incremental ops.
+    /// Test multiple sequential block inserts all produce mergeable SyncPayloads.
     #[tokio::test]
     async fn test_multiple_incremental_syncs() {
-        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
-
         let (store, bus) = store_with_flows();
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
-        let client_agent = PrincipalId::new();
 
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Initial sync
-        let full_oplog = store.get(ctx).unwrap().doc.oplog_bytes().unwrap();
-        let mut client = BlockDocument::from_oplog(ctx, client_agent, &full_oplog)
-            .expect("initial sync");
+        let snapshot = store.get(ctx).unwrap().doc.snapshot();
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
 
-        // Insert multiple blocks, merging each incrementally
         for i in 0..5 {
             let _ = store.insert_block(
-                ctx,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                format!("Message {}", i)
+                ctx, None, None, Role::User, BlockKind::Text, format!("Message {}", i)
             ).unwrap();
 
             let msg = sub.try_recv().expect("should receive event");
@@ -1656,76 +1562,61 @@ mod tests {
                 _ => panic!("expected BlockInserted"),
             };
 
-            let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
-            client.merge_ops_owned(serialized_ops)
-                .expect(&format!("should merge block {} incrementally", i));
+            let payload: SyncPayload = serde_json::from_slice(&ops).unwrap();
+            client.merge_ops(payload).expect(&format!("should merge block {i}"));
         }
 
-        // Verify all blocks synced
         assert_eq!(client.block_count(), 5);
 
-        // Verify content matches server
         let server_blocks = store.block_snapshots(ctx).unwrap();
         let client_blocks = client.blocks_ordered();
-
-        for (server_block, client_block) in server_blocks.iter().zip(client_blocks.iter()) {
-            assert_eq!(server_block.content, client_block.content);
+        for (sb, cb) in server_blocks.iter().zip(client_blocks.iter()) {
+            assert_eq!(sb.content, cb.content);
         }
     }
 
-    /// Test that text streaming (append_text) produces incremental ops.
+    /// Test that text streaming (append_text) produces mergeable SyncPayload.
     #[tokio::test]
-    async fn test_text_streaming_incremental_ops() {
-        use kaijutsu_crdt::{BlockDocument, SerializedOpsOwned};
-
+    async fn test_text_streaming_sync_payload() {
         let (store, bus) = store_with_flows();
         let mut sub = bus.subscribe("block.>");
         let ctx = ContextId::new();
-        let client_agent = PrincipalId::new();
 
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Insert initial empty block
         let block_id = store.insert_block(
-            ctx,
-            None,
-            None,
-            Role::Model,
-            BlockKind::Text,
-            ""  // Start empty
+            ctx, None, None, Role::Model, BlockKind::Text, ""
         ).unwrap();
         let _ = sub.try_recv(); // drain insert event
 
-        // Full sync after block created
-        let full_oplog = store.get(ctx).unwrap().doc.oplog_bytes().unwrap();
-        let mut client = BlockDocument::from_oplog(ctx, client_agent, &full_oplog)
-            .expect("initial sync");
+        // Sync via proper protocol: ops_since with empty frontier sends full DTE
+        // ops for new blocks, establishing shared causal history on the client.
+        let mut client = CrdtBlockStore::new(ctx, PrincipalId::new());
+        let initial_payload = store.ops_since(ctx, &HashMap::new()).unwrap();
+        client.merge_ops(initial_payload).expect("initial sync");
+        assert_eq!(client.block_count(), 1);
 
-        // Stream text in chunks
         let chunks = ["Hello", " ", "World", "!"];
         for chunk in chunks {
+            let client_frontier = client.frontier();
             store.append_text(ctx, &block_id, chunk).unwrap();
 
             let msg = sub.try_recv().expect("should receive event");
-            let ops = match msg.payload {
-                BlockFlow::TextOps { ops, .. } => ops,
+            match msg.payload {
+                BlockFlow::TextOps { .. } => {}
                 _ => panic!("expected TextOps event, got {:?}", msg.payload),
-            };
+            }
 
-            let serialized_ops: SerializedOpsOwned = postcard::from_bytes(&ops).unwrap();
-            client.merge_ops_owned(serialized_ops)
-                .expect(&format!("should merge chunk '{}'", chunk));
+            // Use frontier-based sync for incremental ops
+            let payload = store.ops_since(ctx, &client_frontier).unwrap();
+            client.merge_ops(payload).expect(&format!("should merge chunk '{chunk}'"));
         }
 
-        // Verify final content
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snapshot.content, "Hello World!");
     }
 
     /// Test that merge_ops emits BlockFlow events for new blocks.
-    ///
-    /// Simulates the pushOps RPC path: one store inserts a block, serializes
-    /// the ops, another store merges them — and subscribers see the Inserted event.
     #[tokio::test]
     async fn test_merge_ops_emits_inserted_event() {
         let (server, bus) = store_with_flows();
@@ -1734,39 +1625,33 @@ mod tests {
 
         server.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Capture the initial oplog BEFORE the insert (just the empty document setup)
-        let initial_oplog = {
+        // Snapshot before insert
+        let initial_snapshot = {
             let entry = server.get(ctx).unwrap();
-            entry.doc.oplog_bytes().unwrap()
+            serde_json::to_vec(&entry.doc.snapshot()).unwrap()
         };
 
-        // Get oplog before insertion (to compute incremental ops)
         let frontier_before = server.frontier(ctx).unwrap();
 
-        // Insert a block on the server (this emits Inserted locally)
         let _block_id = server.insert_block(
             ctx, None, None, Role::User, BlockKind::Text, "hello from remote",
         ).unwrap();
 
-        // Drain the local Inserted event
         let msg = sub.try_recv().expect("should get Inserted from insert_block");
         assert!(matches!(msg.payload, BlockFlow::Inserted { .. }));
 
-        // Get the incremental ops that represent this insertion
         let ops = server.ops_since(ctx, &frontier_before).unwrap();
 
-        // Now create a second store (simulating a different server or the merge path)
-        // and merge those ops into a document that starts from the pre-insertion state.
+        // Create receiver from initial snapshot
         let (receiver, recv_bus) = store_with_flows();
         let mut recv_sub = recv_bus.subscribe("block.>");
 
-        // Create the document on receiver from the server's initial oplog (before the insert)
-        receiver.create_document_from_oplog(ctx, DocumentKind::Conversation, None, &initial_oplog).unwrap();
+        receiver.create_document_from_snapshot(
+            ctx, DocumentKind::Conversation, None, &initial_snapshot
+        ).unwrap();
 
-        // Merge the remote ops (the insert we made)
-        receiver.merge_ops_owned(ctx, ops).unwrap();
+        receiver.merge_ops(ctx, ops).unwrap();
 
-        // The receiver's FlowBus should have an Inserted event
         let msg = recv_sub.try_recv().expect("merge_ops should emit Inserted event");
         match msg.payload {
             BlockFlow::Inserted { context_id, block, .. } => {
@@ -1783,52 +1668,37 @@ mod tests {
     async fn test_merge_ops_emits_status_and_text_events() {
         let ctx = ContextId::new();
 
-        // Server A: will produce the block + modifications
         let (server_a, _) = store_with_flows();
         server_a.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Insert a block on A
         let block_id = server_a.insert_block(
             ctx, None, None, Role::Model, BlockKind::Text, "initial",
         ).unwrap();
 
-        // Snapshot A's insert ops for receiver's initial sync
-        let insert_ops = {
-            let entry = server_a.get(ctx).unwrap();
-            entry.doc.ops_since(&kaijutsu_crdt::Frontier::root())
-        };
-
-        // Receiver: create doc from server A's oplog (gets block at initial state)
+        // Receiver syncs via proper protocol: empty document + ops_since
         let (receiver, recv_bus) = store_with_flows();
-        let initial_oplog = {
-            let entry = server_a.get(ctx).unwrap();
-            entry.doc.oplog_bytes().unwrap()
-        };
-        receiver.create_document_from_oplog(ctx, DocumentKind::Conversation, None, &initial_oplog).unwrap();
+        receiver.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let initial_ops = server_a.ops_since(ctx, &HashMap::new()).unwrap();
+        receiver.merge_ops(ctx, initial_ops).unwrap();
 
-        // Capture receiver's frontier before A's modifications
         let recv_frontier = receiver.frontier(ctx).unwrap();
 
-        // Now modify the block on A: change status (Done→Running) and edit text
+        // Modify block on A
         server_a.set_status(ctx, &block_id, Status::Running).unwrap();
         server_a.edit_text(ctx, &block_id, 7, " content", 0).unwrap();
 
-        // Get incremental ops covering A's modifications (since receiver's frontier)
+        // Compute diff — frontier types differ (per-block vs per-block), but both stores
+        // use HashMap<BlockId, Frontier>, so we can pass receiver's frontier to server A
         let diff_ops = server_a.ops_since(ctx, &recv_frontier).unwrap();
 
-        // Subscribe AFTER initial sync, before merging the diff
         let mut recv_sub = recv_bus.subscribe("block.>");
+        receiver.merge_ops(ctx, diff_ops).unwrap();
 
-        // Merge the modifications
-        receiver.merge_ops_owned(ctx, diff_ops).unwrap();
-
-        // Collect all events
         let mut events = Vec::new();
         while let Some(msg) = recv_sub.try_recv() {
             events.push(msg.payload);
         }
 
-        // Should have StatusChanged and TextOps events
         let has_status = events.iter().any(|e| matches!(e, BlockFlow::StatusChanged { status: Status::Running, .. }));
         let has_text = events.iter().any(|e| matches!(e, BlockFlow::TextOps { .. }));
 
@@ -1836,61 +1706,28 @@ mod tests {
         assert!(has_text, "should emit TextOps, got: {:?}", events);
     }
 
-    /// Integration test: stream → finalize → promote → compact → verify content.
-    ///
-    /// Simulates the real LLM streaming lifecycle through BlockStore and verifies
-    /// that register promotion + compaction preserves content while reducing oplog.
+    /// Integration test: stream → finalize → verify content preserved.
     #[tokio::test]
-    async fn test_register_promotion_lifecycle() {
+    async fn test_streaming_lifecycle() {
         let (store, _bus) = store_with_flows();
         let ctx = ContextId::new();
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // 1. Insert block and start streaming
         let block_id = store.insert_block(
-            ctx, None, None,
-            Role::Model, BlockKind::Text, "",
+            ctx, None, None, Role::Model, BlockKind::Text, "",
         ).unwrap();
         store.set_status(ctx, &block_id, Status::Running).unwrap();
 
-        // 2. Stream content (many small edits — this is what register promotion saves)
         let streaming_text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
         for (i, ch) in streaming_text.chars().enumerate() {
             store.edit_text(ctx, &block_id, i, &ch.to_string(), 0).unwrap();
         }
 
-        // 3. Capture oplog before finalization
-        let oplog_before = {
-            let entry = store.get(ctx).unwrap();
-            entry.doc.oplog_bytes().unwrap().len()
-        };
-
-        // 4. Finalize — set_status(Done) triggers promote_to_register
         store.set_status(ctx, &block_id, Status::Done).unwrap();
 
-        // 5. Verify content readable after promotion
-        {
-            let entry = store.get(ctx).unwrap();
-            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
-            assert_eq!(snap.content, streaming_text);
-            assert_eq!(snap.status, Status::Done);
-        }
-
-        // 6. Compact
-        store.compact_document(ctx).unwrap();
-
-        // 7. Verify content survives compaction
-        {
-            let entry = store.get(ctx).unwrap();
-            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
-            assert_eq!(snap.content, streaming_text);
-
-            let oplog_after = entry.doc.oplog_bytes().unwrap().len();
-            assert!(
-                oplog_after < oplog_before,
-                "compaction should reduce oplog: {} vs {}",
-                oplog_after, oplog_before,
-            );
-        }
+        let entry = store.get(ctx).unwrap();
+        let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(snap.content, streaming_text);
+        assert_eq!(snap.status, Status::Done);
     }
 }

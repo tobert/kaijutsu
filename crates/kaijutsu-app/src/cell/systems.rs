@@ -1212,25 +1212,29 @@ pub fn sync_main_cell_to_conversation(
     }
 
     if matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
-        // CRDT merge: preserve local edits, incorporate remote changes
-        let local_frontier = editor.doc.frontier();
-        let remote_ops = source_doc.ops_since(&local_frontier);
-        match editor.doc.merge_ops_owned(remote_ops) {
-            Ok(()) => trace!("Merged remote ops into editing doc"),
-            Err(e) => {
-                // Fallback to full replace on merge failure
-                warn!("CRDT merge failed during editing, full sync: {e}");
-                let agent_id = editor.doc.agent_id();
-                let snapshot = source_doc.snapshot();
-                editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
-            }
-        }
+        // During editing: rebuild from store snapshot, preserving cursor position.
+        // TODO: CRDT merge between editor's BlockDocument and sync CrdtBlockStore
+        // requires shared history — for now full replace is safe because edits
+        // flow through the server's block store and come back via sync.
+        let agent_id = editor.doc.agent_id();
+        let store_snap = source_doc.snapshot();
+        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
+            context_id: store_snap.context_id,
+            blocks: store_snap.blocks,
+            version: sync_version,
+        };
+        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
         // Don't reposition cursor during editing
     } else {
-        // Normal path: full document replacement
+        // Normal path: full document replacement from store snapshot
         let agent_id = editor.doc.agent_id();
-        let snapshot = source_doc.snapshot();
-        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(snapshot, agent_id);
+        let store_snap = source_doc.snapshot();
+        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
+            context_id: store_snap.context_id,
+            blocks: store_snap.blocks,
+            version: sync_version,
+        };
+        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
 
         // Update cursor to end of document
         if let Some(last_block) = editor.blocks().last() {
@@ -1550,8 +1554,8 @@ pub fn handle_context_switch(
         if let Some(cached) = doc_cache.get(ctx_id) {
             let agent_id = session_agent.0;
 
-            // Rebuild DocumentSyncState from cached document's oplog
-            let oplog_bytes = cached.synced.doc().oplog_bytes().unwrap_or_default();
+            // Rebuild DocumentSyncState from cached document's snapshot
+            let oplog_bytes = serde_json::to_vec(&cached.synced.doc().snapshot()).unwrap_or_default();
             sync_state.reset();
             match sync_state.apply_initial_state(ctx_id, agent_id, &oplog_bytes) {
                 Ok(_) => {

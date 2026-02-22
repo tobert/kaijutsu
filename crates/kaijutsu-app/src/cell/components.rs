@@ -6,12 +6,13 @@
 use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
-pub use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
+pub use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
+pub use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Session-scoped agent identity for CRDT operations.
 ///
-/// Created once at startup, reused for all BlockDocument/SyncedDocument
+/// Created once at startup, reused for all CrdtBlockStore/SyncedDocument
 /// construction. Without this, each frame or context switch would generate
 /// a fresh PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
 #[derive(Resource)]
@@ -64,7 +65,7 @@ pub enum CellKind {
 /// Component linking a cell to a conversation.
 ///
 /// When attached to a cell (like MainCell), the cell's content
-/// is synced with the conversation's BlockDocument.
+/// is synced with the conversation's CrdtBlockStore.
 #[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component)]
 pub struct ViewingConversation {
@@ -139,15 +140,16 @@ pub struct CursorCache {
 
 /// Text editor state for a cell.
 ///
-/// The `doc` field (BlockDocument) is the single source of truth for all content.
-/// All modifications go through the BlockDocument's CRDT operations.
+/// The `doc` field (BlockDocument) is the local editor buffer.
+/// Synced content arrives via `DocumentSyncState` (CrdtBlockStore) and is
+/// copied into this editor's BlockDocument via snapshot conversion.
 ///
 /// Note: Not reflectable due to BlockDocument lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
 pub struct CellEditor {
-    /// Block document - the source of truth for all content.
-    pub doc: BlockDocument,
+    /// Block document - local editor buffer.
+    pub doc: kaijutsu_crdt::BlockDocument,
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
@@ -166,7 +168,7 @@ impl CellEditor {
     /// Create a new editor with a random agent ID.
     pub fn new() -> Self {
         Self {
-            doc: BlockDocument::new(ContextId::new(), PrincipalId::new()),
+            doc: kaijutsu_crdt::BlockDocument::new(ContextId::new(), PrincipalId::new()),
             cursor: BlockCursor::default(),
             cursor_cache: CursorCache::default(),
         }
@@ -214,7 +216,7 @@ impl CellEditor {
     // =========================================================================
     // TEXT MUTATION
     // (Currently unused — block cell input uses handle_block_cell_input which
-    //  operates on BlockEditCursor + BlockDocument directly. Kept as building
+    //  operates on BlockEditCursor + CrdtBlockStore directly. Kept as building
     //  blocks for future CellEditor-based editing scenarios.)
     // =========================================================================
 
@@ -465,7 +467,7 @@ pub struct EditingBlockCell;
 /// Tracks the edit cursor position within an editing block.
 ///
 /// This is separate from CellEditor's cursor because BlockCells don't have
-/// a full CellEditor - they render from the MainCell's BlockDocument.
+/// a full CellEditor - they render from the MainCell's CrdtBlockStore.
 /// The cursor is an offset within the block's content string.
 #[derive(Component, Default)]
 pub struct BlockEditCursor {
@@ -478,7 +480,7 @@ pub struct BlockEditCursor {
     pub edit_frontier: Option<kaijutsu_crdt::Frontier>,
 }
 
-/// Resource tracking CRDT sync state and owning the authoritative BlockDocument.
+/// Resource tracking CRDT sync state and owning the authoritative CrdtBlockStore.
 ///
 /// This is the **single source of truth** for conversation document state.
 /// It integrates SyncManager's frontier-tracking with document ownership,
@@ -493,7 +495,7 @@ pub struct BlockEditCursor {
 #[derive(Resource, Default)]
 pub struct DocumentSyncState {
     /// The authoritative document (None until first sync).
-    pub doc: Option<BlockDocument>,
+    pub doc: Option<CrdtBlockStore>,
     /// Sync manager for frontier tracking.
     manager: kaijutsu_client::SyncManager,
 }
@@ -526,7 +528,7 @@ impl DocumentSyncState {
     /// Apply initial state from server (BlockCellInitialState event).
     ///
     /// Always performs a full sync from the provided oplog.
-    /// Creates the BlockDocument if it doesn't exist.
+    /// Creates the CrdtBlockStore if it doesn't exist.
     pub fn apply_initial_state(
         &mut self,
         context_id: ContextId,
@@ -534,7 +536,7 @@ impl DocumentSyncState {
         oplog_bytes: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(context_id, agent_id)
+            CrdtBlockStore::new(context_id, agent_id)
         });
         self.manager.apply_initial_state(doc, context_id, oplog_bytes)
     }
@@ -553,7 +555,7 @@ impl DocumentSyncState {
         ops: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(context_id, agent_id)
+            CrdtBlockStore::new(context_id, agent_id)
         });
         self.manager.apply_block_inserted(doc, context_id, block, ops)
     }
@@ -569,7 +571,7 @@ impl DocumentSyncState {
         ops: &[u8],
     ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
         let doc = self.doc.get_or_insert_with(|| {
-            BlockDocument::new(context_id, agent_id)
+            CrdtBlockStore::new(context_id, agent_id)
         });
         self.manager.apply_text_ops(doc, context_id, ops)
     }
@@ -597,7 +599,7 @@ impl DocumentSyncState {
 /// A cached document for a single context, including its CRDT doc and sync state.
 #[allow(dead_code)]
 pub struct CachedDocument {
-    /// Synced document — wraps BlockDocument + SyncManager.
+    /// Synced document — wraps CrdtBlockStore + SyncManager.
     pub synced: kaijutsu_client::SyncedDocument,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
@@ -611,7 +613,7 @@ pub struct CachedDocument {
 
 /// Multi-context document cache.
 ///
-/// Holds `BlockDocument` + `SyncManager` per joined context, enabling:
+/// Holds `CrdtBlockStore` + `SyncManager` per joined context, enabling:
 /// - Instant context switching (cache hit → snapshot swap)
 /// - Background sync for inactive contexts (events route by context_id)
 /// - LRU eviction when too many contexts are cached

@@ -381,7 +381,7 @@ impl KernelHandle {
     /// Detach from the kernel
     #[tracing::instrument(skip(self), name = "rpc_client.detach")]
     pub async fn detach(self) -> Result<(), RpcError> {
-        let request = self.kernel.detach_request();
+        let request = self.kernel.detach_agent_request();
         request.send().promise.await?;
         Ok(())
     }

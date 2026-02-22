@@ -218,6 +218,16 @@ impl BlockDocument {
         self.agent_id
     }
 
+    /// Set the agent/principal ID for subsequent block operations.
+    ///
+    /// This changes which PrincipalId is stamped into new BlockIds.
+    /// The DTE AgentId (self.agent) stays unchanged — it's for CRDT op
+    /// identity, not block authorship. BlockId.agent_id is what tracks
+    /// who created a block.
+    pub fn set_agent_id(&mut self, agent_id: PrincipalId) {
+        self.agent_id = agent_id;
+    }
+
     /// Get the current version.
     pub fn version(&self) -> u64 {
         self.version

@@ -126,16 +126,8 @@ pub fn handle_unfocus(
                     if let Ok(editor) = main_cells.get(main_ent) {
                         for (_, cursor) in editing_cells.iter() {
                             if let Some(ref frontier) = cursor.edit_frontier {
-                                // 1. Merge local ops into DocumentSyncState so the
-                                //    full-replace path doesn't lose them this frame
-                                if let Some(ref mut sync_doc) = sync_state.doc {
-                                    let local_ops = editor.doc.ops_since(&sync_doc.frontier());
-                                    if let Err(e) = sync_doc.merge_ops_owned(local_ops) {
-                                        warn!("Failed to merge local ops into sync state: {}", e);
-                                    }
-                                }
-
-                                // 2. Push ops to server (async, fire-and-forget)
+                                // Push ops to server (async, fire-and-forget).
+                                // Server echo via sync will update DocumentSyncState.
                                 if let Some(ref actor) = actor {
                                     match editor.doc.ops_since_bytes(frontier) {
                                         Ok(ops_bytes) if !ops_bytes.is_empty() => {

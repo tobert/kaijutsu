@@ -13,7 +13,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+// tokio::sync::Mutex used inside ConversationCache for per-context locking
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
@@ -47,7 +47,7 @@ use kaijutsu_kernel::{
     ToolFilter,
 };
 use kaijutsu_crdt::{BlockKind, Role, Status};
-use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId};
+use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId, SessionId};
 use serde_json;
 use tracing::Instrument;
 
@@ -182,8 +182,63 @@ async fn register_block_tools(
     ).await;
 }
 
-/// Per-context LLM conversation cache. Arc<RwLock<>> for cross-connection sharing.
-pub type ConversationCache = Arc<RwLock<HashMap<ContextId, Vec<LlmMessage>>>>;
+/// Per-context LLM conversation cache with per-context locking and LRU eviction.
+///
+/// Each context gets its own `tokio::sync::Mutex<Vec<LlmMessage>>`, so concurrent
+/// prompts to the same context serialize properly. DashMap provides the outer
+/// concurrent access. LRU eviction keeps memory bounded.
+pub struct ConversationCache {
+    entries: dashmap::DashMap<ContextId, Arc<tokio::sync::Mutex<Vec<LlmMessage>>>>,
+    last_accessed: dashmap::DashMap<ContextId, std::time::Instant>,
+    max_contexts: usize,
+}
+
+impl ConversationCache {
+    /// Create a new cache with the given capacity.
+    pub fn new(max_contexts: usize) -> Self {
+        Self {
+            entries: dashmap::DashMap::new(),
+            last_accessed: dashmap::DashMap::new(),
+            max_contexts,
+        }
+    }
+
+    /// Get or create the per-context lock. Returns an Arc<Mutex> that the caller
+    /// holds for the entire `process_llm_stream` — serializing concurrent prompts.
+    pub fn get_or_create(&self, ctx: ContextId) -> Arc<tokio::sync::Mutex<Vec<LlmMessage>>> {
+        self.last_accessed.insert(ctx, std::time::Instant::now());
+
+        if let Some(entry) = self.entries.get(&ctx) {
+            return entry.clone();
+        }
+
+        // Evict LRU if at capacity (skip entries with strong_count > 1, they're in active use)
+        if self.entries.len() >= self.max_contexts {
+            let mut oldest: Option<(ContextId, std::time::Instant)> = None;
+            for entry in self.last_accessed.iter() {
+                let ctx_id = *entry.key();
+                let accessed = *entry.value();
+                // Skip entries in active use
+                if let Some(e) = self.entries.get(&ctx_id) {
+                    if Arc::strong_count(&e) > 1 {
+                        continue;
+                    }
+                }
+                if oldest.is_none() || accessed < oldest.unwrap().1 {
+                    oldest = Some((ctx_id, accessed));
+                }
+            }
+            if let Some((evict_id, _)) = oldest {
+                self.entries.remove(&evict_id);
+                self.last_accessed.remove(&evict_id);
+            }
+        }
+
+        let lock = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        self.entries.insert(ctx, lock.clone());
+        lock
+    }
+}
 
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
@@ -195,7 +250,7 @@ pub struct SharedKernelState {
     pub documents: SharedBlockStore,
     pub config_backend: Arc<ConfigCrdtBackend>,
     pub config_watcher: Option<ConfigWatcherHandle>,
-    pub conversation_cache: ConversationCache,
+    pub conversation_cache: Arc<ConversationCache>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -209,6 +264,8 @@ pub struct ServerRegistry {
 /// Per-connection state. Lives in each connection's LocalSet.
 pub struct ConnectionState {
     pub principal: Principal,
+    pub session_id: SessionId,
+    pub current_context_id: Option<ContextId>,
     pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
     pub consent_mode: ConsentMode,
@@ -219,11 +276,18 @@ impl ConnectionState {
     pub fn new(principal: Principal) -> Self {
         Self {
             principal,
+            session_id: SessionId::new(),
+            current_context_id: None,
             kaish: None,
             command_history: Vec::new(),
             consent_mode: ConsentMode::Collaborative,
             next_exec_id: AtomicU64::new(1),
         }
+    }
+
+    /// Get the connection's active context, falling back to the given default.
+    pub fn current_context_or(&self, default: ContextId) -> ContextId {
+        self.current_context_id.unwrap_or(default)
     }
 
     fn next_exec_id(&self) -> u64 {
@@ -585,7 +649,7 @@ pub async fn create_shared_kernel(
         documents,
         config_backend,
         config_watcher,
-        conversation_cache: Arc::new(RwLock::new(HashMap::new())),
+        conversation_cache: Arc::new(ConversationCache::new(64)),
     };
 
     Ok(Arc::new(shared))
@@ -707,7 +771,7 @@ impl kernel::Server for KernelImpl {
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
                     match EmbeddedKaish::new(
-                        &format!("{}-{}", kernel.name, conn.principal.username),
+                        &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
@@ -1010,6 +1074,7 @@ impl kernel::Server for KernelImpl {
         log::debug!("apply_block_op called for context {}", context_id);
 
         let documents = &self.kernel.documents;
+        let user_agent_id = self.connection.borrow().principal.id;
 
         // Handle each operation variant
         use crate::kaijutsu_capnp::block_doc_op::Which;
@@ -1024,14 +1089,15 @@ impl kernel::Server for KernelImpl {
                     None
                 };
 
-                // Insert block using the snapshot data
-                if let Err(e) = documents.insert_block(
+                // Insert block using the snapshot data (authored by the user)
+                if let Err(e) = documents.insert_block_as(
                     context_id,
                     block.parent_id.as_ref(),
                     after_id.as_ref(),
                     block.role,
                     block.kind,
                     &block.content,
+                    Some(user_agent_id),
                 ) {
                     return Promise::err(capnp::Error::failed(e));
                 }
@@ -1230,33 +1296,11 @@ impl kernel::Server for KernelImpl {
             }
         };
 
-        // Check oplog size — compact if over 100KB to keep initial sync fast
-        let oplog_bytes = doc.doc.oplog_bytes().unwrap_or_default();
-        let needs_compaction = oplog_bytes.len() > 100_000;
-        drop(doc); // Release read ref before potential compaction
-
-        if needs_compaction {
-            if let Err(e) = documents.compact_document_silent(context_id) {
-                log::warn!("Failed to compact context {}: {}", context_id, e);
-            }
-        }
-
-        // Re-acquire read ref (post-compaction if it happened)
-        let doc = match documents.get(context_id) {
-            Some(d) => d,
-            None => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "context '{}' not found in kernel '{}'",
-                    context_id, self.kernel.id.to_hex()
-                )));
-            }
-        };
-
         let mut cell_state = results.get().init_state();
         cell_state.set_context_id(context_id.as_bytes());
         cell_state.reborrow().set_version(doc.version());
 
-        // Get actual blocks from BlockDocument
+        // Get blocks from store
         let blocks = doc.doc.blocks_ordered();
         let mut block_list = cell_state.reborrow().init_blocks(blocks.len() as u32);
         for (i, block) in blocks.iter().enumerate() {
@@ -1264,15 +1308,24 @@ impl kernel::Server for KernelImpl {
             set_block_snapshot(&mut block_builder, block);
         }
 
-        // Send full oplog for proper CRDT sync
-        // This enables clients to merge subsequent incremental ops
-        let oplog_bytes = doc.doc.oplog_bytes().unwrap_or_default();
-        cell_state.set_ops(&oplog_bytes);
+        // Send store snapshot for CRDT sync (replaces oplog_bytes).
+        // Uses JSON because StoreSnapshot contains BlockSnapshot with
+        // skip_serializing_if attributes (incompatible with postcard).
+        let snapshot = doc.doc.snapshot();
+        let snapshot_bytes = match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "failed to serialize store snapshot: {}", e
+                )));
+            }
+        };
+        cell_state.set_ops(&snapshot_bytes);
         log::debug!(
-            "Sending DocumentState for context {} with {} blocks, {} bytes oplog",
+            "Sending DocumentState for context {} with {} blocks, {} bytes snapshot",
             context_id,
             blocks.len(),
-            oplog_bytes.len()
+            snapshot_bytes.len()
         );
 
         Promise::ok(())
@@ -1304,6 +1357,7 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
+        let user_agent_id = self.connection.borrow().principal.id;
 
         Promise::from_future(async move {
             log::debug!("prompt future started for context_id={}", context_id);
@@ -1369,7 +1423,7 @@ impl kernel::Server for KernelImpl {
             // Create user message block at the end of the document
             let last_block = documents.last_block_id(context_id);
             log::info!("Inserting user block into context {}, after={:?}", context_id, last_block);
-            let user_block_id = documents.insert_block(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content)
+            let user_block_id = documents.insert_block_as(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content, Some(user_agent_id))
                 .map_err(|e| {
                     log::error!("Failed to insert user block: {}", e);
                     capnp::Error::failed(format!("failed to insert user block: {}", e))
@@ -1393,6 +1447,7 @@ impl kernel::Server for KernelImpl {
                 system_prompt,
                 max_output_tokens,
                 conversation_cache,
+                user_agent_id,
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -1453,6 +1508,13 @@ impl kernel::Server for KernelImpl {
         let instance = pry!(pry!(params.get_instance()).to_str()).to_owned();
 
         let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+
+        // Determine parent from connection's current context before switching
+        let parent_ctx = {
+            let conn = connection.borrow();
+            conn.current_context_or(kernel.default_context_id)
+        };
 
         log::info!("join_context: context_id={} instance='{}' kernel='{}'",
             context_id, instance, kernel.id.to_hex());
@@ -1477,13 +1539,15 @@ impl kernel::Server for KernelImpl {
             {
                 let mut drift = kernel.kernel.drift().write().await;
                 if drift.get(context_id).is_none() {
-                    let parent_id = Some(kernel.default_context_id);
-                    drift.register(context_id, None, parent_id);
+                    drift.register(context_id, None, Some(parent_ctx));
                     log::info!("Registered context {} in kernel DriftRouter", context_id);
                 }
                 let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
                 let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
             }
+
+            // Update connection's active context
+            connection.borrow_mut().current_context_id = Some(context_id);
 
             // Return the context_id
             results.get().set_context_id(context_id.as_bytes());
@@ -1754,6 +1818,7 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
+        let user_agent_id = self.connection.borrow().principal.id;
 
         Promise::from_future(async move {
             // Get or create embedded kaish executor (same pattern as execute RPC)
@@ -1763,7 +1828,7 @@ impl kernel::Server for KernelImpl {
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
                     match EmbeddedKaish::new(
-                        &format!("{}-{}", kernel.name, conn.principal.username),
+                        &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
@@ -1797,19 +1862,21 @@ impl kernel::Server for KernelImpl {
                 ));
             }
 
-            // Create ToolCall block for the shell command
+            // Create ToolCall block for the shell command (authored by user)
             let last_block = documents.last_block_id(context_id);
             log::info!("Inserting shell command into context {}, after={:?}", context_id, last_block);
-            let command_block_id = documents.insert_tool_call(
+            let command_block_id = documents.insert_tool_call_as(
                 context_id, None, last_block.as_ref(),
                 "shell", serde_json::json!({"code": code}),
+                Some(user_agent_id),
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
             log::info!("Created shell command block: {:?}", command_block_id);
 
-            // Create ToolResult block (empty, will be filled by execution)
-            let output_block_id = documents.insert_tool_result(
+            // Create ToolResult block (empty, will be filled by execution — system-authored)
+            let output_block_id = documents.insert_tool_result_as(
                 context_id, &command_block_id, Some(&command_block_id),
                 "", false, None,
+                Some(PrincipalId::system()),
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
@@ -1853,7 +1920,7 @@ impl kernel::Server for KernelImpl {
                             output.len(), result.code, hint_json.is_some());
 
                         // Update output block with result text
-                        if let Err(e) = documents_clone.edit_text(context_id, &output_block_id_clone, 0, &output, 0) {
+                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output, 0, Some(PrincipalId::system())) {
                             log::error!("Failed to update shell output: {}", e);
                         }
 
@@ -1874,7 +1941,7 @@ impl kernel::Server for KernelImpl {
                         let error_msg = format!("Error: {}", e);
                         log::error!("Shell execution failed: {}", e);
                         // Write error to output block
-                        if let Err(e) = documents_clone.edit_text(context_id, &output_block_id_clone, 0, &error_msg, 0) {
+                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
                             log::error!("Failed to update shell output with error: {}", e);
                         }
                         // Mark as error
@@ -2157,19 +2224,19 @@ impl kernel::Server for KernelImpl {
 
         let documents = &self.kernel.documents;
 
-        // Deserialize the CRDT ops
-        let serialized_ops: kaijutsu_crdt::SerializedOpsOwned = match postcard::from_bytes(&ops_data) {
-            Ok(ops) => ops,
+        // Deserialize the sync payload
+        let payload: kaijutsu_crdt::block_store::SyncPayload = match serde_json::from_slice(&ops_data) {
+            Ok(p) => p,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
-                    "failed to deserialize ops: {}",
+                    "failed to deserialize sync payload: {}",
                     e
                 )));
             }
         };
 
-        // Merge the ops into the document
-        let ack_version = match documents.merge_ops_owned(context_id, serialized_ops) {
+        // Merge the sync payload into the document
+        let ack_version = match documents.merge_ops(context_id, payload) {
             Ok(version) => version,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
@@ -2733,7 +2800,7 @@ impl kernel::Server for KernelImpl {
 
         let documents = self.kernel.documents.clone();
         let kernel_arc = self.kernel.kernel.clone();
-        let parent_ctx_id = self.kernel.default_context_id;
+        let parent_ctx_id = source_context_id;
 
         // Validate document and version (DashMap access is sync)
         let doc_entry = match documents.get(source_context_id) {
@@ -2796,6 +2863,7 @@ impl kernel::Server for KernelImpl {
 
         let documents = self.kernel.documents.clone();
         let kernel_arc = self.kernel.kernel.clone();
+        let user_agent_id = self.connection.borrow().principal.id;
 
         // Get the source document and extract block snapshot (DashMap access is sync)
         let doc_entry = match documents.get(source_block_id.context_id) {
@@ -2827,15 +2895,16 @@ impl kernel::Server for KernelImpl {
                 ));
             }
 
-            // Insert the block into target document
+            // Insert the block into target document (authored by calling user)
             let after_id = documents.last_block_id(target_ctx_id);
-            let new_block_id = documents.insert_block(
+            let new_block_id = documents.insert_block_as(
                 target_ctx_id,
                 None,
                 after_id.as_ref(),
                 block_snapshot.role,
                 block_snapshot.kind,
                 block_snapshot.content,
+                Some(user_agent_id),
             ).map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
 
             // Build result
@@ -3002,7 +3071,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetContextIdParams,
         mut results: kernel::GetContextIdResults,
     ) -> Promise<(), capnp::Error> {
-        let ctx_id = self.kernel.default_context_id;
+        let ctx_id = self.connection.borrow().current_context_or(self.kernel.default_context_id);
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_context_id");
@@ -3026,7 +3095,7 @@ impl kernel::Server for KernelImpl {
         let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
         let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
         let kernel_arc = self.kernel.kernel.clone();
-        let ctx_id = self.kernel.default_context_id;
+        let ctx_id = self.connection.borrow().current_context_or(self.kernel.default_context_id);
 
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
         Promise::from_future(async move {
@@ -3074,7 +3143,7 @@ impl kernel::Server for KernelImpl {
         let content = pry!(pry!(params_reader.get_content()).to_str()).to_owned();
         let summarize = params_reader.get_summarize();
 
-        let source_ctx = self.kernel.default_context_id;
+        let source_ctx = self.connection.borrow().current_context_or(self.kernel.default_context_id);
         let kernel_arc = self.kernel.kernel.clone();
         let documents = self.kernel.documents.clone();
 
@@ -3165,7 +3234,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::DriftFlushResults,
     ) -> Promise<(), capnp::Error> {
         let trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
-        let caller_ctx = self.kernel.default_context_id;
+        let caller_ctx = self.connection.borrow().current_context_or(self.kernel.default_context_id);
         let kernel_arc = self.kernel.kernel.clone();
         let documents = self.kernel.documents.clone();
 
@@ -3191,7 +3260,7 @@ impl kernel::Server for KernelImpl {
                 let target_ctx = drift_item.target_ctx;
                 let after = documents.last_block_id(target_ctx);
 
-                match documents.insert_drift_block(
+                match documents.insert_drift_block_as(
                     target_ctx,
                     None,
                     after.as_ref(),
@@ -3199,6 +3268,7 @@ impl kernel::Server for KernelImpl {
                     drift_item.source_ctx,
                     drift_item.source_model.clone(),
                     drift_item.drift_kind,
+                    Some(PrincipalId::system()),
                 ) {
                     Ok(block_id) => {
                         log::info!("Drift flushed: {} → {} (block={})",
@@ -3284,10 +3354,10 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
+        let target_ctx_id = self.connection.borrow().current_context_or(kernel.default_context_id);
 
         Promise::from_future(async move {
             let kernel_arc = kernel.kernel.clone();
-            let target_ctx_id = kernel.default_context_id;
             let target_docs = kernel.documents.clone();
 
             let (source_model, trace_id) = {
@@ -3336,7 +3406,7 @@ impl kernel::Server for KernelImpl {
             // Insert drift block directly into target (caller's) document
             let after = target_docs.last_block_id(target_ctx_id);
 
-            let block_id = target_docs.insert_drift_block(
+            let block_id = target_docs.insert_drift_block_as(
                 target_ctx_id,
                 None,
                 after.as_ref(),
@@ -3344,6 +3414,7 @@ impl kernel::Server for KernelImpl {
                 source_ctx_id,
                 Some(model.to_string()),
                 kaijutsu_crdt::DriftKind::Pull,
+                Some(PrincipalId::system()),
             ).map_err(|e| capnp::Error::failed(format!("failed to inject drift block: {}", e)))?;
 
             log::info!("Drift pulled: {} → {} (block={})", source_ctx_id, target_ctx_id, block_id.to_key());
@@ -3427,7 +3498,7 @@ impl kernel::Server for KernelImpl {
             // Insert drift block into parent document
             let after = documents.last_block_id(parent_ctx_id);
 
-            let block_id = documents.insert_drift_block(
+            let block_id = documents.insert_drift_block_as(
                 parent_ctx_id,
                 None,
                 after.as_ref(),
@@ -3435,6 +3506,7 @@ impl kernel::Server for KernelImpl {
                 source_ctx_id,
                 Some(model.to_string()),
                 kaijutsu_crdt::DriftKind::Merge,
+                Some(PrincipalId::system()),
             ).map_err(|e| capnp::Error::failed(format!("failed to inject merge block: {}", e)))?;
 
             log::info!("Drift merged: {} → parent {} (block={})",
@@ -3746,19 +3818,12 @@ impl kernel::Server for KernelImpl {
             None
         };
 
-        match self.kernel.documents.compact_document(context_id) {
-            Ok(new_size) => {
-                let generation = self.kernel.documents
-                    .get(context_id)
-                    .map(|e| e.sync_generation())
-                    .unwrap_or(0);
-                let mut r = results.get();
-                r.set_new_size(new_size as u64);
-                r.set_generation(generation);
-                Promise::ok(())
-            }
-            Err(e) => Promise::err(capnp::Error::failed(e)),
-        }
+        // Per-block DTE stores don't need compaction — each block's DTE
+        // is already minimal. Return 0 as no-op.
+        let mut r = results.get();
+        r.set_new_size(0);
+        r.set_generation(0);
+        Promise::ok(())
     }
 }
 
@@ -3917,6 +3982,9 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
 ///
 /// `after_block_id` is the starting point for block ordering - all streaming blocks
 /// will be inserted after this block (typically the user's message).
+///
+/// `user_agent_id` identifies the user who initiated the prompt. Model/tool blocks
+/// use `PrincipalId::system()` since they're machine-generated.
 async fn process_llm_stream(
     provider: Arc<RigProvider>,
     documents: SharedBlockStore,
@@ -3928,14 +3996,14 @@ async fn process_llm_stream(
     after_block_id: kaijutsu_crdt::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
-    conversation_cache: ConversationCache,
+    conversation_cache: Arc<ConversationCache>,
+    _user_agent_id: PrincipalId,
 ) {
-    // Load existing conversation history for this document.
-    // Replaying the exact same bytes gives us KV cache hits on the API side.
-    let mut messages: Vec<LlmMessage> = conversation_cache.read().await
-        .get(&cell_id)
-        .cloned()
-        .unwrap_or_default();
+    // Get per-context lock — held for the entire stream, serializing
+    // concurrent prompts to the same context (Fix D+E).
+    let cache_lock = conversation_cache.get_or_create(cell_id);
+    let mut messages = cache_lock.lock().await;
+
     let history_len = messages.len();
     messages.push(LlmMessage::user(&content));
     log::info!("Loaded {} cached messages for cell {}, adding user message", history_len, cell_id);
@@ -3952,7 +4020,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached");
+            let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Some(PrincipalId::system()));
             break;
         }
 
@@ -3972,7 +4040,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e));
+                let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
                 return;
             }
         };
@@ -3991,7 +4059,7 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "") {
+                    match documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -4002,7 +4070,7 @@ async fn process_llm_stream(
 
                 StreamEvent::ThinkingDelta(text) => {
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text(cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text_as(cell_id, block_id, &text, Some(PrincipalId::system())) {
                             log::error!("Failed to append thinking text: {}", e);
                         }
                     }
@@ -4013,7 +4081,7 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "") {
+                    match documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -4027,7 +4095,7 @@ async fn process_llm_stream(
                     assistant_text.push_str(&text);
 
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text(cell_id, block_id, &text) {
+                        if let Err(e) = documents.append_text_as(cell_id, block_id, &text, Some(PrincipalId::system())) {
                             log::error!("Failed to append text: {}", e);
                         }
                     }
@@ -4042,7 +4110,7 @@ async fn process_llm_stream(
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
 
                     // Insert block and track it
-                    match documents.insert_tool_call(cell_id, None, Some(&last_block_id), &name, input.clone()) {
+                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), block_id);
@@ -4065,7 +4133,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err));
+                    let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Some(PrincipalId::system()));
                     return;
                 }
             }
@@ -4128,8 +4196,8 @@ async fn process_llm_stream(
                     // Insert tool result block (CRDT DAG — each result parents its own tool_call)
                     let mut result_block_id = None;
                     if let Some(ref tcb_id) = tool_call_block_id {
-                        match documents.insert_tool_result(
-                            cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None,
+                        match documents.insert_tool_result_as(
+                            cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None, Some(PrincipalId::system()),
                         ) {
                             Ok(id) => result_block_id = Some(id),
                             Err(e) => log::error!("Failed to insert tool result block: {}", e),
@@ -4172,10 +4240,9 @@ async fn process_llm_stream(
         // Loop continues - re-prompt with tool results
     }
 
-    // Persist conversation history for next turn — byte-for-byte identical
-    // prefix on the next prompt() call gives us KV cache hits.
-    log::info!("Saving {} conversation messages for cell {}", messages.len(), cell_id);
-    conversation_cache.write().await.insert(cell_id, messages);
+    // Conversation history is already persisted in the per-context lock.
+    // The MutexGuard drops when this function returns.
+    log::info!("Conversation cache updated: {} messages for cell {}", messages.len(), cell_id);
 
     // Save final state after streaming completes
     if let Err(e) = documents.save_snapshot(cell_id) {

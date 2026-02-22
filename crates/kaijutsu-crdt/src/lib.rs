@@ -23,7 +23,7 @@
 //! - **File**: File content tracked in a context
 
 mod block;
-mod block_store;
+pub mod block_store;
 pub(crate) mod content;
 mod dag;
 mod document;

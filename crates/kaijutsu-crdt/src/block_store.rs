@@ -85,6 +85,15 @@ impl BlockStore {
         self.agent_id
     }
 
+    /// Override the agent/principal ID for subsequent block operations.
+    ///
+    /// This changes who "authored" newly created blocks (via `BlockId.agent_id`).
+    /// The DTE agent within each per-block Document is unrelated — it tracks
+    /// CRDT operation identity, not block authorship.
+    pub fn set_agent_id(&mut self, agent_id: PrincipalId) {
+        self.agent_id = agent_id;
+    }
+
     /// Get the current version.
     pub fn version(&self) -> u64 {
         self.version
@@ -662,10 +671,16 @@ impl BlockStore {
                     updated_headers.push(*block.header());
                 }
                 None => {
-                    // New block: send full snapshot for reconstruction
+                    // New block: send snapshot (metadata) + full DTE ops (content history).
+                    // The receiver creates with empty content then merges the DTE ops,
+                    // preserving causal history for subsequent incremental sync.
                     new_blocks.push(block.snapshot());
-                    // Also include header so Lamport timestamp propagates
                     updated_headers.push(*block.header());
+                    // Full ops from root so receiver gets complete DTE causal graph
+                    let full_ops = block.ops_since(&Frontier::root());
+                    if !full_ops.is_empty() {
+                        block_ops.push((*id, full_ops));
+                    }
                 }
             }
         }
@@ -683,13 +698,26 @@ impl BlockStore {
         // Track max remote Lamport timestamp for clock advancement
         let mut max_remote_ts: u64 = 0;
 
-        // First, create blocks from full snapshots (new blocks)
+        // First, create blocks from snapshots (new blocks).
+        // Use empty content — DTE ops in block_ops will fill it in,
+        // preserving causal history for subsequent incremental sync.
+        // Falls back to from_snapshot (with content) if no DTE ops are
+        // present for this block (e.g., persistence restore).
+        let has_ops_for: std::collections::HashSet<BlockId> = payload.block_ops.iter()
+            .map(|(id, _)| *id)
+            .collect();
+
         for snap in &payload.new_blocks {
             if !self.blocks.contains_key(&snap.id) {
-                // Use the snapshot's order_key if present (preserves remote ordering)
                 let fallback_key = format!("{:020}", self.blocks.len());
-                let block = BlockContent::from_snapshot(snap, self.agent_id, fallback_key);
-                // Track remote Lamport from the new block's header
+                let block = if has_ops_for.contains(&snap.id) {
+                    // DTE ops will provide content with proper causal history.
+                    // Bare DTE — no structure creation, sender's ops bring everything.
+                    BlockContent::from_snapshot_for_sync(snap, self.agent_id, fallback_key)
+                } else {
+                    // No DTE ops (persistence restore) — use snapshot content
+                    BlockContent::from_snapshot(snap, self.agent_id, fallback_key)
+                };
                 max_remote_ts = max_remote_ts.max(block.header().updated_at);
                 self.blocks.insert(snap.id, block);
                 if snap.id.agent_id == self.agent_id {
@@ -791,6 +819,53 @@ impl BlockStore {
         forked
     }
 
+    /// Fork the store at a specific version, excluding blocks created after that version.
+    ///
+    /// Preserves original authorship — see [`fork`] for details.
+    pub fn fork_at_version(
+        &self,
+        new_context_id: ContextId,
+        new_agent_id: PrincipalId,
+        at_version: u64,
+    ) -> Self {
+        let mut forked = Self::new(new_context_id, new_agent_id);
+
+        for (_, block) in &self.blocks {
+            if block.is_deleted() {
+                continue;
+            }
+            if block.header().created_at > at_version {
+                continue;
+            }
+            let snap = block.snapshot();
+
+            // Remap IDs: only context_id changes
+            let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
+            let new_parent_id = snap
+                .parent_id
+                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+            let new_tool_call_id = snap
+                .tool_call_id
+                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+
+            if snap.id.agent_id == new_agent_id {
+                forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
+            }
+
+            let mut remapped = snap;
+            remapped.id = new_id;
+            remapped.parent_id = new_parent_id;
+            remapped.tool_call_id = new_tool_call_id;
+
+            let order_key = block.order_key().to_string();
+            let content = BlockContent::from_snapshot(&remapped, new_agent_id, order_key);
+            forked.blocks.insert(new_id, content);
+        }
+
+        forked.version = 1;
+        forked
+    }
+
     // =========================================================================
     // Snapshot / Restore
     // =========================================================================
@@ -846,6 +921,7 @@ pub struct StoreSnapshot {
 }
 
 /// Per-block sync payload.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SyncPayload {
     /// Per-block DTE ops (incremental delta for known blocks).
     pub block_ops: Vec<(BlockId, diamond_types_extended::SerializedOpsOwned)>,
@@ -1553,5 +1629,52 @@ mod tests {
             c_pos,
             d_pos
         );
+    }
+
+    #[test]
+    fn test_incremental_text_sync_after_merge() {
+        // Verifies that ops_since sends full DTE ops for new blocks,
+        // so the receiver gets causal history and subsequent incremental
+        // text ops can merge successfully.
+        let ctx = ContextId::new();
+        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+
+        let id = store1
+            .insert_block(None, None, Role::Model, BlockKind::Text, "")
+            .unwrap();
+
+        // Sync to store2
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+        assert_eq!(store2.block_count(), 1);
+
+        // Store1 appends text
+        store1.append_text(&id, "Hello").unwrap();
+
+        // Try incremental sync using store2's frontier
+        let frontiers = store2.frontier();
+        let payload = store1.ops_since(&frontiers);
+        let result = store2.merge_ops(payload);
+
+        assert!(result.is_ok(), "incremental text sync failed: {:?}", result);
+        let snap = store2.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "Hello");
+    }
+
+    #[test]
+    fn test_snapshot_json_roundtrip() {
+        let mut store = test_store();
+        store
+            .insert_block(None, None, Role::User, BlockKind::Text, "Hello")
+            .unwrap();
+
+        let snapshot = store.snapshot();
+        // Use JSON (not postcard) because BlockSnapshot has skip_serializing_if
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize");
+        let restored: StoreSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(restored.blocks.len(), 1);
+        assert_eq!(restored.blocks[0].content, "Hello");
     }
 }

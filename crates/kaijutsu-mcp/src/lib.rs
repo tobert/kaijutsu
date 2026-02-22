@@ -60,7 +60,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{ContextId, ConversationDAG, Frontier, PrincipalId};
+use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId};
+use kaijutsu_crdt::block_store::SyncPayload;
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -281,27 +282,24 @@ impl KaijutsuMcp {
         let doc_state = kernel.get_context_state(context_id).await?;
 
         // Populate the store — single source of truth for all MCP reads
-        let frontier = if !doc_state.ops.is_empty() {
-            store.create_document_from_oplog(
+        if !doc_state.ops.is_empty() {
+            store.create_document_from_snapshot(
                 doc_state.context_id,
                 DocumentKind::Conversation,
                 None,
                 &doc_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
-
-            // Extract frontier from the store's document
-            store.get(doc_state.context_id)
-                .map(|entry| entry.doc.frontier())
-                .unwrap_or_default()
         } else {
             store.create_document(
                 doc_state.context_id,
                 DocumentKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
+        }
 
-            Frontier::root()
-        };
+        // Extract frontier from the store's document
+        let frontier = store.frontier(doc_state.context_id)
+            .unwrap_or_default();
 
         let sync = SyncManager::with_state(
             Some(doc_state.context_id),
@@ -417,7 +415,7 @@ impl KaijutsuMcp {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Serialize ops for transmission
-        let ops_bytes = postcard::to_stdvec(&ops)
+        let ops_bytes = serde_json::to_vec(&ops)
             .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         if ops_bytes.len() <= 2 {
@@ -586,13 +584,14 @@ impl KaijutsuMcp {
         let after_id = req.after_id.as_ref().and_then(|s| parse_block_id(s));
         let content = req.content.unwrap_or_default();
 
-        match self.store().insert_block(
+        match self.store().insert_block_as(
             context_id,
             parent_id.as_ref(),
             after_id.as_ref(),
             role,
             kind,
             &content,
+            Some(PrincipalId::system()),
         ) {
             Ok(block_id) => {
                 let version = self.store().get(context_id)
@@ -690,7 +689,7 @@ impl KaijutsuMcp {
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        match self.store().append_text(context_id, &block_id, &req.text) {
+        match self.store().append_text_as(context_id, &block_id, &req.text, Some(PrincipalId::system())) {
             Ok(()) => {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
@@ -735,7 +734,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text(context_id, &block_id, pos, &text_with_newline, 0)
+                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(PrincipalId::system()))
                     } else {
                         Err(format!(
                             "Invalid line number {}: block has {} line{} (valid range: 0-{})",
@@ -747,7 +746,7 @@ impl KaijutsuMcp {
                     let total_lines = line_count(&content);
                     if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
                         if start < end {
-                            self.store().edit_text(context_id, &block_id, start, "", end - start)
+                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(PrincipalId::system()))
                         } else {
                             Ok(())
                         }
@@ -781,7 +780,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text(context_id, &block_id, start, &text_with_newline, end - start)
+                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(PrincipalId::system()))
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
@@ -1026,7 +1025,7 @@ impl KaijutsuMcp {
             None => return format!("Error: document '{}' not found", req.document_id),
         };
 
-        let dag = ConversationDAG::from_document(&entry.doc);
+        let dag = ConversationDAG::from_store(&entry.doc);
         let mut output = String::new();
 
         // Header: document_id (kind, N blocks)
@@ -1064,9 +1063,9 @@ impl KaijutsuMcp {
             None => return format!("Error: block not found"),
         };
 
-        // Get CRDT internals from the oplog
-        let frontier = entry.doc.frontier();
+        // Get CRDT internals
         let version = entry.version();
+        let block_count = entry.doc.block_count();
 
         // Count content characters/lines
         let content_length = snapshot.content.len();
@@ -1076,7 +1075,7 @@ impl KaijutsuMcp {
             "block_id": req.block_id,
             "document_id": context_id.to_hex(),
             "version": version,
-            "frontier": frontier,
+            "block_count": block_count,
             "content_length": content_length,
             "content_lines": content_lines,
             "metadata": {
@@ -1665,7 +1664,7 @@ impl KaijutsuMcp {
         // Structure analysis
         if focus == "all" || focus == "structure" {
             content.push_str("## Structure\n\n");
-            let dag = ConversationDAG::from_document(&entry.doc);
+            let dag = ConversationDAG::from_store(&entry.doc);
             let tree_lines = format_dag_tree(&dag, None, false);
             for line in tree_lines {
                 content.push_str(&line);
@@ -2610,7 +2609,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["block_id"].is_string());
         assert!(parsed["version"].is_number());
-        assert!(parsed["frontier"].is_array());
+        assert!(parsed["block_count"].is_number());
         assert_eq!(parsed["content_lines"], 1);
         assert_eq!(parsed["metadata"]["role"], "user");
         assert_eq!(parsed["metadata"]["kind"], "text");
@@ -2782,52 +2781,66 @@ mod tests {
 
     // =========================================================================
     // apply_server_event tests — exercises the store-based sync path
+    //
+    // Uses kernel BlockStore as both "server" and "client" to generate proper
+    // SyncPayload (JSON-serialized) ops, matching the real sync protocol.
     // =========================================================================
 
-    use kaijutsu_crdt::{BlockDocument, BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+    use std::collections::HashMap;
+    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
-    /// Helper: create a store with an initial document populated from a server doc's oplog.
-    /// Returns (store, sync, server_doc, context_id) for further manipulation.
-    fn setup_synced_store() -> (SharedBlockStore, Arc<Mutex<SyncManager>>, BlockDocument, ContextId) {
+    /// Helper: create a synced client/server pair with one block ("Hello from server").
+    ///
+    /// The server store inserts the block, then the client store syncs from it
+    /// via `ops_since` + `merge_ops`, so both share CRDT causal history.
+    /// Returns (client_store, sync_manager, server_store, context_id).
+    fn setup_synced_store() -> (SharedBlockStore, Arc<Mutex<SyncManager>>, SharedBlockStore, ContextId) {
         let context_id = ContextId::new();
-        let agent_id = PrincipalId::new();
-        let mut server = BlockDocument::new(context_id, agent_id);
-        server.insert_block(None, None, Role::User, BlockKind::Text, "Hello from server")
-            .expect("insert block");
 
-        let oplog = server.oplog_bytes().unwrap();
+        // Server store — the authoritative source
+        let server = shared_block_store(PrincipalId::new());
+        server.create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create server document");
+        server.insert_block(context_id, None, None, Role::User, BlockKind::Text, "Hello from server")
+            .expect("insert block on server");
 
-        let store = shared_block_store(PrincipalId::system());
-        store.create_document_from_oplog(
-            context_id,
-            DocumentKind::Conversation,
-            None,
-            &oplog,
-        ).expect("create from oplog");
+        // Client store — synced from server via SyncPayload
+        let client = shared_block_store(PrincipalId::system());
+        client.create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create client document");
+        let initial_payload = server.ops_since(context_id, &HashMap::new())
+            .expect("ops_since from empty frontier");
+        client.merge_ops(context_id, initial_payload)
+            .expect("initial sync merge");
 
-        let frontier = store.get(context_id)
-            .map(|e| e.doc.frontier())
-            .unwrap_or_default();
-
+        let frontier = client.frontier(context_id).unwrap_or_default();
         let sync = Arc::new(Mutex::new(
             SyncManager::with_state(Some(context_id), Some(frontier)),
         ));
 
-        (store, sync, server, context_id)
+        (client, sync, server, context_id)
+    }
+
+    /// Helper: get SyncPayload from server as JSON bytes.
+    fn server_ops_bytes(
+        server: &SharedBlockStore,
+        ctx_id: ContextId,
+        frontier: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
+    ) -> Vec<u8> {
+        let payload = server.ops_since(ctx_id, frontier).expect("ops_since");
+        serde_json::to_vec(&payload).expect("serialize SyncPayload to JSON")
     }
 
     #[test]
     fn test_apply_block_inserted_updates_store() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         // Server inserts a new block
-        let pre_frontier = server.frontier();
-        let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "New block from server",
-        ).expect("insert");
-        let block = server.get_block_snapshot(&block_id).expect("snapshot");
-        let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "New block from server")
+            .expect("insert");
+        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
+        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
 
         // Before applying: store should have 1 block
         assert_eq!(
@@ -2856,16 +2869,15 @@ mod tests {
 
     #[test]
     fn test_apply_text_ops_updates_store() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         // Get the block ID of the existing block on the server
-        let block_id = server.blocks_ordered()[0].id;
+        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
 
         // Server edits the block's text
-        let pre_frontier = server.frontier();
-        server.edit_text(&block_id, 17, " — updated!", 0).expect("edit");
-        let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        server.edit_text(ctx_id, &block_id, 17, " — updated!", 0).expect("edit");
+        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
 
         // Before: store has original text
         assert!(
@@ -2895,7 +2907,7 @@ mod tests {
     fn test_apply_status_changed_updates_store() {
         let (store, sync, server, ctx_id) = setup_synced_store();
 
-        let block_id = server.blocks_ordered()[0].id;
+        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
 
         // The block starts as Done (from BlockSnapshot::text constructor)
         assert_eq!(
@@ -2921,16 +2933,14 @@ mod tests {
 
     #[test]
     fn test_apply_event_wrong_document_ignored() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         // Server inserts a new block
-        let pre_frontier = server.frontier();
-        let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "Should not appear",
-        ).expect("insert");
-        let block = server.get_block_snapshot(&block_id).expect("snapshot");
-        let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Should not appear")
+            .expect("insert");
+        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
+        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
 
         // Apply with WRONG context_id — should be silently ignored
         let wrong_ctx = ContextId::new();
@@ -2952,18 +2962,16 @@ mod tests {
 
     #[test]
     fn test_apply_event_bumps_store_version() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         let version_before = store.get(ctx_id).unwrap().version();
 
         // Apply a block insert
-        let pre_frontier = server.frontier();
-        let block_id = server.insert_block(
-            None, None, Role::User, BlockKind::Text, "Version bump test",
-        ).expect("insert");
-        let block = server.get_block_snapshot(&block_id).expect("snapshot");
-        let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        let block_id = server.insert_block(ctx_id, None, None, Role::User, BlockKind::Text, "Version bump test")
+            .expect("insert");
+        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
+        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
 
         apply_server_event(
             &store, &sync, ctx_id,
@@ -2983,17 +2991,17 @@ mod tests {
 
     #[test]
     fn test_store_reads_consistent_after_multiple_events() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         // Simulate a burst of events: 3 block inserts + a text edit + a status change
+        let mut inserted_ids = Vec::new();
         for i in 0..3 {
-            let pre = server.frontier();
-            let bid = server.insert_block(
-                None, None, Role::Model, BlockKind::Text,
-                &format!("Block {i}"),
-            ).expect("insert");
-            let block = server.get_block_snapshot(&bid).expect("snap");
-            let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
+            let pre = server.frontier(ctx_id).unwrap();
+            let bid = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, &format!("Block {i}"))
+                .expect("insert");
+            let ops = server_ops_bytes(&server, ctx_id, &pre);
+            let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&bid).unwrap();
+            inserted_ids.push(bid);
 
             apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockInserted {
                 context_id: ctx_id,
@@ -3003,12 +3011,12 @@ mod tests {
         }
 
         // Now edit the last-inserted block's text ("Block 2" → "Block 2 — edited")
-        let blocks = server.blocks_ordered();
-        let last_block_id = blocks.last().unwrap().id;
-        let last_content_len = blocks.last().unwrap().content.len();
-        let pre = server.frontier();
-        server.edit_text(&last_block_id, last_content_len, " — edited", 0).expect("edit");
-        let ops = postcard::to_stdvec(&server.ops_since(&pre)).expect("ser");
+        let last_block_id = inserted_ids[2];
+        let last_content_len = server.get(ctx_id).unwrap().doc
+            .get_block_snapshot(&last_block_id).unwrap().content.len();
+        let pre = server.frontier(ctx_id).unwrap();
+        server.edit_text(ctx_id, &last_block_id, last_content_len, " — edited", 0).expect("edit");
+        let ops = server_ops_bytes(&server, ctx_id, &pre);
 
         apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockTextOps {
             context_id: ctx_id,
@@ -3017,7 +3025,7 @@ mod tests {
         });
 
         // Status change on the first inserted block
-        let first_new_block = blocks[1].id; // blocks[0] is the original
+        let first_new_block = inserted_ids[0];
         apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockStatusChanged {
             context_id: ctx_id,
             block_id: first_new_block,
@@ -3045,7 +3053,7 @@ mod tests {
 
         let original_block_count = store.get(ctx_id).unwrap().doc.block_count();
         let original_version = store.get(ctx_id).unwrap().version();
-        let block_id = server.blocks_ordered()[0].id;
+        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
 
         // Apply BlockInserted with garbage ops
         let evil_agent = PrincipalId::new();
@@ -3113,7 +3121,7 @@ mod tests {
 
     #[test]
     fn test_reset_then_incremental_event_preserves_blocks() {
-        let (store, sync, mut server, ctx_id) = setup_synced_store();
+        let (store, sync, server, ctx_id) = setup_synced_store();
 
         // Verify initial state
         assert_eq!(store.get(ctx_id).unwrap().doc.block_count(), 1);
@@ -3123,13 +3131,11 @@ mod tests {
 
         // Server adds a new block. Ops are incremental (not full oplog) —
         // this is what would arrive after missing some events.
-        let pre_frontier = server.frontier();
-        let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "Post-reset block",
-        ).expect("insert");
-        let block = server.get_block_snapshot(&block_id).expect("snapshot");
-        let ops = server.ops_since(&pre_frontier);
-        let ops_bytes = postcard::to_stdvec(&ops).expect("serialize");
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Post-reset block")
+            .expect("insert");
+        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
+        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
 
         apply_server_event(
             &store, &sync, ctx_id,

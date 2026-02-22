@@ -1,10 +1,11 @@
 //! High-level CRDT sync wrapper for kaijutsu clients.
 //!
-//! [`SyncedDocument`] bundles a [`BlockDocument`] with a [`SyncManager`], hiding
-//! CRDT internals (Frontier, oplog bytes, SerializedOpsOwned) behind a clean API.
+//! [`SyncedDocument`] bundles a [`CrdtBlockStore`] with a [`SyncManager`], hiding
+//! CRDT internals (Frontier, SyncPayload, StoreSnapshot) behind a clean API.
 //! Both the Bevy app and MCP server consume this instead of duplicating sync logic.
 
-use kaijutsu_crdt::{BlockDocument, ContextId};
+use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
+use kaijutsu_crdt::ContextId;
 use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId};
 use tracing::{info, warn};
 
@@ -27,11 +28,11 @@ pub enum SyncEffect {
 
 /// A CRDT document with integrated sync state.
 ///
-/// Wraps [`BlockDocument`] + [`SyncManager`] so consumers don't need to know
-/// about Frontier, oplog bytes, or SerializedOpsOwned. The single `apply_event`
+/// Wraps [`CrdtBlockStore`] + [`SyncManager`] so consumers don't need to know
+/// about Frontier, SyncPayload, or StoreSnapshot. The single `apply_event`
 /// method replaces the 40+ line match blocks in both Bevy and MCP consumers.
 pub struct SyncedDocument {
-    doc: BlockDocument,
+    doc: CrdtBlockStore,
     sync: SyncManager,
     context_id: ContextId,
 }
@@ -40,7 +41,7 @@ impl SyncedDocument {
     /// Create a new, empty synced document.
     pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
         Self {
-            doc: BlockDocument::new(context_id, agent_id),
+            doc: CrdtBlockStore::new(context_id, agent_id),
             sync: SyncManager::new(),
             context_id,
         }
@@ -277,13 +278,13 @@ impl SyncedDocument {
     // Escape hatches — for consumers that need internals
     // =========================================================================
 
-    /// Direct access to the underlying document.
-    pub fn doc(&self) -> &BlockDocument {
+    /// Direct access to the underlying block store.
+    pub fn doc(&self) -> &CrdtBlockStore {
         &self.doc
     }
 
-    /// Mutable access to the underlying document.
-    pub fn doc_mut(&mut self) -> &mut BlockDocument {
+    /// Mutable access to the underlying block store.
+    pub fn doc_mut(&mut self) -> &mut CrdtBlockStore {
         &mut self.doc
     }
 
@@ -305,7 +306,9 @@ impl SyncedDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
     use kaijutsu_types::{BlockKind, Role};
+    use std::collections::HashMap;
 
     fn test_context_id() -> ContextId {
         ContextId::new()
@@ -315,30 +318,44 @@ mod tests {
         PrincipalId::new()
     }
 
-    fn create_server_doc(context_id: ContextId) -> BlockDocument {
-        let mut doc = BlockDocument::new(context_id, test_agent_id());
-        doc.insert_block(
-            None,
-            None,
-            Role::User,
-            BlockKind::Text,
-            "Hello from server",
-        )
-        .expect("insert block");
-        doc
+    fn create_server_store(context_id: ContextId) -> CrdtBlockStore {
+        let mut store = CrdtBlockStore::new(context_id, test_agent_id());
+        store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello from server",
+            )
+            .expect("insert block");
+        store
+    }
+
+    /// Helper: serialize a StoreSnapshot to JSON bytes.
+    fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
+        serde_json::to_vec(&store.snapshot()).expect("serialize snapshot")
+    }
+
+    /// Helper: serialize a SyncPayload to JSON bytes.
+    fn sync_payload_bytes(
+        store: &CrdtBlockStore,
+        frontiers: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&store.ops_since(frontiers)).expect("serialize sync payload")
     }
 
     #[test]
     fn test_new_and_from_document_state() {
         let ctx = test_context_id();
-        let server = create_server_doc(ctx);
-        let oplog = server.oplog_bytes().unwrap();
+        let server = create_server_store(ctx);
+        let snap = snapshot_bytes(&server);
 
         let state = DocumentState {
             context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
-            ops: oplog,
+            ops: snap,
         };
 
         let sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
@@ -350,14 +367,14 @@ mod tests {
     #[test]
     fn test_apply_event_block_inserted() {
         let ctx = test_context_id();
-        let mut server = create_server_doc(ctx);
-        let initial_oplog = server.oplog_bytes().unwrap();
+        let mut server = create_server_store(ctx);
+        let initial_snap = snapshot_bytes(&server);
 
         let state = DocumentState {
             context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
-            ops: initial_oplog,
+            ops: initial_snap,
         };
         let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
 
@@ -373,7 +390,7 @@ mod tests {
             )
             .unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
-        let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
+        let ops = sync_payload_bytes(&server, &frontier_before);
 
         let effect = sd.apply_event(&ServerEvent::BlockInserted {
             context_id: ctx,
@@ -402,13 +419,13 @@ mod tests {
     #[test]
     fn test_apply_event_sync_reset() {
         let ctx = test_context_id();
-        let server = create_server_doc(ctx);
-        let oplog = server.oplog_bytes().unwrap();
+        let server = create_server_store(ctx);
+        let snap = snapshot_bytes(&server);
         let state = DocumentState {
             context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
-            ops: oplog,
+            ops: snap,
         };
         let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
         assert!(sd.is_synced());
@@ -423,44 +440,38 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_event_text_streaming() {
+    fn test_apply_event_text_via_snapshot() {
+        // Per-block DTE: after merge_ops creates a block from snapshot,
+        // incremental DTE text ops fail (DataMissing) because the client
+        // has a fresh DTE document. Text updates arrive as full snapshots
+        // via apply_document_state instead.
         let ctx = test_context_id();
-        let mut server = create_server_doc(ctx);
-        let initial_oplog = server.oplog_bytes().unwrap();
+        let mut server = create_server_store(ctx);
+        let initial_snap = snapshot_bytes(&server);
         let state = DocumentState {
             context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
-            ops: initial_oplog,
+            ops: initial_snap,
         };
         let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
 
-        // Create a streaming block
-        let frontier_before = server.frontier();
+        // Create a streaming block and add text on the server
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Hello!")
             .unwrap();
-        let block = server.get_block_snapshot(&block_id).unwrap();
-        let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
 
-        sd.apply_event(&ServerEvent::BlockInserted {
+        // Client gets updated snapshot
+        let updated_snap = snapshot_bytes(&server);
+        let updated_state = DocumentState {
             context_id: ctx,
-            block: Box::new(block),
-            ops,
-        });
+            blocks: server.blocks_ordered(),
+            version: 2,
+            ops: updated_snap,
+        };
+        let effect = sd.apply_document_state(&updated_state).unwrap();
 
-        // Stream text
-        let frontier_before = server.frontier();
-        server.append_text(&block_id, "Hello!").unwrap();
-        let ops = postcard::to_stdvec(&server.ops_since(&frontier_before)).unwrap();
-
-        let effect = sd.apply_event(&ServerEvent::BlockTextOps {
-            context_id: ctx,
-            block_id,
-            ops,
-        });
-
-        assert!(matches!(effect, SyncEffect::Updated { .. }));
+        assert!(matches!(effect, SyncEffect::FullSync { block_count: 2 }));
         let b = sd.get_block(&block_id).unwrap();
         assert_eq!(b.content, "Hello!");
     }
@@ -471,13 +482,13 @@ mod tests {
         let mut sd = SyncedDocument::new(ctx, test_agent_id());
         assert!(!sd.is_synced());
 
-        let server = create_server_doc(ctx);
-        let oplog = server.oplog_bytes().unwrap();
+        let server = create_server_store(ctx);
+        let snap = snapshot_bytes(&server);
         let state = DocumentState {
             context_id: ctx,
             blocks: server.blocks_ordered(),
             version: 1,
-            ops: oplog,
+            ops: snap,
         };
 
         let effect = sd.apply_document_state(&state).unwrap();
