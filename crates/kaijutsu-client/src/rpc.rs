@@ -1434,6 +1434,17 @@ pub(crate) fn parse_block_snapshot(
         }
     }
 
+    // File path (for BlockKind::File blocks)
+    if reader.has_file_path() {
+        if let Ok(path) = reader.get_file_path() {
+            if let Ok(s) = path.to_str() {
+                if !s.is_empty() {
+                    builder = builder.file_path(s);
+                }
+            }
+        }
+    }
+
     Ok(builder.build())
 }
 
@@ -1625,4 +1636,132 @@ pub enum RpcError {
     CapabilityLost,
     #[error("Server error: {0}")]
     ServerError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capnp::message::Builder as MessageBuilder;
+
+    /// Helper: build a BlockSnapshot capnp message, set fields, then parse it back
+    /// through `parse_block_snapshot` to verify roundtrip fidelity.
+    fn roundtrip_snapshot(snap: &BlockSnapshot) -> BlockSnapshot {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::block_snapshot::Builder>();
+
+        // Set ID
+        {
+            let mut id = builder.reborrow().init_id();
+            id.set_context_id(snap.id.context_id.as_bytes());
+            id.set_agent_id(snap.id.agent_id.as_bytes());
+            id.set_seq(snap.id.seq);
+        }
+
+        // Set kind
+        builder.set_kind(match snap.kind {
+            BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+            BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+            BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+            BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+            BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+            BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+        });
+
+        // Set role
+        builder.set_role(match snap.role {
+            Role::User => crate::kaijutsu_capnp::Role::User,
+            Role::Model => crate::kaijutsu_capnp::Role::Model,
+            Role::System => crate::kaijutsu_capnp::Role::System,
+            Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+            Role::Asset => crate::kaijutsu_capnp::Role::Asset,
+        });
+
+        // Set status
+        builder.set_status(match snap.status {
+            Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+            Status::Running => crate::kaijutsu_capnp::Status::Running,
+            Status::Done => crate::kaijutsu_capnp::Status::Done,
+            Status::Error => crate::kaijutsu_capnp::Status::Error,
+        });
+
+        builder.set_content(&snap.content);
+        builder.set_collapsed(snap.collapsed);
+
+        // Set file_path if present
+        if let Some(ref path) = snap.file_path {
+            builder.set_file_path(path);
+        }
+
+        // Set tool_kind if present
+        if let Some(tk) = snap.tool_kind {
+            builder.set_has_tool_kind(true);
+            builder.set_tool_kind(match tk {
+                ToolKind::Shell => crate::kaijutsu_capnp::ToolKind::Shell,
+                ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
+                ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
+            });
+        }
+
+        // Parse back
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
+            .unwrap();
+        parse_block_snapshot(&reader).unwrap()
+    }
+
+    #[test]
+    fn test_parse_block_snapshot_file_path_roundtrip() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let id = BlockId { context_id: ctx, agent_id: agent, seq: 1 };
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::File)
+            .role(Role::Asset)
+            .status(Status::Done)
+            .content("file content here")
+            .file_path("/src/main.rs")
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        assert_eq!(parsed.file_path.as_deref(), Some("/src/main.rs"));
+        assert_eq!(parsed.kind, BlockKind::File);
+        assert_eq!(parsed.role, Role::Asset);
+    }
+
+    #[test]
+    fn test_parse_block_snapshot_no_file_path() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let id = BlockId { context_id: ctx, agent_id: agent, seq: 2 };
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::User)
+            .status(Status::Done)
+            .content("hello")
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        assert_eq!(parsed.file_path, None);
+        assert_eq!(parsed.kind, BlockKind::Text);
+    }
+
+    #[test]
+    fn test_parse_block_snapshot_tool_kind_roundtrip() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let id = BlockId { context_id: ctx, agent_id: agent, seq: 3 };
+
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolCall)
+            .role(Role::Model)
+            .status(Status::Done)
+            .content("{}")
+            .tool_kind(ToolKind::Mcp)
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        assert_eq!(parsed.tool_kind, Some(ToolKind::Mcp));
+    }
 }

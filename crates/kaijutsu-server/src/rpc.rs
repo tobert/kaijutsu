@@ -1488,6 +1488,54 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
+    /// Create a new context with the given label.
+    ///
+    /// Generates a fresh ContextId (UUIDv7), creates the document in the
+    /// block store, and registers it in the kernel's drift router.
+    fn create_context(
+        self: Rc<Self>,
+        params: kernel::CreateContextParams,
+        mut results: kernel::CreateContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let label = pry!(pry!(pry!(params.get()).get_label()).to_str()).to_owned();
+
+        let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+
+        let parent_ctx = {
+            let conn = connection.borrow();
+            conn.current_context_or(kernel.default_context_id)
+        };
+
+        log::info!("create_context: label='{}' kernel='{}'", label, kernel.id.to_hex());
+
+        Promise::from_future(async move {
+            let context_id = ContextId::new();
+
+            // Create the document for this context
+            if let Err(e) = kernel.documents.create_document(
+                context_id,
+                DocumentKind::Conversation,
+                None,
+            ) {
+                return Err(capnp::Error::failed(
+                    format!("Failed to create document for context {}: {}", context_id, e),
+                ));
+            }
+
+            // Register in kernel-level drift router with label and parent
+            {
+                let mut drift = kernel.kernel.drift().write().await;
+                let label_ref = if label.is_empty() { None } else { Some(label.as_str()) };
+                drift.register(context_id, label_ref, Some(parent_ctx));
+                log::info!("Created context {} (label={:?}) in kernel DriftRouter", context_id, label_ref);
+            }
+
+            results.get().set_id(context_id.as_bytes());
+            Ok(())
+        })
+    }
+
     /// Join a context, returning its context_id.
     ///
     /// Creates the context document if it doesn't exist. Registers in

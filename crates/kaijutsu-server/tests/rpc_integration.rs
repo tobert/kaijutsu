@@ -111,3 +111,69 @@ fn test_kernel_appears_in_list() {
         assert_eq!(kernels.len(), 1);
     });
 }
+
+#[test]
+fn test_create_context_returns_valid_id() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let context_id = kernel.create_context("test-ctx").await.unwrap();
+
+        assert!(!context_id.is_nil(), "createContext should return a non-nil ContextId");
+    });
+}
+
+#[test]
+fn test_create_context_appears_in_list() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+
+        // Count contexts before
+        let before = kernel.list_contexts().await.unwrap();
+        let before_count = before.len();
+
+        let context_id = kernel.create_context("my-label").await.unwrap();
+
+        // Should appear in list with correct label
+        let after = kernel.list_contexts().await.unwrap();
+        assert_eq!(after.len(), before_count + 1, "New context should appear in list");
+
+        let found = after.iter().find(|c| c.id == context_id);
+        assert!(found.is_some(), "Created context should be findable by ID");
+        assert_eq!(found.unwrap().label, "my-label");
+    });
+}
+
+#[test]
+fn test_create_context_joinable() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let context_id = kernel.create_context("joinable").await.unwrap();
+
+        // Should be joinable
+        let joined_id = kernel.join_context(context_id, "test-instance").await.unwrap();
+        assert_eq!(joined_id, context_id, "Joining a created context should return the same ID");
+    });
+}
+
+#[test]
+fn test_create_context_unique_ids() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let id1 = kernel.create_context("ctx-a").await.unwrap();
+        let id2 = kernel.create_context("ctx-b").await.unwrap();
+
+        assert_ne!(id1, id2, "Each created context should have a unique ID");
+    });
+}
