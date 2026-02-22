@@ -88,8 +88,8 @@ impl AppendBuffer {
 pub struct AppendBatcher {
     documents: SharedBlockStore,
     config: BatchConfig,
-    /// Buffers keyed by block key (document_id/agent_id/seq).
-    buffers: Arc<Mutex<HashMap<String, AppendBuffer>>>,
+    /// Buffers keyed by BlockId (Copy + Hash + Eq).
+    buffers: Arc<Mutex<HashMap<BlockId, AppendBuffer>>>,
 }
 
 impl AppendBatcher {
@@ -111,21 +111,20 @@ impl AppendBatcher {
     ///
     /// Returns `true` if text was flushed to the CRDT, `false` if buffered.
     pub async fn append(&self, context_id: ContextId, block_id: &BlockId, text: &str) -> bool {
-        let key = block_id.to_key();
         let should_flush;
 
         {
             let mut buffers = self.buffers.lock();
             let buffer = buffers
-                .entry(key.clone())
-                .or_insert_with(|| AppendBuffer::new(context_id, block_id.clone()));
+                .entry(*block_id)
+                .or_insert_with(|| AppendBuffer::new(context_id, *block_id));
 
             buffer.buffer.push_str(text);
             should_flush = buffer.should_flush(&self.config);
         }
 
         if should_flush {
-            self.flush_block(&key).await;
+            self.flush_block(block_id).await;
             true
         } else {
             false
@@ -133,34 +132,32 @@ impl AppendBatcher {
     }
 
     /// Force flush a specific block's buffer.
-    pub async fn flush_block(&self, block_key: &str) {
+    pub async fn flush_block(&self, block_id: &BlockId) {
         let buffer_content = {
             let mut buffers = self.buffers.lock();
-            if let Some(buffer) = buffers.get_mut(block_key) {
+            if let Some(buffer) = buffers.get_mut(block_id) {
                 let content = buffer.take();
                 let context_id = buffer.context_id;
-                let block_id = buffer.block_id.clone();
                 if content.is_empty() {
                     None
                 } else {
-                    Some((context_id, block_id, content))
+                    Some((context_id, content))
                 }
             } else {
                 None
             }
         };
 
-        if let Some((context_id, block_id, content)) = buffer_content {
-            // Append to the CRDT
-            let _ = self.documents.append_text(context_id, &block_id, &content);
+        if let Some((context_id, content)) = buffer_content {
+            let _ = self.documents.append_text(context_id, block_id, &content);
         }
     }
 
     /// Flush all pending buffers.
     pub async fn flush_all(&self) {
-        let keys: Vec<String> = {
+        let keys: Vec<BlockId> = {
             let buffers = self.buffers.lock();
-            buffers.keys().cloned().collect()
+            buffers.keys().copied().collect()
         };
 
         for key in keys {
@@ -169,11 +166,11 @@ impl AppendBatcher {
     }
 
     /// Flush and remove a block's buffer (call when block is finalized).
-    pub async fn finalize_block(&self, block_key: &str) {
-        self.flush_block(block_key).await;
+    pub async fn finalize_block(&self, block_id: &BlockId) {
+        self.flush_block(block_id).await;
 
         let mut buffers = self.buffers.lock();
-        buffers.remove(block_key);
+        buffers.remove(block_id);
     }
 
     /// Get current buffer stats for debugging.
@@ -335,7 +332,7 @@ mod tests {
         assert_eq!(batcher.stats().active_buffers, 1);
 
         // Finalize
-        batcher.finalize_block(&block_id.to_key()).await;
+        batcher.finalize_block(&block_id).await;
         assert_eq!(batcher.stats().active_buffers, 0);
 
         // Content should be written
