@@ -11,7 +11,7 @@ pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Session-scoped agent identity for CRDT operations.
 ///
-/// Created once at startup, reused for all CrdtBlockStore/SyncedDocument
+/// Created once at startup, reused for all SyncedDocument
 /// construction. Without this, each frame or context switch would generate
 /// a fresh PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
 #[derive(Resource)]
@@ -64,7 +64,7 @@ pub enum CellKind {
 /// Component linking a cell to a conversation.
 ///
 /// When attached to a cell (like MainCell), the cell's content
-/// is synced with the conversation's CrdtBlockStore.
+/// is synced with the conversation's document in DocumentCache.
 #[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component)]
 pub struct ViewingConversation {
@@ -215,7 +215,7 @@ impl CellEditor {
     // =========================================================================
     // TEXT MUTATION
     // (Currently unused — block cell input uses handle_block_cell_input which
-    //  operates on BlockEditCursor + CrdtBlockStore directly. Kept as building
+    //  operates on BlockEditCursor + BlockDocument directly. Kept as building
     //  blocks for future CellEditor-based editing scenarios.)
     // =========================================================================
 

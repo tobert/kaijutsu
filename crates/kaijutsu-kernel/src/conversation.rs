@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// - Mounts providing access to resource kernels (worktrees, repos, etc.)
 ///
 /// The actual message content is stored in a `BlockDocument` owned by the
-/// sync layer (DocumentSyncState on the client).
+/// sync layer (DocumentCache on the client).
 pub struct Conversation {
     /// Unique identifier for this conversation.
     pub id: String,
