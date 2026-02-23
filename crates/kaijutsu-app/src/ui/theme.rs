@@ -63,6 +63,25 @@ impl Default for AnsiColors {
     }
 }
 
+/// Syntax highlighting colors for kaish shell input.
+///
+/// Defaults are derived from the ANSI palette (Tokyo Night).
+#[derive(Clone, Debug)]
+pub struct SyntaxColors {
+    pub keyword: Color,     // if, for, fn, while
+    pub string: Color,      // "hello", 'world'
+    pub number: Color,      // 42, 3.14
+    pub operator: Color,    // |, &&, ||, ;
+    pub variable: Color,    // $HOME, $foo
+    pub flag: Color,        // --verbose, -la
+    pub comment: Color,     // # comment
+    pub command: Color,     // echo, ls, git (the verb)
+    pub path: Color,        // /foo/bar
+    pub punctuation: Color, // { } ( )
+    pub error: Color,       // unrecognized tokens
+    pub prefix: Color,      // the : or ` shell prefix char
+}
+
 /// Application theme resource.
 ///
 /// Contains all colors used throughout the application, from base UI
@@ -131,9 +150,14 @@ pub struct Theme {
     pub cursor_visual: Vec4,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ANSI palette (for future terminal/syntax use)
+    // ANSI palette (for terminal/syntax use)
     // ═══════════════════════════════════════════════════════════════════════
     pub ansi: AnsiColors,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Syntax highlighting (kaish shell input)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub syntax: SyntaxColors,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Frame Configuration (9-slice system)
@@ -402,6 +426,22 @@ impl Default for Theme {
                 bright_magenta: Color::srgb(0.733, 0.604, 0.969), // #bb9af7
                 bright_cyan: Color::srgb(0.490, 0.812, 1.00),   // #7dcfff
                 bright_white: Color::srgb(0.753, 0.792, 0.961), // #c0caf5
+            },
+
+            // Syntax highlighting — derived from ANSI palette
+            syntax: SyntaxColors {
+                keyword: Color::srgb(0.733, 0.604, 0.969),      // magenta
+                string: Color::srgb(0.620, 0.808, 0.416),       // green
+                number: Color::srgb(0.878, 0.686, 0.404),       // yellow
+                operator: Color::srgb(0.490, 0.812, 1.00),      // cyan
+                variable: Color::srgb(0.878, 0.686, 0.404),     // bright_yellow
+                flag: Color::srgb(0.478, 0.635, 0.969),         // bright_blue
+                comment: Color::srgb(0.255, 0.282, 0.408),      // bright_black
+                command: Color::srgb(0.478, 0.635, 0.969),       // blue
+                path: Color::srgb(0.490, 0.812, 1.00),          // cyan
+                punctuation: Color::srgb(0.753, 0.792, 0.961),  // fg
+                error: Color::srgb(0.969, 0.463, 0.557),        // red
+                prefix: Color::srgb(0.255, 0.282, 0.408),       // bright_black
             },
 
             // Frame configuration

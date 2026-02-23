@@ -2653,10 +2653,29 @@ pub fn init_compose_block_buffer(
 // handle_compose_block_input — DELETED (Phase 5)
 // Migrated to input::systems::handle_compose_input
 
+/// Map a kaish token kind to a cosmic_text color via the theme's syntax palette.
+fn syntax_color_for_token(kind: &crate::kaish::TokenKind, theme: &Theme) -> cosmic_text::Color {
+    use crate::kaish::TokenKind;
+    bevy_to_cosmic_color(match kind {
+        TokenKind::Keyword => theme.syntax.keyword,
+        TokenKind::String => theme.syntax.string,
+        TokenKind::Number => theme.syntax.number,
+        TokenKind::Operator => theme.syntax.operator,
+        TokenKind::Variable => theme.syntax.variable,
+        TokenKind::Flag => theme.syntax.flag,
+        TokenKind::Comment => theme.syntax.comment,
+        TokenKind::Command => theme.syntax.command,
+        TokenKind::Path => theme.syntax.path,
+        TokenKind::Punctuation => theme.syntax.punctuation,
+        TokenKind::Error => theme.syntax.error,
+    })
+}
+
 /// Sync ComposeBlock text to its MsdfTextBuffer.
 ///
 /// In shell mode, runs kaish syntax validation on each keystroke and tints
 /// text red for invalid syntax (but not for incomplete input like `if`).
+/// Valid/incomplete shell input gets per-token syntax highlighting.
 pub fn sync_compose_block_buffer(
     font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
@@ -2669,31 +2688,64 @@ pub fn sync_compose_block_buffer(
     for (compose, mut buffer, mut config) in compose_blocks.iter_mut() {
         let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
 
-        // Show placeholder when empty
-        let display_text = if compose.is_empty() {
-            "Type here..."
-        } else {
-            &compose.text
-        };
-
-        // Set glyph color from theme before shaping (color bakes into glyphs)
-        // Auto-detect shell mode from text prefix (: or `)
-        let color = if compose.is_empty() {
-            theme.fg_dim // Placeholder is dimmed
+        if compose.is_empty() {
+            // Placeholder
+            buffer.set_color(theme.fg_dim);
+            config.default_color = theme.fg_dim;
+            buffer.set_text(&mut font_system, "Type here...", attrs, cosmic_text::Shaping::Advanced);
         } else if is_shell_command(&compose.text) {
-            let validation = crate::kaish::validate(strip_shell_prefix(&compose.text));
+            let stripped = strip_shell_prefix(&compose.text);
+            let validation = crate::kaish::validate(stripped);
+
             if !validation.valid && !validation.incomplete {
-                theme.block_tool_error // Red tint for syntax errors
+                // Hard syntax error — red tint on entire text
+                buffer.set_color(theme.block_tool_error);
+                config.default_color = theme.block_tool_error;
+                buffer.set_text(&mut font_system, &compose.text, attrs, cosmic_text::Shaping::Advanced);
             } else {
-                theme.block_user
+                // Valid or incomplete — syntax highlight with tokenizer
+                let prefix = &compose.text[..compose.text.len() - stripped.len()];
+                let tokens = crate::kaish::tokenize(stripped);
+
+                let mut spans: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
+                // Attrs::color() consumes self, so clone for each span
+                let colored = |c: cosmic_text::Color| attrs.clone().color(c);
+
+                // Prefix char (: or `) in dim color
+                let prefix_color = bevy_to_cosmic_color(theme.syntax.prefix);
+                spans.push((prefix, colored(prefix_color)));
+
+                // Build spans from tokens, filling whitespace gaps with default attrs
+                let default_color = bevy_to_cosmic_color(theme.block_user);
+                let mut cursor = 0;
+                for token in &tokens {
+                    // Gap before this token (whitespace)
+                    if token.start > cursor {
+                        let gap = &stripped[cursor..token.start];
+                        spans.push((gap, colored(default_color)));
+                    }
+                    let text_slice = &stripped[token.start..token.end];
+                    let color = syntax_color_for_token(&token.kind, &theme);
+                    spans.push((text_slice, colored(color)));
+                    cursor = token.end;
+                }
+                // Trailing text after last token
+                if cursor < stripped.len() {
+                    let tail = &stripped[cursor..];
+                    spans.push((tail, colored(default_color)));
+                }
+
+                // Use the base user color for overall buffer color (affects cursor etc.)
+                buffer.set_color(theme.block_user);
+                config.default_color = theme.block_user;
+                buffer.set_rich_text(&mut font_system, spans, &attrs, cosmic_text::Shaping::Advanced);
             }
         } else {
-            theme.block_user // User input color
+            // Plain chat text
+            buffer.set_color(theme.block_user);
+            config.default_color = theme.block_user;
+            buffer.set_text(&mut font_system, &compose.text, attrs, cosmic_text::Shaping::Advanced);
         };
-        buffer.set_color(color);
-        config.default_color = color;
-
-        buffer.set_text(&mut font_system, display_text, attrs, cosmic_text::Shaping::Advanced);
 
         // Shape the text so glyphs are populated for MSDF rendering
         let wrap_width = config.bounds.width().max(100) as f32;

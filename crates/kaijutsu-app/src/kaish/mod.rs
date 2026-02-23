@@ -38,7 +38,6 @@ pub struct SyntaxError {
 }
 
 /// Token with span information for syntax highlighting.
-#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 #[derive(Debug, Clone)]
 pub struct SpannedToken {
     /// The token kind.
@@ -50,7 +49,6 @@ pub struct SpannedToken {
 }
 
 /// Simplified token kinds for syntax highlighting.
-#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     /// Command or identifier.
@@ -126,7 +124,6 @@ pub fn validate(input: &str) -> ValidationResult {
 /// Tokenize input for syntax highlighting.
 ///
 /// Returns a list of tokens with their spans and kinds.
-#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 pub fn tokenize(input: &str) -> Vec<SpannedToken> {
     use logos::Logos;
 
@@ -153,7 +150,6 @@ pub fn tokenize(input: &str) -> Vec<SpannedToken> {
 ///
 /// Uses kaish's `TokenCategory` for stable classification that doesn't break
 /// when new tokens are added to the lexer.
-#[allow(dead_code)] // Future: syntax highlighting in ComposeBlock
 fn classify_token(token: &Token) -> TokenKind {
     match token.category() {
         TokenCategory::Keyword => TokenKind::Keyword,

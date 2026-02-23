@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5259,7 +5259,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5292,7 +5292,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-schema"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "capnp",
 ]
