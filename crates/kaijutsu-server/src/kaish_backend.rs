@@ -42,11 +42,11 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 pub type SharedContextId = Arc<RwLock<ContextId>>;
 
 use kaish_kernel::{
-    BackendError, BackendResult, EntryInfo, KernelBackend, PatchOp, ReadRange, ToolInfo,
+    BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo,
     ToolResult, WriteMode,
 };
 use kaish_kernel::tools::{ExecContext, ParamSchema, ToolArgs, ToolSchema};
-use kaish_kernel::vfs::MountInfo;
+use kaish_kernel::vfs::{DirEntry, MountInfo};
 
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
 ///
@@ -425,17 +425,17 @@ impl KernelBackend for KaijutsuBackend {
     // Directory Operations
     // =========================================================================
 
-    async fn list(&self, path: &Path) -> BackendResult<Vec<EntryInfo>> {
+    async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
         match self.resolve_path(path) {
             PathResolution::Root => {
-                Ok(vec![EntryInfo::directory("docs")])
+                Ok(vec![DirEntry::directory("docs")])
             }
             PathResolution::DocsRoot => {
                 let entries = self
                     .blocks
                     .list_ids()
                     .into_iter()
-                    .map(|id| EntryInfo::directory(id.to_hex()))
+                    .map(|id| DirEntry::directory(id.to_hex()))
                     .collect();
                 Ok(entries)
             }
@@ -444,12 +444,12 @@ impl KernelBackend for KaijutsuBackend {
                     BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
                 let blocks = entry.doc.blocks_ordered();
-                let mut entries: Vec<EntryInfo> = blocks
+                let mut entries: Vec<DirEntry> = blocks
                     .iter()
-                    .map(|b| EntryInfo::file(b.id.to_key(), b.content.len() as u64))
+                    .map(|b| DirEntry::file(b.id.to_key(), b.content.len() as u64))
                     .collect();
                 // Add _meta pseudo-file
-                entries.push(EntryInfo::file("_meta", 0));
+                entries.push(DirEntry::file("_meta", 0));
                 Ok(entries)
             }
             PathResolution::Block(_, _) | PathResolution::DocumentMeta(_) => {
@@ -459,20 +459,20 @@ impl KernelBackend for KaijutsuBackend {
         }
     }
 
-    async fn stat(&self, path: &Path) -> BackendResult<EntryInfo> {
+    async fn stat(&self, path: &Path) -> BackendResult<DirEntry> {
         match self.resolve_path(path) {
-            PathResolution::Root => Ok(EntryInfo::directory("/")),
-            PathResolution::DocsRoot => Ok(EntryInfo::directory("docs")),
+            PathResolution::Root => Ok(DirEntry::directory("/")),
+            PathResolution::DocsRoot => Ok(DirEntry::directory("docs")),
             PathResolution::Document(ctx_id) => {
                 if self.blocks.contains(ctx_id) {
-                    Ok(EntryInfo::directory(ctx_id.to_hex()))
+                    Ok(DirEntry::directory(ctx_id.to_hex()))
                 } else {
                     Err(BackendError::NotFound(ctx_id.to_hex()))
                 }
             }
             PathResolution::DocumentMeta(ctx_id) => {
                 if self.blocks.contains(ctx_id) {
-                    Ok(EntryInfo::file("_meta", 0))
+                    Ok(DirEntry::file("_meta", 0))
                 } else {
                     Err(BackendError::NotFound(ctx_id.to_hex()))
                 }
@@ -485,10 +485,14 @@ impl KernelBackend for KaijutsuBackend {
                 let block = blocks.iter().find(|b| b.id == block_id).ok_or_else(|| {
                     BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
                 })?;
-                Ok(EntryInfo::file(block_id.to_key(), block.content.len() as u64))
+                Ok(DirEntry::file(block_id.to_key(), block.content.len() as u64))
             }
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
+    }
+
+    async fn lstat(&self, path: &Path) -> BackendResult<DirEntry> {
+        self.stat(path).await
     }
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {

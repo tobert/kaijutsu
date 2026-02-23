@@ -14,16 +14,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 
 use kaish_kernel::{
-    BackendError, BackendResult, EntryInfo, KernelBackend,
+    BackendError, BackendResult, KernelBackend,
     PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 use kaish_kernel::backend::ConflictError;
 use kaish_kernel::tools::{ExecContext, ToolArgs};
+use kaish_kernel::vfs::{DirEntry, DirEntryKind};
 
 use kaijutsu_kernel::vfs::{
     FileType, MountTable, VfsError, VfsOps,
@@ -72,32 +72,33 @@ fn vfs_to_backend(err: VfsError) -> BackendError {
     }
 }
 
-/// Convert a kaijutsu `FileAttr` to a kaish `EntryInfo`.
-fn file_attr_to_entry_info(name: &str, attr: &kaijutsu_kernel::vfs::FileAttr) -> EntryInfo {
-    let modified = attr.mtime
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs());
-
-    EntryInfo {
+/// Convert a kaijutsu `FileAttr` to a kaish `DirEntry`.
+fn file_attr_to_dir_entry(name: &str, attr: &kaijutsu_kernel::vfs::FileAttr) -> DirEntry {
+    let kind = match attr.kind {
+        FileType::File => DirEntryKind::File,
+        FileType::Directory => DirEntryKind::Directory,
+        FileType::Symlink => DirEntryKind::Symlink,
+    };
+    DirEntry {
         name: name.to_string(),
-        is_dir: attr.kind == FileType::Directory,
-        is_file: attr.kind == FileType::File,
-        is_symlink: attr.kind == FileType::Symlink,
+        kind,
         size: attr.size,
-        modified,
+        modified: Some(attr.mtime),
         permissions: Some(attr.perm),
         symlink_target: None,
     }
 }
 
-/// Convert a kaijutsu `DirEntry` to a kaish `EntryInfo`.
-fn dir_entry_to_entry_info(entry: &kaijutsu_kernel::vfs::DirEntry) -> EntryInfo {
-    EntryInfo {
+/// Convert a kaijutsu `DirEntry` to a kaish `DirEntry`.
+fn kj_dir_entry_to_kaish(entry: &kaijutsu_kernel::vfs::DirEntry) -> DirEntry {
+    let kind = match entry.kind {
+        FileType::File => DirEntryKind::File,
+        FileType::Directory => DirEntryKind::Directory,
+        FileType::Symlink => DirEntryKind::Symlink,
+    };
+    DirEntry {
         name: entry.name.clone(),
-        is_dir: entry.kind == FileType::Directory,
-        is_file: entry.kind == FileType::File,
-        is_symlink: entry.kind == FileType::Symlink,
+        kind,
         size: 0,
         modified: None,
         permissions: None,
@@ -329,20 +330,24 @@ impl KernelBackend for MountBackend {
     // Directory Operations
     // =========================================================================
 
-    async fn list(&self, path: &Path) -> BackendResult<Vec<EntryInfo>> {
+    async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
         let entries = self.mount_table
             .readdir(path)
             .await
             .map_err(vfs_to_backend)?;
-        Ok(entries.iter().map(dir_entry_to_entry_info).collect())
+        Ok(entries.iter().map(kj_dir_entry_to_kaish).collect())
     }
 
-    async fn stat(&self, path: &Path) -> BackendResult<EntryInfo> {
+    async fn stat(&self, path: &Path) -> BackendResult<DirEntry> {
         let attr = self.mount_table
             .getattr(path)
             .await
             .map_err(vfs_to_backend)?;
-        Ok(file_attr_to_entry_info(&path_name(path), &attr))
+        Ok(file_attr_to_dir_entry(&path_name(path), &attr))
+    }
+
+    async fn lstat(&self, path: &Path) -> BackendResult<DirEntry> {
+        self.stat(path).await
     }
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {
@@ -547,7 +552,7 @@ mod tests {
             .unwrap();
 
         let info = backend.stat(Path::new("/tmp/stat.txt")).await.unwrap();
-        assert!(info.is_file);
+        assert!(info.is_file());
         assert_eq!(info.size, 5);
     }
 
