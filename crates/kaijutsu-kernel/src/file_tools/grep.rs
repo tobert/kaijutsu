@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use kaish_glob::{FileWalker, GlobPath, WalkOptions};
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use crate::vfs::{MountTable, VfsOps};
 
 use super::cache::FileDocumentCache;
@@ -58,7 +58,7 @@ impl ExecutionEngine for GrepEngine {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: '/')"
+                    "description": "Directory to search in (default: project root)"
                 },
                 "glob": {
                     "type": "string",
@@ -73,8 +73,8 @@ impl ExecutionEngine for GrepEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.grep")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.grep")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: GrepParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -96,7 +96,8 @@ impl ExecutionEngine for GrepEngine {
             }
         };
 
-        let search_root = p.path.as_deref().unwrap_or("/");
+        let default_root = ctx.cwd.to_string_lossy();
+        let search_root = p.path.as_deref().unwrap_or(&default_root);
         let adapter = VfsWalkerAdapter(&self.vfs);
 
         let options = WalkOptions {

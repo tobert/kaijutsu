@@ -39,17 +39,18 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
         .unwrap();
 
     // Register individual drift engines
+    // context_id removed from constructors — engines read it from ToolContext at call time
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_ls", "List drift contexts", "drift"),
-        Arc::new(DriftLsEngine::new(&kernel, ctx_id)),
+        Arc::new(DriftLsEngine::new(&kernel)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_push", "Stage drift content", "drift"),
-        Arc::new(DriftPushEngine::new(&kernel, documents.clone(), ctx_id)),
+        Arc::new(DriftPushEngine::new(&kernel, documents.clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_flush", "Flush staged drifts", "drift"),
-        Arc::new(DriftFlushEngine::new(&kernel, documents.clone(), ctx_id)),
+        Arc::new(DriftFlushEngine::new(&kernel, documents.clone())),
     ).await;
 
     // Register "default" context in drift router
@@ -58,8 +59,9 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
         router.register(ctx_id, Some("default"), None);
     }
 
-    let kaish = EmbeddedKaish::new("e2e-drift", documents.clone(), kernel.clone(), None)
-        .expect("EmbeddedKaish::new failed");
+    let kaish = EmbeddedKaish::with_identity(
+        "e2e-drift", documents.clone(), kernel.clone(), None, Some(ctx_id),
+    ).expect("EmbeddedKaish::with_identity failed");
 
     (kaish, kernel, documents)
 }

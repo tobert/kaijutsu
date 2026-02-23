@@ -77,7 +77,28 @@ impl EmbeddedKaish {
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
     ) -> Result<Self> {
-        let docs_backend = Arc::new(KaijutsuBackend::new(blocks, kernel.clone()));
+        Self::with_identity(name, blocks, kernel, project_root, None)
+    }
+
+    /// Create an embedded kaish executor with explicit identity fields.
+    ///
+    /// When `context_id` is provided, it flows through to `ToolContext` for
+    /// drift/whoami engines that need to know which context the caller is in.
+    pub fn with_identity(
+        name: &str,
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
+        context_id: Option<kaijutsu_types::ContextId>,
+    ) -> Result<Self> {
+        let docs_backend = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel.clone(),
+            kaijutsu_types::PrincipalId::system(),
+            context_id.unwrap_or_else(kaijutsu_types::ContextId::new),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        ));
         let mount_table = kernel.vfs().clone();
 
         let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(

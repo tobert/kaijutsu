@@ -23,7 +23,7 @@ use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::{LlmRegistry, LlmResult, RigProvider};
 use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::state::KernelState;
-use crate::tools::{ExecResult, ExecutionEngine, ToolInfo, ToolRegistry};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
 use crate::vfs::{
     DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult,
 };
@@ -299,12 +299,12 @@ impl Kernel {
     }
 
     /// Execute code using the default engine.
-    pub async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         // Record in history
         let history_id = self.add_history(code).await;
 
         // Execute
-        let result = self.tools.read().await.execute(code).await?;
+        let result = self.tools.read().await.execute(code, ctx).await?;
 
         // Update history with result
         self.state.write().await.set_history_result(
@@ -317,7 +317,7 @@ impl Kernel {
     }
 
     /// Execute code using a specific engine.
-    pub async fn execute_with(&self, engine_name: &str, code: &str) -> anyhow::Result<ExecResult> {
+    pub async fn execute_with(&self, engine_name: &str, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let engine = self
             .tools
             .read()
@@ -326,7 +326,7 @@ impl Kernel {
             .ok_or_else(|| anyhow::anyhow!("engine not found: {}", engine_name))?;
 
         let history_id = self.add_history(code).await;
-        let result = engine.execute(code).await?;
+        let result = engine.execute(code, ctx).await?;
 
         self.state.write().await.set_history_result(
             history_id,
@@ -618,7 +618,7 @@ mod tests {
         ).await;
         kernel.set_default_engine("noop").await;
 
-        let result = kernel.execute("hello").await.unwrap();
+        let result = kernel.execute("hello", &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("hello"));
     }

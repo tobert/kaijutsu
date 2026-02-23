@@ -1766,7 +1766,7 @@ impl McpServerPool {
 // McpToolEngine - ExecutionEngine implementation for MCP tools
 // =============================================================================
 
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 /// Convert a `CallToolResult` into a string representation.
 ///
@@ -1889,8 +1889,8 @@ impl ExecutionEngine for McpToolEngine {
         Some(self.input_schema.clone())
     }
 
-    #[tracing::instrument(skip(self, code), name = "engine.mcp_tool")]
-    async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.mcp_tool")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         // Parse the input as JSON
         let arguments: JsonValue = if code.trim().is_empty() {
             JsonValue::Object(serde_json::Map::new())

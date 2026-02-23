@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use kaish_glob::{FileWalker, GlobPath, WalkOptions};
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use crate::vfs::MountTable;
 
 use super::vfs_walker::VfsWalkerAdapter;
@@ -48,15 +48,15 @@ impl ExecutionEngine for GlobEngine {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Root directory to search from (default: '/')"
+                    "description": "Root directory to search from (default: project root)"
                 }
             },
             "required": ["pattern"]
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.glob")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.glob")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: GlobParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -68,7 +68,8 @@ impl ExecutionEngine for GlobEngine {
         };
 
         // Determine the search root: use static_prefix optimization + user path
-        let base = p.path.as_deref().unwrap_or("/");
+        let default_root = ctx.cwd.to_string_lossy();
+        let base = p.path.as_deref().unwrap_or(&default_root);
         let search_root = match glob_path.static_prefix() {
             Some(prefix) => {
                 let mut root = std::path::PathBuf::from(base);

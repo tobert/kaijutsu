@@ -5,22 +5,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use kaijutsu_crdt::ContextId;
-
 use crate::drift::DriftRouter;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 /// Engine that returns the current context's identity.
 pub struct WhoamiEngine {
     drift_router: Arc<RwLock<DriftRouter>>,
-    context_id: ContextId,
 }
 
 impl WhoamiEngine {
-    pub fn new(drift_router: Arc<RwLock<DriftRouter>>, context_id: ContextId) -> Self {
+    pub fn new(drift_router: Arc<RwLock<DriftRouter>>) -> Self {
         Self {
             drift_router,
-            context_id,
         }
     }
 }
@@ -43,15 +39,15 @@ impl ExecutionEngine for WhoamiEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, _params), name = "engine.whoami")]
-    async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, _params, ctx), name = "engine.whoami")]
+    async fn execute(&self, _params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let router = self.drift_router.read().await;
 
-        let handle = router.get(self.context_id);
+        let handle = router.get(ctx.context_id);
 
         let info = serde_json::json!({
-            "context_id": self.context_id.to_hex(),
-            "context_id_short": self.context_id.short(),
+            "context_id": ctx.context_id.to_hex(),
+            "context_id_short": ctx.context_id.short(),
             "label": handle.and_then(|h| h.label.as_deref()),
             "model": handle.and_then(|h| h.model.as_deref()),
             "provider": handle.and_then(|h| h.provider.as_deref()),

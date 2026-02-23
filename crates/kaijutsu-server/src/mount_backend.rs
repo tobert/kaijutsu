@@ -475,7 +475,14 @@ mod tests {
     async fn test_mount_backend() -> MountBackend {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-mount").await);
-        let docs = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        ));
 
         let mount_table = Arc::new(MountTable::new());
         mount_table.mount("/tmp", MemoryBackend::new()).await;

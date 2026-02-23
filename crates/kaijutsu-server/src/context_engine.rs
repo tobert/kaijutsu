@@ -186,7 +186,7 @@ impl ExecutionEngine for ContextEngine {
         }))
     }
 
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    async fn execute(&self, params: &str, _ctx: &kaijutsu_kernel::ToolContext) -> anyhow::Result<ExecResult> {
         // Parse the JSON params
         let parsed: serde_json::Value = match serde_json::from_str(params) {
             Ok(v) => v,
@@ -232,7 +232,7 @@ mod tests {
         let engine = ContextEngine::new(drift, current);
 
         let result = engine
-            .execute(r#"{"_positional": ["list"]}"#)
+            .execute(r#"{"_positional": ["list"]}"#, &kaijutsu_kernel::ToolContext::test())
             .await
             .unwrap();
         assert!(result.success);
@@ -249,7 +249,7 @@ mod tests {
         let engine = ContextEngine::new(drift, current.clone());
 
         let result = engine
-            .execute(r#"{"_positional": ["switch", "planning"]}"#)
+            .execute(r#"{"_positional": ["switch", "planning"]}"#, &kaijutsu_kernel::ToolContext::test())
             .await
             .unwrap();
         assert!(result.success);
@@ -264,7 +264,7 @@ mod tests {
         let engine = ContextEngine::new(drift, current);
 
         let result = engine
-            .execute(r#"{"_positional": ["help"]}"#)
+            .execute(r#"{"_positional": ["help"]}"#, &kaijutsu_kernel::ToolContext::test())
             .await
             .unwrap();
         assert!(result.success);

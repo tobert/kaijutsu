@@ -176,7 +176,14 @@ mod tests {
     async fn test_docs_filesystem_read_only() {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs").await);
-        let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let backend = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(!fs.read_only());
     }
@@ -185,7 +192,14 @@ mod tests {
     async fn test_docs_filesystem_real_path() {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-rp").await);
-        let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let backend = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(fs.real_path(Path::new("some/path")).is_none());
     }
@@ -194,7 +208,14 @@ mod tests {
     async fn test_docs_filesystem_list_root() {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-list").await);
-        let backend = Arc::new(KaijutsuBackend::new(blocks, kernel));
+        let backend = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        ));
         let fs = KaijutsuFilesystem::new(backend);
 
         // Listing root of docs should succeed (may be empty)

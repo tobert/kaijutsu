@@ -35,7 +35,7 @@ use kaijutsu_crdt::ids::{resolve_context_prefix, PrefixError};
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 /// Shared, thread-safe DriftRouter reference.
 pub type SharedDriftRouter = Arc<RwLock<DriftRouter>>;
@@ -463,14 +463,12 @@ fn drift_kernel(
 /// List all contexts in the kernel's drift router.
 pub struct DriftLsEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
-    context_id: ContextId,
 }
 
 impl DriftLsEngine {
-    pub fn new(kernel: &Arc<crate::kernel::Kernel>, context_id: ContextId) -> Self {
+    pub fn new(kernel: &Arc<crate::kernel::Kernel>) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
-            context_id,
         }
     }
 }
@@ -488,8 +486,8 @@ impl ExecutionEngine for DriftLsEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, _params), name = "engine.drift_ls")]
-    async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, _params, ctx), name = "engine.drift_ls")]
+    async fn execute(&self, _params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let kernel = match drift_kernel(&self.kernel) {
             Ok(k) => k,
             Err(e) => return Ok(ExecResult::failure(1, e)),
@@ -499,22 +497,22 @@ impl ExecutionEngine for DriftLsEngine {
         let contexts = router.list_contexts();
 
         let mut output = String::new();
-        for ctx in &contexts {
-            let marker = if ctx.id == self.context_id { "* " } else { "  " };
-            let display = ctx.display_name();
-            let provider_info = match (&ctx.provider, &ctx.model) {
+        for handle in &contexts {
+            let marker = if handle.id == ctx.context_id { "* " } else { "  " };
+            let display = handle.display_name();
+            let provider_info = match (&handle.provider, &handle.model) {
                 (Some(p), Some(m)) => format!(" ({}:{})", p, m),
                 (Some(p), None) => format!(" ({})", p),
                 _ => String::new(),
             };
-            let parent_info = ctx
+            let parent_info = handle
                 .parent_id
                 .as_ref()
                 .map(|p| format!(" [parent: {}]", p.short()))
                 .unwrap_or_default();
             output.push_str(&format!(
                 "{}{} {}{}{}\n",
-                marker, ctx.id.short(), display, provider_info, parent_info,
+                marker, handle.id.short(), display, provider_info, parent_info,
             ));
         }
 
@@ -534,7 +532,6 @@ impl ExecutionEngine for DriftLsEngine {
 pub struct DriftPushEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -549,12 +546,10 @@ impl DriftPushEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_id,
         }
     }
 }
@@ -586,8 +581,8 @@ impl ExecutionEngine for DriftPushEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "drift.push")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "drift.push")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: DriftPushParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -610,13 +605,13 @@ impl ExecutionEngine for DriftPushEngine {
         if p.summarize {
             let source_model = {
                 let router = kernel.drift().read().await;
-                match router.get(self.context_id) {
+                match router.get(ctx.context_id) {
                     Some(h) => h.model.clone(),
-                    None => return Ok(ExecResult::failure(1, format!("caller context {} not found", self.context_id.short()))),
+                    None => return Ok(ExecResult::failure(1, format!("caller context {} not found", ctx.context_id.short()))),
                 }
             };
 
-            let blocks = match self.documents.block_snapshots(self.context_id) {
+            let blocks = match self.documents.block_snapshots(ctx.context_id) {
                 Ok(b) => b,
                 Err(e) => return Ok(ExecResult::failure(1, format!("failed to read blocks: {}", e))),
             };
@@ -642,7 +637,7 @@ impl ExecutionEngine for DriftPushEngine {
             };
 
             let mut router = kernel.drift().write().await;
-            let staged_id = match router.stage(self.context_id, target_id, summary, Some(model.to_string()), DriftKind::Distill) {
+            let staged_id = match router.stage(ctx.context_id, target_id, summary, Some(model.to_string()), DriftKind::Distill) {
                 Ok(id) => id,
                 Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
@@ -655,8 +650,8 @@ impl ExecutionEngine for DriftPushEngine {
             };
 
             let mut router = kernel.drift().write().await;
-            let source_model = router.get(self.context_id).and_then(|h| h.model.clone());
-            let staged_id = match router.stage(self.context_id, target_id, content, source_model, DriftKind::Push) {
+            let source_model = router.get(ctx.context_id).and_then(|h| h.model.clone());
+            let staged_id = match router.stage(ctx.context_id, target_id, content, source_model, DriftKind::Push) {
                 Ok(id) => id,
                 Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
             };
@@ -674,7 +669,6 @@ impl ExecutionEngine for DriftPushEngine {
 pub struct DriftPullEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -687,12 +681,10 @@ impl DriftPullEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_id,
         }
     }
 }
@@ -713,8 +705,8 @@ impl ExecutionEngine for DriftPullEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "drift.pull")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "drift.pull")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: DriftPullParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -753,7 +745,7 @@ impl ExecutionEngine for DriftPullEngine {
         });
         drop(registry);
 
-        tracing::info!("Pulling from {} ({} blocks, model={}) → {}", source_id.short(), blocks.len(), model, self.context_id.short());
+        tracing::info!("Pulling from {} ({} blocks, model={}) → {}", source_id.short(), blocks.len(), model, ctx.context_id.short());
 
         let summary = match provider
             .prompt_with_system(model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
@@ -763,10 +755,10 @@ impl ExecutionEngine for DriftPullEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("distillation LLM call failed: {}", e))),
         };
 
-        let after = self.documents.last_block_id(self.context_id);
+        let after = self.documents.last_block_id(ctx.context_id);
 
         let block_id = match self.documents.insert_drift_block(
-            self.context_id,
+            ctx.context_id,
             None,
             after.as_ref(),
             summary,
@@ -778,7 +770,7 @@ impl ExecutionEngine for DriftPullEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("failed to inject drift block: {}", e))),
         };
 
-        Ok(ExecResult::success(format!("Pulled from {} → {} (block={})", source_id.short(), self.context_id.short(), block_id.to_key())))
+        Ok(ExecResult::success(format!("Pulled from {} → {} (block={})", source_id.short(), ctx.context_id.short(), block_id.to_key())))
     }
 
     async fn is_available(&self) -> bool { true }
@@ -790,19 +782,16 @@ impl ExecutionEngine for DriftPullEngine {
 pub struct DriftFlushEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    context_id: ContextId,
 }
 
 impl DriftFlushEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_id,
         }
     }
 }
@@ -820,8 +809,8 @@ impl ExecutionEngine for DriftFlushEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, _params), name = "drift.flush")]
-    async fn execute(&self, _params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, _params, ctx), name = "drift.flush")]
+    async fn execute(&self, _params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let kernel = match drift_kernel(&self.kernel) {
             Ok(k) => k,
             Err(e) => return Ok(ExecResult::failure(1, e)),
@@ -829,7 +818,7 @@ impl ExecutionEngine for DriftFlushEngine {
 
         let staged = {
             let mut router = kernel.drift().write().await;
-            router.drain(Some(self.context_id))
+            router.drain(Some(ctx.context_id))
         };
 
         let count = staged.len();
@@ -879,8 +868,6 @@ impl ExecutionEngine for DriftFlushEngine {
 pub struct DriftMergeEngine {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     documents: SharedBlockStore,
-    #[allow(dead_code)] // kept for structural consistency; may be used for auth checks
-    context_id: ContextId,
 }
 
 #[derive(serde::Deserialize)]
@@ -892,12 +879,10 @@ impl DriftMergeEngine {
     pub fn new(
         kernel: &Arc<crate::kernel::Kernel>,
         documents: SharedBlockStore,
-        context_id: ContextId,
     ) -> Self {
         Self {
             kernel: Arc::downgrade(kernel),
             documents,
-            context_id,
         }
     }
 }
@@ -917,8 +902,8 @@ impl ExecutionEngine for DriftMergeEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "drift.merge")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "drift.merge")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: DriftMergeParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -1342,8 +1327,8 @@ mod tests {
             r.register(debug_id, Some("debug"), None);
         }
 
-        let engine = DriftLsEngine::new(&kernel, main_id);
-        let result = engine.execute("{}").await.unwrap();
+        let engine = DriftLsEngine::new(&kernel);
+        let result = engine.execute("{}", &ToolContext::test()).await.unwrap();
 
         assert!(result.success);
         assert!(result.stdout.contains("main"));
@@ -1352,6 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drift_push_and_flush_engines() {
+        use kaijutsu_types::{KernelId, PrincipalId, SessionId};
         let kernel = Arc::new(crate::kernel::Kernel::new("test").await);
         let src_id = ContextId::new();
         let tgt_id = ContextId::new();
@@ -1368,9 +1354,10 @@ mod tests {
             .unwrap();
 
         // Push via DriftPushEngine (target_ctx accepts label prefix)
-        let push_engine = DriftPushEngine::new(&kernel, documents.clone(), src_id);
+        let push_engine = DriftPushEngine::new(&kernel, documents.clone());
+        let test_ctx = ToolContext::new(PrincipalId::new(), src_id, "/", SessionId::new(), KernelId::new());
         let push_result = push_engine
-            .execute(r#"{"target_ctx": "target", "content": "hello from source"}"#)
+            .execute(r#"{"target_ctx": "target", "content": "hello from source"}"#, &test_ctx)
             .await
             .unwrap();
         assert!(push_result.success, "push failed: {}", push_result.stderr);
@@ -1385,8 +1372,8 @@ mod tests {
         }
 
         // Flush via DriftFlushEngine
-        let flush_engine = DriftFlushEngine::new(&kernel, documents.clone(), src_id);
-        let flush_result = flush_engine.execute("{}").await.unwrap();
+        let flush_engine = DriftFlushEngine::new(&kernel, documents.clone());
+        let flush_result = flush_engine.execute("{}", &test_ctx).await.unwrap();
         assert!(flush_result.success, "flush failed: {}", flush_result.stderr);
         assert!(flush_result.stdout.contains("Flushed 1 drifts"));
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 use super::cache::FileDocumentCache;
 
@@ -65,8 +65,8 @@ impl ExecutionEngine for EditEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.edit")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.edit")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: EditParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),

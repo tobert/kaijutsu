@@ -6,7 +6,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 // ============================================================================
 // DisplayHint - Dual-format output for humans vs models
@@ -290,6 +293,58 @@ impl EngineArgs {
 }
 
 // ============================================================================
+// ToolContext — execution context for every tool invocation
+// ============================================================================
+
+/// Execution context passed to every tool invocation.
+///
+/// The "who, where, what" of the call site. Kaijutsu's counterpart to
+/// kaish's ExecContext, focused on identity and location rather than
+/// shell plumbing (pipes, jobs, aliases).
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    /// Who is executing this tool.
+    pub principal_id: PrincipalId,
+    /// Which conversation context this occurs in.
+    pub context_id: ContextId,
+    /// Working directory for file-relative operations (VFS or real path).
+    pub cwd: PathBuf,
+    /// Session identifier for audit trail.
+    pub session_id: SessionId,
+    /// Kernel identifier.
+    pub kernel_id: KernelId,
+}
+
+impl ToolContext {
+    pub fn new(
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        cwd: impl Into<PathBuf>,
+        session_id: SessionId,
+        kernel_id: KernelId,
+    ) -> Self {
+        Self {
+            principal_id,
+            context_id,
+            cwd: cwd.into(),
+            session_id,
+            kernel_id,
+        }
+    }
+
+    /// Minimal context for tests.
+    pub fn test() -> Self {
+        Self {
+            principal_id: PrincipalId::new(),
+            context_id: ContextId::new(),
+            cwd: PathBuf::from("/"),
+            session_id: SessionId::new(),
+            kernel_id: KernelId::new(),
+        }
+    }
+}
+
+// ============================================================================
 // ExecutionEngine trait
 // ============================================================================
 
@@ -305,7 +360,7 @@ pub trait ExecutionEngine: Send + Sync {
     fn description(&self) -> &str;
 
     /// Execute code and return the result.
-    async fn execute(&self, code: &str) -> anyhow::Result<ExecResult>;
+    async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult>;
 
     /// Check if this engine is available/ready.
     async fn is_available(&self) -> bool;
@@ -432,10 +487,10 @@ impl ToolRegistry {
     }
 
     /// Execute code using the default engine.
-    #[tracing::instrument(skip(self, code))]
-    pub async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, code, ctx))]
+    pub async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         match self.default_engine() {
-            Some(engine) => engine.execute(code).await,
+            Some(engine) => engine.execute(code, ctx).await,
             None => Ok(ExecResult::failure(1, "no execution engine available")),
         }
     }
@@ -455,7 +510,7 @@ impl ExecutionEngine for NoopEngine {
         "No-op engine for testing"
     }
 
-    async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         Ok(ExecResult::success(format!("noop: {}", code)))
     }
 
@@ -534,7 +589,7 @@ mod tests {
         );
         registry.set_default_engine("noop");
 
-        let result = registry.execute("hello").await.unwrap();
+        let result = registry.execute("hello", &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("hello"));
     }
@@ -544,7 +599,7 @@ mod tests {
         let engine = NoopEngine;
         assert!(engine.is_available().await);
 
-        let result = engine.execute("test").await.unwrap();
+        let result = engine.execute("test", &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "noop: test");
     }

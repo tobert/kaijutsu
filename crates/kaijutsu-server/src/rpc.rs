@@ -79,8 +79,9 @@ async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
     context_id: ContextId,
-    default_root: &str,
 ) {
+    let _ = context_id; // retained for block tool scoping; drift/whoami now use ToolContext
+
     let current = crate::context_engine::current_context();
     kernel.register_tool_with_engine(
         ToolInfo::new("context", "Manage conversation contexts (switch, list)", "kernel"),
@@ -133,28 +134,30 @@ async fn register_block_tools(
     ).await;
 
     // ── Drift tools (split into individual engines) ──
+    // context_id removed from constructors — engines now read it from ToolContext at call time
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_ls", "List all contexts in this kernel's drift router", "drift"),
-        Arc::new(DriftLsEngine::new(kernel, context_id)),
+        Arc::new(DriftLsEngine::new(kernel)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_push", "Stage content for transfer to another context", "drift"),
-        Arc::new(DriftPushEngine::new(kernel, documents.clone(), context_id)),
+        Arc::new(DriftPushEngine::new(kernel, documents.clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_pull", "Read and LLM-summarize another context's conversation", "drift"),
-        Arc::new(DriftPullEngine::new(kernel, documents.clone(), context_id)),
+        Arc::new(DriftPullEngine::new(kernel, documents.clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_flush", "Deliver all staged drifts to target documents", "drift"),
-        Arc::new(DriftFlushEngine::new(kernel, documents.clone(), context_id)),
+        Arc::new(DriftFlushEngine::new(kernel, documents.clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("drift_merge", "Summarize a forked context back into its parent", "drift"),
-        Arc::new(DriftMergeEngine::new(kernel, documents.clone(), context_id)),
+        Arc::new(DriftMergeEngine::new(kernel, documents.clone())),
     ).await;
 
     // ── File tools (CRDT-backed) ──
+    // default_root removed from glob/grep — engines now read cwd from ToolContext at call time
     let file_cache = Arc::new(FileDocumentCache::new(documents.clone(), kernel.vfs().clone()));
     kernel.register_tool_with_engine(
         ToolInfo::new("read", "Read file content with optional line numbers", "file"),
@@ -170,15 +173,15 @@ async fn register_block_tools(
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
-        Arc::new(GlobEngine::new(kernel.vfs().clone(), default_root)),
+        Arc::new(GlobEngine::new(kernel.vfs().clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("grep", "Search file content with regex", "file"),
-        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone(), default_root)),
+        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone())),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("whoami", "Show current context identity", "drift"),
-        Arc::new(WhoamiEngine::new(kernel.drift().clone(), context_id)),
+        Arc::new(WhoamiEngine::new(kernel.drift().clone())),
     ).await;
 }
 
@@ -614,8 +617,7 @@ pub async fn create_shared_kernel(
 
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
-    let default_root = src_dir.display().to_string();
-    register_block_tools(&kernel_arc, documents.clone(), ctx_id, &default_root).await;
+    register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
 
     // Recover contexts from persisted document IDs.
     // Documents are keyed by ContextId directly; register each in the drift router.
@@ -989,6 +991,23 @@ impl kernel::Server for KernelImpl {
 
         let kernel_arc = self.kernel.kernel.clone();
 
+        // Build ToolContext from connection state
+        let tool_ctx = {
+            let conn = self.connection.borrow();
+            kaijutsu_kernel::ToolContext::new(
+                conn.principal.id,
+                conn.current_context_or(self.kernel.default_context_id),
+                conn.kaish.as_ref().map(|_k| {
+                    // Can't .await in sync context — use a default for now.
+                    // The actual cwd will be populated by kaish_backend when it
+                    // bridges ExecContext → ToolContext.
+                    std::path::PathBuf::from("/")
+                }).unwrap_or_else(|| std::path::PathBuf::from("/")),
+                conn.session_id,
+                self.kernel.id,
+            )
+        };
+
         Promise::from_future(async move {
             let mut result = results.get().init_result();
             result.set_request_id(&request_id);
@@ -1004,7 +1023,7 @@ impl kernel::Server for KernelImpl {
             let engine = kernel_arc.tools().read().await.get_engine(&tool_name);
             match engine {
                 Some(engine) => {
-                    match engine.execute(&tool_params).await {
+                    match engine.execute(&tool_params, &tool_ctx).await {
                         Ok(exec_result) => {
                             result.set_success(exec_result.success);
                             result.set_output(&exec_result.stdout);
@@ -1357,6 +1376,16 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let user_agent_id = self.connection.borrow().principal.id;
+        let tool_ctx = {
+            let conn = self.connection.borrow();
+            kaijutsu_kernel::ToolContext::new(
+                conn.principal.id,
+                context_id,
+                "/", // cwd will be refined by kaish_backend for shell-originated calls
+                conn.session_id,
+                kernel.id,
+            )
+        };
 
         Promise::from_future(async move {
             log::debug!("prompt future started for context_id={}", context_id);
@@ -1447,6 +1476,7 @@ impl kernel::Server for KernelImpl {
                 max_output_tokens,
                 conversation_cache,
                 user_agent_id,
+                tool_ctx,
             ));
 
             // Return immediately with prompt_id - streaming happens in background
@@ -4045,6 +4075,7 @@ async fn process_llm_stream(
     max_output_tokens: u64,
     conversation_cache: Arc<ConversationCache>,
     _user_agent_id: PrincipalId,
+    tool_ctx: kaijutsu_kernel::ToolContext,
 ) {
     // Get per-context lock — held for the entire stream, serializing
     // concurrent prompts to the same context (Fix D+E).
@@ -4225,6 +4256,7 @@ async fn process_llm_stream(
                 let kernel = kernel.clone();
                 let documents = documents.clone();
                 let cell_id = cell_id;
+                let tool_ctx = tool_ctx.clone();
                 // Option<Option<BlockId>>: None = not in map (shouldn't happen),
                 // Some(None) = insertion failed, Some(Some(id)) = normal
                 let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
@@ -4282,7 +4314,7 @@ async fn process_llm_stream(
                     tokio::task::yield_now().await;
 
                     // Step 4: Execute tool
-                    let result = kernel.execute_with(&tool_name, &params).await;
+                    let result = kernel.execute_with(&tool_name, &params, &tool_ctx).await;
 
                     let (result_content, is_error) = match result {
                         Ok(r) if r.success => {

@@ -22,7 +22,7 @@
 
 use crate::block_store::SharedBlockStore;
 use crate::db::DocumentKind;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role};
 use kaijutsu_types::ContextId;
@@ -527,8 +527,8 @@ impl ExecutionEngine for RhaiEngine {
         "Rhai scripting engine with CRDT-aware cell and block operations"
     }
 
-    #[tracing::instrument(skip(self, code), name = "engine.rhai")]
-    async fn execute(&self, code: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.rhai")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         // Clear interrupt flag before execution
         self.interrupted.store(false, Ordering::SeqCst);
 
@@ -596,7 +596,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute("40 + 2").await.unwrap();
+        let result = engine.execute("40 + 2", &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "42");
     }
@@ -606,7 +606,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute(r#""hello" + " " + "world""#).await.unwrap();
+        let result = engine.execute(r#""hello" + " " + "world""#, &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "hello world");
     }
@@ -616,7 +616,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
-        let result = engine.execute(r#"create_cell("markdown")"#).await.unwrap();
+        let result = engine.execute(r#"create_cell("markdown")"#, &ToolContext::test()).await.unwrap();
         assert!(result.success);
         assert!(!result.stdout.is_empty());
 
@@ -637,6 +637,7 @@ mod tests {
             set_content(id, "fn main() {}");
             get_content(id)
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();
@@ -659,6 +660,7 @@ mod tests {
             let blocks = list_blocks(cell);
             blocks.len()
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();
@@ -680,6 +682,7 @@ mod tests {
             edit_text(cell, block, 6, "Rhai", 5);
             get_block_content(cell, block)
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();
@@ -702,6 +705,7 @@ mod tests {
             delete_block(cell, b2);
             list_blocks(cell).len()
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();
@@ -715,7 +719,7 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute("undefined_function()").await.unwrap();
+        let result = engine.execute("undefined_function()", &ToolContext::test()).await.unwrap();
         assert!(!result.success);
         assert!(!result.stderr.is_empty());
     }
@@ -738,6 +742,7 @@ mod tests {
                 "running"
             }
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();
@@ -760,6 +765,7 @@ mod tests {
                 x += 1;
             }
         "#,
+                &ToolContext::test(),
             )
             .await
             .unwrap();

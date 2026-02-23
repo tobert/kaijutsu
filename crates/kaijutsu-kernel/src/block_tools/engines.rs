@@ -8,7 +8,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::block_store::SharedBlockStore;
-use crate::tools::{ExecResult, ExecutionEngine};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use kaijutsu_crdt::{BlockId, BlockKind, Role, Status};
 use kaijutsu_types::ContextId;
 
@@ -318,8 +318,8 @@ impl ExecutionEngine for BlockCreateEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_create")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_create")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockCreateParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -404,8 +404,8 @@ impl ExecutionEngine for BlockAppendEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_append")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_append")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockAppendParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -605,8 +605,8 @@ impl ExecutionEngine for BlockEditEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_edit")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_edit")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockEditParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -703,8 +703,8 @@ impl ExecutionEngine for BlockSpliceEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_splice")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_splice")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockSpliceParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -825,8 +825,8 @@ impl ExecutionEngine for BlockReadEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_read")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_read")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockReadParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -971,8 +971,8 @@ impl ExecutionEngine for BlockSearchEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_search")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_search")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1115,8 +1115,8 @@ impl ExecutionEngine for BlockListEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_list")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_list")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockListParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1202,8 +1202,8 @@ impl ExecutionEngine for BlockStatusEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.block_status")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_status")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockStatusParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1409,8 +1409,8 @@ impl ExecutionEngine for KernelSearchEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params), name = "engine.kernel_search")]
-    async fn execute(&self, params: &str) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, _ctx), name = "engine.kernel_search")]
+    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: KernelSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1454,7 +1454,7 @@ mod tests {
         let engine = BlockCreateEngine::new(store.clone(), "test-agent");
 
         let params = r#"{"role": "user", "kind": "text", "content": "hello world"}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1471,7 +1471,7 @@ mod tests {
 
         let engine = BlockAppendEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "append failed: {}", result.stderr);
 
@@ -1491,7 +1491,7 @@ mod tests {
             r#"{{"block_id": "{}", "operations": [{{"op": "insert", "line": 1, "content": "line2"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "edit insert failed: {}", result.stderr);
 
@@ -1514,7 +1514,7 @@ mod tests {
             r#"{{"block_id": "{}", "operations": [{{"op": "replace", "start_line": 1, "end_line": 2, "content": "rust", "expected_text": "world"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
         assert!(result.success, "CAS should succeed: {}", result.stderr);
 
         // Invalid CAS should fail
@@ -1522,7 +1522,7 @@ mod tests {
             r#"{{"block_id": "{}", "operations": [{{"op": "replace", "start_line": 0, "end_line": 1, "content": "goodbye", "expected_text": "wrong"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
         assert!(!result.success, "CAS should fail with wrong expected text");
         assert!(result.stderr.contains("content mismatch"));
     }
@@ -1535,7 +1535,7 @@ mod tests {
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "read failed: {}", result.stderr);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1551,7 +1551,7 @@ mod tests {
 
         let engine = BlockSearchEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#, block_id.to_key());
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "search failed: {}", result.stderr);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1568,7 +1568,7 @@ mod tests {
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1584,7 +1584,7 @@ mod tests {
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1599,7 +1599,7 @@ mod tests {
 
         let engine = BlockStatusEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "status": "running"}}"#, block_id.to_key());
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "status update failed: {}", result.stderr);
 
@@ -1625,7 +1625,7 @@ mod tests {
 
         // Search for "hello" across all blocks
         let params = r#"{"query": "hello"}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
         assert!(result.success, "search failed: {}", result.stderr);
 
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1633,19 +1633,19 @@ mod tests {
 
         // Search with document filter (using hex ContextId)
         let params = format!(r#"{{"query": "hello", "document_id": "{}"}}"#, ctx.to_hex());
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 2, "should find 2 matches in ctx");
 
         // Search with role filter
         let params = r#"{"query": "hello", "role": "model"}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 1, "should find 1 match from model");
 
         // Search with context lines
         let params = r#"{"query": "foo", "context_lines": 1, "max_matches": 1}"#;
-        let result = engine.execute(params).await.unwrap();
+        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         let matches = response["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
@@ -1672,7 +1672,7 @@ mod tests {
             }}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
         assert!(!result.success, "batch should fail due to CAS mismatch in op[1]");
         assert!(result.stderr.contains("content mismatch"), "error: {}", result.stderr);
 
@@ -1694,7 +1694,7 @@ mod tests {
             }}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params).await.unwrap();
+        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
         assert!(result.success, "valid batch should succeed: {}", result.stderr);
 
         let entry = store.get(ctx).unwrap();

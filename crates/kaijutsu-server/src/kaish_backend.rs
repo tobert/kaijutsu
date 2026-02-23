@@ -60,12 +60,24 @@ pub struct KaijutsuBackend {
     blocks: SharedBlockStore,
     /// The kaijutsu kernel for tool dispatch.
     kernel: Arc<KaijutsuKernel>,
+    /// Identity fields for bridging kaish ExecContext → kaijutsu ToolContext.
+    principal_id: kaijutsu_types::PrincipalId,
+    context_id: kaijutsu_types::ContextId,
+    session_id: kaijutsu_types::SessionId,
+    kernel_id: kaijutsu_types::KernelId,
 }
 
 impl KaijutsuBackend {
-    /// Create a new backend with block store and kaijutsu kernel.
-    pub fn new(blocks: SharedBlockStore, kernel: Arc<KaijutsuKernel>) -> Self {
-        Self { blocks, kernel }
+    /// Create a new backend with block store, kernel, and identity fields.
+    pub fn new(
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
+        principal_id: kaijutsu_types::PrincipalId,
+        context_id: kaijutsu_types::ContextId,
+        session_id: kaijutsu_types::SessionId,
+        kernel_id: kaijutsu_types::KernelId,
+    ) -> Self {
+        Self { blocks, kernel, principal_id, context_id, session_id, kernel_id }
     }
 
     /// Resolve a VFS path to a ContextId and optional block ID.
@@ -586,7 +598,7 @@ impl KernelBackend for KaijutsuBackend {
         &self,
         name: &str,
         args: ToolArgs,
-        _ctx: &mut ExecContext,
+        ctx: &mut ExecContext,
     ) -> BackendResult<ToolResult> {
         let params_json = tool_args_to_json(&args);
         let params_str = serde_json::to_string(&params_json)
@@ -598,8 +610,19 @@ impl KernelBackend for KaijutsuBackend {
             .await
             .ok_or_else(|| BackendError::ToolNotFound(name.to_string()))?;
 
+        // Bridge kaish ExecContext → kaijutsu ToolContext.
+        // Uses kaish's cwd so file-relative operations (glob, grep) scope correctly.
+        // Identity fields come from the stored connection state.
+        let tool_ctx = kaijutsu_kernel::ToolContext::new(
+            self.principal_id,
+            self.context_id,
+            ctx.cwd.clone(),
+            self.session_id,
+            self.kernel_id,
+        );
+
         let result = engine
-            .execute(&params_str)
+            .execute(&params_str, &tool_ctx)
             .await
             .map_err(|e| BackendError::Io(e.to_string()))?;
 
@@ -903,7 +926,14 @@ mod tests {
     async fn test_path_resolution() {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test").await);
-        let backend = KaijutsuBackend::new(blocks, kernel);
+        let backend = KaijutsuBackend::new(
+            blocks,
+            kernel,
+            kaijutsu_types::PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        );
 
         // Test root paths
         assert!(matches!(
