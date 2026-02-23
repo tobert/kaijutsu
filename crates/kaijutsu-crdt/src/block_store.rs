@@ -1676,4 +1676,43 @@ mod tests {
         assert_eq!(restored.blocks.len(), 1);
         assert_eq!(restored.blocks[0].content, "Hello");
     }
+
+    /// Verify that CrdtBlockStore → snapshot → BlockDocument preserves block ordering.
+    ///
+    /// This is the exact path used by the rendering pipeline:
+    /// sync_main_cell_to_conversation takes a store snapshot and rebuilds a
+    /// BlockDocument via from_snapshot. If ordering diverges, blocks appear
+    /// out of order on screen.
+    #[test]
+    fn test_store_to_document_ordering_consistency() {
+        use crate::document::BlockDocument;
+
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, agent);
+
+        // Create a realistic conversation: user, model, tool call, tool result, model
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "Hello").unwrap();
+        let b2 = store.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Let me check...").unwrap();
+        let b3 = store.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search").unwrap();
+        let b4 = store.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "results here").unwrap();
+        let b5 = store.insert_block(None, Some(&b4), Role::Model, BlockKind::Text, "Based on the results...").unwrap();
+
+        // Take snapshot (what sync_main_cell does)
+        let store_snap = store.snapshot();
+        let store_ids: Vec<BlockId> = store_snap.blocks.iter().map(|b| b.id).collect();
+
+        // Convert to DocumentSnapshot and rebuild BlockDocument (the rendering path)
+        let doc_snap = crate::DocumentSnapshot {
+            context_id: store_snap.context_id,
+            blocks: store_snap.blocks,
+            version: 1,
+        };
+        let doc = BlockDocument::from_snapshot(doc_snap, agent);
+        let doc_ids: Vec<BlockId> = doc.blocks_ordered().iter().map(|b| b.id).collect();
+
+        // Ordering must match
+        assert_eq!(store_ids, doc_ids, "Store and Document block ordering diverged");
+        assert_eq!(store_ids, vec![b1, b2, b3, b4, b5]);
+    }
 }

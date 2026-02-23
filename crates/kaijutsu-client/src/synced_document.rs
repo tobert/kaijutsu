@@ -94,6 +94,11 @@ impl SyncedDocument {
         !self.sync.needs_full_sync(self.context_id)
     }
 
+    /// Get a store snapshot (for rendering pipeline).
+    pub fn snapshot(&self) -> kaijutsu_crdt::block_store::StoreSnapshot {
+        self.doc.snapshot()
+    }
+
     // =========================================================================
     // Apply incoming events
     // =========================================================================
@@ -512,5 +517,118 @@ mod tests {
             server: "test".to_string(),
         });
         assert_eq!(effect, SyncEffect::Ignored);
+    }
+
+    /// End-to-end test: SyncedDocument → snapshot → BlockDocument.
+    ///
+    /// Simulates the rendering pipeline path: events arrive via apply_event,
+    /// then sync_main_cell_to_conversation takes a snapshot and rebuilds
+    /// a BlockDocument for display. Verifies block count, order, and content.
+    #[test]
+    fn test_synced_document_to_block_document_rendering_chain() {
+        let ctx = test_context_id();
+        let server_agent = test_agent_id();
+        let client_agent = test_agent_id();
+
+        // Server creates a realistic conversation with explicit ordering
+        let mut server = CrdtBlockStore::new(ctx, server_agent);
+        let b1 = server.insert_block(None, None, Role::User, BlockKind::Text, "Hello").unwrap();
+        let b2 = server.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Hi there").unwrap();
+        let b3 = server.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search").unwrap();
+
+        // Client syncs initial state via DocumentState
+        let snap = snapshot_bytes(&server);
+        let state = DocumentState {
+            context_id: ctx,
+            blocks: server.blocks_ordered(),
+            version: 1,
+            ops: snap,
+        };
+        let mut sd = SyncedDocument::from_document_state(&state, client_agent).unwrap();
+        assert_eq!(sd.block_count(), 3);
+
+        // Server adds a new block (after b3)
+        let frontier_before = server.frontier();
+        let b4 = server.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "found it").unwrap();
+        let _ = b4;
+        let ops = sync_payload_bytes(&server, &frontier_before);
+        // Get snapshot of the new block for the event
+        let block = server.blocks_ordered().into_iter().last().unwrap();
+
+        // Apply via ServerEvent::BlockInserted
+        let effect = sd.apply_event(&ServerEvent::BlockInserted {
+            context_id: ctx,
+            block: Box::new(block),
+            ops,
+        });
+        assert!(matches!(effect, SyncEffect::Updated { block_count: 4 }));
+
+        // Simulate sync_main_cell_to_conversation: snapshot → BlockDocument
+        let store_snap = sd.snapshot();
+        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
+            context_id: store_snap.context_id,
+            blocks: store_snap.blocks,
+            version: sd.version(),
+        };
+        let doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, client_agent);
+        let blocks = doc.blocks_ordered();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].content, "Hello");
+        assert_eq!(blocks[1].content, "Hi there");
+        assert_eq!(blocks[2].kind, BlockKind::ToolCall);
+        assert_eq!(blocks[3].content, "found it");
+    }
+
+    /// Verify SyncedDocument recovers from text ops failures.
+    ///
+    /// If a text ops merge fails (corrupt data), subsequent BlockInserted
+    /// events should still succeed. This was the root cause of the
+    /// "stuck scroll" bug when using the dual sync path.
+    #[test]
+    fn test_synced_document_resilient_to_text_ops_failure() {
+        let ctx = test_context_id();
+        let client_agent = test_agent_id();
+
+        // Server creates initial block
+        let server = create_server_store(ctx);
+
+        // Client syncs initial state
+        let snap = snapshot_bytes(&server);
+        let state = DocumentState {
+            context_id: ctx,
+            blocks: server.blocks_ordered(),
+            version: 1,
+            ops: snap,
+        };
+        let mut sd = SyncedDocument::from_document_state(&state, client_agent).unwrap();
+        let v1 = sd.version();
+
+        // Apply corrupt text ops — should fail gracefully
+        let corrupt_event = ServerEvent::BlockTextOps {
+            context_id: ctx,
+            block_id: BlockId::new(ctx, PrincipalId::new(), 999),
+            ops: vec![0xFF, 0xFE, 0xFD],
+        };
+        let effect = sd.apply_event(&corrupt_event);
+        // Should still return Updated (error is logged but doesn't crash)
+        assert!(matches!(effect, SyncEffect::Updated { .. }));
+
+        // Now add a new block on server and sync it
+        let mut server2 = server; // move
+        let frontier_before = server2.frontier();
+        let b2 = server2.insert_block(None, None, Role::Model, BlockKind::Text, "Response").unwrap();
+        let ops = sync_payload_bytes(&server2, &frontier_before);
+        let block = server2.get_block_snapshot(&b2).unwrap();
+
+        let effect = sd.apply_event(&ServerEvent::BlockInserted {
+            context_id: ctx,
+            block: Box::new(block),
+            ops,
+        });
+
+        // Should succeed — the corrupt text ops didn't break the sync pipeline
+        assert!(matches!(effect, SyncEffect::Updated { block_count: 2 }));
+        assert!(sd.version() > v1, "version should have advanced");
     }
 }

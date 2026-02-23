@@ -7,7 +7,6 @@ use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
 pub use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
-pub use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Session-scoped agent identity for CRDT operations.
@@ -141,7 +140,7 @@ pub struct CursorCache {
 /// Text editor state for a cell.
 ///
 /// The `doc` field (BlockDocument) is the local editor buffer.
-/// Synced content arrives via `DocumentSyncState` (CrdtBlockStore) and is
+/// Synced content arrives via `DocumentCache` (SyncedDocument per context) and is
 /// copied into this editor's BlockDocument via snapshot conversion.
 ///
 /// Note: Not reflectable due to BlockDocument lacking Default.
@@ -480,118 +479,6 @@ pub struct BlockEditCursor {
     pub edit_frontier: Option<kaijutsu_crdt::Frontier>,
 }
 
-/// Resource tracking CRDT sync state and owning the authoritative CrdtBlockStore.
-///
-/// This is the **single source of truth** for conversation document state.
-/// It integrates SyncManager's frontier-tracking with document ownership,
-/// eliminating the dual-path sync issues between ConversationRegistry and sync state.
-///
-/// **Sync protocol:**
-/// - `doc = None` or `context_id` changed → full sync (from_oplog)
-/// - `doc = Some(_)` and matching context_id → incremental merge (merge_ops_owned)
-///
-/// The sync manager handles frontier tracking internally. Systems should use
-/// the convenience methods on this resource rather than accessing the manager directly.
-#[derive(Resource, Default)]
-pub struct DocumentSyncState {
-    /// The authoritative document (None until first sync).
-    pub doc: Option<CrdtBlockStore>,
-    /// Sync manager for frontier tracking.
-    manager: kaijutsu_client::SyncManager,
-}
-
-#[allow(dead_code)]
-impl DocumentSyncState {
-    /// Create a new DocumentSyncState with no document.
-    pub fn new() -> Self {
-        Self {
-            doc: None,
-            manager: kaijutsu_client::SyncManager::new(),
-        }
-    }
-
-    /// Get the version counter (bumped on every successful sync).
-    pub fn version(&self) -> u64 {
-        self.manager.version()
-    }
-
-    /// Check if we need a full sync for the given context.
-    pub fn needs_full_sync(&self, context_id: ContextId) -> bool {
-        self.doc.is_none() || self.manager.needs_full_sync(context_id)
-    }
-
-    /// Get the current context_id (for testing/debugging).
-    pub fn context_id(&self) -> Option<ContextId> {
-        self.manager.context_id()
-    }
-
-    /// Apply initial state from server (BlockCellInitialState event).
-    ///
-    /// Always performs a full sync from the provided oplog.
-    /// Creates the CrdtBlockStore if it doesn't exist.
-    pub fn apply_initial_state(
-        &mut self,
-        context_id: ContextId,
-        agent_id: PrincipalId,
-        oplog_bytes: &[u8],
-    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
-        let doc = self.doc.get_or_insert_with(|| {
-            CrdtBlockStore::new(context_id, agent_id)
-        });
-        self.manager.apply_initial_state(doc, context_id, oplog_bytes)
-    }
-
-    /// Apply a block insertion event (BlockInserted).
-    ///
-    /// Decision logic:
-    /// - If block already exists → skip (idempotent)
-    /// - If needs_full_sync → rebuild from oplog
-    /// - Otherwise → incremental merge
-    pub fn apply_block_inserted(
-        &mut self,
-        context_id: ContextId,
-        agent_id: PrincipalId,
-        block: &BlockSnapshot,
-        ops: &[u8],
-    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
-        let doc = self.doc.get_or_insert_with(|| {
-            CrdtBlockStore::new(context_id, agent_id)
-        });
-        self.manager.apply_block_inserted(doc, context_id, block, ops)
-    }
-
-    /// Apply text ops event (BlockTextOps).
-    ///
-    /// Always attempts incremental merge (text streaming).
-    /// On failure, resets frontier to trigger full sync on next block event.
-    pub fn apply_text_ops(
-        &mut self,
-        context_id: ContextId,
-        agent_id: PrincipalId,
-        ops: &[u8],
-    ) -> Result<kaijutsu_client::SyncResult, kaijutsu_client::SyncError> {
-        let doc = self.doc.get_or_insert_with(|| {
-            CrdtBlockStore::new(context_id, agent_id)
-        });
-        self.manager.apply_text_ops(doc, context_id, ops)
-    }
-
-    /// Reset sync state, forcing full sync on next event.
-    ///
-    /// This clears the document and resets the sync manager.
-    /// Use when switching conversations or recovering from errors.
-    pub fn reset(&mut self) {
-        self.doc = None;
-        self.manager.reset();
-    }
-
-    /// Get a reference to the underlying sync manager (for testing/debugging).
-    #[allow(dead_code)]
-    pub fn manager(&self) -> &kaijutsu_client::SyncManager {
-        &self.manager
-    }
-}
-
 // ============================================================================
 // DOCUMENT CACHE — Multi-Context Document Management
 // ============================================================================
@@ -611,15 +498,15 @@ pub struct CachedDocument {
     pub scroll_offset: f32,
 }
 
-/// Multi-context document cache.
+/// Multi-context document cache — the authoritative source for all document state.
 ///
-/// Holds `CrdtBlockStore` + `SyncManager` per joined context, enabling:
+/// Holds a `SyncedDocument` per joined context, enabling:
 /// - Instant context switching (cache hit → snapshot swap)
 /// - Background sync for inactive contexts (events route by context_id)
 /// - LRU eviction when too many contexts are cached
 ///
-/// `DocumentSyncState` becomes a thin proxy to the active cache entry
-/// for backward compatibility with existing systems.
+/// `sync_main_cell_to_conversation` reads from the active cache entry to
+/// rebuild the MainCell's BlockDocument for rendering.
 #[derive(Resource)]
 #[allow(dead_code)]
 pub struct DocumentCache {
@@ -1227,4 +1114,88 @@ pub struct RoleHeaderLayout {
     pub y_offset: f32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scroll_state(content_height: f32, visible_height: f32, target_offset: f32) -> ConversationScrollState {
+        ConversationScrollState {
+            offset: target_offset,
+            target_offset,
+            content_height,
+            visible_height,
+            following: false,
+            user_scrolled_this_frame: false,
+            last_content_gen: 0,
+        }
+    }
+
+    #[test]
+    fn test_is_at_bottom_at_max() {
+        let state = scroll_state(1000.0, 400.0, 600.0);
+        assert!(state.is_at_bottom());
+    }
+
+    #[test]
+    fn test_is_at_bottom_within_threshold() {
+        // 50px threshold: max_offset=600, target=551 → 600-551=49 < 50
+        let state = scroll_state(1000.0, 400.0, 551.0);
+        assert!(state.is_at_bottom());
+    }
+
+    #[test]
+    fn test_is_at_bottom_outside_threshold() {
+        // max_offset=600, target=549 → 600-549=51 > 50
+        let state = scroll_state(1000.0, 400.0, 549.0);
+        assert!(!state.is_at_bottom());
+    }
+
+    #[test]
+    fn test_max_offset_content_smaller_than_visible() {
+        let state = scroll_state(200.0, 400.0, 0.0);
+        assert_eq!(state.max_offset(), 0.0);
+    }
+
+    #[test]
+    fn test_scroll_by_negative_disables_following() {
+        let mut state = scroll_state(1000.0, 400.0, 600.0);
+        state.following = true;
+        // Scroll up far enough to be outside the 50px threshold
+        state.scroll_by(-100.0);
+        assert!(!state.following);
+    }
+
+    #[test]
+    fn test_scroll_by_positive_to_bottom_re_enables_following() {
+        let mut state = scroll_state(1000.0, 400.0, 590.0);
+        state.following = false;
+        state.scroll_by(100.0); // would go past max, gets clamped
+        assert!(state.following);
+        assert_eq!(state.offset, 600.0); // clamped to max
+    }
+
+    #[test]
+    fn test_scroll_by_sets_user_scrolled_flag() {
+        let mut state = scroll_state(1000.0, 400.0, 300.0);
+        assert!(!state.user_scrolled_this_frame);
+        state.scroll_by(10.0);
+        assert!(state.user_scrolled_this_frame);
+    }
+
+    #[test]
+    fn test_start_following_enables_follow_mode() {
+        let mut state = scroll_state(1000.0, 400.0, 300.0);
+        assert!(!state.following);
+        state.start_following();
+        assert!(state.following);
+    }
+
+    #[test]
+    fn test_scroll_to_end_sets_target_and_following() {
+        let mut state = scroll_state(1000.0, 400.0, 0.0);
+        state.scroll_to_end();
+        assert_eq!(state.target_offset, 600.0);
+        assert!(state.following);
+    }
+}
 

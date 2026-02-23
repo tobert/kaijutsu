@@ -126,7 +126,7 @@ pub fn handle_unfocus(
                         for (_, cursor) in editing_cells.iter() {
                             if let Some(ref frontier) = cursor.edit_frontier {
                                 // Push ops to server (async, fire-and-forget).
-                                // Server echo via sync will update DocumentSyncState.
+                                // Server echo via sync will update DocumentCache.
                                 if let Some(ref actor) = actor {
                                     match editor.doc.ops_since_bytes(frontier) {
                                         Ok(ops_bytes) if !ops_bytes.is_empty() => {

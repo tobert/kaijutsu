@@ -35,7 +35,7 @@ use crate::ui::tiling_reconciler::TilingPhase;
 use super::components::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
-    DocumentCache, DocumentSyncState, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
+    DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
     PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, SubmitFailed,
     ViewingConversation, WorkspaceLayout,
 };
@@ -88,7 +88,6 @@ impl Plugin for CellPlugin {
             .init_resource::<ConversationScrollState>()
             .init_resource::<LayoutGeneration>()
             .init_resource::<SessionAgent>()
-            .init_resource::<DocumentSyncState>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
             .init_resource::<systems::EditorEntities>();

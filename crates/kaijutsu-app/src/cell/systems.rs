@@ -614,8 +614,7 @@ fn strip_shell_prefix(text: &str) -> &str {
 pub fn handle_prompt_submitted(
     mut submit_events: MessageReader<PromptSubmitted>,
     mut fail_writer: MessageWriter<super::components::SubmitFailed>,
-    current_conv: Res<CurrentConversation>,
-    sync_state: Res<super::components::DocumentSyncState>,
+    doc_cache: Res<super::components::DocumentCache>,
     mut scroll_state: ResMut<ConversationScrollState>,
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
@@ -625,19 +624,11 @@ pub fn handle_prompt_submitted(
         return;
     }
 
-    // Get the current conversation ID
-    let Some(conv_id) = current_conv.id() else {
-        warn!("No current conversation to add message to");
+    // Get the active context ID from DocumentCache
+    let Some(ctx_id) = doc_cache.active_id() else {
+        warn!("No active context to add message to");
         return;
     };
-
-    // Get the document cell_id from sync state
-    // This ensures we use the same ID the server uses for BlockInserted events
-    let Some(ref doc) = sync_state.doc else {
-        warn!("No document in sync state");
-        return;
-    };
-    let ctx_id = doc.context_id();
 
     for event in submit_events.read() {
         if let Some(ref actor) = actor {
@@ -659,7 +650,7 @@ pub fn handle_prompt_submitted(
                         }
                     })
                     .detach();
-                info!("Sent shell command to server (conv={}, ctx={})", conv_id, ctx_id);
+                info!("Sent shell command to server (ctx={})", ctx_id);
             } else {
                 let text = event.text.clone();
                 // Chat: fire-and-forget, results via ServerEvent broadcast
@@ -674,7 +665,7 @@ pub fn handle_prompt_submitted(
                         }
                     })
                     .detach();
-                info!("Sent prompt to server (conv={}, ctx={})", conv_id, ctx_id);
+                info!("Sent prompt to server (ctx={})", ctx_id);
             }
             // Enable follow mode to smoothly track streaming response
             scroll_state.start_following();
@@ -1154,43 +1145,37 @@ pub fn track_conversation_container(
     }
 }
 
-/// Sync the MainCell's content with DocumentSyncState.
+/// Sync the MainCell's content with the active document in DocumentCache.
 ///
 /// This system:
-/// 1. Checks if there's a current conversation
-/// 2. Checks if the sync state's version has changed
-/// 3. If changed, rebuilds the MainCell's BlockDocument from sync state
+/// 1. Checks if there's an active document in the cache
+/// 2. Checks if the SyncedDocument's version has changed
+/// 3. If changed, rebuilds the MainCell's BlockDocument from the cache snapshot
 ///
-/// DocumentSyncState owns the authoritative BlockDocument. This system
-/// copies that document to the MainCell's CellEditor for rendering.
+/// DocumentCache owns the authoritative SyncedDocument per context. This system
+/// copies the active document to the MainCell's CellEditor for rendering.
 pub fn sync_main_cell_to_conversation(
-    current_conv: Res<CurrentConversation>,
-    sync_state: Res<super::components::DocumentSyncState>,
+    doc_cache: Res<super::components::DocumentCache>,
     entities: Res<EditorEntities>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
     focus_area: Res<crate::input::focus::FocusArea>,
 ) {
-    // Need both a current conversation and sync state document
-    let Some(conv_id) = current_conv.id() else {
-        debug!("sync_main_cell: no current conversation");
+    let Some(active_id) = doc_cache.active_id() else {
+        trace!("sync_main_cell: no active document in cache");
         return;
     };
     let Some(entity) = entities.main_cell else {
         trace!("sync_main_cell: no main cell entity");
         return;
     };
-    let Some(ref source_doc) = sync_state.doc else {
-        trace!("sync_main_cell: no document in sync state");
+    let Some(cached) = doc_cache.get(active_id) else {
+        trace!("sync_main_cell: active document not in cache");
         return;
     };
 
-    // Verify context ID matches
-    let ctx_id = source_doc.context_id();
-    if ctx_id.to_string() != *conv_id {
-        debug!("sync_main_cell: context ID mismatch ({} vs {})", ctx_id, conv_id);
-        return;
-    }
+    let ctx_id = cached.synced.context_id();
+    let sync_version = cached.synced.version();
 
     // Get the main cell's editor and viewing component
     let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
@@ -1199,7 +1184,6 @@ pub fn sync_main_cell_to_conversation(
     };
 
     // Check if we need to sync (version changed)
-    let sync_version = sync_state.version();
     let needs_sync = match viewing_opt {
         Some(ref viewing) => {
             viewing.conversation_id != ctx_id || viewing.last_sync_version != sync_version
@@ -1211,32 +1195,18 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
-    if matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
-        // During editing: rebuild from store snapshot, preserving cursor position.
-        // TODO: CRDT merge between editor's BlockDocument and sync CrdtBlockStore
-        // requires shared history — for now full replace is safe because edits
-        // flow through the server's block store and come back via sync.
-        let agent_id = editor.doc.agent_id();
-        let store_snap = source_doc.snapshot();
-        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
-            context_id: store_snap.context_id,
-            blocks: store_snap.blocks,
-            version: sync_version,
-        };
-        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
-        // Don't reposition cursor during editing
-    } else {
-        // Normal path: full document replacement from store snapshot
-        let agent_id = editor.doc.agent_id();
-        let store_snap = source_doc.snapshot();
-        let doc_snap = kaijutsu_crdt::DocumentSnapshot {
-            context_id: store_snap.context_id,
-            blocks: store_snap.blocks,
-            version: sync_version,
-        };
-        editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
+    // Rebuild BlockDocument from the SyncedDocument's store snapshot
+    let agent_id = editor.doc.agent_id();
+    let store_snap = cached.synced.snapshot();
+    let doc_snap = kaijutsu_crdt::DocumentSnapshot {
+        context_id: store_snap.context_id,
+        blocks: store_snap.blocks,
+        version: sync_version,
+    };
+    editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
 
-        // Update cursor to end of document
+    if !matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
+        // Update cursor to end of document (unless editing)
         if let Some(last_block) = editor.blocks().last() {
             let len = last_block.content.len();
             editor.cursor = super::components::BlockCursor::at(last_block.id, len);
@@ -1273,14 +1243,10 @@ use crate::connection::{RpcResultMessage, ServerEventMessage};
 /// - `RpcResultMessage::ContextJoined` — initial document state after joining a context
 ///
 /// **Multi-context routing:**
-/// All events are routed by `document_id` to the appropriate `CachedDocument` in
-/// `DocumentCache`. For the active document, changes are also mirrored to
-/// `DocumentSyncState` for backward compatibility with `sync_main_cell_to_conversation`.
-///
-/// **Sync protocol (per document):**
-/// - Initial state (ContextJoined) → full sync via `from_oplog()`
-/// - Subsequent BlockInserted → incremental merge via `merge_ops_owned()`
-/// - BlockTextOps → always incremental merge
+/// All events are routed by `context_id` to the appropriate `CachedDocument` in
+/// `DocumentCache`. Each `CachedDocument` wraps a `SyncedDocument` which handles
+/// CRDT merge internally. `sync_main_cell_to_conversation` reads from the active
+/// cache entry to rebuild the MainCell's BlockDocument for rendering.
 ///
 /// Implements terminal-like auto-scroll: if the user is at the bottom when
 /// new content arrives, we stay at the bottom.
@@ -1288,7 +1254,6 @@ pub fn handle_block_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut result_events: MessageReader<RpcResultMessage>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    mut sync_state: ResMut<super::components::DocumentSyncState>,
     mut doc_cache: ResMut<super::components::DocumentCache>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut current_conv: ResMut<CurrentConversation>,
@@ -1363,29 +1328,16 @@ pub fn handle_block_events(
                 });
             }
 
-            // Mirror to DocumentSyncState for the active document
+            // Update CurrentConversation string bridge for the active document
             if doc_cache.active_id() == Some(ctx_id) {
                 let ctx_str = ctx_id.to_string();
                 if current_conv.id() != Some(&ctx_str) {
                     info!("Updating current_conv to context_id: {} (was {:?})", ctx_id, current_conv.id());
                     current_conv.0 = Some(ctx_str);
                 }
-
-                if let Some(state) = initial_state {
-                    match sync_state.apply_initial_state(state.context_id, agent_id, &state.ops) {
-                        Ok(result) => {
-                            info!("Initial state sync result: {:?}", result);
-                        }
-                        Err(e) => {
-                            error!("Initial state sync error: {}", e);
-                        }
-                    }
-                }
             }
         }
     }
-
-    let active_ctx_id = doc_cache.active_id();
 
     // Handle streamed block events — route by context_id through DocumentCache
     for ServerEventMessage(event) in server_events.read() {
@@ -1420,64 +1372,6 @@ pub fn handle_block_events(
             }
         }
 
-        // Mirror to DocumentSyncState if active (legacy path — will be removed
-        // when DocumentSyncState is fully replaced by DocumentCache)
-        match event {
-            ServerEvent::BlockInserted { context_id, block, ops } => {
-                if active_ctx_id == Some(*context_id) {
-                    match sync_state.apply_block_inserted(*context_id, agent_id, block, ops) {
-                        Ok(result) => trace!("Block insert sync: {:?}", result),
-                        Err(e) => trace!("Block insert sync error: {}", e),
-                    }
-                }
-            }
-            ServerEvent::BlockTextOps { context_id, ops, .. } => {
-                if active_ctx_id == Some(*context_id) {
-                    match sync_state.apply_text_ops(*context_id, agent_id, ops) {
-                        Ok(result) => trace!("Text ops sync: {:?}", result),
-                        Err(e) => trace!("Text ops sync error: {}", e),
-                    }
-                }
-            }
-            ServerEvent::BlockStatusChanged { context_id, block_id, status } => {
-                if active_ctx_id == Some(*context_id) {
-                    if let Some(ref mut doc) = sync_state.doc {
-                        if *context_id == doc.context_id() {
-                            let _ = doc.set_status(block_id, *status);
-                        }
-                    }
-                }
-            }
-            ServerEvent::BlockDeleted { context_id, block_id } => {
-                if active_ctx_id == Some(*context_id) {
-                    if let Some(ref mut doc) = sync_state.doc {
-                        if *context_id == doc.context_id() {
-                            let _ = doc.delete_block(block_id);
-                        }
-                    }
-                }
-            }
-            ServerEvent::BlockCollapsedChanged { context_id, block_id, collapsed } => {
-                if active_ctx_id == Some(*context_id) {
-                    if let Some(ref mut doc) = sync_state.doc {
-                        if *context_id == doc.context_id() {
-                            let _ = doc.set_collapsed(block_id, *collapsed);
-                        }
-                    }
-                }
-            }
-            ServerEvent::BlockMoved { context_id, block_id, after_id } => {
-                if active_ctx_id == Some(*context_id) {
-                    if let Some(ref mut doc) = sync_state.doc {
-                        if *context_id == doc.context_id() {
-                            let _ = doc.move_block(block_id, after_id.as_ref());
-                        }
-                    }
-                }
-            }
-            // SyncReset and resource events handled by cache path above
-            _ => {}
-        }
     }
 
     // Terminal-like auto-scroll: if we were at the bottom before processing
@@ -1492,19 +1386,17 @@ pub fn handle_block_events(
 ///
 /// When `ContextSwitchRequested` is received (from constellation gt/gT/Ctrl-^/click):
 /// 1. Save current scroll state to active CachedDocument
-/// 2. Look up target document_id from context_name
-/// 3. **Cache hit**: swap active_id, mirror cached doc to DocumentSyncState, restore scroll
-/// 4. **Cache miss**: log warning (future: trigger join_context RPC)
+/// 2. Look up target in DocumentCache
+/// 3. **Cache hit**: swap active_id, restore scroll
+/// 4. **Cache miss**: spawn actor to join context, then auto-switch on ContextJoined
 pub fn handle_context_switch(
     mut switch_events: MessageReader<super::components::ContextSwitchRequested>,
     mut doc_cache: ResMut<super::components::DocumentCache>,
-    mut sync_state: ResMut<super::components::DocumentSyncState>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut current_conv: ResMut<CurrentConversation>,
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
-    session_agent: Res<super::components::SessionAgent>,
 ) {
     for event in switch_events.read() {
         let ctx_id = event.context_id;
@@ -1550,23 +1442,8 @@ pub fn handle_context_switch(
         // Switch active document
         doc_cache.set_active(ctx_id);
 
-        // Mirror cached document to DocumentSyncState
         if let Some(cached) = doc_cache.get(ctx_id) {
-            let agent_id = session_agent.0;
-
-            // Rebuild DocumentSyncState from cached document's snapshot
-            let oplog_bytes = postcard::to_allocvec(&cached.synced.doc().snapshot()).unwrap_or_default();
-            sync_state.reset();
-            match sync_state.apply_initial_state(ctx_id, agent_id, &oplog_bytes) {
-                Ok(_) => {
-                    info!("Context switch: mirrored {} to DocumentSyncState", ctx_id);
-                }
-                Err(e) => {
-                    error!("Context switch: failed to mirror {} to DocumentSyncState: {}", ctx_id, e);
-                }
-            }
-
-            // Update CurrentConversation (string bridge to legacy DB)
+            // Update CurrentConversation (string bridge)
             current_conv.0 = Some(ctx_id.to_string());
 
             // Restore scroll offset
@@ -2244,7 +2121,7 @@ pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer, Option<&super::block_border::BlockBorderStyle>)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2319,7 +2196,7 @@ pub fn layout_block_cells(
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
 
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, mut buffer)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout, mut buffer, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2360,11 +2237,14 @@ pub fn layout_block_cells(
         // This shapes the buffer if needed and returns accurate wrapped line count
         // Pixel alignment via metrics_cache helps small text render crisply
         let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
-        // Tight height: just the lines, minimal padding for future chrome.
-        // Border vertical padding is on Node.padding — taffy adds it to the
-        // border box automatically, so min_height is content-only.
+        // Height: lines + minimal padding + border padding.
+        // We include border padding so content_height matches taffy's content_size
+        // (taffy adds Node.padding to min_height for the layout box).
         // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
-        let height = (line_count as f32) * layout.line_height + 4.0;
+        let padding_v = border_style
+            .map(|s| s.padding.top + s.padding.bottom)
+            .unwrap_or(0.0);
+        let height = (line_count as f32) * layout.line_height + 4.0 + padding_v;
 
         block_layout.y_offset = y_offset;
         block_layout.height = height;
