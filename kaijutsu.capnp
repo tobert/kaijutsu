@@ -113,8 +113,8 @@ struct BlockSnapshot {
   hasExitCode @13 :Bool;      # True if exitCode is set (Int32 value type)
   isError @14 :Bool;          # True if toolResult is an error
 
-  # Display hint for richer output formatting (JSON-serialized)
-  displayHint @15 :Text;      # JSON DisplayHint for tables/trees
+  # Structured output data for richer formatting (JSON-serialized OutputData)
+  displayHint @15 :Text;      # JSON OutputData (tables/trees) — field name kept for wire compat
 
   # Drift-specific fields (cross-context transfer)
   sourceContext @16 :Data;    # 16-byte ContextId of originating context
@@ -359,7 +359,7 @@ struct ShellExecResult {
   stdout @2 :Data;          # Raw bytes (may be binary — images, postcard, etc.)
   stderr @3 :Text;          # Always text (diagnostics, warnings)
   data @4 :Text;            # JSON-encoded parsed data (if applicable)
-  hint @5 :Text;            # JSON-encoded DisplayHint for tables/trees
+  hint @5 :Text;            # JSON-encoded OutputData for tables/trees
 }
 
 # Shell variable value (mirrors kaish ast::Value)

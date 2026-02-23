@@ -775,21 +775,19 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the display hint for a block.
+    /// Set structured output data on a block.
     ///
-    /// Display hints provide formatting information (tables, trees) for richer output.
-    /// The hint is stored as a JSON string in the CRDT block.
-    pub fn set_display_hint(
+    /// Output data provides formatting information (tables, trees) for richer output.
+    pub fn set_output(
         &self,
         context_id: ContextId,
         block_id: &BlockId,
-        hint: Option<&str>,
+        output: Option<&kaijutsu_types::OutputData>,
     ) -> Result<(), String> {
         let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
         let agent_id = self.agent_id();
-        entry.doc.set_display_hint(block_id, hint).map_err(|e| e.to_string())?;
+        entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
         entry.touch(agent_id);
-        // Note: No event emission for display hint changes for now - they're synced with full state
         Ok(())
     }
 

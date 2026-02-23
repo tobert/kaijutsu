@@ -46,7 +46,7 @@ const KEY_TOOL_INPUT: &str = "tool_input";
 const KEY_TOOL_CALL_ID: &str = "tool_call_id";
 const KEY_EXIT_CODE: &str = "exit_code";
 const KEY_IS_ERROR: &str = "is_error";
-const KEY_DISPLAY_HINT: &str = "display_hint";
+const KEY_OUTPUT: &str = "display_hint"; // Keep DTE map key for compat with existing data
 
 // Drift-specific fields
 const KEY_SOURCE_CONTEXT: &str = "source_context";
@@ -396,8 +396,9 @@ impl BlockDocument {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let display_hint = block_map.get(KEY_DISPLAY_HINT)
-            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let output = block_map.get(KEY_OUTPUT)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| serde_json::from_str::<kaijutsu_types::OutputData>(&s).ok());
 
         // Drift-specific fields
         let source_context = block_map.get(KEY_SOURCE_CONTEXT)
@@ -427,7 +428,7 @@ impl BlockDocument {
             tool_call_id,
             exit_code,
             is_error,
-            display_hint,
+            output,
             source_context,
             source_model,
             drift_kind,
@@ -616,7 +617,7 @@ impl BlockDocument {
             None, // exit_code
             false, // is_error
             false, // compacted
-            None, // display_hint
+            None, // output
             None, // source_context
             None, // source_model
             None, // drift_kind
@@ -651,7 +652,7 @@ impl BlockDocument {
             None,
             false,
             false, // compacted
-            None, // display_hint
+            None, // output
             None, // source_context
             None, // source_model
             None, // drift_kind
@@ -688,7 +689,7 @@ impl BlockDocument {
             exit_code,
             is_error,
             false, // compacted
-            None, // display_hint
+            None, // output
             None, // source_context
             None, // source_model
             None, // drift_kind
@@ -727,7 +728,7 @@ impl BlockDocument {
             None, // exit_code
             false, // is_error
             false, // compacted
-            None, // display_hint
+            None, // output
             Some(source_context),
             source_model,
             Some(drift_kind),
@@ -779,7 +780,7 @@ impl BlockDocument {
             snapshot.exit_code,
             snapshot.is_error,
             snapshot.compacted,
-            snapshot.display_hint,
+            snapshot.output.as_ref().and_then(|o| serde_json::to_string(o).ok()),
             snapshot.source_context,
             snapshot.source_model,
             snapshot.drift_kind,
@@ -805,7 +806,7 @@ impl BlockDocument {
         exit_code: Option<i32>,
         is_error: bool,
         compacted: bool,
-        display_hint: Option<String>,
+        output_json: Option<String>,
         source_context: Option<ContextId>,
         source_model: Option<String>,
         drift_kind: Option<crate::DriftKind>,
@@ -906,8 +907,8 @@ impl BlockDocument {
                     block_map.set(KEY_IS_ERROR, true);
                 }
 
-                if let Some(ref hint) = display_hint {
-                    block_map.set(KEY_DISPLAY_HINT, hint.as_str());
+                if let Some(ref json) = output_json {
+                    block_map.set(KEY_OUTPUT, json.as_str());
                 }
 
                 // Drift-specific fields
@@ -1002,24 +1003,25 @@ impl BlockDocument {
         Ok(())
     }
 
-    /// Set the display hint of a block.
+    /// Set structured output data on a block.
     ///
-    /// Display hints are used for richer output formatting (tables, trees).
-    /// The hint is stored as a JSON string.
-    pub fn set_display_hint(&mut self, id: &BlockId, hint: Option<&str>) -> Result<()> {
+    /// Output data is JSON-serialized for DTE map storage internally.
+    pub fn set_output(&mut self, id: &BlockId, output: Option<&kaijutsu_types::OutputData>) -> Result<()> {
         let _snapshot = self.get_block_snapshot(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
 
         let block_key = format!("{PREFIX_BLOCK}{}", id.to_key());
 
-        if let Some(h) = hint {
-            self.doc.transact(self.agent, |tx| {
-                if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
-                    block_map.set(KEY_DISPLAY_HINT, h);
-                }
-            });
+        if let Some(data) = output {
+            if let Ok(json) = serde_json::to_string(data) {
+                self.doc.transact(self.agent, |tx| {
+                    if let Some(mut block_map) = tx.get_map_mut(&[&block_key]) {
+                        block_map.set(KEY_OUTPUT, json.as_str());
+                    }
+                });
+            }
         }
-        // If hint is None, we don't need to do anything - it's already not set
+        // If output is None, we don't need to do anything - it's already not set
 
         self.version += 1;
         Ok(())
@@ -1316,7 +1318,7 @@ impl BlockDocument {
                 block.exit_code,
                 block.is_error,
                 block.compacted,
-                block.display_hint,
+                block.output.as_ref().and_then(|o| serde_json::to_string(o).ok()),
                 block.source_context,
                 block.source_model,
                 block.drift_kind,
@@ -1451,7 +1453,7 @@ impl BlockDocument {
                 block_snap.exit_code,
                 block_snap.is_error,
                 block_snap.compacted,
-                block_snap.display_hint.clone(),
+                block_snap.output.as_ref().and_then(|o| serde_json::to_string(o).ok()),
                 block_snap.source_context,
                 block_snap.source_model.clone(),
                 block_snap.drift_kind,

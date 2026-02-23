@@ -12,71 +12,6 @@ use std::sync::Arc;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 // ============================================================================
-// DisplayHint - Dual-format output for humans vs models
-// ============================================================================
-
-/// Display hint for command output.
-///
-/// Tools can specify how their output should be formatted for different audiences:
-/// - **Humans** → Pretty columns, colors, traditional tree
-/// - **Models** → Token-efficient compact formats (brace notation, JSON)
-///
-/// This mirrors kaish's DisplayHint but uses serde for wire serialization.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DisplayHint {
-    /// No special formatting - use raw output as-is.
-    #[default]
-    None,
-
-    /// Pre-rendered output for both audiences.
-    Formatted {
-        /// Pretty format for humans (TTY).
-        user: String,
-        /// Compact format for models/piping.
-        model: String,
-    },
-
-    /// Tabular data - client handles column layout.
-    Table {
-        /// Optional column headers.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        headers: Option<Vec<String>>,
-        /// Table rows (each row is a vector of cell values).
-        rows: Vec<Vec<String>>,
-        /// Entry metadata for coloring (is_dir, is_executable, etc.).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        entry_types: Option<Vec<EntryType>>,
-    },
-
-    /// Tree structure - client chooses traditional vs compact.
-    Tree {
-        /// Root directory name.
-        root: String,
-        /// Tree structure as JSON for flexible rendering.
-        structure: serde_json::Value,
-        /// Pre-rendered traditional format (for human display).
-        traditional: String,
-        /// Pre-rendered compact format (for model/piped display).
-        compact: String,
-    },
-}
-
-/// Entry type for colorizing file listings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntryType {
-    /// Regular file.
-    File,
-    /// Directory.
-    Directory,
-    /// Executable file.
-    Executable,
-    /// Symbolic link.
-    Symlink,
-}
-
-// ============================================================================
 // Tool Info
 // ============================================================================
 
@@ -117,14 +52,9 @@ pub struct ExecResult {
     pub exit_code: i32,
     /// Whether execution succeeded.
     pub success: bool,
-    /// Display hint for richer formatting.
-    #[serde(default, skip_serializing_if = "is_display_hint_none")]
-    pub hint: DisplayHint,
-}
-
-/// Helper for serde skip_serializing_if
-fn is_display_hint_none(hint: &DisplayHint) -> bool {
-    matches!(hint, DisplayHint::None)
+    /// Structured output data for richer formatting (tables, trees).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<kaijutsu_types::OutputData>,
 }
 
 impl ExecResult {
@@ -135,7 +65,7 @@ impl ExecResult {
             stderr: String::new(),
             exit_code: 0,
             success: true,
-            hint: DisplayHint::None,
+            output: None,
         }
     }
 
@@ -146,7 +76,7 @@ impl ExecResult {
             stderr: stderr.into(),
             exit_code,
             success: false,
-            hint: DisplayHint::None,
+            output: None,
         }
     }
 
@@ -161,13 +91,13 @@ impl ExecResult {
             stderr: stderr.into(),
             exit_code,
             success: exit_code == 0,
-            hint: DisplayHint::None,
+            output: None,
         }
     }
 
-    /// Create a result with a display hint.
-    pub fn with_hint(mut self, hint: DisplayHint) -> Self {
-        self.hint = hint;
+    /// Attach structured output data for richer formatting.
+    pub fn with_output_data(mut self, data: kaijutsu_types::OutputData) -> Self {
+        self.output = Some(data);
         self
     }
 }
@@ -605,52 +535,31 @@ mod tests {
     }
 
     #[test]
-    fn test_display_hint_default() {
+    fn test_output_default_none() {
         let result = ExecResult::success("test");
-        assert_eq!(result.hint, DisplayHint::None);
+        assert!(result.output.is_none());
     }
 
     #[test]
-    fn test_display_hint_with_hint() {
-        let result = ExecResult::success("test").with_hint(DisplayHint::Formatted {
-            user: "Pretty output".to_string(),
-            model: "compact".to_string(),
-        });
-        match &result.hint {
-            DisplayHint::Formatted { user, model } => {
-                assert_eq!(user, "Pretty output");
-                assert_eq!(model, "compact");
-            }
-            _ => panic!("Expected Formatted hint"),
-        }
+    fn test_output_with_data() {
+        use kaijutsu_types::OutputData;
+        let data = OutputData::text("Pretty output");
+        let result = ExecResult::success("test").with_output_data(data.clone());
+        assert_eq!(result.output, Some(data));
     }
 
     #[test]
-    fn test_display_hint_table() {
-        let hint = DisplayHint::Table {
-            headers: Some(vec!["Name".to_string(), "Size".to_string()]),
-            rows: vec![
-                vec!["file1.txt".to_string(), "1024".to_string()],
-                vec!["file2.txt".to_string(), "2048".to_string()],
-            ],
-            entry_types: Some(vec![EntryType::File, EntryType::File]),
-        };
-        let result = ExecResult::success("file1.txt\nfile2.txt").with_hint(hint);
-        assert!(matches!(result.hint, DisplayHint::Table { .. }));
-    }
-
-    #[test]
-    fn test_display_hint_serialization() {
-        let hint = DisplayHint::Table {
-            headers: None,
-            rows: vec![vec!["src".to_string()], vec!["Cargo.toml".to_string()]],
-            entry_types: Some(vec![EntryType::Directory, EntryType::File]),
-        };
-        let json = serde_json::to_string(&hint).unwrap();
-        assert!(json.contains("\"type\":\"table\""));
+    fn test_output_data_serialization() {
+        use kaijutsu_types::{OutputData, OutputNode, OutputEntryType};
+        let mut node1 = OutputNode::new("src");
+        node1.entry_type = OutputEntryType::Directory;
+        let mut node2 = OutputNode::new("Cargo.toml");
+        node2.entry_type = OutputEntryType::File;
+        let data = OutputData::nodes(vec![node1, node2]);
+        let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"directory\""));
-        let parsed: DisplayHint = serde_json::from_str(&json).unwrap();
-        assert_eq!(hint, parsed);
+        let parsed: OutputData = serde_json::from_str(&json).unwrap();
+        assert_eq!(data, parsed);
     }
 
     // ========================================================================

@@ -1996,30 +1996,26 @@ impl kernel::Server for KernelImpl {
                             result.code, result.out.len(), result.err.len());
                         log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
 
-                        // Convert kaish OutputData to kaijutsu DisplayHint and serialize
-                        let display_hint = crate::embedded_kaish::convert_output_data(result.output.as_ref());
-                        let hint_json = crate::embedded_kaish::serialize_display_hint(&display_hint);
-
                         // Combine out and err (kaish uses out/err/code fields)
-                        let output = if result.err.is_empty() {
+                        let output_text = if result.err.is_empty() {
                             result.out
                         } else if result.out.is_empty() {
                             result.err
                         } else {
                             format!("{}\n{}", result.out, result.err)
                         };
-                        log::debug!("Shell execution completed: {} bytes, exit_code={}, has_hint={}",
-                            output.len(), result.code, hint_json.is_some());
+                        log::debug!("Shell execution completed: {} bytes, exit_code={}, has_output={}",
+                            output_text.len(), result.code, result.output.is_some());
 
                         // Update output block with result text
-                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output, 0, Some(PrincipalId::system())) {
+                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
                             log::error!("Failed to update shell output: {}", e);
                         }
 
-                        // Store display hint if present
-                        if let Some(hint) = hint_json.as_deref() {
-                            if let Err(e) = documents_clone.set_display_hint(context_id, &output_block_id_clone, Some(hint)) {
-                                log::error!("Failed to set display hint: {}", e);
+                        // Store structured output data if present
+                        if let Some(ref output_data) = result.output {
+                            if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
+                                log::error!("Failed to set output data: {}", e);
                             }
                         }
 
@@ -2146,10 +2142,11 @@ impl kernel::Server for KernelImpl {
                     result_builder.set_data(&serde_json::to_string(&json_value).unwrap_or_default());
                 }
 
-                // Serialize display hint
-                let hint = crate::embedded_kaish::convert_output_data(exec_result.output.as_ref());
-                if let Some(hint_json) = crate::embedded_kaish::serialize_display_hint(&hint) {
-                    result_builder.set_hint(&hint_json);
+                // Serialize structured output data as JSON
+                if let Some(ref output_data) = exec_result.output {
+                    if let Ok(json) = serde_json::to_string(output_data) {
+                        result_builder.set_hint(&json);
+                    }
                 }
             } else {
                 // No last result - return empty/zero values
@@ -4509,9 +4506,11 @@ fn set_block_snapshot(
     }
     builder.set_is_error(block.is_error);
 
-    // Set display hint if present
-    if let Some(ref hint) = block.display_hint {
-        builder.set_display_hint(hint);
+    // Set output data if present (JSON-serialized for wire)
+    if let Some(ref output) = block.output {
+        if let Ok(json) = serde_json::to_string(output) {
+            builder.set_display_hint(&json);
+        }
     }
 
     // Set tool mechanism metadata
@@ -4639,13 +4638,13 @@ fn parse_block_snapshot(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
-    // Read display hint from wire protocol
-    let display_hint = if reader.has_display_hint() {
+    // Read output data from wire protocol (JSON-deserialized)
+    let output = if reader.has_display_hint() {
         reader.get_display_hint()
             .ok()
             .and_then(|s| s.to_str().ok())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned())
+            .and_then(|s| serde_json::from_str::<kaijutsu_types::OutputData>(s).ok())
     } else {
         None
     };
@@ -4668,7 +4667,7 @@ fn parse_block_snapshot(
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
-        display_hint,
+        output,
         file_path: if reader.has_file_path() {
             reader.get_file_path().ok()
                 .and_then(|s| s.to_str().ok())

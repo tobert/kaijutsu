@@ -196,6 +196,9 @@ impl KernelBackend for MountBackend {
                     .await
                     .map_err(vfs_to_backend)
             }
+            _ => Err(BackendError::InvalidOperation(
+                "unsupported write mode".into(),
+            )),
         }
     }
 

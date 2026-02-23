@@ -31,12 +31,11 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
-use kaish_kernel::interpreter::{EntryType as KaishEntryType, ExecResult, OutputData};
+use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::vfs::Filesystem;
 use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
@@ -279,102 +278,6 @@ fn generate_blob_id() -> String {
     format!("{:x}", timestamp)
 }
 
-// ============================================================================
-// DisplayHint Conversion
-// ============================================================================
-
-/// Convert a kaish EntryType to kaijutsu EntryType.
-pub fn convert_entry_type(et: &KaishEntryType) -> EntryType {
-    match et {
-        KaishEntryType::Text | KaishEntryType::File => EntryType::File,
-        KaishEntryType::Directory => EntryType::Directory,
-        KaishEntryType::Executable => EntryType::Executable,
-        KaishEntryType::Symlink => EntryType::Symlink,
-    }
-}
-
-/// Convert kaish `OutputData` to kaijutsu `DisplayHint`.
-///
-/// The mapping:
-/// - `None` → `DisplayHint::None`
-/// - Simple text → `DisplayHint::None` (text is already in stdout)
-/// - Tabular (headers + cells) → `DisplayHint::Table`
-/// - Nested children → `DisplayHint::Tree`
-/// - Flat list → `DisplayHint::Table` (single-column)
-pub fn convert_output_data(output: Option<&OutputData>) -> DisplayHint {
-    let output = match output {
-        Some(o) => o,
-        None => return DisplayHint::None,
-    };
-
-    // Simple text — no structured hint needed
-    if output.is_simple_text() {
-        return DisplayHint::None;
-    }
-
-    // Tabular data
-    if output.is_tabular() || output.headers.is_some() {
-        let rows: Vec<Vec<String>> = output
-            .root
-            .iter()
-            .map(|node| {
-                let mut row = vec![node.name.clone()];
-                row.extend(node.cells.iter().cloned());
-                row
-            })
-            .collect();
-        let entry_types: Vec<EntryType> = output
-            .root
-            .iter()
-            .map(|node| convert_entry_type(&node.entry_type))
-            .collect();
-        return DisplayHint::Table {
-            headers: output.headers.clone(),
-            rows,
-            entry_types: Some(entry_types),
-        };
-    }
-
-    // Nested tree
-    if !output.is_flat() {
-        let canonical = output.to_canonical_string();
-        let json_structure = serde_json::to_value(output).unwrap_or_default();
-        let root_name = output
-            .root
-            .first()
-            .map(|n| n.name.clone())
-            .unwrap_or_default();
-        return DisplayHint::Tree {
-            root: root_name,
-            structure: json_structure,
-            traditional: canonical.clone(),
-            compact: canonical,
-        };
-    }
-
-    // Flat list without cells — single-column table
-    let rows: Vec<Vec<String>> = output.root.iter().map(|n| vec![n.name.clone()]).collect();
-    let entry_types: Vec<EntryType> = output
-        .root
-        .iter()
-        .map(|node| convert_entry_type(&node.entry_type))
-        .collect();
-    DisplayHint::Table {
-        headers: None,
-        rows,
-        entry_types: Some(entry_types),
-    }
-}
-
-/// Serialize a DisplayHint to JSON for storage in CRDT blocks.
-///
-/// Returns None for DisplayHint::None to avoid storing unnecessary data.
-pub fn serialize_display_hint(hint: &DisplayHint) -> Option<String> {
-    match hint {
-        DisplayHint::None => None,
-        _ => serde_json::to_string(hint).ok(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

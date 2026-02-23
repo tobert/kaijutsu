@@ -5241,6 +5241,7 @@ dependencies = [
 name = "kaijutsu-types"
 version = "0.1.0"
 dependencies = [
+ "kaish-types",
  "postcard",
  "serde",
  "serde_json",
@@ -5276,6 +5277,7 @@ dependencies = [
  "jaq-std",
  "kaish-glob",
  "kaish-schema",
+ "kaish-types",
  "logos",
  "nix 0.29.0",
  "procfs",
@@ -5295,6 +5297,15 @@ name = "kaish-schema"
 version = "0.3.1"
 dependencies = [
  "capnp",
+]
+
+[[package]]
+name = "kaish-types"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

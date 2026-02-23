@@ -1377,12 +1377,14 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.is_error(true);
     }
 
-    // Display hint
+    // Structured output data (JSON-serialized OutputData)
     if reader.has_display_hint() {
         if let Ok(hint) = reader.get_display_hint() {
             if let Ok(s) = hint.to_str() {
                 if !s.is_empty() {
-                    builder = builder.display_hint(s);
+                    if let Ok(data) = serde_json::from_str::<kaijutsu_types::OutputData>(s) {
+                        builder = builder.output(data);
+                    }
                 }
             }
         }

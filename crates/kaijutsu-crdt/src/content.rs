@@ -79,7 +79,7 @@ pub struct BlockContent {
     tool_name: Option<String>,
     tool_input: Option<String>,
     tool_call_id: Option<BlockId>,
-    display_hint: Option<String>,
+    output: Option<kaijutsu_types::OutputData>,
     source_context: Option<crate::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<crate::DriftKind>,
@@ -112,7 +112,7 @@ impl BlockContent {
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -151,7 +151,7 @@ impl BlockContent {
         block.tool_name = snap.tool_name.clone();
         block.tool_input = snap.tool_input.clone();
         block.tool_call_id = snap.tool_call_id;
-        block.display_hint = snap.display_hint.clone();
+        block.output = snap.output.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -183,7 +183,7 @@ impl BlockContent {
             tool_name: snap.tool_name.clone(),
             tool_input: snap.tool_input.clone(),
             tool_call_id: snap.tool_call_id,
-            display_hint: snap.display_hint.clone(),
+            output: snap.output.clone(),
             source_context: snap.source_context,
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
@@ -301,12 +301,12 @@ impl BlockContent {
         self.tool_call_id = id;
     }
 
-    pub fn display_hint(&self) -> Option<&str> {
-        self.display_hint.as_deref()
+    pub fn output(&self) -> Option<&kaijutsu_types::OutputData> {
+        self.output.as_ref()
     }
 
-    pub fn set_display_hint(&mut self, hint: Option<String>) {
-        self.display_hint = hint;
+    pub fn set_output(&mut self, output: Option<kaijutsu_types::OutputData>) {
+        self.output = output;
     }
 
     pub fn source_context(&self) -> Option<crate::ContextId> {
@@ -375,7 +375,7 @@ impl BlockContent {
             tool_call_id: self.tool_call_id,
             exit_code: self.header.exit_code,
             is_error: self.header.is_error,
-            display_hint: self.display_hint.clone(),
+            output: self.output.clone(),
             source_context: self.source_context,
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,

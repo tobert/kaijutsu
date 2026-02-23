@@ -224,7 +224,7 @@ fn row_to_block(
         tool_call_id,
         exit_code,
         is_error,
-        display_hint: None, // TODO: persist display hints to DB if needed
+        output: None, // TODO: persist output data to DB if needed
         source_context: None, // TODO: persist drift metadata to DB if needed
         source_model: None,
         drift_kind: None,

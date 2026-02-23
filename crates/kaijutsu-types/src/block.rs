@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
 use crate::ids::{ContextId, PrincipalId};
+use crate::OutputData;
 
 /// Globally unique block identifier with typed IDs.
 ///
@@ -460,7 +461,7 @@ impl std::fmt::Display for DriftKind {
 /// ## Field groups
 ///
 /// - **Core**: id, parent_id, role, status, kind, content, created_at
-/// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, display_hint
+/// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, output
 /// - **Drift** (Drift): drift_kind, source_context, source_model
 ///
 /// The block's author is always `id.agent_id` — no separate field to diverge.
@@ -509,10 +510,11 @@ pub struct BlockSnapshot {
     /// Whether this is an error result (for ToolResult blocks).
     #[serde(default)]
     pub is_error: bool,
-    /// Display hint for richer output formatting (JSON-serialized).
+    /// Structured output data for richer formatting (tables, trees).
     /// Used for shell output blocks to enable per-viewer rendering.
-    #[serde(default)]
-    pub display_hint: Option<String>,
+    /// Replaces the old JSON-serialized `display_hint` string.
+    #[serde(default, alias = "display_hint")]
+    pub output: Option<OutputData>,
 
     // Drift-specific fields (Drift)
 
@@ -574,7 +576,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -609,7 +611,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -651,7 +653,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -689,7 +691,7 @@ impl BlockSnapshot {
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -698,18 +700,18 @@ impl BlockSnapshot {
         }
     }
 
-    /// Create a tool result block with a display hint.
+    /// Create a tool result block with structured output data.
     ///
-    /// Display hints enable per-viewer rendering (e.g., ANSI terminal output,
+    /// Output data enables per-viewer rendering (e.g., ANSI terminal output,
     /// table formatting) without baking presentation into content.
-    pub fn tool_result_with_hint(
+    pub fn tool_result_with_output(
         id: BlockId,
         tool_call_id: BlockId,
         tool_kind: ToolKind,
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
-        display_hint: Option<String>,
+        output: Option<OutputData>,
     ) -> Self {
         debug_assert!(
             tool_call_id.context_id == id.context_id,
@@ -731,7 +733,7 @@ impl BlockSnapshot {
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
-            display_hint,
+            output,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -769,7 +771,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
-            display_hint: None,
+            output: None,
             source_context: Some(source_context),
             source_model,
             drift_kind: Some(drift_kind),
@@ -805,7 +807,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
-            display_hint: None,
+            output: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -853,7 +855,7 @@ impl BlockSnapshot {
             && self.tool_call_id == other.tool_call_id
             && self.exit_code == other.exit_code
             && self.is_error == other.is_error
-            && self.display_hint == other.display_hint
+            && self.output == other.output
             && self.source_context == other.source_context
             && self.source_model == other.source_model
             && self.drift_kind == other.drift_kind
@@ -906,7 +908,7 @@ impl BlockSnapshotBuilder {
                 tool_call_id: None,
                 exit_code: None,
                 is_error: false,
-                display_hint: None,
+                output: None,
                 source_context: None,
                 source_model: None,
                 drift_kind: None,
@@ -979,8 +981,8 @@ impl BlockSnapshotBuilder {
         self
     }
 
-    pub fn display_hint(mut self, hint: impl Into<String>) -> Self {
-        self.snap.display_hint = Some(hint.into());
+    pub fn output(mut self, data: OutputData) -> Self {
+        self.snap.output = Some(data);
         self
     }
 
@@ -1385,24 +1387,25 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_shell_result_with_hint() {
+    fn test_block_snapshot_shell_result_with_output() {
         let ctx = test_context();
         let cmd_id = BlockId::new(ctx, test_agent(), 1);
         let id = BlockId::new(ctx, PrincipalId::system(), 1);
-        let snap = BlockSnapshot::tool_result_with_hint(
+        let output_data = OutputData::text("formatted output");
+        let snap = BlockSnapshot::tool_result_with_output(
             id,
             cmd_id,
             ToolKind::Shell,
             "output",
             true,
             Some(1),
-            Some("ansi".to_string()),
+            Some(output_data.clone()),
         );
 
         assert!(snap.is_shell());
         assert!(snap.is_error);
         assert_eq!(snap.status, Status::Error);
-        assert_eq!(snap.display_hint, Some("ansi".to_string()));
+        assert_eq!(snap.output, Some(output_data));
     }
 
     #[test]
@@ -1603,7 +1606,7 @@ mod tests {
             .tool_call_id(call_id)
             .exit_code(127)
             .is_error(true)
-            .display_hint("ansi")
+            .output(OutputData::text("ansi output"))
             .source_context(source)
             .source_model("gemini-pro")
             .drift_kind(DriftKind::Distill)
@@ -1622,7 +1625,7 @@ mod tests {
         assert_eq!(snap.tool_call_id, Some(call_id));
         assert_eq!(snap.exit_code, Some(127));
         assert!(snap.is_error);
-        assert_eq!(snap.display_hint, Some("ansi".to_string()));
+        assert_eq!(snap.output, Some(OutputData::text("ansi output")));
         assert_eq!(snap.source_context, Some(source));
         assert_eq!(snap.source_model, Some("gemini-pro".to_string()));
         assert_eq!(snap.drift_kind, Some(DriftKind::Distill));
@@ -1828,12 +1831,12 @@ mod tests {
     #[test]
     #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "tool_call_id must be in same context")]
-    fn test_panic_on_cross_context_tool_result_with_hint() {
+    fn test_panic_on_cross_context_tool_result_with_output() {
         let ctx1 = ContextId::new();
         let ctx2 = ContextId::new();
         let agent = test_agent();
         let call_id = BlockId::new(ctx1, agent, 0);
-        BlockSnapshot::tool_result_with_hint(
+        BlockSnapshot::tool_result_with_output(
             BlockId::new(ctx2, agent, 1),
             call_id,
             ToolKind::Shell,

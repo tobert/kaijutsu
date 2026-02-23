@@ -51,6 +51,9 @@ pub mod context;
 pub mod kernel;
 pub mod session;
 
+// Re-export kaish output types for structured tool results.
+pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
+
 // Re-export primary types at crate root for convenience.
 pub use ids::{ContextId, KernelId, PrincipalId, SessionId};
 pub use ids::{PrefixError, PrefixResolvable, resolve_prefix, resolve_context_prefix};

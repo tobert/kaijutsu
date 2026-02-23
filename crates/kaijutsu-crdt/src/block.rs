@@ -5,5 +5,6 @@
 
 pub use kaijutsu_types::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder,
-    DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
+    DriftKind, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
+    Role, Status, ToolKind,
 };

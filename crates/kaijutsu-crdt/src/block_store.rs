@@ -606,14 +606,14 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the display hint.
-    pub fn set_display_hint(&mut self, id: &BlockId, hint: Option<&str>) -> Result<()> {
+    /// Set structured output data on a block.
+    pub fn set_output(&mut self, id: &BlockId, output: Option<kaijutsu_types::OutputData>) -> Result<()> {
         let block = self
             .blocks
             .get_mut(id)
             .filter(|b| !b.is_deleted())
             .ok_or(CrdtError::BlockNotFound(*id))?;
-        block.set_display_hint(hint.map(|s| s.to_string()));
+        block.set_output(output);
         self.version += 1;
         Ok(())
     }

@@ -318,6 +318,11 @@ impl KernelBackend for KaijutsuBackend {
                                 .map_err(|e| BackendError::Io(e))?;
                         }
                     }
+                    _ => {
+                        return Err(BackendError::InvalidOperation(
+                            "unsupported write mode".into(),
+                        ));
+                    }
                 }
                 let _ = content_str; // content unused for document-level writes
                 Ok(())
