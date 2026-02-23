@@ -79,6 +79,7 @@ async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
     context_id: ContextId,
+    default_root: &str,
 ) {
     let current = crate::context_engine::current_context();
     kernel.register_tool_with_engine(
@@ -169,11 +170,11 @@ async fn register_block_tools(
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
-        Arc::new(GlobEngine::new(kernel.vfs().clone())),
+        Arc::new(GlobEngine::new(kernel.vfs().clone(), default_root)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("grep", "Search file content with regex", "file"),
-        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone())),
+        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone(), default_root)),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("whoami", "Show current context identity", "drift"),
@@ -613,7 +614,8 @@ pub async fn create_shared_kernel(
 
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
-    register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
+    let default_root = src_dir.display().to_string();
+    register_block_tools(&kernel_arc, documents.clone(), ctx_id, &default_root).await;
 
     // Recover contexts from persisted document IDs.
     // Documents are keyed by ContextId directly; register each in the drift router.
@@ -4095,7 +4097,7 @@ async fn process_llm_stream(
         // Collect tool calls for this iteration
         let mut tool_calls: Vec<(String, String, serde_json::Value)> = vec![]; // (id, name, input)
         // Track tool_use_id → BlockId mapping for CRDT
-        let mut tool_call_blocks: std::collections::HashMap<String, kaijutsu_crdt::BlockId> = std::collections::HashMap::new();
+        let mut tool_call_blocks: std::collections::HashMap<String, Option<kaijutsu_crdt::BlockId>> = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
 
@@ -4154,13 +4156,18 @@ async fn process_llm_stream(
                     // Store for later execution
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
 
-                    // Insert block and track it
+                    // Insert block and track it — on failure, store None so
+                    // the execution future can surface the error to the model
+                    // instead of silently losing the tool result.
                     match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
-                            tool_call_blocks.insert(id.clone(), block_id);
+                            tool_call_blocks.insert(id.clone(), Some(block_id));
                         }
-                        Err(e) => log::error!("Failed to insert tool use block: {}", e),
+                        Err(e) => {
+                            log::error!("Failed to insert tool call block for {}: {}", name, e);
+                            tool_call_blocks.insert(id.clone(), None);
+                        }
                     }
                 }
 
@@ -4210,17 +4217,71 @@ async fn process_llm_stream(
             })
             .collect();
 
-        // Execute all tools concurrently
+        // Execute all tools concurrently with streaming results.
+        // Pattern mirrors shell_execute: create empty Running block → yield →
+        // execute → write content → set final status.
         let futures: Vec<_> = tool_calls.into_iter()
             .map(|(tool_use_id, tool_name, input)| {
                 let kernel = kernel.clone();
                 let documents = documents.clone();
                 let cell_id = cell_id;
-                let tool_call_block_id = tool_call_blocks.get(&tool_use_id).cloned();
+                // Option<Option<BlockId>>: None = not in map (shouldn't happen),
+                // Some(None) = insertion failed, Some(Some(id)) = normal
+                let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
                 async move {
                     let params = input.to_string();
                     log::info!("Executing tool: {} with params: {}", tool_name, params);
 
+                    let tool_call_block_id = match tool_call_entry {
+                        Some(Some(id)) => Some(id),
+                        Some(None) => {
+                            // ToolCall block insertion failed — the model should
+                            // know its tool infrastructure is broken rather than
+                            // getting a phantom result with no call.
+                            log::warn!(
+                                "Tool {} (id={}) has no ToolCall block — \
+                                 returning error to model",
+                                tool_name, tool_use_id,
+                            );
+                            return (
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content: format!(
+                                        "Internal error: failed to create ToolCall block for {}. \
+                                         The tool was not executed. Try again.",
+                                        tool_name,
+                                    ),
+                                    is_error: true,
+                                },
+                                None,
+                            );
+                        }
+                        None => None,
+                    };
+
+                    // Step 1-2: Create empty ToolResult block and set Running
+                    let mut result_block_id = None;
+                    if let Some(ref tcb_id) = tool_call_block_id {
+                        match documents.insert_tool_result_as(
+                            cell_id, tcb_id, Some(tcb_id), "", false, None,
+                            Some(PrincipalId::system()),
+                        ) {
+                            Ok(id) => {
+                                let _ = documents.set_status(cell_id, &id, Status::Running);
+                                result_block_id = Some(id);
+                            }
+                            Err(e) => log::warn!(
+                                "Failed to insert tool result block for {} — \
+                                 model will still receive result but user won't see it: {}",
+                                tool_name, e,
+                            ),
+                        }
+                    }
+
+                    // Step 3: Let BlockInserted flush to clients before text ops
+                    tokio::task::yield_now().await;
+
+                    // Step 4: Execute tool
                     let result = kernel.execute_with(&tool_name, &params).await;
 
                     let (result_content, is_error) = match result {
@@ -4238,17 +4299,23 @@ async fn process_llm_stream(
                         }
                     };
 
-                    // Insert tool result block (CRDT DAG — each result parents its own tool_call)
-                    let mut result_block_id = None;
-                    if let Some(ref tcb_id) = tool_call_block_id {
-                        match documents.insert_tool_result_as(
-                            cell_id, tcb_id, Some(tcb_id), &result_content, is_error, None, Some(PrincipalId::system()),
-                        ) {
-                            Ok(id) => result_block_id = Some(id),
-                            Err(e) => log::error!("Failed to insert tool result block: {}", e),
+                    // Step 5: Write result content via CRDT text ops
+                    if let Some(ref rb_id) = result_block_id {
+                        if !result_content.is_empty() {
+                            if let Err(e) = documents.edit_text_as(
+                                cell_id, rb_id, 0, &result_content, 0,
+                                Some(PrincipalId::system()),
+                            ) {
+                                log::error!("Failed to write tool result text: {}", e);
+                            }
                         }
+
+                        // Step 6: Set final status
+                        let final_status = if is_error { Status::Error } else { Status::Done };
+                        let _ = documents.set_status(cell_id, rb_id, final_status);
                     }
 
+                    // Step 7: Return for conversation history
                     (
                         ContentBlock::ToolResult {
                             tool_use_id,
