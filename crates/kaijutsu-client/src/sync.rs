@@ -368,39 +368,28 @@ impl SyncManager {
 
         // Determine sync strategy
         //
-        // When needs_full_sync is true but the document already has content,
-        // try incremental merge first. This handles the common recovery case:
-        // BlockTextOps fail (DataMissing) -> frontier resets -> next BlockInserted
-        // triggers full sync. But the ops in BlockInserted are incremental (not
-        // a full snapshot), so from_snapshot with those bytes would fail.
-        // The existing document already has the base state; incremental merge
-        // should succeed because the new ops build on that state.
+        // BlockInserted ops are always incremental SyncPayload, never a full
+        // StoreSnapshot. Try incremental merge first regardless of sync state.
+        // The SyncPayload includes new_blocks with full BlockSnapshot data,
+        // so even an empty document can merge successfully.
+        //
+        // Full sync (StoreSnapshot) only comes from getDocumentState RPC,
+        // not from BlockInserted events.
         let result = if self.needs_full_sync(context_id) {
-            if !doc.is_empty() {
-                // Try incremental merge first — preserves existing document
-                match self.do_incremental_merge(doc, ops, Some(&block.id)) {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        warn!(
-                            "Recovery: incremental merge failed for {:?}, falling back to full sync: {}",
-                            block.id, e
-                        );
-                        match self.do_full_sync(doc, context_id, ops, Some(&block.id)) {
-                            Ok(result) => Ok(result),
-                            Err(e) => {
-                                // Both paths failed — buffer for later replay
-                                self.buffer_failed_ops(Some(&block.id), ops);
-                                Err(e)
-                            }
+            match self.do_incremental_merge(doc, ops, Some(&block.id)) {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    warn!(
+                        "Recovery: incremental merge failed for {:?}, falling back to full sync: {}",
+                        block.id, e
+                    );
+                    match self.do_full_sync(doc, context_id, ops, Some(&block.id)) {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            // Both paths failed — buffer for later replay
+                            self.buffer_failed_ops(Some(&block.id), ops);
+                            Err(e)
                         }
-                    }
-                }
-            } else {
-                match self.do_full_sync(doc, context_id, ops, Some(&block.id)) {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        self.buffer_failed_ops(Some(&block.id), ops);
-                        Err(e)
                     }
                 }
             }

@@ -514,7 +514,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -570,7 +570,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -628,7 +628,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -682,7 +682,7 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(effective_agent);
             (block_id, final_snapshot, ops_bytes)
         };
@@ -760,7 +760,7 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text edits (high frequency during streaming)
 
@@ -813,7 +813,7 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
@@ -889,7 +889,7 @@ impl BlockStore {
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
-            let ops_bytes = serde_json::to_vec(&entry.doc.ops_since(&frontier_before))
+            let ops_bytes = postcard::to_allocvec(&entry.doc.ops_since(&frontier_before))
                 .unwrap_or_default();
             (version, Self::diff_block_events(context_id, &before, &after, ops_bytes))
         };
@@ -1149,7 +1149,7 @@ impl BlockStore {
                 .ok_or_else(|| "Block not found after insert".to_string())?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = serde_json::to_vec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -1500,7 +1500,7 @@ mod tests {
         };
 
         // Deserialize SyncPayload and merge on client
-        let payload: SyncPayload = serde_json::from_slice(&ops).expect("should deserialize SyncPayload");
+        let payload: SyncPayload = postcard::from_bytes(&ops).expect("should deserialize SyncPayload");
         client.merge_ops(payload).expect("client should merge sync payload");
 
         // Verify client has the block
@@ -1531,7 +1531,7 @@ mod tests {
             _ => panic!("expected BlockInserted"),
         };
 
-        let payload: SyncPayload = serde_json::from_slice(&ops).unwrap();
+        let payload: SyncPayload = postcard::from_bytes(&ops).unwrap();
         client.merge_ops(payload).expect("should merge tool_call sync payload");
 
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
                 _ => panic!("expected BlockInserted"),
             };
 
-            let payload: SyncPayload = serde_json::from_slice(&ops).unwrap();
+            let payload: SyncPayload = postcard::from_bytes(&ops).unwrap();
             client.merge_ops(payload).expect(&format!("should merge block {i}"));
         }
 
