@@ -1555,7 +1555,7 @@ pub fn handle_context_switch(
             let agent_id = session_agent.0;
 
             // Rebuild DocumentSyncState from cached document's snapshot
-            let oplog_bytes = serde_json::to_vec(&cached.synced.doc().snapshot()).unwrap_or_default();
+            let oplog_bytes = postcard::to_allocvec(&cached.synced.doc().snapshot()).unwrap_or_default();
             sync_state.reset();
             match sync_state.apply_initial_state(ctx_id, agent_id, &oplog_bytes) {
                 Ok(_) => {

@@ -247,7 +247,7 @@ impl BlockStore {
             return Err(format!("Document {} already exists", context_id.to_hex()));
         }
 
-        let snapshot: StoreSnapshot = serde_json::from_slice(snapshot_bytes)
+        let snapshot: StoreSnapshot = postcard::from_bytes(snapshot_bytes)
             .map_err(|e| format!("Failed to deserialize store snapshot: {}", e))?;
 
         let agent_id = self.agent_id();
@@ -1047,7 +1047,7 @@ impl BlockStore {
             // Try to load snapshot for this document
             let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
                 if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
-                    match serde_json::from_slice::<StoreSnapshot>(&oplog_bytes) {
+                    match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
                         Ok(store_snapshot) => {
                             tracing::debug!(
                                 document_id = %meta.id,
@@ -1056,13 +1056,26 @@ impl BlockStore {
                             );
                             DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                document_id = %meta.id,
-                                error = %e,
-                                "Failed to deserialize store snapshot, skipping corrupted document"
-                            );
-                            continue;
+                        Err(_) => {
+                            // Legacy fallback: try JSON for pre-migration data
+                            match serde_json::from_slice::<StoreSnapshot>(&oplog_bytes) {
+                                Ok(store_snapshot) => {
+                                    tracing::info!(
+                                        document_id = %meta.id,
+                                        blocks = store_snapshot.blocks.len(),
+                                        "Restored document from legacy JSON snapshot (will migrate to postcard on next save)"
+                                    );
+                                    DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        document_id = %meta.id,
+                                        error = %e,
+                                        "Failed to deserialize store snapshot as postcard or JSON, skipping corrupted document"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1091,9 +1104,7 @@ impl BlockStore {
         let version = entry.version() as i64;
         let content = entry.content();
 
-        // Serialize snapshot as JSON (StoreSnapshot contains BlockSnapshot
-        // with skip_serializing_if, which requires a self-describing format)
-        let snapshot_bytes = serde_json::to_vec(&snapshot)
+        let snapshot_bytes = postcard::to_allocvec(&snapshot)
             .map_err(|e| format!("Failed to serialize store snapshot: {}", e))?;
 
         drop(entry); // Release the read lock before acquiring DB lock
@@ -1628,7 +1639,7 @@ mod tests {
         // Snapshot before insert
         let initial_snapshot = {
             let entry = server.get(ctx).unwrap();
-            serde_json::to_vec(&entry.doc.snapshot()).unwrap()
+            postcard::to_allocvec(&entry.doc.snapshot()).unwrap()
         };
 
         let frontier_before = server.frontier(ctx).unwrap();
