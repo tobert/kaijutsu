@@ -2288,8 +2288,26 @@ pub fn update_block_cell_nodes(
         let Ok((layout, mut node, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
+        // Set padding from border style so text sits inside the content box
+        // while the border (absolute child at 100%×100%) fills the border box.
+        let (target_padding, padding_v) = if let Some(style) = border_style {
+            (UiRect {
+                left: Val::Px(style.padding.left),
+                right: Val::Px(style.padding.right),
+                top: Val::Px(style.padding.top),
+                bottom: Val::Px(style.padding.bottom),
+            }, style.padding.top + style.padding.bottom)
+        } else {
+            (UiRect::ZERO, 0.0)
+        };
+
+        // min_height is the content-area height. layout.height includes padding_v
+        // (for accurate scroll content_height), so subtract it here — taffy adds
+        // Node.padding on top of min_height to get the border-box height.
+        let content_height = layout.height - padding_v;
+        let target_height = Val::Px(content_height);
+
         // Compare before writing to avoid triggering Bevy change detection → taffy relayout
-        let target_height = Val::Px(layout.height);
         if node.min_height != target_height {
             node.min_height = target_height;
         }
@@ -2301,18 +2319,6 @@ pub fn update_block_cell_nodes(
         if node.margin != target_margin {
             node.margin = target_margin;
         }
-        // Set padding from border style so text sits inside the content box
-        // while the border (absolute child at 100%×100%) fills the border box.
-        let target_padding = if let Some(style) = border_style {
-            UiRect {
-                left: Val::Px(style.padding.left),
-                right: Val::Px(style.padding.right),
-                top: Val::Px(style.padding.top),
-                bottom: Val::Px(style.padding.bottom),
-            }
-        } else {
-            UiRect::ZERO
-        };
         if node.padding != target_padding {
             node.padding = target_padding;
         }
