@@ -694,12 +694,22 @@ pub struct TilingWidgetsPlugin;
 
 impl Plugin for TilingWidgetsPlugin {
     fn build(&self, app: &mut App) {
+        use super::tiling_reconciler::TilingPhase;
+
         app.init_resource::<DockLayout>()
             .register_type::<DockLayout>()
+            // Dock layout sync must run before the reconciler reads TilingTree
+            .add_systems(
+                Update,
+                sync_dock_layout_to_tiling_tree
+                    .before(TilingPhase::Reconcile),
+            )
+            // Widget update systems must run after the reconciler has
+            // despawned/respawned pane entities and flushed ApplyDeferred,
+            // otherwise deferred add_child commands target stale entities.
             .add_systems(
                 Update,
                 (
-                    sync_dock_layout_to_tiling_tree,
                     update_mode_widget,
                     update_connection_widget,
                     update_contexts_widget,
@@ -709,7 +719,8 @@ impl Plugin for TilingWidgetsPlugin {
                     update_agent_activity_widget,
                     update_block_activity_widget,
                     handle_context_badge_click,
-                ),
+                )
+                    .in_set(TilingPhase::PostReconcile),
             );
     }
 }
