@@ -27,7 +27,7 @@
 //! with tool dispatch routed through the kernel's tool registry.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
@@ -38,9 +38,10 @@ use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishCo
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::tools::{DisplayHint, EntryType};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
+use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::docs_filesystem::KaijutsuFilesystem;
-use crate::kaish_backend::KaijutsuBackend;
+use crate::kaish_backend::{KaijutsuBackend, SharedContextId};
 use crate::mount_backend::MountBackend;
 
 /// Embedded kaish executor backed by CRDT blocks.
@@ -52,52 +53,54 @@ pub struct EmbeddedKaish {
     kernel: KaishKernel,
     /// Kernel name/id.
     name: String,
+    /// Shared mutable context ID — updated when the connection switches context.
+    /// The same `Arc` is held by `KaijutsuBackend`, so updates propagate to tool calls.
+    context_id: SharedContextId,
 }
 
 impl EmbeddedKaish {
-    /// Create a new embedded kaish executor.
+    /// Create a new embedded kaish executor with default identity.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - Name for this kaish kernel (for state persistence)
-    /// * `blocks` - Shared block store for CRDT operations
-    /// * `kernel` - Kaijutsu kernel for tool dispatch and VFS mounts
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let blocks = shared_block_store(PrincipalId::system());
-    /// let kernel = Arc::new(KaijutsuKernel::new("agent-1").await);
-    /// let kaish = EmbeddedKaish::new("my-kernel", blocks, kernel, None)?;
-    /// let result = kaish.execute("echo hello").await?;
-    /// ```
+    /// Uses `PrincipalId::system()` and a fresh `ContextId`. For real connections,
+    /// prefer `with_identity` which accepts the actual connection identity.
     pub fn new(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::with_identity(name, blocks, kernel, project_root, None)
+        Self::with_identity(
+            name, blocks, kernel, project_root,
+            PrincipalId::system(),
+            ContextId::new(),
+            SessionId::new(),
+            KernelId::new(),
+        )
     }
 
     /// Create an embedded kaish executor with explicit identity fields.
     ///
-    /// When `context_id` is provided, it flows through to `ToolContext` for
-    /// drift/whoami engines that need to know which context the caller is in.
+    /// Identity flows through to `ToolContext` for drift/whoami engines.
+    /// The `context_id` is wrapped in `Arc<RwLock>` so that context switches
+    /// (via `set_context_id`) propagate to all tool calls without rebuilding.
     pub fn with_identity(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
-        context_id: Option<kaijutsu_types::ContextId>,
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        kernel_id: KernelId,
     ) -> Result<Self> {
+        let shared_context_id: SharedContextId = Arc::new(RwLock::new(context_id));
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
-            kaijutsu_types::PrincipalId::system(),
-            context_id.unwrap_or_else(kaijutsu_types::ContextId::new),
-            kaijutsu_types::SessionId::new(),
-            kaijutsu_types::KernelId::new(),
+            principal_id,
+            shared_context_id.clone(),
+            session_id,
+            kernel_id,
         ));
         let mount_table = kernel.vfs().clone();
 
@@ -127,6 +130,7 @@ impl EmbeddedKaish {
         Ok(Self {
             kernel: kaish_kernel,
             name: name.to_string(),
+            context_id: shared_context_id,
         })
     }
 
@@ -153,6 +157,18 @@ impl EmbeddedKaish {
     /// Get the kernel name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Update the context ID (e.g., after a context switch).
+    ///
+    /// Propagates to `KaijutsuBackend` via the shared `Arc<RwLock>`.
+    pub fn set_context_id(&self, id: ContextId) {
+        *self.context_id.write().expect("context_id lock poisoned") = id;
+    }
+
+    /// Read the current context ID.
+    pub fn context_id(&self) -> ContextId {
+        *self.context_id.read().expect("context_id lock poisoned")
     }
 
     /// Ping the kernel (health check) - always succeeds for embedded.

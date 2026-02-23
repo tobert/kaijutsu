@@ -78,9 +78,7 @@ fn extract_rpc_trace(trace: capnp::Result<trace_context::Reader<'_>>, name: &'st
 async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
-    context_id: ContextId,
 ) {
-    let _ = context_id; // retained for block tool scoping; drift/whoami now use ToolContext
 
     let current = crate::context_engine::current_context();
     kernel.register_tool_with_engine(
@@ -617,7 +615,7 @@ pub async fn create_shared_kernel(
 
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
-    register_block_tools(&kernel_arc, documents.clone(), ctx_id).await;
+    register_block_tools(&kernel_arc, documents.clone()).await;
 
     // Recover contexts from persisted document IDs.
     // Documents are keyed by ContextId directly; register each in the drift router.
@@ -767,17 +765,22 @@ impl kernel::Server for KernelImpl {
         // Use Promise::from_future for async execution
 
         Promise::from_future(async move {
-            // Get or create embedded kaish executor
+            // Get or create embedded kaish executor with real connection identity
             let kaish = {
                 let mut conn = connection.borrow_mut();
 
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                    match EmbeddedKaish::new(
+                    let context_id = conn.current_context_or(kernel.default_context_id);
+                    match EmbeddedKaish::with_identity(
                         &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
+                        conn.principal.id,
+                        context_id,
+                        conn.session_id,
+                        kernel.id,
                     ) {
                         Ok(kaish) => {
                             conn.kaish = Some(Rc::new(kaish));
@@ -990,27 +993,33 @@ impl kernel::Server for KernelImpl {
         let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
 
         let kernel_arc = self.kernel.kernel.clone();
+        let kernel_id = self.kernel.id;
+        let default_context_id = self.kernel.default_context_id;
 
-        // Build ToolContext from connection state
-        let tool_ctx = {
+        // Extract identity and kaish ref for async cwd resolution
+        let (principal_id, context_id, session_id, kaish_ref) = {
             let conn = self.connection.borrow();
-            kaijutsu_kernel::ToolContext::new(
+            (
                 conn.principal.id,
-                conn.current_context_or(self.kernel.default_context_id),
-                conn.kaish.as_ref().map(|_k| {
-                    // Can't .await in sync context — use a default for now.
-                    // The actual cwd will be populated by kaish_backend when it
-                    // bridges ExecContext → ToolContext.
-                    std::path::PathBuf::from("/")
-                }).unwrap_or_else(|| std::path::PathBuf::from("/")),
+                conn.current_context_or(default_context_id),
                 conn.session_id,
-                self.kernel.id,
+                conn.kaish.clone(),
             )
         };
 
         Promise::from_future(async move {
             let mut result = results.get().init_result();
             result.set_request_id(&request_id);
+
+            // Resolve cwd from kaish session (now in async context, can await)
+            let cwd = match &kaish_ref {
+                Some(k) => k.cwd().await,
+                None => std::path::PathBuf::from("/"),
+            };
+
+            let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                principal_id, context_id, cwd, session_id, kernel_id,
+            );
 
             // Check if tool is allowed by kernel's tool filter
             if !kernel_arc.tool_allowed(&tool_name).await {
@@ -1375,20 +1384,22 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
-        let user_agent_id = self.connection.borrow().principal.id;
-        let tool_ctx = {
+        let (user_agent_id, session_id, kaish_ref) = {
             let conn = self.connection.borrow();
-            kaijutsu_kernel::ToolContext::new(
-                conn.principal.id,
-                context_id,
-                "/", // cwd will be refined by kaish_backend for shell-originated calls
-                conn.session_id,
-                kernel.id,
-            )
+            (conn.principal.id, conn.session_id, conn.kaish.clone())
         };
 
         Promise::from_future(async move {
             log::debug!("prompt future started for context_id={}", context_id);
+
+            // Resolve cwd from kaish session (in async context, can await)
+            let cwd = match &kaish_ref {
+                Some(k) => k.cwd().await,
+                None => std::path::PathBuf::from("/"),
+            };
+            let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                user_agent_id, context_id, cwd, session_id, kernel.id,
+            );
 
             // Get LLM provider and kernel references from the shared kernel
             let documents = kernel.documents.clone();
@@ -1898,17 +1909,21 @@ impl kernel::Server for KernelImpl {
         let user_agent_id = self.connection.borrow().principal.id;
 
         Promise::from_future(async move {
-            // Get or create embedded kaish executor (same pattern as execute RPC)
+            // Get or create embedded kaish executor with real connection identity
             let kaish = {
                 let mut conn = connection.borrow_mut();
 
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                    match EmbeddedKaish::new(
+                    match EmbeddedKaish::with_identity(
                         &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
                         kernel.kernel.clone(),
                         None,
+                        conn.principal.id,
+                        conn.current_context_or(kernel.default_context_id),
+                        conn.session_id,
+                        kernel.id,
                     ) {
                         Ok(kaish) => {
                             conn.kaish = Some(Rc::new(kaish));

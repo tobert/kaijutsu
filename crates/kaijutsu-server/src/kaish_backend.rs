@@ -26,7 +26,7 @@
 //! Where `ctx_hex` is the 32-char hex representation of a ContextId.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -36,7 +36,10 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::db::DocumentKind;
 use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+
+/// Shared mutable context ID, updated when a connection switches context.
+pub type SharedContextId = Arc<RwLock<ContextId>>;
 
 use kaish_kernel::{
     BackendError, BackendResult, EntryInfo, KernelBackend, PatchOp, ReadRange, ToolInfo,
@@ -61,21 +64,25 @@ pub struct KaijutsuBackend {
     /// The kaijutsu kernel for tool dispatch.
     kernel: Arc<KaijutsuKernel>,
     /// Identity fields for bridging kaish ExecContext → kaijutsu ToolContext.
-    principal_id: kaijutsu_types::PrincipalId,
-    context_id: kaijutsu_types::ContextId,
-    session_id: kaijutsu_types::SessionId,
-    kernel_id: kaijutsu_types::KernelId,
+    principal_id: PrincipalId,
+    /// Shared mutable context ID — updated when the connection switches context.
+    context_id: SharedContextId,
+    session_id: SessionId,
+    kernel_id: KernelId,
 }
 
 impl KaijutsuBackend {
     /// Create a new backend with block store, kernel, and identity fields.
+    ///
+    /// The `context_id` is shared (via `Arc<RwLock>`) so that context switches
+    /// propagate to tool calls made through kaish without rebuilding the backend.
     pub fn new(
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
-        principal_id: kaijutsu_types::PrincipalId,
-        context_id: kaijutsu_types::ContextId,
-        session_id: kaijutsu_types::SessionId,
-        kernel_id: kaijutsu_types::KernelId,
+        principal_id: PrincipalId,
+        context_id: SharedContextId,
+        session_id: SessionId,
+        kernel_id: KernelId,
     ) -> Self {
         Self { blocks, kernel, principal_id, context_id, session_id, kernel_id }
     }
@@ -612,10 +619,11 @@ impl KernelBackend for KaijutsuBackend {
 
         // Bridge kaish ExecContext → kaijutsu ToolContext.
         // Uses kaish's cwd so file-relative operations (glob, grep) scope correctly.
-        // Identity fields come from the stored connection state.
+        // context_id is read from the shared lock so context switches propagate.
+        let context_id = *self.context_id.read().expect("context_id lock poisoned");
         let tool_ctx = kaijutsu_kernel::ToolContext::new(
             self.principal_id,
-            self.context_id,
+            context_id,
             ctx.cwd.clone(),
             self.session_id,
             self.kernel_id,
@@ -929,10 +937,10 @@ mod tests {
         let backend = KaijutsuBackend::new(
             blocks,
             kernel,
-            kaijutsu_types::PrincipalId::system(),
-            kaijutsu_types::ContextId::new(),
-            kaijutsu_types::SessionId::new(),
-            kaijutsu_types::KernelId::new(),
+            PrincipalId::system(),
+            Arc::new(RwLock::new(ContextId::new())),
+            SessionId::new(),
+            KernelId::new(),
         );
 
         // Test root paths

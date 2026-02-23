@@ -479,7 +479,7 @@ mod tests {
             blocks,
             kernel,
             PrincipalId::system(),
-            kaijutsu_types::ContextId::new(),
+            Arc::new(std::sync::RwLock::new(kaijutsu_types::ContextId::new())),
             kaijutsu_types::SessionId::new(),
             kaijutsu_types::KernelId::new(),
         ));

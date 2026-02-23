@@ -16,6 +16,7 @@ use kaijutsu_kernel::drift::{DriftLsEngine, DriftPushEngine, DriftFlushEngine};
 use kaijutsu_kernel::tools::{EngineArgs, ToolInfo};
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
 use kaijutsu_crdt::{ContextId, PrincipalId};
+use kaijutsu_types::{KernelId, SessionId};
 use kaijutsu_server::EmbeddedKaish;
 
 // ============================================================================
@@ -60,7 +61,8 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
     }
 
     let kaish = EmbeddedKaish::with_identity(
-        "e2e-drift", documents.clone(), kernel.clone(), None, Some(ctx_id),
+        "e2e-drift", documents.clone(), kernel.clone(), None,
+        PrincipalId::system(), ctx_id, SessionId::new(), KernelId::new(),
     ).expect("EmbeddedKaish::with_identity failed");
 
     (kaish, kernel, documents)
