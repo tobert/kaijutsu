@@ -247,7 +247,6 @@ impl ConversationDb {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        Self::migrate(&conn);
         Ok(Self { conn })
     }
 
@@ -257,16 +256,6 @@ impl ConversationDb {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
-    }
-
-    /// Run forward-only schema migrations for existing databases.
-    /// New columns added via ALTER TABLE; errors are ignored (column already exists).
-    fn migrate(conn: &Connection) {
-        // v1: add tool_use_id to tool_calls and tool_results
-        let _ = conn.execute_batch(
-            "ALTER TABLE tool_calls ADD COLUMN tool_use_id TEXT;
-             ALTER TABLE tool_results ADD COLUMN tool_use_id TEXT;",
-        );
     }
 
     // =========================================================================
