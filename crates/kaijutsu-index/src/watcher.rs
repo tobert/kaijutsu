@@ -25,7 +25,10 @@ pub fn spawn_index_watcher(
             let event = match events.recv().await {
                 Some(e) => e,
                 None => {
-                    tracing::info!("semantic index watcher: event stream closed");
+                    tracing::info!("semantic index watcher: event stream closed, saving");
+                    if let Err(e) = index.save().await {
+                        tracing::warn!(error = %e, "failed to save HNSW on shutdown");
+                    }
                     break;
                 }
             };

@@ -38,12 +38,31 @@ impl HnswIndex {
 
             match hnsw_io.load_hnsw_with_dist(DistCosine) {
                 Ok(loaded) => {
-                    tracing::info!(path = %data_dir.display(), "loaded HNSW index from disk");
+                    // Rebuild embeddings cache from HNSW's persisted vectors.
+                    // Layer 0 contains all points — iterate to populate the cache
+                    // so get_embedding() and get_all_embeddings() work after reload.
+                    let mut embeddings: Vec<Option<Vec<f32>>> = Vec::new();
+                    let pi = loaded.get_point_indexation();
+                    for point in pi.get_layer_iterator(0) {
+                        let slot = point.get_origin_id();
+                        let v = point.get_v();
+                        if slot >= embeddings.len() {
+                            embeddings.resize(slot + 1, None);
+                        }
+                        embeddings[slot] = Some(v.to_vec());
+                    }
+
+                    let count = embeddings.iter().filter(|e| e.is_some()).count();
+                    tracing::info!(
+                        path = %data_dir.display(),
+                        points = count,
+                        "loaded HNSW index from disk"
+                    );
                     return Ok(Self {
                         hnsw: loaded,
                         data_dir,
                         dims: config.dimensions,
-                        embeddings: Vec::new(),
+                        embeddings,
                         _hnsw_io: Some(hnsw_io),
                     });
                 }
@@ -199,6 +218,19 @@ mod tests {
         let results = index.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 0);
+
+        // Embeddings cache must be rebuilt from HNSW on reload
+        let emb0 = index.get_embedding(0).expect("embedding 0 should exist after reload");
+        assert_eq!(emb0.len(), 4);
+        assert!((emb0[0] - 1.0).abs() < 1e-6);
+
+        let emb1 = index.get_embedding(1).expect("embedding 1 should exist after reload");
+        assert_eq!(emb1.len(), 4);
+        assert!((emb1[1] - 1.0).abs() < 1e-6);
+
+        // get_all_embeddings should also work
+        let all = index.get_all_embeddings().unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]

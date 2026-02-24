@@ -720,7 +720,7 @@ pub async fn create_shared_kernel(
                         // Spawn background watcher for re-indexing on block completion
                         let block_source = Arc::new(BlockStoreSource(documents.clone()));
                         let status_receiver = FlowBusStatusReceiver {
-                            sub: block_flows_for_index.subscribe("block.status_changed"),
+                            sub: block_flows_for_index.subscribe("block.status"),
                         };
                         kaijutsu_index::watcher::spawn_index_watcher(
                             idx.clone(),
@@ -4291,6 +4291,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::SearchSimilarResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
+        let span = extract_rpc_trace(p.get_trace(), "search_similar");
         let query = pry!(pry!(p.get_query()).to_str()).to_string();
         let k = p.get_k() as usize;
         let kernel = self.kernel.clone();
@@ -4317,7 +4318,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_neighbors(
@@ -4326,6 +4327,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetNeighborsResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
+        let span = extract_rpc_trace(p.get_trace(), "get_neighbors");
         let context_id_bytes = pry!(p.get_context_id());
         let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
             .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
@@ -4353,7 +4355,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 
     fn get_clusters(
@@ -4362,6 +4364,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetClustersResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
+        let span = extract_rpc_trace(p.get_trace(), "get_clusters");
         let min_cluster_size = p.get_min_cluster_size() as usize;
         let kernel = self.kernel.clone();
 
@@ -4382,7 +4385,7 @@ impl kernel::Server for KernelImpl {
                 }
             }
             Ok(())
-        })
+        }.instrument(span))
     }
 }
 
