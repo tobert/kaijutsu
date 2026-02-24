@@ -25,8 +25,8 @@ use tracing::Instrument;
 
 use crate::rpc::{
     ClientToolFilter, Completion, ContextInfo, DocumentState, HistoryEntry, Identity,
-    KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, ShellValue,
-    StagedDriftInfo, ToolResult, VersionSnapshot,
+    InputState, KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult,
+    ShellValue, StagedDriftInfo, SubmitResult, ToolResult, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
@@ -101,6 +101,12 @@ enum RpcCommand {
     SetShellVar { name: String, value: ShellValue, reply: oneshot::Sender<Result<(), ActorError>> },
     ListShellVars { reply: oneshot::Sender<Result<Vec<(String, ShellValue)>, ActorError>> },
 
+    // ── Input Document ──────────────────────────────────────────────────
+    EditInput { context_id: ContextId, pos: u64, insert: String, delete: u64, reply: oneshot::Sender<Result<u64, ActorError>> },
+    GetInputState { context_id: ContextId, reply: oneshot::Sender<Result<InputState, ActorError>> },
+    PushInputOps { context_id: ContextId, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
+    SubmitInput { context_id: ContextId, reply: oneshot::Sender<Result<SubmitResult, ActorError>> },
+
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool { tool: String, params: String, reply: oneshot::Sender<Result<ToolResult, ActorError>> },
     CallMcpTool { server: String, tool: String, arguments: serde_json::Value, reply: oneshot::Sender<Result<McpToolResult, ActorError>> },
@@ -158,6 +164,10 @@ impl RpcCommand {
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::EditInput { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetInputState { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -394,6 +404,42 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, ActorError> {
         self.send(|reply| RpcCommand::ListShellVars { reply }).await
+    }
+
+    // ── Input Document ──────────────────────────────────────────────────
+
+    /// Edit the input document: insert text at position, delete characters.
+    #[tracing::instrument(skip(self, insert))]
+    pub async fn edit_input(
+        &self,
+        context_id: ContextId,
+        pos: u64,
+        insert: &str,
+        delete: u64,
+    ) -> Result<u64, ActorError> {
+        self.send(|reply| RpcCommand::EditInput {
+            context_id, pos, insert: insert.into(), delete, reply,
+        }).await
+    }
+
+    /// Get the full input document state for a context.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_input_state(&self, context_id: ContextId) -> Result<InputState, ActorError> {
+        self.send(|reply| RpcCommand::GetInputState { context_id, reply }).await
+    }
+
+    /// Push raw CRDT operations to the input document.
+    #[tracing::instrument(skip(self, ops))]
+    pub async fn push_input_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, ActorError> {
+        self.send(|reply| RpcCommand::PushInputOps {
+            context_id, ops: ops.to_vec(), reply,
+        }).await
+    }
+
+    /// Submit the input document: snapshot to conversation block and clear.
+    #[tracing::instrument(skip(self))]
+    pub async fn submit_input(&self, context_id: ContextId) -> Result<SubmitResult, ActorError> {
+        self.send(|reply| RpcCommand::SubmitInput { context_id, reply }).await
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -959,6 +1005,20 @@ async fn dispatch_command(
         }
         RpcCommand::ListShellVars { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.list_shell_vars());
+        }
+
+        // ── Input Document ────────────────────────────────────────
+        RpcCommand::EditInput { context_id, pos, insert, delete, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.edit_input(context_id, pos, &insert, delete));
+        }
+        RpcCommand::GetInputState { context_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_input_state(context_id));
+        }
+        RpcCommand::PushInputOps { context_id, ops, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.push_input_ops(context_id, &ops));
+        }
+        RpcCommand::SubmitInput { context_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.submit_input(context_id));
         }
 
         // ── Tool Execution ───────────────────────────────────────

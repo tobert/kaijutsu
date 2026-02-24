@@ -112,6 +112,8 @@ impl Plugin for CellPlugin {
             (
                 // Block event handling (server → client sync, routes through DocumentCache)
                 systems::handle_block_events,
+                // Input document events (InputTextOps, InputCleared → ComposeBlock sync)
+                systems::handle_input_doc_events.after(systems::handle_block_events),
                 // Context switching (reads ContextSwitchRequested, swaps active cache entry)
                 systems::handle_context_switch.after(systems::handle_block_events),
                 // Handle prompt submission (after context switch to avoid routing to wrong context)

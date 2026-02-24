@@ -329,6 +329,56 @@ pub struct DriftMergeRequest {
 }
 
 // ============================================================================
+// Input Document Types
+// ============================================================================
+
+/// Read the current input document text for a context.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InputReadRequest {
+    /// Context ID (hex or label). Omit to use the current context.
+    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
+    pub context_id: Option<String>,
+}
+
+/// Replace the entire input document text.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InputWriteRequest {
+    /// Context ID (hex or label). Omit to use the current context.
+    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
+    pub context_id: Option<String>,
+    /// The text to write (replaces all existing content).
+    #[schemars(description = "The text to write (replaces all existing content)")]
+    pub text: String,
+}
+
+/// Surgical edit on the input document: insert and/or delete at a position.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InputEditRequest {
+    /// Context ID (hex or label). Omit to use the current context.
+    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
+    pub context_id: Option<String>,
+    /// Character position to start the edit (0-indexed).
+    #[schemars(description = "Character position to start the edit (0-indexed)")]
+    pub pos: u64,
+    /// Text to insert at the position (empty string for delete-only).
+    #[schemars(description = "Text to insert at the position (empty string for delete-only)")]
+    #[serde(default)]
+    pub insert: String,
+    /// Number of characters to delete starting at the position.
+    #[schemars(description = "Number of characters to delete starting at the position")]
+    #[serde(default)]
+    pub delete: u64,
+}
+
+/// Submit the input document: snapshot to a conversation block and clear.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InputSubmitRequest {
+    /// Context ID (hex or label). Omit to use the current context.
+    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
+    pub context_id: Option<String>,
+}
+
+// ============================================================================
 // Response Types
 // ============================================================================
 

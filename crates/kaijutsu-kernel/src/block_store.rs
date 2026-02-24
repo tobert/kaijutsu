@@ -22,7 +22,8 @@ use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status};
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
-use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
+use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
+use crate::input_doc::InputDocEntry;
 
 /// Thread-safe database handle.
 type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
@@ -106,12 +107,16 @@ impl DocumentEntry {
 pub struct BlockStore {
     /// Concurrent document storage.
     documents: DashMap<ContextId, DocumentEntry>,
+    /// Per-context input documents (compose scratchpads).
+    input_docs: DashMap<ContextId, InputDocEntry>,
     /// Database for persistence.
     db: Option<DbHandle>,
     /// Default agent ID for this store.
     agent_id: RwLock<PrincipalId>,
     /// FlowBus for typed pub/sub.
     block_flows: Option<SharedBlockFlowBus>,
+    /// FlowBus for input doc events.
+    input_flows: Option<SharedInputDocFlowBus>,
 }
 
 impl BlockStore {
@@ -119,9 +124,11 @@ impl BlockStore {
     pub fn new(agent_id: PrincipalId) -> Self {
         Self {
             documents: DashMap::new(),
+            input_docs: DashMap::new(),
             db: None,
             agent_id: RwLock::new(agent_id),
             block_flows: None,
+            input_flows: None,
         }
     }
 
@@ -129,9 +136,11 @@ impl BlockStore {
     pub fn with_flows(agent_id: PrincipalId, block_flows: SharedBlockFlowBus) -> Self {
         Self {
             documents: DashMap::new(),
+            input_docs: DashMap::new(),
             db: None,
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
+            input_flows: None,
         }
     }
 
@@ -139,9 +148,11 @@ impl BlockStore {
     pub fn with_db(db: DocumentDb, agent_id: PrincipalId) -> Self {
         Self {
             documents: DashMap::new(),
+            input_docs: DashMap::new(),
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id),
             block_flows: None,
+            input_flows: None,
         }
     }
 
@@ -153,9 +164,11 @@ impl BlockStore {
     ) -> Self {
         Self {
             documents: DashMap::new(),
+            input_docs: DashMap::new(),
             db: Some(Arc::new(std::sync::Mutex::new(db))),
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
+            input_flows: None,
         }
     }
 
@@ -1111,6 +1124,196 @@ impl BlockStore {
         db_guard
             .save_snapshot(&context_id.to_hex(), version, &content, Some(&snapshot_bytes))
             .map_err(|e| format!("DB error: {}", e))?;
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Input Document Operations
+    // =========================================================================
+
+    /// Set the input document flow bus.
+    pub fn set_input_flows(&mut self, bus: SharedInputDocFlowBus) {
+        self.input_flows = Some(bus);
+    }
+
+    /// Get the input flow bus.
+    pub fn input_flows(&self) -> Option<&SharedInputDocFlowBus> {
+        self.input_flows.as_ref()
+    }
+
+    /// Emit an input doc flow event if the bus is configured.
+    fn emit_input(&self, flow: InputDocFlow) {
+        if let Some(bus) = &self.input_flows {
+            bus.publish(flow);
+        }
+    }
+
+    /// Create an input document for a context.
+    ///
+    /// Idempotent — returns Ok if the input doc already exists.
+    pub fn create_input_doc(&self, context_id: ContextId) -> Result<(), String> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.input_docs.entry(context_id) {
+            Entry::Occupied(_) => Ok(()), // Already exists
+            Entry::Vacant(vacant) => {
+                let agent_id = self.agent_id();
+                let entry = InputDocEntry::new(agent_id);
+
+                // Persist if we have a DB
+                if let Some(db) = &self.db {
+                    let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+                    let _ = db_guard.create_input_doc(&context_id.to_hex());
+                }
+
+                vacant.insert(entry);
+                Ok(())
+            }
+        }
+    }
+
+    /// Edit the input document for a context.
+    ///
+    /// Returns serialized ops for broadcasting.
+    pub fn edit_input(
+        &self,
+        context_id: ContextId,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut entry = self.input_docs.get_mut(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+
+        let ops = entry.edit_text(pos, insert, delete)?;
+
+        self.emit_input(InputDocFlow::TextOps {
+            context_id,
+            ops: ops.clone(),
+            source: crate::flows::OpSource::Local,
+        });
+
+        Ok(ops)
+    }
+
+    /// Get the current input text for a context.
+    pub fn get_input_text(&self, context_id: ContextId) -> Result<String, String> {
+        let entry = self.input_docs.get(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+        Ok(entry.get_text())
+    }
+
+    /// Get the full input document state (text + ops + version) for sync.
+    pub fn get_input_state(&self, context_id: ContextId) -> Result<(String, Vec<u8>, u64), String> {
+        let entry = self.input_docs.get(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+        let text = entry.get_text();
+        let ops = entry.all_ops()?;
+        let version = entry.version();
+        Ok((text, ops, version))
+    }
+
+    /// Get input ops since a frontier (for incremental sync).
+    pub fn input_ops_since(&self, context_id: ContextId, frontier: &Frontier) -> Result<Vec<u8>, String> {
+        let entry = self.input_docs.get(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+        entry.ops_since(frontier)
+    }
+
+    /// Merge remote ops into an input document.
+    pub fn merge_input_ops(&self, context_id: ContextId, ops_bytes: &[u8]) -> Result<u64, String> {
+        let mut entry = self.input_docs.get_mut(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+
+        entry.merge_ops(ops_bytes)?;
+
+        self.emit_input(InputDocFlow::TextOps {
+            context_id,
+            ops: ops_bytes.to_vec(),
+            source: crate::flows::OpSource::Remote,
+        });
+
+        Ok(entry.version())
+    }
+
+    /// Clear the input document for a context.
+    ///
+    /// Returns the text that was in the input doc before clearing.
+    pub fn clear_input(&self, context_id: ContextId) -> Result<String, String> {
+        let mut entry = self.input_docs.get_mut(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+
+        let (text, _ops) = entry.clear()?;
+
+        self.emit_input(InputDocFlow::Cleared { context_id });
+
+        // Persist cleared state
+        if let Some(db) = &self.db {
+            if let Ok(db_guard) = db.lock() {
+                let _ = db_guard.clear_input_doc(&context_id.to_hex());
+            }
+        }
+
+        Ok(text)
+    }
+
+    /// Save the current input document state to the database.
+    pub fn save_input_snapshot(&self, context_id: ContextId) -> Result<(), String> {
+        let db = self.db.as_ref().ok_or("No database configured")?;
+
+        let entry = self.input_docs.get(&context_id)
+            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+
+        let text = entry.get_text();
+        let ops_bytes = entry.all_ops()?;
+        let version = entry.version() as i64;
+        drop(entry);
+
+        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+        db_guard.upsert_input_doc(&context_id.to_hex(), &text, Some(&ops_bytes), version)
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Load input documents from database on startup.
+    pub fn load_input_docs_from_db(&self) -> Result<(), String> {
+        let db = self.db.as_ref().ok_or("No database configured")?;
+        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+
+        let rows = db_guard.list_input_docs()
+            .map_err(|e| format!("DB error: {}", e))?;
+        drop(db_guard);
+
+        let agent_id = self.agent_id();
+
+        for (ctx_hex, oplog_bytes) in rows {
+            let context_id = match ContextId::parse(&ctx_hex) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(context_id = %ctx_hex, error = %e, "Failed to parse input doc context ID, skipping");
+                    continue;
+                }
+            };
+
+            let entry = if let Some(ops_bytes) = oplog_bytes {
+                match InputDocEntry::from_ops(&ops_bytes, agent_id) {
+                    Ok(entry) => {
+                        tracing::debug!(context_id = %ctx_hex, text_len = entry.get_text().len(), "Restored input doc from oplog");
+                        entry
+                    }
+                    Err(e) => {
+                        tracing::warn!(context_id = %ctx_hex, error = %e, "Failed to restore input doc, creating empty");
+                        InputDocEntry::new(agent_id)
+                    }
+                }
+            } else {
+                InputDocEntry::new(agent_id)
+            };
+
+            self.input_docs.insert(context_id, entry);
+        }
 
         Ok(())
     }

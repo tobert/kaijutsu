@@ -199,6 +199,10 @@ interface BlockEvents {
   onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status);
   onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data);
   onSyncReset @6 (contextId :Data, generation :UInt64);
+
+  # Input document events (compose scratchpad)
+  onInputTextOps @7 (contextId :Data, ops :Data);
+  onInputCleared @8 (contextId :Data);
 }
 
 # ============================================================================
@@ -907,6 +911,24 @@ interface Kernel {
   # Compact a context's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
   compactContext @74 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
+
+  # ============================================================================
+  # Input Document (CRDT scratchpad per context)
+  # ============================================================================
+  # Each context has a companion CRDT text document for compose input.
+  # Any participant can read/write it. Submit snapshots to conversation block.
+
+  # High-level edit: insert text at position, delete characters
+  editInput @75 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Full state fetch for join/reconnect recovery
+  getInputState @76 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
+
+  # Raw DTE ops for CRDT-aware clients
+  pushInputOps @77 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Atomic submit: read input, detect shell/chat, create block, clear input
+  submitInput @78 (contextId :Data, trace :TraceContext) -> (commandBlockId :BlockId, isShell :Bool);
 }
 
 # ============================================================================

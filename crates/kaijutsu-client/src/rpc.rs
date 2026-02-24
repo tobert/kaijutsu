@@ -1186,6 +1186,109 @@ impl KernelHandle {
         }
         Ok(result)
     }
+
+    // =========================================================================
+    // Input Document (CRDT compose scratchpad)
+    // =========================================================================
+
+    /// High-level edit on the input document: insert text at position, delete characters.
+    ///
+    /// Returns the acknowledged version.
+    #[tracing::instrument(skip(self, insert), name = "rpc_client.edit_input")]
+    pub async fn edit_input(
+        &self,
+        context_id: ContextId,
+        pos: u64,
+        insert: &str,
+        delete: u64,
+    ) -> Result<u64, RpcError> {
+        let mut request = self.kernel.edit_input_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_pos(pos);
+        request.get().set_insert(insert);
+        request.get().set_delete(delete);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_ack_version())
+    }
+
+    /// Get the full input document state for a context.
+    ///
+    /// Returns the current content, CRDT oplog, and version.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_input_state")]
+    pub async fn get_input_state(
+        &self,
+        context_id: ContextId,
+    ) -> Result<InputState, RpcError> {
+        let mut request = self.kernel.get_input_state_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        Ok(InputState {
+            content: result.get_content()?.to_string()?,
+            ops: result.get_ops().map(|d| d.to_vec()).unwrap_or_default(),
+            version: result.get_version(),
+        })
+    }
+
+    /// Push raw CRDT operations to the input document.
+    ///
+    /// For CRDT-aware clients that maintain their own DTE document.
+    /// Returns the acknowledged version.
+    #[tracing::instrument(skip(self, ops), name = "rpc_client.push_input_ops")]
+    pub async fn push_input_ops(
+        &self,
+        context_id: ContextId,
+        ops: &[u8],
+    ) -> Result<u64, RpcError> {
+        let mut request = self.kernel.push_input_ops_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_ops(ops);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_ack_version())
+    }
+
+    /// Submit the input document: snapshot to conversation block and clear.
+    ///
+    /// Returns the created block ID and whether it was detected as a shell command.
+    #[tracing::instrument(skip(self), name = "rpc_client.submit_input")]
+    pub async fn submit_input(
+        &self,
+        context_id: ContextId,
+    ) -> Result<SubmitResult, RpcError> {
+        let mut request = self.kernel.submit_input_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        let block_id = parse_block_id(&result.get_command_block_id()?)?;
+        Ok(SubmitResult {
+            block_id,
+            is_shell: result.get_is_shell(),
+        })
+    }
 }
 
 /// Read a `ShellValue` from a Cap'n Proto reader.
@@ -1573,6 +1676,21 @@ pub struct DocumentState {
     pub version: u64,
     /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
     pub ops: Vec<u8>,
+}
+
+/// Result from submitting the input document (submitInput @78).
+#[derive(Debug, Clone)]
+pub struct SubmitResult {
+    pub block_id: BlockId,
+    pub is_shell: bool,
+}
+
+/// Full input document state for a context.
+#[derive(Debug, Clone)]
+pub struct InputState {
+    pub content: String,
+    pub ops: Vec<u8>,
+    pub version: u64,
 }
 
 /// Result from a kernel tool execution (executeTool @16).

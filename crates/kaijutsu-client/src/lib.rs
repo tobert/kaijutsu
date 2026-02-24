@@ -10,6 +10,7 @@ pub mod ssh;
 pub mod subscriptions;
 pub mod sync;
 pub mod synced_document;
+pub mod synced_input;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {
@@ -19,15 +20,16 @@ pub mod kaijutsu_capnp {
 pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode,
-    ContextInfo, ContextMembership, DocumentState, HistoryEntry, Identity, KernelConfig,
-    KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource, McpResourceContents,
-    McpToolResult, MountSpec, RpcClient, RpcError, ShellValue, StagedDriftInfo, ToolResult,
-    VersionSnapshot,
+    ContextInfo, ContextMembership, DocumentState, HistoryEntry, Identity, InputState,
+    KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource,
+    McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, ShellValue,
+    StagedDriftInfo, SubmitResult, ToolResult, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
+pub use synced_input::SyncedInput;
 
 /// Connect to a server via SSH and return an RPC client
 ///

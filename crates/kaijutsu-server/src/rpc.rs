@@ -37,6 +37,7 @@ use kaijutsu_kernel::{
     // FlowBus
     BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
     SharedConfigFlowBus, shared_config_flow_bus,
+    InputDocFlow, SharedInputDocFlowBus, shared_input_doc_flow_bus,
     block_store::BlockStore,
     // Agents
     AgentCapability, AgentConfig, AgentInfo, AgentStatus, AgentActivityEvent,
@@ -314,7 +315,7 @@ fn kernel_data_dir(kernel_id: KernelId) -> std::path::PathBuf {
 ///
 /// If `data_dir_override` is set, uses that directory for the database.
 /// Otherwise uses the XDG default (~/.local/share/kaijutsu/kernels/{kernel_id_hex}/).
-fn create_block_store_with_db(kernel_id: KernelId, agent_id: PrincipalId, block_flows: SharedBlockFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
+fn create_block_store_with_db(kernel_id: KernelId, agent_id: PrincipalId, block_flows: SharedBlockFlowBus, input_flows: SharedInputDocFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
     let db_dir = match data_dir_override {
         Some(dir) => {
             let d = dir.join(kernel_id.to_hex());
@@ -329,17 +330,29 @@ fn create_block_store_with_db(kernel_id: KernelId, agent_id: PrincipalId, block_
     match DocumentDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened document database at {:?}", db_path);
-            let store = Arc::new(BlockStore::with_db_and_flows(db, agent_id, block_flows));
+            // Ensure input_docs table exists (migration for existing DBs)
+            if let Err(e) = db.ensure_input_docs_table() {
+                log::warn!("Failed to create input_docs table: {}", e);
+            }
+            let mut inner = BlockStore::with_db_and_flows(db, agent_id, block_flows);
+            inner.set_input_flows(input_flows);
+            let store = Arc::new(inner);
             if let Err(e) = store.load_from_db() {
                 log::warn!("Failed to load documents from DB: {}", e);
             } else {
                 log::info!("Loaded {} documents from database", store.len());
             }
+            // Load persisted input documents
+            if let Err(e) = store.load_input_docs_from_db() {
+                log::warn!("Failed to load input docs from DB: {}", e);
+            }
             store
         }
         Err(e) => {
             log::warn!("Failed to open document database at {:?}: {}, using in-memory", db_path, e);
-            Arc::new(BlockStore::with_flows(agent_id, block_flows))
+            let mut inner = BlockStore::with_flows(agent_id, block_flows);
+            inner.set_input_flows(input_flows);
+            Arc::new(inner)
         }
     }
 }
@@ -573,9 +586,10 @@ pub async fn create_shared_kernel(
     config_dir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
-    // Create shared FlowBus first - shared between Kernel and BlockStore
+    // Create shared FlowBus instances - shared between Kernel and BlockStore
     let block_flows = shared_block_flow_bus(1024);
     let config_flows = shared_config_flow_bus(256);
+    let input_flows = shared_input_doc_flow_bus(256);
 
     // Generate kernel ID
     let id = KernelId::new();
@@ -598,7 +612,7 @@ pub async fn create_shared_kernel(
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
     // Create block store with database persistence and shared FlowBus
-    let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, data_dir);
+    let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, input_flows, data_dir);
 
     // Create default context
     let ctx_id = ContextId::new();
@@ -1185,96 +1199,131 @@ impl kernel::Server for KernelImpl {
         let callback = pry!(pry!(params.get()).get_callback());
 
         {
-            // Get the FlowBus from the kernel
+            // Get the FlowBus instances from the kernel
             let block_flows = self.kernel.kernel.block_flows().clone();
+            let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
 
             // Spawn a bridge task that forwards FlowBus events to the callback
             // Use spawn_local because Cap'n Proto callbacks are not Send
+            // Uses tokio::select! to multiplex block + input doc events on one callback
             tokio::task::spawn_local(async move {
-                let mut sub = block_flows.subscribe("block.*");
-                log::debug!("Started FlowBus subscription for kernel {}", kernel_id.to_hex());
+                let mut block_sub = block_flows.subscribe("block.*");
+                // Input flows are optional (only present if set_input_flows was called)
+                let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
+                log::debug!("Started FlowBus subscription for kernel {} (input_flows={})",
+                    kernel_id.to_hex(), input_sub.is_some());
 
-                while let Some(msg) = sub.recv().await {
-                    // Each branch sends its own request type; we convert the result to bool
-                    let success = match msg.payload {
-                        BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
-                            let mut req = callback.on_block_inserted_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                params.set_has_after_id(after_id.is_some());
-                                if let Some(after) = after_id {
-                                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                loop {
+                    let success = tokio::select! {
+                        Some(msg) = block_sub.recv() => {
+                            match msg.payload {
+                                BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
+                                    let mut req = callback.on_block_inserted_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_has_after_id(after_id.is_some());
+                                        if let Some(after) = after_id {
+                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                                        }
+                                        // Include CRDT ops for proper sync
+                                        params.set_ops(ops);
+                                        let mut block_state = params.init_block();
+                                        set_block_snapshot(&mut block_state, block);
+                                    }
+                                    req.send().promise.await.is_ok()
                                 }
-                                // Include CRDT ops for proper sync
-                                params.set_ops(ops);
-                                let mut block_state = params.init_block();
-                                set_block_snapshot(&mut block_state, block);
-                            }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::Deleted { context_id, ref block_id, .. } => {
-                            let mut req = callback.on_block_deleted_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                            }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
-                            let mut req = callback.on_block_status_changed_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                params.set_status(status_to_capnp(status));
-                            }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
-                            let mut req = callback.on_block_collapsed_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                params.set_collapsed(collapsed);
-                            }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
-                            let mut req = callback.on_block_moved_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                params.set_has_after_id(after_id.is_some());
-                                if let Some(after) = after_id {
-                                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                                BlockFlow::Deleted { context_id, ref block_id, .. } => {
+                                    let mut req = callback.on_block_deleted_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
+                                    let mut req = callback.on_block_status_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_status(status_to_capnp(status));
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
+                                    let mut req = callback.on_block_collapsed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_collapsed(collapsed);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
+                                    let mut req = callback.on_block_moved_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_has_after_id(after_id.is_some());
+                                        if let Some(after) = after_id {
+                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                                        }
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
+                                    let mut req = callback.on_block_text_ops_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_ops(ops);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::SyncReset { context_id, generation } => {
+                                    let mut req = callback.on_sync_reset_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_generation(generation);
+                                    }
+                                    req.send().promise.await.is_ok()
                                 }
                             }
-                            req.send().promise.await.is_ok()
                         }
-                        BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
-                            let mut req = callback.on_block_text_ops_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                params.set_ops(ops);
+                        Some(msg) = async {
+                            match &mut input_sub {
+                                Some(sub) => sub.recv().await,
+                                None => std::future::pending().await,
                             }
-                            req.send().promise.await.is_ok()
-                        }
-                        BlockFlow::SyncReset { context_id, generation } => {
-                            let mut req = callback.on_sync_reset_request();
-                            {
-                                let mut params = req.get();
-                                params.set_context_id(context_id.as_bytes());
-                                params.set_generation(generation);
+                        } => {
+                            match msg.payload {
+                                InputDocFlow::TextOps { context_id, ref ops, .. } => {
+                                    let mut req = callback.on_input_text_ops_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_ops(ops);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                InputDocFlow::Cleared { context_id } => {
+                                    let mut req = callback.on_input_cleared_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
                             }
-                            req.send().promise.await.is_ok()
                         }
+                        else => break,
                     };
 
                     // If callback fails (client disconnected), stop the bridge task
@@ -1565,6 +1614,11 @@ impl kernel::Server for KernelImpl {
                 ));
             }
 
+            // Create the input document for this context
+            if let Err(e) = kernel.documents.create_input_doc(context_id) {
+                log::warn!("Failed to create input doc for context {}: {}", context_id, e);
+            }
+
             // Register in kernel-level drift router with label and parent
             {
                 let mut drift = kernel.kernel.drift().write().await;
@@ -1621,6 +1675,11 @@ impl kernel::Server for KernelImpl {
                 }
             } else {
                 log::debug!("Re-joining existing context {}", context_id);
+            }
+
+            // Ensure input doc exists (idempotent)
+            if let Err(e) = kernel.documents.create_input_doc(context_id) {
+                log::warn!("Failed to create input doc for context {}: {}", context_id, e);
             }
 
             // Register context in kernel-level drift router
@@ -3913,6 +3972,263 @@ impl kernel::Server for KernelImpl {
         r.set_new_size(0);
         r.set_generation(0);
         Promise::ok(())
+    }
+
+    // =========================================================================
+    // Input document operations (compose scratchpad)
+    // =========================================================================
+
+    fn edit_input(
+        self: Rc<Self>,
+        params: kernel::EditInputParams,
+        mut results: kernel::EditInputResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "edit_input").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let pos = p.get_pos() as usize;
+        let insert = pry!(pry!(p.get_insert()).to_str()).to_owned();
+        let delete = p.get_delete() as usize;
+
+        log::debug!("edit_input: context={}, pos={}, insert_len={}, delete={}", context_id, pos, insert.len(), delete);
+
+        let documents = &self.kernel.documents;
+
+        match documents.edit_input(context_id, pos, &insert, delete) {
+            Ok(_ops) => {
+                // edit_input returns the ops and emits InputDocFlow::TextOps via FlowBus.
+                // The version is implicit from the DTE document; return 0 as ack.
+                // Clients use the FlowBus subscription for real-time sync.
+                results.get().set_ack_version(0);
+                Promise::ok(())
+            }
+            Err(e) => {
+                Promise::err(capnp::Error::failed(format!("edit_input failed: {}", e)))
+            }
+        }
+    }
+
+    fn get_input_state(
+        self: Rc<Self>,
+        params: kernel::GetInputStateParams,
+        mut results: kernel::GetInputStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_input_state").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        log::debug!("get_input_state: context={}", context_id);
+
+        let documents = &self.kernel.documents;
+
+        match documents.get_input_state(context_id) {
+            Ok((content, ops, version)) => {
+                let mut r = results.get();
+                r.set_content(&content);
+                r.set_ops(&ops);
+                r.set_version(version);
+                Promise::ok(())
+            }
+            Err(e) => {
+                Promise::err(capnp::Error::failed(format!("get_input_state failed: {}", e)))
+            }
+        }
+    }
+
+    fn push_input_ops(
+        self: Rc<Self>,
+        params: kernel::PushInputOpsParams,
+        mut results: kernel::PushInputOpsResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "push_input_ops").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let ops_data = pry!(p.get_ops()).to_vec();
+
+        log::debug!("push_input_ops: context={}, ops_len={}", context_id, ops_data.len());
+
+        let documents = &self.kernel.documents;
+
+        match documents.merge_input_ops(context_id, &ops_data) {
+            Ok(version) => {
+                results.get().set_ack_version(version);
+                Promise::ok(())
+            }
+            Err(e) => {
+                Promise::err(capnp::Error::failed(format!("push_input_ops failed: {}", e)))
+            }
+        }
+    }
+
+    fn submit_input(
+        self: Rc<Self>,
+        params: kernel::SubmitInputParams,
+        mut results: kernel::SubmitInputResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "submit_input");
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        log::info!("submit_input: context={}", context_id);
+
+        let kernel = self.kernel.clone();
+        let connection = self.connection.clone();
+        let user_agent_id = self.connection.borrow().principal.id;
+
+        Promise::from_future(async move {
+            let documents = kernel.documents.clone();
+
+            // Atomically read and clear the input document
+            let text = documents.clear_input(context_id)
+                .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
+
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return Err(capnp::Error::failed("input is empty".into()));
+            }
+
+            // Detect shell prefix: `:` or `` ` ``
+            let is_shell = text.starts_with(':') || text.starts_with('`');
+
+            // Document must exist — join_context is the sole creator
+            if documents.get(context_id).is_none() {
+                return Err(capnp::Error::failed(
+                    format!("context {} not found — call join_context first", context_id)
+                ));
+            }
+
+            if is_shell {
+                // Strip the shell prefix
+                let code = if text.starts_with(':') || text.starts_with('`') {
+                    text[1..].trim().to_string()
+                } else {
+                    text.clone()
+                };
+
+                // Get or create embedded kaish executor
+                let kaish = {
+                    let kernel_ref = &kernel;
+                    let mut conn = connection.borrow_mut();
+
+                    if conn.kaish.is_none() {
+                        log::info!("Creating embedded kaish for kernel {}", kernel_ref.id.to_hex());
+                        match EmbeddedKaish::with_identity(
+                            &format!("{}-{}-{}", kernel_ref.name, conn.principal.username, conn.session_id.short()),
+                            kernel_ref.documents.clone(),
+                            kernel_ref.kernel.clone(),
+                            None,
+                            conn.principal.id,
+                            conn.current_context_or(kernel_ref.default_context_id),
+                            conn.session_id,
+                            kernel_ref.id,
+                        ) {
+                            Ok(kaish) => {
+                                conn.kaish = Some(Rc::new(kaish));
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create embedded kaish: {}", e);
+                                return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
+                            }
+                        }
+                    }
+
+                    conn.kaish.as_ref().unwrap().clone()
+                };
+
+                // Create ToolCall block for the shell command (authored by user)
+                let last_block = documents.last_block_id(context_id);
+                let command_block_id = documents.insert_tool_call_as(
+                    context_id, None, last_block.as_ref(),
+                    "shell", serde_json::json!({"code": code}),
+                    Some(user_agent_id),
+                ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
+
+                // Create ToolResult block (empty, filled by execution)
+                let output_block_id = documents.insert_tool_result_as(
+                    context_id, &command_block_id, Some(&command_block_id),
+                    "", false, None,
+                    Some(PrincipalId::system()),
+                ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
+
+                // Mark output block as Running
+                if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
+                    log::warn!("Failed to set output block to Running: {}", e);
+                }
+
+                // Spawn execution in background
+                let documents_clone = documents.clone();
+                let output_block_id_clone = output_block_id;
+                tokio::task::spawn_local(async move {
+                    tokio::task::yield_now().await;
+
+                    match kaish.execute(&code).await {
+                        Ok(result) => {
+                            let output_text = if result.err.is_empty() {
+                                result.out
+                            } else if result.out.is_empty() {
+                                result.err
+                            } else {
+                                format!("{}\n{}", result.out, result.err)
+                            };
+
+                            if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
+                                log::error!("Failed to update shell output: {}", e);
+                            }
+
+                            if let Some(ref output_data) = result.output {
+                                if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
+                                    log::error!("Failed to set output data: {}", e);
+                                }
+                            }
+
+                            let final_status = if result.code == 0 { Status::Done } else { Status::Error };
+                            if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
+                                log::error!("Failed to set output block status: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Error: {}", e);
+                            log::error!("Shell execution failed: {}", e);
+                            if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
+                                log::error!("Failed to update shell output with error: {}", e);
+                            }
+                            if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
+                                log::error!("Failed to set output block error status: {}", e);
+                            }
+                        }
+                    }
+                });
+
+                // Return command block ID
+                let mut block_id_builder = results.get().init_command_block_id();
+                set_block_id_builder(&mut block_id_builder, &command_block_id);
+                results.get().set_is_shell(true);
+            } else {
+                // Chat prompt — create user message block and kick off LLM
+
+                // Create user message block at the end of the document
+                let last_block = documents.last_block_id(context_id);
+                let user_block_id = documents.insert_block_as(
+                    context_id, None, last_block.as_ref(),
+                    Role::User, BlockKind::Text, &text, Some(user_agent_id),
+                ).map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
+
+                // Return user block ID — LLM streaming is handled separately via prompt RPC
+                let mut block_id_builder = results.get().init_command_block_id();
+                set_block_id_builder(&mut block_id_builder, &user_block_id);
+                results.get().set_is_shell(false);
+            }
+
+            Ok(())
+        }.instrument(trace_span))
     }
 }
 

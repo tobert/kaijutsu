@@ -14,6 +14,7 @@
 pub mod agents;
 pub mod block_store;
 pub mod block_tools;
+pub mod input_doc;
 pub mod config_backend;
 pub mod control;
 pub mod conversation;
@@ -112,4 +113,7 @@ pub use flows::{
     LoggingFlow, SharedLoggingFlowBus, shared_logging_flow_bus,
     // Config flow types
     ConfigFlow, ConfigSource, SharedConfigFlowBus, shared_config_flow_bus,
+    // Input doc flow types
+    InputDocFlow, SharedInputDocFlowBus, shared_input_doc_flow_bus,
 };
+pub use input_doc::InputDocEntry;

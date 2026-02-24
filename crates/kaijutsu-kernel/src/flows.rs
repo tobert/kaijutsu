@@ -889,6 +889,57 @@ impl HasSubject for LoggingFlow {
 }
 
 // ============================================================================
+// Input Doc Flow Events
+// ============================================================================
+
+/// Input document flow events for compose scratchpad changes.
+///
+/// These events are emitted when the per-context input document is modified.
+/// Used to broadcast typing to other participants on the same context.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum InputDocFlow {
+    /// Text operations applied to the input document.
+    TextOps {
+        /// The context whose input doc was modified.
+        context_id: ContextId,
+        /// Serialized DTE operations (postcard-encoded SerializedOpsOwned).
+        ops: Vec<u8>,
+        /// Origin of this operation.
+        source: OpSource,
+    },
+
+    /// The input document was cleared (after submit).
+    Cleared {
+        /// The context whose input doc was cleared.
+        context_id: ContextId,
+    },
+}
+
+impl InputDocFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::TextOps { .. } => "input.text_ops",
+            Self::Cleared { .. } => "input.cleared",
+        }
+    }
+
+    /// Get the context ID for this event.
+    pub fn context_id(&self) -> ContextId {
+        match self {
+            Self::TextOps { context_id, .. }
+            | Self::Cleared { context_id, .. } => *context_id,
+        }
+    }
+}
+
+impl HasSubject for InputDocFlow {
+    fn subject(&self) -> &str {
+        InputDocFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
@@ -909,6 +960,9 @@ pub type SharedLoggingFlowBus = Arc<FlowBus<LoggingFlow>>;
 
 /// Thread-safe handle to a ConfigFlow bus.
 pub type SharedConfigFlowBus = Arc<FlowBus<ConfigFlow>>;
+
+/// Thread-safe handle to an InputDocFlow bus.
+pub type SharedInputDocFlowBus = Arc<FlowBus<InputDocFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
@@ -937,6 +991,11 @@ pub fn shared_logging_flow_bus(capacity: usize) -> SharedLoggingFlowBus {
 
 /// Create a new shared config flow bus.
 pub fn shared_config_flow_bus(capacity: usize) -> SharedConfigFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared input doc flow bus.
+pub fn shared_input_doc_flow_bus(capacity: usize) -> SharedInputDocFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 

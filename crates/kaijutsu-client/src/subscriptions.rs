@@ -68,6 +68,15 @@ pub enum ServerEvent {
         context_id: ContextId,
         generation: u64,
     },
+    /// CRDT text operations applied to a context's input document.
+    InputTextOps {
+        context_id: ContextId,
+        ops: Vec<u8>,
+    },
+    /// A context's input document was cleared (after submit).
+    InputCleared {
+        context_id: ContextId,
+    },
     /// An MCP resource's content was updated.
     ResourceUpdated {
         server: String,
@@ -368,6 +377,55 @@ impl block_events::Server for BlockEventsForwarder {
         let generation = params.get_generation();
 
         let _ = self.event_tx.send(ServerEvent::SyncReset { context_id, generation });
+        Promise::ok(())
+    }
+
+    fn on_input_text_ops(
+        self: Rc<Self>,
+        params: block_events::OnInputTextOpsParams,
+        _results: block_events::OnInputTextOpsResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let ops = match params.get_ops() {
+            Ok(data) => data.to_vec(),
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.event_tx.send(ServerEvent::InputTextOps { context_id, ops });
+        Promise::ok(())
+    }
+
+    fn on_input_cleared(
+        self: Rc<Self>,
+        params: block_events::OnInputClearedParams,
+        _results: block_events::OnInputClearedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.event_tx.send(ServerEvent::InputCleared { context_id });
         Promise::ok(())
     }
 }

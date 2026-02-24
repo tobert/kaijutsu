@@ -1261,6 +1261,8 @@ pub fn handle_block_events(
     mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
     mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
     session_agent: Res<super::components::SessionAgent>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    channel: Res<crate::connection::RpcResultChannel>,
 ) {
     use kaijutsu_client::ServerEvent;
     use super::components::CachedDocument;
@@ -1272,7 +1274,8 @@ pub fn handle_block_events(
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
-        if let RpcResultMessage::ContextJoined { membership, initial_state } = result {
+        match result {
+        RpcResultMessage::ContextJoined { membership, initial_state } => {
             let ctx_id = membership.context_id;
 
             // Create or update cache entry
@@ -1293,6 +1296,7 @@ pub fn handle_block_events(
 
                 let cached = CachedDocument {
                     synced,
+                    input: None,
                     context_name: membership.context_id.short(),
                     synced_at_generation: sync_gen.0,
                     last_accessed: std::time::Instant::now(),
@@ -1312,6 +1316,39 @@ pub fn handle_block_events(
                         }
                     }
                 }
+            }
+
+            // Phase 4: Fetch input document state for the joined context.
+            // This initializes the SyncedInput so compose edits can be
+            // dual-written to the server CRDT.
+            if let Some(ref actor) = actor {
+                let handle = actor.handle.clone();
+                let tx = channel.sender();
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        match handle.get_input_state(ctx_id).await {
+                            Ok(state) => {
+                                let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                    context_id: ctx_id,
+                                    state,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("get_input_state failed for {}: {}", ctx_id, e);
+                                // Fall back to empty SyncedInput — edits will still
+                                // work, just without server history.
+                                let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                    context_id: ctx_id,
+                                    state: kaijutsu_client::InputState {
+                                        content: String::new(),
+                                        ops: Vec::new(),
+                                        version: 0,
+                                    },
+                                });
+                            }
+                        }
+                    })
+                    .detach();
             }
 
             // If this is the first context or no active doc yet, make it active
@@ -1336,6 +1373,33 @@ pub fn handle_block_events(
                     current_conv.0 = Some(ctx_str);
                 }
             }
+        }
+        RpcResultMessage::InputStateReceived { context_id, state } => {
+            // Phase 4: Initialize SyncedInput from server state.
+            let ctx_id = *context_id;
+            if let Some(cached) = doc_cache.get_mut(ctx_id)
+                && cached.input.is_none()
+            {
+                if state.ops.is_empty() {
+                    // No server state — create empty SyncedInput
+                    cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                    info!("Initialized empty SyncedInput for {}", ctx_id);
+                } else {
+                    match kaijutsu_client::SyncedInput::from_state(ctx_id, agent_id, &state.ops) {
+                        Ok(input) => {
+                            info!("Initialized SyncedInput for {} (text='{}')", ctx_id, state.content);
+                            cached.input = Some(input);
+                        }
+                        Err(e) => {
+                            warn!("Failed to create SyncedInput from state for {}: {}", ctx_id, e);
+                            // Fall back to empty
+                            cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
         }
     }
 
@@ -1379,6 +1443,80 @@ pub fn handle_block_events(
     if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;
+    }
+}
+
+/// Handle input document events (InputTextOps, InputCleared).
+///
+/// Phase 4: Processes server-side input document changes and syncs them
+/// into the ComposeBlock for rendering.
+///
+/// - `InputTextOps`: Remote edits (from another agent or collaborative session)
+///   are merged into the `SyncedInput` CRDT and the ComposeBlock text is updated.
+/// - `InputCleared`: Server confirmed input was submitted and cleared. Resets
+///   the ComposeBlock. This is the authoritative "submit succeeded" signal.
+pub fn handle_input_doc_events(
+    mut server_events: MessageReader<ServerEventMessage>,
+    mut doc_cache: ResMut<super::components::DocumentCache>,
+    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+) {
+    use kaijutsu_client::ServerEvent;
+
+    for ServerEventMessage(event) in server_events.read() {
+        match event {
+            ServerEvent::InputTextOps { context_id, ops } => {
+                // Only process for active context
+                if doc_cache.active_id() != Some(*context_id) {
+                    // Still merge ops for inactive contexts so CRDT stays in sync
+                    if let Some(cached) = doc_cache.get_mut(*context_id)
+                        && let Some(input) = &mut cached.input
+                    {
+                        if let Err(e) = input.apply_remote_ops(ops) {
+                            warn!("Failed to apply remote input ops for {}: {}", context_id, e);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(cached) = doc_cache.get_mut(*context_id)
+                    && let Some(input) = &mut cached.input
+                {
+                    if let Err(e) = input.apply_remote_ops(ops) {
+                        warn!("Failed to apply remote input ops: {}", e);
+                        continue;
+                    }
+                    // Sync compose text to match CRDT state
+                    let text = input.text();
+                    if let Ok(mut compose) = compose_blocks.single_mut() {
+                        compose.text = text.clone();
+                        // Clamp cursor to valid range
+                        compose.cursor = compose.cursor.min(text.len());
+                        compose.selection_anchor = None;
+                    }
+                }
+            }
+            ServerEvent::InputCleared { context_id } => {
+                // Clear CRDT state
+                if let Some(cached) = doc_cache.get_mut(*context_id)
+                    && let Some(input) = &mut cached.input
+                {
+                    input.clear();
+                }
+
+                // Clear compose block only for active context
+                if doc_cache.active_id() == Some(*context_id) {
+                    if let Ok(mut compose) = compose_blocks.single_mut() {
+                        compose.text.clear();
+                        compose.cursor = 0;
+                        compose.selection_anchor = None;
+                    }
+                    // Enable follow mode for the incoming response
+                    scroll_state.start_following();
+                }
+            }
+            _ => {} // Other events handled by handle_block_events
+        }
     }
 }
 

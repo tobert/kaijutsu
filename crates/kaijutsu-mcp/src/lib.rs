@@ -477,6 +477,32 @@ impl KaijutsuMcp {
         kaijutsu_crdt::resolve_context_prefix(entries, query)
             .map_err(|e| format!("Error resolving context '{query}': {e}"))
     }
+
+    /// Resolve a context ID for input document operations.
+    ///
+    /// If `query` is Some, resolves via label/hex prefix lookup (Remote) or
+    /// direct parse (Local). If None, falls back to the current connected
+    /// context (Remote) or errors (Local).
+    async fn resolve_input_context(
+        &self,
+        query: Option<&str>,
+    ) -> Result<kaijutsu_crdt::ContextId, String> {
+        match (&self.backend, query) {
+            // Explicit context provided — resolve it
+            (Backend::Remote(remote), Some(q)) => {
+                self.resolve_context(&remote.actor, q).await
+            }
+            (Backend::Local(_), Some(q)) => {
+                ContextId::parse(q)
+                    .map_err(|e| format!("Error: invalid context ID '{}': {}", q, e))
+            }
+            // No context provided — use current
+            (Backend::Remote(remote), None) => Ok(remote.context_id),
+            (Backend::Local(_), None) => {
+                Err("Error: context_id is required in local mode".to_string())
+            }
+        }
+    }
 }
 
 impl Default for KaijutsuMcp {
@@ -1615,6 +1641,154 @@ impl KaijutsuMcp {
         output.push_str(&format!("    Full undo would require storing undo stack or computing inverse operations.\n"));
 
         output
+    }
+
+    // ========================================================================
+    // Input Document Tools (CRDT compose scratchpad)
+    // ========================================================================
+
+    #[tool(description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
+    async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> String {
+        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match &self.backend {
+            Backend::Local(store) => {
+                // Ensure input doc exists
+                let _ = store.create_input_doc(ctx_id);
+                match store.get_input_text(ctx_id) {
+                    Ok(text) => serde_json::json!({
+                        "context_id": ctx_id.short(),
+                        "content": text,
+                        "length": text.len(),
+                    }).to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+            Backend::Remote(remote) => {
+                match remote.actor.get_input_state(ctx_id).await {
+                    Ok(state) => serde_json::json!({
+                        "context_id": ctx_id.short(),
+                        "content": state.content,
+                        "length": state.content.len(),
+                        "version": state.version,
+                    }).to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+        }
+    }
+
+    #[tool(description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.write_input")]
+    async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> String {
+        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match &self.backend {
+            Backend::Local(store) => {
+                // Ensure input doc exists
+                let _ = store.create_input_doc(ctx_id);
+                // Clear then write
+                let _ = store.clear_input(ctx_id);
+                if !req.text.is_empty() {
+                    if let Err(e) = store.edit_input(ctx_id, 0, &req.text, 0) {
+                        return format!("Error: {}", e);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "context_id": ctx_id.short(),
+                    "length": req.text.len(),
+                }).to_string()
+            }
+            Backend::Remote(remote) => {
+                // Get current state to know how much to delete
+                let current_len = match remote.actor.get_input_state(ctx_id).await {
+                    Ok(state) => state.content.len() as u64,
+                    Err(e) => return format!("Error getting current state: {}", e),
+                };
+                // Delete all, then insert new text in one operation
+                match remote.actor.edit_input(ctx_id, 0, &req.text, current_len).await {
+                    Ok(version) => serde_json::json!({
+                        "success": true,
+                        "context_id": ctx_id.short(),
+                        "length": req.text.len(),
+                        "version": version,
+                    }).to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+        }
+    }
+
+    #[tool(description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.edit_input")]
+    async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> String {
+        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match &self.backend {
+            Backend::Local(store) => {
+                // Ensure input doc exists
+                let _ = store.create_input_doc(ctx_id);
+                match store.edit_input(ctx_id, req.pos as usize, &req.insert, req.delete as usize) {
+                    Ok(_ops) => {
+                        let text = store.get_input_text(ctx_id).unwrap_or_default();
+                        serde_json::json!({
+                            "success": true,
+                            "context_id": ctx_id.short(),
+                            "length": text.len(),
+                        }).to_string()
+                    }
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+            Backend::Remote(remote) => {
+                match remote.actor.edit_input(ctx_id, req.pos, &req.insert, req.delete).await {
+                    Ok(version) => serde_json::json!({
+                        "success": true,
+                        "context_id": ctx_id.short(),
+                        "version": version,
+                    }).to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+        }
+    }
+
+    #[tool(description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.")]
+    #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
+    async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> String {
+        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
+        match &self.backend {
+            Backend::Local(_store) => {
+                // Local mode doesn't have submit semantics (no conversation block creation)
+                "Error: submit_input requires --connect to kaijutsu-server".to_string()
+            }
+            Backend::Remote(remote) => {
+                match remote.actor.submit_input(ctx_id).await {
+                    Ok(result) => serde_json::json!({
+                        "success": true,
+                        "context_id": ctx_id.short(),
+                        "block_id": result.block_id.to_key(),
+                        "is_shell": result.is_shell,
+                    }).to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+        }
     }
 }
 
@@ -3164,5 +3338,142 @@ mod tests {
             entry.doc.full_text().contains("Post-reset block"),
             "New block content present after reset recovery"
         );
+    }
+
+    // =========================================================================
+    // Input Document Tools (Local mode)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_read_input_local_requires_context() {
+        let mcp = KaijutsuMcp::new();
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: None,
+        })).await;
+        assert!(result.contains("Error"), "Should error without context_id in local mode: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_read_input_local_empty() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: Some(ctx_id.to_hex()),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "");
+        assert_eq!(parsed["length"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_input_local() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let hex = ctx_id.to_hex();
+
+        // Write some text
+        let result = mcp.write_input(Parameters(InputWriteRequest {
+            context_id: Some(hex.clone()),
+            text: "hello from MCP".to_string(),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["success"].as_bool().unwrap(), "write_input failed: {result}");
+        assert_eq!(parsed["length"].as_u64().unwrap(), 14);
+
+        // Read it back
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: Some(hex.clone()),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "hello from MCP");
+    }
+
+    #[tokio::test]
+    async fn test_write_input_overwrite() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let hex = ctx_id.to_hex();
+
+        mcp.write_input(Parameters(InputWriteRequest {
+            context_id: Some(hex.clone()),
+            text: "first".to_string(),
+        })).await;
+
+        mcp.write_input(Parameters(InputWriteRequest {
+            context_id: Some(hex.clone()),
+            text: "second".to_string(),
+        })).await;
+
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: Some(hex.clone()),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn test_edit_input_insert() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let hex = ctx_id.to_hex();
+
+        // Write initial text
+        mcp.write_input(Parameters(InputWriteRequest {
+            context_id: Some(hex.clone()),
+            text: "hello world".to_string(),
+        })).await;
+
+        // Insert " beautiful" at position 5
+        let result = mcp.edit_input(Parameters(InputEditRequest {
+            context_id: Some(hex.clone()),
+            pos: 5,
+            insert: " beautiful".to_string(),
+            delete: 0,
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["success"].as_bool().unwrap(), "edit_input failed: {result}");
+
+        // Read back
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: Some(hex.clone()),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "hello beautiful world");
+    }
+
+    #[tokio::test]
+    async fn test_edit_input_delete() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let hex = ctx_id.to_hex();
+
+        mcp.write_input(Parameters(InputWriteRequest {
+            context_id: Some(hex.clone()),
+            text: "hello world".to_string(),
+        })).await;
+
+        // Delete "world" (5 chars starting at position 6)
+        mcp.edit_input(Parameters(InputEditRequest {
+            context_id: Some(hex.clone()),
+            pos: 6,
+            insert: String::new(),
+            delete: 5,
+        })).await;
+
+        let result = mcp.read_input(Parameters(InputReadRequest {
+            context_id: Some(hex.clone()),
+        })).await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "hello ");
+    }
+
+    #[tokio::test]
+    async fn test_submit_input_local_errors() {
+        let mcp = KaijutsuMcp::new();
+        let ctx_id = ContextId::new();
+        let result = mcp.submit_input(Parameters(InputSubmitRequest {
+            context_id: Some(ctx_id.to_hex()),
+        })).await;
+        assert!(result.contains("Error"), "submit_input should error in local mode: {result}");
     }
 }

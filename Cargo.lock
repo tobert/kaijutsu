@@ -5096,6 +5096,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "diamond-types-extended",
  "env_logger",
  "futures",
  "kaijutsu-crdt",

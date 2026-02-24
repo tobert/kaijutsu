@@ -390,6 +390,82 @@ impl DocumentDb {
 
         rows.collect()
     }
+
+    // =========================================================================
+    // Input document persistence
+    // =========================================================================
+
+    /// Ensure the input_docs table exists.
+    pub fn ensure_input_docs_table(&self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS input_docs (
+                context_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL DEFAULT '',
+                oplog_bytes BLOB,
+                version INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER DEFAULT (unixepoch())
+            );"
+        )
+    }
+
+    /// Create or update an input document.
+    pub fn upsert_input_doc(
+        &self,
+        context_id: &str,
+        content: &str,
+        oplog_bytes: Option<&[u8]>,
+        version: i64,
+    ) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO input_docs (context_id, content, oplog_bytes, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![context_id, content, oplog_bytes, version],
+        )?;
+        Ok(())
+    }
+
+    /// Create an empty input document (idempotent).
+    pub fn create_input_doc(&self, context_id: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO input_docs (context_id, content, version) VALUES (?1, '', 0)",
+            params![context_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear an input document's content.
+    pub fn clear_input_doc(&self, context_id: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE input_docs SET content = '', oplog_bytes = NULL, version = version + 1, updated_at = unixepoch() WHERE context_id = ?1",
+            params![context_id],
+        )?;
+        Ok(())
+    }
+
+    /// Load all input documents.
+    pub fn list_input_docs(&self) -> SqliteResult<Vec<(String, Option<Vec<u8>>)>> {
+        // Table may not exist yet (DB created before migration)
+        let table_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='input_docs'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, oplog_bytes FROM input_docs"
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let ctx_hex: String = row.get(0)?;
+            let oplog_bytes: Option<Vec<u8>> = row.get(1)?;
+            Ok((ctx_hex, oplog_bytes))
+        })?;
+
+        rows.collect()
+    }
 }
 
 #[cfg(test)]

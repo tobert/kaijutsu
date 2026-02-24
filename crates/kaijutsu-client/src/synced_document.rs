@@ -240,10 +240,11 @@ impl SyncedDocument {
                 SyncEffect::NeedsResync
             }
 
-            // Resource events don't affect document state
-            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => {
-                SyncEffect::Ignored
-            }
+            // Resource and input document events don't affect conversation document state
+            ServerEvent::ResourceUpdated { .. }
+            | ServerEvent::ResourceListChanged { .. }
+            | ServerEvent::InputTextOps { .. }
+            | ServerEvent::InputCleared { .. } => SyncEffect::Ignored,
         }
     }
 

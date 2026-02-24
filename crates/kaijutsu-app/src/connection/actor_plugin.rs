@@ -134,6 +134,11 @@ pub enum RpcResultMessage {
     DriftQueueReceived {
         staged: Vec<kaijutsu_client::StagedDriftInfo>,
     },
+    /// Input document state received (for initializing SyncedInput on context join).
+    InputStateReceived {
+        context_id: ContextId,
+        state: kaijutsu_client::InputState,
+    },
     /// Generic RPC error (for toast/notification).
     RpcError {
         operation: String,

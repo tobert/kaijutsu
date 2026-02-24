@@ -488,6 +488,9 @@ pub struct BlockEditCursor {
 pub struct CachedDocument {
     /// Synced document — wraps CrdtBlockStore + SyncManager.
     pub synced: kaijutsu_client::SyncedDocument,
+    /// CRDT-backed input document (compose scratchpad).
+    /// `None` until the input state is fetched from the server.
+    pub input: Option<kaijutsu_client::SyncedInput>,
     /// Context name (e.g. the kernel_id or user-supplied name).
     pub context_name: String,
     /// Generation counter at last sync (for staleness detection).

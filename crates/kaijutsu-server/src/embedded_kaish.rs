@@ -40,6 +40,7 @@ use kaijutsu_kernel::Kernel as KaijutsuKernel;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::docs_filesystem::KaijutsuFilesystem;
+use crate::input_filesystem::InputFilesystem;
 use crate::kaish_backend::{KaijutsuBackend, SharedContextId};
 use crate::mount_backend::MountBackend;
 
@@ -93,6 +94,10 @@ impl EmbeddedKaish {
         kernel_id: KernelId,
     ) -> Result<Self> {
         let shared_context_id: SharedContextId = Arc::new(RwLock::new(context_id));
+        let input_fs = Arc::new(InputFilesystem::new(
+            blocks.clone(),
+            shared_context_id.clone(),
+        ));
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
@@ -124,6 +129,7 @@ impl EmbeddedKaish {
 
         let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
             vfs.mount_arc("/v/docs", docs_fs);
+            vfs.mount_arc("/v/input", input_fs);
         })?;
 
         Ok(Self {

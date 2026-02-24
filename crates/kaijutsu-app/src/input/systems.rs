@@ -811,20 +811,48 @@ pub fn handle_timeline(
 /// Consumes TextInputReceived for character insertion and ActionFired for
 /// editing actions (Submit, Backspace, Delete, cursor movement).
 /// Auto-detects shell prefix (: or `) for routing on Submit.
+///
+/// **Phase 4 — Dual-write to CRDT input document:**
+/// Each local edit is immediately applied to ComposeBlock (zero perceived latency),
+/// then asynchronously pushed to the server via `edit_input` RPC. On submit,
+/// `submit_input` RPC is used instead of local `PromptSubmitted` — the compose
+/// block is cleared only when the server sends `InputCleared`.
 pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
     mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    doc_cache: Res<crate::cell::DocumentCache>,
 ) {
     let Ok(mut compose) = compose_blocks.single_mut() else {
         return;
     };
 
+    // Helper: fire-and-forget edit_input to server (async, non-blocking).
+    // Captures cursor position BEFORE the local edit so the server sees
+    // the same offset.
+    let ctx_id = doc_cache.active_id();
+
     // Handle text insertion
     for super::events::TextInputReceived(text) in text_events.read() {
+        let pos_before = compose.cursor;
         compose.insert(text);
+
+        // Dual-write: push insert to server
+        if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+            let handle = actor.handle.clone();
+            let insert_text = text.clone();
+            let pos = pos_before as u64;
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
+                        log::warn!("edit_input (insert) failed: {e}");
+                    }
+                })
+                .detach();
+        }
     }
 
     // Handle editing actions
@@ -832,19 +860,119 @@ pub fn handle_compose_input(
         match action {
             Action::Submit => {
                 if !compose.is_empty() {
-                    let text = compose.take();
-                    info!("ComposeBlock submitted: {} chars", text.len());
-                    submit_writer.write(PromptSubmitted { text });
+                    // Try CRDT-backed submit via server
+                    if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                        let handle = actor.handle.clone();
+                        info!("ComposeBlock submit via submit_input (ctx={})", ctx);
+                        bevy::tasks::IoTaskPool::get()
+                            .spawn(async move {
+                                match handle.submit_input(ctx).await {
+                                    Ok(result) => {
+                                        log::info!(
+                                            "submit_input succeeded: block={:?} shell={}",
+                                            result.block_id, result.is_shell
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::error!("submit_input failed: {e}");
+                                        // Server-side submit failed — the text stays
+                                        // in compose (no InputCleared will arrive).
+                                    }
+                                }
+                            })
+                            .detach();
+                        // Do NOT clear compose locally — wait for InputCleared event.
+                    } else {
+                        // Offline fallback: use local PromptSubmitted path
+                        let text = compose.take();
+                        info!("ComposeBlock submitted (offline): {} chars", text.len());
+                        submit_writer.write(PromptSubmitted { text });
+                    }
                 }
             }
             Action::InsertNewline => {
+                let pos_before = compose.cursor;
                 compose.insert("\n");
+
+                if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                    let handle = actor.handle.clone();
+                    let pos = pos_before as u64;
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.edit_input(ctx, pos, "\n", 0).await {
+                                log::warn!("edit_input (newline) failed: {e}");
+                            }
+                        })
+                        .detach();
+                }
             }
             Action::Backspace => {
+                // Capture position/deletion info BEFORE local edit
+                let had_selection = compose.selection_range().is_some();
+                let (del_pos, del_len) = if had_selection {
+                    let range = compose.selection_range().unwrap();
+                    (range.start, range.end - range.start)
+                } else if compose.cursor > 0 {
+                    // Find the character boundary like ComposeBlock.backspace does
+                    let prev = compose.text[..compose.cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    (prev, compose.cursor - prev)
+                } else {
+                    (0, 0)
+                };
+
                 compose.backspace();
+
+                if del_len > 0
+                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
+                {
+                    let handle = actor.handle.clone();
+                    let pos = del_pos as u64;
+                    let delete = del_len as u64;
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
+                                log::warn!("edit_input (backspace) failed: {e}");
+                            }
+                        })
+                        .detach();
+                }
             }
             Action::Delete => {
+                let had_selection = compose.selection_range().is_some();
+                let (del_pos, del_len) = if had_selection {
+                    let range = compose.selection_range().unwrap();
+                    (range.start, range.end - range.start)
+                } else if compose.cursor < compose.text.len() {
+                    let next = compose.text[compose.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| compose.cursor + i)
+                        .unwrap_or(compose.text.len());
+                    (compose.cursor, next - compose.cursor)
+                } else {
+                    (0, 0)
+                };
+
                 compose.delete();
+
+                if del_len > 0
+                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
+                {
+                    let handle = actor.handle.clone();
+                    let pos = del_pos as u64;
+                    let delete = del_len as u64;
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
+                                log::warn!("edit_input (delete) failed: {e}");
+                            }
+                        })
+                        .detach();
+                }
             }
             Action::CursorLeft => {
                 compose.move_left();
@@ -867,10 +995,28 @@ pub fn handle_compose_input(
             Action::Cut => {
                 if let Some(ref mut clip) = clipboard {
                     if let Some(text) = compose.selected_text() {
+                        // Capture deletion info before modifying
+                        let range = compose.selection_range().unwrap();
+                        let del_pos = range.start;
+                        let del_len = range.end - range.start;
+
                         if let Err(e) = clip.0.set_text(text) {
                             warn!("Cut failed: {e}");
                         } else {
                             compose.delete_selection();
+
+                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                                let handle = actor.handle.clone();
+                                let pos = del_pos as u64;
+                                let delete = del_len as u64;
+                                bevy::tasks::IoTaskPool::get()
+                                    .spawn(async move {
+                                        if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
+                                            log::warn!("edit_input (cut) failed: {e}");
+                                        }
+                                    })
+                                    .detach();
+                            }
                         }
                     }
                 }
@@ -878,7 +1024,32 @@ pub fn handle_compose_input(
             Action::Paste => {
                 if let Some(ref mut clip) = clipboard {
                     match clip.0.get_text() {
-                        Ok(text) => compose.insert(&text),
+                        Ok(text) => {
+                            // If there's a selection, capture the deletion first
+                            let sel_range = compose.selection_range();
+                            let pos_before = if let Some(ref range) = sel_range {
+                                range.start
+                            } else {
+                                compose.cursor
+                            };
+                            let del_len = sel_range.as_ref().map(|r| r.end - r.start).unwrap_or(0);
+
+                            compose.insert(&text);
+
+                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                                let handle = actor.handle.clone();
+                                let pos = pos_before as u64;
+                                let delete = del_len as u64;
+                                let insert_text = text.clone();
+                                bevy::tasks::IoTaskPool::get()
+                                    .spawn(async move {
+                                        if let Err(e) = handle.edit_input(ctx, pos, &insert_text, delete).await {
+                                            log::warn!("edit_input (paste) failed: {e}");
+                                        }
+                                    })
+                                    .detach();
+                            }
+                        }
                         Err(e) => warn!("Paste failed: {e}"),
                     }
                 }

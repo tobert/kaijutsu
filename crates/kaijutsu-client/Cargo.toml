@@ -20,6 +20,9 @@ postcard = { version = "1", features = ["use-std"] }
 tracing = "0.1"
 kaijutsu-telemetry = { workspace = true }
 
+# CRDT engine (for SyncedInput — wraps DTE Document directly)
+diamond-types-extended.workspace = true
+
 # Shared CRDT types
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-types = { path = "../kaijutsu-types" }
