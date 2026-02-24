@@ -13,6 +13,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
+use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -76,6 +77,12 @@ fn main() {
             // Disable Bevy's LogPlugin - we set up our own tracing subscriber
             .disable::<bevy::log::LogPlugin>()
         )
+        // 3D mesh picking for constellation node clicks
+        .add_plugins(MeshPickingPlugin)
+        .insert_resource(MeshPickingSettings {
+            require_markers: true,
+            ..default()
+        })
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
         // Text rendering (glyphon + cosmic-text)

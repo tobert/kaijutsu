@@ -11,19 +11,24 @@ use bevy::{
     asset::RenderAssetUsages,
     camera::visibility::RenderLayers,
     mesh::PrimitiveTopology,
+    picking::{Pickable, prelude::*},
     prelude::*,
 };
 
 use super::{
-    Constellation,
-    hyper::LorentzTransform,
+    Constellation, ConstellationContainer, ConstellationVisible,
+    hyper::{HyperPoint, LorentzTransform},
     layout::H3Layout,
-    viewport::{ViewportState, TestSphere},
+    viewport::{ViewportState, ConstellationCamera3d, TestSphere},
 };
+use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::{Theme, agent_color_for_provider};
 
 /// The render layer used for all constellation 3D content.
 const CONSTELLATION_LAYER: usize = 1;
+
+/// Number of subdivisions for geodesic edge curves.
+const GEODESIC_SUBDIVISIONS: usize = 8;
 
 /// Marker for a 3D node entity in the constellation scene.
 #[derive(Component)]
@@ -34,6 +39,12 @@ pub struct Node3d {
 /// Marker for the edge line mesh entity.
 #[derive(Component)]
 pub struct EdgeMesh;
+
+/// Marker for a screen-space label overlaid on a 3D node.
+#[derive(Component)]
+pub struct NodeLabel3d {
+    pub context_id: String,
+}
 
 /// Resource holding the H3 layout and focus transform.
 #[derive(Resource)]
@@ -66,6 +77,7 @@ pub fn setup_render3d_systems(app: &mut App) {
                 update_3d_node_transforms,
                 update_3d_node_visuals,
                 rebuild_3d_edges,
+                update_node_labels,
                 cleanup_test_spheres,
             )
                 .chain(),
@@ -148,7 +160,9 @@ fn spawn_3d_nodes(
             })),
             Transform::from_translation(ball_pos),
             RenderLayers::layer(CONSTELLATION_LAYER),
-        ));
+            Pickable::default(),
+        ))
+        .observe(on_node_3d_click);
     }
 }
 
@@ -234,7 +248,12 @@ fn update_3d_node_visuals(
     }
 }
 
-/// Rebuild the edge line mesh when layout changes.
+/// Rebuild the edge line mesh when layout changes, using geodesic arcs.
+///
+/// For each parent-child edge, subdivides the hyperbolic geodesic into
+/// `GEODESIC_SUBDIVISIONS` segments, applies the focus transform, and
+/// projects to ball coordinates. This produces smooth curves that follow
+/// the natural geometry of the Poincaré ball.
 fn rebuild_3d_edges(
     mut commands: Commands,
     constellation: Res<Constellation>,
@@ -257,7 +276,7 @@ fn rebuild_3d_edges(
         commands.entity(entity).despawn();
     }
 
-    if constellation.nodes.len() < 2 {
+    if constellation.nodes.len() < 2 || scene.layout.nodes.len() != constellation.nodes.len() {
         return;
     }
 
@@ -269,17 +288,50 @@ fn rebuild_3d_edges(
         .map(|(i, n)| (n.context_id.as_str(), i))
         .collect();
 
-    // Collect edge vertex pairs
+    // Collect edge vertex pairs via geodesic subdivision
     let mut positions: Vec<[f32; 3]> = Vec::new();
 
     for (i, node) in constellation.nodes.iter().enumerate() {
-        if let Some(ref parent_id) = node.parent_id {
-            if let Some(&parent_idx) = id_to_idx.get(parent_id.as_str()) {
-                let from = scene.ball_positions[parent_idx];
-                let to = scene.ball_positions[i];
-                positions.push(from.into());
-                positions.push(to.into());
+        let Some(ref parent_id) = node.parent_id else {
+            continue;
+        };
+        let Some(&parent_idx) = id_to_idx.get(parent_id.as_str()) else {
+            continue;
+        };
+
+        let parent_hyper = scene.layout.nodes[parent_idx].hyper_pos;
+        let child_hyper = scene.layout.nodes[i].hyper_pos;
+        let dist = parent_hyper.distance(&child_hyper);
+
+        if dist < 1e-10 {
+            continue; // Coincident points — skip
+        }
+
+        // Boost that maps parent to origin, compute child in parent-centered frame
+        let boost = LorentzTransform::boost_to_origin(&parent_hyper);
+        let boost_inv = boost.inverse();
+        let child_local = boost.apply(&child_hyper);
+
+        let dir = child_local.spatial();
+        let dir_len = dir.length();
+        if dir_len < 1e-14 {
+            continue;
+        }
+        let dir_normalized = dir / dir_len;
+
+        // Subdivide the geodesic and project each point
+        let mut prev_ball: Option<Vec3> = None;
+        for step in 0..=GEODESIC_SUBDIVISIONS {
+            let t = step as f64 / GEODESIC_SUBDIVISIONS as f64;
+            let interp = HyperPoint::from_direction_and_distance(dir_normalized, dist * t);
+            let global = boost_inv.apply(&interp);
+            let ball = scene.focus_transform.apply(&global).to_ball_f32();
+
+            if let Some(prev) = prev_ball {
+                positions.push(prev.into());
+                positions.push(ball.into());
             }
+            prev_ball = Some(ball);
         }
     }
 
@@ -303,6 +355,159 @@ fn rebuild_3d_edges(
         Transform::IDENTITY,
         RenderLayers::layer(CONSTELLATION_LAYER),
     ));
+}
+
+/// Observer: click on a 3D node sphere to focus that context.
+fn on_node_3d_click(
+    click: On<Pointer<Click>>,
+    node_query: Query<&Node3d>,
+    mut constellation: ResMut<Constellation>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+    mut focus: ResMut<crate::input::focus::FocusArea>,
+    focus_stack: Res<crate::input::focus::FocusStack>,
+) {
+    if focus_stack.is_modal() {
+        return;
+    }
+    let Ok(node) = node_query.get(click.entity) else {
+        return;
+    };
+    info!("3D click on constellation node: {}", node.context_id);
+    constellation.focus(&node.context_id);
+    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&node.context_id) {
+        switch_writer.write(crate::cell::ContextSwitchRequested {
+            context_id: ctx_id,
+        });
+        *focus = crate::input::focus::FocusArea::Compose;
+    }
+}
+
+/// Update screen-space labels for 3D constellation nodes.
+///
+/// Projects 3D node positions through the constellation camera to get 2D
+/// screen coordinates, then positions MSDF text labels as absolute-positioned
+/// children of the ConstellationContainer.
+///
+/// Labels are spawned/despawned when the constellation changes, but
+/// repositioned every frame (cheap — just `Val::Px` updates).
+fn update_node_labels(
+    mut commands: Commands,
+    constellation: Res<Constellation>,
+    visible: Res<ConstellationVisible>,
+    viewport_state: Res<ViewportState>,
+    cameras: Query<(&Camera, &GlobalTransform), With<ConstellationCamera3d>>,
+    nodes_3d: Query<(&Node3d, &Transform), Without<EdgeMesh>>,
+    mut labels: Query<(Entity, &mut NodeLabel3d, &mut Node)>,
+    container_q: Query<Entity, With<ConstellationContainer>>,
+) {
+    if !visible.0 || viewport_state.camera_entity.is_none() {
+        // Hide all labels when constellation is not visible
+        for (_, _, mut node) in labels.iter_mut() {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok(container_entity) = container_q.single() else {
+        return;
+    };
+
+    let Ok((camera, cam_gtransform)) = cameras.single() else {
+        return;
+    };
+
+    // Build a set of existing label context_ids for spawn/despawn tracking
+    let existing_label_ids: std::collections::HashSet<String> = labels
+        .iter()
+        .map(|(_, label, _)| label.context_id.clone())
+        .collect();
+
+    // Build set of current 3D node context_ids
+    let current_node_ids: std::collections::HashSet<&str> = nodes_3d
+        .iter()
+        .map(|(n, _)| n.context_id.as_str())
+        .collect();
+
+    // Despawn labels for nodes no longer present
+    for (entity, label, _) in labels.iter() {
+        if !current_node_ids.contains(label.context_id.as_str()) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // Spawn labels for new nodes
+    if constellation.is_changed() {
+        for (node_3d, _) in nodes_3d.iter() {
+            if existing_label_ids.contains(&node_3d.context_id) {
+                continue;
+            }
+
+            // Get label text: prefer human label, fall back to short hex
+            let label_text = constellation
+                .node_by_id(&node_3d.context_id)
+                .and_then(|n| n.model.as_deref().or(Some(&n.context_id)))
+                .map(|s| {
+                    if s.len() > 16 {
+                        format!("{}...", &s[..13])
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .unwrap_or_default();
+
+            let label_entity = commands
+                .spawn((
+                    NodeLabel3d {
+                        context_id: node_3d.context_id.clone(),
+                    },
+                    Node {
+                        position_type: PositionType::Absolute,
+                        ..default()
+                    },
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
+                        MsdfUiText::new(&label_text)
+                            .with_font_size(10.0)
+                            .with_color(Color::srgba(0.8, 0.85, 0.9, 0.9)),
+                        UiTextPositionCache::default(),
+                        Node {
+                            min_width: Val::Px(80.0),
+                            min_height: Val::Px(14.0),
+                            ..default()
+                        },
+                    ));
+                })
+                .id();
+
+            commands.entity(container_entity).add_child(label_entity);
+        }
+    }
+
+    // Reposition all labels by projecting 3D positions to viewport coords
+    for (_, label, mut node) in labels.iter_mut() {
+        // Find the matching 3D node's transform
+        let Some(node_transform) = nodes_3d
+            .iter()
+            .find(|(n, _)| n.context_id == label.context_id)
+            .map(|(_, t)| t)
+        else {
+            node.display = Display::None;
+            continue;
+        };
+
+        match camera.world_to_viewport(cam_gtransform, node_transform.translation) {
+            Ok(viewport_pos) => {
+                node.display = Display::Flex;
+                node.left = Val::Px(viewport_pos.x - 40.0);
+                node.top = Val::Px(viewport_pos.y + 12.0); // Below the sphere
+            }
+            Err(_) => {
+                // Behind camera
+                node.display = Display::None;
+            }
+        }
+    }
 }
 
 /// Remove Phase 1.5 test spheres once real nodes are being rendered.

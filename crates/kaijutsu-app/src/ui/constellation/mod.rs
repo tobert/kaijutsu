@@ -51,6 +51,8 @@ use crate::agents::AgentActivityMessage;
 pub use create_dialog::{DialogMode, OpenContextDialog, create_or_fork_context};
 pub use navigation::{CameraOrbit, find_nearest_in_direction_3d};
 pub use render3d::ConstellationScene;
+#[allow(unused_imports)] // Phase 5+: available for despawn queries from other modules
+pub use render3d::NodeLabel3d;
 
 // Render module provides visual systems (used by the plugin internally)
 

@@ -9,12 +9,13 @@
 use bevy::{
     asset::RenderAssetUsages,
     camera::{RenderTarget, visibility::RenderLayers},
+    picking::{Pickable, mesh_picking::MeshPickingCamera},
     prelude::*,
     render::render_resource::{TextureDimension, TextureFormat, TextureUsages},
     ui::widget::ViewportNode,
 };
 
-use super::ConstellationContainer;
+use super::{ConstellationContainer, ConstellationVisible};
 
 /// Marker for the 3D camera used by the constellation viewport.
 #[derive(Component)]
@@ -45,8 +46,22 @@ pub fn setup_viewport_systems(app: &mut App) {
             Update,
             (
                 setup_constellation_3d,
+                sync_camera_active,
             ),
         );
+}
+
+/// Disable the 3D camera when the constellation is hidden to save GPU work.
+fn sync_camera_active(
+    visible: Res<ConstellationVisible>,
+    mut cameras: Query<&mut Camera, With<ConstellationCamera3d>>,
+) {
+    if !visible.is_changed() {
+        return;
+    }
+    for mut camera in cameras.iter_mut() {
+        camera.is_active = visible.0;
+    }
 }
 
 /// One-time setup: create render target, 3D camera, test geometry, and wire
@@ -84,6 +99,7 @@ fn setup_constellation_3d(
     let camera_entity = commands
         .spawn((
             ConstellationCamera3d,
+            MeshPickingCamera,
             Camera3d::default(),
             Camera {
                 order: -1, // Render before the UI camera
@@ -151,10 +167,12 @@ fn setup_constellation_3d(
         RenderLayers::layer(CONSTELLATION_LAYER),
     ));
 
-    // Translucent ball boundary sphere (r=0.95)
+    // Translucent ball boundary sphere (r=0.95) — IGNORE picking so clicks
+    // pass through to the node spheres inside
     let boundary_mesh = meshes.add(Sphere::new(0.95));
     commands.spawn((
         BallBoundary,
+        Pickable::IGNORE,
         Mesh3d(boundary_mesh),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgba(0.3, 0.4, 0.8, 0.04),
