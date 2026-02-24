@@ -1181,6 +1181,21 @@ mod tests {
         assert!(status_sub.try_recv().is_none());
     }
 
+    /// Regression: rpc.rs semantic index watcher subscribes to "block.status".
+    /// If StatusChanged's subject changes, the watcher silently stops receiving events.
+    #[test]
+    fn test_status_changed_subject_is_block_status() {
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let flow = BlockFlow::StatusChanged {
+            context_id: ctx,
+            block_id: id,
+            status: Status::Done,
+            source: OpSource::Local,
+        };
+        assert_eq!(flow.subject(), "block.status");
+    }
+
     #[test]
     fn test_shared_block_flow_bus() {
         let bus = shared_block_flow_bus(1024);

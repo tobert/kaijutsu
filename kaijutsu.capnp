@@ -239,7 +239,7 @@ struct ContextHandleInfo {
 
 struct SimilarContext {
   contextId @0 :Data;   # 16-byte ContextId
-  score @1 :Float32;    # Cosine similarity (0.0 - 1.0)
+  score @1 :Float32;    # Cosine similarity, clamped to [0.0, 1.0]
   label @2 :Text;       # Optional context label
 }
 
