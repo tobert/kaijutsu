@@ -46,7 +46,7 @@ const KEY_TOOL_INPUT: &str = "tool_input";
 const KEY_TOOL_CALL_ID: &str = "tool_call_id";
 const KEY_EXIT_CODE: &str = "exit_code";
 const KEY_IS_ERROR: &str = "is_error";
-const KEY_OUTPUT: &str = "display_hint"; // Keep DTE map key for compat with existing data
+const KEY_OUTPUT: &str = "output";
 
 // Drift-specific fields
 const KEY_SOURCE_CONTEXT: &str = "source_context";

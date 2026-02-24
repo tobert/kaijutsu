@@ -108,13 +108,13 @@ Full serializable block state. Extends BlockHeader with non-Copy fields:
 
 - `content: String` — primary text
 - `tool_name`, `tool_input`, `tool_call_id` — tool metadata
-- `display_hint` — per-viewer rendering hint
+- `output` — structured output data (OutputData) for rich formatting
 - `source_context`, `source_model`, `drift_kind` — drift provenance
 - `file_path` — logical path for File blocks
 - `order_key` — fractional index for sibling ordering (set by BlockStore)
 
 Named constructors: `text()`, `thinking()`, `tool_call()`, `tool_result()`,
-`tool_result_with_hint()`, `drift()`, `file()`. Also `BlockSnapshotBuilder`.
+`tool_result_with_output()`, `drift()`, `file()`. Also `BlockSnapshotBuilder`.
 
 `is_shell()` convenience: `tool_kind == Some(Shell) && kind.is_tool()`.
 

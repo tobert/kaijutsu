@@ -512,12 +512,10 @@ pub struct BlockSnapshot {
     pub is_error: bool,
     /// Structured output data for richer formatting (tables, trees).
     /// Used for shell output blocks to enable per-viewer rendering.
-    /// Replaces the old JSON-serialized `display_hint` string.
     ///
-    /// Wire format: JSON string (for postcard backward compat with the old
-    /// `display_hint: Option<String>` field). Custom serde module handles
-    /// the String ↔ OutputData conversion transparently.
-    #[serde(default, alias = "display_hint", with = "output_serde")]
+    /// Wire format: JSON-serialized `:Text` in Cap'n Proto (field still named
+    /// `displayHint` on wire — renaming is a separate schema change).
+    #[serde(default)]
     pub output: Option<OutputData>,
 
     // Drift-specific fields (Drift)
@@ -1025,48 +1023,6 @@ impl BlockSnapshotBuilder {
 // Postcard backward-compat serde for OutputData
 // ============================================================================
 
-/// Custom serde module that serializes `Option<OutputData>` as `Option<String>`
-/// (JSON-encoded) for postcard binary compatibility.
-///
-/// Old format: `display_hint: Option<String>` (JSON string or None)
-/// New format: `output: Option<OutputData>` (typed struct)
-///
-/// Since postcard is positional, the binary layout must remain `Option<String>`.
-/// This module handles the transparent conversion:
-/// - Serialize: OutputData → JSON string → Option<String>
-/// - Deserialize: Option<String> → try parse as OutputData → Option<OutputData>
-///
-/// Old `DisplayHint` JSON (e.g. `{"type":"table",...}`) silently becomes None
-/// since it won't parse as OutputData. This is acceptable — old formatting
-/// degrades to plain text.
-mod output_serde {
-    use super::OutputData;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(output: &Option<OutputData>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match output {
-            Some(data) => {
-                let s = serde_json::to_string(data).map_err(serde::ser::Error::custom)?;
-                serializer.serialize_some(&s)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OutputData>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: Option<String> = Option::deserialize(deserializer)?;
-        match s {
-            Some(s) => Ok(serde_json::from_str(&s).ok()),
-            None => Ok(None),
-        }
-    }
-}
 
 // ============================================================================
 // Tests
@@ -1561,22 +1517,6 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_postcard_backward_compat_old_display_hint() {
-        // Simulate reading old postcard data where display_hint was Option<String>.
-        // The output_serde module should handle this: old DisplayHint JSON
-        // won't parse as OutputData and silently becomes None.
-        let ctx = test_context();
-        let author = test_agent();
-        let id = BlockId::new(ctx, author, 1);
-
-        // Create a snapshot with output=None, serialize it, verify roundtrip
-        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        let bytes = postcard::to_allocvec(&snap).unwrap();
-        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
-        assert!(parsed.output.is_none());
-    }
-
-    #[test]
     fn test_block_snapshot_json_roundtrip_with_output() {
         let ctx = test_context();
         let author = test_agent();
@@ -1590,32 +1530,6 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.output, Some(output_data));
-    }
-
-    #[test]
-    fn test_block_snapshot_json_backward_compat_old_display_hint() {
-        // Old JSON had display_hint as a raw JSON string.
-        // With the alias + output_serde, old format parses gracefully —
-        // the JSON string is deserialized, and serde_json::from_str attempts
-        // to parse it as OutputData. With #[serde(default)] on OutputData,
-        // any valid JSON object will parse (with empty defaults).
-        // This is acceptable — the data won't crash, just won't be useful.
-        let ctx = test_context();
-        let author = test_agent();
-        let id = BlockId::new(ctx, author, 1);
-        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        let mut json = serde_json::to_string(&snap).unwrap();
-        // Inject old-style display_hint field (a raw string, not OutputData JSON)
-        json = json.replace(
-            "\"output\":null",
-            "\"display_hint\":\"{\\\"type\\\":\\\"table\\\"}\"",
-        );
-        // Should parse without error
-        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
-        // Old format parses but produces empty OutputData (all defaults)
-        if let Some(ref output) = parsed.output {
-            assert!(output.root.is_empty());
-        }
     }
 
     #[test]
