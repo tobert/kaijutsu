@@ -582,9 +582,15 @@ impl BlockStore {
 
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input)
                 .map_err(|e| e.to_string())?;
-            let mut snapshot = entry.doc.get_block_snapshot(&block_id)
+
+            // Persist tool_use_id to BlockContent so it survives snapshot round-trips
+            if let Some(ref tui) = tool_use_id {
+                entry.doc.set_tool_use_id(&block_id, Some(tui.clone()))
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
-            snapshot.tool_use_id = tool_use_id;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
@@ -645,9 +651,15 @@ impl BlockStore {
 
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code)
                 .map_err(|e| e.to_string())?;
-            let mut snapshot = entry.doc.get_block_snapshot(&block_id)
+
+            // Persist tool_use_id to BlockContent so it survives snapshot round-trips
+            if let Some(ref tui) = tool_use_id {
+                entry.doc.set_tool_use_id(&block_id, Some(tui.clone()))
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
-            snapshot.tool_use_id = tool_use_id;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
@@ -810,6 +822,20 @@ impl BlockStore {
         let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
         let agent_id = self.agent_id();
         entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
+        entry.touch(agent_id);
+        Ok(())
+    }
+
+    /// Set the LLM-assigned tool invocation ID on a block.
+    pub fn set_tool_use_id(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        tool_use_id: Option<String>,
+    ) -> Result<(), String> {
+        let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        let agent_id = self.agent_id();
+        entry.doc.set_tool_use_id(block_id, tool_use_id).map_err(|e| e.to_string())?;
         entry.touch(agent_id);
         Ok(())
     }
@@ -1077,26 +1103,13 @@ impl BlockStore {
                             );
                             DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
                         }
-                        Err(_) => {
-                            // Legacy fallback: try JSON for pre-migration data
-                            match serde_json::from_slice::<StoreSnapshot>(&oplog_bytes) {
-                                Ok(store_snapshot) => {
-                                    tracing::info!(
-                                        document_id = %meta.id,
-                                        blocks = store_snapshot.blocks.len(),
-                                        "Restored document from legacy JSON snapshot (will migrate to postcard on next save)"
-                                    );
-                                    DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        document_id = %meta.id,
-                                        error = %e,
-                                        "Failed to deserialize store snapshot as postcard or JSON, skipping corrupted document"
-                                    );
-                                    continue;
-                                }
-                            }
+                        Err(e) => {
+                            tracing::error!(
+                                document_id = %meta.id,
+                                error = %e,
+                                "Failed to deserialize store snapshot, skipping (wipe DB to recover)"
+                            );
+                            continue;
                         }
                     }
                 } else {

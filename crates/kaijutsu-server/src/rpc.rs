@@ -4905,6 +4905,11 @@ fn set_block_snapshot(
         builder.set_file_path(path);
     }
 
+    // Set tool_use_id (LLM-assigned tool invocation ID)
+    if let Some(ref tui) = block.tool_use_id {
+        builder.set_tool_use_id(tui);
+    }
+
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
         builder.set_source_context(ctx.as_bytes());
@@ -5045,11 +5050,16 @@ fn parse_block_snapshot(
         } else { None },
         tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
         tool_input,
+        tool_use_id: if reader.has_tool_use_id() {
+            reader.get_tool_use_id().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+        } else { None },
         tool_call_id,
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
         output,
-        tool_use_id: None, // Not on wire yet — only populated from LLM stream events
         file_path: if reader.has_file_path() {
             reader.get_file_path().ok()
                 .and_then(|s| s.to_str().ok())

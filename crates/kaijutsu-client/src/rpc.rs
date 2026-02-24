@@ -1539,6 +1539,17 @@ pub(crate) fn parse_block_snapshot(
         }
     }
 
+    // tool_use_id (LLM-assigned tool invocation ID)
+    if reader.has_tool_use_id() {
+        if let Ok(tui) = reader.get_tool_use_id() {
+            if let Ok(s) = tui.to_str() {
+                if !s.is_empty() {
+                    builder = builder.tool_use_id(s);
+                }
+            }
+        }
+    }
+
     // File path (for BlockKind::File blocks)
     if reader.has_file_path() {
         if let Ok(path) = reader.get_file_path() {

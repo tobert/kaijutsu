@@ -21,9 +21,15 @@ const INPUT_TEXT_KEY: &str = "input";
 
 impl SyncedInput {
     /// Create a new empty input doc for a context.
+    ///
+    /// Pre-registers `PrincipalId::system()` as a known DTE agent so that
+    /// server-originated ops (which use the system principal) can merge
+    /// without `ParseError::DataMissing`.
     pub fn new(context_id: ContextId, principal_id: PrincipalId) -> Self {
         let mut doc = Document::new();
         let agent = doc.create_agent(Uuid::from_bytes(*principal_id.as_bytes()));
+        // Pre-register the server's system agent so remote ops can merge
+        let _system = doc.create_agent(Uuid::from_bytes(*PrincipalId::system().as_bytes()));
         {
             let mut w = doc.writer(agent);
             w.root_create_text(INPUT_TEXT_KEY);
@@ -207,5 +213,54 @@ mod tests {
         let ctx = test_context_id();
         let input = SyncedInput::new(ctx, test_principal_id());
         assert_eq!(input.context_id(), ctx);
+    }
+
+    #[test]
+    fn test_system_agent_ops_via_from_state() {
+        // Verify that system agent ops work when client is created via from_state
+        // (the normal path: server creates doc, client gets full state, then incremental ops)
+        let ctx = test_context_id();
+        let system_pid = PrincipalId::system();
+
+        // Create a "server-side" doc using the system agent
+        let mut server_doc = Document::new();
+        let server_agent = server_doc.create_agent(Uuid::from_bytes(*system_pid.as_bytes()));
+        server_doc.transact(server_agent, |tx| {
+            tx.root().create_text(INPUT_TEXT_KEY);
+        });
+
+        // Client gets full state from server (the normal sync path)
+        let full_ops = {
+            let ops = server_doc.ops_since_owned(&diamond_types_extended::Frontier::root());
+            postcard::to_allocvec(&ops).unwrap()
+        };
+        let mut client = SyncedInput::from_state(ctx, test_principal_id(), &full_ops).unwrap();
+
+        // Now server edits with system agent — incremental ops should merge
+        let frontier_before = server_doc.version().clone();
+        server_doc.transact(server_agent, |tx| {
+            if let Some(mut text) = tx.get_text_mut(&[INPUT_TEXT_KEY]) {
+                text.insert(0, "server edit");
+            }
+        });
+        let incremental_ops = server_doc.ops_since_owned(&frontier_before);
+        let ops_bytes = postcard::to_allocvec(&incremental_ops).unwrap();
+
+        // Client should accept these ops because it has the full causal history
+        client.apply_remote_ops(&ops_bytes).unwrap();
+        assert_eq!(client.text(), "server edit");
+    }
+
+    #[test]
+    fn test_system_agent_preregistered_in_new() {
+        // Verify that PrincipalId::system() is registered as a known agent
+        // in SyncedInput::new(). This is a best-effort measure — it helps when
+        // the only issue is unknown agent UUID, but doesn't solve divergent
+        // document structure (which requires from_state).
+        let ctx = test_context_id();
+        let input = SyncedInput::new(ctx, test_principal_id());
+        // The doc should have 2 agents: client + system
+        // (No direct way to assert this, but verify it doesn't panic)
+        assert_eq!(input.text(), "");
     }
 }

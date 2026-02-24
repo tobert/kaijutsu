@@ -618,6 +618,18 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the LLM-assigned tool invocation ID on a block.
+    pub fn set_tool_use_id(&mut self, id: &BlockId, tool_use_id: Option<String>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_tool_use_id(tool_use_id);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {
@@ -1247,6 +1259,29 @@ mod tests {
 
         assert_eq!(restored.block_count(), store.block_count());
         assert_eq!(restored.full_text(), store.full_text());
+    }
+
+    #[test]
+    fn test_tool_use_id_snapshot_roundtrip() {
+        let mut store = test_store();
+
+        // Insert a tool call and set tool_use_id
+        let tc_id = store
+            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}))
+            .unwrap();
+        store.set_tool_use_id(&tc_id, Some("toolu_01ABC".to_string())).unwrap();
+
+        // Verify it's on the snapshot
+        let snap = store.get_block_snapshot(&tc_id).unwrap();
+        assert_eq!(snap.tool_use_id, Some("toolu_01ABC".to_string()));
+
+        // Round-trip through StoreSnapshot
+        let store_snapshot = store.snapshot();
+        let restored = BlockStore::from_snapshot(store_snapshot, PrincipalId::new());
+
+        let restored_snap = restored.get_block_snapshot(&tc_id).unwrap();
+        assert_eq!(restored_snap.tool_use_id, Some("toolu_01ABC".to_string()));
+        assert_eq!(restored_snap.tool_name, Some("shell".to_string()));
     }
 
     #[test]

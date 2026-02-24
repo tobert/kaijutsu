@@ -810,7 +810,10 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 // Flush pending tool results before accumulating tool uses
                 state.flush_tool_results();
                 let tool_use_id = block.tool_use_id.clone()
-                    .unwrap_or_else(|| block.id.to_key());
+                    .unwrap_or_else(|| {
+                        tracing::warn!(block_id = %block.id.to_key(), "ToolCall block missing tool_use_id, falling back to block ID");
+                        block.id.to_key()
+                    });
                 let name = block.tool_name.clone().unwrap_or_default();
                 let input = block.tool_input.as_ref()
                     .and_then(|s| serde_json::from_str(s).ok())
@@ -825,8 +828,14 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 // Flush pending assistant before accumulating tool results
                 state.flush_assistant();
                 let tool_use_id = block.tool_use_id.clone()
-                    .or_else(|| block.tool_call_id.map(|id| id.to_key()))
-                    .unwrap_or_else(|| block.id.to_key());
+                    .or_else(|| {
+                        tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing tool_use_id, falling back to tool_call_id");
+                        block.tool_call_id.map(|id| id.to_key())
+                    })
+                    .unwrap_or_else(|| {
+                        tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing both tool_use_id and tool_call_id, falling back to block ID");
+                        block.id.to_key()
+                    });
                 state.tool_results.push(ContentBlock::ToolResult {
                     tool_use_id,
                     content: block.content.clone(),

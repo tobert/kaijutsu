@@ -333,6 +333,14 @@ impl BlockContent {
         self.file_path = path;
     }
 
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref()
+    }
+
+    pub fn set_tool_use_id(&mut self, id: Option<String>) {
+        self.tool_use_id = id;
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).
@@ -376,11 +384,11 @@ impl BlockContent {
             tool_kind: self.header.tool_kind,
             tool_name: self.tool_name.clone(),
             tool_input: self.tool_input.clone(),
+            tool_use_id: self.tool_use_id.clone(),
             tool_call_id: self.tool_call_id,
             exit_code: self.header.exit_code,
             is_error: self.header.is_error,
             output: self.output.clone(),
-            tool_use_id: self.tool_use_id.clone(),
             source_context: self.source_context,
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,

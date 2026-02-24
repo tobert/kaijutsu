@@ -128,6 +128,9 @@ struct BlockSnapshot {
 
   # File metadata (File blocks)
   filePath @22 :Text;         # Path for file-kind blocks (e.g. "/src/main.rs")
+
+  # LLM-assigned tool invocation ID (e.g. "toolu_01ABC...")
+  toolUseId @23 :Text;        # Present on ToolCall and ToolResult blocks
 }
 
 # Operations on block documents

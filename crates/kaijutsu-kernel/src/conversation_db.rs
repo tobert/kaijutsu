@@ -223,21 +223,21 @@ fn row_to_block(
         kind,
         content: row.content,
         collapsed: row.collapsed,
-        compacted: false,
+        compacted: false, // Not persisted — compaction system manages this via StoreSnapshot
         created_at: row.created_at,
-        tool_kind: None,
+        tool_kind: None, // Not persisted — no column (ToolKind is metadata, not content)
         tool_name,
         tool_input,
+        tool_use_id,
         tool_call_id,
         exit_code,
         is_error,
-        output: None, // TODO: persist output data to DB if needed
-        tool_use_id,
-        source_context: None, // TODO: persist drift metadata to DB if needed
-        source_model: None,
-        drift_kind: None,
-        file_path: None,
-        order_key: None,
+        output: None, // Not persisted — OutputData uses set_output() via StoreSnapshot path
+        source_context: None, // Not persisted — drift metadata only in StoreSnapshot path
+        source_model: None, // Not persisted — drift metadata only in StoreSnapshot path
+        drift_kind: None, // Not persisted — drift metadata only in StoreSnapshot path
+        file_path: None, // Not persisted — file/asset blocks only in StoreSnapshot path
+        order_key: None, // Ephemeral — regenerated from order_idx on load
     })
 }
 

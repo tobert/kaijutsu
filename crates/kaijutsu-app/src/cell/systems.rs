@@ -1473,7 +1473,10 @@ pub fn handle_input_doc_events(
                     && let Some(input) = &mut cached.input
                 {
                     if let Err(e) = input.apply_remote_ops(ops) {
-                        warn!("Failed to apply remote input ops for {}: {}", context_id, e);
+                        warn!("Failed to apply remote input ops for {}: {}, dropping input for re-sync", context_id, e);
+                        // Drop the broken input — it will be re-initialized on
+                        // next InputStateReceived or context switch.
+                        cached.input = None;
                     }
                 }
                 // Do NOT update ComposeBlock from echoed ops — ComposeBlock is

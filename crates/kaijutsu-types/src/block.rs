@@ -501,6 +501,11 @@ pub struct BlockSnapshot {
     /// Tool input as JSON string (for ToolCall blocks).
     #[serde(default)]
     pub tool_input: Option<String>,
+    /// LLM-assigned tool invocation ID (e.g., "toolu_01ABC...").
+    /// Stored on both ToolCall and ToolResult blocks for lossless replay.
+    /// Opaque string — not a BlockId, no remapping needed during fork.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
     /// Reference to parent ToolCall block (for ToolResult blocks).
     #[serde(default)]
     pub tool_call_id: Option<BlockId>,
@@ -517,11 +522,6 @@ pub struct BlockSnapshot {
     /// `displayHint` on wire — renaming is a separate schema change).
     #[serde(default)]
     pub output: Option<OutputData>,
-    /// LLM-assigned tool invocation ID (e.g., "toolu_01ABC...").
-    /// Stored on both ToolCall and ToolResult blocks for lossless replay.
-    /// Opaque string — not a BlockId, no remapping needed during fork.
-    #[serde(default)]
-    pub tool_use_id: Option<String>,
 
     // Drift-specific fields (Drift)
 
@@ -580,6 +580,7 @@ impl BlockSnapshot {
             tool_kind: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             tool_call_id: None,
             exit_code: None,
             is_error: false,
@@ -588,7 +589,6 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            tool_use_id: None,
             order_key: None,
         }
     }
@@ -616,6 +616,7 @@ impl BlockSnapshot {
             tool_kind: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             tool_call_id: None,
             exit_code: None,
             is_error: false,
@@ -624,7 +625,6 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            tool_use_id: None,
             order_key: None,
         }
     }
@@ -660,11 +660,11 @@ impl BlockSnapshot {
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
             tool_input: Some(input_json),
+            tool_use_id,
             tool_call_id: None,
             exit_code: None,
             is_error: false,
             output: None,
-            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -700,11 +700,11 @@ impl BlockSnapshot {
             tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
+            tool_use_id,
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
             output: None,
-            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -744,11 +744,11 @@ impl BlockSnapshot {
             tool_kind: Some(tool_kind),
             tool_name: None,
             tool_input: None,
+            tool_use_id,
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
             output,
-            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -783,11 +783,11 @@ impl BlockSnapshot {
             tool_kind: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             tool_call_id: None,
             exit_code: None,
             is_error: false,
             output: None,
-            tool_use_id: None,
             source_context: Some(source_context),
             source_model,
             drift_kind: Some(drift_kind),
@@ -820,11 +820,11 @@ impl BlockSnapshot {
             tool_kind: None,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
             tool_call_id: None,
             exit_code: None,
             is_error: false,
             output: None,
-            tool_use_id: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -923,11 +923,11 @@ impl BlockSnapshotBuilder {
                 tool_kind: None,
                 tool_name: None,
                 tool_input: None,
+                tool_use_id: None,
                 tool_call_id: None,
                 exit_code: None,
                 is_error: false,
                 output: None,
-                tool_use_id: None,
                 source_context: None,
                 source_model: None,
                 drift_kind: None,
@@ -1672,6 +1672,7 @@ mod tests {
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
             .tool_input("{\"cmd\":\"ls\"}")
+            .tool_use_id("toolu_test_123")
             .tool_call_id(call_id)
             .exit_code(127)
             .is_error(true)
@@ -1691,6 +1692,7 @@ mod tests {
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
         assert_eq!(snap.tool_name, Some("shell".to_string()));
         assert_eq!(snap.tool_input, Some("{\"cmd\":\"ls\"}".to_string()));
+        assert_eq!(snap.tool_use_id, Some("toolu_test_123".to_string()));
         assert_eq!(snap.tool_call_id, Some(call_id));
         assert_eq!(snap.exit_code, Some(127));
         assert!(snap.is_error);
