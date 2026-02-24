@@ -66,7 +66,8 @@ pub use llm::{
     StreamEvent, StreamRequest, RigStreamAdapter, LlmStream,
     // Configuration
     ProviderConfig, ToolConfig, ToolFilter, ContextSegment,
-    LlmConfig, ModelAlias, initialize_llm_registry, load_llm_config,
+    LlmConfig, ModelAlias, ModelsConfig, EmbeddingModelConfig,
+    initialize_llm_registry, load_llm_config, load_models_config,
     // Default model
     DEFAULT_MODEL,
 };
@@ -84,7 +85,7 @@ pub use mcp_config::{McpConfig, load_mcp_config};
 pub use config_backend::{
     ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
     ConfigWatcherHandle, ValidationResult,
-    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MODELS_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_SYSTEM_PROMPT,
 };
 
 pub use drift::{

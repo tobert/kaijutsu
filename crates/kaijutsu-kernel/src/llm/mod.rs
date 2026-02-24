@@ -38,7 +38,10 @@ pub mod stream;
 
 // Re-export key types
 pub use config::{ContextSegment, ProviderConfig, ToolConfig, ToolFilter};
-pub use rhai_config::{LlmConfig, ModelAlias, initialize_llm_registry, load_llm_config};
+pub use rhai_config::{
+    LlmConfig, ModelAlias, ModelsConfig, EmbeddingModelConfig,
+    initialize_llm_registry, load_llm_config, load_models_config,
+};
 pub use stream::{LlmStream, RigStreamAdapter, StreamEvent, StreamRequest, StreamingBlockType};
 
 use rig::client::{CompletionClient, Nothing};

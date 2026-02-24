@@ -9,6 +9,7 @@ description = "SSH + Cap'n Proto server for kaijutsu"
 kaijutsu-kernel.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
+kaijutsu-index = { path = "../kaijutsu-index" }
 
 # Kaish execution engine (spawned as subprocess, connected via IPC)
 kaish-kernel.workspace = true

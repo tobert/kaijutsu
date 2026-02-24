@@ -237,6 +237,17 @@ struct ContextHandleInfo {
   traceId @6 :Data;               # 16-byte OTel trace ID for context-scoped tracing
 }
 
+struct SimilarContext {
+  contextId @0 :Data;   # 16-byte ContextId
+  score @1 :Float32;    # Cosine similarity (0.0 - 1.0)
+  label @2 :Text;       # Optional context label
+}
+
+struct ContextCluster {
+  clusterId @0 :UInt32;
+  contextIds @1 :List(Data);  # List of 16-byte ContextIds
+}
+
 struct KernelConfig {
   name @0 :Text;
   mounts @1 :List(MountSpec);
@@ -932,6 +943,15 @@ interface Kernel {
 
   # Atomic submit: read input, detect shell/chat, create block, clear input
   submitInput @78 (contextId :Data, trace :TraceContext) -> (commandBlockId :BlockId, isShell :Bool);
+
+  # Semantic search: find contexts similar to a text query
+  searchSimilar @79 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Context neighbors: find contexts similar to a given context
+  getNeighbors @80 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Clustering: group contexts by semantic similarity
+  getClusters @81 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
 }
 
 # ============================================================================

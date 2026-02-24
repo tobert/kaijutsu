@@ -253,6 +253,9 @@ pub struct SharedKernelState {
     pub config_backend: Arc<ConfigCrdtBackend>,
     pub config_watcher: Option<ConfigWatcherHandle>,
     pub conversation_cache: Arc<ConversationCache>,
+    /// Semantic vector index for context search/clustering.
+    /// None if embedding model not configured or unavailable.
+    pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -405,56 +408,60 @@ async fn create_config_backend(
 
 /// Initialize a kernel's LLM registry from its config backend.
 ///
-/// Loads `llm.rhai` from the config CRDT, parses it, and populates
-/// the kernel's `LlmRegistry` with providers and aliases.
-async fn initialize_kernel_llm(
+/// Loads `models.rhai` from the config CRDT, parses it, and populates
+/// the kernel's `LlmRegistry` with providers and aliases. Returns the
+/// embedding config if present (for semantic index initialization).
+async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
     config_backend: &Arc<ConfigCrdtBackend>,
-) {
-    // Ensure llm.rhai is loaded
-    if let Err(e) = config_backend.ensure_config("llm.rhai").await {
-        log::warn!("Failed to load llm.rhai: {}", e);
-        return;
+) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
+    // Ensure models.rhai is loaded (falls back to llm.rhai alias in get_default_content)
+    if let Err(e) = config_backend.ensure_config("models.rhai").await {
+        log::warn!("Failed to load models.rhai: {}", e);
+        return None;
     }
 
     // Get the content
-    let script = match config_backend.get_content("llm.rhai") {
+    let script = match config_backend.get_content("models.rhai") {
         Ok(content) => content,
         Err(e) => {
-            log::warn!("Failed to read llm.rhai content: {}", e);
-            return;
+            log::warn!("Failed to read models.rhai content: {}", e);
+            return None;
         }
     };
 
-    // Parse and build registry
-    match kaijutsu_kernel::load_llm_config(&script) {
-        Ok(config) => {
-            let registry = kaijutsu_kernel::initialize_llm_registry(&config);
+    // Parse full models config (LLM + embedding)
+    match kaijutsu_kernel::load_models_config(&script) {
+        Ok(models_config) => {
+            let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
             *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from llm.rhai");
+            log::info!("Initialized kernel LLM registry from models.rhai");
+            models_config.embedding
         }
         Err(e) => {
-            log::warn!("Failed to parse llm.rhai from CRDT: {}, reloading from disk", e);
+            log::warn!("Failed to parse models.rhai from CRDT: {}, reloading from disk", e);
             // CRDT snapshot is corrupted — reload from disk and retry
-            if let Err(reload_err) = config_backend.reload_from_disk("llm.rhai").await {
-                log::error!("Failed to reload llm.rhai from disk: {}", reload_err);
-                return;
+            if let Err(reload_err) = config_backend.reload_from_disk("models.rhai").await {
+                log::error!("Failed to reload models.rhai from disk: {}", reload_err);
+                return None;
             }
-            let script = match config_backend.get_content("llm.rhai") {
+            let script = match config_backend.get_content("models.rhai") {
                 Ok(content) => content,
                 Err(e) => {
-                    log::error!("Failed to read reloaded llm.rhai: {}", e);
-                    return;
+                    log::error!("Failed to read reloaded models.rhai: {}", e);
+                    return None;
                 }
             };
-            match kaijutsu_kernel::load_llm_config(&script) {
-                Ok(config) => {
-                    let registry = kaijutsu_kernel::initialize_llm_registry(&config);
+            match kaijutsu_kernel::load_models_config(&script) {
+                Ok(models_config) => {
+                    let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
                     *kernel.llm().write().await = registry;
-                    log::info!("Initialized kernel LLM registry from llm.rhai (reloaded from disk)");
+                    log::info!("Initialized kernel LLM registry from models.rhai (reloaded from disk)");
+                    models_config.embedding
                 }
                 Err(e) => {
-                    log::error!("Failed to parse llm.rhai even after reload: {}", e);
+                    log::error!("Failed to parse models.rhai even after reload: {}", e);
+                    None
                 }
             }
         }
@@ -573,6 +580,42 @@ pub struct CommandEntry {
 }
 
 // ============================================================================
+// Semantic Index Integration
+// ============================================================================
+
+/// Adapter: SharedBlockStore → kaijutsu_index::BlockSource
+struct BlockStoreSource(SharedBlockStore);
+
+impl kaijutsu_index::BlockSource for BlockStoreSource {
+    fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        BlockStore::block_snapshots(&self.0, ctx)
+    }
+}
+
+/// Adapter: FlowBus<BlockFlow> subscription → kaijutsu_index::StatusReceiver
+struct FlowBusStatusReceiver {
+    sub: kaijutsu_kernel::flows::Subscription<BlockFlow>,
+}
+
+impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
+    fn recv(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<kaijutsu_index::StatusEvent>> + Send + '_>> {
+        Box::pin(async {
+            loop {
+                let msg = self.sub.recv().await?;
+                if let BlockFlow::StatusChanged { context_id, status, .. } = msg.payload {
+                    if status.is_terminal() {
+                        return Some(kaijutsu_index::StatusEvent {
+                            context_id,
+                            status,
+                        });
+                    }
+                }
+            }
+        })
+    }
+}
+
+// ============================================================================
 // Shared Kernel Creation
 // ============================================================================
 
@@ -612,6 +655,7 @@ pub async fn create_shared_kernel(
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
     // Create block store with database persistence and shared FlowBus
+    let block_flows_for_index = block_flows.clone();
     let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, input_flows, data_dir);
 
     // Create default context
@@ -650,11 +694,56 @@ pub async fn create_shared_kernel(
         }
     }
 
-    // Initialize LLM registry from llm.rhai config
-    initialize_kernel_llm(&kernel_arc, &config_backend).await;
+    // Initialize LLM registry + embedding config from models.rhai
+    let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
 
     // Initialize MCP servers from mcp.rhai config
     initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
+
+    // Initialize semantic index if embedding model is configured
+    let semantic_index = if let Some(emb_config) = embedding_config {
+        let data_dir = match data_dir {
+            Some(dir) => dir.join(id.to_hex()),
+            None => kernel_data_dir(id),
+        };
+        let index_config = kaijutsu_index::IndexConfig::new(
+            emb_config.model_dir.clone(),
+            emb_config.dimensions,
+            emb_config.max_tokens,
+            &data_dir,
+        );
+        match kaijutsu_index::OnnxEmbedder::new(&emb_config.model_dir, emb_config.dimensions, emb_config.max_tokens) {
+            Ok(embedder) => {
+                match kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder)) {
+                    Ok(idx) => {
+                        let idx = Arc::new(idx);
+                        // Spawn background watcher for re-indexing on block completion
+                        let block_source = Arc::new(BlockStoreSource(documents.clone()));
+                        let status_receiver = FlowBusStatusReceiver {
+                            sub: block_flows_for_index.subscribe("block.status_changed"),
+                        };
+                        kaijutsu_index::watcher::spawn_index_watcher(
+                            idx.clone(),
+                            block_source,
+                            Box::new(status_receiver),
+                        );
+                        log::info!("Semantic index initialized with {}", emb_config.model_dir.display());
+                        Some(idx)
+                    }
+                    Err(e) => {
+                        log::warn!("Semantic index unavailable: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Embedding model unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let shared = SharedKernelState {
         id,
@@ -665,6 +754,7 @@ pub async fn create_shared_kernel(
         config_backend,
         config_watcher,
         conversation_cache: Arc::new(ConversationCache::new(64)),
+        semantic_index,
     };
 
     Ok(Arc::new(shared))
@@ -4193,6 +4283,106 @@ impl kernel::Server for KernelImpl {
 
             Ok(())
         }.instrument(trace_span))
+    }
+
+    fn search_similar(
+        self: Rc<Self>,
+        params: kernel::SearchSimilarParams,
+        mut results: kernel::SearchSimilarResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let query = pry!(pry!(p.get_query()).to_str()).to_string();
+        let k = p.get_k() as usize;
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let search_results = match &kernel.semantic_index {
+                Some(idx) => idx.search(&query, k).await
+                    .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?,
+                None => vec![],
+            };
+
+            // Populate labels from drift router
+            let drift = kernel.kernel.drift().read().await;
+
+            let mut list = results.get().init_results(search_results.len() as u32);
+            for (i, r) in search_results.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_context_id(r.context_id.as_bytes());
+                entry.set_score(r.score);
+                if let Some(handle) = drift.get(r.context_id) {
+                    if let Some(ref label) = handle.label {
+                        entry.set_label(label);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_neighbors(
+        self: Rc<Self>,
+        params: kernel::GetNeighborsParams,
+        mut results: kernel::GetNeighborsResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let k = p.get_k() as usize;
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let search_results = match &kernel.semantic_index {
+                Some(idx) => idx.neighbors(context_id, k).await
+                    .map_err(|e| capnp::Error::failed(format!("neighbors: {}", e)))?,
+                None => vec![],
+            };
+
+            let drift = kernel.kernel.drift().read().await;
+
+            let mut list = results.get().init_results(search_results.len() as u32);
+            for (i, r) in search_results.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_context_id(r.context_id.as_bytes());
+                entry.set_score(r.score);
+                if let Some(handle) = drift.get(r.context_id) {
+                    if let Some(ref label) = handle.label {
+                        entry.set_label(label);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_clusters(
+        self: Rc<Self>,
+        params: kernel::GetClustersParams,
+        mut results: kernel::GetClustersResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let min_cluster_size = p.get_min_cluster_size() as usize;
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let clusters = match &kernel.semantic_index {
+                Some(idx) => idx.clusters(min_cluster_size).await
+                    .map_err(|e| capnp::Error::failed(format!("clusters: {}", e)))?,
+                None => vec![],
+            };
+
+            let mut list = results.get().init_clusters(clusters.len() as u32);
+            for (i, c) in clusters.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_cluster_id(c.cluster_id as u32);
+                let mut ids = entry.init_context_ids(c.context_ids.len() as u32);
+                for (j, ctx_id) in c.context_ids.iter().enumerate() {
+                    ids.set(j as u32, ctx_id.as_bytes());
+                }
+            }
+            Ok(())
+        })
     }
 }
 

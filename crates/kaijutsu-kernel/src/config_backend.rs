@@ -55,8 +55,11 @@ fn config_context_id(path: &str) -> ContextId {
 /// Embedded default theme content.
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.rhai");
 
-/// Embedded default LLM configuration.
-pub const DEFAULT_LLM_CONFIG: &str = include_str!("../../../assets/defaults/llm.rhai");
+/// Embedded default models configuration (LLM providers + embedding).
+pub const DEFAULT_MODELS_CONFIG: &str = include_str!("../../../assets/defaults/models.rhai");
+
+/// Alias for backwards compatibility.
+pub const DEFAULT_LLM_CONFIG: &str = DEFAULT_MODELS_CONFIG;
 
 /// Embedded default MCP server configuration.
 pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.rhai");
@@ -337,7 +340,7 @@ impl ConfigCrdtBackend {
     fn get_default_content(&self, path: &str) -> Option<String> {
         match path {
             "theme.rhai" => Some(DEFAULT_THEME.to_string()),
-            "llm.rhai" => Some(DEFAULT_LLM_CONFIG.to_string()),
+            "models.rhai" | "llm.rhai" => Some(DEFAULT_MODELS_CONFIG.to_string()),
             "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
             "system.md" => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             _ => None,

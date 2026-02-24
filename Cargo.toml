@@ -10,6 +10,7 @@ members = [
     "crates/kaijutsu-mcp",
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",
+    "crates/kaijutsu-index",
 ]
 
 [workspace.package]

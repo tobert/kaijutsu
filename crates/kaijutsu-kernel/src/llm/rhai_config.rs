@@ -5,6 +5,7 @@
 //! typed config used to populate an `LlmRegistry`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,47 @@ pub struct ModelAlias {
     pub model: String,
 }
 
+/// Full models configuration extracted from models.rhai (née llm.rhai).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    /// LLM provider settings.
+    pub llm: LlmConfig,
+    /// Embedding model settings (for semantic indexing).
+    pub embedding: Option<EmbeddingModelConfig>,
+}
+
+/// Configuration for a local ONNX embedding model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingModelConfig {
+    /// Whether embedding is enabled.
+    pub enabled: bool,
+    /// Directory containing model.onnx + tokenizer.json.
+    pub model_dir: PathBuf,
+    /// Output embedding dimensions (e.g. 384 for bge-small).
+    pub dimensions: usize,
+    /// Maximum input tokens (truncated beyond this).
+    pub max_tokens: usize,
+}
+
+/// Parse a `models.rhai` (or `llm.rhai`) script and extract full configuration
+/// including LLM providers and embedding model settings.
+pub fn load_models_config(script: &str) -> LlmResult<ModelsConfig> {
+    let engine = rhai::Engine::new();
+    let ast = engine.compile(script).map_err(|e| {
+        LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
+    })?;
+
+    let mut scope = rhai::Scope::new();
+    engine.run_ast_with_scope(&mut scope, &ast).map_err(|e| {
+        LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e))
+    })?;
+
+    let llm = load_llm_config_from_scope(&scope);
+    let embedding = extract_embedding_config(&scope);
+
+    Ok(ModelsConfig { llm, embedding })
+}
+
 /// Parse an `llm.rhai` script and extract configuration.
 ///
 /// The script is expected to define:
@@ -39,31 +81,32 @@ pub struct ModelAlias {
 pub fn load_llm_config(script: &str) -> LlmResult<LlmConfig> {
     let engine = rhai::Engine::new();
     let ast = engine.compile(script).map_err(|e| {
-        LlmError::InvalidRequest(format!("llm.rhai parse error: {}", e))
+        LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
     })?;
 
     let mut scope = rhai::Scope::new();
     engine.run_ast_with_scope(&mut scope, &ast).map_err(|e| {
-        LlmError::InvalidRequest(format!("llm.rhai evaluation error: {}", e))
+        LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e))
     })?;
 
-    // Extract default_provider
+    Ok(load_llm_config_from_scope(&scope))
+}
+
+/// Extract LLM configuration from an already-evaluated Rhai scope.
+fn load_llm_config_from_scope(scope: &rhai::Scope) -> LlmConfig {
     let default_provider = scope
         .get_value::<rhai::ImmutableString>("default_provider")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "anthropic".to_string());
 
-    // Extract providers map
-    let providers = extract_providers(&scope);
+    let providers = extract_providers(scope);
+    let model_aliases = extract_aliases(scope);
 
-    // Extract model aliases
-    let model_aliases = extract_aliases(&scope);
-
-    Ok(LlmConfig {
+    LlmConfig {
         default_provider,
         providers,
         model_aliases,
-    })
+    }
 }
 
 /// Extract provider configurations from the Rhai scope.
@@ -190,6 +233,50 @@ fn extract_aliases(scope: &rhai::Scope) -> HashMap<String, ModelAlias> {
     }
 
     aliases
+}
+
+/// Extract embedding model configuration from the Rhai scope.
+///
+/// Looks for an `embedding` map with `enabled`, `model_dir`, `dimensions`, `max_tokens`.
+/// Returns None if the section is missing or disabled.
+fn extract_embedding_config(scope: &rhai::Scope) -> Option<EmbeddingModelConfig> {
+    let map = scope.get_value::<rhai::Map>("embedding")?;
+
+    let enabled = map
+        .get("enabled")
+        .and_then(|v| v.as_bool().ok())
+        .unwrap_or(false);
+
+    if !enabled {
+        return None;
+    }
+
+    let model_dir = map
+        .get("model_dir")
+        .and_then(|v| v.clone().into_string().ok())
+        .map(|s| {
+            let expanded = shellexpand::tilde(&s);
+            PathBuf::from(expanded.as_ref())
+        })?;
+
+    let dimensions = map
+        .get("dimensions")
+        .and_then(|v| v.as_int().ok())
+        .map(|i| i as usize)
+        .unwrap_or(384);
+
+    let max_tokens = map
+        .get("max_tokens")
+        .and_then(|v| v.as_int().ok())
+        .map(|i| i as usize)
+        .unwrap_or(512);
+
+    Some(EmbeddingModelConfig {
+        enabled,
+        model_dir,
+        dimensions,
+        max_tokens,
+    })
 }
 
 /// Build an `LlmRegistry` from a parsed `LlmConfig`.
@@ -395,5 +482,52 @@ let model_aliases = #{};
         assert_eq!(config.default_provider, "anthropic");
         assert!(!config.providers.is_empty());
         assert!(!config.model_aliases.is_empty());
+    }
+
+    #[test]
+    fn test_default_models_rhai_parses() {
+        // Verify the models.rhai asset parses correctly with embedding section
+        let default_script = include_str!("../../../../assets/defaults/models.rhai");
+        let config = load_models_config(default_script).unwrap();
+        assert_eq!(config.llm.default_provider, "anthropic");
+        assert!(!config.llm.providers.is_empty());
+        assert!(!config.llm.model_aliases.is_empty());
+
+        // Embedding config should be present and enabled
+        let emb = config.embedding.expect("embedding section should be present");
+        assert!(emb.enabled);
+        assert_eq!(emb.dimensions, 384);
+        assert_eq!(emb.max_tokens, 512);
+        assert!(emb.model_dir.to_str().unwrap().contains("bge-small"));
+    }
+
+    #[test]
+    fn test_extract_embedding_config_disabled() {
+        let script = r#"
+let default_provider = "anthropic";
+let providers = #{};
+let model_aliases = #{};
+let embedding = #{
+    enabled: false,
+    model_dir: "/tmp/model",
+    dimensions: 384,
+    max_tokens: 512,
+};
+"#;
+        let config = load_models_config(script).unwrap();
+        // Disabled embedding returns None
+        assert!(config.embedding.is_none());
+    }
+
+    #[test]
+    fn test_extract_embedding_config_missing() {
+        let script = r#"
+let default_provider = "anthropic";
+let providers = #{};
+let model_aliases = #{};
+"#;
+        let config = load_models_config(script).unwrap();
+        // No embedding section returns None
+        assert!(config.embedding.is_none());
     }
 }
