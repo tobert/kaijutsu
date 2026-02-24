@@ -321,6 +321,18 @@ pub struct Theme {
     pub agent_color_deepseek: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Constellation 3D Configuration (hyperbolic layout)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Base hemisphere radius for leaf nodes in the H3 layout
+    pub constellation_base_leaf_radius: f64,
+    /// Packing factor for hemisphere area sums (gap compensation)
+    pub constellation_packing_factor: f64,
+    /// Camera distance from the Poincaré ball center
+    #[allow(dead_code)] // Phase 4: focus navigation
+    pub constellation_camera_distance: f32,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -537,6 +549,11 @@ impl Default for Theme {
             agent_color_gemini: Color::srgba(1.00, 0.84, 0.00, 0.9),    // #ffd700 gold
             agent_color_local: Color::srgba(0.31, 0.98, 0.48, 0.9),     // #50fa7b matrix green
             agent_color_deepseek: Color::srgba(1.00, 0.72, 0.42, 0.9),  // #ffb86c orange
+
+            // Constellation 3D
+            constellation_base_leaf_radius: 0.3,
+            constellation_packing_factor: 1.4,
+            constellation_camera_distance: 3.0,
 
             // Block borders
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber

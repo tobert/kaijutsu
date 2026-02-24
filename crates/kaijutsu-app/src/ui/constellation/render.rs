@@ -5,6 +5,13 @@
 //! - Connection lines between related contexts
 //! - Camera-aware positioning with pan/zoom support
 //! - Tab toggles Display + Visibility::Hidden (prevents MSDF text bleed-through)
+//!
+//! NOTE: 2D card/connection/starfield systems are currently disabled — replaced
+//! by the 3D viewport in `viewport.rs` (Phase 1.5+). Kept for reference and
+//! potential reuse in Phase 3 (3D instanced rendering).
+
+// Many 2D systems are temporarily unused while the 3D viewport replaces them.
+// dead_code is suppressed via `#[allow(dead_code)]` on the module in mod.rs.
 
 use bevy::prelude::*;
 
@@ -24,16 +31,19 @@ use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
 pub struct ConstellationRendering;
 
 /// Marker for model label text on constellation nodes.
+#[allow(dead_code)] // Phase 3: 3D rendering will reuse
 #[derive(Component)]
 pub struct ModelLabel {
     pub context_id: String,
 }
 
 /// Marker for the procedural star field background behind constellation content.
+#[allow(dead_code)] // Phase 3: adapted for 3D
 #[derive(Component)]
 pub struct StarFieldBackground;
 
 /// Marker for the concentric ring guide circles behind constellation content.
+#[allow(dead_code)] // Phase 5: replaced by depth shells
 #[derive(Component)]
 pub struct RingGuideBackground;
 
@@ -45,31 +55,38 @@ pub struct ConstellationLegend;
 #[derive(Component)]
 pub struct LegendContent;
 
-/// Setup the constellation rendering systems
+/// Setup the constellation rendering systems.
+///
+/// The 2D node/card/connection rendering is disabled — replaced by the 3D
+/// viewport in `viewport.rs`. Systems that remain:
+/// - Visibility sync (constellation ↔ conversation toggle)
+/// - Container spawn (still needed as ViewportNode parent)
+/// - Legend panel (2D overlay on top of 3D viewport)
+/// - Cell text visibility (MSDF bleed-through prevention)
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
         Update,
         (
             enforce_constellation_focus_sync,
             spawn_constellation_container,
-            spawn_star_field,
-            spawn_ring_guide,
+            // 2D rendering systems disabled — replaced by 3D viewport (Phase 1.5+)
+            // spawn_star_field,
+            // spawn_ring_guide,
             sync_constellation_visibility,
             sync_cell_text_visibility,
-            spawn_context_nodes,
-            spawn_create_node,
-            spawn_connection_lines,
-            // attach_mini_renders disabled — card nodes don't use render-to-texture
-            update_node_visuals,
-            update_star_field,
-            update_ring_guide,
-            update_create_node_visual,
-            update_model_labels,
-            update_connection_visuals,
+            // spawn_context_nodes,
+            // spawn_create_node,
+            // spawn_connection_lines,
+            // update_node_visuals,
+            // update_star_field,
+            // update_ring_guide,
+            // update_create_node_visual,
+            // update_model_labels,
+            // update_connection_visuals,
             spawn_legend_panel,
             update_legend_content,
-            despawn_removed_nodes,
-            despawn_removed_connections,
+            // despawn_removed_nodes,
+            // despawn_removed_connections,
         )
             .chain()
             .in_set(ConstellationRendering),

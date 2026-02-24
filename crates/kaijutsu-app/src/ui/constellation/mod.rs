@@ -1,8 +1,18 @@
-//! Constellation - Context navigation as a full-screen radial tree graph
+//! Constellation - Context navigation in 3D hyperbolic space
 //!
-//! The constellation replaces linear context navigation with a spatial model
-//! inspired by 4X strategy games and skill trees. Contexts form nodes in a
-//! radial tree layout, with the root at center and children radiating outward.
+//! Renders the constellation as an H3-inspired hyperbolic cone tree inside a
+//! Poincaré ball, displayed via Bevy's `ViewportNode` in the existing flexbox
+//! layout. Focus changes are Lorentz boosts — the space moves through the
+//! camera, providing navigational stability.
+//!
+//! ## Architecture
+//!
+//! - `hyper.rs` — Hyperbolic math (HyperPoint, LorentzTransform, Poincaré projection)
+//! - `layout.rs` — H3 layout engine (bottom-up hemisphere sizing, top-down placement)
+//! - `viewport.rs` — ViewportNode setup, 3D camera, render target
+//! - `render3d.rs` — Node/edge spawning, visual updates in 3D scene
+//! - `navigation.rs` — Focus animation via geodesic lerp, camera orbit
+//! - `render.rs` — Old 2D rendering (disabled, kept for reference)
 //!
 //! ## Activation
 //!
@@ -10,16 +20,28 @@
 //! The constellation takes over the content area, hiding conversation panes.
 //! Enter on a focused node switches context and returns to conversation.
 //!
-//! ## Visual Design
+//! ## Navigation
 //!
-//! - Nodes: Rectangular cards with agent-colored borders and soft glow
-//! - Connections: Lines with distance falloff glow
-//! - States: Idle (dim), active (bright), streaming (green dot), error (red dot)
-//! - "New" tile: Create new contexts by clicking or pressing `n`
+//! - `hjkl` — Spatial focus navigation (Lorentz boost to nearest node)
+//! - `Shift+hjkl` — Orbit camera around Poincaré ball
+//! - `+/-` — Zoom (orbit distance)
+//! - `0` — Reset camera to default view
+//! - `Enter` — Switch to focused context
+//! - `f` — Fork focused context
+//! - `m` — Model picker for focused context
 
+#[allow(dead_code)] // Phase 3+: 2D systems reused for 3D rendering
 mod create_dialog;
+#[allow(dead_code)] // Phase 2+: layout/navigation
+pub mod hyper;
+#[allow(dead_code)] // Phase 2: layout engine used by viewport
+pub mod layout;
 pub mod model_picker;
+mod navigation;
+#[allow(dead_code)] // Phase 3+: 2D systems kept for reference/reuse
 mod render;
+mod render3d;
+mod viewport;
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
@@ -27,6 +49,8 @@ use kaijutsu_client::ContextMembership;
 use crate::agents::AgentActivityMessage;
 
 pub use create_dialog::{DialogMode, OpenContextDialog, create_or_fork_context};
+pub use navigation::{CameraOrbit, find_nearest_in_direction_3d};
+pub use render3d::ConstellationScene;
 
 // Render module provides visual systems (used by the plugin internally)
 
@@ -74,6 +98,15 @@ impl Plugin for ConstellationPlugin {
 
         // Add rendering systems from the render module
         render::setup_constellation_rendering(app);
+
+        // Add 3D viewport systems (Phase 1.5+)
+        viewport::setup_viewport_systems(app);
+
+        // Add 3D rendering systems (Phase 3+)
+        render3d::setup_render3d_systems(app);
+
+        // Add 3D navigation systems (Phase 4+)
+        navigation::setup_navigation_systems(app);
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);

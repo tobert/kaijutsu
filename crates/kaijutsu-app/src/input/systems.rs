@@ -633,8 +633,10 @@ use crate::cell::{
     BlockEditCursor, ComposeBlock, EditingBlockCell, PromptSubmitted,
 };
 use crate::ui::constellation::{
-    Constellation, ConstellationCamera, DialogMode, NewContextConfig, OpenContextDialog,
-    create_or_fork_context, find_nearest_in_direction, model_picker::OpenModelPicker,
+    CameraOrbit, Constellation, ConstellationCamera, ConstellationScene, DialogMode,
+    NewContextConfig, OpenContextDialog, create_or_fork_context,
+    find_nearest_in_direction, find_nearest_in_direction_3d,
+    model_picker::OpenModelPicker,
 };
 
 /// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
@@ -646,6 +648,8 @@ pub fn handle_constellation_nav(
     mut focus: ResMut<FocusArea>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
+    scene: Option<Res<ConstellationScene>>,
+    mut orbit: Option<ResMut<CameraOrbit>>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
@@ -657,25 +661,52 @@ pub fn handle_constellation_nav(
     for ActionFired(action) in actions.read() {
         match action {
             Action::SpatialNav(direction) => {
-                if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
+                // Use 3D navigation if scene is available, fall back to 2D
+                let target_id = if let Some(ref scene) = scene {
+                    find_nearest_in_direction_3d(&constellation, scene, *direction)
+                } else {
+                    find_nearest_in_direction(&constellation, *direction)
+                };
+                if let Some(target_id) = target_id {
                     constellation.focus(&target_id);
+                    // 2D camera fallback (kept for non-3D mode)
                     if let Some(node) = constellation.node_by_id(&target_id) {
                         camera.target_offset = -node.position * camera.zoom;
                     }
                 }
             }
             Action::Pan(direction) => {
-                let pan_speed = 50.0;
-                camera.target_offset += *direction * pan_speed;
+                // Use orbit yaw/pitch if available, fall back to 2D pan
+                if let Some(ref mut orbit) = orbit {
+                    let orbit_speed = 0.3;
+                    orbit.target_yaw += direction.x * orbit_speed;
+                    orbit.target_pitch = (orbit.target_pitch + direction.y * orbit_speed)
+                        .clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
+                } else {
+                    let pan_speed = 50.0;
+                    camera.target_offset += *direction * pan_speed;
+                }
             }
             Action::ZoomIn => {
-                camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
+                if let Some(ref mut orbit) = orbit {
+                    orbit.target_distance = (orbit.target_distance / 1.15).max(1.5);
+                } else {
+                    camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
+                }
             }
             Action::ZoomOut => {
-                camera.target_zoom = (camera.target_zoom / 1.25).max(0.25);
+                if let Some(ref mut orbit) = orbit {
+                    orbit.target_distance = (orbit.target_distance * 1.15).min(10.0);
+                } else {
+                    camera.target_zoom = (camera.target_zoom / 1.25).max(0.25);
+                }
             }
             Action::ZoomReset => {
-                camera.reset();
+                if let Some(ref mut orbit) = orbit {
+                    orbit.reset();
+                } else {
+                    camera.reset();
+                }
             }
             Action::Activate => {
                 // Enter → switch context and dismiss constellation
