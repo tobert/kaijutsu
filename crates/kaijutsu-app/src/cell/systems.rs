@@ -1448,11 +1448,12 @@ pub fn handle_block_events(
 
 /// Handle input document events (InputTextOps, InputCleared).
 ///
-/// Phase 4: Processes server-side input document changes and syncs them
-/// into the ComposeBlock for rendering.
+/// Processes server-side input document changes.
 ///
-/// - `InputTextOps`: Remote edits (from another agent or collaborative session)
-///   are merged into the `SyncedInput` CRDT and the ComposeBlock text is updated.
+/// - `InputTextOps`: Merged into `SyncedInput` CRDT for all contexts (keeps
+///   CRDT in sync for inactive-context recovery and future collaborative editing).
+///   ComposeBlock is NOT updated — it is authoritative for the active context.
+///   Server ops are echoes of our own `edit_input` calls.
 /// - `InputCleared`: Server confirmed input was submitted and cleared. Resets
 ///   the ComposeBlock. This is the authoritative "submit succeeded" signal.
 pub fn handle_input_doc_events(
@@ -1466,35 +1467,19 @@ pub fn handle_input_doc_events(
     for ServerEventMessage(event) in server_events.read() {
         match event {
             ServerEvent::InputTextOps { context_id, ops } => {
-                // Only process for active context
-                if doc_cache.active_id() != Some(*context_id) {
-                    // Still merge ops for inactive contexts so CRDT stays in sync
-                    if let Some(cached) = doc_cache.get_mut(*context_id)
-                        && let Some(input) = &mut cached.input
-                    {
-                        if let Err(e) = input.apply_remote_ops(ops) {
-                            warn!("Failed to apply remote input ops for {}: {}", context_id, e);
-                        }
-                    }
-                    continue;
-                }
-
+                // Merge ops into SyncedInput for ALL contexts (keeps CRDT in sync
+                // for inactive-context recovery and context-switch).
                 if let Some(cached) = doc_cache.get_mut(*context_id)
                     && let Some(input) = &mut cached.input
                 {
                     if let Err(e) = input.apply_remote_ops(ops) {
-                        warn!("Failed to apply remote input ops: {}", e);
-                        continue;
-                    }
-                    // Sync compose text to match CRDT state
-                    let text = input.text();
-                    if let Ok(mut compose) = compose_blocks.single_mut() {
-                        compose.text = text.clone();
-                        // Clamp cursor to valid range
-                        compose.cursor = compose.cursor.min(text.len());
-                        compose.selection_anchor = None;
+                        warn!("Failed to apply remote input ops for {}: {}", context_id, e);
                     }
                 }
+                // Do NOT update ComposeBlock from echoed ops — ComposeBlock is
+                // authoritative for the active context. Server ops are echoes of
+                // our own edit_input calls; syncing them back causes character
+                // loss during fast typing.
             }
             ServerEvent::InputCleared { context_id } => {
                 // Clear CRDT state

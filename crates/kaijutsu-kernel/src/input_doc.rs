@@ -167,11 +167,6 @@ impl InputDocEntry {
         self.doc.version().clone()
     }
 
-    /// Get the DTE agent ID.
-    #[allow(dead_code)] // Phase 2: used by RPC handlers
-    pub fn agent(&self) -> AgentId {
-        self.agent
-    }
 
     /// Record that a principal modified the input.
     pub fn touch(&self, principal_id: PrincipalId) {

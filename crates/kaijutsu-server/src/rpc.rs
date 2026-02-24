@@ -1450,56 +1450,7 @@ impl kernel::Server for KernelImpl {
                 user_agent_id, context_id, cwd, session_id, kernel.id,
             );
 
-            // Get LLM provider and kernel references from the shared kernel
             let documents = kernel.documents.clone();
-            let kernel_arc = kernel.kernel.clone();
-            let config_backend = kernel.config_backend.clone();
-            let conversation_cache = kernel.conversation_cache.clone();
-
-            // Load system prompt from config
-            let system_prompt = {
-                if let Err(e) = config_backend.ensure_config("system.md").await {
-                    log::warn!("Failed to ensure system.md config: {}", e);
-                }
-                config_backend.get_content("system.md")
-                    .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
-            };
-
-            // Resolve provider from kernel's LLM registry
-            let (provider, model_name, max_output_tokens) = {
-                let registry = kernel_arc.llm().read().await;
-                let requested_model = model.as_deref();
-                let max_tokens = registry.max_output_tokens();
-
-                // Try alias resolution first, then default
-                if let Some(name) = requested_model {
-                    if let Some((p, m)) = registry.resolve_model(name) {
-                        (p, m, max_tokens)
-                    } else {
-                        let p = registry.default_provider().ok_or_else(|| {
-                            log::error!("No LLM provider configured");
-                            capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
-                        })?;
-                        (p, name.to_string(), max_tokens)
-                    }
-                } else {
-                    let p = registry.default_provider().ok_or_else(|| {
-                        log::error!("No LLM provider configured");
-                        capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
-                    })?;
-                    let m = registry.default_model()
-                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                        .to_string();
-                    (p, m, max_tokens)
-                }
-            };
-
-            // Build tool definitions from equipped tools (async)
-            let tools = build_tool_definitions(&kernel_arc).await;
-
-            // Generate prompt ID
-            let prompt_id = uuid::Uuid::new_v4().to_string();
-            log::debug!("Generated prompt_id={}", prompt_id);
 
             // Document must exist — join_context is the sole creator
             if documents.get(context_id).is_none() {
@@ -1518,26 +1469,18 @@ impl kernel::Server for KernelImpl {
                 })?;
             log::debug!("Inserted user block: {:?}", user_block_id);
 
-            log::info!("User message block inserted, spawning LLM stream task");
-            log::info!("Using model: {} (requested: {:?})", model_name, model);
+            // Generate prompt ID
+            let prompt_id = uuid::Uuid::new_v4().to_string();
+            log::debug!("Generated prompt_id={}", prompt_id);
 
-            // Spawn LLM streaming in background task with agentic loop
-            // Pass user block_id so streaming blocks are inserted AFTER it
-            tokio::task::spawn_local(process_llm_stream(
-                provider,
-                documents,
-                context_id,
-                content,
-                model_name,
-                kernel_arc,
-                tools,
-                user_block_id, // last_block_id - streaming blocks appear after this
-                system_prompt,
-                max_output_tokens,
-                conversation_cache,
-                user_agent_id,
-                tool_ctx,
-            ));
+            log::info!("User message block inserted, spawning LLM stream task");
+            log::info!("Using model: {} (requested: {:?})", model.as_deref().unwrap_or("default"), model);
+
+            // Spawn LLM streaming in background
+            spawn_llm_for_prompt(
+                &kernel, context_id, &content, model.as_deref(),
+                &user_block_id, tool_ctx, user_agent_id,
+            ).await?;
 
             // Return immediately with prompt_id - streaming happens in background
             results.get().set_prompt_id(&prompt_id);
@@ -4086,14 +4029,17 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             let documents = kernel.documents.clone();
 
-            // Atomically read and clear the input document
-            let text = documents.clear_input(context_id)
-                .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
-
+            // Read text first, validate, THEN clear — avoids clearing compose
+            // on whitespace-only input (InputCleared would fire with no block created).
+            let text = documents.get_input_text(context_id)
+                .map_err(|e| capnp::Error::failed(format!("get_input_text: {}", e)))?;
             let text = text.trim().to_string();
             if text.is_empty() {
                 return Err(capnp::Error::failed("input is empty".into()));
             }
+            // Input has content — now clear it
+            documents.clear_input(context_id)
+                .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
 
             // Detect shell prefix: `:` or `` ` ``
             let is_shell = text.starts_with(':') || text.starts_with('`');
@@ -4212,7 +4158,20 @@ impl kernel::Server for KernelImpl {
                 set_block_id_builder(&mut block_id_builder, &command_block_id);
                 results.get().set_is_shell(true);
             } else {
-                // Chat prompt — create user message block and kick off LLM
+                // Chat prompt — create user message block and invoke LLM
+
+                // Build ToolContext from connection state
+                let (session_id, kaish_ref) = {
+                    let conn = connection.borrow();
+                    (conn.session_id, conn.kaish.clone())
+                };
+                let cwd = match &kaish_ref {
+                    Some(k) => k.cwd().await,
+                    None => std::path::PathBuf::from("/"),
+                };
+                let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                    user_agent_id, context_id, cwd, session_id, kernel.id,
+                );
 
                 // Create user message block at the end of the document
                 let last_block = documents.last_block_id(context_id);
@@ -4221,7 +4180,12 @@ impl kernel::Server for KernelImpl {
                     Role::User, BlockKind::Text, &text, Some(user_agent_id),
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
 
-                // Return user block ID — LLM streaming is handled separately via prompt RPC
+                // Spawn LLM streaming in background
+                spawn_llm_for_prompt(
+                    &kernel, context_id, &text, None,
+                    &user_block_id, tool_ctx, user_agent_id,
+                ).await?;
+
                 let mut block_id_builder = results.get().init_command_block_id();
                 set_block_id_builder(&mut block_id_builder, &user_block_id);
                 results.get().set_is_shell(false);
@@ -4379,6 +4343,88 @@ async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
             })
         })
         .collect()
+}
+
+/// Resolve LLM provider and spawn streaming for a user prompt.
+///
+/// Shared by `prompt` and `submit_input` handlers. Creates the assistant response
+/// flow (thinking -> text -> tool calls -> results) as background blocks via
+/// `process_llm_stream`.
+async fn spawn_llm_for_prompt(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+    content: &str,
+    model: Option<&str>,
+    after_block_id: &kaijutsu_crdt::BlockId,
+    tool_ctx: kaijutsu_kernel::ToolContext,
+    user_agent_id: PrincipalId,
+) -> Result<(), capnp::Error> {
+    let documents = kernel.documents.clone();
+    let kernel_arc = kernel.kernel.clone();
+    let config_backend = kernel.config_backend.clone();
+    let conversation_cache = kernel.conversation_cache.clone();
+
+    // Load system prompt from config
+    let system_prompt = {
+        if let Err(e) = config_backend.ensure_config("system.md").await {
+            log::warn!("Failed to ensure system.md config: {}", e);
+        }
+        config_backend.get_content("system.md")
+            .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
+    };
+
+    // Resolve provider from kernel's LLM registry
+    let (provider, model_name, max_output_tokens) = {
+        let registry = kernel_arc.llm().read().await;
+        let max_tokens = registry.max_output_tokens();
+
+        if let Some(name) = model {
+            if let Some((p, m)) = registry.resolve_model(name) {
+                (p, m, max_tokens)
+            } else {
+                let p = registry.default_provider().ok_or_else(|| {
+                    log::error!("No LLM provider configured");
+                    capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
+                })?;
+                (p, name.to_string(), max_tokens)
+            }
+        } else {
+            let p = registry.default_provider().ok_or_else(|| {
+                log::error!("No LLM provider configured");
+                capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
+            })?;
+            let m = registry.default_model()
+                .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                .to_string();
+            (p, m, max_tokens)
+        }
+    };
+
+    // Build tool definitions from equipped tools
+    let tools = build_tool_definitions(&kernel_arc).await;
+
+    log::info!("Spawning LLM stream: context={}, model={}", context_id, model_name);
+
+    let content = content.to_owned();
+    let after_block_id = *after_block_id;
+
+    tokio::task::spawn_local(process_llm_stream(
+        provider,
+        documents,
+        context_id,
+        content,
+        model_name,
+        kernel_arc,
+        tools,
+        after_block_id,
+        system_prompt,
+        max_output_tokens,
+        conversation_cache,
+        user_agent_id,
+        tool_ctx,
+    ));
+
+    Ok(())
 }
 
 /// Process LLM streaming in a background task with agentic loop.
