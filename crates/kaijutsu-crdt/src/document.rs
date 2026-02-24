@@ -429,6 +429,7 @@ impl BlockDocument {
             exit_code,
             is_error,
             output,
+            tool_use_id: None, // Legacy document predates tool_use_id
             source_context,
             source_model,
             drift_kind,

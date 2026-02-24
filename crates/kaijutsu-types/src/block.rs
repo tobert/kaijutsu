@@ -517,6 +517,11 @@ pub struct BlockSnapshot {
     /// `displayHint` on wire — renaming is a separate schema change).
     #[serde(default)]
     pub output: Option<OutputData>,
+    /// LLM-assigned tool invocation ID (e.g., "toolu_01ABC...").
+    /// Stored on both ToolCall and ToolResult blocks for lossless replay.
+    /// Opaque string — not a BlockId, no remapping needed during fork.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
 
     // Drift-specific fields (Drift)
 
@@ -583,6 +588,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            tool_use_id: None,
             order_key: None,
         }
     }
@@ -618,6 +624,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            tool_use_id: None,
             order_key: None,
         }
     }
@@ -633,6 +640,7 @@ impl BlockSnapshot {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         role: Role,
+        tool_use_id: Option<String>,
     ) -> Self {
         debug_assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
@@ -656,6 +664,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             output: None,
+            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -672,6 +681,7 @@ impl BlockSnapshot {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
+        tool_use_id: Option<String>,
     ) -> Self {
         debug_assert!(
             tool_call_id.context_id == id.context_id,
@@ -694,6 +704,7 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             output: None,
+            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -714,6 +725,7 @@ impl BlockSnapshot {
         is_error: bool,
         exit_code: Option<i32>,
         output: Option<OutputData>,
+        tool_use_id: Option<String>,
     ) -> Self {
         debug_assert!(
             tool_call_id.context_id == id.context_id,
@@ -736,6 +748,7 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             output,
+            tool_use_id,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -774,6 +787,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             output: None,
+            tool_use_id: None,
             source_context: Some(source_context),
             source_model,
             drift_kind: Some(drift_kind),
@@ -810,6 +824,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             output: None,
+            tool_use_id: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -858,6 +873,7 @@ impl BlockSnapshot {
             && self.exit_code == other.exit_code
             && self.is_error == other.is_error
             && self.output == other.output
+            && self.tool_use_id == other.tool_use_id
             && self.source_context == other.source_context
             && self.source_model == other.source_model
             && self.drift_kind == other.drift_kind
@@ -911,6 +927,7 @@ impl BlockSnapshotBuilder {
                 exit_code: None,
                 is_error: false,
                 output: None,
+                tool_use_id: None,
                 source_context: None,
                 source_model: None,
                 drift_kind: None,
@@ -985,6 +1002,11 @@ impl BlockSnapshotBuilder {
 
     pub fn output(mut self, data: OutputData) -> Self {
         self.snap.output = Some(data);
+        self
+    }
+
+    pub fn tool_use_id(mut self, id: impl Into<String>) -> Self {
+        self.snap.tool_use_id = Some(id.into());
         self
     }
 
@@ -1296,6 +1318,7 @@ mod tests {
             "read_file",
             input,
             Role::Model,
+            None,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
@@ -1320,6 +1343,7 @@ mod tests {
             "shell",
             input,
             Role::User,
+            None,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
@@ -1341,6 +1365,7 @@ mod tests {
             "shell",
             input,
             Role::Model,
+            None,
         );
 
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
@@ -1361,6 +1386,7 @@ mod tests {
             "file contents here",
             false,
             Some(0),
+            None,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolResult);
@@ -1385,6 +1411,7 @@ mod tests {
             "total 42\ndrwxr-xr-x ...",
             false,
             Some(0),
+            None,
         );
 
         assert_eq!(snap.kind, BlockKind::ToolResult);
@@ -1407,6 +1434,7 @@ mod tests {
             true,
             Some(1),
             Some(output_data.clone()),
+            None,
         );
 
         assert!(snap.is_shell());
@@ -1508,7 +1536,7 @@ mod tests {
         let output_data = OutputData::text("formatted output");
         let snap = BlockSnapshot::tool_result_with_output(
             id, call_id, ToolKind::Shell, "raw output", false, Some(0),
-            Some(output_data.clone()),
+            Some(output_data.clone()), None,
         );
         let bytes = postcard::to_allocvec(&snap).unwrap();
         let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
@@ -1525,7 +1553,7 @@ mod tests {
         let output_data = OutputData::text("formatted");
         let snap = BlockSnapshot::tool_result_with_output(
             id, call_id, ToolKind::Shell, "raw", false, Some(0),
-            Some(output_data.clone()),
+            Some(output_data.clone()), None,
         );
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
@@ -1545,6 +1573,7 @@ mod tests {
             "shell",
             input,
             Role::User,
+            None,
         );
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
@@ -1747,7 +1776,7 @@ mod tests {
         let call_id = BlockId::new(ctx, author, 1);
         let id = BlockId::new(ctx, PrincipalId::system(), 1);
         let snap = BlockSnapshot::tool_result(
-            id, call_id, ToolKind::Shell, "output", true, Some(127),
+            id, call_id, ToolKind::Shell, "output", true, Some(127), None,
         );
         let header = BlockHeader::from_snapshot(&snap);
         assert_eq!(header.tool_kind, Some(ToolKind::Shell));
@@ -1776,6 +1805,7 @@ mod tests {
             "shell",
             serde_json::json!({"cmd": "ls"}),
             Role::User,
+            None,
         );
         let header = BlockHeader::from_snapshot(&snap);
         assert!(header.is_tool());
@@ -1847,6 +1877,7 @@ mod tests {
             "shell",
             serde_json::json!({}),
             Role::Model,
+            None,
         );
     }
 
@@ -1865,6 +1896,7 @@ mod tests {
             "output",
             false,
             Some(0),
+            None,
         );
     }
 
@@ -1883,6 +1915,7 @@ mod tests {
             "output",
             false,
             Some(0),
+            None,
             None,
         );
     }
@@ -2044,6 +2077,7 @@ mod tests {
             "shell",
             serde_json::json!({"command": "cat /etc/hosts"}),
             Role::Model,
+            None,
         );
 
         let tool_result = BlockSnapshot::tool_result(
@@ -2053,6 +2087,7 @@ mod tests {
             "127.0.0.1 localhost",
             false,
             Some(0),
+            None,
         );
 
         let text2 = BlockSnapshot::text(
@@ -2286,6 +2321,7 @@ mod tests {
                 "shell",
                 serde_json::json!({"command": tool_name}),
                 Role::Model,
+                None,
             );
             model_seq += 1;
 
@@ -2296,6 +2332,7 @@ mod tests {
                 format!("{tool_name}: ok"),
                 false,
                 Some(0),
+                None,
             );
             sys_seq += 1;
 

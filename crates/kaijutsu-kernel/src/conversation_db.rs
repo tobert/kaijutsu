@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     seq INTEGER NOT NULL,
     tool_name TEXT NOT NULL,
     tool_input TEXT,
+    tool_use_id TEXT,
     PRIMARY KEY (cell_id, agent_id, seq),
     FOREIGN KEY (cell_id, agent_id, seq) REFERENCES blocks(cell_id, agent_id, seq) ON DELETE CASCADE
 );
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS tool_results (
     call_seq INTEGER NOT NULL,
     exit_code INTEGER,
     is_error INTEGER NOT NULL DEFAULT 0,
+    tool_use_id TEXT,
     PRIMARY KEY (cell_id, agent_id, seq),
     FOREIGN KEY (cell_id, agent_id, seq) REFERENCES blocks(cell_id, agent_id, seq) ON DELETE CASCADE
 );
@@ -124,6 +126,7 @@ struct BlockRow {
 struct ToolCallRow {
     tool_name: String,
     tool_input: Option<String>,
+    tool_use_id: Option<String>,
 }
 
 /// Maps a row from the tool_results table.
@@ -134,6 +137,7 @@ struct ToolResultRow {
     call_seq: u64,
     exit_code: Option<i32>,
     is_error: bool,
+    tool_use_id: Option<String>,
 }
 
 // =============================================================================
@@ -189,24 +193,27 @@ fn row_to_block(
     let kind = BlockKind::from_str(&row.kind).unwrap_or_default();
 
     // Extract tool-specific fields from extension rows
-    let (tool_name, tool_input) = tool_call
+    let (tool_name, tool_input, tc_tool_use_id) = tool_call
         .map(|tc| {
             let input = tc.tool_input;
-            (Some(tc.tool_name), input)
+            (Some(tc.tool_name), input, tc.tool_use_id)
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
 
-    let (tool_call_id, exit_code, is_error) = match tool_result {
+    let (tool_call_id, exit_code, is_error, tr_tool_use_id) = match tool_result {
         Some(tr) => {
             let call_ctx = ContextId::parse(&tr.call_cell_id)
                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
             let call_agent = PrincipalId::parse(&tr.call_agent_id)
                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
             let call_id = BlockId::new(call_ctx, call_agent, tr.call_seq);
-            (Some(call_id), tr.exit_code, tr.is_error)
+            (Some(call_id), tr.exit_code, tr.is_error, tr.tool_use_id)
         }
-        None => (None, None, false),
+        None => (None, None, false, None),
     };
+
+    // tool_use_id comes from whichever extension row is present
+    let tool_use_id = tc_tool_use_id.or(tr_tool_use_id);
 
     Ok(BlockSnapshot {
         id,
@@ -225,6 +232,7 @@ fn row_to_block(
         exit_code,
         is_error,
         output: None, // TODO: persist output data to DB if needed
+        tool_use_id,
         source_context: None, // TODO: persist drift metadata to DB if needed
         source_model: None,
         drift_kind: None,
@@ -239,6 +247,7 @@ impl ConversationDb {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn);
         Ok(Self { conn })
     }
 
@@ -248,6 +257,16 @@ impl ConversationDb {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    /// Run forward-only schema migrations for existing databases.
+    /// New columns added via ALTER TABLE; errors are ignored (column already exists).
+    fn migrate(conn: &Connection) {
+        // v1: add tool_use_id to tool_calls and tool_results
+        let _ = conn.execute_batch(
+            "ALTER TABLE tool_calls ADD COLUMN tool_use_id TEXT;
+             ALTER TABLE tool_results ADD COLUMN tool_use_id TEXT;",
+        );
     }
 
     // =========================================================================
@@ -386,27 +405,30 @@ impl ConversationDb {
             BlockKind::ToolCall => {
                 if let Some(ref tool_name) = block.tool_name {
                     let tool_input = block.tool_input.as_deref();
+                    let tool_use_id = block.tool_use_id.as_deref();
                     tx.execute(
-                        "INSERT INTO tool_calls (cell_id, agent_id, seq, tool_name, tool_input)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        "INSERT INTO tool_calls (cell_id, agent_id, seq, tool_name, tool_input, tool_use_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![
                             row.cell_id,
                             row.agent_id,
                             row.seq as i64,
                             tool_name,
                             tool_input,
+                            tool_use_id,
                         ],
                     )?;
                 }
             }
             BlockKind::ToolResult => {
                 if let Some(ref call_id) = block.tool_call_id {
+                    let tool_use_id = block.tool_use_id.as_deref();
                     tx.execute(
                         "INSERT INTO tool_results (
                             cell_id, agent_id, seq,
                             call_cell_id, call_agent_id, call_seq,
-                            exit_code, is_error
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            exit_code, is_error, tool_use_id
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             row.cell_id,
                             row.agent_id,
@@ -416,6 +438,7 @@ impl ConversationDb {
                             call_id.seq as i64,
                             block.exit_code,
                             block.is_error as i32,
+                            tool_use_id,
                         ],
                     )?;
                 }
@@ -541,7 +564,7 @@ impl ConversationDb {
         seq: u64,
     ) -> SqliteResult<Option<ToolCallRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tool_name, tool_input FROM tool_calls
+            "SELECT tool_name, tool_input, tool_use_id FROM tool_calls
              WHERE cell_id = ?1 AND agent_id = ?2 AND seq = ?3",
         )?;
 
@@ -550,6 +573,7 @@ impl ConversationDb {
             Some(row) => Ok(Some(ToolCallRow {
                 tool_name: row.get(0)?,
                 tool_input: row.get(1)?,
+                tool_use_id: row.get(2)?,
             })),
             None => Ok(None),
         }
@@ -563,7 +587,7 @@ impl ConversationDb {
         seq: u64,
     ) -> SqliteResult<Option<ToolResultRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT call_cell_id, call_agent_id, call_seq, exit_code, is_error
+            "SELECT call_cell_id, call_agent_id, call_seq, exit_code, is_error, tool_use_id
              FROM tool_results
              WHERE cell_id = ?1 AND agent_id = ?2 AND seq = ?3",
         )?;
@@ -576,6 +600,7 @@ impl ConversationDb {
                 call_seq: row.get::<_, i64>(2)? as u64,
                 exit_code: row.get(3)?,
                 is_error: row.get::<_, i32>(4)? != 0,
+                tool_use_id: row.get(5)?,
             })),
             None => Ok(None),
         }

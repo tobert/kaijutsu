@@ -285,6 +285,7 @@ impl HookListener {
             &tool.name,
             input,
             Some(PrincipalId::system()),
+            None,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -309,6 +310,7 @@ impl HookListener {
             is_error,
             None,
             Some(PrincipalId::system()),
+            None,
         ) {
             tracing::warn!("Hook insert_tool_result error: {e}");
         }

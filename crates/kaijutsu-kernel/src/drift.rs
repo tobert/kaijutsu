@@ -1282,6 +1282,7 @@ mod tests {
             &long_content,
             false,
             None,
+            None,
         )];
 
         let prompt = build_distillation_prompt(&blocks, None);

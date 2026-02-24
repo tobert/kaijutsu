@@ -180,6 +180,7 @@ let cmd = BlockSnapshot::tool_call(
     "shell",
     serde_json::json!({"command": "ls -la"}),
     Role::User,
+    None, // tool_use_id: only set for LLM-issued tool calls
 );
 assert!(cmd.is_shell());
 assert_eq!(cmd.author(), amy.id);

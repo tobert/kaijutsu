@@ -1962,7 +1962,7 @@ impl kernel::Server for KernelImpl {
             let command_block_id = documents.insert_tool_call_as(
                 context_id, None, last_block.as_ref(),
                 "shell", serde_json::json!({"code": code}),
-                Some(user_agent_id),
+                Some(user_agent_id), None,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
             log::info!("Created shell command block: {:?}", command_block_id);
 
@@ -1970,7 +1970,7 @@ impl kernel::Server for KernelImpl {
             let output_block_id = documents.insert_tool_result_as(
                 context_id, &command_block_id, Some(&command_block_id),
                 "", false, None,
-                Some(PrincipalId::system()),
+                Some(PrincipalId::system()), None,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
@@ -4094,14 +4094,14 @@ impl kernel::Server for KernelImpl {
                 let command_block_id = documents.insert_tool_call_as(
                     context_id, None, last_block.as_ref(),
                     "shell", serde_json::json!({"code": code}),
-                    Some(user_agent_id),
+                    Some(user_agent_id), None,
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
 
                 // Create ToolResult block (empty, filled by execution)
                 let output_block_id = documents.insert_tool_result_as(
                     context_id, &command_block_id, Some(&command_block_id),
                     "", false, None,
-                    Some(PrincipalId::system()),
+                    Some(PrincipalId::system()), None,
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
 
                 // Mark output block as Running
@@ -4456,6 +4456,25 @@ async fn process_llm_stream(
     let cache_lock = conversation_cache.get_or_create(cell_id);
     let mut messages = cache_lock.lock().await;
 
+    // Hydrate from blocks on cache miss (first access, LRU eviction, restart)
+    if messages.is_empty() {
+        match documents.block_snapshots(cell_id) {
+            Ok(blocks) => {
+                let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
+                if !hydrated.is_empty() {
+                    log::info!(
+                        "Hydrated {} messages from {} blocks for context {}",
+                        hydrated.len(), blocks.len(), cell_id
+                    );
+                    *messages = hydrated;
+                }
+            }
+            Err(e) => {
+                log::debug!("Could not hydrate cache for {}: {}", cell_id, e);
+            }
+        }
+    }
+
     let history_len = messages.len();
     messages.push(LlmMessage::user(&content));
     log::info!("Loaded {} cached messages for cell {}, adding user message", history_len, cell_id);
@@ -4564,7 +4583,7 @@ async fn process_llm_stream(
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(PrincipalId::system())) {
+                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(PrincipalId::system()), Some(id.clone())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), Some(block_id));
@@ -4670,7 +4689,7 @@ async fn process_llm_stream(
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result_as(
                             cell_id, tcb_id, Some(tcb_id), "", false, None,
-                            Some(PrincipalId::system()),
+                            Some(PrincipalId::system()), Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
                                 let _ = documents.set_status(cell_id, &id, Status::Running);
@@ -5030,6 +5049,7 @@ fn parse_block_snapshot(
         exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
         is_error: reader.get_is_error(),
         output,
+        tool_use_id: None, // Not on wire yet — only populated from LLM stream events
         file_path: if reader.has_file_path() {
             reader.get_file_path().ok()
                 .and_then(|s| s.to_str().ok())

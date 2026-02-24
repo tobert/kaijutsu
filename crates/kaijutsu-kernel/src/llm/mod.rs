@@ -667,6 +667,181 @@ impl LlmRegistry {
     }
 }
 
+// ============================================================================
+// Hydration: BlockSnapshot[] → Message[]
+// ============================================================================
+
+/// Reconstruct LLM conversation history from stored blocks.
+///
+/// Walks blocks in order and produces the `Message` sequence expected by the
+/// LLM API. Skips thinking, drift, file, compacted, and empty blocks.
+///
+/// Preserves `tool_use_id` from blocks when available, falling back to
+/// `BlockId::to_key()` for pre-migration blocks.
+///
+/// **Trailing-tool-use guard:** If the last message is an assistant with
+/// tool_uses but no following tool_results, synthesizes error results so the
+/// LLM API doesn't reject the request.
+pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Message> {
+    use kaijutsu_types::{BlockKind, Role as BlockRole};
+
+    struct HydrationState {
+        messages: Vec<Message>,
+        assistant_text: Option<String>,
+        tool_uses: Vec<ContentBlock>,
+        tool_results: Vec<ContentBlock>,
+    }
+
+    impl HydrationState {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                assistant_text: None,
+                tool_uses: Vec::new(),
+                tool_results: Vec::new(),
+            }
+        }
+
+        /// Flush any pending assistant text + tool_uses into a message.
+        fn flush_assistant(&mut self) {
+            if self.assistant_text.is_none() && self.tool_uses.is_empty() {
+                return;
+            }
+            if self.tool_uses.is_empty() {
+                // Plain text assistant message
+                if let Some(text) = self.assistant_text.take() {
+                    self.messages.push(Message::assistant(text));
+                }
+            } else {
+                // Assistant message with tool uses (optionally preceded by text)
+                let text = self.assistant_text.take();
+                let tool_uses = std::mem::take(&mut self.tool_uses);
+                self.messages.push(Message::with_tool_uses(text, tool_uses));
+            }
+        }
+
+        /// Flush any pending tool results into a user message.
+        fn flush_tool_results(&mut self) {
+            if self.tool_results.is_empty() {
+                return;
+            }
+            let results = std::mem::take(&mut self.tool_results);
+            self.messages.push(Message::tool_results(results));
+        }
+
+        /// Flush everything pending (assistant then tool results).
+        fn flush_all(&mut self) {
+            self.flush_assistant();
+            self.flush_tool_results();
+        }
+
+        /// Consume and return final messages, applying trailing-tool-use guard.
+        fn into_messages(mut self) -> Vec<Message> {
+            self.flush_all();
+
+            // Trailing-tool-use guard: if the last message is an assistant with
+            // tool_uses and no tool_results follow, synthesize error results.
+            if let Some(last) = self.messages.last() {
+                if last.role == Role::Assistant {
+                    if let MessageContent::Blocks(blocks) = &last.content {
+                        let tool_use_ids: Vec<String> = blocks.iter().filter_map(|b| {
+                            if let ContentBlock::ToolUse { id, .. } = b {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        }).collect();
+
+                        if !tool_use_ids.is_empty() {
+                            let error_results: Vec<ContentBlock> = tool_use_ids.into_iter()
+                                .map(|id| ContentBlock::ToolResult {
+                                    tool_use_id: id,
+                                    content: "Tool execution was interrupted (context was forked or pruned)".into(),
+                                    is_error: true,
+                                })
+                                .collect();
+                            self.messages.push(Message::tool_results(error_results));
+                        }
+                    }
+                }
+            }
+
+            self.messages
+        }
+    }
+
+    let mut state = HydrationState::new();
+
+    for block in blocks {
+        // Skip blocks that shouldn't appear in LLM history
+        if block.compacted { continue; }
+        if matches!(block.kind, BlockKind::Thinking | BlockKind::Drift | BlockKind::File) {
+            continue;
+        }
+        if block.role == BlockRole::System || block.role == BlockRole::Asset {
+            continue;
+        }
+        if block.content.is_empty()
+            && block.kind != BlockKind::ToolCall
+            && block.kind != BlockKind::ToolResult
+        {
+            continue;
+        }
+
+        match (block.role, block.kind) {
+            (BlockRole::User, BlockKind::Text) => {
+                state.flush_all();
+                state.messages.push(Message::user(&block.content));
+            }
+            (BlockRole::Model, BlockKind::Text) => {
+                // Flush pending tool results before accumulating assistant text
+                state.flush_tool_results();
+                match &mut state.assistant_text {
+                    Some(text) => {
+                        text.push('\n');
+                        text.push_str(&block.content);
+                    }
+                    None => {
+                        state.assistant_text = Some(block.content.clone());
+                    }
+                }
+            }
+            (BlockRole::Model, BlockKind::ToolCall) => {
+                // Flush pending tool results before accumulating tool uses
+                state.flush_tool_results();
+                let tool_use_id = block.tool_use_id.clone()
+                    .unwrap_or_else(|| block.id.to_key());
+                let name = block.tool_name.clone().unwrap_or_default();
+                let input = block.tool_input.as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                state.tool_uses.push(ContentBlock::ToolUse {
+                    id: tool_use_id,
+                    name,
+                    input,
+                });
+            }
+            (BlockRole::Tool, BlockKind::ToolResult) => {
+                // Flush pending assistant before accumulating tool results
+                state.flush_assistant();
+                let tool_use_id = block.tool_use_id.clone()
+                    .or_else(|| block.tool_call_id.map(|id| id.to_key()))
+                    .unwrap_or_else(|| block.id.to_key());
+                state.tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: block.content.clone(),
+                    is_error: block.is_error,
+                });
+            }
+            _ => {
+                // Skip unexpected role/kind combinations
+            }
+        }
+    }
+
+    state.into_messages()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,5 +974,352 @@ mod tests {
         assert_eq!(prov, "anthropic");
         assert_eq!(model, "claude-haiku-4-5-20251001");
         assert!(registry.resolve_alias("nonexistent").is_none());
+    }
+
+    // ── Hydration tests ───────────────────────────────────────────────
+
+    mod hydration {
+        use super::super::*;
+        use kaijutsu_types::{
+            BlockId, BlockSnapshot, ContextId, PrincipalId,
+            Role as BlockRole, ToolKind,
+        };
+
+        fn ctx() -> ContextId { ContextId::new() }
+        fn user() -> PrincipalId { PrincipalId::new() }
+        fn model() -> PrincipalId { PrincipalId::new() }
+        fn system() -> PrincipalId { PrincipalId::system() }
+
+        #[test]
+        fn empty_blocks_produce_empty_messages() {
+            assert!(hydrate_from_blocks(&[]).is_empty());
+        }
+
+        #[test]
+        fn simple_user_model_exchange() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Hi there"),
+            ];
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[0].as_text(), Some("Hello"));
+            assert_eq!(msgs[1].role, Role::Assistant);
+            assert_eq!(msgs[1].as_text(), Some("Hi there"));
+        }
+
+        #[test]
+        fn tool_roundtrip_with_tool_use_id() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let user_block = BlockSnapshot::text(
+                BlockId::new(c, u, 0), None, BlockRole::User, "Read /etc/hosts",
+            );
+            let call_id = BlockId::new(c, m, 0);
+            let tool_call = BlockSnapshot::tool_call(
+                call_id, None, ToolKind::Mcp, "read_file",
+                serde_json::json!({"path": "/etc/hosts"}),
+                BlockRole::Model,
+                Some("toolu_01ABC".to_string()),
+            );
+            let tool_result = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0), call_id, ToolKind::Mcp,
+                "127.0.0.1 localhost", false, Some(0),
+                Some("toolu_01ABC".to_string()),
+            );
+
+            let msgs = hydrate_from_blocks(&[user_block, tool_call, tool_result]);
+            assert_eq!(msgs.len(), 3);
+
+            // User message
+            assert_eq!(msgs[0].as_text(), Some("Read /etc/hosts"));
+
+            // Assistant with tool use
+            assert_eq!(msgs[1].role, Role::Assistant);
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 1);
+                    match &blocks[0] {
+                        ContentBlock::ToolUse { id, name, .. } => {
+                            assert_eq!(id, "toolu_01ABC");
+                            assert_eq!(name, "read_file");
+                        }
+                        other => panic!("Expected ToolUse, got {:?}", other),
+                    }
+                }
+                other => panic!("Expected Blocks, got {:?}", other),
+            }
+
+            // Tool results
+            assert_eq!(msgs[2].role, Role::User);
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 1);
+                    match &blocks[0] {
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            assert_eq!(tool_use_id, "toolu_01ABC");
+                            assert_eq!(content, "127.0.0.1 localhost");
+                            assert!(!is_error);
+                        }
+                        other => panic!("Expected ToolResult, got {:?}", other),
+                    }
+                }
+                other => panic!("Expected Blocks, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn multiple_tool_calls_grouped() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Build it"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 0), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "cargo build"}),
+                    BlockRole::Model, Some("toolu_1".into()),
+                ),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 1), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "cargo test"}),
+                    BlockRole::Model, Some("toolu_2".into()),
+                ),
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 0), BlockId::new(c, m, 0), ToolKind::Shell,
+                    "ok", false, Some(0), Some("toolu_1".into()),
+                ),
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 1), BlockId::new(c, m, 1), ToolKind::Shell,
+                    "ok", false, Some(0), Some("toolu_2".into()),
+                ),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 3); // user, assistant(2 tool_uses), user(2 tool_results)
+
+            // Assistant should have 2 tool uses
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => assert_eq!(blocks.len(), 2),
+                _ => panic!("Expected blocks"),
+            }
+
+            // Tool results should have 2 results
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => assert_eq!(blocks.len(), 2),
+                _ => panic!("Expected blocks"),
+            }
+        }
+
+        #[test]
+        fn skips_thinking_drift_file_compacted_empty() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::thinking(BlockId::new(c, m, 0), None, "Let me think..."),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Hi"),
+                BlockSnapshot::drift(
+                    BlockId::new(c, PrincipalId::system(), 0), None,
+                    "drift content", ContextId::new(), None,
+                    kaijutsu_types::DriftKind::Push,
+                ),
+                BlockSnapshot::file(BlockId::new(c, u, 1), None, "/foo", "content"),
+                {
+                    let mut b = BlockSnapshot::text(BlockId::new(c, m, 2), None, BlockRole::Model, "old");
+                    b.compacted = true;
+                    b
+                },
+                BlockSnapshot::text(BlockId::new(c, m, 3), None, BlockRole::Model, ""),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2); // just user + assistant
+            assert_eq!(msgs[0].as_text(), Some("Hello"));
+            assert_eq!(msgs[1].as_text(), Some("Hi"));
+        }
+
+        #[test]
+        fn consecutive_model_text_merged() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Part 1"),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Part 2"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[1].as_text(), Some("Part 1\nPart 2"));
+        }
+
+        #[test]
+        fn tool_use_id_fallback_to_block_key() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let call_id = BlockId::new(c, m, 0);
+            let result_id = BlockId::new(c, s, 0);
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Do it"),
+                BlockSnapshot::tool_call(
+                    call_id, None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "ls"}),
+                    BlockRole::Model, None, // no tool_use_id
+                ),
+                BlockSnapshot::tool_result(
+                    result_id, call_id, ToolKind::Shell,
+                    "files", false, Some(0), None, // no tool_use_id
+                ),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 3);
+
+            // Tool use should fall back to block id key
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::ToolUse { id, .. } => {
+                        assert_eq!(id, &call_id.to_key());
+                    }
+                    _ => panic!("Expected ToolUse"),
+                },
+                _ => panic!("Expected Blocks"),
+            }
+
+            // Tool result should fall back to tool_call_id key
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        assert_eq!(tool_use_id, &call_id.to_key());
+                    }
+                    _ => panic!("Expected ToolResult"),
+                },
+                _ => panic!("Expected Blocks"),
+            }
+        }
+
+        #[test]
+        fn trailing_tool_use_guard() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Do it"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 0), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "ls"}),
+                    BlockRole::Model, Some("toolu_orphan".into()),
+                ),
+                // No tool result follows!
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 3); // user, assistant(tool_use), user(synthetic error)
+
+            // Last message should be synthesized error results
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 1);
+                    match &blocks[0] {
+                        ContentBlock::ToolResult { tool_use_id, is_error, content } => {
+                            assert_eq!(tool_use_id, "toolu_orphan");
+                            assert!(is_error);
+                            assert!(content.contains("interrupted"));
+                        }
+                        _ => panic!("Expected ToolResult"),
+                    }
+                }
+                _ => panic!("Expected Blocks"),
+            }
+        }
+
+        #[test]
+        fn full_agentic_loop_replay() {
+            // Simulate: user → model text + tool_call → tool_result → model text + tool_call → tool_result → model text
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let blocks = vec![
+                // Turn 1: user prompt
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Fix the bug"),
+                // Turn 2: model thinks + calls tool
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Let me check"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 1), None, ToolKind::Mcp, "read_file",
+                    serde_json::json!({"path": "src/main.rs"}),
+                    BlockRole::Model, Some("toolu_read".into()),
+                ),
+                // Turn 3: tool result
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 0), BlockId::new(c, m, 1), ToolKind::Mcp,
+                    "fn main() { panic!() }", false, Some(0),
+                    Some("toolu_read".into()),
+                ),
+                // Turn 4: model edits
+                BlockSnapshot::text(BlockId::new(c, m, 2), None, BlockRole::Model, "Found it, fixing"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 3), None, ToolKind::Mcp, "write_file",
+                    serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
+                    BlockRole::Model, Some("toolu_write".into()),
+                ),
+                // Turn 5: tool result
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 1), BlockId::new(c, m, 3), ToolKind::Mcp,
+                    "ok", false, Some(0),
+                    Some("toolu_write".into()),
+                ),
+                // Turn 6: model done
+                BlockSnapshot::text(BlockId::new(c, m, 4), None, BlockRole::Model, "Fixed!"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+
+            // Expected: user, assistant(text+tool), user(result), assistant(text+tool), user(result), assistant
+            assert_eq!(msgs.len(), 6);
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[0].as_text(), Some("Fix the bug"));
+
+            assert_eq!(msgs[1].role, Role::Assistant);
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 2); // text + tool_use
+                }
+                _ => panic!("Expected blocks"),
+            }
+
+            assert_eq!(msgs[2].role, Role::User); // tool results
+
+            assert_eq!(msgs[3].role, Role::Assistant);
+            match &msgs[3].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 2); // text + tool_use
+                }
+                _ => panic!("Expected blocks"),
+            }
+
+            assert_eq!(msgs[4].role, Role::User); // tool results
+            assert_eq!(msgs[5].role, Role::Assistant);
+            assert_eq!(msgs[5].as_text(), Some("Fixed!"));
+        }
     }
 }

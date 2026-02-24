@@ -3035,6 +3035,7 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
             Role::Model,
+            None,
         );
         let result = format_single_block(&block, None);
         // Shader borders handle visual framing — text is plain
@@ -3055,6 +3056,7 @@ mod tests {
             "list_all",
             serde_json::json!(null),
             Role::Model,
+            None,
         );
         block.status = Status::Done;
         let result = format_single_block(&block, None);
@@ -3073,6 +3075,7 @@ mod tests {
             "",
             false,
             Some(0),
+            None,
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "done");
@@ -3090,6 +3093,7 @@ mod tests {
             "file contents here",
             false,
             Some(0),
+            None,
         );
         let result = format_single_block(&result_block, None);
         assert!(result.starts_with("done\n"));
@@ -3109,6 +3113,7 @@ mod tests {
             content,
             false,
             Some(0),
+            None,
         );
         let result = format_single_block(&result_block, None);
         assert!(!result.contains('┌'));
@@ -3127,6 +3132,7 @@ mod tests {
             "permission denied",
             true,
             Some(1),
+            None,
         );
         let result = format_single_block(&result_block, None);
         assert!(result.contains("error \u{2717}"));
@@ -3145,6 +3151,7 @@ mod tests {
             "",
             true,
             Some(1),
+            None,
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "error");

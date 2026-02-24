@@ -79,6 +79,7 @@ pub struct BlockContent {
     tool_name: Option<String>,
     tool_input: Option<String>,
     tool_call_id: Option<BlockId>,
+    tool_use_id: Option<String>,
     output: Option<kaijutsu_types::OutputData>,
     source_context: Option<crate::ContextId>,
     source_model: Option<String>,
@@ -112,6 +113,7 @@ impl BlockContent {
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
+            tool_use_id: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -151,6 +153,7 @@ impl BlockContent {
         block.tool_name = snap.tool_name.clone();
         block.tool_input = snap.tool_input.clone();
         block.tool_call_id = snap.tool_call_id;
+        block.tool_use_id = snap.tool_use_id.clone();
         block.output = snap.output.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
@@ -183,6 +186,7 @@ impl BlockContent {
             tool_name: snap.tool_name.clone(),
             tool_input: snap.tool_input.clone(),
             tool_call_id: snap.tool_call_id,
+            tool_use_id: snap.tool_use_id.clone(),
             output: snap.output.clone(),
             source_context: snap.source_context,
             source_model: snap.source_model.clone(),
@@ -376,6 +380,7 @@ impl BlockContent {
             exit_code: self.header.exit_code,
             is_error: self.header.is_error,
             output: self.output.clone(),
+            tool_use_id: self.tool_use_id.clone(),
             source_context: self.source_context,
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,

@@ -58,6 +58,8 @@ pub use llm::{
     // Core types
     LlmError, LlmRegistry, LlmResult, RigProvider,
     Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
+    // Hydration
+    hydrate_from_blocks,
     // Tool definitions
     ToolDefinition as LlmToolDefinition,
     // Streaming

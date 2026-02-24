@@ -554,10 +554,13 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
     ) -> Result<BlockId, String> {
-        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, None)
+        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, None, None)
     }
 
     /// Insert a tool call block with an explicit author identity.
+    ///
+    /// `tool_use_id` is the LLM-assigned tool invocation ID (e.g., "toolu_01ABC...").
+    /// Pass `Some(id)` when capturing from LLM stream events, `None` for shell/manual calls.
     pub fn insert_tool_call_as(
         &self,
         context_id: ContextId,
@@ -566,6 +569,7 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         agent_id: Option<PrincipalId>,
+        tool_use_id: Option<String>,
     ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
@@ -578,8 +582,9 @@ impl BlockStore {
 
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input)
                 .map_err(|e| e.to_string())?;
-            let snapshot = entry.doc.get_block_snapshot(&block_id)
+            let mut snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
+            snapshot.tool_use_id = tool_use_id;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
@@ -611,10 +616,13 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
     ) -> Result<BlockId, String> {
-        self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, None)
+        self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, None, None)
     }
 
     /// Insert a tool result block with an explicit author identity.
+    ///
+    /// `tool_use_id` is the LLM-assigned tool invocation ID for correlating
+    /// tool calls with results during hydration.
     pub fn insert_tool_result_as(
         &self,
         context_id: ContextId,
@@ -624,6 +632,7 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
         agent_id: Option<PrincipalId>,
+        tool_use_id: Option<String>,
     ) -> Result<BlockId, String> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
@@ -636,8 +645,9 @@ impl BlockStore {
 
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code)
                 .map_err(|e| e.to_string())?;
-            let snapshot = entry.doc.get_block_snapshot(&block_id)
+            let mut snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or_else(|| "Block not found after insert".to_string())?;
+            snapshot.tool_use_id = tool_use_id;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
