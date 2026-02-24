@@ -300,42 +300,84 @@ impl ConnectionState {
     }
 }
 
-/// Get the data directory for a kernel's persistent storage.
+/// Get the stable data directory for kernel persistent storage.
 /// Creates the directory if it doesn't exist.
-/// Returns: ~/.local/share/kaijutsu/kernels/{kernel_id_hex}/
-fn kernel_data_dir(kernel_id: KernelId) -> std::path::PathBuf {
+/// Returns: ~/.local/share/kaijutsu/kernel/
+fn kernel_data_dir() -> std::path::PathBuf {
     let dir = kaish_kernel::xdg_data_home()
         .join("kaijutsu")
-        .join("kernels")
-        .join(kernel_id.to_hex());
+        .join("kernel");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("Failed to create kernel data dir {:?}: {}", dir, e);
     }
+
+    // Log a migration hint if old per-kernel directories exist
+    let old_dir = kaish_kernel::xdg_data_home()
+        .join("kaijutsu")
+        .join("kernels");
+    if old_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&old_dir) {
+            let count = entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
+            if count > 0 {
+                log::info!(
+                    "Found {} old kernel data dir(s) in {:?}. \
+                     To recover, copy the most recent data.db to {:?}",
+                    count, old_dir, dir
+                );
+            }
+        }
+    }
+
     dir
+}
+
+/// Read the default context ID from the bootstrap table in the block store's DB.
+fn read_bootstrap_context(documents: &SharedBlockStore) -> Option<ContextId> {
+    let db_handle = documents.db()?;
+    let db = db_handle.lock().ok()?;
+    let hex = db.get_bootstrap("default_context_id").ok()??;
+    ContextId::parse(&hex).ok()
+}
+
+/// Write the default context ID to the bootstrap table in the block store's DB.
+fn write_bootstrap_context(documents: &SharedBlockStore, ctx_id: ContextId) {
+    if let Some(db_handle) = documents.db() {
+        if let Ok(db) = db_handle.lock() {
+            if let Err(e) = db.ensure_bootstrap_table() {
+                log::warn!("Failed to create bootstrap table: {}", e);
+                return;
+            }
+            if let Err(e) = db.set_bootstrap("default_context_id", &ctx_id.to_hex()) {
+                log::warn!("Failed to write default_context_id to bootstrap: {}", e);
+            }
+        }
+    }
 }
 
 /// Open or create a BlockStore with database persistence for a kernel.
 ///
-/// If `data_dir_override` is set, uses that directory for the database.
-/// Otherwise uses the XDG default (~/.local/share/kaijutsu/kernels/{kernel_id_hex}/).
-fn create_block_store_with_db(kernel_id: KernelId, agent_id: PrincipalId, block_flows: SharedBlockFlowBus, input_flows: SharedInputDocFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
+/// If `data_dir_override` is set, uses that directory directly for the database.
+/// Otherwise uses the stable XDG default (~/.local/share/kaijutsu/kernel/).
+fn create_block_store_with_db(agent_id: PrincipalId, block_flows: SharedBlockFlowBus, input_flows: SharedInputDocFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
     let db_dir = match data_dir_override {
         Some(dir) => {
-            let d = dir.join(kernel_id.to_hex());
-            if let Err(e) = std::fs::create_dir_all(&d) {
-                log::warn!("Failed to create data dir {:?}: {}", d, e);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                log::warn!("Failed to create data dir {:?}: {}", dir, e);
             }
-            d
+            dir.to_path_buf()
         }
-        None => kernel_data_dir(kernel_id),
+        None => kernel_data_dir(),
     };
     let db_path = db_dir.join("data.db");
     match DocumentDb::open(&db_path) {
         Ok(db) => {
             log::info!("Opened document database at {:?}", db_path);
-            // Ensure input_docs table exists (migration for existing DBs)
+            // Ensure migration tables exist for existing DBs
             if let Err(e) = db.ensure_input_docs_table() {
                 log::warn!("Failed to create input_docs table: {}", e);
+            }
+            if let Err(e) = db.ensure_bootstrap_table() {
+                log::warn!("Failed to create bootstrap table: {}", e);
             }
             let mut inner = BlockStore::with_db_and_flows(db, agent_id, block_flows);
             inner.set_input_flows(input_flows);
@@ -634,7 +676,7 @@ pub async fn create_shared_kernel(
     let config_flows = shared_config_flow_bus(256);
     let input_flows = shared_input_doc_flow_bus(256);
 
-    // Generate kernel ID
+    // Generate kernel ID (session marker — fresh each restart)
     let id = KernelId::new();
     let id_str = id.to_hex();
 
@@ -654,18 +696,50 @@ pub async fn create_shared_kernel(
     // Read-write /tmp for scratch/interop with external tools
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
+    // Resolve stable data directory (used for block store DB + semantic index)
+    let resolved_data_dir = match data_dir {
+        Some(dir) => {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                log::warn!("Failed to create data dir {:?}: {}", dir, e);
+            }
+            dir.to_path_buf()
+        }
+        None => kernel_data_dir(),
+    };
+
     // Create block store with database persistence and shared FlowBus
     let block_flows_for_index = block_flows.clone();
-    let documents = create_block_store_with_db(id, PrincipalId::system(), block_flows, input_flows, data_dir);
+    let documents = create_block_store_with_db(
+        PrincipalId::system(), block_flows, input_flows,
+        Some(&resolved_data_dir),
+    );
 
-    // Create default context
-    let ctx_id = ContextId::new();
-    if !documents.contains(ctx_id) {
-        log::info!("Creating default context document for kernel {}", id_str);
+    // Resolve default context: bootstrap from DB → existing, or create new
+    let ctx_id = if let Some(persisted_id) = read_bootstrap_context(&documents) {
+        if documents.contains(persisted_id) {
+            log::info!("Restored default context {} from bootstrap", persisted_id.short());
+            persisted_id
+        } else {
+            log::warn!(
+                "Bootstrap context {} not found in DB, creating new default",
+                persisted_id.short()
+            );
+            let new_id = ContextId::new();
+            documents
+                .create_document(new_id, DocumentKind::Conversation, None)
+                .map_err(|e| capnp::Error::failed(e))?;
+            write_bootstrap_context(&documents, new_id);
+            new_id
+        }
+    } else {
+        let new_id = ContextId::new();
+        log::info!("Creating default context {} for kernel {}", new_id.short(), id_str);
         documents
-            .create_document(ctx_id, DocumentKind::Conversation, None)
+            .create_document(new_id, DocumentKind::Conversation, None)
             .map_err(|e| capnp::Error::failed(e))?;
-    }
+        write_bootstrap_context(&documents, new_id);
+        new_id
+    };
 
     // Create config backend
     let (config_backend, config_watcher) =
@@ -702,15 +776,11 @@ pub async fn create_shared_kernel(
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {
-        let data_dir = match data_dir {
-            Some(dir) => dir.join(id.to_hex()),
-            None => kernel_data_dir(id),
-        };
         let index_config = kaijutsu_index::IndexConfig::new(
             emb_config.model_dir.clone(),
             emb_config.dimensions,
             emb_config.max_tokens,
-            &data_dir,
+            &resolved_data_dir,
         );
         match kaijutsu_index::OnnxEmbedder::new(&emb_config.model_dir, emb_config.dimensions, emb_config.max_tokens) {
             Ok(embedder) => {
@@ -4649,22 +4719,20 @@ async fn process_llm_stream(
     let cache_lock = conversation_cache.get_or_create(cell_id);
     let mut messages = cache_lock.lock().await;
 
-    // Hydrate from blocks on cache miss (first access, LRU eviction, restart)
-    if messages.is_empty() {
-        match documents.block_snapshots(cell_id) {
-            Ok(blocks) => {
-                let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
-                if !hydrated.is_empty() {
-                    log::info!(
-                        "Hydrated {} messages from {} blocks for context {}",
-                        hydrated.len(), blocks.len(), cell_id
-                    );
-                    *messages = hydrated;
-                }
-            }
-            Err(e) => {
-                log::debug!("Could not hydrate cache for {}: {}", cell_id, e);
-            }
+    // Always re-hydrate from blocks — ensures shell commands, MCP tool calls,
+    // and other agent blocks added between prompts are visible to the LLM.
+    // block_snapshots() reads from in-memory DashMap, sub-millisecond for typical conversations.
+    match documents.block_snapshots(cell_id) {
+        Ok(blocks) => {
+            let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
+            log::info!(
+                "Hydrated {} messages from {} blocks for context {}",
+                hydrated.len(), blocks.len(), cell_id
+            );
+            *messages = hydrated;
+        }
+        Err(e) => {
+            log::debug!("Could not hydrate cache for {}: {}", cell_id, e);
         }
     }
 

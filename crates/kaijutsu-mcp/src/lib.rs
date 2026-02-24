@@ -503,6 +503,70 @@ impl KaijutsuMcp {
             }
         }
     }
+
+    /// Get all context IDs visible to this MCP server.
+    ///
+    /// For Local: returns IDs from the local store.
+    /// For Remote: queries the server via `list_contexts()` for the full set,
+    /// ensuring we see contexts beyond the one we joined.
+    async fn all_context_ids(&self) -> Result<Vec<ContextId>, String> {
+        match &self.backend {
+            Backend::Local(store) => Ok(store.list_ids()),
+            Backend::Remote(remote) => {
+                let contexts = remote.actor.list_contexts().await
+                    .map_err(|e| format!("Error listing contexts: {e}"))?;
+                Ok(contexts.iter().map(|c| c.id).collect())
+            }
+        }
+    }
+
+    /// Fetch block snapshots for a context, checking local store first then
+    /// falling back to RPC for contexts not in the local cache.
+    async fn fetch_context_blocks(
+        &self,
+        ctx_id: ContextId,
+    ) -> Result<Vec<kaijutsu_crdt::BlockSnapshot>, String> {
+        // Try local store first
+        if let Ok(blocks) = self.store().block_snapshots(ctx_id) {
+            return Ok(blocks);
+        }
+        // For Remote, fetch via RPC
+        if let Some(actor) = self.actor() {
+            let state = actor.get_context_state(ctx_id).await
+                .map_err(|e| format!("Error fetching context {}: {e}", ctx_id.short()))?;
+            Ok(state.blocks)
+        } else {
+            Err(format!("Context {} not found", ctx_id.short()))
+        }
+    }
+
+    /// Find a block by ID string across all visible contexts.
+    /// Checks local store first, then fetches from server if needed.
+    async fn find_block_cross_context(
+        &self,
+        block_id_str: &str,
+    ) -> Option<(ContextId, kaijutsu_crdt::BlockId, kaijutsu_crdt::BlockSnapshot)> {
+        // Try local store first (fast path)
+        let block_id = parse_block_id(block_id_str)?;
+        let ctx = block_id.context_id;
+
+        if let Some(entry) = self.store().get(ctx) {
+            if let Some(snap) = entry.doc.get_block_snapshot(&block_id) {
+                return Some((ctx, block_id, snap));
+            }
+        }
+
+        // For Remote, fetch the context's state and look for the block
+        if let Some(actor) = self.actor() {
+            if let Ok(state) = actor.get_context_state(ctx).await {
+                if let Some(snap) = state.blocks.into_iter().find(|b| b.id == block_id) {
+                    return Some((ctx, block_id, snap));
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Default for KaijutsuMcp {
@@ -542,8 +606,26 @@ impl KaijutsuMcp {
 
     #[tool(description = "List all documents in the kernel with their metadata and block counts.")]
     #[tracing::instrument(skip(self), name = "mcp.doc_list")]
-    fn doc_list(&self) -> String {
-        let docs: Vec<DocumentInfo> = self.store().list_ids().iter().map(|id| {
+    async fn doc_list(&self) -> String {
+        // Get context metadata from server if connected
+        let context_meta: std::collections::HashMap<ContextId, kaijutsu_client::ContextInfo> =
+            if let Some(actor) = self.actor() {
+                match actor.list_contexts().await {
+                    Ok(contexts) => contexts.into_iter().map(|c| (c.id, c)).collect(),
+                    Err(_) => std::collections::HashMap::new(),
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        // Get all context IDs (local + remote)
+        let all_ids = match self.all_context_ids().await {
+            Ok(ids) => ids,
+            Err(e) => return format!("Error: {e}"),
+        };
+
+        let mut docs = Vec::new();
+        for id in &all_ids {
             let (kind, language, block_count) = self.store().get(*id)
                 .map(|entry| {
                     let kind = entry.kind.as_str().to_string();
@@ -551,15 +633,20 @@ impl KaijutsuMcp {
                     let count = entry.doc.blocks_ordered().len();
                     (kind, lang, count)
                 })
-                .unwrap_or_else(|| ("unknown".to_string(), None, 0));
+                .unwrap_or_else(|| ("conversation".to_string(), None, 0));
 
-            DocumentInfo {
+            let meta = context_meta.get(id);
+            docs.push(DocumentInfo {
                 id: id.to_hex(),
                 kind,
                 language,
                 block_count,
-            }
-        }).collect();
+                label: meta.map(|m| m.label.clone()).filter(|l| !l.is_empty()),
+                provider: meta.map(|m| m.provider.clone()).filter(|p| !p.is_empty()),
+                model: meta.map(|m| m.model.clone()).filter(|m| !m.is_empty()),
+                parent_id: meta.and_then(|m| m.parent_id.map(|p| p.to_hex())),
+            });
+        }
 
         serde_json::json!({
             "documents": docs,
@@ -639,21 +726,15 @@ impl KaijutsuMcp {
 
     #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
-    fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
-        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
+    async fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
+        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document not found"),
-        };
-
-        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
-            Some(s) => s,
-            None => return format!("Error: block not found"),
-        };
+        let version = self.store().get(context_id)
+            .map(|e| e.version())
+            .unwrap_or(0);
 
         let content = &snapshot.content;
         let total_lines = line_count(content);
@@ -702,7 +783,7 @@ impl KaijutsuMcp {
             "role": snapshot.role.as_str(),
             "kind": snapshot.kind.as_str(),
             "status": snapshot.status.as_str(),
-            "version": entry.version(),
+            "version": version,
             "line_count": total_lines,
             "metadata": metadata,
         }).to_string()
@@ -837,7 +918,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "List blocks with optional filters for document, kind, status, and role.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_list")]
-    fn block_list(&self, Parameters(req): Parameters<BlockListRequest>) -> String {
+    async fn block_list(&self, Parameters(req): Parameters<BlockListRequest>) -> String {
         let kind_filter = req.kind.as_ref().and_then(|k| parse_block_kind(k));
         let status_filter = req.status.as_ref().and_then(|s| parse_status(s));
         let role_filter = req.role.as_ref().and_then(|r| parse_role(r));
@@ -846,63 +927,68 @@ impl KaijutsuMcp {
 
         let context_ids: Vec<ContextId> = if let Some(ref doc_id) = req.document_id {
             match ContextId::parse(doc_id) {
-                Ok(id) if self.store().contains(id) => vec![id],
+                Ok(id) => vec![id],
                 _ => vec![],
             }
         } else {
-            self.store().list_ids()
+            match self.all_context_ids().await {
+                Ok(ids) => ids,
+                Err(e) => return format!("Error: {e}"),
+            }
         };
 
         for context_id in context_ids {
-            if let Some(entry) = self.store().get(context_id) {
-                for snapshot in entry.doc.blocks_ordered() {
-                    // Apply filters
-                    if let Some(kind) = kind_filter {
-                        if snapshot.kind != kind {
-                            continue;
-                        }
+            let snapshots = match self.fetch_context_blocks(context_id).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for snapshot in snapshots {
+                // Apply filters
+                if let Some(kind) = kind_filter {
+                    if snapshot.kind != kind {
+                        continue;
                     }
-                    if let Some(status) = status_filter {
-                        if snapshot.status != status {
-                            continue;
-                        }
-                    }
-                    if let Some(role) = role_filter {
-                        if snapshot.role != role {
-                            continue;
-                        }
-                    }
-
-                    // Create summary (first 100 chars)
-                    let summary = if snapshot.content.chars().count() > 100 {
-                        let truncated: String = snapshot.content.chars().take(100).collect();
-                        format!("{}... ({} lines)", truncated, line_count(&snapshot.content))
-                    } else {
-                        snapshot.content.clone()
-                    };
-
-                    let mut block_sum = BlockSummary {
-                        block_id: snapshot.id.to_key(),
-                        parent_id: snapshot.parent_id.map(|id| id.to_key()),
-                        role: snapshot.role.as_str().to_string(),
-                        kind: snapshot.kind.as_str().to_string(),
-                        status: snapshot.status.as_str().to_string(),
-                        summary,
-                    };
-
-                    // Prepend drift source to summary for drift blocks
-                    if snapshot.kind == kaijutsu_crdt::BlockKind::Drift {
-                        if let Some(ref ctx) = snapshot.source_context {
-                            let model = snapshot.source_model.as_deref().unwrap_or("?");
-                            block_sum.summary = format!(
-                                "[drift from {} via {}] {}",
-                                ctx, model, block_sum.summary
-                            );
-                        }
-                    }
-
-                    blocks.push(block_sum);
                 }
+                if let Some(status) = status_filter {
+                    if snapshot.status != status {
+                        continue;
+                    }
+                }
+                if let Some(role) = role_filter {
+                    if snapshot.role != role {
+                        continue;
+                    }
+                }
+
+                // Create summary (first 100 chars)
+                let summary = if snapshot.content.chars().count() > 100 {
+                    let truncated: String = snapshot.content.chars().take(100).collect();
+                    format!("{}... ({} lines)", truncated, line_count(&snapshot.content))
+                } else {
+                    snapshot.content.clone()
+                };
+
+                let mut block_sum = BlockSummary {
+                    block_id: snapshot.id.to_key(),
+                    parent_id: snapshot.parent_id.map(|id| id.to_key()),
+                    role: snapshot.role.as_str().to_string(),
+                    kind: snapshot.kind.as_str().to_string(),
+                    status: snapshot.status.as_str().to_string(),
+                    summary,
+                };
+
+                // Prepend drift source to summary for drift blocks
+                if snapshot.kind == kaijutsu_crdt::BlockKind::Drift {
+                    if let Some(ref ctx) = snapshot.source_context {
+                        let model = snapshot.source_model.as_deref().unwrap_or("?");
+                        block_sum.summary = format!(
+                            "[drift from {} via {}] {}",
+                            ctx, model, block_sum.summary
+                        );
+                    }
+                }
+
+                blocks.push(block_sum);
             }
         }
 
@@ -948,7 +1034,7 @@ impl KaijutsuMcp {
 
     #[tool(description = "Search across all blocks using regex patterns. Returns matches with context lines.")]
     #[tracing::instrument(skip(self, req), name = "mcp.kernel_search")]
-    fn kernel_search(&self, Parameters(req): Parameters<KernelSearchRequest>) -> String {
+    async fn kernel_search(&self, Parameters(req): Parameters<KernelSearchRequest>) -> String {
         let regex = match Regex::new(&req.query) {
             Ok(r) => r,
             Err(e) => return format!("Error: invalid regex '{}': {}", req.query, e),
@@ -961,15 +1047,18 @@ impl KaijutsuMcp {
 
         let context_ids: Vec<ContextId> = if let Some(ref doc_id) = req.document_id {
             match ContextId::parse(doc_id) {
-                Ok(id) if self.store().contains(id) => vec![id],
+                Ok(id) => vec![id],
                 _ => vec![],
             }
         } else {
-            self.store().list_ids()
+            match self.all_context_ids().await {
+                Ok(ids) => ids,
+                Err(e) => return format!("Error: {e}"),
+            }
         };
 
         'outer: for context_id in context_ids {
-            let snapshots = match self.store().block_snapshots(context_id) {
+            let snapshots = match self.fetch_context_blocks(context_id).await {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -1041,22 +1130,26 @@ impl KaijutsuMcp {
 
     #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.")]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_tree")]
-    fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
+    async fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
             Ok(id) => id,
             Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
         };
 
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document '{}' not found", req.document_id),
+        // Try local store first for kind metadata, fall back to "conversation"
+        let kind = self.store().get(context_id)
+            .map(|e| e.kind.as_str().to_string())
+            .unwrap_or_else(|| "conversation".to_string());
+
+        let snapshots = match self.fetch_context_blocks(context_id).await {
+            Ok(s) => s,
+            Err(e) => return format!("Error: document '{}' not found: {}", req.document_id, e),
         };
 
-        let dag = ConversationDAG::from_store(&entry.doc);
+        let dag = ConversationDAG::from_snapshots(snapshots);
         let mut output = String::new();
 
         // Header: document_id (kind, N blocks)
-        let kind = entry.kind.as_str();
         output.push_str(&format!("{} ({}, {} block{})\n",
             req.document_id, kind, dag.len(),
             if dag.len() == 1 { "" } else { "s" }
@@ -1074,25 +1167,16 @@ impl KaijutsuMcp {
 
     #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
-    fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
-        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
+    async fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
+        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document not found"),
-        };
-
-        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
-            Some(s) => s,
-            None => return format!("Error: block not found"),
-        };
-
-        // Get CRDT internals
-        let version = entry.version();
-        let block_count = entry.doc.block_count();
+        // Get CRDT internals from local store if available
+        let (version, block_count) = self.store().get(context_id)
+            .map(|e| (e.version(), e.doc.block_count()))
+            .unwrap_or((0, 0));
 
         // Count content characters/lines
         let content_length = snapshot.content.len();
@@ -1123,24 +1207,16 @@ impl KaijutsuMcp {
 
     #[tool(description = "Get version history information for a block. Shows creation time and current version details.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
-    fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
-        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
+    async fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
+        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document not found"),
-        };
-
-        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
-            Some(s) => s,
-            None => return format!("Error: block not found"),
-        };
-
         let content_lines = line_count(&snapshot.content);
-        let version = entry.version();
+        let version = self.store().get(context_id)
+            .map(|e| e.version())
+            .unwrap_or(0);
 
         // Format as human-readable output
         let mut output = String::new();
@@ -1167,20 +1243,10 @@ impl KaijutsuMcp {
 
     #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.")]
     #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
-    fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
-        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
+    async fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
+        let (_context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
-        };
-
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document not found"),
-        };
-
-        let snapshot = match entry.doc.get_block_snapshot(&block_id) {
-            Some(s) => s,
-            None => return format!("Error: block not found"),
         };
 
         let current = &snapshot.content;
@@ -2550,15 +2616,15 @@ mod tests {
         parsed["document_id"].as_str().unwrap().to_string()
     }
 
-    #[test]
-    fn test_doc_create_and_list() {
+    #[tokio::test]
+    async fn test_doc_create_and_list() {
         let mcp = KaijutsuMcp::new();
 
         // Create a document
         let doc_id = create_test_doc(&mcp, "conversation");
 
         // List documents
-        let result = mcp.doc_list();
+        let result = mcp.doc_list().await;
         assert!(result.contains(&doc_id));
         assert!(result.contains("conversation"));
     }
@@ -2591,7 +2657,7 @@ mod tests {
             block_id: block_id.to_string(),
             line_numbers: true,
             range: None,
-        }));
+        })).await;
         assert!(result.contains("Hello, world!"));
         assert!(result.contains("user"));
         assert!(result.contains("text"));
@@ -2627,7 +2693,7 @@ mod tests {
             block_id: block_id.to_string(),
             line_numbers: false,
             range: None,
-        }));
+        })).await;
         assert!(result.contains("Hello, world!"));
     }
 
@@ -2663,7 +2729,7 @@ mod tests {
             role: None,
             context_lines: 0,
             max_matches: 100,
-        }));
+        })).await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["total"], 2);
@@ -2701,7 +2767,7 @@ mod tests {
             document_id: doc_id,
             max_depth: None,
             expand_tools: false,
-        }));
+        })).await;
 
         assert!(result.contains("conversation"));
         assert!(result.contains("2 blocks"));
@@ -2742,7 +2808,7 @@ mod tests {
             document_id: doc_id.clone(),
             max_depth: None,
             expand_tools: false,
-        }));
+        })).await;
 
         // Collapsed format shows "→ ✓" or "→ ✗"
         assert!(result.contains("→ ✓") || result.contains("tool("));
@@ -2752,7 +2818,7 @@ mod tests {
             document_id: doc_id,
             max_depth: None,
             expand_tools: true,
-        }));
+        })).await;
 
         // Expanded format shows both nodes separately
         assert!(result.contains("[model/tool_call]"));
@@ -2779,7 +2845,7 @@ mod tests {
         // Test block_inspect
         let result = mcp.block_inspect(Parameters(BlockInspectRequest {
             block_id: block_id.to_string(),
-        }));
+        })).await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["block_id"].is_string());
@@ -2811,7 +2877,7 @@ mod tests {
         let result = mcp.block_history(Parameters(BlockHistoryRequest {
             block_id: block_id.to_string(),
             limit: None,
-        }));
+        })).await;
 
         assert!(result.contains("block:"));
         assert!(result.contains("created:"));
@@ -2873,7 +2939,7 @@ mod tests {
         let result = mcp.block_diff(Parameters(BlockDiffRequest {
             block_id: block_id.to_string(),
             original: Some("Hello\nOld\nFoo".to_string()),
-        }));
+        })).await;
 
         assert!(result.contains("diff"));
         assert!(result.contains("- Old"));
@@ -2884,7 +2950,7 @@ mod tests {
         let result = mcp.block_diff(Parameters(BlockDiffRequest {
             block_id: block_id.to_string(),
             original: None,
-        }));
+        })).await;
 
         assert!(result.contains("No original text provided"));
         assert!(result.contains("3 lines"));
@@ -2949,7 +3015,7 @@ mod tests {
         let result = mcp.block_diff(Parameters(BlockDiffRequest {
             block_id: block_id.to_string(),
             original: Some("Same content".to_string()),
-        }));
+        })).await;
 
         assert!(result.contains("(no changes)"));
     }

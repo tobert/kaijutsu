@@ -389,6 +389,18 @@ pub struct DocumentInfo {
     pub kind: String,
     pub language: Option<String>,
     pub block_count: usize,
+    /// Context label (from drift router), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// LLM provider name, if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// LLM model name, if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Parent context ID, if this is a fork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 /// Block summary for listing.

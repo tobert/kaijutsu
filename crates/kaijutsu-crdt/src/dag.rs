@@ -33,7 +33,7 @@ impl ConversationDAG {
     }
 
     /// Build a DAG from an ordered list of block snapshots.
-    fn from_snapshots(snapshots: Vec<BlockSnapshot>) -> Self {
+    pub fn from_snapshots(snapshots: Vec<BlockSnapshot>) -> Self {
         let mut roots = Vec::new();
         let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         let mut blocks = HashMap::new();

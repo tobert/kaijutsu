@@ -466,6 +466,52 @@ impl DocumentDb {
 
         rows.collect()
     }
+
+    // =========================================================================
+    // Bootstrap (stable kernel metadata across restarts)
+    // =========================================================================
+
+    /// Ensure the bootstrap key-value table exists.
+    pub fn ensure_bootstrap_table(&self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bootstrap (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );"
+        )
+    }
+
+    /// Get a bootstrap value by key.
+    pub fn get_bootstrap(&self, key: &str) -> SqliteResult<Option<String>> {
+        // Table may not exist yet (DB created before migration)
+        let table_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='bootstrap'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM bootstrap WHERE key = ?1"
+        )?;
+        let mut rows = stmt.query(params![key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set a bootstrap value.
+    pub fn set_bootstrap(&self, key: &str, value: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bootstrap (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

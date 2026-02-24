@@ -26,7 +26,7 @@ use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, Shared
 use crate::input_doc::InputDocEntry;
 
 /// Thread-safe database handle.
-type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
+pub type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
@@ -170,6 +170,11 @@ impl BlockStore {
             block_flows: Some(block_flows),
             input_flows: None,
         }
+    }
+
+    /// Get a reference to the database handle, if one is configured.
+    pub fn db(&self) -> Option<&DbHandle> {
+        self.db.as_ref()
     }
 
     /// Get the FlowBus for typed pub/sub.
