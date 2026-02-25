@@ -313,6 +313,7 @@ struct LlmProviderInfo {
   name @0 :Text;              # Provider name (e.g., "anthropic", "gemini")
   defaultModel @1 :Text;      # Default model for this provider
   available @2 :Bool;         # Whether the provider is available (has API key)
+  models @3 :List(Text);      # All available model IDs (from aliases + default)
 }
 
 # Current LLM configuration for a kernel

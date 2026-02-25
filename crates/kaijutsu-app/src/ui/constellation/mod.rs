@@ -32,6 +32,7 @@
 
 #[allow(dead_code)] // Phase 3+: 2D systems reused for 3D rendering
 mod create_dialog;
+pub mod fork_form;
 #[allow(dead_code)] // Phase 2+: layout/navigation
 pub mod hyper;
 #[allow(dead_code)] // Phase 2: layout engine used by viewport
@@ -48,7 +49,8 @@ use kaijutsu_client::ContextMembership;
 
 use crate::agents::AgentActivityMessage;
 
-pub use create_dialog::{DialogMode, OpenContextDialog, create_or_fork_context};
+pub use create_dialog::create_or_fork_context;
+pub use fork_form::OpenForkForm;
 pub use navigation::{CameraOrbit, find_nearest_in_direction_3d};
 pub use render3d::ConstellationScene;
 #[allow(unused_imports)] // Phase 5+: available for despawn queries from other modules
@@ -115,6 +117,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add model picker systems
         model_picker::setup_model_picker_systems(app);
+
+        // Add fork form systems (full-viewport fork configuration)
+        fork_form::setup_fork_form_systems(app);
     }
 }
 

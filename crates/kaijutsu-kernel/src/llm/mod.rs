@@ -638,6 +638,31 @@ impl LlmRegistry {
         self.providers.keys().map(|s| s.as_str()).collect()
     }
 
+    /// List all available model IDs for a provider (from aliases + default).
+    pub fn models_for_provider(&self, provider_name: &str) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .model_aliases
+            .values()
+            .filter(|a| a.provider == provider_name)
+            .map(|a| a.model.clone())
+            .collect();
+        // Include provider's default model if not already listed
+        if let Some(configs) = &self.provider_configs {
+            for config in configs {
+                if config.provider_type == provider_name {
+                    if let Some(ref default) = config.default_model {
+                        if !models.contains(default) {
+                            models.push(default.clone());
+                        }
+                    }
+                }
+            }
+        }
+        models.sort();
+        models.dedup();
+        models
+    }
+
     /// Deep-copy the registry state for fork/thread.
     ///
     /// Clones all provider `Arc`s, default settings, and aliases so the

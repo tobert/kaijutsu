@@ -633,8 +633,8 @@ use crate::cell::{
     BlockEditCursor, ComposeBlock, EditingBlockCell, PromptSubmitted,
 };
 use crate::ui::constellation::{
-    CameraOrbit, Constellation, ConstellationCamera, ConstellationScene, DialogMode,
-    NewContextConfig, OpenContextDialog, create_or_fork_context,
+    CameraOrbit, Constellation, ConstellationCamera, ConstellationScene,
+    NewContextConfig, OpenForkForm, create_or_fork_context,
     find_nearest_in_direction, find_nearest_in_direction_3d,
     model_picker::OpenModelPicker,
 };
@@ -651,8 +651,8 @@ pub fn handle_constellation_nav(
     scene: Option<Res<ConstellationScene>>,
     mut orbit: Option<ResMut<CameraOrbit>>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    mut dialog_writer: MessageWriter<OpenContextDialog>,
     mut model_writer: MessageWriter<OpenModelPicker>,
+    mut fork_form_writer: MessageWriter<OpenForkForm>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
     new_ctx_config: Res<NewContextConfig>,
@@ -756,10 +756,16 @@ pub fn handle_constellation_nav(
             Action::ConstellationFork => {
                 if let Some(ref focus_id) = constellation.focus_id {
                     if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
-                        dialog_writer.write(OpenContextDialog(DialogMode::ForkContext {
+                        // Get parent's model/provider from constellation node
+                        let node = constellation.node_by_id(focus_id);
+                        let parent_provider = node.and_then(|n| n.provider.clone());
+                        let parent_model = node.and_then(|n| n.model.clone());
+                        fork_form_writer.write(OpenForkForm {
                             source_context: focus_id.clone(),
                             source_context_id: ctx_id,
-                        }));
+                            parent_provider,
+                            parent_model,
+                        });
                     } else {
                         warn!("Cannot fork '{}': invalid context ID", focus_id);
                     }
