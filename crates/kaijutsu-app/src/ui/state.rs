@@ -169,20 +169,15 @@ impl Plugin for AppScreenPlugin {
 /// conversation in the registry and sets it as current.
 fn handle_context_joined(
     mut result_events: MessageReader<crate::connection::RpcResultMessage>,
-    mut registry: ResMut<crate::conversation::ConversationRegistry>,
-    mut current_conv: ResMut<crate::conversation::CurrentConversation>,
+    mut context_order: ResMut<crate::conversation::ContextOrder>,
+    mut active_ctx: ResMut<crate::conversation::ActiveContext>,
 ) {
     for result in result_events.read() {
         if let crate::connection::RpcResultMessage::ContextJoined { membership, .. } = result {
-            let document_id = membership.context_id.to_string();
-            // Create conversation metadata if it doesn't exist (idempotent)
-            if registry.get(&document_id).is_none() {
-                let conv = kaijutsu_kernel::Conversation::with_id(&document_id, &document_id);
-                registry.add(conv);
-                info!("Created conversation metadata for {}", document_id);
-            }
-
-            current_conv.0 = Some(document_id);
+            let ctx_id = membership.context_id;
+            context_order.add(ctx_id);
+            active_ctx.0 = Some(ctx_id);
+            info!("Context joined: {}", ctx_id);
         }
     }
 }

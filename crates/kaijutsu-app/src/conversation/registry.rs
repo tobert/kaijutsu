@@ -1,93 +1,48 @@
-//! Conversation registry resources.
+//! Context-based conversation tracking resources.
 
 use bevy::prelude::*;
-use kaijutsu_kernel::Conversation;
-use std::collections::HashMap;
+use kaijutsu_crdt::ContextId;
 
-/// Registry of all conversations.
+/// Ordered list of known contexts.
 ///
-/// Stores conversations by ID and maintains display order.
+/// Populated by ContextJoined events. Maintains display order.
 #[derive(Resource, Default)]
-pub struct ConversationRegistry {
-    /// Conversations by ID.
-    conversations: HashMap<String, Conversation>,
-    /// Ordered list of conversation IDs for display.
-    order: Vec<String>,
+pub struct ContextOrder {
+    ids: Vec<ContextId>,
 }
 
-impl ConversationRegistry {
-    /// Add a conversation to the registry.
-    ///
-    /// If a conversation with the same ID exists, it will be replaced.
-    pub fn add(&mut self, conv: Conversation) {
-        let id = conv.id.clone();
-        if !self.order.contains(&id) {
-            self.order.push(id.clone());
-        }
-        self.conversations.insert(id, conv);
-    }
-
-    /// Remove a conversation by ID.
-    #[allow(dead_code)]
-    pub fn remove(&mut self, id: &str) -> Option<Conversation> {
-        self.order.retain(|oid| oid != id);
-        self.conversations.remove(id)
-    }
-
-    /// Get a conversation by ID.
-    pub fn get(&self, id: &str) -> Option<&Conversation> {
-        self.conversations.get(id)
-    }
-
-    /// Get a mutable conversation by ID.
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut Conversation> {
-        self.conversations.get_mut(id)
-    }
-
-    /// Get all conversations in display order.
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = &Conversation> {
-        self.order.iter().filter_map(|id| self.conversations.get(id))
-    }
-
-    /// Get the number of conversations.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.conversations.len()
-    }
-
-    /// Check if the registry is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.conversations.is_empty()
-    }
-
-    /// Get ordered list of conversation IDs.
-    pub fn ids(&self) -> &[String] {
-        &self.order
-    }
-
-    /// Move a conversation to the front of the order (most recent).
-    pub fn move_to_front(&mut self, id: &str) {
-        if let Some(pos) = self.order.iter().position(|oid| oid == id) {
-            let id = self.order.remove(pos);
-            self.order.insert(0, id);
+impl ContextOrder {
+    /// Add a context (no-op if already present).
+    pub fn add(&mut self, id: ContextId) {
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
         }
     }
 
+    /// Get all context IDs in display order.
+    pub fn ids(&self) -> &[ContextId] {
+        &self.ids
+    }
+
+    /// Move a context to the front of the order (most recent).
+    pub fn move_to_front(&mut self, id: ContextId) {
+        if let Some(pos) = self.ids.iter().position(|oid| *oid == id) {
+            let id = self.ids.remove(pos);
+            self.ids.insert(0, id);
+        }
+    }
 }
 
-/// Resource tracking the currently active conversation.
+/// Resource tracking the currently active context.
 ///
-/// The active conversation is what's displayed in the MainCell and
+/// The active context is what's displayed in the MainCell and
 /// what receives messages from the prompt.
 #[derive(Resource, Default)]
-pub struct CurrentConversation(pub Option<String>);
+pub struct ActiveContext(pub Option<ContextId>);
 
-impl CurrentConversation {
-    /// Get the current conversation ID, if any.
-    pub fn id(&self) -> Option<&str> {
-        self.0.as_deref()
+impl ActiveContext {
+    /// Get the current context ID, if any.
+    pub fn id(&self) -> Option<ContextId> {
+        self.0
     }
 }

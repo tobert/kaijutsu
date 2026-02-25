@@ -455,6 +455,7 @@ impl ActorHandle {
     }
 
     /// Get schemas for all registered kernel tools.
+    #[tracing::instrument(skip(self))]
     pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, ActorError> {
         self.send(|reply| RpcCommand::GetToolSchemas { reply }).await
     }

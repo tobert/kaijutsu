@@ -11,7 +11,7 @@ use super::components::{
     Status, ViewingConversation, WorkspaceLayout,
 };
 use crate::input::FocusArea;
-use crate::conversation::CurrentConversation;
+use crate::conversation::ActiveContext;
 use crate::text::{
     bevy_to_cosmic_color, FontMetricsCache, MsdfBufferInfo, MsdfText, SharedFontSystem,
     MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics,
@@ -1256,7 +1256,7 @@ pub fn handle_block_events(
     mut scroll_state: ResMut<ConversationScrollState>,
     mut doc_cache: ResMut<super::components::DocumentCache>,
     layout_gen: Res<super::components::LayoutGeneration>,
-    mut current_conv: ResMut<CurrentConversation>,
+    mut active_ctx: ResMut<ActiveContext>,
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     mut switch_writer: MessageWriter<super::components::ContextSwitchRequested>,
     mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
@@ -1365,12 +1365,11 @@ pub fn handle_block_events(
                 });
             }
 
-            // Update CurrentConversation string bridge for the active document
+            // Update ActiveContext for the active document
             if doc_cache.active_id() == Some(ctx_id) {
-                let ctx_str = ctx_id.to_string();
-                if current_conv.id() != Some(&ctx_str) {
-                    info!("Updating current_conv to context_id: {} (was {:?})", ctx_id, current_conv.id());
-                    current_conv.0 = Some(ctx_str);
+                if active_ctx.id() != Some(ctx_id) {
+                    info!("Updating active_ctx to context_id: {} (was {:?})", ctx_id, active_ctx.id());
+                    active_ctx.0 = Some(ctx_id);
                 }
             }
         }
@@ -1519,7 +1518,7 @@ pub fn handle_context_switch(
     mut switch_events: MessageReader<super::components::ContextSwitchRequested>,
     mut doc_cache: ResMut<super::components::DocumentCache>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    mut current_conv: ResMut<CurrentConversation>,
+    mut active_ctx: ResMut<ActiveContext>,
     mut pending_switch: ResMut<super::components::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
@@ -1569,8 +1568,8 @@ pub fn handle_context_switch(
         doc_cache.set_active(ctx_id);
 
         if let Some(cached) = doc_cache.get(ctx_id) {
-            // Update CurrentConversation (string bridge)
-            current_conv.0 = Some(ctx_id.to_string());
+            // Update ActiveContext
+            active_ctx.0 = Some(ctx_id);
 
             // Restore scroll offset
             scroll_state.offset = cached.scroll_offset;

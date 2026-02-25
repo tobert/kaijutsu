@@ -1251,7 +1251,7 @@ impl kernel::Server for KernelImpl {
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_tool_schemas");
         Promise::from_future(async move {
             let registry = kernel_arc.tools().read().await;
-            let tools = registry.list();
+            let tools = registry.list_with_engines();
             let mut builder = results.get().init_schemas(tools.len() as u32);
             for (i, tool) in tools.iter().enumerate() {
                 let mut s = builder.reborrow().get(i as u32);
@@ -4737,6 +4737,17 @@ async fn spawn_llm_for_prompt(
 /// Block events are broadcast via FlowBus (BlockStore emits BlockFlow events).
 ///
 /// `after_block_id` is the starting point for block ordering - all streaming blocks
+/// Map a tool's registry category to the appropriate `ToolKind`.
+///
+/// Categories in use: "kernel", "block", "drift", "file", "mcp".
+/// Only "mcp" maps to `Mcp`; everything else is `Builtin`.
+fn tool_kind_for_category(category: &str) -> TypesToolKind {
+    match category {
+        "mcp" => TypesToolKind::Mcp,
+        _ => TypesToolKind::Builtin,
+    }
+}
+
 /// will be inserted after this block (typically the user's message).
 ///
 /// `user_agent_id` identifies the user who initiated the prompt. Model/tool blocks
@@ -4825,7 +4836,7 @@ async fn process_llm_stream(
         // Process stream events
         let mut current_block_id: Option<kaijutsu_crdt::BlockId> = None;
         // Collect tool calls for this iteration
-        let mut tool_calls: Vec<(String, String, serde_json::Value)> = vec![]; // (id, name, input)
+        let mut tool_calls: Vec<(String, String, serde_json::Value, TypesToolKind)> = vec![]; // (id, name, input, tool_kind)
         // Track tool_use_id → BlockId mapping for CRDT
         let mut tool_call_blocks: std::collections::HashMap<String, Option<kaijutsu_crdt::BlockId>> = std::collections::HashMap::new();
         // Collect text output for conversation history
@@ -4883,13 +4894,21 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ToolUse { id, name, input } => {
+                    // Resolve tool_kind from registry category
+                    let tool_kind = {
+                        let registry = kernel.tools().read().await;
+                        registry.get(&name)
+                            .map(|info| tool_kind_for_category(&info.category))
+                            .unwrap_or(TypesToolKind::Builtin)
+                    };
+
                     // Store for later execution
-                    tool_calls.push((id.clone(), name.clone(), input.clone()));
+                    tool_calls.push((id.clone(), name.clone(), input.clone(), tool_kind));
 
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone())) {
+                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), Some(block_id));
@@ -4940,7 +4959,7 @@ async fn process_llm_stream(
 
         // Build assistant tool uses (for conversation history)
         let assistant_tool_uses: Vec<ContentBlock> = tool_calls.iter()
-            .map(|(id, name, input)| ContentBlock::ToolUse {
+            .map(|(id, name, input, _)| ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
@@ -4951,7 +4970,7 @@ async fn process_llm_stream(
         // Pattern mirrors shell_execute: create empty Running block → yield →
         // execute → write content → set final status.
         let futures: Vec<_> = tool_calls.into_iter()
-            .map(|(tool_use_id, tool_name, input)| {
+            .map(|(tool_use_id, tool_name, input, tool_kind)| {
                 let kernel = kernel.clone();
                 let documents = documents.clone();
                 let cell_id = cell_id;
@@ -4995,7 +5014,7 @@ async fn process_llm_stream(
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result_as(
                             cell_id, tcb_id, Some(tcb_id), "", false, None,
-                            Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.clone()),
+                            Some(tool_kind), Some(PrincipalId::system()), Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
                                 let _ = documents.set_status(cell_id, &id, Status::Running);

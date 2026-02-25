@@ -1451,7 +1451,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.",
-        annotations(destructive_hint = true, open_world_hint = false))]
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_pull")]
     async fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
         let actor = match self.actor() {
@@ -1475,7 +1475,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.",
-        annotations(destructive_hint = true, open_world_hint = false))]
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_merge")]
     async fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
         let actor = match self.actor() {
@@ -1585,6 +1585,31 @@ impl KaijutsuMcp {
         let mut event_rx = remote.actor.subscribe_events();
         let fallback_interval = tokio::time::Duration::from_millis(500);
 
+        // Shared completion check — looks for a finished ToolResult child of our command block.
+        // One shell command produces exactly one ToolResult child, so parent_id match is sufficient.
+        let check_completion = |source: &str| -> Option<String> {
+            let entry = remote.store.get(ctx_id)?;
+            let blocks = entry.doc.blocks_ordered();
+            let output = blocks.iter().find(|b| {
+                b.parent_id.as_ref() == Some(&cmd_block_id)
+                    && b.is_shell()
+                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
+                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
+            })?;
+            tracing::info!(
+                command = %req.command,
+                status = %output.status.as_str(),
+                output_len = output.content.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Shell command completed (via {source})"
+            );
+            Some(if output.content.is_empty() {
+                "(no output)".to_string()
+            } else {
+                output.content.clone()
+            })
+        };
+
         loop {
             if start.elapsed().as_secs() > timeout_secs {
                 return format!(
@@ -1597,64 +1622,29 @@ impl KaijutsuMcp {
             let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
 
             match event {
-                Ok(Ok(ServerEvent::BlockStatusChanged { block_id, status, .. })) => {
-                    // Check if this status change is for a child of our command block
-                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) {
-                        // Read from store (single source of truth, kept in sync by background listener)
-                        if let Some(entry) = remote.store.get(ctx_id) {
-                            if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
-                                b.parent_id.as_ref() == Some(&cmd_block_id)
-                                    && b.is_shell()
-                                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                                    && b.id == block_id
-                            }) {
-                                tracing::info!(
-                                    command = %req.command,
-                                    status = %output.status.as_str(),
-                                    output_len = output.content.len(),
-                                    elapsed_ms = start.elapsed().as_millis() as u64,
-                                    "Shell command completed (via event)"
-                                );
-                                return if output.content.is_empty() {
-                                    "(no output)".to_string()
-                                } else {
-                                    output.content.clone()
-                                };
-                            }
-                        }
+                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
+                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
+                {
+                    if let Some(result) = check_completion("event") {
+                        return result;
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return "Error: event stream closed".to_string();
                 }
-                _ => {
-                    // Timeout or other event — fallback: check store state
-                    if let Some(entry) = remote.store.get(ctx_id) {
-                        if let Some(output) = entry.doc.blocks_ordered().iter().find(|b| {
-                            b.parent_id.as_ref() == Some(&cmd_block_id)
-                                && b.is_shell()
-                                && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                        }) {
-                            match output.status {
-                                kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
-                                    tracing::info!(
-                                        command = %req.command,
-                                        status = %output.status.as_str(),
-                                        output_len = output.content.len(),
-                                        elapsed_ms = start.elapsed().as_millis() as u64,
-                                        "Shell command completed (via fallback)"
-                                    );
-                                    return if output.content.is_empty() {
-                                        "(no output)".to_string()
-                                    } else {
-                                        output.content.clone()
-                                    };
-                                }
-                                _ => {} // Still running
-                            }
-                        }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    tracing::warn!(skipped = n, "Event stream lagged, checking store");
+                    if let Some(result) = check_completion("lagged") {
+                        return result;
                     }
                 }
+                Err(_timeout) => {
+                    // 500ms fallback — check store state
+                    if let Some(result) = check_completion("fallback") {
+                        return result;
+                    }
+                }
+                _ => continue, // Other events — keep waiting
             }
         }
     }
@@ -1884,7 +1874,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.",
-        annotations(destructive_hint = false, open_world_hint = false))]
+        annotations(destructive_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
     async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {

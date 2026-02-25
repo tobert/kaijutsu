@@ -17,8 +17,6 @@ pub mod block_tools;
 pub mod input_doc;
 pub mod config_backend;
 pub mod control;
-pub mod conversation;
-pub mod conversation_db;
 pub mod db;
 pub mod drift;
 pub mod file_tools;
@@ -47,8 +45,6 @@ pub use block_tools::{
     CursorEvent, CursorPosition, CursorTracker,
 };
 pub use control::ConsentMode;
-pub use conversation::{AccessLevel, Conversation, Mount, Participant, ParticipantKind};
-pub use conversation_db::ConversationDb;
 pub use db::{DocumentDb, DocumentKind, DocumentMeta, OpRecord, Snapshot};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
