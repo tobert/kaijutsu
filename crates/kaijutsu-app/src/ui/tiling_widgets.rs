@@ -95,20 +95,25 @@ pub fn sync_dock_layout_to_tiling_tree(
 /// with appropriate color from the theme.
 pub fn update_mode_widget(
     focus_area: Res<FocusArea>,
+    screen: Res<State<crate::ui::screen::Screen>>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
 ) {
-    if !focus_area.is_changed() {
+    if !focus_area.is_changed() && !screen.is_changed() {
         return;
     }
 
-    let color = match focus_area.as_ref() {
-        FocusArea::Compose => theme.mode_chat,
-        FocusArea::Conversation => theme.mode_normal,
-        FocusArea::EditingBlock => theme.mode_chat,
-        FocusArea::Constellation => theme.mode_visual,
-        FocusArea::Dialog => theme.mode_shell,
+    use crate::ui::screen::Screen;
+    let (color, name) = match screen.get() {
+        Screen::Constellation => (theme.mode_visual, "CONSTELLATION"),
+        Screen::ForkForm => (theme.mode_shell, "FORK"),
+        Screen::Conversation => match focus_area.as_ref() {
+            FocusArea::Compose => (theme.mode_chat, focus_area.name()),
+            FocusArea::Conversation => (theme.mode_normal, focus_area.name()),
+            FocusArea::EditingBlock => (theme.mode_chat, focus_area.name()),
+            FocusArea::Dialog => (theme.mode_shell, focus_area.name()),
+        },
     };
 
     for (widget, children) in widget_panes.iter() {
@@ -117,7 +122,7 @@ pub fn update_mode_widget(
         }
         for child in children.iter() {
             if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = focus_area.name().to_string();
+                msdf_text.text = name.to_string();
                 msdf_text.color = bevy_to_rgba8(color);
             }
         }
@@ -391,19 +396,24 @@ pub fn update_contexts_widget(
 /// Hints change based on what has focus — compose, navigation, constellation, etc.
 pub fn update_hints_widget(
     focus_area: Res<FocusArea>,
+    screen: Res<State<crate::ui::screen::Screen>>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
     mut texts: Query<&mut MsdfUiText>,
 ) {
-    if !focus_area.is_changed() {
+    if !focus_area.is_changed() && !screen.is_changed() {
         return;
     }
 
-    let hints = match focus_area.as_ref() {
-        FocusArea::Compose => "Enter: submit │ Shift+Enter: newline │ Tab: navigate │ Esc: back │ :/`: shell prefix",
-        FocusArea::Conversation => "j/k: navigate │ Tab: compose │ f: expand │ i: compose │ `: constellation │ Alt+hjkl: pane",
-        FocusArea::EditingBlock => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
-        FocusArea::Constellation => "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: compose │ +/-: zoom │ 0: reset",
-        FocusArea::Dialog => "Enter: confirm │ Esc: cancel │ j/k: navigate",
+    use crate::ui::screen::Screen;
+    let hints = match screen.get() {
+        Screen::Constellation => "h/j/k/l: navigate │ Enter: switch │ f: fork │ m: model │ Tab: compose │ +/-: zoom │ 0: reset",
+        Screen::ForkForm => "Tab: switch field │ j/k: select model │ Enter: fork │ Esc: cancel",
+        Screen::Conversation => match focus_area.as_ref() {
+            FocusArea::Compose => "Enter: submit │ Shift+Enter: newline │ Tab: navigate │ Esc: back │ :/`: shell prefix",
+            FocusArea::Conversation => "j/k: navigate │ Tab: compose │ f: expand │ i: compose │ `: constellation │ Alt+hjkl: pane",
+            FocusArea::EditingBlock => "Enter: newline │ Esc: stop editing │ ←/→: cursor │ Home/End: line",
+            FocusArea::Dialog => "Enter: confirm │ Esc: cancel │ j/k: navigate",
+        },
     };
 
     for (widget, children) in widget_panes.iter() {

@@ -1,6 +1,7 @@
 pub mod constellation;
 pub mod debug;
 pub mod drift;
+pub mod screen;
 pub mod state;
 pub mod theme;
 pub mod theme_loader;

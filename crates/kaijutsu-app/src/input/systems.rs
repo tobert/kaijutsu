@@ -8,7 +8,6 @@ use bevy::prelude::*;
 use super::action::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
-use crate::ui::constellation::ConstellationVisible; // Used by handle_focus_cycle (reads visibility)
 
 // ============================================================================
 // FOCUS CYCLING — Tab/Shift+Tab
@@ -16,51 +15,32 @@ use crate::ui::constellation::ConstellationVisible; // Used by handle_focus_cycl
 
 /// Handle CycleFocusForward and CycleFocusBackward actions.
 ///
-/// Tab cycle order: Compose → Conversation → (Constellation if visible) → wrap.
+/// Within-conversation Tab cycle: Compose → Conversation → Compose.
+/// Screen-level toggling (Constellation ↔ Conversation) is handled by
+/// `handle_toggle_constellation` via `NextState<Screen>`.
 pub fn handle_focus_cycle(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    constellation_visible: Option<Res<ConstellationVisible>>,
 ) {
     for ActionFired(action) in actions.read() {
-        let constellation_on = constellation_visible
-            .as_ref()
-            .map(|v| v.0)
-            .unwrap_or(false);
-
         match action {
             Action::CycleFocusForward => {
                 *focus = match focus.as_ref() {
                     FocusArea::Compose => FocusArea::Conversation,
-                    FocusArea::Conversation => {
-                        if constellation_on {
-                            FocusArea::Constellation
-                        } else {
-                            FocusArea::Compose
-                        }
-                    }
-                    FocusArea::Constellation => FocusArea::Compose,
-                    // Don't cycle out of dialog/dashboard/editing
+                    FocusArea::Conversation => FocusArea::Compose,
+                    // Don't cycle out of dialog/editing
                     other => other.clone(),
                 };
             }
             Action::CycleFocusBackward => {
                 *focus = match focus.as_ref() {
-                    FocusArea::Compose => {
-                        if constellation_on {
-                            FocusArea::Constellation
-                        } else {
-                            FocusArea::Conversation
-                        }
-                    }
+                    FocusArea::Compose => FocusArea::Conversation,
                     FocusArea::Conversation => FocusArea::Compose,
-                    FocusArea::Constellation => FocusArea::Conversation,
                     other => other.clone(),
                 };
             }
             _ => {}
         }
-        // ConstellationVisible synced by enforce_constellation_focus_sync
     }
 }
 
@@ -89,17 +69,19 @@ use crate::ui::state::ViewStack;
 /// 2. ViewStack overlay active → pop view, keep FocusArea
 /// 3. FocusArea::EditingBlock → clean up markers, FocusArea::Conversation
 /// 4. FocusArea::Compose → FocusArea::Conversation
-/// 5. FocusArea::Constellation → FocusArea::Conversation (visibility synced by render)
 pub fn handle_unfocus(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut view_stack: ResMut<ViewStack>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     editing_cells: Query<(Entity, &BlockEditCursor), With<EditingBlockCell>>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
+    use crate::ui::screen::Screen;
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Unfocus) {
             continue;
@@ -110,14 +92,20 @@ pub fn handle_unfocus(
             continue;
         }
 
-        // 2. Pop ViewStack if an overlay view is active (ExpandedBlock, etc)
+        // 2. Screen-level: Escape on Constellation → go to Conversation
+        if matches!(screen.get(), Screen::Constellation) {
+            next_screen.set(Screen::Conversation);
+            continue;
+        }
+
+        // 3. Pop ViewStack if an overlay view is active (ExpandedBlock, etc)
         if !view_stack.is_at_root() {
             info!("Escape: popping view stack");
             view_stack.pop();
             continue;
         }
 
-        // 3. Normal focus transitions
+        // 4. Normal focus transitions
         match focus.as_ref() {
             FocusArea::EditingBlock => {
                 // Extract ops and push to server before cleanup
@@ -159,10 +147,6 @@ pub fn handle_unfocus(
                 *focus = FocusArea::Conversation;
             }
             FocusArea::Compose => {
-                *focus = FocusArea::Conversation;
-            }
-            FocusArea::Constellation => {
-                // ConstellationVisible synced by enforce_constellation_focus_sync
                 *focus = FocusArea::Conversation;
             }
             _ => {}
@@ -285,22 +269,25 @@ pub fn handle_screenshot(
     }
 }
 
-/// Handle ToggleConstellation action.
+/// Handle ToggleConstellation action — toggles between Screen::Constellation and
+/// Screen::Conversation via the state machine. OnEnter/OnExit systems handle
+/// visibility, camera activation, and focus.
 pub fn handle_toggle_constellation(
     mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
 ) {
+    use crate::ui::screen::Screen;
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::ToggleConstellation) {
             continue;
         }
 
-        // Just toggle focus — enforce_constellation_focus_sync handles visibility
-        *focus = if matches!(*focus, FocusArea::Constellation) {
-            FocusArea::Conversation
-        } else {
-            FocusArea::Constellation
-        };
+        match screen.get() {
+            Screen::Constellation => next_screen.set(Screen::Conversation),
+            Screen::Conversation => next_screen.set(Screen::Constellation),
+            Screen::ForkForm => {} // Don't toggle while fork form is open
+        }
     }
 }
 
@@ -641,11 +628,11 @@ use crate::ui::constellation::{
 
 /// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
 ///
-/// Guarded to FocusArea::Constellation — prevents Activate/Pan/etc from
+/// Guarded by `in_state(Screen::Constellation)` — prevents Activate/Pan/etc from
 /// leaking when a Dialog overlays the (still-visible) constellation.
 pub fn handle_constellation_nav(
     mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
     scene: Option<Res<ConstellationScene>>,
@@ -709,14 +696,14 @@ pub fn handle_constellation_nav(
                 }
             }
             Action::Activate => {
-                // Enter → switch context and dismiss constellation
+                // Enter → switch context and go to conversation
                 if let Some(ref focus_id) = constellation.focus_id {
                     if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
                         info!("Constellation: switching to {}", focus_id);
                         switch_writer.write(crate::cell::ContextSwitchRequested {
                             context_id: ctx_id,
                         });
-                        *focus = FocusArea::Compose;
+                        next_screen.set(crate::ui::screen::Screen::Conversation);
                     }
                 }
             }
@@ -727,7 +714,7 @@ pub fn handle_constellation_nav(
                         switch_writer.write(crate::cell::ContextSwitchRequested {
                             context_id: ctx_id,
                         });
-                        *focus = FocusArea::Compose;
+                        next_screen.set(crate::ui::screen::Screen::Conversation);
                     }
                 }
             }
@@ -738,7 +725,7 @@ pub fn handle_constellation_nav(
                         switch_writer.write(crate::cell::ContextSwitchRequested {
                             context_id: ctx_id,
                         });
-                        *focus = FocusArea::Compose;
+                        next_screen.set(crate::ui::screen::Screen::Conversation);
                     }
                 }
             }
@@ -749,7 +736,7 @@ pub fn handle_constellation_nav(
                         switch_writer.write(crate::cell::ContextSwitchRequested {
                             context_id: ctx_id,
                         });
-                        *focus = FocusArea::Compose;
+                        next_screen.set(crate::ui::screen::Screen::Conversation);
                     }
                 }
             }

@@ -172,8 +172,10 @@ impl Plugin for InputPlugin {
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
                 systems::handle_timeline.run_if(focus::in_conversation),
                 systems::handle_activate_navigation.run_if(focus::in_conversation),
-                // Constellation context
-                systems::handle_constellation_nav.run_if(focus::in_constellation),
+                // Constellation context (gated by Screen state, not FocusArea)
+                systems::handle_constellation_nav.run_if(
+                    in_state(crate::ui::screen::Screen::Constellation)
+                ),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),
                 // Text input contexts

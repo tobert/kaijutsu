@@ -1,11 +1,13 @@
-//! Input context — derived from FocusArea to determine which bindings are active.
+//! Input context — derived from FocusArea and Screen to determine which bindings are active.
 //!
 //! Each `FocusArea` maps to a set of active `InputContext` values.
+//! `Screen::Constellation` activates the `Constellation` input context.
 //! The dispatcher checks bindings against active contexts to determine matches.
 
 use bevy::prelude::*;
 
 use super::focus::FocusArea;
+use crate::ui::screen::Screen;
 
 /// Binding context — determines when a binding is active.
 ///
@@ -19,7 +21,7 @@ pub enum InputContext {
     TextInput,
     /// Active when Conversation block list has focus: j/k, f, Tab
     Navigation,
-    /// Active when Constellation is focused: hjkl spatial, zoom, fork
+    /// Active when Constellation screen is active: hjkl spatial, zoom, fork
     Constellation,
     /// Active when a modal dialog is open: Enter/Escape/j/k
     Dialog,
@@ -27,7 +29,7 @@ pub enum InputContext {
 
 /// Resource tracking which input contexts are currently active.
 ///
-/// Derived each frame by `sync_input_context` from `FocusArea`.
+/// Derived each frame by `sync_input_context` from `FocusArea` + `State<Screen>`.
 /// The dispatcher reads this to determine which bindings to evaluate.
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
@@ -40,15 +42,16 @@ impl ActiveInputContexts {
     }
 }
 
-/// System: derive active input contexts from the current FocusArea.
+/// System: derive active input contexts from the current FocusArea and Screen state.
 ///
-/// Runs every frame before dispatch. Maps FocusArea → set of InputContext values.
+/// Runs every frame before dispatch. Maps FocusArea + Screen → set of InputContext values.
 pub fn sync_input_context(
     focus: Res<FocusArea>,
+    screen: Res<State<Screen>>,
     mut active: ResMut<ActiveInputContexts>,
 ) {
-    // Only update if focus changed
-    if !focus.is_changed() && !active.is_added() {
+    // Only update if focus or screen changed
+    if !focus.is_changed() && !screen.is_changed() && !active.is_added() {
         return;
     }
 
@@ -57,15 +60,28 @@ pub fn sync_input_context(
     // Global is always active
     active.0.push(InputContext::Global);
 
+    // Screen-level context: Constellation input bindings are active on the
+    // Constellation screen (unless a FocusStack dialog overrides)
+    if matches!(screen.get(), Screen::Constellation) && !matches!(*focus, FocusArea::Dialog) {
+        active.0.push(InputContext::Constellation);
+        return;
+    }
+
+    // ForkForm screen has its own input handling gated by in_state(Screen::ForkForm)
+    if matches!(screen.get(), Screen::ForkForm) {
+        // Dialog context for j/k/Enter/Escape + text input for name field
+        active.0.push(InputContext::Dialog);
+        active.0.push(InputContext::TextInput);
+        return;
+    }
+
+    // Within-conversation focus areas
     match focus.as_ref() {
         FocusArea::Compose | FocusArea::EditingBlock => {
             active.0.push(InputContext::TextInput);
         }
         FocusArea::Conversation => {
             active.0.push(InputContext::Navigation);
-        }
-        FocusArea::Constellation => {
-            active.0.push(InputContext::Constellation);
         }
         FocusArea::Dialog => {
             active.0.push(InputContext::Dialog);

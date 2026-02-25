@@ -73,11 +73,6 @@ pub fn in_editing_block(focus: Res<FocusArea>) -> bool {
     matches!(*focus, FocusArea::EditingBlock)
 }
 
-/// System run condition: FocusArea is Constellation.
-pub fn in_constellation(focus: Res<FocusArea>) -> bool {
-    matches!(*focus, FocusArea::Constellation)
-}
-
 /// System run condition: any text input mode (Compose or EditingBlock).
 #[allow(dead_code)]
 pub fn in_text_input(focus: Res<FocusArea>) -> bool {
@@ -102,14 +97,12 @@ pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
 #[reflect(Resource)]
 pub enum FocusArea {
     /// Compose text input area. Typing inserts text. Enter submits.
+    #[default]
     Compose,
     /// Conversation block list. j/k navigates, Enter/i activates, f expands.
     Conversation,
     /// Inline editing of an existing block (User Text blocks only).
     EditingBlock,
-    /// Constellation node graph. hjkl spatial nav, Enter switches context.
-    #[default]
-    Constellation,
     /// Modal dialog. Captures all input. Enter confirms, Escape cancels.
     Dialog,
 }
@@ -132,7 +125,6 @@ impl FocusArea {
             FocusArea::Compose => "COMPOSE",
             FocusArea::Conversation => "NAVIGATE",
             FocusArea::EditingBlock => "EDITING",
-            FocusArea::Constellation => "CONSTELLATION",
             FocusArea::Dialog => "DIALOG",
         }
     }

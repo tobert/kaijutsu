@@ -14,11 +14,12 @@
 use bevy::prelude::*;
 
 use super::{
-    Constellation, ConstellationVisible,
+    Constellation,
     hyper::{HyperPoint, LorentzTransform, geodesic_lerp},
     render3d::ConstellationScene,
     viewport::ConstellationCamera3d,
 };
+use crate::ui::screen::Screen;
 
 /// Resource for 3D focus animation state.
 #[derive(Resource)]
@@ -154,10 +155,10 @@ fn update_focus_transform(
 fn interpolate_focus(
     mut anim: ResMut<FocusAnimation>,
     mut scene: ResMut<ConstellationScene>,
-    visible: Res<ConstellationVisible>,
+    screen: Res<State<Screen>>,
     time: Res<Time>,
 ) {
-    if !visible.0 || !anim.animating {
+    if !matches!(screen.get(), Screen::Constellation) || !anim.animating {
         return;
     }
 
@@ -188,11 +189,11 @@ fn interpolate_focus(
 /// Smoothly interpolate camera orbit and update the 3D camera transform.
 fn update_camera_orbit(
     mut orbit: ResMut<CameraOrbit>,
-    visible: Res<ConstellationVisible>,
+    screen: Res<State<Screen>>,
     time: Res<Time>,
     mut cameras: Query<&mut Transform, With<ConstellationCamera3d>>,
 ) {
-    if !visible.0 {
+    if !matches!(screen.get(), Screen::Constellation) {
         return;
     }
 

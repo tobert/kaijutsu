@@ -101,6 +101,8 @@ fn main() {
         .add_plugins(conversation::ConversationPlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
+        // Screen state machine (Constellation/Conversation/ForkForm transitions)
+        .add_plugins(ui::screen::ScreenPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
         // Constellation - context navigation as visual node graph

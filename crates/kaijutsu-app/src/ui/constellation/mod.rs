@@ -30,7 +30,6 @@
 //! - `f` — Fork focused context
 //! - `m` — Model picker for focused context
 
-#[allow(dead_code)] // Phase 3+: 2D systems reused for 3D rendering
 mod create_dialog;
 pub mod fork_form;
 #[allow(dead_code)] // Phase 2+: layout/navigation
@@ -42,7 +41,7 @@ mod navigation;
 #[allow(dead_code)] // Phase 3+: 2D systems kept for reference/reuse
 mod render;
 mod render3d;
-mod viewport;
+pub(crate) mod viewport;
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
@@ -76,10 +75,8 @@ pub struct ConstellationPlugin;
 impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Constellation>()
-            .init_resource::<ConstellationVisible>()
             .init_resource::<ConstellationCamera>()
             .init_resource::<NewContextConfig>()
-            .register_type::<ConstellationVisible>()
             .register_type::<NewContextConfig>()
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
@@ -126,17 +123,6 @@ impl Plugin for ConstellationPlugin {
 // ============================================================================
 // CORE DATA MODEL
 // ============================================================================
-
-/// Whether the constellation view is visible (full-takeover of content area).
-#[derive(Resource, Reflect)]
-#[reflect(Resource)]
-pub struct ConstellationVisible(pub bool);
-
-impl Default for ConstellationVisible {
-    fn default() -> Self {
-        Self(true)
-    }
-}
 
 /// Camera for constellation pan/zoom.
 ///
@@ -446,7 +432,7 @@ fn handle_node_click(
     mut constellation: ResMut<Constellation>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
-    mut focus: ResMut<crate::input::focus::FocusArea>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     focus_stack: Res<crate::input::focus::FocusStack>,
 ) {
     if focus_stack.is_modal() {
@@ -461,8 +447,7 @@ fn handle_node_click(
                 switch_writer.write(crate::cell::ContextSwitchRequested {
                     context_id: ctx_id,
                 });
-                // enforce_constellation_focus_sync handles visibility
-                *focus = crate::input::focus::FocusArea::Compose;
+                next_screen.set(crate::ui::screen::Screen::Conversation);
             }
         }
     }
@@ -614,10 +599,10 @@ fn layout_children(
 /// Smoothly interpolate camera offset and zoom toward targets.
 fn interpolate_camera(
     mut camera: ResMut<ConstellationCamera>,
-    visible: Res<ConstellationVisible>,
+    screen: Res<State<crate::ui::screen::Screen>>,
     time: Res<Time>,
 ) {
-    if !visible.0 {
+    if !matches!(screen.get(), crate::ui::screen::Screen::Constellation) {
         return;
     }
 

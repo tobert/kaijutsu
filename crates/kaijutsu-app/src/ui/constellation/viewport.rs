@@ -15,7 +15,7 @@ use bevy::{
     ui::widget::ViewportNode,
 };
 
-use super::{ConstellationContainer, ConstellationVisible};
+use super::ConstellationContainer;
 
 /// Marker for the 3D camera used by the constellation viewport.
 #[derive(Component)]
@@ -44,24 +44,8 @@ pub fn setup_viewport_systems(app: &mut App) {
     app.init_resource::<ViewportState>()
         .add_systems(
             Update,
-            (
-                setup_constellation_3d,
-                sync_camera_active,
-            ),
+            setup_constellation_3d,
         );
-}
-
-/// Disable the 3D camera when the constellation is hidden to save GPU work.
-fn sync_camera_active(
-    visible: Res<ConstellationVisible>,
-    mut cameras: Query<&mut Camera, With<ConstellationCamera3d>>,
-) {
-    if !visible.is_changed() {
-        return;
-    }
-    for mut camera in cameras.iter_mut() {
-        camera.is_active = visible.0;
-    }
 }
 
 /// One-time setup: create render target, 3D camera, test geometry, and wire

@@ -18,12 +18,11 @@ use bevy::prelude::*;
 use super::{
     create_dialog::{spawn_create_context_node, CreateContextNode},
     ActivityState, Constellation, ConstellationCamera, ConstellationConnection,
-    ConstellationContainer, ConstellationNode, ConstellationVisible, DriftConnectionKind,
+    ConstellationContainer, ConstellationNode, DriftConnectionKind,
 };
-use crate::input::focus::{FocusArea, FocusStack};
 use crate::shaders::{DriftArcMaterial, ConstellationCardMaterial, HudPanelMaterial, RingGuideMaterial, StarFieldMaterial};
-use crate::text::MsdfText;
 use crate::ui::drift::DriftState;
+use crate::ui::screen::Screen;
 use crate::ui::theme::{agent_color_for_provider, color_to_vec4, Theme};
 
 /// System set for constellation rendering
@@ -67,13 +66,10 @@ pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
         Update,
         (
-            enforce_constellation_focus_sync,
             spawn_constellation_container,
             // 2D rendering systems disabled — replaced by 3D viewport (Phase 1.5+)
             // spawn_star_field,
             // spawn_ring_guide,
-            sync_constellation_visibility,
-            sync_cell_text_visibility,
             // spawn_context_nodes,
             // spawn_create_node,
             // spawn_connection_lines,
@@ -91,31 +87,6 @@ pub fn setup_constellation_rendering(app: &mut App) {
             .chain()
             .in_set(ConstellationRendering),
     );
-}
-
-/// Enforce constellation↔focus sync: when `FocusArea` changes, update
-/// `ConstellationVisible` to match. This is the single source of truth for
-/// the invariant "constellation is visible iff focus is Constellation".
-///
-/// Skipped while a modal is active (dialog over constellation), so the
-/// constellation stays visible behind the dialog overlay.
-fn enforce_constellation_focus_sync(
-    mut visible: ResMut<ConstellationVisible>,
-    focus: Res<FocusArea>,
-    focus_stack: Res<FocusStack>,
-) {
-    if !focus.is_changed() {
-        return;
-    }
-    // Don't sync while modal is active — constellation stays as-is behind dialog
-    if focus_stack.is_modal() {
-        return;
-    }
-
-    let should_show = matches!(*focus, FocusArea::Constellation);
-    if visible.0 != should_show {
-        visible.0 = should_show;
-    }
 }
 
 /// Spawn the constellation container as a full-size flex child of ContentArea.
@@ -327,78 +298,6 @@ fn update_ring_guide(
             );
             mat.dimensions = Vec4::new(size.x, size.y, 0.0, 0.0);
         }
-    }
-}
-
-/// Sync constellation visibility: toggle Display and Visibility on constellation
-/// and ConversationRoot.
-///
-/// `Display` controls layout (flex space allocation). `Visibility::Hidden` propagates
-/// through `InheritedVisibility` to all descendants, which the MSDF extract phase
-/// checks — preventing text bleed-through between views.
-///
-/// Targets `ConversationRoot` (the stable parent of all pane entities) rather than
-/// individual `ConversationContainer`/`ComposeBlock` entities, which may not exist
-/// if the tiling reconciler hasn't spawned them yet.
-fn sync_constellation_visibility(
-    visible: Res<ConstellationVisible>,
-    mut constellation_containers: Query<
-        (&mut Node, &mut Visibility),
-        (With<ConstellationContainer>, Without<crate::ui::state::ConversationRoot>),
-    >,
-    mut conv_root: Query<
-        (&mut Node, &mut Visibility),
-        (With<crate::ui::state::ConversationRoot>, Without<ConstellationContainer>),
-    >,
-) {
-    if !visible.is_changed() {
-        return;
-    }
-
-    let constellation_display = if visible.0 { Display::Flex } else { Display::None };
-    let conversation_display = if visible.0 { Display::None } else { Display::Flex };
-
-    // Visibility::Hidden propagates to all descendants via InheritedVisibility,
-    // which the MSDF extract phase checks before rendering text.
-    let constellation_vis = if visible.0 { Visibility::Inherited } else { Visibility::Hidden };
-    let conversation_vis = if visible.0 { Visibility::Hidden } else { Visibility::Inherited };
-
-    for (mut node, mut vis) in constellation_containers.iter_mut() {
-        node.display = constellation_display;
-        *vis = constellation_vis;
-    }
-
-    for (mut node, mut vis) in conv_root.iter_mut() {
-        node.display = conversation_display;
-        *vis = conversation_vis;
-    }
-}
-
-/// Hide orphaned cell-text entities when constellation is showing.
-///
-/// Block cells and role headers are spawned as root-level entities (no parent)
-/// with screen-space coordinates via `MsdfTextAreaConfig`. Since they're not
-/// descendants of `ConversationRoot`, `Visibility::Hidden` doesn't propagate
-/// to them. This system directly sets their `Visibility` based on constellation
-/// state. Targets `MsdfText` entities without `Node` (UI text has `Node` and
-/// inherits visibility through the UI hierarchy).
-fn sync_cell_text_visibility(
-    visible: Res<ConstellationVisible>,
-    mut cell_texts: Query<&mut Visibility, (With<MsdfText>, Without<Node>)>,
-    new_texts: Query<(), (Added<MsdfText>, Without<Node>)>,
-) {
-    if !visible.is_changed() && new_texts.is_empty() {
-        return;
-    }
-
-    let target = if visible.0 {
-        Visibility::Hidden
-    } else {
-        Visibility::Inherited
-    };
-
-    for mut vis in cell_texts.iter_mut() {
-        *vis = target;
     }
 }
 
@@ -1136,7 +1035,7 @@ fn spawn_legend_panel(
 /// dots and context counts, and staged drift count.
 fn update_legend_content(
     mut commands: Commands,
-    visible: Res<ConstellationVisible>,
+    screen: Res<State<Screen>>,
     drift_state: Res<DriftState>,
     constellation: Res<Constellation>,
     theme: Res<Theme>,
@@ -1144,7 +1043,7 @@ fn update_legend_content(
     content_q: Query<Entity, With<LegendContent>>,
     mut last_fingerprint: Local<u64>,
 ) {
-    if !visible.0 {
+    if !matches!(screen.get(), Screen::Constellation) {
         return;
     }
 

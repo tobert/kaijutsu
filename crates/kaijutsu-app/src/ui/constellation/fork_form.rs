@@ -1,8 +1,9 @@
 //! Full-viewport fork configuration form.
 //!
-//! Replaces the modal fork dialog with a full-viewport form that takes over
-//! from the constellation. Shows model selection (from `get_llm_config`)
-//! and an optional name input. Submit: fork → set_context_model → switch.
+//! Uses `Screen::ForkForm` for screen-level transitions. The form root is tagged
+//! with `DespawnOnExit(Screen::ForkForm)` for automatic cleanup when leaving.
+//! Camera deactivation happens via `OnExit(Screen::Constellation)` in the screen
+//! state machine — no manual camera hacks needed.
 //!
 //! Model is immutable on a context — fork to change it.
 
@@ -14,11 +15,9 @@ use uuid::Uuid;
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
 use crate::input::action::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
-use crate::input::focus::{FocusArea, FocusStack};
 use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::ui::screen::Screen;
 use crate::ui::theme::Theme;
-
-use super::ConstellationVisible;
 
 
 // ============================================================================
@@ -115,8 +114,8 @@ pub fn setup_fork_form_systems(app: &mut App) {
             Update,
             (
                 handle_open_fork_form,
-                poll_fork_form_models,
-                handle_fork_form_input,
+                poll_fork_form_models.run_if(in_state(Screen::ForkForm)),
+                handle_fork_form_input.run_if(in_state(Screen::ForkForm)),
             ),
         );
 }
@@ -128,9 +127,7 @@ pub fn setup_fork_form_systems(app: &mut App) {
 fn handle_open_fork_form(
     mut commands: Commands,
     theme: Res<Theme>,
-    mut focus: ResMut<FocusArea>,
-    mut focus_stack: ResMut<FocusStack>,
-    mut visible: ResMut<ConstellationVisible>,
+    mut next_screen: ResMut<NextState<Screen>>,
     mut events: MessageReader<OpenForkForm>,
     existing: Query<Entity, With<ForkFormRoot>>,
     result_slot: Res<ForkFormModelResult>,
@@ -143,16 +140,14 @@ fn handle_open_fork_form(
     for msg in events.read() {
         info!("Opening fork form for context {}", msg.source_context_id.short());
 
-        // Hide constellation 3D scene (UI can't occlude 3D render targets).
-        // Note: sync_constellation_visibility will show the conversation root
-        // in response, but our form overlays it at ZIndex::MODAL.
-        visible.0 = false;
-        focus_stack.push(&mut focus, FocusArea::Dialog);
+        // Transition to ForkForm screen — OnExit(Constellation) deactivates
+        // the 3D camera automatically. No manual camera hack needed.
+        next_screen.set(Screen::ForkForm);
 
         // Clear async slot
         *result_slot.0.lock().unwrap() = None;
 
-        // Spawn the form UI
+        // Spawn the form UI (tagged with DespawnOnExit for auto-cleanup)
         spawn_fork_form(&mut commands, &theme, msg);
 
         // Kick off async model fetch
@@ -168,8 +163,6 @@ fn handle_open_fork_form(
                                 .into_iter()
                                 .filter(|p| p.available)
                                 .map(|p| {
-                                    // Fall back to default_model if models list is empty
-                                    // (backward compat with servers that don't populate it)
                                     let models = if p.models.is_empty() {
                                         if p.default_model.is_empty() {
                                             Vec::new()
@@ -190,10 +183,14 @@ fn handle_open_fork_form(
                         }
                         Err(e) => {
                             error!("Failed to fetch LLM config: {}", e);
+                            *slot.lock().unwrap() = Some(FetchedModels { providers: vec![] });
                         }
                     }
                 })
                 .detach();
+        } else {
+            warn!("No RPC actor available, fork form will have no model list");
+            *result_slot.0.lock().unwrap() = Some(FetchedModels { providers: vec![] });
         }
     }
 }
@@ -208,7 +205,7 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
         msg.source_context_id.short(),
     );
 
-    // Full-viewport root
+    // Full-viewport root — DespawnOnExit auto-cleans when leaving ForkForm screen
     commands
         .spawn((
             ForkFormRoot {
@@ -224,6 +221,7 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
                 parent_model: msg.parent_model.clone(),
                 models_loaded: false,
             },
+            DespawnOnExit(Screen::ForkForm),
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
@@ -501,6 +499,26 @@ fn poll_fork_form_models(
         return;
     };
 
+    // Show hint when no models are available (RPC error or no providers)
+    if models.is_empty() {
+        let hint_entity = commands
+            .spawn((
+                MsdfUiText::new("No models available (will inherit parent)")
+                    .with_font_size(13.0)
+                    .with_color(theme.fg_dim),
+                UiTextPositionCache::default(),
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(15.0),
+                    ..default()
+                },
+            ))
+            .id();
+        commands.entity(container).add_child(hint_entity);
+        info!("Fork form: no models available");
+        return;
+    }
+
     let mut current_provider = String::new();
     for (i, entry) in models.iter().enumerate() {
         // Provider header when provider changes
@@ -579,12 +597,10 @@ fn poll_fork_form_models(
 // ============================================================================
 
 fn handle_fork_form_input(
-    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut text_events: MessageReader<TextInputReceived>,
-    mut focus: ResMut<FocusArea>,
-    mut focus_stack: ResMut<FocusStack>,
-    mut state_query: Query<(&mut ForkFormState, Entity, &ForkFormRoot)>,
+    mut next_screen: ResMut<NextState<Screen>>,
+    mut state_query: Query<(&mut ForkFormState, &ForkFormRoot)>,
     mut name_display: Query<&mut MsdfUiText, With<ForkFormNameDisplay>>,
     mut model_items: Query<(&ForkFormModelItem, &mut BackgroundColor, &Children)>,
     mut model_texts: Query<&mut MsdfUiText, (Without<ForkFormNameDisplay>, Without<ForkFormLoadingText>)>,
@@ -595,7 +611,7 @@ fn handle_fork_form_input(
     conn_state: Res<RpcConnectionState>,
     actor: Option<Res<RpcActor>>,
 ) {
-    let Ok((mut state, form_entity, form_root)) = state_query.single_mut() else {
+    let Ok((mut state, form_root)) = state_query.single_mut() else {
         return;
     };
 
@@ -673,12 +689,14 @@ fn handle_fork_form_input(
                         &conn_state,
                         actor.as_deref(),
                     );
-                    close_fork_form(&mut commands, form_entity, &mut focus, &mut focus_stack);
+                    // DespawnOnExit handles cleanup when screen transitions
+                    next_screen.set(Screen::Constellation);
                 }
             }
             Action::Unfocus => {
                 info!("Fork form cancelled");
-                close_fork_form(&mut commands, form_entity, &mut focus, &mut focus_stack);
+                // DespawnOnExit handles cleanup when screen transitions
+                next_screen.set(Screen::Constellation);
             }
             _ => {}
         }
@@ -737,7 +755,7 @@ fn update_field_borders(
 }
 
 // ============================================================================
-// SUBMIT & CLOSE
+// SUBMIT
 // ============================================================================
 
 fn submit_fork_form(
@@ -753,11 +771,7 @@ fn submit_fork_form(
     };
 
     let selected = state.models.get(state.selected_model_index);
-    let fork_label = if state.name_text.is_empty() {
-        String::new()
-    } else {
-        state.name_text.clone()
-    };
+    let fork_label = state.name_text.clone();
 
     let handle = actor.handle.clone();
     let source_ctx_id = form_root.source_context_id;
@@ -822,16 +836,4 @@ fn submit_fork_form(
             });
         })
         .detach();
-}
-
-fn close_fork_form(
-    commands: &mut Commands,
-    form_entity: Entity,
-    focus: &mut FocusArea,
-    focus_stack: &mut FocusStack,
-) {
-    // Pop focus → restores Constellation → enforce_constellation_focus_sync
-    // sets ConstellationVisible(true)
-    focus_stack.pop(focus);
-    commands.entity(form_entity).despawn();
 }

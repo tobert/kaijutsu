@@ -16,11 +16,12 @@ use bevy::{
 };
 
 use super::{
-    Constellation, ConstellationContainer, ConstellationVisible,
+    Constellation, ConstellationContainer,
     hyper::{HyperPoint, LorentzTransform},
     layout::H3Layout,
     viewport::{ViewportState, ConstellationCamera3d, TestSphere},
 };
+use crate::ui::screen::Screen;
 use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::{Theme, agent_color_for_provider};
 
@@ -363,7 +364,7 @@ fn on_node_3d_click(
     node_query: Query<&Node3d>,
     mut constellation: ResMut<Constellation>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    mut focus: ResMut<crate::input::focus::FocusArea>,
+    mut next_screen: ResMut<NextState<Screen>>,
     focus_stack: Res<crate::input::focus::FocusStack>,
 ) {
     if focus_stack.is_modal() {
@@ -378,7 +379,7 @@ fn on_node_3d_click(
         switch_writer.write(crate::cell::ContextSwitchRequested {
             context_id: ctx_id,
         });
-        *focus = crate::input::focus::FocusArea::Compose;
+        next_screen.set(Screen::Conversation);
     }
 }
 
@@ -393,14 +394,14 @@ fn on_node_3d_click(
 fn update_node_labels(
     mut commands: Commands,
     constellation: Res<Constellation>,
-    visible: Res<ConstellationVisible>,
+    screen: Res<State<Screen>>,
     viewport_state: Res<ViewportState>,
     cameras: Query<(&Camera, &GlobalTransform), With<ConstellationCamera3d>>,
     nodes_3d: Query<(&Node3d, &Transform), Without<EdgeMesh>>,
     mut labels: Query<(Entity, &mut NodeLabel3d, &mut Node)>,
     container_q: Query<Entity, With<ConstellationContainer>>,
 ) {
-    if !visible.0 || viewport_state.camera_entity.is_none() {
+    if !matches!(screen.get(), Screen::Constellation) || viewport_state.camera_entity.is_none() {
         // Hide all labels when constellation is not visible
         for (_, _, mut node) in labels.iter_mut() {
             node.display = Display::None;
