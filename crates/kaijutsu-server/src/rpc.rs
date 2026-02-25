@@ -321,7 +321,7 @@ fn kernel_data_dir() -> std::path::PathBuf {
         if let Ok(entries) = std::fs::read_dir(&old_dir) {
             let count = entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
             if count > 0 {
-                log::info!(
+                log::warn!(
                     "Found {} old kernel data dir(s) in {:?}. \
                      To recover, copy the most recent data.db to {:?}",
                     count, old_dir, dir
@@ -4764,6 +4764,8 @@ async fn process_llm_stream(
     // Always re-hydrate from blocks — ensures shell commands, MCP tool calls,
     // and other agent blocks added between prompts are visible to the LLM.
     // block_snapshots() reads from in-memory DashMap, sub-millisecond for typical conversations.
+    // The user block was already inserted before this function was called, so
+    // hydrated messages include it — no explicit push needed.
     match documents.block_snapshots(cell_id) {
         Ok(blocks) => {
             let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
@@ -4774,13 +4776,14 @@ async fn process_llm_stream(
             *messages = hydrated;
         }
         Err(e) => {
-            log::debug!("Could not hydrate cache for {}: {}", cell_id, e);
+            // Hydration failed — fall back to appending the user message to
+            // whatever the cache currently holds (may be stale or empty).
+            log::warn!("Could not hydrate cache for {}: {}, falling back to cache + append", cell_id, e);
+            messages.push(LlmMessage::user(&content));
         }
     }
 
-    let history_len = messages.len();
-    messages.push(LlmMessage::user(&content));
-    log::info!("Loaded {} cached messages for cell {}, adding user message", history_len, cell_id);
+    log::info!("Sending {} messages for context {}", messages.len(), cell_id);
 
     // Track total iterations to prevent infinite loops
     let max_iterations = 20;
