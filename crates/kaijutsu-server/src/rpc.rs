@@ -3816,19 +3816,24 @@ impl kernel::Server for KernelImpl {
                 registry.default_model().unwrap_or("")
             );
 
-            let provider_names = registry.list();
+            // Only include available providers (skip disabled/unconfigured)
+            let provider_names: Vec<&str> = registry.list().into_iter()
+                .filter(|name| registry.get(name).is_some())
+                .collect();
             let mut providers = config.init_providers(provider_names.len() as u32);
             for (i, name) in provider_names.iter().enumerate() {
                 let mut entry = providers.reborrow().get(i as u32);
                 entry.set_name(name);
-                // Get the provider's default model if available
+                entry.set_available(true);
                 if let Some(p) = registry.get(name) {
-                    let models = p.available_models();
-                    entry.set_default_model(models.first().copied().unwrap_or(""));
-                    entry.set_available(true);
-                } else {
-                    entry.set_default_model("");
-                    entry.set_available(false);
+                    let avail = p.available_models();
+                    entry.set_default_model(avail.first().copied().unwrap_or(""));
+                }
+                // Populate full models list from aliases + default
+                let model_ids = registry.models_for_provider(name);
+                let mut models_list = entry.init_models(model_ids.len() as u32);
+                for (j, model_id) in model_ids.iter().enumerate() {
+                    models_list.set(j as u32, model_id);
                 }
             }
 

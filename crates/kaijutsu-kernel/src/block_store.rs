@@ -18,7 +18,7 @@ use diamond_types_extended::Frontier;
 use parking_lot::RwLock;
 
 use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, StoreSnapshot, SyncPayload};
-use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind};
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
@@ -558,8 +558,9 @@ impl BlockStore {
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId, String> {
-        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, None, None)
+        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, tool_kind, None, None)
     }
 
     /// Insert a tool call block with an explicit author identity.
@@ -573,6 +574,7 @@ impl BlockStore {
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
+        tool_kind: Option<ToolKind>,
         agent_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
     ) -> Result<BlockId, String> {
@@ -585,7 +587,7 @@ impl BlockStore {
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
 
-            let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input)
+            let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, tool_kind)
                 .map_err(|e| e.to_string())?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips
@@ -626,8 +628,9 @@ impl BlockStore {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId, String> {
-        self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, None, None)
+        self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, tool_kind, None, None)
     }
 
     /// Insert a tool result block with an explicit author identity.
@@ -642,6 +645,7 @@ impl BlockStore {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
+        tool_kind: Option<ToolKind>,
         agent_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
     ) -> Result<BlockId, String> {
@@ -654,7 +658,7 @@ impl BlockStore {
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
 
-            let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code)
+            let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, tool_kind)
                 .map_err(|e| e.to_string())?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips
@@ -1762,7 +1766,7 @@ mod tests {
         let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
 
         let block_id = store.insert_tool_call(
-            ctx, None, None, "bash", serde_json::json!({"command": "ls -la"})
+            ctx, None, None, "bash", serde_json::json!({"command": "ls -la"}), None
         ).unwrap();
 
         let msg = sub.try_recv().expect("should receive event");

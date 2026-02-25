@@ -581,7 +581,8 @@ impl KaijutsuMcp {
     // Document Tools
     // ========================================================================
 
-    #[tool(description = "Create a new document for collaborative editing. Documents contain blocks of content organized in a DAG structure.")]
+    #[tool(description = "Create a new document for collaborative editing. Documents contain blocks of content organized in a DAG structure.",
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_create")]
     fn doc_create(&self, Parameters(req): Parameters<DocCreateRequest>) -> String {
         let kind = match parse_document_kind(&req.kind) {
@@ -604,7 +605,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "List all documents in the kernel with their metadata and block counts.")]
+    #[tool(description = "List all documents in the kernel with their metadata and block counts.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self), name = "mcp.doc_list")]
     async fn doc_list(&self) -> String {
         // Get context metadata from server if connected
@@ -654,7 +656,8 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    #[tool(description = "Delete a document and all its blocks.")]
+    #[tool(description = "Delete a document and all its blocks.",
+        annotations(destructive_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_delete")]
     fn doc_delete(&self, Parameters(req): Parameters<DocDeleteRequest>) -> String {
         let context_id = match ContextId::parse(&req.id) {
@@ -675,7 +678,8 @@ impl KaijutsuMcp {
     // Block Tools
     // ========================================================================
 
-    #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.")]
+    #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.",
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_create")]
     async fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
@@ -724,7 +728,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.")]
+    #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
     async fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
@@ -789,7 +794,8 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.")]
+    #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_append")]
     async fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -814,7 +820,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.")]
+    #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_edit")]
     async fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -916,7 +923,8 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    #[tool(description = "List blocks with optional filters for document, kind, status, and role.")]
+    #[tool(description = "List blocks with optional filters for document, kind, status, and role.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_list")]
     async fn block_list(&self, Parameters(req): Parameters<BlockListRequest>) -> String {
         let kind_filter = req.kind.as_ref().and_then(|k| parse_block_kind(k));
@@ -998,7 +1006,8 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    #[tool(description = "Set the status of a block: pending, running, done, or error.")]
+    #[tool(description = "Set the status of a block: pending, running, done, or error.",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_status")]
     async fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -1032,7 +1041,8 @@ impl KaijutsuMcp {
     // Search Tools
     // ========================================================================
 
-    #[tool(description = "Search across all blocks using regex patterns. Returns matches with context lines.")]
+    #[tool(description = "Search across all blocks using regex patterns. Returns matches with context lines.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.kernel_search")]
     async fn kernel_search(&self, Parameters(req): Parameters<KernelSearchRequest>) -> String {
         let regex = match Regex::new(&req.query) {
@@ -1128,7 +1138,8 @@ impl KaijutsuMcp {
     // Debug/Visualization Tools
     // ========================================================================
 
-    #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.")]
+    #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_tree")]
     async fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
@@ -1165,7 +1176,8 @@ impl KaijutsuMcp {
         output
     }
 
-    #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.")]
+    #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
     async fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
@@ -1205,7 +1217,8 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    #[tool(description = "Get version history information for a block. Shows creation time and current version details.")]
+    #[tool(description = "Get version history information for a block. Shows creation time and current version details.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
     async fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
@@ -1241,7 +1254,8 @@ impl KaijutsuMcp {
         output
     }
 
-    #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.")]
+    #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
     async fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
         let (_context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
@@ -1314,7 +1328,8 @@ impl KaijutsuMcp {
     // Drift Tools (Cross-Context Communication)
     // ========================================================================
 
-    #[tool(description = "List all registered drift contexts. Shows short IDs, labels, providers, models, and lineage.")]
+    #[tool(description = "List all registered drift contexts. Shows short IDs, labels, providers, models, and lineage.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self), name = "mcp.drift_ls")]
     async fn drift_ls(&self) -> String {
         let actor = match self.actor() {
@@ -1344,7 +1359,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush. Target can be a short ID prefix or label.")]
+    #[tool(description = "Stage a drift push to transfer content to another context. Content is queued and sent on flush. Target can be a short ID prefix or label.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_push")]
     async fn drift_push(&self, Parameters(req): Parameters<DriftPushRequest>) -> String {
         let actor = match self.actor() {
@@ -1369,7 +1385,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush.")]
+    #[tool(description = "View the drift staging queue. Shows pending transfers awaiting flush.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self), name = "mcp.drift_queue")]
     async fn drift_queue(&self) -> String {
         let actor = match self.actor() {
@@ -1401,7 +1418,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Cancel a staged drift by its ID.")]
+    #[tool(description = "Cancel a staged drift by its ID.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_cancel")]
     async fn drift_cancel(&self, Parameters(req): Parameters<DriftCancelRequest>) -> String {
         let actor = match self.actor() {
@@ -1416,7 +1434,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Flush all staged drifts, injecting content into target contexts.")]
+    #[tool(description = "Flush all staged drifts, injecting content into target contexts.",
+        annotations(destructive_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self), name = "mcp.drift_flush")]
     async fn drift_flush(&self) -> String {
         let actor = match self.actor() {
@@ -1431,7 +1450,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.")]
+    #[tool(description = "Pull summarized content from another context. Reads the source context's conversation, distills it via LLM, and injects the summary as a Drift block in the current context. Use 'prompt' to direct the summary focus.",
+        annotations(destructive_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_pull")]
     async fn drift_pull(&self, Parameters(req): Parameters<DriftPullRequest>) -> String {
         let actor = match self.actor() {
@@ -1454,7 +1474,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.")]
+    #[tool(description = "Merge a forked context back into its parent. Distills the fork's conversation via LLM and injects the summary into the parent context as a Drift block.",
+        annotations(destructive_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.drift_merge")]
     async fn drift_merge(&self, Parameters(req): Parameters<DriftMergeRequest>) -> String {
         let actor = match self.actor() {
@@ -1481,7 +1502,8 @@ impl KaijutsuMcp {
     // Kaish Execution (via ActorHandle → ToolRegistry)
     // ========================================================================
 
-    #[tool(description = "Execute a tool through the kernel's tool registry. Available tools include git, drift, search, and any registered execution engines. Returns the tool's output synchronously. Requires --connect to kaijutsu-server.")]
+    #[tool(description = "Execute a kernel tool by exact name. Use list_kernel_tools to discover available tool names and their input schemas. Common tools: drift_ls, drift_push, drift_pull, drift_flush, drift_merge, glob, grep, kernel_search. Requires --connect.",
+        annotations(open_world_hint = true))]
     #[tracing::instrument(skip(self, req), name = "mcp.kaish_exec")]
     async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> String {
         let actor = match self.actor() {
@@ -1501,7 +1523,33 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect to kaijutsu-server.")]
+    #[tool(description = "List all kernel tools with their names, descriptions, categories, and input schemas. Use this to discover exact tool names for kaish_exec. Requires --connect.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tracing::instrument(skip(self), name = "mcp.list_kernel_tools")]
+    async fn list_kernel_tools(&self) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: list_kernel_tools requires --connect to kaijutsu-server".to_string(),
+        };
+
+        match actor.get_tool_schemas().await {
+            Ok(schemas) => {
+                let tools: Vec<serde_json::Value> = schemas.iter().map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "description": s.description,
+                        "category": s.category,
+                        "input_schema": serde_json::from_str::<serde_json::Value>(&s.input_schema).unwrap_or(serde_json::Value::Object(Default::default())),
+                    })
+                }).collect();
+                serde_json::to_string_pretty(&tools).unwrap_or_else(|e| format!("Error serializing: {e}"))
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect.",
+        annotations(open_world_hint = true))]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
     async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         let remote = match self.remote() {
@@ -1615,7 +1663,8 @@ impl KaijutsuMcp {
     // Context Identity
     // ========================================================================
 
-    #[tool(description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.")]
+    #[tool(description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self), name = "mcp.whoami")]
     async fn whoami(&self) -> String {
         let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
@@ -1658,7 +1707,8 @@ impl KaijutsuMcp {
     // Undo
     // ========================================================================
 
-    #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.")]
+    #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_undo")]
     fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
@@ -1713,7 +1763,8 @@ impl KaijutsuMcp {
     // Input Document Tools (CRDT compose scratchpad)
     // ========================================================================
 
-    #[tool(description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.")]
+    #[tool(description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
     async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1748,7 +1799,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.")]
+    #[tool(description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.write_input")]
     async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1793,7 +1845,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.")]
+    #[tool(description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.edit_input")]
     async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1830,7 +1883,8 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.")]
+    #[tool(description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.",
+        annotations(destructive_hint = false, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
     async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {

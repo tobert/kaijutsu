@@ -847,7 +847,7 @@ mod tests {
         // Create document with a tool call
         let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"path": "/etc/hosts", "recursive": true});
-        doc.insert_tool_call(None, None, "read_file", tool_input.clone())
+        doc.insert_tool_call(None, None, "read_file", tool_input.clone(), None)
             .unwrap();
 
         db.save(&conv, Some(&doc)).unwrap();
@@ -875,7 +875,7 @@ mod tests {
         let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"command": "ls -la"});
         let call_id = doc
-            .insert_tool_call(None, None, "bash", tool_input)
+            .insert_tool_call(None, None, "bash", tool_input, None)
             .unwrap();
         doc.insert_tool_result_block(
             &call_id,
@@ -883,6 +883,7 @@ mod tests {
             "total 4\ndrwxr-xr-x 2 user user 4096 Jan 1 00:00 .",
             false,
             Some(0),
+            None,
         )
         .unwrap();
 
@@ -912,7 +913,7 @@ mod tests {
         let mut doc = BlockDocument::new(ContextId::new(), PrincipalId::new());
         let tool_input = serde_json::json!({"command": "cat /nonexistent"});
         let call_id = doc
-            .insert_tool_call(None, None, "bash", tool_input)
+            .insert_tool_call(None, None, "bash", tool_input, None)
             .unwrap();
         doc.insert_tool_result_block(
             &call_id,
@@ -920,6 +921,7 @@ mod tests {
             "cat: /nonexistent: No such file or directory",
             true,
             Some(1),
+            None,
         )
         .unwrap();
 

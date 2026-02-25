@@ -107,7 +107,7 @@ mod tests {
     fn test_tool_blocks_are_editable() {
         let mut doc = test_doc();
 
-        let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"})).unwrap();
+        let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"}), None).unwrap();
 
         let result = doc.append_text(&tool_id, ", \"extra\": true}");
         assert!(result.is_ok());
@@ -116,7 +116,7 @@ mod tests {
         assert_eq!(snapshot.kind, BlockKind::ToolCall);
         assert_eq!(snapshot.tool_name, Some("read_file".to_string()));
 
-        let result_id = doc.insert_tool_result_block(&tool_id, Some(&tool_id), "file contents", false, None).unwrap();
+        let result_id = doc.insert_tool_result_block(&tool_id, Some(&tool_id), "file contents", false, None, None).unwrap();
 
         doc.append_text(&result_id, "\nmore output").unwrap();
 

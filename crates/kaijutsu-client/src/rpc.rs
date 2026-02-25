@@ -553,6 +553,32 @@ impl KernelHandle {
         })
     }
 
+    /// Get schemas for all registered kernel tools.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_tool_schemas")]
+    pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, RpcError> {
+        let mut request = self.kernel.get_tool_schemas_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let schemas = response.get()?.get_schemas()?;
+
+        let mut result = Vec::with_capacity(schemas.len() as usize);
+        for i in 0..schemas.len() {
+            let s = schemas.get(i);
+            result.push(ToolSchema {
+                name: s.get_name()?.to_string()?,
+                description: s.get_description()?.to_string()?,
+                category: s.get_category()?.to_string()?,
+                input_schema: s.get_input_schema()?.to_string()?,
+            });
+        }
+        Ok(result)
+    }
+
     /// Call an MCP tool
     ///
     /// Invokes a tool on a registered MCP server and returns the result.
@@ -1021,10 +1047,19 @@ impl KernelHandle {
         let providers_reader = config.get_providers()?;
         let mut providers = Vec::with_capacity(providers_reader.len() as usize);
         for p in providers_reader.iter() {
+            let models: Vec<String> = if p.has_models() {
+                p.get_models()?
+                    .iter()
+                    .filter_map(|m| m.ok().and_then(|s| s.to_string().ok()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             providers.push(LlmProviderInfo {
                 name: p.get_name()?.to_string()?,
                 default_model: p.get_default_model()?.to_string()?,
                 available: p.get_available(),
+                models,
             });
         }
 
@@ -1642,6 +1677,8 @@ pub struct LlmProviderInfo {
     pub name: String,
     pub default_model: String,
     pub available: bool,
+    /// All available model IDs for this provider (from aliases + default).
+    pub models: Vec<String>,
 }
 
 /// Current LLM configuration for a kernel
@@ -1712,6 +1749,15 @@ pub struct ToolResult {
     pub request_id: String,
     pub success: bool,
     pub output: String,
+}
+
+/// Schema for a kernel tool (getToolSchemas @11).
+#[derive(Debug, Clone)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub input_schema: String,
 }
 
 /// Result from an MCP tool call

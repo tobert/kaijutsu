@@ -11,7 +11,7 @@ use diamond_types_extended::Frontier;
 use crate::content::{order_midpoint, BlockContent};
 use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, DriftKind,
-    PrincipalId, Result, Role, Status, MAX_DAG_DEPTH,
+    PrincipalId, Result, Role, Status, ToolKind, MAX_DAG_DEPTH,
 };
 
 /// Collection of blocks with per-block DTE instances.
@@ -336,6 +336,7 @@ impl BlockStore {
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
@@ -366,7 +367,7 @@ impl BlockStore {
             collapsed: false,
             created_at: now,
             updated_at: ts,
-            tool_kind: None,
+            tool_kind,
             exit_code: None,
             is_error: false,
         };
@@ -387,6 +388,7 @@ impl BlockStore {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let after = after.or(Some(tool_call_id));
@@ -414,7 +416,7 @@ impl BlockStore {
             collapsed: false,
             created_at: now,
             updated_at: ts,
-            tool_kind: None,
+            tool_kind,
             exit_code,
             is_error,
         };
@@ -1096,6 +1098,7 @@ mod tests {
                 None,
                 "read_file",
                 serde_json::json!({"path": "/etc/hosts"}),
+                None,
             )
             .unwrap();
 
@@ -1105,7 +1108,7 @@ mod tests {
         assert_eq!(snap.status, Status::Running);
 
         let result_id = store
-            .insert_tool_result_block(&call_id, Some(&call_id), "127.0.0.1 localhost", false, Some(0))
+            .insert_tool_result_block(&call_id, Some(&call_id), "127.0.0.1 localhost", false, Some(0), None)
             .unwrap();
 
         let snap = store.get_block_snapshot(&result_id).unwrap();
@@ -1267,7 +1270,7 @@ mod tests {
 
         // Insert a tool call and set tool_use_id
         let tc_id = store
-            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}))
+            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}), None)
             .unwrap();
         store.set_tool_use_id(&tc_id, Some("toolu_01ABC".to_string())).unwrap();
 

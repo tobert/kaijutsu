@@ -634,6 +634,7 @@ impl BlockDocument {
         after: Option<&BlockId>,
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
@@ -646,7 +647,7 @@ impl BlockDocument {
             Role::Model,
             BlockKind::ToolCall,
             input_json.clone(),
-            None, // tool_kind
+            tool_kind,
             Some(tool_name.into()),
             Some(input_json),
             None,
@@ -670,6 +671,7 @@ impl BlockDocument {
         content: impl Into<String>,
         is_error: bool,
         exit_code: Option<i32>,
+        tool_kind: Option<ToolKind>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
 
@@ -683,7 +685,7 @@ impl BlockDocument {
             Role::Tool,
             BlockKind::ToolResult,
             content.into(),
-            None, // tool_kind
+            tool_kind,
             None,
             None,
             Some(*tool_call_id),
@@ -1598,6 +1600,7 @@ mod tests {
         let tool_call_id = doc.insert_tool_call(
             None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
+            None,
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&tool_call_id).unwrap();
@@ -1606,7 +1609,7 @@ mod tests {
 
         let result_id = doc.insert_tool_result_block(
             &tool_call_id, Some(&tool_call_id),
-            "127.0.0.1 localhost", false, Some(0),
+            "127.0.0.1 localhost", false, Some(0), None,
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&result_id).unwrap();
@@ -1928,11 +1931,12 @@ mod tests {
         let tool_call_id = original.insert_tool_call(
             None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
+            None,
         ).unwrap();
 
         let _tool_result_id = original.insert_tool_result_block(
             &tool_call_id, Some(&tool_call_id),
-            "127.0.0.1 localhost", false, Some(0),
+            "127.0.0.1 localhost", false, Some(0), None,
         ).unwrap();
 
         let fork_ctx = ContextId::new();

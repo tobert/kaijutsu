@@ -252,13 +252,13 @@ impl RhaiEngine {
                     "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
                         let input = serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
-                        store_insert.insert_tool_call(ctx, None, after_ref, "unknown", input)
+                        store_insert.insert_tool_call(ctx, None, after_ref, "unknown", input, None)
                     }
                     "tool_result" => {
                         // For tool_result, we need a tool_call_id. Use after_ref if available.
                         let tool_call_id = after.as_ref();
                         if let Some(tc_id) = tool_call_id {
-                            store_insert.insert_tool_result(ctx, tc_id, after_ref, &content, false, None)
+                            store_insert.insert_tool_result(ctx, tc_id, after_ref, &content, false, None, None)
                         } else {
                             // Fallback to text if no tool_call_id
                             store_insert.insert_block(ctx, None, after_ref, Role::Tool, BlockKind::Text, &content)

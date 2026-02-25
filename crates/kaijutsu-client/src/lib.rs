@@ -23,7 +23,7 @@ pub use rpc::{
     ContextInfo, ContextMembership, DocumentState, HistoryEntry, Identity, InputState,
     KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource,
     McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, ShellValue,
-    StagedDriftInfo, SubmitResult, ToolResult, VersionSnapshot,
+    StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};

@@ -26,7 +26,7 @@ use tracing::Instrument;
 use crate::rpc::{
     ClientToolFilter, Completion, ContextInfo, DocumentState, HistoryEntry, Identity,
     InputState, KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult,
-    ShellValue, StagedDriftInfo, SubmitResult, ToolResult, VersionSnapshot,
+    ShellValue, StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
@@ -109,6 +109,7 @@ enum RpcCommand {
 
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool { tool: String, params: String, reply: oneshot::Sender<Result<ToolResult, ActorError>> },
+    GetToolSchemas { reply: oneshot::Sender<Result<Vec<ToolSchema>, ActorError>> },
     CallMcpTool { server: String, tool: String, arguments: serde_json::Value, reply: oneshot::Sender<Result<McpToolResult, ActorError>> },
 
     // ── MCP Resources ────────────────────────────────────────────────────
@@ -169,6 +170,7 @@ impl RpcCommand {
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ReadMcpResource { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -450,6 +452,11 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::ExecuteTool {
             tool: tool.into(), params: params.into(), reply,
         }).await
+    }
+
+    /// Get schemas for all registered kernel tools.
+    pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, ActorError> {
+        self.send(|reply| RpcCommand::GetToolSchemas { reply }).await
     }
 
     /// Call an MCP tool.
@@ -1027,6 +1034,9 @@ async fn dispatch_command(
         // ── Tool Execution ───────────────────────────────────────
         RpcCommand::ExecuteTool { tool, params, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.execute_tool(&tool, &params));
+        }
+        RpcCommand::GetToolSchemas { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_tool_schemas());
         }
         RpcCommand::CallMcpTool { server, tool, arguments, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.call_mcp_tool(&server, &tool, &arguments));

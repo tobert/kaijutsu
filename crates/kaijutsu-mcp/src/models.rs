@@ -257,8 +257,8 @@ fn default_undo_steps() -> u32 {
 /// Execute a tool through the kernel's tool registry (git, drift, etc.).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KaishExecRequest {
-    /// Tool name to execute (e.g., "git", "drift", "search")
-    #[schemars(description = "Tool name to execute (e.g., 'git', 'drift', 'search')")]
+    /// Exact tool name to execute (use list_kernel_tools to discover names)
+    #[schemars(description = "Exact tool name (use list_kernel_tools to discover available names, e.g., 'drift_ls', 'glob', 'grep')")]
     pub tool: String,
     /// JSON parameters for the tool
     #[schemars(description = "JSON parameters for the tool (tool-specific)")]

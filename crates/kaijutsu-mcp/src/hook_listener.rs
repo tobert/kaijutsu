@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as TokioMutex;
 
-use kaijutsu_crdt::{BlockKind, ContextId, PrincipalId, Role};
+use kaijutsu_crdt::{BlockKind, ContextId, PrincipalId, Role, ToolKind};
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::hook_types::{HookEvent, HookResponse, PingResponse, KAIJUTSU_MCP_TOOLS};
@@ -284,6 +284,7 @@ impl HookListener {
             None,
             &tool.name,
             input,
+            Some(ToolKind::Mcp),
             Some(PrincipalId::system()),
             None,
         ) {
@@ -309,6 +310,7 @@ impl HookListener {
             &truncated,
             is_error,
             None,
+            Some(ToolKind::Mcp),
             Some(PrincipalId::system()),
             None,
         ) {
