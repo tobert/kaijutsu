@@ -48,6 +48,8 @@ use kaijutsu_kernel::{
 };
 use kaijutsu_crdt::{BlockKind, Role, Status};
 use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId, SessionId};
+// Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
+use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
 use tracing::Instrument;
 
@@ -770,6 +772,16 @@ pub async fn create_shared_kernel(
 
     // Initialize LLM registry + embedding config from models.rhai
     let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
+
+    // Set root context's provider/model from the now-populated LLM registry
+    {
+        let registry = kernel_arc.llm().read().await;
+        if let (Some(provider), Some(model)) = (registry.default_provider_name(), registry.default_model()) {
+            let mut drift = kernel_arc.drift().write().await;
+            let _ = drift.configure_llm(ctx_id, provider, model);
+            log::info!("Root context model: provider={}, model={}", provider, model);
+        }
+    }
 
     // Initialize MCP servers from mcp.rhai config
     initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
@@ -2122,7 +2134,7 @@ impl kernel::Server for KernelImpl {
             let command_block_id = documents.insert_tool_call_as(
                 context_id, None, last_block.as_ref(),
                 "shell", serde_json::json!({"code": code}),
-                Some(user_agent_id), None,
+                Some(TypesToolKind::Shell), Some(user_agent_id), None,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
             log::info!("Created shell command block: {:?}", command_block_id);
 
@@ -2130,7 +2142,7 @@ impl kernel::Server for KernelImpl {
             let output_block_id = documents.insert_tool_result_as(
                 context_id, &command_block_id, Some(&command_block_id),
                 "", false, None,
-                Some(PrincipalId::system()), None,
+                Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
             log::debug!("Created shell output block: {:?}", output_block_id);
 
@@ -3075,10 +3087,10 @@ impl kernel::Server for KernelImpl {
 
         let span = extract_rpc_trace(params_reader.get_trace(), "fork_from_version");
         Promise::from_future(async move {
-            // Register in drift router
+            // Register in drift router — inherits parent's provider/model
             let label = label_owned.as_deref();
             let mut drift = kernel_arc.drift().write().await;
-            drift.register(new_ctx_id, label, Some(parent_ctx_id));
+            drift.register_fork(new_ctx_id, label, parent_ctx_id);
             // Link to the parent context's long-running trace
             let trace_id = drift.get(parent_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
             let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_from_version").entered();
@@ -3346,33 +3358,42 @@ impl kernel::Server for KernelImpl {
         let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
         let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
         let kernel_arc = self.kernel.kernel.clone();
-        let ctx_id = self.connection.borrow().current_context_or(self.kernel.default_context_id);
+
+        // Use explicit contextId if provided (16 bytes), otherwise connection's current
+        let ctx_id_bytes = pry!(params_reader.get_context_id());
+        let ctx_id = if ctx_id_bytes.len() == 16 {
+            pry!(ContextId::try_from_slice(ctx_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into())))
+        } else {
+            self.connection.borrow().current_context_or(self.kernel.default_context_id)
+        };
 
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
         Promise::from_future(async move {
-            // Update drift router metadata
+            // Update drift router metadata (per-context model assignment)
             {
                 let mut drift = kernel_arc.drift().write().await;
                 let _ = drift.configure_llm(ctx_id, &provider_name, &model);
             }
 
-            // Create new provider from config and register with kernel
+            // Ensure provider is registered in LLM registry (for API client),
+            // but do NOT change kernel-wide defaults — model is per-context
             let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
                 .with_default_model(&model);
             match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
                 Ok(new_provider) => {
                     let mut registry = kernel_arc.llm().write().await;
-                    registry.register(&provider_name, Arc::new(new_provider));
-                    registry.set_default(&provider_name);
-                    registry.set_default_model(&model);
+                    if registry.get(&provider_name).is_none() {
+                        registry.register(&provider_name, Arc::new(new_provider));
+                    }
                     results.get().set_success(true);
                     results.get().set_error("");
-                    log::info!("LLM configured: provider={}, model={}", provider_name, model);
+                    log::info!("Context {} model set: provider={}, model={}", ctx_id.short(), provider_name, model);
                 }
                 Err(e) => {
                     results.get().set_success(false);
                     results.get().set_error(&format!("{}", e));
-                    log::warn!("Failed to configure LLM: {}", e);
+                    log::warn!("Failed to configure LLM for context {}: {}", ctx_id.short(), e);
                 }
             }
 
@@ -4254,14 +4275,14 @@ impl kernel::Server for KernelImpl {
                 let command_block_id = documents.insert_tool_call_as(
                     context_id, None, last_block.as_ref(),
                     "shell", serde_json::json!({"code": code}),
-                    Some(user_agent_id), None,
+                    Some(TypesToolKind::Shell), Some(user_agent_id), None,
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
 
                 // Create ToolResult block (empty, filled by execution)
                 let output_block_id = documents.insert_tool_result_as(
                     context_id, &command_block_id, Some(&command_block_id),
                     "", false, None,
-                    Some(PrincipalId::system()), None,
+                    Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
 
                 // Mark output block as Running
@@ -4636,30 +4657,46 @@ async fn spawn_llm_for_prompt(
             .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
-    // Resolve provider from kernel's LLM registry
+    // Read per-context model from DriftRouter (quick read, release lock)
+    let (ctx_model, ctx_provider_name) = {
+        let drift = kernel_arc.drift().read().await;
+        match drift.get(context_id) {
+            Some(h) => (h.model.clone(), h.provider.clone()),
+            None => (None, None),
+        }
+    };
+
+    // Resolve provider + model from LLM registry
+    // Priority: explicit param > per-context (DriftRouter) > kernel default
     let (provider, model_name, max_output_tokens) = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
-        if let Some(name) = model {
-            if let Some((p, m)) = registry.resolve_model(name) {
-                (p, m, max_tokens)
-            } else {
+        let effective_model = model.map(|m| m.to_string()).or(ctx_model);
+
+        match effective_model {
+            Some(name) => {
+                // Prefer per-context provider, then resolve via registry
+                let provider = ctx_provider_name.as_deref()
+                    .and_then(|pn| registry.get(pn))
+                    .or_else(|| registry.default_provider())
+                    .ok_or_else(|| {
+                        log::error!("No LLM provider configured");
+                        capnp::Error::failed("No LLM provider configured (check models.rhai)".into())
+                    })?;
+                (provider, name, max_tokens)
+            }
+            None => {
+                // No model anywhere — kernel default
                 let p = registry.default_provider().ok_or_else(|| {
                     log::error!("No LLM provider configured");
-                    capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
+                    capnp::Error::failed("No LLM provider configured (check models.rhai)".into())
                 })?;
-                (p, name.to_string(), max_tokens)
+                let m = registry.default_model()
+                    .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                    .to_string();
+                (p, m, max_tokens)
             }
-        } else {
-            let p = registry.default_provider().ok_or_else(|| {
-                log::error!("No LLM provider configured");
-                capnp::Error::failed("No LLM provider configured (check llm.rhai)".into())
-            })?;
-            let m = registry.default_model()
-                .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                .to_string();
-            (p, m, max_tokens)
         }
     };
 
@@ -4844,7 +4881,7 @@ async fn process_llm_stream(
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(PrincipalId::system()), Some(id.clone())) {
+                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), Some(block_id));
@@ -4950,7 +4987,7 @@ async fn process_llm_stream(
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result_as(
                             cell_id, tcb_id, Some(tcb_id), "", false, None,
-                            Some(PrincipalId::system()), Some(tool_use_id.clone()),
+                            Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
                                 let _ = documents.set_status(cell_id, &id, Status::Running);

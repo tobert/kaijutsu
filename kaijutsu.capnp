@@ -862,8 +862,9 @@ interface Kernel {
   # Get this kernel's context ID and label
   getContextId @57 (trace :TraceContext) -> (id :Data, label :Text);
 
-  # Configure LLM provider/model on an existing kernel
-  configureLlm @58 (provider :Text, model :Text, trace :TraceContext) -> (success :Bool, error :Text);
+  # Configure LLM provider/model for a specific context (per-context model assignment).
+  # If contextId is empty/missing, uses the connection's current context.
+  configureLlm @58 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
 
   # Push content to another context's staging queue
   driftPush @59 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);

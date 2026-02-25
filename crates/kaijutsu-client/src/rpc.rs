@@ -831,10 +831,11 @@ impl KernelHandle {
         Ok((id, label))
     }
 
-    /// Configure the LLM provider and model for this kernel.
-    #[tracing::instrument(skip(self), name = "rpc_client.configure_llm")]
-    pub async fn configure_llm(
+    /// Set the LLM provider and model for a specific context.
+    #[tracing::instrument(skip(self), name = "rpc_client.set_context_model")]
+    pub async fn set_context_model(
         &self,
+        context_id: ContextId,
         provider: &str,
         model: &str,
     ) -> Result<bool, RpcError> {
@@ -843,6 +844,7 @@ impl KernelHandle {
             let mut params = request.get();
             params.set_provider(provider);
             params.set_model(model);
+            params.set_context_id(context_id.as_bytes());
         }
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();

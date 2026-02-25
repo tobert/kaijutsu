@@ -151,6 +151,7 @@ impl DriftRouter {
     /// Register a context with a pre-assigned ContextId.
     ///
     /// The caller (server RPC) creates the ContextId and passes it in.
+    /// Provider and model default to None; use `configure_llm()` to set them.
     #[tracing::instrument(skip(self), name = "drift.register")]
     pub fn register(
         &mut self,
@@ -169,6 +170,41 @@ impl DriftRouter {
             provider: None,
             model: None,
             parent_id,
+            created_at: now_epoch(),
+            trace_id: uuid::Uuid::new_v4().into_bytes(),
+        };
+
+        self.contexts.insert(id, handle);
+    }
+
+    /// Register a forked context, inheriting provider/model from the parent.
+    ///
+    /// Model is immutable on a context after creation — fork to change it.
+    #[tracing::instrument(skip(self), name = "drift.register_fork")]
+    pub fn register_fork(
+        &mut self,
+        id: ContextId,
+        label: Option<&str>,
+        parent_id: ContextId,
+    ) {
+        if let Some(l) = label {
+            self.label_to_id.insert(l.to_string(), id);
+        }
+
+        // Inherit parent's provider/model (COW semantics — snapshot at fork time)
+        let (parent_provider, parent_model) = self
+            .contexts
+            .get(&parent_id)
+            .map(|h| (h.provider.clone(), h.model.clone()))
+            .unwrap_or((None, None));
+
+        let handle = ContextHandle {
+            id,
+            label: label.map(|s| s.to_string()),
+            pwd: None,
+            provider: parent_provider,
+            model: parent_model,
+            parent_id: Some(parent_id),
             created_at: now_epoch(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
         };
@@ -1071,6 +1107,40 @@ mod tests {
         let handle = router.get(id).unwrap();
         assert_eq!(handle.provider.as_deref(), Some("gemini"));
         assert_eq!(handle.model.as_deref(), Some("gemini-2.0-flash"));
+    }
+
+    #[test]
+    fn test_register_fork_inherits_model() {
+        let mut router = DriftRouter::new();
+        let parent_id = ContextId::new();
+        router.register(parent_id, Some("parent"), None);
+        router
+            .configure_llm(parent_id, "anthropic", "claude-sonnet-4-20250514")
+            .unwrap();
+
+        let child_id = ContextId::new();
+        router.register_fork(child_id, Some("child"), parent_id);
+
+        let child = router.get(child_id).unwrap();
+        assert_eq!(child.provider.as_deref(), Some("anthropic"));
+        assert_eq!(child.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(child.parent_id, Some(parent_id));
+    }
+
+    #[test]
+    fn test_register_fork_no_parent_model() {
+        let mut router = DriftRouter::new();
+        let parent_id = ContextId::new();
+        router.register(parent_id, Some("bare"), None);
+        // Parent has no model set
+
+        let child_id = ContextId::new();
+        router.register_fork(child_id, None, parent_id);
+
+        let child = router.get(child_id).unwrap();
+        assert_eq!(child.provider, None);
+        assert_eq!(child.model, None);
+        assert_eq!(child.parent_id, Some(parent_id));
     }
 
     #[test]

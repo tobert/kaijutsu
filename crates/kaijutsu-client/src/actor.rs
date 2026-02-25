@@ -117,7 +117,7 @@ enum RpcCommand {
 
     // ── LLM ──────────────────────────────────────────────────────────────
     Prompt { content: String, model: Option<String>, context_id: ContextId, reply: oneshot::Sender<Result<String, ActorError>> },
-    ConfigureLlm { provider: String, model: String, reply: oneshot::Sender<Result<bool, ActorError>> },
+    ConfigureLlm { context_id: ContextId, provider: String, model: String, reply: oneshot::Sender<Result<bool, ActorError>> },
     GetLlmConfig { reply: oneshot::Sender<Result<LlmConfigInfo, ActorError>> },
     SetDefaultProvider { provider: String, reply: oneshot::Sender<Result<bool, ActorError>> },
     SetDefaultModel { provider: String, model: String, reply: oneshot::Sender<Result<bool, ActorError>> },
@@ -500,11 +500,14 @@ impl ActorHandle {
         }).await
     }
 
-    /// Configure the LLM provider and model for this kernel.
+    /// Set the LLM provider and model for a specific context.
+    ///
+    /// Model is immutable on a context — fork to change it. This is called
+    /// after fork to assign a model different from the parent's.
     #[tracing::instrument(skip(self))]
-    pub async fn configure_llm(&self, provider: &str, model: &str) -> Result<bool, ActorError> {
+    pub async fn set_context_model(&self, context_id: ContextId, provider: &str, model: &str) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::ConfigureLlm {
-            provider: provider.into(), model: model.into(), reply,
+            context_id, provider: provider.into(), model: model.into(), reply,
         }).await
     }
 
@@ -1041,8 +1044,8 @@ async fn dispatch_command(
         RpcCommand::Prompt { content, model, context_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.prompt(&content, model.as_deref(), context_id));
         }
-        RpcCommand::ConfigureLlm { provider, model, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.configure_llm(&provider, &model));
+        RpcCommand::ConfigureLlm { context_id, provider, model, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.set_context_model(context_id, &provider, &model));
         }
         RpcCommand::GetLlmConfig { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_llm_config());
