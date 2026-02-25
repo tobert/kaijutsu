@@ -112,26 +112,27 @@ pub fn handle_unfocus(
                 if let Some(main_ent) = entities.main_cell {
                     if let Ok(editor) = main_cells.get(main_ent) {
                         for (_, cursor) in editing_cells.iter() {
-                            if let Some(ref frontier) = cursor.edit_frontier {
-                                // Push ops to server (async, fire-and-forget).
-                                // Server echo via sync will update DocumentCache.
-                                if let Some(ref actor) = actor {
-                                    match editor.doc.ops_since_bytes(frontier) {
-                                        Ok(ops_bytes) if !ops_bytes.is_empty() => {
-                                            let ctx_id = editor.doc.context_id();
-                                            let handle = actor.handle.clone();
-                                            info!("Pushing {} bytes of edit ops for {}", ops_bytes.len(), ctx_id);
-                                            bevy::tasks::IoTaskPool::get()
-                                                .spawn(async move {
-                                                    match handle.push_ops(ctx_id, &ops_bytes).await {
-                                                        Ok(v) => log::info!("Edit ops pushed, ack version: {v}"),
-                                                        Err(e) => log::error!("Failed to push edit ops: {e}"),
-                                                    }
-                                                })
-                                                .detach();
+                            if let Some(ref frontiers) = cursor.edit_frontier {
+                                // Build SyncPayload (native BlockStore format — matches server).
+                                let payload = editor.store.ops_since(frontiers);
+                                if !payload.is_empty() {
+                                    if let Some(ref actor) = actor {
+                                        match postcard::to_stdvec(&payload) {
+                                            Ok(ops_bytes) => {
+                                                let ctx_id = editor.store.context_id();
+                                                let handle = actor.handle.clone();
+                                                info!("Pushing {} bytes of edit ops for {}", ops_bytes.len(), ctx_id);
+                                                bevy::tasks::IoTaskPool::get()
+                                                    .spawn(async move {
+                                                        match handle.push_ops(ctx_id, &ops_bytes).await {
+                                                            Ok(v) => log::info!("Edit ops pushed, ack version: {v}"),
+                                                            Err(e) => log::error!("Failed to push edit ops: {e}"),
+                                                        }
+                                                    })
+                                                    .detach();
+                                            }
+                                            Err(e) => warn!("Failed to serialize edit ops: {e}"),
                                         }
-                                        Ok(_) => {} // empty ops, no edit happened
-                                        Err(e) => warn!("Failed to serialize edit ops: {e}"),
                                     }
                                 }
                             }
@@ -184,7 +185,7 @@ pub fn handle_activate_navigation(
         };
 
         // Only allow editing User Text blocks
-        let Some(block) = editor.doc.get_block_snapshot(block_id) else {
+        let Some(block) = editor.store.get_block_snapshot(block_id) else {
             continue;
         };
 
@@ -196,7 +197,7 @@ pub fn handle_activate_navigation(
         if let Some(entity) = container.get_entity(block_id) {
             info!("Entering edit mode for block {:?}", block_id);
 
-            let edit_frontier = editor.doc.frontier();
+            let edit_frontier = editor.store.frontier();
             commands.entity(entity).insert((
                 EditingBlockCell,
                 BlockEditCursor {
@@ -1086,7 +1087,7 @@ pub fn handle_compose_input(
 /// Handle text input in inline block editing mode.
 ///
 /// Consumes TextInputReceived for character insertion and ActionFired for
-/// editing actions. Operates on CRDT via BlockDocument.
+/// editing actions. Operates on CRDT via BlockStore.
 pub fn handle_block_edit_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
@@ -1111,7 +1112,7 @@ pub fn handle_block_edit_input(
         if let Some(anchor) = cursor.selection_anchor {
             let start = anchor.min(cursor.offset);
             let end = anchor.max(cursor.offset);
-            let _ = editor.doc.edit_text(&block_cell.block_id, start, "", end - start);
+            let _ = editor.store.edit_text(&block_cell.block_id, start, "", end - start);
             cursor.offset = start;
             cursor.selection_anchor = None;
         }
@@ -1121,7 +1122,7 @@ pub fn handle_block_edit_input(
             }
             let s = c.to_string();
             if editor
-                .doc
+                .store
                 .edit_text(&block_cell.block_id, cursor.offset, &s, 0)
                 .is_ok()
             {
@@ -1138,12 +1139,12 @@ pub fn handle_block_edit_input(
                 if let Some(anchor) = cursor.selection_anchor {
                     let start = anchor.min(cursor.offset);
                     let end = anchor.max(cursor.offset);
-                    let _ = editor.doc.edit_text(&block_cell.block_id, start, "", end - start);
+                    let _ = editor.store.edit_text(&block_cell.block_id, start, "", end - start);
                     cursor.offset = start;
                     cursor.selection_anchor = None;
                 }
                 if editor
-                    .doc
+                    .store
                     .edit_text(&block_cell.block_id, cursor.offset, "\n", 0)
                     .is_ok()
                 {
@@ -1155,12 +1156,12 @@ pub fn handle_block_edit_input(
                 if let Some(anchor) = cursor.selection_anchor {
                     let start = anchor.min(cursor.offset);
                     let end = anchor.max(cursor.offset);
-                    if editor.doc.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
+                    if editor.store.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
                         cursor.offset = start;
                     }
                     cursor.selection_anchor = None;
                 } else if cursor.offset > 0
-                    && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
+                    && let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id)
                 {
                     let text = &block.content;
                     let mut new_offset = cursor.offset.saturating_sub(1);
@@ -1169,7 +1170,7 @@ pub fn handle_block_edit_input(
                     }
                     let delete_len = cursor.offset - new_offset;
                     if editor
-                        .doc
+                        .store
                         .edit_text(&block_cell.block_id, new_offset, "", delete_len)
                         .is_ok()
                     {
@@ -1182,11 +1183,11 @@ pub fn handle_block_edit_input(
                 if let Some(anchor) = cursor.selection_anchor {
                     let start = anchor.min(cursor.offset);
                     let end = anchor.max(cursor.offset);
-                    if editor.doc.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
+                    if editor.store.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
                         cursor.offset = start;
                     }
                     cursor.selection_anchor = None;
-                } else if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                } else if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     if cursor.offset < text.len() {
                         let mut end = cursor.offset + 1;
@@ -1195,7 +1196,7 @@ pub fn handle_block_edit_input(
                         }
                         let delete_len = end - cursor.offset;
                         let _ = editor
-                            .doc
+                            .store
                             .edit_text(&block_cell.block_id, cursor.offset, "", delete_len);
                     }
                 }
@@ -1203,7 +1204,7 @@ pub fn handle_block_edit_input(
             Action::CursorLeft => {
                 cursor.selection_anchor = None;
                 if cursor.offset > 0
-                    && let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id)
+                    && let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id)
                 {
                     let text = &block.content;
                     let mut new_offset = cursor.offset - 1;
@@ -1215,7 +1216,7 @@ pub fn handle_block_edit_input(
             }
             Action::CursorRight => {
                 cursor.selection_anchor = None;
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     if cursor.offset < text.len() {
                         let mut new_offset = cursor.offset + 1;
@@ -1228,7 +1229,7 @@ pub fn handle_block_edit_input(
             }
             Action::CursorHome => {
                 cursor.selection_anchor = None;
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     let before_cursor = &text[..cursor.offset];
                     cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -1236,14 +1237,14 @@ pub fn handle_block_edit_input(
             }
             Action::CursorEnd => {
                 cursor.selection_anchor = None;
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                     let text = &block.content;
                     let after_cursor = &text[cursor.offset..];
                     cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
                 }
             }
             Action::SelectAll => {
-                if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                     if !block.content.is_empty() {
                         cursor.selection_anchor = Some(0);
                         cursor.offset = block.content.len();
@@ -1253,7 +1254,7 @@ pub fn handle_block_edit_input(
             Action::Copy => {
                 if let Some(ref mut clip) = clipboard {
                     if let Some(anchor) = cursor.selection_anchor {
-                        if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                        if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                             let start = anchor.min(cursor.offset);
                             let end = anchor.max(cursor.offset);
                             if end <= block.content.len() {
@@ -1269,7 +1270,7 @@ pub fn handle_block_edit_input(
             Action::Cut => {
                 if let Some(ref mut clip) = clipboard {
                     if let Some(anchor) = cursor.selection_anchor {
-                        if let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) {
+                        if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
                             let start = anchor.min(cursor.offset);
                             let end = anchor.max(cursor.offset);
                             if end <= block.content.len() {
@@ -1277,7 +1278,7 @@ pub fn handle_block_edit_input(
                                 if let Err(e) = clip.0.set_text(&selected) {
                                     warn!("Cut failed: {e}");
                                 } else {
-                                    let _ = editor.doc.edit_text(
+                                    let _ = editor.store.edit_text(
                                         &block_cell.block_id, start, "", end - start,
                                     );
                                     cursor.offset = start;
@@ -1296,14 +1297,14 @@ pub fn handle_block_edit_input(
                             if let Some(anchor) = cursor.selection_anchor {
                                 let start = anchor.min(cursor.offset);
                                 let end = anchor.max(cursor.offset);
-                                let _ = editor.doc.edit_text(
+                                let _ = editor.store.edit_text(
                                     &block_cell.block_id, start, "", end - start,
                                 );
                                 cursor.offset = start;
                                 cursor.selection_anchor = None;
                             }
                             if editor
-                                .doc
+                                .store
                                 .edit_text(&block_cell.block_id, cursor.offset, &pasted, 0)
                                 .is_ok()
                             {

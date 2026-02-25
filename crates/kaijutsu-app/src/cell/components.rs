@@ -139,16 +139,17 @@ pub struct CursorCache {
 
 /// Text editor state for a cell.
 ///
-/// The `doc` field (BlockDocument) is the local editor buffer.
+/// The `store` field (BlockStore) is the local editor buffer — one DTE instance
+/// per block, matching the server's native format.
 /// Synced content arrives via `DocumentCache` (SyncedDocument per context) and is
-/// copied into this editor's BlockDocument via snapshot conversion.
+/// copied into this editor's BlockStore via `from_snapshot`.
 ///
-/// Note: Not reflectable due to BlockDocument lacking Default.
+/// Note: Not reflectable due to BlockStore lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
 pub struct CellEditor {
-    /// Block document - local editor buffer.
-    pub doc: kaijutsu_crdt::BlockDocument,
+    /// Block store - local editor buffer (per-block DTE).
+    pub store: kaijutsu_crdt::BlockStore,
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
@@ -167,7 +168,7 @@ impl CellEditor {
     /// Create a new editor with a random agent ID.
     pub fn new() -> Self {
         Self {
-            doc: kaijutsu_crdt::BlockDocument::new(ContextId::new(), PrincipalId::new()),
+            store: kaijutsu_crdt::BlockStore::new(ContextId::new(), PrincipalId::new()),
             cursor: BlockCursor::default(),
             cursor_cache: CursorCache::default(),
         }
@@ -177,7 +178,7 @@ impl CellEditor {
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         if !text.is_empty()
-            && let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, &text) {
+            && let Ok(block_id) = self.store.insert_block(None, None, Role::User, BlockKind::Text, &text) {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
         self
@@ -189,27 +190,27 @@ impl CellEditor {
 
     /// Get the full text content (concatenation of all blocks).
     pub fn text(&self) -> String {
-        self.doc.full_text()
+        self.store.full_text()
     }
 
     /// Get the current document version.
     pub fn version(&self) -> u64 {
-        self.doc.version()
+        self.store.version()
     }
 
     /// Check if the editor has any blocks.
     pub fn has_blocks(&self) -> bool {
-        !self.doc.is_empty()
+        !self.store.is_empty()
     }
 
     /// Get blocks in order.
     pub fn blocks(&self) -> Vec<BlockSnapshot> {
-        self.doc.blocks_ordered()
+        self.store.blocks_ordered()
     }
 
     /// Get block IDs in order without constructing full snapshots.
     pub fn block_ids(&self) -> Vec<BlockId> {
-        self.doc.block_ids_ordered()
+        self.store.block_ids_ordered()
     }
 
     // =========================================================================
@@ -225,7 +226,7 @@ impl CellEditor {
         // Ensure we have a block to insert into
         if self.cursor.block_id.is_none() {
             // Create a new text block
-            if let Ok(block_id) = self.doc.insert_block(None, None, Role::User, BlockKind::Text, "") {
+            if let Ok(block_id) = self.store.insert_block(None, None, Role::User, BlockKind::Text, "") {
                 self.cursor.block_id = Some(block_id);
                 self.cursor.offset = 0;
             } else {
@@ -235,7 +236,7 @@ impl CellEditor {
 
         if let Some(ref block_id) = self.cursor.block_id
             && self
-                .doc
+                .store
                 .edit_text(block_id, self.cursor.offset, text, 0)
                 .is_ok()
             {
@@ -252,7 +253,7 @@ impl CellEditor {
 
         if let Some(ref block_id) = self.cursor.block_id {
             // Find previous character boundary
-            if let Some(block) = self.doc.get_block_snapshot(block_id) {
+            if let Some(block) = self.store.get_block_snapshot(block_id) {
                 let text = block.content.clone();
                 let mut new_offset = self.cursor.offset.saturating_sub(1);
                 while new_offset > 0 && !text.is_char_boundary(new_offset) {
@@ -261,7 +262,7 @@ impl CellEditor {
                 let delete_len = self.cursor.offset - new_offset;
 
                 if self
-                    .doc
+                    .store
                     .edit_text(block_id, new_offset, "", delete_len)
                     .is_ok()
                 {
@@ -275,7 +276,7 @@ impl CellEditor {
     #[allow(dead_code)]
     pub fn delete(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
-            && let Some(block) = self.doc.get_block_snapshot(block_id) {
+            && let Some(block) = self.store.get_block_snapshot(block_id) {
                 let text = block.content.clone();
                 if self.cursor.offset >= text.len() {
                     return; // At end, nothing to delete
@@ -289,7 +290,7 @@ impl CellEditor {
                 let delete_len = end - self.cursor.offset;
 
                 let _ = self
-                    .doc
+                    .store
                     .edit_text(block_id, self.cursor.offset, "", delete_len);
             }
     }
@@ -303,7 +304,7 @@ impl CellEditor {
     pub fn move_left(&mut self) {
         if self.cursor.offset > 0
             && let Some(ref block_id) = self.cursor.block_id
-                && let Some(block) = self.doc.get_block_snapshot(block_id) {
+                && let Some(block) = self.store.get_block_snapshot(block_id) {
                     let text = block.content.clone();
                     let mut new_offset = self.cursor.offset - 1;
                     while new_offset > 0 && !text.is_char_boundary(new_offset) {
@@ -317,7 +318,7 @@ impl CellEditor {
     #[allow(dead_code)]
     pub fn move_right(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
-            && let Some(block) = self.doc.get_block_snapshot(block_id) {
+            && let Some(block) = self.store.get_block_snapshot(block_id) {
                 let text = block.content.clone();
                 if self.cursor.offset < text.len() {
                     let mut new_offset = self.cursor.offset + 1;
@@ -333,7 +334,7 @@ impl CellEditor {
     #[allow(dead_code)]
     pub fn move_home(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
-            && let Some(block) = self.doc.get_block_snapshot(block_id) {
+            && let Some(block) = self.store.get_block_snapshot(block_id) {
                 let text = block.content.clone();
                 // Find previous newline or start
                 let before_cursor = &text[..self.cursor.offset];
@@ -345,7 +346,7 @@ impl CellEditor {
     #[allow(dead_code)]
     pub fn move_end(&mut self) {
         if let Some(ref block_id) = self.cursor.block_id
-            && let Some(block) = self.doc.get_block_snapshot(block_id) {
+            && let Some(block) = self.store.get_block_snapshot(block_id) {
                 let text = block.content.clone();
                 let after_cursor = &text[self.cursor.offset..];
                 self.cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
@@ -358,9 +359,9 @@ impl CellEditor {
 
     /// Toggle collapse state of a thinking block.
     pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
-        if let Some(block) = self.doc.get_block_snapshot(block_id) {
+        if let Some(block) = self.store.get_block_snapshot(block_id) {
             let new_state = !block.collapsed;
-            let _ = self.doc.set_collapsed(block_id, new_state);
+            let _ = self.store.set_collapsed(block_id, new_state);
         }
     }
 
@@ -466,7 +467,7 @@ pub struct EditingBlockCell;
 /// Tracks the edit cursor position within an editing block.
 ///
 /// This is separate from CellEditor's cursor because BlockCells don't have
-/// a full CellEditor - they render from the MainCell's CrdtBlockStore.
+/// a full CellEditor - they render from the MainCell's BlockStore.
 /// The cursor is an offset within the block's content string.
 #[derive(Component, Default)]
 pub struct BlockEditCursor {
@@ -474,9 +475,9 @@ pub struct BlockEditCursor {
     pub offset: usize,
     /// Selection anchor (byte offset). When Some, selection spans anchor..offset.
     pub selection_anchor: Option<usize>,
-    /// CRDT frontier captured when editing started.
+    /// Per-block CRDT frontiers captured when editing started.
     /// Used to extract ops_since() for push to server on exit.
-    pub edit_frontier: Option<kaijutsu_crdt::Frontier>,
+    pub edit_frontier: Option<std::collections::HashMap<BlockId, kaijutsu_crdt::Frontier>>,
 }
 
 // ============================================================================
@@ -509,7 +510,7 @@ pub struct CachedDocument {
 /// - LRU eviction when too many contexts are cached
 ///
 /// `sync_main_cell_to_conversation` reads from the active cache entry to
-/// rebuild the MainCell's BlockDocument for rendering.
+/// rebuild the MainCell's BlockStore for rendering.
 #[derive(Resource)]
 #[allow(dead_code)]
 pub struct DocumentCache {

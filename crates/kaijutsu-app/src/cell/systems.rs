@@ -546,7 +546,7 @@ fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
         return (0, 0);
     };
 
-    let blocks = editor.doc.blocks_ordered();
+    let blocks = editor.store.blocks_ordered();
     let mut row = 0;
 
     for (i, block) in blocks.iter().enumerate() {
@@ -1150,7 +1150,7 @@ pub fn track_conversation_container(
 /// This system:
 /// 1. Checks if there's an active document in the cache
 /// 2. Checks if the SyncedDocument's version has changed
-/// 3. If changed, rebuilds the MainCell's BlockDocument from the cache snapshot
+/// 3. If changed, rebuilds the MainCell's BlockStore from the cache snapshot
 ///
 /// DocumentCache owns the authoritative SyncedDocument per context. This system
 /// copies the active document to the MainCell's CellEditor for rendering.
@@ -1195,15 +1195,10 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
-    // Rebuild BlockDocument from the SyncedDocument's store snapshot
-    let agent_id = editor.doc.agent_id();
+    // Rebuild BlockStore from the SyncedDocument's store snapshot (direct, no intermediate)
+    let agent_id = editor.store.agent_id();
     let store_snap = cached.synced.snapshot();
-    let doc_snap = kaijutsu_crdt::DocumentSnapshot {
-        context_id: store_snap.context_id,
-        blocks: store_snap.blocks,
-        version: sync_version,
-    };
-    editor.doc = kaijutsu_crdt::BlockDocument::from_snapshot(doc_snap, agent_id);
+    editor.store = kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id);
 
     if !matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
         // Update cursor to end of document (unless editing)
@@ -1246,7 +1241,7 @@ use crate::connection::{RpcResultMessage, ServerEventMessage};
 /// All events are routed by `context_id` to the appropriate `CachedDocument` in
 /// `DocumentCache`. Each `CachedDocument` wraps a `SyncedDocument` which handles
 /// CRDT merge internally. `sync_main_cell_to_conversation` reads from the active
-/// cache entry to rebuild the MainCell's BlockDocument for rendering.
+/// cache entry to rebuild the MainCell's BlockStore for rendering.
 ///
 /// Implements terminal-like auto-scroll: if the user is at the bottom when
 /// new content arrives, we stay at the bottom.
@@ -1814,7 +1809,7 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
     }
 }
 
-/// Spawn or update BlockCell entities to match the MainCell's BlockDocument.
+/// Spawn or update BlockCell entities to match the MainCell's BlockStore.
 ///
 /// This system diffs the current block IDs against existing BlockCell entities:
 /// - Spawns new BlockCells for added blocks
@@ -2713,7 +2708,7 @@ pub fn update_block_edit_cursor(
         return;
     };
 
-    let Some(block) = editor.doc.get_block_snapshot(&block_cell.block_id) else {
+    let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) else {
         return;
     };
 

@@ -951,6 +951,16 @@ pub struct SyncPayload {
     pub deleted_blocks: Vec<BlockId>,
 }
 
+impl SyncPayload {
+    /// Check if this payload contains no operations.
+    pub fn is_empty(&self) -> bool {
+        self.block_ops.is_empty()
+            && self.new_blocks.is_empty()
+            && self.updated_headers.is_empty()
+            && self.deleted_blocks.is_empty()
+    }
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
