@@ -59,8 +59,8 @@ pub use ids::{ContextId, KernelId, PrincipalId, SessionId};
 pub use ids::{PrefixError, PrefixResolvable, resolve_prefix, resolve_context_prefix};
 pub use principal::{Principal, Credential, CredentialKind};
 pub use block::{
-    BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, DriftKind,
-    MAX_DAG_DEPTH, Role, Status, ToolKind,
+    BlockFilter, BlockHeader, BlockId, BlockKind, BlockQuery, BlockSnapshot,
+    BlockSnapshotBuilder, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
 };
 pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};

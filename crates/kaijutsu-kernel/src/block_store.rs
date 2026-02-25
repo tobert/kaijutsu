@@ -9,7 +9,7 @@
 //! - FlowBus for typed pub/sub real-time updates
 //! - parking_lot for efficient locking
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -19,6 +19,7 @@ use parking_lot::RwLock;
 
 use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, StoreSnapshot, SyncPayload};
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind};
+use kaijutsu_types::BlockFilter;
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
@@ -1049,6 +1050,69 @@ impl BlockStore {
         Ok(entry.doc.blocks_ordered())
     }
 
+    /// Get a single block snapshot by ID.
+    pub fn get_block_snapshot(&self, context_id: ContextId, block_id: &BlockId) -> Result<Option<BlockSnapshot>, String> {
+        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        Ok(entry.doc.get_block_snapshot(block_id))
+    }
+
+    /// Get multiple block snapshots by ID. Missing blocks are silently skipped.
+    pub fn get_blocks_by_ids(&self, context_id: ContextId, ids: &[BlockId]) -> Result<Vec<BlockSnapshot>, String> {
+        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        let mut result = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(snap) = entry.doc.get_block_snapshot(id) {
+                result.push(snap);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Query blocks matching a filter.
+    ///
+    /// If `filter.parent_id` is set, only descendants (up to `max_depth`) are considered.
+    /// Otherwise iterates all blocks in order, applying the filter predicate.
+    pub fn query_blocks(&self, context_id: ContextId, filter: &BlockFilter) -> Result<Vec<BlockSnapshot>, String> {
+        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+
+        // If parent_id is set, compute descendant set via BFS
+        let descendant_ids = if let Some(ref root_id) = filter.parent_id {
+            Some(compute_descendants(&entry.doc, root_id, filter.max_depth))
+        } else {
+            None
+        };
+
+        let mut result = Vec::new();
+        let limit = if filter.limit > 0 { filter.limit as usize } else { usize::MAX };
+
+        for block in entry.doc.blocks_ordered() {
+            // If we have a descendant set, check membership
+            if let Some(ref descendants) = descendant_ids {
+                if !descendants.contains(&block.id) {
+                    continue;
+                }
+            }
+
+            if filter.matches(&block) {
+                result.push(block);
+                if result.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get CRDT sync state (serialized ops + version) without blocks.
+    pub fn context_sync_state(&self, context_id: ContextId) -> Result<(Vec<u8>, u64), String> {
+        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        let snapshot = entry.doc.snapshot();
+        let bytes = postcard::to_allocvec(&snapshot)
+            .map_err(|e| format!("failed to serialize store snapshot: {}", e))?;
+        Ok((bytes, entry.version()))
+    }
+
     /// Get the full text content of a document.
     pub fn get_content(&self, context_id: ContextId) -> Result<String, String> {
         let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
@@ -1409,6 +1473,27 @@ impl BlockStore {
 
         Ok(block_id)
     }
+}
+
+/// BFS from `root_id` collecting all descendant block IDs up to `max_depth` levels.
+/// Depth 0 = unlimited. The root itself is included in the result set.
+fn compute_descendants(doc: &CrdtBlockStore, root_id: &BlockId, max_depth: u32) -> HashSet<BlockId> {
+    let mut result = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((*root_id, 0u32));
+    result.insert(*root_id);
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if max_depth > 0 && depth >= max_depth {
+            continue;
+        }
+        for child_id in doc.get_children(&current) {
+            if result.insert(child_id) {
+                queue.push_back((child_id, depth + 1));
+            }
+        }
+    }
+    result
 }
 
 impl Default for BlockStore {

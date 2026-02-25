@@ -20,10 +20,10 @@ pub mod kaijutsu_capnp {
 pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode,
-    ContextInfo, ContextMembership, DocumentState, HistoryEntry, Identity, InputState,
+    ContextInfo, ContextMembership, HistoryEntry, Identity, InputState,
     KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource,
     McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, ShellValue,
-    StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
+    StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};

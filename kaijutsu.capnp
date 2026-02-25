@@ -176,6 +176,30 @@ struct ContextState {
   ops @3 :Data;         # Full oplog bytes for CRDT sync
 }
 
+# Query for fetching blocks — union of all/byIds/byFilter
+struct BlockQuery {
+  union {
+    all @0 :Void;
+    byIds @1 :List(BlockId);
+    byFilter @2 :BlockFilter;
+  }
+}
+
+# Filter criteria for block queries
+struct BlockFilter {
+  kinds @0 :List(BlockKind);
+  hasKinds @1 :Bool;
+  roles @2 :List(Role);
+  hasRoles @3 :Bool;
+  statuses @4 :List(Status);
+  hasStatuses @5 :Bool;
+  excludeCompacted @6 :Bool;
+  limit @7 :UInt32;
+  maxDepth @8 :UInt32;
+  parentId @9 :BlockId;
+  hasParentId @10 :Bool;
+}
+
 # What changed at a given version
 enum ChangeKind {
   blockAdded @0;
@@ -954,6 +978,16 @@ interface Kernel {
 
   # Clustering: group contexts by semantic similarity
   getClusters @81 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
+
+  # ============================================================================
+  # Block Queries (replaces getContextState for block-only fetches)
+  # ============================================================================
+
+  # Fetch blocks by query: all, byIds, or byFilter
+  getBlocks @82 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
+
+  # Fetch CRDT sync state only (ops + version, no blocks)
+  getContextSync @83 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
 }
 
 # ============================================================================

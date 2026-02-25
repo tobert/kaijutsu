@@ -100,10 +100,10 @@ pub enum RpcResultMessage {
     KernelAttached(Result<KernelInfo, String>),
     /// Identity received.
     IdentityReceived(Identity),
-    /// Context joined — includes membership info and initial document state.
+    /// Context joined — includes membership info and initial sync state.
     ContextJoined {
         membership: ContextMembership,
-        initial_state: Option<kaijutsu_client::DocumentState>,
+        initial_sync: Option<kaijutsu_client::SyncState>,
     },
     /// Context left.
     ContextLeft,
@@ -236,10 +236,10 @@ fn poll_bootstrap_results(
                         // 2. If we joined a context, fetch its state
                         let Some(ctx_id) = ctx_id else { return };
 
-                        let initial_state = match h.get_context_state(ctx_id).await {
+                        let initial_sync = match h.get_context_sync(ctx_id).await {
                             Ok(state) => Some(state),
                             Err(e) => {
-                                log::warn!("Initial get_context_state failed: {e}");
+                                log::warn!("Initial get_context_sync failed: {e}");
                                 None
                             }
                         };
@@ -256,7 +256,7 @@ fn poll_bootstrap_results(
 
                         let _ = tx.send(RpcResultMessage::ContextJoined {
                             membership,
-                            initial_state,
+                            initial_sync,
                         });
                     })
                     .detach();

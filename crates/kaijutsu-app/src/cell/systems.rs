@@ -1275,16 +1275,16 @@ pub fn handle_block_events(
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
         match result {
-        RpcResultMessage::ContextJoined { membership, initial_state } => {
+        RpcResultMessage::ContextJoined { membership, initial_sync } => {
             let ctx_id = membership.context_id;
 
             // Create or update cache entry
             if !doc_cache.contains(ctx_id) {
                 let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, agent_id);
 
-                // Apply initial state if provided
-                if let Some(state) = initial_state {
-                    match synced.apply_document_state(state) {
+                // Apply initial sync state if provided
+                if let Some(state) = initial_sync {
+                    match synced.apply_sync_state(state) {
                         Ok(effect) => {
                             info!("Cache: initial sync for {} effect: {:?}", ctx_id, effect);
                         }
@@ -1303,10 +1303,10 @@ pub fn handle_block_events(
                     scroll_offset: 0.0,
                 };
                 doc_cache.insert(ctx_id, cached);
-            } else if let Some(state) = initial_state {
+            } else if let Some(state) = initial_sync {
                 // Reconnect case: cache entry exists but server has authoritative state
                 if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                    match cached.synced.apply_document_state(state) {
+                    match cached.synced.apply_sync_state(state) {
                         Ok(effect) => {
                             info!("Cache: reconnect refresh for {} effect: {:?}", ctx_id, effect);
                             cached.synced_at_generation = sync_gen.0;
@@ -1622,12 +1622,12 @@ pub fn check_cache_staleness(
 
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                match handle.get_context_state(ctx_id).await {
-                    Ok(state) => {
+                match handle.get_context_sync(ctx_id).await {
+                    Ok(sync) => {
                         info!(
                             "Staleness re-fetch complete for {}: {} bytes oplog",
                             ctx_id,
-                            state.ops.len()
+                            sync.ops.len()
                         );
                     }
                     Err(e) => {

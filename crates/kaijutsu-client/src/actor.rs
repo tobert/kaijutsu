@@ -19,14 +19,15 @@
 //! and slots free up. The system recovers as in-flight RPCs finish.
 
 use kaijutsu_crdt::{ContextId, KernelId};
-use kaijutsu_types::BlockId;
+use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::rpc::{
-    ClientToolFilter, Completion, ContextInfo, DocumentState, HistoryEntry, Identity,
+    ClientToolFilter, Completion, ContextInfo, HistoryEntry, Identity,
     InputState, KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult,
-    ShellValue, StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
+    ShellValue, StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema,
+    VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
@@ -86,7 +87,8 @@ enum RpcCommand {
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
     PushOps { context_id: ContextId, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
-    GetContextState { context_id: ContextId, reply: oneshot::Sender<Result<DocumentState, ActorError>> },
+    GetBlocks { context_id: ContextId, query: BlockQuery, reply: oneshot::Sender<Result<Vec<BlockSnapshot>, ActorError>> },
+    GetContextSync { context_id: ContextId, reply: oneshot::Sender<Result<SyncState, ActorError>> },
     CompactContext { context_id: ContextId, reply: oneshot::Sender<Result<(u64, u64), ActorError>> },
 
     // ── Shell / Execution ────────────────────────────────────────────────
@@ -155,7 +157,8 @@ impl RpcCommand {
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::GetContextState { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Execute { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ShellExecute { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -342,10 +345,41 @@ impl ActorHandle {
         }).await
     }
 
-    /// Get full context state from the server.
+    /// Fetch blocks by arbitrary query.
+    #[tracing::instrument(skip(self, query))]
+    pub async fn get_blocks_query(&self, context_id: ContextId, query: BlockQuery) -> Result<Vec<BlockSnapshot>, ActorError> {
+        self.send(|reply| RpcCommand::GetBlocks { context_id, query, reply }).await
+    }
+
+    /// Fetch a single block by ID. Returns None if not found.
     #[tracing::instrument(skip(self))]
-    pub async fn get_context_state(&self, context_id: ContextId) -> Result<DocumentState, ActorError> {
-        self.send(|reply| RpcCommand::GetContextState { context_id, reply }).await
+    pub async fn get_block(&self, context_id: ContextId, block_id: BlockId) -> Result<Option<BlockSnapshot>, ActorError> {
+        let mut blocks = self.get_blocks_query(context_id, BlockQuery::ByIds(vec![block_id])).await?;
+        Ok(blocks.pop())
+    }
+
+    /// Fetch multiple blocks by ID.
+    #[tracing::instrument(skip(self, block_ids))]
+    pub async fn get_blocks(&self, context_id: ContextId, block_ids: Vec<BlockId>) -> Result<Vec<BlockSnapshot>, ActorError> {
+        self.get_blocks_query(context_id, BlockQuery::ByIds(block_ids)).await
+    }
+
+    /// Fetch all blocks in a context.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_all_blocks(&self, context_id: ContextId) -> Result<Vec<BlockSnapshot>, ActorError> {
+        self.get_blocks_query(context_id, BlockQuery::All).await
+    }
+
+    /// Fetch blocks matching a filter.
+    #[tracing::instrument(skip(self, filter))]
+    pub async fn query_blocks(&self, context_id: ContextId, filter: BlockFilter) -> Result<Vec<BlockSnapshot>, ActorError> {
+        self.get_blocks_query(context_id, BlockQuery::ByFilter(filter)).await
+    }
+
+    /// Fetch CRDT sync state (ops + version) without blocks.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, ActorError> {
+        self.send(|reply| RpcCommand::GetContextSync { context_id, reply }).await
     }
 
     /// Compact a context's oplog. Returns (new_size, generation).
@@ -983,8 +1017,11 @@ async fn dispatch_command(
         RpcCommand::PushOps { context_id, ops, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.push_ops(context_id, &ops));
         }
-        RpcCommand::GetContextState { context_id, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.get_context_state(context_id));
+        RpcCommand::GetBlocks { context_id, query, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_blocks(context_id, &query));
+        }
+        RpcCommand::GetContextSync { context_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.get_context_sync(context_id));
         }
         RpcCommand::CompactContext { context_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.compact_context(context_id));

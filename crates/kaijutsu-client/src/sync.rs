@@ -373,7 +373,7 @@ impl SyncManager {
         // The SyncPayload includes new_blocks with full BlockSnapshot data,
         // so even an empty document can merge successfully.
         //
-        // Full sync (StoreSnapshot) only comes from getDocumentState RPC,
+        // Full sync (StoreSnapshot) only comes from getContextSync RPC,
         // not from BlockInserted events.
         let result = if self.needs_full_sync(context_id) {
             match self.do_incremental_merge(doc, ops, Some(&block.id)) {

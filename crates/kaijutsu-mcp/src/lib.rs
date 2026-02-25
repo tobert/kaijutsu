@@ -277,40 +277,40 @@ impl KaijutsuMcp {
             kaijutsu_kernel::BlockStore::with_flows(PrincipalId::system(), block_flows.clone())
         );
 
-        // Sync document state from server
-        let doc_state = kernel.get_context_state(context_id).await?;
+        // Sync CRDT state from server (ops only, no blocks — they arrive via events)
+        let sync_state = kernel.get_context_sync(context_id).await?;
 
         // Populate the store — single source of truth for all MCP reads
-        if !doc_state.ops.is_empty() {
+        if !sync_state.ops.is_empty() {
             store.create_document_from_snapshot(
-                doc_state.context_id,
+                sync_state.context_id,
                 DocumentKind::Conversation,
                 None,
-                &doc_state.ops,
+                &sync_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
         } else {
             store.create_document(
-                doc_state.context_id,
+                sync_state.context_id,
                 DocumentKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
         }
 
         // Extract frontier from the store's document
-        let frontier = store.frontier(doc_state.context_id)
+        let frontier = store.frontier(sync_state.context_id)
             .unwrap_or_default();
 
         let sync = SyncManager::with_state(
-            Some(doc_state.context_id),
+            Some(sync_state.context_id),
             Some(frontier),
         );
 
-        let block_count = store.get(doc_state.context_id)
+        let block_count = store.get(sync_state.context_id)
             .map(|e| e.doc.block_count())
             .unwrap_or(0);
 
         tracing::debug!(
-            ctx = %doc_state.context_id,
+            ctx = %sync_state.context_id,
             blocks = block_count,
             "Initial sync complete, SyncManager initialized"
         );
@@ -520,8 +520,7 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Fetch block snapshots for a context, checking local store first then
-    /// falling back to RPC for contexts not in the local cache.
+    /// Fetch block snapshots for a context via the targeted getBlocks RPC.
     async fn fetch_context_blocks(
         &self,
         ctx_id: ContextId,
@@ -530,38 +529,35 @@ impl KaijutsuMcp {
         if let Ok(blocks) = self.store().block_snapshots(ctx_id) {
             return Ok(blocks);
         }
-        // For Remote, fetch via RPC
+        // For Remote, fetch via getBlocks (all)
         if let Some(actor) = self.actor() {
-            let state = actor.get_context_state(ctx_id).await
-                .map_err(|e| format!("Error fetching context {}: {e}", ctx_id.short()))?;
-            Ok(state.blocks)
+            actor.get_all_blocks(ctx_id).await
+                .map_err(|e| format!("Error fetching context {}: {e}", ctx_id.short()))
         } else {
             Err(format!("Context {} not found", ctx_id.short()))
         }
     }
 
-    /// Find a block by ID string across all visible contexts.
-    /// Checks local store first, then fetches from server if needed.
-    async fn find_block_cross_context(
+    /// Resolve a single block by ID string. BlockId encodes its ContextId,
+    /// so no cross-context search is needed.
+    async fn resolve_block(
         &self,
         block_id_str: &str,
     ) -> Option<(ContextId, kaijutsu_crdt::BlockId, kaijutsu_crdt::BlockSnapshot)> {
-        // Try local store first (fast path)
         let block_id = parse_block_id(block_id_str)?;
         let ctx = block_id.context_id;
 
+        // Local store first
         if let Some(entry) = self.store().get(ctx) {
             if let Some(snap) = entry.doc.get_block_snapshot(&block_id) {
                 return Some((ctx, block_id, snap));
             }
         }
 
-        // For Remote, fetch the context's state and look for the block
+        // Remote: single-block fetch via getBlocks(byIds)
         if let Some(actor) = self.actor() {
-            if let Ok(state) = actor.get_context_state(ctx).await {
-                if let Some(snap) = state.blocks.into_iter().find(|b| b.id == block_id) {
-                    return Some((ctx, block_id, snap));
-                }
+            if let Ok(Some(snap)) = actor.get_block(ctx, block_id).await {
+                return Some((ctx, block_id, snap));
             }
         }
 
@@ -732,7 +728,7 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
     async fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
-        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
+        let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
@@ -945,28 +941,37 @@ impl KaijutsuMcp {
             }
         };
 
+        // Build a BlockFilter for server-side filtering when possible
+        let filter = kaijutsu_crdt::BlockFilter {
+            kinds: kind_filter.into_iter().collect(),
+            roles: role_filter.into_iter().collect(),
+            statuses: status_filter.into_iter().collect(),
+            ..Default::default()
+        };
+
         for context_id in context_ids {
-            let snapshots = match self.fetch_context_blocks(context_id).await {
-                Ok(s) => s,
-                Err(_) => continue,
+            let snapshots = if filter.has_active_constraint() {
+                // Server-side filtering via getBlocks(byFilter)
+                if let Some(actor) = self.actor() {
+                    match actor.query_blocks(context_id, filter.clone()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    }
+                } else {
+                    // Local-only: fetch all and filter client-side
+                    match self.fetch_context_blocks(context_id).await {
+                        Ok(s) => s.into_iter().filter(|b| filter.matches(b)).collect(),
+                        Err(_) => continue,
+                    }
+                }
+            } else {
+                // No filter — explicit "all" path
+                match self.fetch_context_blocks(context_id).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
             };
             for snapshot in snapshots {
-                // Apply filters
-                if let Some(kind) = kind_filter {
-                    if snapshot.kind != kind {
-                        continue;
-                    }
-                }
-                if let Some(status) = status_filter {
-                    if snapshot.status != status {
-                        continue;
-                    }
-                }
-                if let Some(role) = role_filter {
-                    if snapshot.role != role {
-                        continue;
-                    }
-                }
 
                 // Create summary (first 100 chars)
                 let summary = if snapshot.content.chars().count() > 100 {
@@ -1180,7 +1185,7 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
     async fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
-        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
+        let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
@@ -1221,7 +1226,7 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
     async fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
-        let (context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
+        let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };
@@ -1258,7 +1263,7 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
     #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
     async fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
-        let (_context_id, _block_id, snapshot) = match self.find_block_cross_context(&req.block_id).await {
+        let (_context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
             Some(r) => r,
             None => return format!("Error: block '{}' not found", req.block_id),
         };

@@ -1516,67 +1516,14 @@ impl kernel::Server for KernelImpl {
 
     fn get_context_state(
         self: Rc<Self>,
-        params: kernel::GetContextStateParams,
-        mut results: kernel::GetContextStateResults,
+        _params: kernel::GetContextStateParams,
+        _results: kernel::GetContextStateResults,
     ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_document_state").entered();
-        let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
-
-        log::debug!("get_document_state called for context {}", context_id);
-
-        let _ctx_span = if let Ok(drift) = self.kernel.kernel.drift().try_read() {
-            let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
-            Some(kaijutsu_telemetry::context_root_span(&trace_id, "get_document_state").entered())
-        } else {
-            None
-        };
-
-        let documents = &self.kernel.documents;
-
-        let doc = match documents.get(context_id) {
-            Some(d) => d,
-            None => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "context '{}' not found in kernel '{}'",
-                    context_id, self.kernel.id.to_hex()
-                )));
-            }
-        };
-
-        let mut cell_state = results.get().init_state();
-        cell_state.set_context_id(context_id.as_bytes());
-        cell_state.reborrow().set_version(doc.version());
-
-        // Get blocks from store
-        let blocks = doc.doc.blocks_ordered();
-        let mut block_list = cell_state.reborrow().init_blocks(blocks.len() as u32);
-        for (i, block) in blocks.iter().enumerate() {
-            let mut block_builder = block_list.reborrow().get(i as u32);
-            set_block_snapshot(&mut block_builder, block);
-        }
-
-        // Send store snapshot for CRDT sync (replaces oplog_bytes).
-        let snapshot = doc.doc.snapshot();
-        let snapshot_bytes = match postcard::to_allocvec(&snapshot) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "failed to serialize store snapshot: {}", e
-                )));
-            }
-        };
-        cell_state.set_ops(&snapshot_bytes);
-        log::debug!(
-            "Sending DocumentState for context {} with {} blocks, {} bytes snapshot",
-            context_id,
-            blocks.len(),
-            snapshot_bytes.len()
-        );
-
-        Promise::ok(())
+        // Tombstoned: use getBlocks @82 + getContextSync @83 instead.
+        // Schema ordinal @14 is preserved for wire compatibility.
+        Promise::err(capnp::Error::failed(
+            "getContextState removed: use getBlocks @82 + getContextSync @83".into()
+        ))
     }
 
     // =========================================================================
@@ -4483,6 +4430,75 @@ impl kernel::Server for KernelImpl {
             Ok(())
         }.instrument(span))
     }
+
+    fn get_blocks(
+        self: Rc<Self>,
+        params: kernel::GetBlocksParams,
+        mut results: kernel::GetBlocksResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_blocks").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        let query_reader = pry!(p.get_query());
+        let query = pry!(parse_block_query(&query_reader));
+
+        let documents = &self.kernel.documents;
+
+        let blocks = match query {
+            kaijutsu_types::BlockQuery::All => {
+                pry!(documents.block_snapshots(context_id)
+                    .map_err(|e| capnp::Error::failed(e)))
+            }
+            kaijutsu_types::BlockQuery::ByIds(ids) => {
+                if ids.is_empty() {
+                    return Promise::err(capnp::Error::failed(
+                        "byIds requires at least one block ID".into()
+                    ));
+                }
+                pry!(documents.get_blocks_by_ids(context_id, &ids)
+                    .map_err(|e| capnp::Error::failed(e)))
+            }
+            kaijutsu_types::BlockQuery::ByFilter(filter) => {
+                pry!(filter.validate().map_err(|e| capnp::Error::failed(e)));
+                pry!(documents.query_blocks(context_id, &filter)
+                    .map_err(|e| capnp::Error::failed(e)))
+            }
+        };
+
+        let mut block_list = results.get().init_blocks(blocks.len() as u32);
+        for (i, block) in blocks.iter().enumerate() {
+            let mut block_builder = block_list.reborrow().get(i as u32);
+            set_block_snapshot(&mut block_builder, block);
+        }
+
+        Promise::ok(())
+    }
+
+    fn get_context_sync(
+        self: Rc<Self>,
+        params: kernel::GetContextSyncParams,
+        mut results: kernel::GetContextSyncResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_sync").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        let documents = &self.kernel.documents;
+        let (ops, version) = pry!(documents.context_sync_state(context_id)
+            .map_err(|e| capnp::Error::failed(e)));
+
+        let mut r = results.get();
+        r.set_context_id(context_id.as_bytes());
+        r.set_ops(&ops);
+        r.set_version(version);
+
+        Promise::ok(())
+    }
 }
 
 // ============================================================================
@@ -5286,6 +5302,110 @@ fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::D
         kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
         kaijutsu_crdt::DriftKind::Commit => crate::kaijutsu_capnp::DriftKind::Commit,
     }
+}
+
+/// Parse a Cap'n Proto BlockQuery union into a Rust BlockQuery.
+fn parse_block_query(
+    reader: &crate::kaijutsu_capnp::block_query::Reader<'_>,
+) -> Result<kaijutsu_types::BlockQuery, capnp::Error> {
+    match reader.which()? {
+        crate::kaijutsu_capnp::block_query::All(()) => {
+            Ok(kaijutsu_types::BlockQuery::All)
+        }
+        crate::kaijutsu_capnp::block_query::ByIds(ids_reader) => {
+            let ids_reader = ids_reader?;
+            let mut ids = Vec::with_capacity(ids_reader.len() as usize);
+            for id_reader in ids_reader.iter() {
+                ids.push(parse_block_id_from_reader(&id_reader)?);
+            }
+            Ok(kaijutsu_types::BlockQuery::ByIds(ids))
+        }
+        crate::kaijutsu_capnp::block_query::ByFilter(filter_reader) => {
+            let filter = parse_block_filter(&filter_reader?)?;
+            Ok(kaijutsu_types::BlockQuery::ByFilter(filter))
+        }
+    }
+}
+
+/// Parse a Cap'n Proto BlockFilter into a Rust BlockFilter.
+fn parse_block_filter(
+    reader: &crate::kaijutsu_capnp::block_filter::Reader<'_>,
+) -> Result<kaijutsu_types::BlockFilter, capnp::Error> {
+    let kinds = if reader.get_has_kinds() {
+        let kinds_reader = reader.get_kinds()?;
+        let mut kinds = Vec::with_capacity(kinds_reader.len() as usize);
+        for k in kinds_reader.iter() {
+            kinds.push(match k? {
+                crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+                crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+                crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+                crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+                crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
+                crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+            });
+        }
+        if kinds.is_empty() {
+            return Err(capnp::Error::failed("hasKinds=true but kinds list is empty".into()));
+        }
+        kinds
+    } else {
+        vec![]
+    };
+
+    let roles = if reader.get_has_roles() {
+        let roles_reader = reader.get_roles()?;
+        let mut roles = Vec::with_capacity(roles_reader.len() as usize);
+        for r in roles_reader.iter() {
+            roles.push(match r? {
+                crate::kaijutsu_capnp::Role::User => Role::User,
+                crate::kaijutsu_capnp::Role::Model => Role::Model,
+                crate::kaijutsu_capnp::Role::System => Role::System,
+                crate::kaijutsu_capnp::Role::Tool => Role::Tool,
+                crate::kaijutsu_capnp::Role::Asset => Role::Asset,
+            });
+        }
+        if roles.is_empty() {
+            return Err(capnp::Error::failed("hasRoles=true but roles list is empty".into()));
+        }
+        roles
+    } else {
+        vec![]
+    };
+
+    let statuses = if reader.get_has_statuses() {
+        let statuses_reader = reader.get_statuses()?;
+        let mut statuses = Vec::with_capacity(statuses_reader.len() as usize);
+        for s in statuses_reader.iter() {
+            statuses.push(match s? {
+                crate::kaijutsu_capnp::Status::Pending => Status::Pending,
+                crate::kaijutsu_capnp::Status::Running => Status::Running,
+                crate::kaijutsu_capnp::Status::Done => Status::Done,
+                crate::kaijutsu_capnp::Status::Error => Status::Error,
+            });
+        }
+        if statuses.is_empty() {
+            return Err(capnp::Error::failed("hasStatuses=true but statuses list is empty".into()));
+        }
+        statuses
+    } else {
+        vec![]
+    };
+
+    let parent_id = if reader.get_has_parent_id() {
+        Some(parse_block_id_from_reader(&reader.get_parent_id()?)?)
+    } else {
+        None
+    };
+
+    Ok(kaijutsu_types::BlockFilter {
+        kinds,
+        roles,
+        statuses,
+        exclude_compacted: reader.get_exclude_compacted(),
+        limit: reader.get_limit(),
+        max_depth: reader.get_max_depth(),
+        parent_id,
+    })
 }
 
 /// Convert a CRDT Status to Cap'n Proto Status.

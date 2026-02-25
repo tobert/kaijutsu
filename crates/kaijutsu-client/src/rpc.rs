@@ -5,7 +5,7 @@
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
 use kaijutsu_crdt::{ContextId, KernelId};
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, DriftKind, PrincipalId, Role, Status, ToolKind};
+use kaijutsu_types::{BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, DriftKind, PrincipalId, Role, Status, ToolKind};
 use russh::client::Msg;
 use russh::ChannelStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -413,43 +413,6 @@ impl KernelHandle {
     }
 
     /// Get document state (blocks and CRDT oplog)
-    #[tracing::instrument(skip(self), name = "rpc_client.get_context_state")]
-    pub async fn get_context_state(
-        &self,
-        context_id: ContextId,
-    ) -> Result<DocumentState, RpcError> {
-        let mut request = self.kernel.get_context_state_request();
-        request.get().set_context_id(context_id.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let state = response.get()?.get_state()?;
-
-        let context_id = parse_context_id(state.get_context_id()?)?;
-        let version = state.get_version();
-        let blocks_reader = state.get_blocks()?;
-        let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
-
-        for block in blocks_reader.iter() {
-            let snapshot = parse_block_snapshot(&block)?;
-            blocks.push(snapshot);
-        }
-
-        // Get full oplog for proper CRDT sync
-        let ops = state.get_ops().map(|d| d.to_vec()).unwrap_or_default();
-
-        Ok(DocumentState {
-            context_id,
-            blocks,
-            version,
-            ops,
-        })
-    }
-
     /// Compact a document's oplog, returning new size and sync generation.
     #[tracing::instrument(skip(self), name = "rpc_client.compact_context")]
     pub async fn compact_context(
@@ -467,6 +430,57 @@ impl KernelHandle {
         let response = request.send().promise.await?;
         let r = response.get()?;
         Ok((r.get_new_size(), r.get_generation()))
+    }
+
+    // =========================================================================
+    // Block Queries (getBlocks / getContextSync)
+    // =========================================================================
+
+    /// Fetch blocks by query (all, byIds, or byFilter).
+    #[tracing::instrument(skip(self), name = "rpc_client.get_blocks")]
+    pub async fn get_blocks(
+        &self,
+        context_id: ContextId,
+        query: &BlockQuery,
+    ) -> Result<Vec<BlockSnapshot>, RpcError> {
+        let mut request = self.kernel.get_blocks_request();
+        request.get().set_context_id(context_id.as_bytes());
+        set_block_query_builder(request.get().init_query(), query);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let blocks_reader = response.get()?.get_blocks()?;
+        let mut blocks = Vec::with_capacity(blocks_reader.len() as usize);
+        for block in blocks_reader.iter() {
+            blocks.push(parse_block_snapshot(&block)?);
+        }
+        Ok(blocks)
+    }
+
+    /// Fetch CRDT sync state (ops + version) without blocks.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_context_sync")]
+    pub async fn get_context_sync(
+        &self,
+        context_id: ContextId,
+    ) -> Result<SyncState, RpcError> {
+        let mut request = self.kernel.get_context_sync_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        let context_id = parse_context_id(r.get_context_id()?)?;
+        let ops = r.get_ops().map(|d| d.to_vec()).unwrap_or_default();
+        let version = r.get_version();
+        Ok(SyncState { context_id, ops, version })
     }
 
     // =========================================================================
@@ -1365,6 +1379,96 @@ fn write_shell_value(mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_
 // ============================================================================
 
 /// Parse 16-byte Data into ContextId.
+// ============================================================================
+// Block Query Builder Helpers
+// ============================================================================
+
+fn set_block_query_builder(
+    mut builder: crate::kaijutsu_capnp::block_query::Builder<'_>,
+    query: &BlockQuery,
+) {
+    match query {
+        BlockQuery::All => builder.set_all(()),
+        BlockQuery::ByIds(ids) => {
+            let mut list = builder.init_by_ids(ids.len() as u32);
+            for (i, id) in ids.iter().enumerate() {
+                let mut b = list.reborrow().get(i as u32);
+                set_block_id_builder(&mut b, id);
+            }
+        }
+        BlockQuery::ByFilter(filter) => {
+            let fb = builder.init_by_filter();
+            set_block_filter_builder(fb, filter);
+        }
+    }
+}
+
+fn set_block_filter_builder(
+    mut builder: crate::kaijutsu_capnp::block_filter::Builder<'_>,
+    filter: &BlockFilter,
+) {
+    if !filter.kinds.is_empty() {
+        builder.set_has_kinds(true);
+        let mut list = builder.reborrow().init_kinds(filter.kinds.len() as u32);
+        for (i, kind) in filter.kinds.iter().enumerate() {
+            list.set(i as u32, match kind {
+                BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+            });
+        }
+    }
+
+    if !filter.roles.is_empty() {
+        builder.set_has_roles(true);
+        let mut list = builder.reborrow().init_roles(filter.roles.len() as u32);
+        for (i, role) in filter.roles.iter().enumerate() {
+            list.set(i as u32, match role {
+                Role::User => crate::kaijutsu_capnp::Role::User,
+                Role::Model => crate::kaijutsu_capnp::Role::Model,
+                Role::System => crate::kaijutsu_capnp::Role::System,
+                Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+                Role::Asset => crate::kaijutsu_capnp::Role::Asset,
+            });
+        }
+    }
+
+    if !filter.statuses.is_empty() {
+        builder.set_has_statuses(true);
+        let mut list = builder.reborrow().init_statuses(filter.statuses.len() as u32);
+        for (i, status) in filter.statuses.iter().enumerate() {
+            list.set(i as u32, match status {
+                Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+                Status::Running => crate::kaijutsu_capnp::Status::Running,
+                Status::Done => crate::kaijutsu_capnp::Status::Done,
+                Status::Error => crate::kaijutsu_capnp::Status::Error,
+            });
+        }
+    }
+
+    builder.set_exclude_compacted(filter.exclude_compacted);
+    builder.set_limit(filter.limit);
+    builder.set_max_depth(filter.max_depth);
+
+    if let Some(ref parent_id) = filter.parent_id {
+        builder.set_has_parent_id(true);
+        let mut pid = builder.reborrow().init_parent_id();
+        set_block_id_builder(&mut pid, parent_id);
+    }
+}
+
+fn set_block_id_builder(
+    builder: &mut crate::kaijutsu_capnp::block_id::Builder,
+    id: &BlockId,
+) {
+    builder.set_context_id(id.context_id.as_bytes());
+    builder.set_agent_id(id.agent_id.as_bytes());
+    builder.set_seq(id.seq);
+}
+
 fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
     ContextId::try_from_slice(data).ok_or_else(|| {
         RpcError::ServerError(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
@@ -1718,14 +1822,14 @@ pub enum ShellValue {
 // Block Types
 // ============================================================================
 
-/// Full document state with blocks
+/// CRDT sync state (ops + version, no blocks).
+///
+/// Used by `get_context_sync` for lightweight CRDT bootstrapping and resync.
 #[derive(Debug, Clone)]
-pub struct DocumentState {
+pub struct SyncState {
     pub context_id: ContextId,
-    pub blocks: Vec<BlockSnapshot>,
-    pub version: u64,
-    /// Full oplog bytes for CRDT sync (enables incremental ops to merge)
     pub ops: Vec<u8>,
+    pub version: u64,
 }
 
 /// Result from submitting the input document (submitInput @78).

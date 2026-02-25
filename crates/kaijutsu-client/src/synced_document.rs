@@ -9,7 +9,7 @@ use kaijutsu_crdt::ContextId;
 use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId};
 use tracing::{info, warn};
 
-use crate::rpc::DocumentState;
+use crate::rpc::SyncState;
 use crate::subscriptions::ServerEvent;
 use crate::sync::{SyncError, SyncManager};
 
@@ -47,9 +47,9 @@ impl SyncedDocument {
         }
     }
 
-    /// Create from a full [`DocumentState`] (e.g., from `get_document_state` RPC).
-    pub fn from_document_state(
-        state: &DocumentState,
+    /// Create from a [`SyncState`] (ops + version, no blocks).
+    pub fn from_sync_state(
+        state: &SyncState,
         agent_id: PrincipalId,
     ) -> Result<Self, SyncError> {
         let mut sd = Self::new(state.context_id, agent_id);
@@ -248,10 +248,10 @@ impl SyncedDocument {
         }
     }
 
-    /// Apply a full document state (from `get_document_state` RPC or reconnect).
-    pub fn apply_document_state(
+    /// Apply a sync state (from `get_context_sync` RPC or reconnect).
+    pub fn apply_sync_state(
         &mut self,
-        state: &DocumentState,
+        state: &SyncState,
     ) -> Result<SyncEffect, SyncError> {
         if state.ops.is_empty() {
             return Ok(SyncEffect::Ignored);
@@ -352,19 +352,19 @@ mod tests {
     }
 
     #[test]
-    fn test_new_and_from_document_state() {
+    fn test_new_and_from_sync_state() {
         let ctx = test_context_id();
         let server = create_server_store(ctx);
         let snap = snapshot_bytes(&server);
 
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: snap,
         };
 
-        let sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
+        let sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
         assert_eq!(sd.context_id(), ctx);
         assert_eq!(sd.block_count(), 1);
         assert!(sd.is_synced());
@@ -376,13 +376,13 @@ mod tests {
         let mut server = create_server_store(ctx);
         let initial_snap = snapshot_bytes(&server);
 
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: initial_snap,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
 
         // Add a new block on the server
         let frontier_before = server.frontier();
@@ -427,13 +427,13 @@ mod tests {
         let ctx = test_context_id();
         let server = create_server_store(ctx);
         let snap = snapshot_bytes(&server);
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: snap,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
         assert!(sd.is_synced());
 
         let effect = sd.apply_event(&ServerEvent::SyncReset {
@@ -450,17 +450,17 @@ mod tests {
         // Per-block DTE: after merge_ops creates a block from snapshot,
         // incremental DTE text ops fail (DataMissing) because the client
         // has a fresh DTE document. Text updates arrive as full snapshots
-        // via apply_document_state instead.
+        // via apply_sync_state instead.
         let ctx = test_context_id();
         let mut server = create_server_store(ctx);
         let initial_snap = snapshot_bytes(&server);
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: initial_snap,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
 
         // Create a streaming block and add text on the server
         let block_id = server
@@ -469,13 +469,13 @@ mod tests {
 
         // Client gets updated snapshot
         let updated_snap = snapshot_bytes(&server);
-        let updated_state = DocumentState {
+        let updated_state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 2,
             ops: updated_snap,
         };
-        let effect = sd.apply_document_state(&updated_state).unwrap();
+        let effect = sd.apply_sync_state(&updated_state).unwrap();
 
         assert!(matches!(effect, SyncEffect::FullSync { block_count: 2 }));
         let b = sd.get_block(&block_id).unwrap();
@@ -483,21 +483,21 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_document_state() {
+    fn test_apply_sync_state() {
         let ctx = test_context_id();
         let mut sd = SyncedDocument::new(ctx, test_agent_id());
         assert!(!sd.is_synced());
 
         let server = create_server_store(ctx);
         let snap = snapshot_bytes(&server);
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: snap,
         };
 
-        let effect = sd.apply_document_state(&state).unwrap();
+        let effect = sd.apply_sync_state(&state).unwrap();
         assert!(matches!(effect, SyncEffect::FullSync { block_count: 1 }));
         assert!(sd.is_synced());
         assert_eq!(sd.block_count(), 1);
@@ -537,15 +537,15 @@ mod tests {
         let b2 = server.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Hi there").unwrap();
         let b3 = server.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search").unwrap();
 
-        // Client syncs initial state via DocumentState
+        // Client syncs initial state via SyncState
         let snap = snapshot_bytes(&server);
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: snap,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, client_agent).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, client_agent).unwrap();
         assert_eq!(sd.block_count(), 3);
 
         // Server adds a new block (after b3)
@@ -596,13 +596,13 @@ mod tests {
 
         // Client syncs initial state
         let snap = snapshot_bytes(&server);
-        let state = DocumentState {
+        let state = SyncState {
             context_id: ctx,
-            blocks: server.blocks_ordered(),
+
             version: 1,
             ops: snap,
         };
-        let mut sd = SyncedDocument::from_document_state(&state, client_agent).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, client_agent).unwrap();
         let v1 = sd.version();
 
         // Apply corrupt text ops — should fail gracefully

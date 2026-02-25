@@ -1047,6 +1047,93 @@ impl BlockSnapshotBuilder {
 
 
 // ============================================================================
+// Block Query Types
+// ============================================================================
+
+/// Filter criteria for querying blocks.
+///
+/// All constraint fields are additive (AND logic): a block must match ALL
+/// non-empty constraints. Empty Vec = unconstrained on that dimension.
+///
+/// Use `validate()` before sending to the server — `byFilter` with no active
+/// constraint is a server error (use `BlockQuery::All` instead).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockFilter {
+    /// Only include blocks of these kinds (empty = all kinds).
+    pub kinds: Vec<BlockKind>,
+    /// Only include blocks with these roles (empty = all roles).
+    pub roles: Vec<Role>,
+    /// Only include blocks with these statuses (empty = all statuses).
+    pub statuses: Vec<Status>,
+    /// Exclude blocks marked as compacted.
+    pub exclude_compacted: bool,
+    /// Maximum number of results (0 = unlimited).
+    pub limit: u32,
+    /// Maximum DAG depth from parent_id (0 = unlimited). Only meaningful when
+    /// `parent_id` is set.
+    pub max_depth: u32,
+    /// Only include descendants of this block (BFS from parent).
+    pub parent_id: Option<BlockId>,
+}
+
+impl BlockFilter {
+    /// Check if this filter has at least one active constraint.
+    ///
+    /// A filter with no active constraints should use `BlockQuery::All` instead.
+    pub fn has_active_constraint(&self) -> bool {
+        !self.kinds.is_empty()
+            || !self.roles.is_empty()
+            || !self.statuses.is_empty()
+            || self.exclude_compacted
+            || self.limit > 0
+            || self.max_depth > 0
+            || self.parent_id.is_some()
+    }
+
+    /// Validate this filter for use with `BlockQuery::ByFilter`.
+    ///
+    /// Returns `Err` if:
+    /// - No active constraints (use `BlockQuery::All` instead)
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.has_active_constraint() {
+            return Err("BlockFilter has no active constraints — use BlockQuery::All instead".into());
+        }
+        Ok(())
+    }
+
+    /// Test whether a single block snapshot matches this filter's criteria.
+    ///
+    /// Does NOT check `parent_id` or `max_depth` (those require DAG traversal).
+    /// Does NOT enforce `limit` (that's the caller's responsibility).
+    pub fn matches(&self, block: &BlockSnapshot) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.contains(&block.kind) {
+            return false;
+        }
+        if !self.roles.is_empty() && !self.roles.contains(&block.role) {
+            return false;
+        }
+        if !self.statuses.is_empty() && !self.statuses.contains(&block.status) {
+            return false;
+        }
+        if self.exclude_compacted && block.compacted {
+            return false;
+        }
+        true
+    }
+}
+
+/// Query type for fetching blocks via RPC.
+#[derive(Debug, Clone)]
+pub enum BlockQuery {
+    /// Fetch all blocks in the context.
+    All,
+    /// Fetch specific blocks by ID.
+    ByIds(Vec<BlockId>),
+    /// Fetch blocks matching a filter.
+    ByFilter(BlockFilter),
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2436,5 +2523,100 @@ mod tests {
         let (depth, reached) = walk_to_root(leaf, &index);
         assert!(!reached, "5000-deep chain should hit MAX_DAG_DEPTH circuit breaker");
         assert_eq!(depth, MAX_DAG_DEPTH);
+    }
+
+    // ── BlockFilter ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_block_filter_default_has_no_constraint() {
+        let f = BlockFilter::default();
+        assert!(!f.has_active_constraint());
+        assert!(f.validate().is_err());
+    }
+
+    #[test]
+    fn test_block_filter_kind_constraint() {
+        let f = BlockFilter {
+            kinds: vec![BlockKind::Text],
+            ..Default::default()
+        };
+        assert!(f.has_active_constraint());
+        assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn test_block_filter_matches_kind() {
+        let f = BlockFilter {
+            kinds: vec![BlockKind::ToolCall, BlockKind::ToolResult],
+            ..Default::default()
+        };
+        let ctx = test_context();
+        let agent = test_agent();
+        let text = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
+        let tool = BlockSnapshot::tool_call(
+            BlockId::new(ctx, agent, 1), None, ToolKind::Shell, "ls",
+            serde_json::json!({}), Role::Model, None,
+        );
+        assert!(!f.matches(&text));
+        assert!(f.matches(&tool));
+    }
+
+    #[test]
+    fn test_block_filter_matches_role() {
+        let f = BlockFilter {
+            roles: vec![Role::User],
+            ..Default::default()
+        };
+        let ctx = test_context();
+        let agent = test_agent();
+        let user = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
+        let model = BlockSnapshot::text(BlockId::new(ctx, agent, 1), None, Role::Model, "hey");
+        assert!(f.matches(&user));
+        assert!(!f.matches(&model));
+    }
+
+    #[test]
+    fn test_block_filter_matches_status() {
+        let f = BlockFilter {
+            statuses: vec![Status::Running],
+            ..Default::default()
+        };
+        let ctx = test_context();
+        let agent = test_agent();
+        let done = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
+        assert!(!f.matches(&done)); // text blocks are Status::Done by default
+    }
+
+    #[test]
+    fn test_block_filter_exclude_compacted() {
+        let f = BlockFilter {
+            exclude_compacted: true,
+            ..Default::default()
+        };
+        assert!(f.has_active_constraint());
+        let ctx = test_context();
+        let agent = test_agent();
+        let mut block = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
+        assert!(f.matches(&block));
+        block.compacted = true;
+        assert!(!f.matches(&block));
+    }
+
+    #[test]
+    fn test_block_filter_combined_constraints() {
+        let f = BlockFilter {
+            kinds: vec![BlockKind::Text],
+            roles: vec![Role::Model],
+            exclude_compacted: true,
+            ..Default::default()
+        };
+        let ctx = test_context();
+        let agent = test_agent();
+        // Model text block — matches all constraints
+        let block = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::Model, "hey");
+        assert!(f.matches(&block));
+        // User text block — fails role constraint
+        let user_block = BlockSnapshot::text(BlockId::new(ctx, agent, 1), None, Role::User, "hi");
+        assert!(!f.matches(&user_block));
     }
 }

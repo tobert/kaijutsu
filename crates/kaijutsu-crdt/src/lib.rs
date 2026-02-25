@@ -33,8 +33,8 @@ mod ops;
 
 // Re-export types from kaijutsu-types
 pub use block::{
-    BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, BlockHeader,
-    DriftKind, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
+    BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder,
+    BlockHeader, DriftKind, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
     Role, Status, ToolKind,
 };
 
