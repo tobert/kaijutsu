@@ -5480,18 +5480,14 @@ dependencies = [
  "anyhow",
  "ariadne",
  "async-trait",
- "capnp",
- "capnp-rpc",
  "chrono",
  "chumsky",
  "directories",
- "futures",
  "git2",
  "jaq-core",
  "jaq-json",
  "jaq-std",
  "kaish-glob",
- "kaish-schema",
  "kaish-types",
  "logos",
  "nix 0.29.0",
@@ -5505,13 +5501,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "kaish-schema"
-version = "0.3.1"
-dependencies = [
- "capnp",
 ]
 
 [[package]]
