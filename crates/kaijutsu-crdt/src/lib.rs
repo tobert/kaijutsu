@@ -39,7 +39,7 @@ pub use block::{
 };
 
 // New architecture
-pub use block_store::{BlockStore, StoreSnapshot, SyncPayload};
+pub use block_store::{ForkBlockFilter, BlockStore, StoreSnapshot, SyncPayload};
 pub use content::BlockContent;
 pub use dag::ConversationDAG;
 

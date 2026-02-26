@@ -35,6 +35,7 @@ use kaijutsu_crdt::ids::{resolve_context_prefix, PrefixError};
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, Role};
 
 use crate::block_store::SharedBlockStore;
+use crate::llm::config::ToolFilter;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 /// Shared, thread-safe DriftRouter reference.
@@ -75,6 +76,11 @@ pub struct ContextHandle {
     /// context become child spans under this trace ID, enabling
     /// "show me everything that happened in context X" queries.
     pub trace_id: [u8; 16],
+    /// Per-context tool filter (None = inherit kernel default).
+    ///
+    /// When set, merged with the kernel's tool config at resolution time.
+    /// Context filters can restrict (not relax) the kernel's tool set.
+    pub tool_filter: Option<ToolFilter>,
 }
 
 impl ContextHandle {
@@ -172,6 +178,7 @@ impl DriftRouter {
             parent_id,
             created_at: now_epoch(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
+            tool_filter: None,
         };
 
         self.contexts.insert(id, handle);
@@ -191,12 +198,12 @@ impl DriftRouter {
             self.label_to_id.insert(l.to_string(), id);
         }
 
-        // Inherit parent's provider/model (COW semantics — snapshot at fork time)
-        let (parent_provider, parent_model) = self
+        // Inherit parent's provider/model/tool_filter (COW semantics — snapshot at fork time)
+        let (parent_provider, parent_model, parent_tool_filter) = self
             .contexts
             .get(&parent_id)
-            .map(|h| (h.provider.clone(), h.model.clone()))
-            .unwrap_or((None, None));
+            .map(|h| (h.provider.clone(), h.model.clone(), h.tool_filter.clone()))
+            .unwrap_or((None, None, None));
 
         let handle = ContextHandle {
             id,
@@ -207,6 +214,7 @@ impl DriftRouter {
             parent_id: Some(parent_id),
             created_at: now_epoch(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
+            tool_filter: parent_tool_filter,
         };
 
         self.contexts.insert(id, handle);
@@ -281,6 +289,22 @@ impl DriftRouter {
             .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
         handle.provider = Some(provider.to_string());
         handle.model = Some(model.to_string());
+        Ok(())
+    }
+
+    /// Update tool filter for a context.
+    ///
+    /// Set to `Some(filter)` to restrict tools, or `None` to inherit kernel default.
+    pub fn configure_tools(
+        &mut self,
+        id: ContextId,
+        filter: Option<ToolFilter>,
+    ) -> Result<(), DriftError> {
+        let handle = self
+            .contexts
+            .get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
+        handle.tool_filter = filter;
         Ok(())
     }
 

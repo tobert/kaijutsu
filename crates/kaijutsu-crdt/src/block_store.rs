@@ -4,7 +4,7 @@
 //! collection of `BlockContent` instances, each owning its own DTE Document.
 //! Metadata lives in `BlockHeader` (plain data), content in per-block CRDTs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use diamond_types_extended::Frontier;
 
@@ -13,6 +13,51 @@ use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, DriftKind,
     PrincipalId, Result, Role, Status, ToolKind, MAX_DAG_DEPTH,
 };
+
+/// Filter criteria for selective block inclusion during fork.
+///
+/// All criteria are exclusionary — blocks matching any criterion are skipped.
+/// An empty filter (all defaults) includes everything.
+#[derive(Debug, Clone, Default)]
+pub struct ForkBlockFilter {
+    /// Skip blocks marked as compacted.
+    pub exclude_compacted: bool,
+    /// Skip blocks with these BlockKind names (e.g., "Thinking", "ToolCall").
+    pub exclude_kinds: HashSet<String>,
+    /// Skip blocks with these Role names (e.g., "Tool", "Model").
+    pub exclude_roles: HashSet<String>,
+    /// Limit total blocks (None = unlimited). Keeps the most recent blocks.
+    pub max_blocks: Option<usize>,
+    /// Skip specific blocks by BlockId key (context:agent:seq format).
+    pub exclude_block_ids: HashSet<String>,
+}
+
+impl ForkBlockFilter {
+    /// Check if a block snapshot passes this filter (should be included).
+    pub fn matches(&self, snap: &BlockSnapshot) -> bool {
+        if self.exclude_compacted && snap.compacted {
+            return false;
+        }
+        if !self.exclude_kinds.is_empty() {
+            let kind_name = format!("{:?}", snap.kind);
+            if self.exclude_kinds.contains(&kind_name) {
+                return false;
+            }
+        }
+        if !self.exclude_roles.is_empty() {
+            let role_name = format!("{:?}", snap.role);
+            if self.exclude_roles.contains(&role_name) {
+                return false;
+            }
+        }
+        if !self.exclude_block_ids.is_empty() {
+            if self.exclude_block_ids.contains(&snap.id.to_key()) {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Collection of blocks with per-block DTE instances.
 ///
@@ -863,6 +908,72 @@ impl BlockStore {
             let snap = block.snapshot();
 
             // Remap IDs: only context_id changes
+            let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
+            let new_parent_id = snap
+                .parent_id
+                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+            let new_tool_call_id = snap
+                .tool_call_id
+                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+
+            if snap.id.agent_id == new_agent_id {
+                forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
+            }
+
+            let mut remapped = snap;
+            remapped.id = new_id;
+            remapped.parent_id = new_parent_id;
+            remapped.tool_call_id = new_tool_call_id;
+
+            let order_key = block.order_key().to_string();
+            let content = BlockContent::from_snapshot(&remapped, new_agent_id, order_key);
+            forked.blocks.insert(new_id, content);
+        }
+
+        forked.version = 1;
+        forked
+    }
+
+    /// Fork the store at a specific version with block filtering.
+    ///
+    /// Like [`fork_at_version`] but additionally filters blocks via `BlockFilter`.
+    /// Blocks that don't pass the filter are excluded from the fork.
+    /// If `max_blocks` is set, only the most recent N passing blocks are kept.
+    pub fn fork_filtered(
+        &self,
+        new_context_id: ContextId,
+        new_agent_id: PrincipalId,
+        at_version: u64,
+        filter: &ForkBlockFilter,
+    ) -> Self {
+        let mut forked = Self::new(new_context_id, new_agent_id);
+
+        // Collect passing blocks first (for max_blocks truncation)
+        let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
+
+        for (_, block) in &self.blocks {
+            if block.is_deleted() {
+                continue;
+            }
+            if block.header().created_at > at_version {
+                continue;
+            }
+            let snap = block.snapshot();
+            if !filter.matches(&snap) {
+                continue;
+            }
+            passing.push((block, snap));
+        }
+
+        // Apply max_blocks — keep the most recent (by order_key, since BTreeMap is ordered)
+        if let Some(max) = filter.max_blocks {
+            if passing.len() > max {
+                let skip = passing.len() - max;
+                passing = passing.into_iter().skip(skip).collect();
+            }
+        }
+
+        for (block, snap) in passing {
             let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
             let new_parent_id = snap
                 .parent_id
@@ -1771,5 +1882,150 @@ mod tests {
         // Ordering must match
         assert_eq!(store_ids, doc_ids, "Store and Document block ordering diverged");
         assert_eq!(store_ids, vec![b1, b2, b3, b4, b5]);
+    }
+
+    // =====================================================================
+    // fork_filtered tests
+    // =====================================================================
+
+    #[test]
+    fn test_fork_filtered_empty_filter_includes_all() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "world").unwrap();
+
+        let filter = ForkBlockFilter::default();
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 2);
+    }
+
+    #[test]
+    fn test_fork_filtered_exclude_kinds() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Thinking, "hmm").unwrap();
+        let _b3 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "response").unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_kinds.insert("Thinking".to_string());
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 2, "Thinking block should be excluded");
+    }
+
+    #[test]
+    fn test_fork_filtered_exclude_roles() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Tool, BlockKind::ToolResult, "result").unwrap();
+        let _b3 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "response").unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_roles.insert("Tool".to_string());
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 2, "Tool role blocks should be excluded");
+    }
+
+    #[test]
+    fn test_fork_filtered_exclude_compacted() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "old message").unwrap();
+        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "summary").unwrap();
+
+        // Mark b1 as compacted via SyncPayload with updated header
+        let mut header = BlockHeader::from_snapshot(&store.get_block_snapshot(&b1).unwrap());
+        header.compacted = true;
+        header.updated_at = 1000; // Ensure LWW wins
+        let payload = SyncPayload {
+            block_ops: vec![],
+            new_blocks: vec![],
+            updated_headers: vec![header],
+            deleted_blocks: vec![],
+        };
+        store.merge_ops(payload).unwrap();
+
+        // Verify compacted flag took effect
+        assert!(store.get_block_snapshot(&b1).unwrap().compacted, "Block should be compacted");
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_compacted = true;
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 1, "Compacted block should be excluded");
+    }
+
+    #[test]
+    fn test_fork_filtered_max_blocks() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "msg 1").unwrap();
+        let b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "msg 2").unwrap();
+        let b3 = store.insert_block(Some(&b2), Some(&b2), Role::User, BlockKind::Text, "msg 3").unwrap();
+        let _b4 = store.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::Text, "msg 4").unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.max_blocks = Some(2);
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 2, "Should only keep last 2 blocks");
+    }
+
+    #[test]
+    fn test_fork_filtered_exclude_block_ids() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "keep me").unwrap();
+        let b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "exclude me").unwrap();
+        let _b3 = store.insert_block(Some(&b2), Some(&b2), Role::User, BlockKind::Text, "also keep").unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_block_ids.insert(b2.to_key());
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        assert_eq!(forked.block_count(), 2, "Specific block should be excluded");
+    }
+
+    #[test]
+    fn test_fork_filtered_combined_criteria() {
+        let mut store = test_store();
+
+        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "question").unwrap();
+        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        let _b3 = store.insert_block(Some(&b1), None, Role::Tool, BlockKind::ToolResult, "tool output").unwrap();
+        let _b4 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "answer").unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_kinds.insert("Thinking".to_string());
+        filter.exclude_roles.insert("Tool".to_string());
+
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
+
+        // Should keep: user text + model text = 2
+        assert_eq!(forked.block_count(), 2, "Thinking + Tool blocks should be excluded");
     }
 }

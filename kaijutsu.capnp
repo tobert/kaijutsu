@@ -407,6 +407,15 @@ struct ToolFilterConfig {
   }
 }
 
+# Block filter for filtered fork operations
+struct ForkBlockFilter {
+  excludeCompacted @0 :Bool;      # Skip blocks marked as compacted
+  excludeKinds @1 :List(Text);    # Skip blocks with these BlockKind names
+  excludeRoles @2 :List(Text);    # Skip blocks with these Role names
+  maxBlocks @3 :UInt32;           # Limit total blocks (0 = unlimited)
+  excludeBlockIds @4 :List(Text); # Skip specific blocks by BlockId key (context:agent:seq)
+}
+
 # ============================================================================
 # Shell Types
 # ============================================================================
@@ -1019,6 +1028,26 @@ interface Kernel {
   # Like subscribeBlocks @13 but the server applies the filter before sending,
   # reducing bandwidth and client CPU during high-throughput streaming.
   subscribeBlocksFiltered @84 (callback :BlockEvents, filter :BlockEventFilter);
+
+  # ============================================================================
+  # Per-Context Tool Filter
+  # ============================================================================
+
+  # Set tool filter for a specific context (restricts, doesn't relax kernel filter).
+  setContextToolFilter @85 (contextId :Data, filter :ToolFilterConfig, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Get the per-context tool filter (None = inherit kernel default).
+  getContextToolFilter @86 (contextId :Data, trace :TraceContext) -> (filter :ToolFilterConfig, hasFilter :Bool);
+
+  # ============================================================================
+  # Filtered Fork
+  # ============================================================================
+
+  # Fork a context with block filtering and optional tool filter.
+  forkFiltered @87 (contextId :Data, version :UInt64, contextLabel :Text,
+                    blockFilter :ForkBlockFilter, toolFilter :ToolFilterConfig,
+                    applyToolFilter :Bool,
+                    trace :TraceContext) -> (newContextId :Data);
 }
 
 # ============================================================================

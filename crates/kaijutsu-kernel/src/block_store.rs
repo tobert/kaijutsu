@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use diamond_types_extended::Frontier;
 use parking_lot::RwLock;
 
-use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, StoreSnapshot, SyncPayload};
+use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload};
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
 use kaijutsu_types::{ContextId, PrincipalId};
@@ -430,6 +430,69 @@ impl BlockStore {
                 position_row: None,
                 parent_document: Some(source_id.to_hex()),
                 created_at: 0, // DB default handles timestamp
+            };
+            db_guard
+                .create_document(&meta)
+                .map_err(|e| format!("DB error: {}", e))?;
+        }
+
+        let version = forked_store.version();
+        let entry = DocumentEntry {
+            doc: forked_store,
+            kind,
+            language,
+            version: AtomicU64::new(version),
+            last_agent: RwLock::new(agent_id),
+            sync_generation: AtomicU64::new(0),
+        };
+        self.documents.insert(new_id, entry);
+
+        Ok(())
+    }
+
+    /// Fork a document at a specific version with block filtering.
+    ///
+    /// Like [`fork_document_at_version`] but additionally filters blocks via `ForkBlockFilter`.
+    /// Blocks that don't pass the filter are excluded from the fork.
+    pub fn fork_document_filtered(
+        &self,
+        source_id: ContextId,
+        new_id: ContextId,
+        at_version: u64,
+        filter: &ForkBlockFilter,
+    ) -> Result<(), String> {
+        if self.documents.contains_key(&new_id) {
+            return Err(format!("Document {} already exists", new_id.to_hex()));
+        }
+
+        let source_entry = self.get(source_id)
+            .ok_or_else(|| format!("Source document {} not found", source_id.to_hex()))?;
+
+        let current_version = source_entry.version();
+        if at_version > current_version {
+            return Err(format!(
+                "Requested version {} is in the future (current: {})",
+                at_version, current_version
+            ));
+        }
+
+        let agent_id = self.agent_id();
+        let forked_store = source_entry.doc.fork_filtered(new_id, agent_id, at_version, filter);
+        let kind = source_entry.kind;
+        let language = source_entry.language.clone();
+        drop(source_entry);
+
+        // Persist metadata if we have a DB
+        if let Some(db) = &self.db {
+            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let meta = DocumentMeta {
+                id: new_id.to_hex(),
+                kind,
+                language: language.clone(),
+                position_col: None,
+                position_row: None,
+                parent_document: Some(source_id.to_hex()),
+                created_at: 0,
             };
             db_guard
                 .create_document(&meta)

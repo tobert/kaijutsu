@@ -1207,11 +1207,22 @@ impl kernel::Server for KernelImpl {
                 principal_id, context_id, cwd, session_id, kernel_id,
             );
 
-            // Check if tool is allowed by kernel's tool filter
+            // Check if tool is allowed by kernel + context tool filters
             if !kernel_arc.tool_allowed(&tool_name).await {
                 result.set_success(false);
                 result.set_error(&format!("Tool filtered out by kernel config: {}", tool_name));
                 return Ok(());
+            }
+            // Per-context tool filter (restricts further, can't relax kernel filter)
+            if let Some(ctx_filter) = kernel_arc.drift().read().await
+                .get(context_id)
+                .and_then(|h| h.tool_filter.as_ref())
+            {
+                if !ctx_filter.allows(&tool_name) {
+                    result.set_success(false);
+                    result.set_error(&format!("Tool filtered out by context config: {}", tool_name));
+                    return Ok(());
+                }
             }
 
             // Get the engine for this tool
@@ -3918,6 +3929,159 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
+    // ========================================================================
+    // Per-Context Tool Filter
+    // ========================================================================
+
+    fn set_context_tool_filter(
+        self: Rc<Self>,
+        params: kernel::SetContextToolFilterParams,
+        mut results: kernel::SetContextToolFilterResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        let filter_reader = pry!(params_reader.get_filter());
+        let filter = pry!(parse_tool_filter_from_capnp(filter_reader));
+
+        let kernel_arc = self.kernel.kernel.clone();
+
+        let span = extract_rpc_trace(params_reader.get_trace(), "set_context_tool_filter");
+        Promise::from_future(async move {
+            let mut drift = kernel_arc.drift().write().await;
+            match drift.configure_tools(context_id, Some(filter)) {
+                Ok(()) => {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                    log::info!("Context tool filter updated: {}", context_id);
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                }
+            }
+            Ok(())
+        }.instrument(span))
+    }
+
+    fn get_context_tool_filter(
+        self: Rc<Self>,
+        params: kernel::GetContextToolFilterParams,
+        mut results: kernel::GetContextToolFilterResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        let kernel_arc = self.kernel.kernel.clone();
+
+        let span = extract_rpc_trace(params_reader.get_trace(), "get_context_tool_filter");
+        Promise::from_future(async move {
+            let drift = kernel_arc.drift().read().await;
+            let handle = drift.get(context_id);
+
+            let mut res = results.get();
+            match handle.and_then(|h| h.tool_filter.as_ref()) {
+                Some(filter) => {
+                    res.set_has_filter(true);
+                    serialize_tool_filter_to_capnp(filter, res.init_filter());
+                }
+                None => {
+                    res.set_has_filter(false);
+                    res.init_filter().set_all(());
+                }
+            }
+            Ok(())
+        }.instrument(span))
+    }
+
+    fn fork_filtered(
+        self: Rc<Self>,
+        params: kernel::ForkFilteredParams,
+        mut results: kernel::ForkFilteredResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let source_context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let version = params_reader.get_version();
+        let context_label = pry!(pry!(params_reader.get_context_label()).to_str()).to_owned();
+        let apply_tool_filter = params_reader.get_apply_tool_filter();
+
+        // Parse block filter
+        let block_filter_reader = pry!(params_reader.get_block_filter());
+        let block_filter = pry!(parse_block_filter_from_capnp(block_filter_reader));
+
+        // Parse optional tool filter
+        let tool_filter = if apply_tool_filter {
+            let tf_reader = pry!(params_reader.get_tool_filter());
+            Some(pry!(parse_tool_filter_from_capnp(tf_reader)))
+        } else {
+            None
+        };
+
+        let new_ctx_id = ContextId::new();
+        let documents = self.kernel.documents.clone();
+        let kernel_arc = self.kernel.kernel.clone();
+
+        log::info!(
+            "Filtered fork request: context={}, version={}, label='{}', new_ctx={}",
+            source_context_id, version, context_label, new_ctx_id
+        );
+
+        // Validate document and version
+        let doc_entry = match documents.get(source_context_id) {
+            Some(entry) => entry,
+            None => return Promise::err(capnp::Error::failed("Document not found".into())),
+        };
+        let current_version = doc_entry.version();
+        if current_version < version {
+            return Promise::err(capnp::Error::failed(
+                format!("Requested version {} is in the future (current: {})", version, current_version)
+            ));
+        }
+        drop(doc_entry);
+
+        // Fork with block filter
+        if let Err(e) = documents.fork_document_filtered(
+            source_context_id, new_ctx_id, version, &block_filter,
+        ) {
+            return Promise::err(capnp::Error::failed(format!("Filtered fork failed: {}", e)));
+        }
+
+        let label_owned = if context_label.is_empty() { None } else { Some(context_label.clone()) };
+
+        let span = extract_rpc_trace(params_reader.get_trace(), "fork_filtered");
+        Promise::from_future(async move {
+            // Register in drift router — inherits parent's provider/model/tool_filter
+            let label = label_owned.as_deref();
+            let mut drift = kernel_arc.drift().write().await;
+            drift.register_fork(new_ctx_id, label, source_context_id);
+
+            // Apply per-context tool filter if specified
+            if let Some(filter) = tool_filter {
+                if let Err(e) = drift.configure_tools(new_ctx_id, Some(filter)) {
+                    log::warn!("Failed to set tool filter on forked context: {}", e);
+                }
+            }
+
+            // Link to the parent context's long-running trace
+            let trace_id = drift.get(source_context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
+            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_filtered").entered();
+
+            results.get().set_new_context_id(new_ctx_id.as_bytes());
+
+            log::info!(
+                "Filtered fork created: ctx={} (label={:?}) from context {} at version {}",
+                new_ctx_id, label, source_context_id, version
+            );
+            Ok(())
+        }.instrument(span))
+    }
+
     // =========================================================================
     // Shell Variable Introspection
     // =========================================================================
@@ -4821,22 +4985,126 @@ fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
 }
 
 // ============================================================================
+// Cap'n Proto ↔ Rust Type Helpers
+// ============================================================================
+
+use kaijutsu_crdt::block_store::ForkBlockFilter;
+
+/// Parse a ToolFilter from a Cap'n Proto ToolFilterConfig reader.
+fn parse_tool_filter_from_capnp(
+    reader: tool_filter_config::Reader<'_>,
+) -> Result<ToolFilter, capnp::Error> {
+    match reader.which()? {
+        tool_filter_config::All(()) => Ok(ToolFilter::All),
+        tool_filter_config::AllowList(list) => {
+            let list = list?;
+            let mut tools = std::collections::HashSet::new();
+            for i in 0..list.len() {
+                let name = list.get(i)?.to_str()?;
+                tools.insert(name.to_string());
+            }
+            Ok(ToolFilter::AllowList(tools))
+        }
+        tool_filter_config::DenyList(list) => {
+            let list = list?;
+            let mut tools = std::collections::HashSet::new();
+            for i in 0..list.len() {
+                let name = list.get(i)?.to_str()?;
+                tools.insert(name.to_string());
+            }
+            Ok(ToolFilter::DenyList(tools))
+        }
+    }
+}
+
+/// Serialize a ToolFilter into a Cap'n Proto ToolFilterConfig builder.
+fn serialize_tool_filter_to_capnp(
+    filter: &ToolFilter,
+    mut builder: tool_filter_config::Builder<'_>,
+) {
+    match filter {
+        ToolFilter::All => builder.set_all(()),
+        ToolFilter::AllowList(tools) => {
+            let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+            let mut list = builder.init_allow_list(tools_vec.len() as u32);
+            for (i, tool) in tools_vec.iter().enumerate() {
+                list.set(i as u32, tool);
+            }
+        }
+        ToolFilter::DenyList(tools) => {
+            let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+            let mut list = builder.init_deny_list(tools_vec.len() as u32);
+            for (i, tool) in tools_vec.iter().enumerate() {
+                list.set(i as u32, tool);
+            }
+        }
+    }
+}
+
+/// Parse a BlockFilter from a Cap'n Proto ForkBlockFilter reader.
+fn parse_block_filter_from_capnp(
+    reader: fork_block_filter::Reader<'_>,
+) -> Result<ForkBlockFilter, capnp::Error> {
+    let exclude_compacted = reader.get_exclude_compacted();
+
+    let kinds_list = reader.get_exclude_kinds()?;
+    let mut exclude_kinds = std::collections::HashSet::new();
+    for i in 0..kinds_list.len() {
+        exclude_kinds.insert(kinds_list.get(i)?.to_str()?.to_string());
+    }
+
+    let roles_list = reader.get_exclude_roles()?;
+    let mut exclude_roles = std::collections::HashSet::new();
+    for i in 0..roles_list.len() {
+        exclude_roles.insert(roles_list.get(i)?.to_str()?.to_string());
+    }
+
+    let max_blocks = reader.get_max_blocks();
+
+    let ids_list = reader.get_exclude_block_ids()?;
+    let mut exclude_block_ids = std::collections::HashSet::new();
+    for i in 0..ids_list.len() {
+        exclude_block_ids.insert(ids_list.get(i)?.to_str()?.to_string());
+    }
+
+    Ok(ForkBlockFilter {
+        exclude_compacted,
+        exclude_kinds,
+        exclude_roles,
+        max_blocks: if max_blocks == 0 { None } else { Some(max_blocks as usize) },
+        exclude_block_ids,
+    })
+}
+
+// ============================================================================
 // LLM Stream Helpers
 // ============================================================================
 
 use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
 
-/// Build tool definitions from tools with engines, filtered by the kernel's ToolConfig.
-async fn build_tool_definitions(kernel: &Arc<Kernel>) -> Vec<ToolDefinition> {
+/// Build tool definitions from tools with engines, filtered by kernel + context tool config.
+///
+/// When `context_filter` is provided, it is merged with the kernel's tool filter
+/// (context can restrict, not relax). When None, only kernel filter applies.
+async fn build_tool_definitions(
+    kernel: &Arc<Kernel>,
+    context_filter: Option<&ToolFilter>,
+) -> Vec<ToolDefinition> {
     let registry = kernel.tools().read().await;
-    let tool_config = kernel.tool_config().await;
+    let kernel_config = kernel.tool_config().await;
 
-    // Get tools with engines, filtered by the kernel's tool filter
+    // Merge kernel + context filters (context restricts, doesn't relax)
+    let effective_filter = match context_filter {
+        Some(ctx_filter) => kernel_config.filter.merge(ctx_filter),
+        None => kernel_config.filter.clone(),
+    };
+
+    // Get tools with engines, filtered by the merged filter
     let available = registry.list_with_engines();
 
     available
         .into_iter()
-        .filter(|info| tool_config.allows(&info.name))
+        .filter(|info| effective_filter.allows(&info.name))
         .filter_map(|info| {
             // Only include tools that provide a schema — models can't use tools
             // without knowing the expected parameters
@@ -4880,12 +5148,12 @@ async fn spawn_llm_for_prompt(
             .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
-    // Read per-context model from DriftRouter (quick read, release lock)
-    let (ctx_model, ctx_provider_name) = {
+    // Read per-context model + tool filter from DriftRouter (quick read, release lock)
+    let (ctx_model, ctx_provider_name, ctx_tool_filter) = {
         let drift = kernel_arc.drift().read().await;
         match drift.get(context_id) {
-            Some(h) => (h.model.clone(), h.provider.clone()),
-            None => (None, None),
+            Some(h) => (h.model.clone(), h.provider.clone(), h.tool_filter.clone()),
+            None => (None, None, None),
         }
     };
 
@@ -4923,8 +5191,8 @@ async fn spawn_llm_for_prompt(
         }
     };
 
-    // Build tool definitions from equipped tools
-    let tools = build_tool_definitions(&kernel_arc).await;
+    // Build tool definitions from equipped tools, filtered by kernel + context config
+    let tools = build_tool_definitions(&kernel_arc, ctx_tool_filter.as_ref()).await;
 
     log::info!("Spawning LLM stream: context={}, model={}", context_id, model_name);
 
