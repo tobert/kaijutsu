@@ -30,7 +30,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use kaijutsu_types::{BlockSnapshot, ContextId, Status};
-use tokio::sync::RwLock;
+use std::sync::RwLock;
+use std::sync::Mutex;
 
 // ============================================================================
 // Error Types
@@ -115,7 +116,7 @@ pub struct ClusterInfo {
 pub struct SemanticIndex {
     embedder: Arc<dyn Embedder>,
     hnsw: RwLock<index::HnswIndex>,
-    metadata: tokio::sync::Mutex<metadata::MetadataStore>,
+    metadata: Mutex<metadata::MetadataStore>,
     config: IndexConfig,
 }
 
@@ -130,26 +131,16 @@ impl SemanticIndex {
         Ok(Self {
             embedder: Arc::from(embedder),
             hnsw: RwLock::new(hnsw),
-            metadata: tokio::sync::Mutex::new(metadata),
+            metadata: Mutex::new(metadata),
             config,
         })
     }
 
-    /// Run embedding inference on a blocking thread.
-    ///
-    /// The Embedder trait is deliberately sync (ONNX inference is CPU-bound).
-    /// This prevents blocking the tokio executor.
-    async fn embed_blocking(&self, text: String) -> Result<Vec<f32>, IndexError> {
-        let embedder = Arc::clone(&self.embedder);
-        tokio::task::spawn_blocking(move || embedder.embed(&text))
-            .await
-            .map_err(|e| IndexError::Embedding(format!("spawn_blocking: {}", e)))?
-    }
-
     /// Index a context's blocks. Returns true if content was (re-)embedded.
     ///
-    /// Skips re-embedding if the content hash hasn't changed.
-    pub async fn index_context(
+    /// This is a blocking operation — call from `spawn_blocking`.
+    /// ONNX inference, HNSW graph operations, and SQLite writes all happen synchronously.
+    pub fn index_context(
         &self,
         ctx_id: ContextId,
         blocks: &[BlockSnapshot],
@@ -162,17 +153,17 @@ impl SemanticIndex {
 
         // Check if already indexed with same content
         {
-            let meta = self.metadata.lock().await;
+            let meta = self.metadata.lock().unwrap();
             if meta.get_content_hash(ctx_id)?.is_some_and(|h| h == hash) {
                 return Ok(false);
             }
         }
 
-        // Embed (on blocking thread — ONNX inference is CPU-bound)
-        let embedding = self.embed_blocking(text).await?;
+        // Embed — ONNX inference is CPU-bound, fine on a blocking thread
+        let embedding = self.embedder.embed(&text)?;
 
         // Assign or get slot
-        let mut meta = self.metadata.lock().await;
+        let mut meta = self.metadata.lock().unwrap();
         let slot = meta.assign_slot(
             ctx_id,
             &hash,
@@ -182,13 +173,9 @@ impl SemanticIndex {
 
         // Insert into HNSW
         {
-            let mut hnsw = self.hnsw.write().await;
+            let mut hnsw = self.hnsw.write().unwrap();
             hnsw.insert(slot, &embedding)?;
-        }
-
-        // Save after insertion — context indexing is infrequent, persistence matters
-        if let Err(e) = self.save().await {
-            tracing::warn!(error = %e, "failed to save HNSW index after insertion");
+            hnsw.save()?;
         }
 
         tracing::debug!(
@@ -201,13 +188,15 @@ impl SemanticIndex {
     }
 
     /// Search for contexts similar to a text query.
-    pub async fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>, IndexError> {
-        let embedding = self.embed_blocking(query.to_string()).await?;
+    ///
+    /// Blocking — call from `spawn_blocking`.
+    pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>, IndexError> {
+        let embedding = self.embedder.embed(query)?;
 
-        let hnsw = self.hnsw.read().await;
+        let hnsw = self.hnsw.read().unwrap();
         let neighbors = hnsw.search(&embedding, k)?;
 
-        let meta = self.metadata.lock().await;
+        let meta = self.metadata.lock().unwrap();
         let mut results = Vec::with_capacity(neighbors.len());
         for (slot, distance) in neighbors {
             if let Some(ctx_id) = meta.get_context_id(slot)? {
@@ -223,24 +212,26 @@ impl SemanticIndex {
     }
 
     /// Find contexts similar to a given context.
-    pub async fn neighbors(
+    ///
+    /// Blocking — call from `spawn_blocking`.
+    pub fn neighbors(
         &self,
         ctx_id: ContextId,
         k: usize,
     ) -> Result<Vec<SearchResult>, IndexError> {
-        let meta = self.metadata.lock().await;
+        let meta = self.metadata.lock().unwrap();
         let slot = match meta.get_slot(ctx_id)? {
             Some(s) => s,
             None => return Ok(vec![]),
         };
         drop(meta);
 
-        let hnsw = self.hnsw.read().await;
+        let hnsw = self.hnsw.read().unwrap();
         let embedding = hnsw.get_embedding(slot)?;
         let neighbors = hnsw.search(&embedding, k + 1)?; // +1 to exclude self
         drop(hnsw);
 
-        let meta = self.metadata.lock().await;
+        let meta = self.metadata.lock().unwrap();
         let mut results = Vec::with_capacity(neighbors.len());
         for (neighbor_slot, distance) in neighbors {
             if neighbor_slot == slot {
@@ -259,11 +250,13 @@ impl SemanticIndex {
     }
 
     /// Compute clusters of related contexts.
-    pub async fn clusters(
+    ///
+    /// Blocking — call from `spawn_blocking`.
+    pub fn clusters(
         &self,
         min_cluster_size: usize,
     ) -> Result<Vec<ClusterInfo>, IndexError> {
-        let hnsw = self.hnsw.read().await;
+        let hnsw = self.hnsw.read().unwrap();
         let all_embeddings = hnsw.get_all_embeddings()?;
         drop(hnsw);
 
@@ -273,7 +266,7 @@ impl SemanticIndex {
 
         let raw_clusters = cluster::compute_clusters(&all_embeddings, min_cluster_size)?;
 
-        let meta = self.metadata.lock().await;
+        let meta = self.metadata.lock().unwrap();
         let mut clusters = Vec::with_capacity(raw_clusters.len());
         for (cluster_id, slots) in raw_clusters {
             let mut context_ids = Vec::with_capacity(slots.len());
@@ -294,19 +287,19 @@ impl SemanticIndex {
     }
 
     /// Number of indexed contexts.
-    pub async fn len(&self) -> usize {
-        let meta = self.metadata.lock().await;
+    pub fn len(&self) -> usize {
+        let meta = self.metadata.lock().unwrap();
         meta.count().unwrap_or(0)
     }
 
     /// Whether the index is empty.
-    pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
-    /// Save the HNSW index to disk.
-    pub async fn save(&self) -> Result<(), IndexError> {
-        let hnsw = self.hnsw.read().await;
+    /// Save the HNSW index to disk. Blocking.
+    pub fn save(&self) -> Result<(), IndexError> {
+        let hnsw = self.hnsw.read().unwrap();
         hnsw.save()
     }
 
@@ -397,8 +390,8 @@ mod tests {
         }]
     }
 
-    #[tokio::test]
-    async fn test_index_and_search_round_trip() {
+    #[test]
+    fn test_index_and_search_round_trip() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -406,10 +399,10 @@ mod tests {
         let ctx = ContextId::new();
         let blocks = make_blocks(ctx, "the quick brown fox jumps over the lazy dog");
 
-        let indexed = idx.index_context(ctx, &blocks).await.unwrap();
+        let indexed = idx.index_context(ctx, &blocks).unwrap();
         assert!(indexed, "first indexing should embed");
 
-        let results = idx.search("quick brown fox", 5).await.unwrap();
+        let results = idx.search("quick brown fox", 5).unwrap();
         assert!(!results.is_empty(), "search should return results");
         assert_eq!(results[0].context_id, ctx);
 
@@ -419,8 +412,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_dedup_same_content() {
+    #[test]
+    fn test_dedup_same_content() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -428,15 +421,15 @@ mod tests {
         let ctx = ContextId::new();
         let blocks = make_blocks(ctx, "identical content for dedup test");
 
-        let first = idx.index_context(ctx, &blocks).await.unwrap();
+        let first = idx.index_context(ctx, &blocks).unwrap();
         assert!(first, "first call should index");
 
-        let second = idx.index_context(ctx, &blocks).await.unwrap();
+        let second = idx.index_context(ctx, &blocks).unwrap();
         assert!(!second, "second call with same content should skip");
     }
 
-    #[tokio::test]
-    async fn test_neighbors() {
+    #[test]
+    fn test_neighbors() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -446,10 +439,10 @@ mod tests {
         let blocks1 = make_blocks(ctx1, "machine learning neural networks deep learning");
         let blocks2 = make_blocks(ctx2, "machine learning gradient descent optimization");
 
-        idx.index_context(ctx1, &blocks1).await.unwrap();
-        idx.index_context(ctx2, &blocks2).await.unwrap();
+        idx.index_context(ctx1, &blocks1).unwrap();
+        idx.index_context(ctx2, &blocks2).unwrap();
 
-        let neighbors = idx.neighbors(ctx1, 5).await.unwrap();
+        let neighbors = idx.neighbors(ctx1, 5).unwrap();
         assert!(!neighbors.is_empty(), "should find at least one neighbor");
         assert_eq!(neighbors[0].context_id, ctx2, "neighbor should be ctx2");
 
@@ -459,8 +452,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_persistence_round_trip() {
+    #[test]
+    fn test_persistence_round_trip() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
 
@@ -470,42 +463,42 @@ mod tests {
         // Index and save
         {
             let idx = SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha")).await.unwrap();
-            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta")).await.unwrap();
-            idx.save().await.unwrap();
+            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha")).unwrap();
+            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta")).unwrap();
+            idx.save().unwrap();
         }
 
         // Reload and verify
         {
             let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
-            let results = idx.search("persistence test", 5).await.unwrap();
+            let results = idx.search("persistence test", 5).unwrap();
             assert!(results.len() >= 2, "should find both contexts after reload");
 
-            let neighbors = idx.neighbors(ctx1, 5).await.unwrap();
+            let neighbors = idx.neighbors(ctx1, 5).unwrap();
             assert!(!neighbors.is_empty(), "neighbors should work after reload");
         }
     }
 
-    #[tokio::test]
-    async fn test_empty_index_search() {
+    #[test]
+    fn test_empty_index_search() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
-        let results = idx.search("anything", 5).await.unwrap();
+        let results = idx.search("anything", 5).unwrap();
         assert!(results.is_empty(), "empty index should return empty results");
     }
 
-    #[tokio::test]
-    async fn test_empty_content_not_indexed() {
+    #[test]
+    fn test_empty_content_not_indexed() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
         let ctx = ContextId::new();
-        let indexed = idx.index_context(ctx, &[]).await.unwrap();
+        let indexed = idx.index_context(ctx, &[]).unwrap();
         assert!(!indexed, "empty blocks should not be indexed");
-        assert!(idx.is_empty().await);
+        assert!(idx.is_empty());
     }
 }

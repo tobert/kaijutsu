@@ -4341,8 +4341,14 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let search_results = match &kernel.semantic_index {
-                Some(idx) => idx.search(&query, k).await
-                    .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?,
+                Some(idx) => {
+                    let idx = idx.clone();
+                    let q = query.clone();
+                    tokio::task::spawn_blocking(move || idx.search(&q, k))
+                        .await
+                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                        .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
+                }
                 None => vec![],
             };
 
@@ -4379,8 +4385,13 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let search_results = match &kernel.semantic_index {
-                Some(idx) => idx.neighbors(context_id, k).await
-                    .map_err(|e| capnp::Error::failed(format!("neighbors: {}", e)))?,
+                Some(idx) => {
+                    let idx = idx.clone();
+                    tokio::task::spawn_blocking(move || idx.neighbors(context_id, k))
+                        .await
+                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                        .map_err(|e| capnp::Error::failed(format!("neighbors: {}", e)))?
+                }
                 None => vec![],
             };
 
@@ -4413,8 +4424,13 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let clusters = match &kernel.semantic_index {
-                Some(idx) => idx.clusters(min_cluster_size).await
-                    .map_err(|e| capnp::Error::failed(format!("clusters: {}", e)))?,
+                Some(idx) => {
+                    let idx = idx.clone();
+                    tokio::task::spawn_blocking(move || idx.clusters(min_cluster_size))
+                        .await
+                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                        .map_err(|e| capnp::Error::failed(format!("clusters: {}", e)))?
+                }
                 None => vec![],
             };
 

@@ -425,21 +425,29 @@ impl<T: Clone> Subscription<T> {
     ///
     /// Returns None if the channel is closed.
     pub async fn recv(&mut self) -> Option<FlowMessage<T>> {
+        // TODO: The broadcast channel delivers ALL events to ALL subscribers.
+        // Pattern filtering happens here on the receive side, discarding non-matching
+        // events one by one. During high-throughput streaming (e.g. LLM TextOps),
+        // this burns CPU spinning through hundreds of irrelevant events.
+        // Future fix: topic-partitioned channels or filtered publish.
+        let mut discards = 0u32;
         loop {
             match self.rx.recv().await {
                 Ok(msg) => {
                     if matches_pattern(&self.pattern, &msg.subject) {
                         return Some(msg);
                     }
-                    // Message didn't match pattern, continue waiting
+                    discards += 1;
+                    if discards % 64 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // We fell behind, log and continue
                     tracing::warn!(
                         pattern = %self.pattern,
                         lagged = n,
-                        "Flow subscription lagged behind"
+                        "Flow subscription lagged"
                     );
                 }
             }
