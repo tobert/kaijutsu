@@ -4515,6 +4515,192 @@ impl kernel::Server for KernelImpl {
 
         Promise::ok(())
     }
+
+    fn subscribe_blocks_filtered(
+        self: Rc<Self>,
+        params: kernel::SubscribeBlocksFilteredParams,
+        _results: kernel::SubscribeBlocksFilteredResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_blocks_filtered").entered();
+        let p = pry!(params.get());
+        let callback = pry!(p.get_callback());
+
+        // Parse the BlockEventFilter from the capnp struct
+        let filter = if p.has_filter() {
+            let f = pry!(p.get_filter());
+            parse_block_event_filter(f)
+        } else {
+            kaijutsu_types::BlockEventFilter::default()
+        };
+
+        let has_filter = filter.has_active_constraint();
+
+        // Determine which FlowBus topics to subscribe to based on event_types filter.
+        // If event_types is set, only subscribe to matching topics (leveraging Phase 2 topic partitioning).
+        let subscribe_pattern = if !filter.event_types.is_empty() {
+            // If only one event type, subscribe to just that topic for maximum efficiency.
+            // Otherwise fall back to wildcard.
+            if filter.event_types.len() == 1 {
+                match filter.event_types[0] {
+                    kaijutsu_types::BlockFlowKind::Inserted => "block.inserted",
+                    kaijutsu_types::BlockFlowKind::TextOps => "block.text_ops",
+                    kaijutsu_types::BlockFlowKind::Deleted => "block.deleted",
+                    kaijutsu_types::BlockFlowKind::StatusChanged => "block.status",
+                    kaijutsu_types::BlockFlowKind::CollapsedChanged => "block.collapsed",
+                    kaijutsu_types::BlockFlowKind::Moved => "block.moved",
+                    kaijutsu_types::BlockFlowKind::SyncReset => "block.sync_reset",
+                }
+            } else {
+                "block.*"
+            }
+        } else {
+            "block.*"
+        };
+
+        {
+            let block_flows = self.kernel.kernel.block_flows().clone();
+            let input_flows = self.kernel.documents.input_flows().cloned();
+            let kernel_id = self.kernel.id;
+
+            tokio::task::spawn_local(async move {
+                let mut block_sub = block_flows.subscribe(subscribe_pattern);
+                let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
+                log::debug!(
+                    "Started filtered FlowBus subscription for kernel {} (filter_active={}, pattern={})",
+                    kernel_id.to_hex(), has_filter, subscribe_pattern
+                );
+
+                loop {
+                    let success = tokio::select! {
+                        Some(msg) = block_sub.recv() => {
+                            // Apply server-side filter before serializing to wire
+                            if has_filter && !msg.payload.matches_filter(&filter) {
+                                continue;
+                            }
+
+                            // Same dispatch as subscribe_blocks — forward to callback
+                            match msg.payload {
+                                BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
+                                    let mut req = callback.on_block_inserted_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_has_after_id(after_id.is_some());
+                                        if let Some(after) = after_id {
+                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                                        }
+                                        params.set_ops(ops);
+                                        let mut block_state = params.init_block();
+                                        set_block_snapshot(&mut block_state, block);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::Deleted { context_id, ref block_id, .. } => {
+                                    let mut req = callback.on_block_deleted_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
+                                    let mut req = callback.on_block_status_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_status(status_to_capnp(status));
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
+                                    let mut req = callback.on_block_collapsed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_collapsed(collapsed);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
+                                    let mut req = callback.on_block_moved_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_has_after_id(after_id.is_some());
+                                        if let Some(after) = after_id {
+                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                                        }
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
+                                    let mut req = callback.on_block_text_ops_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_ops(ops);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::SyncReset { context_id, generation } => {
+                                    let mut req = callback.on_sync_reset_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_generation(generation);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                            }
+                        }
+                        Some(msg) = async {
+                            match &mut input_sub {
+                                Some(sub) => sub.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match msg.payload {
+                                InputDocFlow::TextOps { context_id, ref ops, .. } => {
+                                    let mut req = callback.on_input_text_ops_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        params.set_ops(ops);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                InputDocFlow::Cleared { context_id } => {
+                                    let mut req = callback.on_input_cleared_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                            }
+                        }
+                        else => break,
+                    };
+
+                    if !success {
+                        log::debug!(
+                            "Filtered FlowBus bridge task for kernel {} stopping: callback failed",
+                            kernel_id
+                        );
+                        break;
+                    }
+                }
+
+                log::debug!("Filtered FlowBus bridge task for kernel {} ended", kernel_id);
+            });
+        }
+        Promise::ok(())
+    }
 }
 
 // ============================================================================
@@ -5426,6 +5612,89 @@ fn parse_block_filter(
         max_depth: reader.get_max_depth(),
         parent_id,
     })
+}
+
+/// Parse a BlockEventFilter from a Cap'n Proto reader.
+fn parse_block_event_filter(
+    reader: crate::kaijutsu_capnp::block_event_filter::Reader<'_>,
+) -> kaijutsu_types::BlockEventFilter {
+    let context_ids = if reader.get_has_context_ids() {
+        reader
+            .get_context_ids()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|bytes| bytes.ok().and_then(|b| ContextId::try_from_slice(b)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let event_types = if reader.get_has_event_types() {
+        reader
+            .get_event_types()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|k| {
+                        k.ok().map(|k| match k {
+                            crate::kaijutsu_capnp::BlockFlowKind::Inserted => {
+                                kaijutsu_types::BlockFlowKind::Inserted
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::TextOps => {
+                                kaijutsu_types::BlockFlowKind::TextOps
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::Deleted => {
+                                kaijutsu_types::BlockFlowKind::Deleted
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::StatusChanged => {
+                                kaijutsu_types::BlockFlowKind::StatusChanged
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged => {
+                                kaijutsu_types::BlockFlowKind::CollapsedChanged
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::Moved => {
+                                kaijutsu_types::BlockFlowKind::Moved
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::SyncReset => {
+                                kaijutsu_types::BlockFlowKind::SyncReset
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let block_kinds = if reader.get_has_block_kinds() {
+        reader
+            .get_block_kinds()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|k| {
+                        k.ok().map(|k| match k {
+                            crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+                            crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+                            crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+                            crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+                            crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
+                            crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    kaijutsu_types::BlockEventFilter {
+        context_ids,
+        event_types,
+        block_kinds,
+    }
 }
 
 /// Convert a CRDT Status to Cap'n Proto Status.

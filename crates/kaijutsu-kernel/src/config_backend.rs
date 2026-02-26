@@ -716,7 +716,7 @@ impl ConfigCrdtBackend {
                 // Emit changed event (source is Remote since it came from external edit)
                 self.emit(ConfigFlow::Changed {
                     path: event.path.clone(),
-                    ops: vec![], // TODO: Could include CRDT ops here
+                    ops: std::sync::Arc::from(Vec::<u8>::new()), // TODO: Could include CRDT ops here
                     source: OpSource::Remote,
                 });
             }

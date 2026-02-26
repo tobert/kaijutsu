@@ -1134,6 +1134,52 @@ pub enum BlockQuery {
 }
 
 // ============================================================================
+// BlockFlow Event Filter (server-side subscription filtering)
+// ============================================================================
+
+/// Discriminant for BlockFlow variants (no payload).
+///
+/// Used in [`BlockEventFilter`] to specify which event types a subscription
+/// should receive. Maps 1:1 to `BlockFlow` enum variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockFlowKind {
+    Inserted,
+    TextOps,
+    Deleted,
+    StatusChanged,
+    CollapsedChanged,
+    Moved,
+    SyncReset,
+}
+
+/// Server-side filter for block event subscriptions.
+///
+/// Applied before serializing events to the wire, reducing bandwidth and
+/// client-side processing. All non-empty constraint vecs are AND'd together:
+/// an event must match ALL active constraints to pass.
+///
+/// Empty vecs = unconstrained (that dimension matches everything).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BlockEventFilter {
+    /// Only forward events for these contexts (empty = all contexts).
+    pub context_ids: Vec<ContextId>,
+    /// Only forward these event types (empty = all types).
+    pub event_types: Vec<BlockFlowKind>,
+    /// Only forward events for blocks of these kinds (empty = all kinds).
+    /// Only applicable to Inserted events (which carry BlockSnapshot).
+    pub block_kinds: Vec<BlockKind>,
+}
+
+impl BlockEventFilter {
+    /// Check if this filter has at least one active constraint.
+    pub fn has_active_constraint(&self) -> bool {
+        !self.context_ids.is_empty()
+            || !self.event_types.is_empty()
+            || !self.block_kinds.is_empty()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

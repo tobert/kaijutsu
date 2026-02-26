@@ -542,9 +542,9 @@ impl BlockStore {
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
-            block: snapshot,
+            block: Arc::new(snapshot),
             after_id,
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -611,9 +611,9 @@ impl BlockStore {
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
-            block: snapshot,
+            block: Arc::new(snapshot),
             after_id,
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -682,9 +682,9 @@ impl BlockStore {
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
-            block: snapshot,
+            block: Arc::new(snapshot),
             after_id,
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -735,9 +735,9 @@ impl BlockStore {
 
         self.emit(BlockFlow::Inserted {
             context_id,
-            block: final_snapshot,
+            block: Arc::new(final_snapshot),
             after_id,
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -813,7 +813,7 @@ impl BlockStore {
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: block_id.clone(),
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -878,7 +878,7 @@ impl BlockStore {
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: block_id.clone(),
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 
@@ -974,6 +974,8 @@ impl BlockStore {
         let after_map: HashMap<&BlockId, &BlockSnapshot> =
             after.iter().map(|b| (&b.id, b)).collect();
 
+        // Shared Arc for ops — all events from this diff share the same allocation
+        let ops: Arc<[u8]> = Arc::from(ops);
         let mut events = Vec::new();
 
         // New blocks
@@ -982,7 +984,7 @@ impl BlockStore {
                 let after_id = if i > 0 { Some(after[i - 1].id) } else { None };
                 events.push(BlockFlow::Inserted {
                     context_id,
-                    block: snap.clone(),
+                    block: Arc::new(snap.clone()),
                     after_id,
                     ops: ops.clone(),
                     source: OpSource::Remote,
@@ -1286,7 +1288,7 @@ impl BlockStore {
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
-            ops: ops.clone(),
+            ops: Arc::from(ops.clone()),
             source: crate::flows::OpSource::Local,
         });
 
@@ -1326,7 +1328,7 @@ impl BlockStore {
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
-            ops: ops_bytes.to_vec(),
+            ops: Arc::from(ops_bytes.to_vec()),
             source: crate::flows::OpSource::Remote,
         });
 
@@ -1465,9 +1467,9 @@ impl BlockStore {
 
         self.emit(BlockFlow::Inserted {
             context_id,
-            block: snapshot,
+            block: Arc::new(snapshot),
             after_id,
-            ops,
+            ops: Arc::from(ops),
             source: OpSource::Local,
         });
 

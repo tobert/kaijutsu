@@ -862,15 +862,19 @@ impl RpcActor {
     }
 
     /// Register block and resource event subscriptions on the current connection.
+    ///
+    /// Uses `subscribeBlocksFiltered` with a default empty filter (backward compatible —
+    /// an empty filter has no constraints and receives all events).
     async fn setup_subscriptions(&self) -> Result<(), ActorError> {
         let conn = self.connection.as_ref().ok_or(ActorError::NotConnected)?;
 
-        // Block events
+        // Block events (filtered — empty filter = all events)
         let block_fwd = BlockEventsForwarder { event_tx: self.event_tx.clone() };
         let block_client: crate::kaijutsu_capnp::block_events::Client =
             capnp_rpc::new_client(block_fwd);
-        conn.kernel.subscribe_blocks(block_client).await
-            .map_err(|e| ActorError::Rpc(format!("subscribe_blocks: {e}")))?;
+        let filter = kaijutsu_types::BlockEventFilter::default();
+        conn.kernel.subscribe_blocks_filtered(block_client, &filter).await
+            .map_err(|e| ActorError::Rpc(format!("subscribe_blocks_filtered: {e}")))?;
 
         // Resource events
         let resource_fwd = ResourceEventsForwarder { event_tx: self.event_tx.clone() };

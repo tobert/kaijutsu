@@ -75,6 +75,28 @@ enum ToolKind {
   builtin @2;   # Kernel builtin tool (no external process)
 }
 
+# Discriminant for BlockFlow event variants (for subscription filtering).
+enum BlockFlowKind {
+  inserted @0;
+  textOps @1;
+  deleted @2;
+  statusChanged @3;
+  collapsedChanged @4;
+  moved @5;
+  syncReset @6;
+}
+
+# Server-side filter for block event subscriptions.
+# Empty lists = unconstrained. All constraints are AND'd.
+struct BlockEventFilter {
+  contextIds @0 :List(Data);         # 16-byte ContextId UUIDs
+  hasContextIds @1 :Bool;            # Needed because empty list ≠ unconstrained
+  eventTypes @2 :List(BlockFlowKind);
+  hasEventTypes @3 :Bool;
+  blockKinds @4 :List(BlockKind);
+  hasBlockKinds @5 :Bool;
+}
+
 # How a drift block arrived from another context.
 enum DriftKind {
   push @0;      # User manually pushed content
@@ -988,6 +1010,15 @@ interface Kernel {
 
   # Fetch CRDT sync state only (ops + version, no blocks)
   getContextSync @83 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
+
+  # ============================================================================
+  # Filtered Block Subscriptions
+  # ============================================================================
+
+  # Subscribe to block events with server-side filtering.
+  # Like subscribeBlocks @13 but the server applies the filter before sending,
+  # reducing bandwidth and client CPU during high-throughput streaming.
+  subscribeBlocksFiltered @84 (callback :BlockEvents, filter :BlockEventFilter);
 }
 
 # ============================================================================

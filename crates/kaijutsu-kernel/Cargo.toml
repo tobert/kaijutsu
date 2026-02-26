@@ -53,6 +53,9 @@ shellexpand.workspace = true
 # Async streams
 futures = "0.3"
 
+# Topic-partitioned pub/sub (replaces tokio::sync::broadcast in FlowBus)
+async-broadcast = "0.7"
+
 # MCP (Model Context Protocol)
 rmcp.workspace = true
 

@@ -531,6 +531,27 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Subscribe to block events with server-side filtering.
+    ///
+    /// Like `subscribe_blocks` but the server applies the filter before sending,
+    /// reducing bandwidth and client CPU during high-throughput streaming.
+    #[tracing::instrument(skip(self, callback, filter), name = "rpc_client.subscribe_blocks_filtered")]
+    pub async fn subscribe_blocks_filtered(
+        &self,
+        callback: crate::kaijutsu_capnp::block_events::Client,
+        filter: &kaijutsu_types::BlockEventFilter,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_blocks_filtered_request();
+        {
+            let mut params = request.get();
+            params.set_callback(callback);
+            let mut fb = params.init_filter();
+            set_block_event_filter_builder(&mut fb, filter);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     // =========================================================================
     // MCP Tool operations
     // =========================================================================
@@ -1457,6 +1478,50 @@ fn set_block_filter_builder(
         builder.set_has_parent_id(true);
         let mut pid = builder.reborrow().init_parent_id();
         set_block_id_builder(&mut pid, parent_id);
+    }
+}
+
+fn set_block_event_filter_builder(
+    builder: &mut crate::kaijutsu_capnp::block_event_filter::Builder<'_>,
+    filter: &kaijutsu_types::BlockEventFilter,
+) {
+    if !filter.context_ids.is_empty() {
+        builder.set_has_context_ids(true);
+        let mut list = builder.reborrow().init_context_ids(filter.context_ids.len() as u32);
+        for (i, ctx_id) in filter.context_ids.iter().enumerate() {
+            list.set(i as u32, ctx_id.as_bytes());
+        }
+    }
+
+    if !filter.event_types.is_empty() {
+        builder.set_has_event_types(true);
+        let mut list = builder.reborrow().init_event_types(filter.event_types.len() as u32);
+        for (i, kind) in filter.event_types.iter().enumerate() {
+            list.set(i as u32, match kind {
+                kaijutsu_types::BlockFlowKind::Inserted => crate::kaijutsu_capnp::BlockFlowKind::Inserted,
+                kaijutsu_types::BlockFlowKind::TextOps => crate::kaijutsu_capnp::BlockFlowKind::TextOps,
+                kaijutsu_types::BlockFlowKind::Deleted => crate::kaijutsu_capnp::BlockFlowKind::Deleted,
+                kaijutsu_types::BlockFlowKind::StatusChanged => crate::kaijutsu_capnp::BlockFlowKind::StatusChanged,
+                kaijutsu_types::BlockFlowKind::CollapsedChanged => crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged,
+                kaijutsu_types::BlockFlowKind::Moved => crate::kaijutsu_capnp::BlockFlowKind::Moved,
+                kaijutsu_types::BlockFlowKind::SyncReset => crate::kaijutsu_capnp::BlockFlowKind::SyncReset,
+            });
+        }
+    }
+
+    if !filter.block_kinds.is_empty() {
+        builder.set_has_block_kinds(true);
+        let mut list = builder.reborrow().init_block_kinds(filter.block_kinds.len() as u32);
+        for (i, kind) in filter.block_kinds.iter().enumerate() {
+            list.set(i as u32, match kind {
+                BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+            });
+        }
     }
 }
 

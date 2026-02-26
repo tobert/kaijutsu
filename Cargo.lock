@@ -5346,6 +5346,7 @@ name = "kaijutsu-kernel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-broadcast",
  "async-trait",
  "dashmap",
  "diamond-types-extended",
