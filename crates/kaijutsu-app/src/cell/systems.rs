@@ -1199,6 +1199,10 @@ pub fn sync_main_cell_to_conversation(
     let agent_id = editor.store.agent_id();
     let store_snap = cached.synced.snapshot();
     editor.store = kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id);
+    // Propagate the sync version into the store so downstream dirty checks
+    // (sync_block_cell_buffers: last_render_version < store.version()) detect
+    // that content needs re-rendering after each rebuild.
+    editor.store.set_version(sync_version);
 
     if !matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
         // Update cursor to end of document (unless editing)

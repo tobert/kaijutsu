@@ -99,6 +99,15 @@ impl BlockStore {
         self.version
     }
 
+    /// Override the version counter.
+    ///
+    /// Used after `from_snapshot()` to set the version to the upstream sync
+    /// version so that downstream dirty checks (e.g. `last_render_version <
+    /// version`) correctly detect that content needs re-rendering.
+    pub fn set_version(&mut self, v: u64) {
+        self.version = v;
+    }
+
     /// Get the number of live (non-deleted) blocks.
     pub fn block_count(&self) -> usize {
         self.blocks.values().filter(|b| !b.is_deleted()).count()

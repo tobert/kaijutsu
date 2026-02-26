@@ -5076,9 +5076,13 @@ async fn process_llm_stream(
                             }
                         }
 
-                        // Step 6: Set final status
+                        // Step 6: Set final status on result and call blocks
                         let final_status = if is_error { Status::Error } else { Status::Done };
                         let _ = documents.set_status(cell_id, rb_id, final_status);
+                    }
+                    if let Some(ref tcb_id) = tool_call_block_id {
+                        let final_status = if is_error { Status::Error } else { Status::Done };
+                        let _ = documents.set_status(cell_id, tcb_id, final_status);
                     }
 
                     // Step 7: Return for conversation history
