@@ -1,9 +1,18 @@
 //! Reusable form primitives for kaijutsu-app UI.
 //!
 //! Shared components and spawn helpers extracted from fork_form and model_picker.
+//!
+//! ## Schema system
+//!
+//! `Form` + `FormPresentation` components describe a form declaratively.
+//! The `build_form` system fires on `Added<Form>` and produces the entity tree.
+//! Domain code queries `FormFieldContainer(id)` to insert content, and calls
+//! `handle_form_action()` from its input handler for Tab/j/k/Enter/Esc.
 
 pub mod async_slot;
 pub mod field;
+pub mod navigation;
+pub mod schema;
 pub mod selectable;
 pub mod text;
 pub mod tree;
@@ -11,16 +20,14 @@ pub mod tree;
 use bevy::prelude::*;
 
 pub use async_slot::AsyncSlot;
-pub use field::{ActiveFormField, FormField};
+pub use field::ActiveFormField;
+pub use navigation::{handle_form_action, handle_form_space, FormActionResult};
+pub use schema::{
+    ButtonDesc, FieldDesc, Form, FormFieldContainer, FormLayout, FormLoadingText,
+    FormPresentation,
+};
 pub use selectable::{ListItem, SelectableList};
-#[allow(unused_imports)] // Part of public API, used by consumers for entity queries
-pub use selectable::SelectableListRow;
-pub use text::{msdf_label, msdf_text};
-#[allow(unused_imports)] // Available for forms that need marker components on labels
-pub use text::msdf_label_with;
-pub use tree::{TreeCategory, TreeCursorTarget, TreeItem, TreeView};
-#[allow(unused_imports)] // Part of public API, used by consumers for entity queries
-pub use tree::TreeViewRow;
+pub use tree::{TreeCategory, TreeItem, TreeView};
 
 /// Plugin that registers form primitive systems.
 pub struct FormPlugin;
@@ -30,6 +37,7 @@ impl Plugin for FormPlugin {
         app.add_systems(
             Update,
             (
+                schema::build_form,
                 selectable::sync_selectable_list_visuals,
                 tree::rebuild_tree_view,
                 field::sync_form_field_outlines,

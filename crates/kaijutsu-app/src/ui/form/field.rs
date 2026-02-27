@@ -1,11 +1,12 @@
 //! Form field container with active border highlight.
 //!
-//! Extracts the "labeled bordered section with active highlight" pattern used
-//! by fork_form's three fields (Name, Model, Tools).
+//! `FormField` marks bordered field containers. `ActiveFormField` tracks which
+//! field is active. The `sync_form_field_outlines` system updates border colors.
+//!
+//! Field containers are spawned by `schema::build_form` — no standalone spawn helper.
 
 use bevy::prelude::*;
 
-use crate::text::{MsdfUiText, UiTextPositionCache};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -22,77 +23,6 @@ pub struct FormField {
 /// Place on the same entity as the form root.
 #[derive(Component)]
 pub struct ActiveFormField(pub u8);
-
-// ============================================================================
-// SPAWN HELPER
-// ============================================================================
-
-/// Spawn a form field section with a label above a bordered container.
-/// Returns the inner container entity (where you add content children).
-#[allow(dead_code)] // Available for simpler forms that don't need inline children
-pub fn spawn_form_field(
-    parent: &mut ChildSpawnerCommands,
-    field_id: u8,
-    label: &str,
-    theme: &Theme,
-    is_active: bool,
-    min_height: f32,
-    max_height: Option<f32>,
-) -> Entity {
-    let outline_color = if is_active { theme.accent } else { theme.border };
-
-    let mut container_id = Entity::PLACEHOLDER;
-
-    parent
-        .spawn(Node {
-            width: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(6.0),
-            ..default()
-        })
-        .with_children(|section| {
-            // Label
-            section.spawn((
-                MsdfUiText::new(label)
-                    .with_font_size(12.0)
-                    .with_color(theme.fg_dim),
-                UiTextPositionCache::default(),
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(14.0),
-                    ..default()
-                },
-            ));
-
-            // Bordered container
-            let mut node = Node {
-                width: Val::Percent(100.0),
-                min_height: Val::Px(min_height),
-                flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                row_gap: Val::Px(2.0),
-                overflow: Overflow::scroll_y(),
-                ..default()
-            };
-            if let Some(max) = max_height {
-                node.max_height = Val::Px(max);
-            }
-
-            container_id = section
-                .spawn((
-                    FormField { field_id },
-                    node,
-                    BackgroundColor(theme.panel_bg),
-                    BorderColor::all(outline_color),
-                    Outline::new(Val::Px(1.0), Val::ZERO, outline_color),
-                    Interaction::None, // Touch-ready
-                ))
-                .id();
-        });
-
-    container_id
-}
 
 // ============================================================================
 // SYNC SYSTEM

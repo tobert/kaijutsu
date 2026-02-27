@@ -1,11 +1,10 @@
-//! Model picker dialog for constellation nodes
+//! Model picker dialog for constellation nodes.
 //!
 //! Pressing `m` on a focused constellation node opens a modal dialog
 //! showing available LLM providers/models from `get_llm_config()`.
 //! Select with j/k + Enter to call `set_default_model()`.
 //!
-//! Input is dispatched via `ActionFired` messages from the focus-based
-//! input system (FocusArea::Dialog context).
+//! Uses the Form schema system for UI construction and navigation.
 
 use bevy::prelude::*;
 
@@ -13,8 +12,10 @@ use crate::connection::RpcActor;
 use crate::input::action::Action;
 use crate::input::events::ActionFired;
 use crate::input::focus::{FocusArea, FocusStack};
-use crate::text::{MsdfUiText, UiTextPositionCache};
-use crate::ui::form::{msdf_label, AsyncSlot, ListItem, SelectableList};
+use crate::ui::form::{
+    handle_form_action, AsyncSlot, FieldDesc, Form, FormActionResult, FormFieldContainer,
+    FormLayout, FormLoadingText, FormPresentation, ListItem, SelectableList,
+};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -52,13 +53,8 @@ pub struct ModelPickerDialog {
     pub context_name: String,
 }
 
-/// Marker for the "Loading..." text while fetching config.
-#[derive(Component)]
-pub struct ModelPickerLoading;
-
-/// Marker for the list container entity within the dialog.
-#[derive(Component)]
-struct ModelPickerListContainer;
+// Field ID for the single model list field.
+const FIELD_MODELS: u8 = 0;
 
 // ============================================================================
 // SYSTEMS
@@ -102,72 +98,44 @@ fn handle_open_model_picker(
         focus_stack.push(&mut focus, FocusArea::Dialog);
         result_slot.clear();
 
-        // Spawn loading dialog
-        commands
-            .spawn((
-                ModelPickerDialog {
-                    context_name: event.context_name.clone(),
-                },
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    top: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                BackgroundColor(theme.modal_backdrop),
-                ZIndex(crate::constants::ZLayer::MODAL),
-                Interaction::None,
-            ))
-            .with_children(|overlay| {
-                overlay
-                    .spawn((
-                        Node {
-                            width: Val::Px(300.0),
-                            min_height: Val::Px(120.0),
-                            flex_direction: FlexDirection::Column,
-                            padding: UiRect::all(Val::Px(20.0)),
-                            border_radius: BorderRadius::all(Val::Px(8.0)),
-                            row_gap: Val::Px(12.0),
-                            ..default()
-                        },
-                        BackgroundColor(theme.panel_bg),
-                        BorderColor::all(theme.border),
-                        Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
-                    ))
-                    .with_children(|dialog| {
-                        msdf_label(
-                            dialog,
-                            &format!("Model: @{}", event.context_name),
-                            16.0,
-                            theme.fg,
-                        );
-                        dialog.spawn((
-                            ModelPickerLoading,
-                            MsdfUiText::new("Loading models...")
-                                .with_font_size(12.0)
-                                .with_color(theme.fg_dim),
-                            UiTextPositionCache::default(),
-                            Node {
-                                width: Val::Percent(100.0),
-                                height: Val::Px(14.0),
-                                ..default()
-                            },
-                        ));
-                        // List container (SelectableList will be inserted here)
-                        dialog.spawn((
-                            ModelPickerListContainer,
-                            Node {
-                                width: Val::Percent(100.0),
-                                flex_direction: FlexDirection::Column,
-                                ..default()
-                            },
-                        ));
-                    });
-            });
+        // Spawn form entity with schema
+        commands.spawn((
+            ModelPickerDialog {
+                context_name: event.context_name.clone(),
+            },
+            Form {
+                title: format!("Model: @{}", event.context_name),
+                layout: FormLayout::Column(vec![FieldDesc {
+                    field_id: FIELD_MODELS,
+                    label: String::new(),
+                    min_height: 0.0,
+                    max_height: None,
+                    loading_text: Some("Loading models...".into()),
+                    bordered: false,
+                }]),
+                buttons: vec![],
+                hints: String::new(),
+                field_count: 1,
+                initial_field: FIELD_MODELS,
+            },
+            FormPresentation::Modal {
+                width: 300.0,
+                min_height: 120.0,
+            },
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(theme.modal_backdrop),
+            ZIndex(crate::constants::ZLayer::MODAL),
+            Interaction::None,
+        ));
 
         // Fetch config async
         let handle = actor.handle.clone();
@@ -203,12 +171,15 @@ fn handle_open_model_picker(
 fn poll_model_picker_result(
     mut commands: Commands,
     result_slot: Res<AsyncSlot<FetchedLlmConfig>>,
-    loading: Query<Entity, With<ModelPickerLoading>>,
-    container_query: Query<Entity, With<ModelPickerListContainer>>,
-    existing_list: Query<&SelectableList, With<ModelPickerListContainer>>,
+    loading: Query<Entity, With<FormLoadingText>>,
+    container_query: Query<(Entity, &FormFieldContainer), Without<SelectableList>>,
+    existing_list: Query<(&FormFieldContainer, &SelectableList)>,
 ) {
     // Nothing to do if already populated
-    if !existing_list.is_empty() {
+    let has_list = existing_list
+        .iter()
+        .any(|(ffc, _)| ffc.0 == FIELD_MODELS);
+    if has_list {
         return;
     }
 
@@ -221,7 +192,10 @@ fn poll_model_picker_result(
         commands.entity(entity).despawn();
     }
 
-    let Ok(container) = container_query.single() else {
+    let Some((container, _)) = container_query
+        .iter()
+        .find(|(_, ffc)| ffc.0 == FIELD_MODELS)
+    else {
         return;
     };
 
@@ -246,22 +220,29 @@ fn poll_model_picker_result(
     commands.entity(container).insert(list);
 }
 
-/// Handle actions in the model picker (j/k/Enter/Escape via ActionFired).
+/// Handle actions in the model picker.
 fn handle_model_picker_input(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut focus_stack: ResMut<FocusStack>,
-    dialogs: Query<Entity, With<ModelPickerDialog>>,
-    mut list_query: Query<&mut SelectableList, With<ModelPickerListContainer>>,
+    dialogs: Query<(Entity, &Form), With<ModelPickerDialog>>,
+    mut active_field_query: Query<
+        &mut crate::ui::form::ActiveFormField,
+        With<ModelPickerDialog>,
+    >,
+    mut list_query: Query<(&FormFieldContainer, &mut SelectableList)>,
+    mut tree_query: Query<(&FormFieldContainer, &mut crate::ui::form::TreeView)>,
     actor: Option<Res<RpcActor>>,
 ) {
-    let Ok(dialog_entity) = dialogs.single() else {
+    let Ok((dialog_entity, form)) = dialogs.single() else {
         return;
     };
 
-    if list_query.is_empty() {
-        // Still loading — only handle Escape/Unfocus
+    let has_list = list_query.iter().any(|(ffc, _)| ffc.0 == FIELD_MODELS);
+
+    if !has_list {
+        // Still loading — only handle Escape
         for ActionFired(action) in actions.read() {
             if matches!(action, Action::Unfocus) {
                 close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
@@ -270,52 +251,53 @@ fn handle_model_picker_input(
         return;
     }
 
+    let Ok(mut active_field) = active_field_query.single_mut() else {
+        return;
+    };
+
     for ActionFired(action) in actions.read() {
-        match action {
-            Action::Unfocus => {
+        match handle_form_action(action, form, &mut active_field, &mut list_query, &mut tree_query)
+        {
+            FormActionResult::Cancel => {
                 close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
             }
-            Action::Activate => {
-                if let Ok(list) = list_query.single() {
-                    if let Some(item) = list.selected_item() {
-                        // Parse "provider/model" back into parts
-                        if let Some((provider, model)) = item.label.split_once('/') {
-                            info!("Model selected: {}/{}", provider, model);
+            FormActionResult::Submit => {
+                // Find the model list and get the selected item
+                if let Some((_, list)) = list_query.iter().find(|(ffc, _)| ffc.0 == FIELD_MODELS)
+                    && let Some(item) = list.selected_item()
+                    && let Some((provider, model)) = item.label.split_once('/')
+                {
+                    info!("Model selected: {}/{}", provider, model);
 
-                            if let Some(ref actor) = actor {
-                                let handle = actor.handle.clone();
-                                let provider = provider.to_string();
-                                let model = model.to_string();
+                    if let Some(ref actor) = actor {
+                        let handle = actor.handle.clone();
+                        let provider = provider.to_string();
+                        let model = model.to_string();
 
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        match handle.set_default_model(&provider, &model).await {
-                                            Ok(true) => info!("Model set to {}/{}", provider, model),
-                                            Ok(false) => warn!("set_default_model returned false"),
-                                            Err(e) => error!("Failed to set model: {}", e),
-                                        }
-                                    })
-                                    .detach();
-                            }
-                        }
+                        bevy::tasks::IoTaskPool::get()
+                            .spawn(async move {
+                                match handle
+                                    .set_default_model(&provider, &model)
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        info!("Model set to {}/{}", provider, model)
+                                    }
+                                    Ok(false) => {
+                                        warn!("set_default_model returned false")
+                                    }
+                                    Err(e) => error!("Failed to set model: {}", e),
+                                }
+                            })
+                            .detach();
                     }
                 }
 
                 close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
             }
-            Action::FocusNextBlock => {
-                if let Ok(mut list) = list_query.single_mut() {
-                    list.select_next();
-                }
-            }
-            Action::FocusPrevBlock => {
-                if let Ok(mut list) = list_query.single_mut() {
-                    list.select_prev();
-                }
-            }
-            _ => {}
+            FormActionResult::Consumed | FormActionResult::Ignored => {}
         }
     }
 }
