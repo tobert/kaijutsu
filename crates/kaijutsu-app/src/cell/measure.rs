@@ -1,23 +1,23 @@
-//! MSDF text measurement for Bevy UI layout integration.
+//! Text measurement for Bevy UI layout integration.
 //!
-//! Sets `ContentSize` on BlockCells using `FixedMeasure` with pre-computed
-//! heights from MSDF line counts. This lets Bevy's taffy layout engine
+//! Sets `ContentSize` on BlockCells using `FixedMeasure` with estimated
+//! heights from text length. This lets Bevy's taffy layout engine
 //! compute correct heights for BlockCells without manual height tracking.
 
 use bevy::prelude::*;
 use bevy::ui::measurement::{ContentSize, FixedMeasure, NodeMeasure};
+use bevy_vello::prelude::UiVelloText;
 
 use super::components::{
     BlockCell, BlockCellContainer, ConversationContainer, WorkspaceLayout,
 };
 use super::systems::EditorEntities;
-use crate::text::{FontMetricsCache, MsdfTextBuffer, SharedFontSystem};
 use crate::ui::tiling::PaneFocus;
 
-/// Update `ContentSize` on BlockCells with cached MSDF line counts.
+/// Update `ContentSize` on BlockCells with estimated line counts.
 ///
 /// Runs after `sync_block_cell_buffers` (CellPhase::Buffer), before Bevy's
-/// layout pass. Computes visual line count at the current pane width and
+/// layout pass. Estimates visual line count at the current pane width and
 /// sets a `FixedMeasure` so taffy can derive correct heights.
 ///
 /// **Optimization:** Compares computed height against existing measure before
@@ -27,11 +27,9 @@ pub fn update_msdf_measures(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<
-        (&mut MsdfTextBuffer, &mut ContentSize),
+        (&UiVelloText, &mut ContentSize),
         With<BlockCell>,
     >,
-    font_system: Res<SharedFontSystem>,
-    mut metrics_cache: ResMut<FontMetricsCache>,
     layout: Res<WorkspaceLayout>,
     conv_containers: Query<
         &ComputedNode,
@@ -74,10 +72,8 @@ pub fn update_msdf_measures(
     *last_gen = layout_gen.0;
     *last_base_width = base_width;
 
-    let mut fs = font_system.0.lock().unwrap();
-
     for entity in &container.block_cells {
-        let Ok((mut buffer, mut content_size)) = block_cells.get_mut(*entity) else {
+        let Ok((vello_text, mut content_size)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -87,8 +83,13 @@ pub fn update_msdf_measures(
         // BlockCellLayout here to avoid borrow conflicts.
         let wrap_width = base_width;
 
-        let line_count =
-            buffer.visual_line_count(&mut fs, wrap_width, Some(&mut metrics_cache));
+        // Estimate line count from text length and wrap width
+        let char_width = layout.line_height * 0.6; // approximate monospace
+        let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
+        let text = &vello_text.value;
+        let line_count = text.split('\n').map(|line| {
+            if line.is_empty() { 1 } else { (line.len() + chars_per_line - 1) / chars_per_line }
+        }).sum::<usize>().max(1);
 
         let height = (line_count as f32) * layout.line_height + 4.0;
 

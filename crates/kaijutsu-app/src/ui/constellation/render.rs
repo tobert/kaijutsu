@@ -4,7 +4,7 @@
 //! - Rectangular card nodes for each context (using ConstellationCardMaterial)
 //! - Connection lines between related contexts
 //! - Camera-aware positioning with pan/zoom support
-//! - Tab toggles Display + Visibility::Hidden (prevents MSDF text bleed-through)
+//! - Tab toggles Display + Visibility::Hidden (prevents text bleed-through)
 //!
 //! NOTE: 2D card/connection/starfield systems are currently disabled — replaced
 //! by the 3D viewport in `viewport.rs` (Phase 1.5+). Kept for reference and
@@ -61,7 +61,7 @@ pub struct LegendContent;
 /// - Visibility sync (constellation ↔ conversation toggle)
 /// - Container spawn (still needed as ViewportNode parent)
 /// - Legend panel (2D overlay on top of 3D viewport)
-/// - Cell text visibility (MSDF bleed-through prevention)
+/// - Cell text visibility (bleed-through prevention)
 pub fn setup_constellation_rendering(app: &mut App) {
     app.add_systems(
         Update,
@@ -119,7 +119,7 @@ fn spawn_constellation_container(
                 display: Display::None, // Start hidden
                 ..default()
             },
-            Visibility::Hidden, // Hidden for rendering too — prevents MSDF bleed-through
+            Visibility::Hidden, // Hidden for rendering too — prevents text bleed-through
             BackgroundColor(Color::NONE),
         ))
         .id();
@@ -403,10 +403,10 @@ fn spawn_context_nodes(
                     ))
                     .with_children(|label_bg| {
                         label_bg.spawn((
-                            crate::text::MsdfUiText::new(&label)
+                            crate::text::KjUiText::new(&label)
                                 .with_font_size(12.0)
                                 .with_color(theme.fg),
-                            crate::text::UiTextPositionCache::default(),
+                            bevy_vello::prelude::UiVelloText::default(),
                             Node::default(),
                         ));
                     });
@@ -430,10 +430,10 @@ fn spawn_context_nodes(
                     ))
                     .with_children(|model_bg| {
                         model_bg.spawn((
-                            crate::text::MsdfUiText::new(&model_text)
+                            crate::text::KjUiText::new(&model_text)
                                 .with_font_size(9.0)
                                 .with_color(theme.fg_dim),
-                            crate::text::UiTextPositionCache::default(),
+                            bevy_vello::prelude::UiVelloText::default(),
                             Node::default(),
                         ));
                     });
@@ -1048,7 +1048,7 @@ fn update_legend_content(
     }
 
     // Build a cheap fingerprint of the data that drives legend content.
-    // Only rebuild when this fingerprint changes — avoids despawning MSDF
+    // Only rebuild when this fingerprint changes — avoids despawning text
     // text entities every frame (they need 2+ frames to initialize rendering).
     let fingerprint = {
         let mut h: u64 = constellation.nodes.len() as u64;
@@ -1198,11 +1198,11 @@ fn spawn_legend_text(commands: &mut Commands, text: &str, color: Color, font_siz
         ))
         .with_children(|parent| {
             parent.spawn((
-                crate::text::MsdfUiText::new(text)
+                crate::text::KjUiText::new(text)
                     .with_font_size(font_size)
                     .with_color(color),
-                crate::text::UiTextPositionCache::default(),
-                // Explicit size needed — MsdfUiText doesn't participate in Bevy's
+                bevy_vello::prelude::UiVelloText::default(),
+                // Explicit size needed — KjUiText doesn't participate in Bevy's
                 // layout intrinsic sizing, so the node would compute as 0-width.
                 Node {
                     width: Val::Percent(100.0),
@@ -1247,10 +1247,10 @@ fn spawn_legend_agent_row(
 
             // Agent name
             parent.spawn((
-                crate::text::MsdfUiText::new(name)
+                crate::text::KjUiText::new(name)
                     .with_font_size(10.0)
                     .with_color(color),
-                crate::text::UiTextPositionCache::default(),
+                bevy_vello::prelude::UiVelloText::default(),
                 Node {
                     width: Val::Px(70.0),
                     height: Val::Px(12.0),
@@ -1261,10 +1261,10 @@ fn spawn_legend_agent_row(
             // Count (right-aligned)
             let count_text = format!("{} ctx", count);
             parent.spawn((
-                crate::text::MsdfUiText::new(&count_text)
+                crate::text::KjUiText::new(&count_text)
                     .with_font_size(9.0)
                     .with_color(theme.fg_dim),
-                crate::text::UiTextPositionCache::default(),
+                bevy_vello::prelude::UiVelloText::default(),
                 Node {
                     width: Val::Px(50.0),
                     height: Val::Px(11.0),
@@ -1280,7 +1280,7 @@ fn spawn_legend_agent_row(
 fn update_model_labels(
     constellation: Res<Constellation>,
     mut model_labels: Query<(&ModelLabel, &Children)>,
-    mut msdf_texts: Query<&mut crate::text::MsdfUiText>,
+    mut kj_texts: Query<&mut crate::text::KjUiText>,
 ) {
     if !constellation.is_changed() {
         return;
@@ -1296,10 +1296,10 @@ fn update_model_labels(
             .unwrap_or_default();
 
         for child in children.iter() {
-            if let Ok(mut msdf_text) = msdf_texts.get_mut(child)
-                && msdf_text.text != model_text
+            if let Ok(mut kj_text) = kj_texts.get_mut(child)
+                && kj_text.text != model_text
             {
-                msdf_text.text = model_text.clone();
+                kj_text.text = model_text.clone();
             }
         }
     }

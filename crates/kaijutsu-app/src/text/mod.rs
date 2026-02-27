@@ -1,28 +1,16 @@
-//! Text rendering module using MSDF (Multi-channel Signed Distance Fields).
+//! Text rendering module using Vello (vector graphics).
 //!
-//! Provides GPU-accelerated text rendering that integrates with Bevy's render pipeline.
-//! Uses cosmic-text for shaping/layout and MSDF textures for crisp rendering at any scale.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! cosmic-text (shaping + layout)
-//!     ↓
-//! MsdfTextBuffer (positioned glyphs)
-//!     ↓
-//! MsdfAtlas (glyph_id → texture region)
-//!     ↓
-//! msdf_text.wgsl (GPU rendering with effects)
-//! ```
+//! Provides GPU-accelerated text rendering via bevy_vello, which uses
+//! Parley for text layout and Vello for vector path rendering.
 
+pub mod components;
+#[allow(dead_code)] // Phase 4: vello_label/vello_text used when call sites adopt FontHandles
+pub mod helpers;
+#[allow(dead_code)] // Phase 4: rich markdown rendering via Parley spans
 pub mod markdown;
-pub mod msdf;
 mod plugin;
 mod resources;
 
-pub use msdf::{
-    FontMetricsCache, MsdfBufferInfo, MsdfText, MsdfTextBuffer, MsdfTextAreaConfig,
-    MsdfUiText, TextBounds, UiTextPositionCache,
-};
-pub use plugin::TextRenderPlugin;
-pub use resources::{bevy_to_cosmic_color, bevy_to_rgba8, SharedFontSystem, TextMetrics};
+pub use components::{KjText, KjTextEffects, KjUiText, bevy_color_to_brush};
+pub use plugin::KjTextPlugin;
+pub use resources::{FontHandles, TextMetrics};

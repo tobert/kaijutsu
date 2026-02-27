@@ -2,7 +2,7 @@
 //!
 //! Replaces 2D UiMaterial cards with 3D billboard quads positioned using the
 //! H3 layout engine. Edges are rendered as line segments. Labels use screen-space
-//! projected MSDF text overlays.
+//! projected Vello text overlays.
 //!
 //! All 3D entities use `RenderLayers::layer(1)` and are rendered by the
 //! constellation viewport camera.
@@ -22,7 +22,8 @@ use super::{
     viewport::{ViewportState, ConstellationCamera3d, TestSphere},
 };
 use crate::ui::screen::Screen;
-use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::{Theme, agent_color_for_provider};
 
 /// The render layer used for all constellation 3D content.
@@ -386,7 +387,7 @@ fn on_node_3d_click(
 /// Update screen-space labels for 3D constellation nodes.
 ///
 /// Projects 3D node positions through the constellation camera to get 2D
-/// screen coordinates, then positions MSDF text labels as absolute-positioned
+/// screen coordinates, then positions Vello text labels as absolute-positioned
 /// children of the ConstellationContainer.
 ///
 /// Labels are spawned/despawned when the constellation changes, but
@@ -468,10 +469,10 @@ fn update_node_labels(
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        MsdfUiText::new(&label_text)
+                        KjUiText::new(&label_text)
                             .with_font_size(10.0)
                             .with_color(Color::srgba(0.8, 0.85, 0.9, 0.9)),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node {
                             min_width: Val::Px(80.0),
                             min_height: Val::Px(14.0),

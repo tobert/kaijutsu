@@ -6,7 +6,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -196,10 +197,10 @@ pub fn sync_selectable_list_visuals(
                     .with_children(|r| {
                         r.spawn((
                             SelectableListRowText,
-                            MsdfUiText::new(&item.label)
+                            KjUiText::new(&item.label)
                                 .with_font_size(header_font_size)
                                 .with_color(theme.fg_dim),
-                            UiTextPositionCache::default(),
+                            UiVelloText::default(),
                             Node {
                                 width: Val::Percent(100.0),
                                 height: Val::Px((header_font_size * 1.2).ceil()),
@@ -241,10 +242,10 @@ pub fn sync_selectable_list_visuals(
                     .with_children(|r| {
                         r.spawn((
                             SelectableListRowText,
-                            MsdfUiText::new(&text)
+                            KjUiText::new(&text)
                                 .with_font_size(font_size)
                                 .with_color(color),
-                            UiTextPositionCache::default(),
+                            UiVelloText::default(),
                             Node {
                                 width: Val::Percent(100.0),
                                 height: Val::Px((font_size * 1.2).ceil()),

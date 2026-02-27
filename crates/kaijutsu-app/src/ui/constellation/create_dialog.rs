@@ -11,7 +11,8 @@ use kaijutsu_crdt::ContextId;
 use uuid::Uuid;
 
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
-use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::Theme;
 
 use super::NewContextConfig;
@@ -167,12 +168,12 @@ pub fn spawn_create_context_node(
                 },
             ))
             .with_children(|center| {
-                // TODO: explicit size — MsdfUiText no intrinsic sizing
+                // TODO: explicit size — KjUiText no intrinsic sizing
                 center.spawn((
-                    MsdfUiText::new("New")
+                    KjUiText::new("New")
                         .with_font_size(14.0)
                         .with_color(theme.fg_dim),
-                    UiTextPositionCache::default(),
+                    UiVelloText::default(),
                     Node {
                         width: Val::Px(40.0),
                         height: Val::Px(16.0),
@@ -196,12 +197,12 @@ pub fn spawn_create_context_node(
                     BackgroundColor(theme.panel_bg.with_alpha(0.7)),
                 ))
                 .with_children(|label_bg| {
-                    // TODO: explicit size — MsdfUiText no intrinsic sizing
+                    // TODO: explicit size — KjUiText no intrinsic sizing
                     label_bg.spawn((
-                        MsdfUiText::new("n")
+                        KjUiText::new("n")
                             .with_font_size(10.0)
                             .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node {
                             width: Val::Percent(100.0),
                             height: Val::Px(12.0),

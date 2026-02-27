@@ -13,7 +13,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::form::field::{ActiveFormField, FormField};
 use crate::ui::form::text::{msdf_label, msdf_text};
 use crate::ui::theme::Theme;
@@ -342,10 +343,10 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
                     if let Some(ref text) = desc.loading_text {
                         container.spawn((
                             FormLoadingText(desc.field_id),
-                            MsdfUiText::new(text)
+                            KjUiText::new(text)
                                 .with_font_size(14.0)
                                 .with_color(theme.fg_dim),
-                            UiTextPositionCache::default(),
+                            UiVelloText::default(),
                             Node {
                                 width: Val::Percent(100.0),
                                 height: Val::Px(16.0),
@@ -377,10 +378,10 @@ fn spawn_bare_field(
             if let Some(ref text) = desc.loading_text {
                 container.spawn((
                     FormLoadingText(desc.field_id),
-                    MsdfUiText::new(text)
+                    KjUiText::new(text)
                         .with_font_size(12.0)
                         .with_color(theme.fg_dim),
-                    UiTextPositionCache::default(),
+                    UiVelloText::default(),
                     Node {
                         width: Val::Percent(100.0),
                         height: Val::Px(14.0),

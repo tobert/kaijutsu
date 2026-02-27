@@ -20,7 +20,7 @@ use bevy::prelude::*;
 
 use super::constellation::{ConstellationContainer, viewport::ConstellationCamera3d};
 use super::state::ConversationRoot;
-use crate::text::MsdfText;
+use crate::text::KjText;
 
 /// Which full-viewport view is currently active.
 ///
@@ -71,7 +71,7 @@ impl Plugin for ScreenPlugin {
         // OnExit(Constellation) already deactivated the camera.
 
         // ── Continuous ──
-        // Hide newly-added MSDF text entities that appear while not in conversation
+        // Hide newly-added text entities that appear while not in conversation
         // (e.g., block cells created by background sync while constellation is showing).
         app.add_systems(
             Update,
@@ -155,22 +155,22 @@ fn hide_conversation_root(
     }
 }
 
-/// Hide orphaned MSDF cell text when leaving conversation.
+/// Hide orphaned cell text when leaving conversation.
 ///
 /// Block cells and role headers are spawned as root-level entities (no parent)
 /// with screen-space coordinates. Since they're not descendants of
 /// ConversationRoot, Visibility::Hidden doesn't propagate to them.
 fn hide_cell_text(
-    mut cell_texts: Query<&mut Visibility, (With<MsdfText>, Without<Node>)>,
+    mut cell_texts: Query<&mut Visibility, (With<KjText>, Without<Node>)>,
 ) {
     for mut vis in cell_texts.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }
 
-/// Show orphaned MSDF cell text when entering conversation.
+/// Show orphaned cell text when entering conversation.
 fn show_cell_text(
-    mut cell_texts: Query<&mut Visibility, (With<MsdfText>, Without<Node>)>,
+    mut cell_texts: Query<&mut Visibility, (With<KjText>, Without<Node>)>,
 ) {
     for mut vis in cell_texts.iter_mut() {
         *vis = Visibility::Inherited;
@@ -184,13 +184,13 @@ fn set_focus_compose(
     *focus = crate::input::focus::FocusArea::Compose;
 }
 
-/// Hide newly-added MSDF cell text entities when not in conversation view.
+/// Hide newly-added cell text entities when not in conversation view.
 ///
 /// Block cells may be created by background sync while the constellation or
 /// fork form is showing. Without this, they'd bleed through until the next
 /// screen transition.
 fn hide_new_cell_text_outside_conversation(
-    mut new_texts: Query<&mut Visibility, (Added<MsdfText>, Without<Node>)>,
+    mut new_texts: Query<&mut Visibility, (Added<KjText>, Without<Node>)>,
 ) {
     for mut vis in new_texts.iter_mut() {
         *vis = Visibility::Hidden;

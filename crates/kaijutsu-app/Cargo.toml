@@ -18,16 +18,9 @@ bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
 
-# Text rendering (MSDF-based)
-cosmic-text.workspace = true
+# Text rendering (Vello-based)
+bevy_vello = { version = "0.13", features = ["text"] }
 pulldown-cmark.workspace = true
-# Font metrics for shader-based hinting
-swash = "0.2"
-
-# MSDF generation
-msdfgen = { git = "https://github.com/katyo/msdfgen-rs", rev = "5e62bcf", default-features = false, features = ["ttf-parser"] }
-owned_ttf_parser = "0.19"  # Must match msdfgen's ttf-parser version for FontExt trait
-rect_packer = "0.2"
 bytemuck = { version = "1.21", features = ["derive"] }
 
 # Serialization

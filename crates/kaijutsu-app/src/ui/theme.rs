@@ -66,6 +66,7 @@ impl Default for AnsiColors {
 /// Syntax highlighting colors for kaish shell input.
 ///
 /// Defaults are derived from the ANSI palette (Tokyo Night).
+#[allow(dead_code)] // Phase 4: syntax highlighting via Parley spans
 #[derive(Clone, Debug)]
 pub struct SyntaxColors {
     pub keyword: Color,     // if, for, fn, while
@@ -155,8 +156,9 @@ pub struct Theme {
     pub ansi: AnsiColors,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Syntax highlighting (kaish shell input)
+    // Syntax highlighting (kaish shell input) — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
+    #[allow(dead_code)]
     pub syntax: SyntaxColors,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -217,56 +219,23 @@ pub struct Theme {
     pub input_backdrop_color: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Markdown Rendering Colors
+    // Markdown Rendering Colors — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Heading text color (bright accent)
+    #[allow(dead_code)]
     pub md_heading_color: Color,
-    /// Inline `code` foreground color
+    #[allow(dead_code)]
     pub md_code_fg: Color,
-    /// Fenced code block foreground color
+    #[allow(dead_code)]
     pub md_code_block_fg: Color,
-    /// Bold/strong emphasis color (None = inherit base block color)
+    #[allow(dead_code)]
     pub md_strong_color: Option<Color>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Font Rendering Quality (MSDF text)
+    // Font Effects
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Stem darkening strength (0.0-0.5). Thickens thin strokes at small font sizes.
-    /// ~0.15 = ClearType-like weight for 12-16px text.
-    pub font_stem_darkening: f32,
-    /// Hinting strength (0.0-1.0). Sharpens horizontal strokes (stems, crossbars).
-    pub font_hint_amount: f32,
-    /// Enable temporal anti-aliasing for smoother text edges.
-    pub font_taa_enabled: bool,
-    /// Number of frames for TAA to converge (4-16). Lower = faster fade-in.
-    pub font_taa_convergence_frames: u32,
-    /// Initial blend weight (0.3-0.9). Higher = more visible on first frame.
-    pub font_taa_initial_weight: f32,
-    /// Final blend weight (0.05-0.3). Lower = more temporal smoothing.
-    pub font_taa_final_weight: f32,
-    /// Horizontal stroke AA scale (1.0-1.3). Wider AA for vertical strokes.
-    pub font_horz_scale: f32,
-    /// Vertical stroke AA scale (0.5-0.8). Sharper AA for horizontal strokes.
-    pub font_vert_scale: f32,
-    /// SDF threshold for text rendering (0.45-0.55). Lower = thicker strokes.
-    pub font_text_bias: f32,
-    /// Gamma correction for alpha (< 1.0 widens AA for light-on-dark, > 1.0 for dark-on-light).
-    /// Default 0.85 compensates for perceptual thinning of light text on dark backgrounds.
-    pub font_gamma_correction: f32,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Font Effects (MSDF text)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Glow intensity (0.0-1.0). 0 = off.
-    pub font_glow_intensity: f32,
-    /// Glow spread in pixels (0.5-10.0).
-    pub font_glow_spread: f32,
-    /// Glow color.
-    pub font_glow_color: Color,
-    /// Enable rainbow color cycling effect.
+    /// Enable rainbow color cycling effect on user text.
     pub font_rainbow: bool,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -506,23 +475,7 @@ impl Default for Theme {
             md_code_block_fg: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             md_strong_color: None,
 
-            // Font rendering quality
-            font_stem_darkening: 0.15,
-            font_hint_amount: 0.8,
-            font_taa_enabled: true,
-            font_taa_convergence_frames: 8,
-            font_taa_initial_weight: 0.5,
-            font_taa_final_weight: 0.1,
-            font_horz_scale: 1.1,
-            font_vert_scale: 0.6,
-            font_text_bias: 0.47,
-            font_gamma_correction: 0.78,
-
-            // Font effects — post-process bloom glow
-            // Subtle: rainbow text picks up more bloom from brighter colors.
-            font_glow_intensity: 0.1,
-            font_glow_spread: 1.5,
-            font_glow_color: Color::srgba(0.0, 1.0, 1.0, 0.15), // #00ffff electric cyan
+            // Font effects
             font_rainbow: true,
 
             // Constellation

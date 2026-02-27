@@ -33,8 +33,8 @@ use super::theme::Theme;
 use crate::cell::ComposeBlock;
 use crate::cell::ConversationContainer;
 use crate::constants::ZLayer;
-use crate::text::{MsdfText, MsdfTextAreaConfig, MsdfUiText, UiTextPositionCache};
-use crate::text::msdf::SdfTextEffects;
+use crate::text::{KjText, KjUiText, KjTextEffects};
+use bevy_vello::prelude::UiVelloText;
 
 // ============================================================================
 // MARKERS
@@ -349,9 +349,8 @@ fn spawn_content_subtree(
                     },
                     *id,
                     compose,
-                    MsdfText,
-                    MsdfTextAreaConfig::default(),
-                    SdfTextEffects { rainbow: true },
+                    KjText,
+                    KjTextEffects { rainbow: true },
                     Node {
                         min_height: Val::Px(60.0),
                         padding: UiRect::all(Val::Px(12.0)),
@@ -503,7 +502,7 @@ pub struct WidgetPaneText {
     pub widget_type: PaneContent,
 }
 
-/// Spawn a widget with MSDF text as a child entity.
+/// Spawn a widget with Vello text as a child entity.
 fn spawn_widget_text(
     parent: &mut ChildSpawnerCommands,
     id: PaneId,
@@ -551,10 +550,10 @@ fn spawn_widget_text(
         ))
         .with_children(|text_parent| {
             text_parent.spawn((
-                MsdfUiText::new(initial_text)
+                KjUiText::new(initial_text)
                     .with_font_size(font_size)
                     .with_color(color),
-                UiTextPositionCache::default(),
+                UiVelloText::default(),
                 Node {
                     min_width: Val::Px(if has_padding { min_width - 16.0 } else { min_width }),
                     min_height: Val::Px(min_height),
@@ -863,10 +862,10 @@ pub fn sync_unfocused_pane_summaries(
                 let summary_entity = commands
                     .spawn((
                         UnfocusedPaneSummary,
-                        MsdfUiText::new(&summary_text)
+                        KjUiText::new(&summary_text)
                             .with_font_size(14.0)
                             .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node {
                             width: Val::Percent(100.0),
                             padding: UiRect::all(Val::Px(16.0)),

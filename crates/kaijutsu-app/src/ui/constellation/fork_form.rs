@@ -19,7 +19,8 @@ use uuid::Uuid;
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
 use crate::input::action::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
-use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::form::{
     handle_form_action, handle_form_space, ActiveFormField, AsyncSlot, ButtonDesc, FieldDesc, Form,
     FormActionResult, FormFieldContainer, FormLayout, FormLoadingText, FormPresentation, ListItem,
@@ -317,10 +318,10 @@ fn init_name_display(
             let child = commands
                 .spawn((
                     ForkFormNameDisplay,
-                    MsdfUiText::new("hex ID if blank")
+                    KjUiText::new("hex ID if blank")
                         .with_font_size(14.0)
                         .with_color(theme.fg_dim),
-                    UiTextPositionCache::default(),
+                    UiVelloText::default(),
                     Node {
                         width: Val::Percent(100.0),
                         height: Val::Px(16.0),
@@ -394,10 +395,10 @@ fn poll_fork_form_models(
     if list_items.is_empty() {
         let hint = commands
             .spawn((
-                MsdfUiText::new("No models available (will inherit parent)")
+                KjUiText::new("No models available (will inherit parent)")
                     .with_font_size(13.0)
                     .with_color(theme.fg_dim),
-                UiTextPositionCache::default(),
+                UiVelloText::default(),
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Px(15.0),
@@ -471,10 +472,10 @@ fn poll_fork_form_tools(
     if fetched.categories.is_empty() {
         let hint = commands
             .spawn((
-                MsdfUiText::new("No tools available")
+                KjUiText::new("No tools available")
                     .with_font_size(13.0)
                     .with_color(theme.fg_dim),
-                UiTextPositionCache::default(),
+                UiVelloText::default(),
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Px(15.0),
@@ -508,7 +509,7 @@ fn handle_fork_form_input(
             &mut ActiveFormField,
         ),
     >,
-    mut name_display: Query<&mut MsdfUiText, With<ForkFormNameDisplay>>,
+    mut name_display: Query<&mut KjUiText, With<ForkFormNameDisplay>>,
     mut list_query: Query<(&FormFieldContainer, &mut SelectableList)>,
     mut tree_query: Query<(&FormFieldContainer, &mut TreeView)>,
     theme: Res<Theme>,
@@ -578,13 +579,13 @@ fn handle_fork_form_input(
         }
     }
 
-    if text_changed && let Ok(mut msdf) = name_display.single_mut() {
+    if text_changed && let Ok(mut kj) = name_display.single_mut() {
         if state.name_text.is_empty() {
-            msdf.text = "hex ID if blank".to_string();
-            msdf.color = bevy_to_rgba8(theme.fg_dim);
+            kj.text = "hex ID if blank".to_string();
+            kj.color = theme.fg_dim;
         } else {
-            msdf.text = state.name_text.clone();
-            msdf.color = bevy_to_rgba8(theme.fg);
+            kj.text = state.name_text.clone();
+            kj.color = theme.fg;
         }
     }
 }

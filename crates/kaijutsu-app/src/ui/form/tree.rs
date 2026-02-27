@@ -5,7 +5,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -241,10 +242,10 @@ pub fn rebuild_tree_view(
                 ))
                 .with_children(|r| {
                     r.spawn((
-                        MsdfUiText::new(&label)
+                        KjUiText::new(&label)
                             .with_font_size(font_size)
                             .with_color(color),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node {
                             width: Val::Percent(100.0),
                             height: Val::Px((font_size * 1.2).ceil()),
@@ -288,10 +289,10 @@ pub fn rebuild_tree_view(
                         ))
                         .with_children(|r| {
                             r.spawn((
-                                MsdfUiText::new(&label)
+                                KjUiText::new(&label)
                                     .with_font_size(font_size)
                                     .with_color(color),
-                                UiTextPositionCache::default(),
+                                UiVelloText::default(),
                                 Node {
                                     width: Val::Percent(100.0),
                                     height: Val::Px((font_size * 1.2).ceil()),

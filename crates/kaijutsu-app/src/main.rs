@@ -1,7 +1,7 @@
 //! Kaijutsu App - Cell-based collaborative workspace
 //!
 //! A fresh implementation with cells as the universal primitive.
-//! CRDT sync via diamond-types, cosmic-text rendering.
+//! CRDT sync via diamond-types, Vello text rendering.
 //!
 //! ## UI Architecture
 //!
@@ -85,8 +85,8 @@ fn main() {
         })
         // Remote debugging (BRP) - BrpExtrasPlugin includes RemotePlugin
         .add_plugins(BrpExtrasPlugin)
-        // Text rendering (glyphon + cosmic-text)
-        .add_plugins(text::TextRenderPlugin)
+        // Text rendering (Vello vector graphics)
+        .add_plugins(text::KjTextPlugin)
         // Focus-based input dispatch (Phase 1: emits alongside old handlers)
         .add_plugins(input::InputPlugin)
         // Cell editing

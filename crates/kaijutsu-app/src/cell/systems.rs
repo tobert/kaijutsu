@@ -1,7 +1,6 @@
 //! Cell systems for input handling and rendering.
 
 use bevy::prelude::*;
-use bevy::ui::CalculatedClip;
 use bevy::ui::measurement::ContentSize;
 
 use super::components::{
@@ -12,12 +11,8 @@ use super::components::{
 };
 use crate::input::FocusArea;
 use crate::conversation::ActiveContext;
-use crate::text::{
-    bevy_to_cosmic_color, FontMetricsCache, MsdfBufferInfo, MsdfText, SharedFontSystem,
-    MsdfTextAreaConfig, MsdfTextBuffer, TextMetrics,
-    msdf::SdfTextEffects,
-};
-use crate::text::markdown::{self, MarkdownColors};
+use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush};
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -88,38 +83,11 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
 
 // Input handling moved to input/ module (focus-based dispatch).
 
-/// Initialize MsdfTextBuffer for cells that don't have one yet.
-pub fn init_cell_buffers(
-    mut commands: Commands,
-    cells_without_buffer: Query<(Entity, &CellEditor), (With<MsdfText>, Without<MsdfTextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
-    text_metrics: Res<TextMetrics>,
-) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (entity, editor) in cells_without_buffer.iter() {
-        // Create a new buffer with DPI-aware metrics
-        let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        buffer.set_snap_x(true); // monospace: snap to pixel grid
-        buffer.set_letter_spacing(text_metrics.letter_spacing);
-
-        // Initialize with current editor text
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(
-            &mut font_system,
-            &editor.text(),
-            attrs,
-            cosmic_text::Shaping::Advanced,
-        );
-
-        // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
-        info!("Initialized MsdfTextBuffer for entity {:?}", entity);
-    }
-}
+/// Initialize text for cells that don't have UiVelloText yet.
+///
+/// No longer needed — Vello text entities are complete at spawn time.
+/// Kept as a no-op for plugin system set compatibility.
+pub fn init_cell_buffers() {}
 
 /// Format content blocks for display.
 ///
@@ -232,32 +200,22 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
     }
 }
 
-/// Update MsdfTextBuffer from CellEditor when dirty.
+/// Sync UiVelloText from CellEditor when dirty.
 ///
 /// For cells with content blocks, formats them with visual markers.
 /// For plain text cells, uses the text directly.
 pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut MsdfTextBuffer, Option<&BlockCellContainer>), Changed<CellEditor>>,
-    font_system: Res<SharedFontSystem>,
+    mut cells: Query<(&CellEditor, &mut UiVelloText, Option<&BlockCellContainer>), Changed<CellEditor>>,
 ) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (editor, mut buffer, container) in cells.iter_mut() {
+    for (editor, mut vello_text, container) in cells.iter_mut() {
         // Skip cells that have BlockCells — they render per-block via sync_block_cell_buffers.
-        // Clear the MainCell buffer so it doesn't render an overlapping text wall.
+        // Clear the MainCell text so it doesn't render an overlapping text wall.
         if container.is_some_and(|c| !c.block_cells.is_empty()) {
-            buffer.set_text(
-                &mut font_system,
-                "",
-                cosmic_text::Attrs::new(),
-                cosmic_text::Shaping::Advanced,
-            );
+            if !vello_text.value.is_empty() {
+                vello_text.value.clear();
+            }
             continue;
         }
-
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
 
         // Use block-formatted text if we have blocks, otherwise use raw text
         let display_text = if editor.has_blocks() {
@@ -266,12 +224,9 @@ pub fn sync_cell_buffers(
             editor.text()
         };
 
-        buffer.set_text(
-            &mut font_system,
-            &display_text,
-            attrs,
-            cosmic_text::Shaping::Advanced,
-        );
+        if vello_text.value != display_text {
+            vello_text.value = display_text;
+        }
     }
 }
 
@@ -308,7 +263,7 @@ pub fn compute_cell_heights(
 /// Visual indication for focused cell.
 pub fn highlight_focused_cell(
     focus: Res<FocusTarget>,
-    mut cells: Query<(Entity, &mut MsdfTextAreaConfig), With<Cell>>,
+    mut cells: Query<(Entity, &mut UiVelloText), With<Cell>>,
     theme: Option<Res<crate::ui::theme::Theme>>,
 ) {
     let Some(ref theme) = theme else {
@@ -316,15 +271,15 @@ pub fn highlight_focused_cell(
         return;
     };
 
-    for (entity, mut config) in cells.iter_mut() {
+    for (entity, mut vello_text) in cells.iter_mut() {
         let color = if Some(entity) == focus.entity {
             theme.accent // Brighter for focused
         } else {
             theme.fg_dim
         };
-        // Compare before writing to avoid triggering change detection
-        if config.default_color != color {
-            config.default_color = color;
+        let new_brush = bevy_color_to_brush(color);
+        if vello_text.style.brush != new_brush {
+            vello_text.style.brush = new_brush;
         }
     }
 }
@@ -336,12 +291,12 @@ pub fn highlight_focused_cell(
 /// - Input area might "attach" to the focused block or move on-screen
 /// - Consider: FocusTarget.entity vs ActiveThread vs ReplyTarget as separate concepts
 ///
-/// For now: Any cell with MsdfTextAreaConfig can receive focus.
+/// For now: Any cell with ComputedNode can receive focus.
 /// The cursor renders at the focused cell's position.
 pub fn click_to_focus(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
-    cells: Query<(Entity, &MsdfTextAreaConfig), With<Cell>>,
+    cells: Query<(Entity, &ComputedNode, &UiGlobalTransform), With<Cell>>,
     mut focus: ResMut<FocusTarget>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
@@ -353,13 +308,19 @@ pub fn click_to_focus(
         return;
     };
 
-    // Check if cursor is inside any cell bounds
-    for (entity, config) in cells.iter() {
-        let bounds = &config.bounds;
-        if cursor_pos.x >= bounds.left as f32
-            && cursor_pos.x <= bounds.right as f32
-            && cursor_pos.y >= bounds.top as f32
-            && cursor_pos.y <= bounds.bottom as f32
+    // Check if cursor is inside any cell bounds (using Bevy UI layout)
+    for (entity, computed, transform) in cells.iter() {
+        let (_, _, translation) = transform.to_scale_angle_translation();
+        let size = computed.size();
+        let left = translation.x - size.x / 2.0;
+        let top = translation.y - size.y / 2.0;
+        let right = left + size.x;
+        let bottom = top + size.y;
+
+        if cursor_pos.x >= left
+            && cursor_pos.x <= right
+            && cursor_pos.y >= top
+            && cursor_pos.y <= bottom
         {
             focus.entity = Some(entity);
             return;
@@ -464,7 +425,7 @@ pub fn update_cursor(
     focus: Res<FocusTarget>,
     focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
-    mut cells: Query<(&mut CellEditor, &MsdfTextAreaConfig)>,
+    mut cells: Query<(&mut CellEditor, &ComputedNode, &UiGlobalTransform)>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
     theme: Res<crate::ui::theme::Theme>,
@@ -484,7 +445,7 @@ pub fn update_cursor(
         return;
     };
 
-    let Ok((mut editor, config)) = cells.get_mut(focused_entity) else {
+    let Ok((mut editor, computed, transform)) = cells.get_mut(focused_entity) else {
         *visibility = Visibility::Hidden;
         return;
     };
@@ -495,11 +456,17 @@ pub fn update_cursor(
     // Calculate cursor position (uses cache to avoid O(N) scan every frame)
     let (row, col) = cursor_position(&mut editor);
 
+    // Get cell position from Bevy UI layout
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = computed.content_box();
+    let cell_left = translation.x + content.min.x;
+    let cell_top = translation.y + content.min.y;
+
     // Position relative to cell bounds using TextMetrics for consistency
     let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = config.left + (col as f32 * char_width);
-    let y = config.top + (row as f32 * line_height);
+    let x = cell_left + (col as f32 * char_width);
+    let y = cell_top + (row as f32 * line_height);
 
     node.left = Val::Px(x - 2.0); // Slight offset for beam alignment
     node.top = Val::Px(y);
@@ -826,16 +793,15 @@ use super::components::FocusedBlockCell;
 
 /// Highlight the focused block cell with a visual indicator.
 ///
-/// Applies a background tint or border highlight to the BlockCell
-/// that has the FocusedBlockCell marker.
+/// Applies a brighter text color to the BlockCell that has the FocusedBlockCell marker.
 pub fn highlight_focused_block(
-    mut focused_configs: Query<(&BlockCell, &mut MsdfTextAreaConfig), With<FocusedBlockCell>>,
+    mut focused_cells: Query<(&BlockCell, &mut UiVelloText), With<FocusedBlockCell>>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     theme: Res<Theme>,
 ) {
     // Early return if no focused blocks - skip HashMap allocation entirely
-    if focused_configs.is_empty() {
+    if focused_cells.is_empty() {
         return;
     }
 
@@ -858,7 +824,7 @@ pub fn highlight_focused_block(
         .collect();
 
     // Focused blocks get a slightly brighter color
-    for (block_cell, mut config) in focused_configs.iter_mut() {
+    for (block_cell, mut vello_text) in focused_cells.iter_mut() {
         if let Some(block) = blocks.get(&block_cell.block_id) {
             let base_color = block_color(block, &theme);
             // Brighten the color slightly to indicate focus
@@ -869,9 +835,10 @@ pub fn highlight_focused_block(
                 (srgba.blue * 1.15).min(1.0),
                 srgba.alpha,
             );
+            let new_brush = bevy_color_to_brush(focused_color);
             // Compare before writing to avoid triggering change detection
-            if config.default_color != focused_color {
-                config.default_color = focused_color;
+            if vello_text.style.brush != new_brush {
+                vello_text.style.brush = new_brush;
             }
         }
     }
@@ -897,7 +864,7 @@ pub fn spawn_expanded_block_view(
     mut entities: ResMut<EditorEntities>,
     existing_views: Query<Entity, With<ExpandedBlockView>>,
     main_cells: Query<&CellEditor, With<MainCell>>,
-    font_system: Res<SharedFontSystem>,
+    font_handles: Res<FontHandles>,
     text_metrics: Res<TextMetrics>,
     theme: Res<Theme>,
 ) {
@@ -924,37 +891,30 @@ pub fn spawn_expanded_block_view(
             return;
         };
 
-        // Create the text buffer
-        let mut fs = font_system.0.lock().unwrap();
-        let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = MsdfTextBuffer::new(&mut fs, metrics);
-        buffer.set_snap_x(true); // monospace: snap to pixel grid
-        buffer.set_letter_spacing(text_metrics.letter_spacing);
-
         let color = block_color(block, &theme);
-        buffer.set_color(color);
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
-        drop(fs);
 
-        // Spawn the view entity
+        // Spawn the view entity with Vello text
         let entity = commands
             .spawn((
                 ExpandedBlockView,
-                MsdfText,
-                buffer,
-                MsdfBufferInfo::default(),
-                MsdfTextAreaConfig {
-                    left: 40.0,
-                    top: 60.0,  // Leave room for header
-                    scale: 1.0,
-                    bounds: crate::text::TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: 1200,
-                        bottom: 800,
+                KjText,
+                UiVelloText {
+                    value: block.content.clone(),
+                    style: bevy_vello::prelude::VelloTextStyle {
+                        font: font_handles.mono.clone(),
+                        brush: bevy_color_to_brush(color),
+                        font_size: text_metrics.cell_font_size,
+                        ..default()
                     },
-                    default_color: color,
+                    ..default()
+                },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(40.0),
+                    top: Val::Px(60.0),
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
                 },
                 Visibility::Inherited,
                 // Store block info for updates
@@ -991,12 +951,10 @@ pub fn sync_expanded_block_content(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut expanded_views: Query<
-        (&ExpandedBlockInfo, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig),
+        (&ExpandedBlockInfo, &mut UiVelloText),
         With<ExpandedBlockView>,
     >,
-    font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
-    windows: Query<&Window>,
 ) {
     if !view_stack.has_expanded_block() {
         return;
@@ -1009,38 +967,24 @@ pub fn sync_expanded_block_content(
         return;
     };
 
-    // Get window size for bounds
-    let (width, height) = windows
-        .iter()
-        .next()
-        .map(|w| (w.width(), w.height()))
-        .unwrap_or((1280.0, 800.0));
-
     let blocks = editor.blocks();
 
-    for (info, mut buffer, mut config) in expanded_views.iter_mut() {
+    for (info, mut vello_text) in expanded_views.iter_mut() {
         let Some(block) = blocks.iter().find(|b| b.id == info.block_id) else {
             continue;
         };
 
         // Update text if changed
-        let mut fs = font_system.0.lock().unwrap();
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut fs, &block.content, attrs, cosmic_text::Shaping::Advanced);
-        drop(fs);
+        if vello_text.value != block.content {
+            vello_text.value = block.content.clone();
+        }
 
         // Update color
         let color = block_color(block, &theme);
-        buffer.set_color(color);
-        config.default_color = color;
-
-        // Update bounds to fill screen (with padding)
-        config.bounds = crate::text::TextBounds {
-            left: 40,
-            top: 60,
-            right: (width - 40.0) as i32,
-            bottom: (height - 40.0) as i32,
-        };
+        let new_brush = bevy_color_to_brush(color);
+        if vello_text.style.brush != new_brush {
+            vello_text.style.brush = new_brush;
+        }
     }
 }
 
@@ -1076,7 +1020,7 @@ pub fn spawn_main_cell(
     // Initial welcome message
     let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
 
-    // NOTE: MainCell does NOT get MsdfText/MsdfTextAreaConfig.
+    // NOTE: MainCell does NOT get UiVelloText directly.
     // The BlockCell system handles per-block rendering.
     // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
@@ -1875,9 +1819,8 @@ pub fn spawn_block_cells(
                 .spawn((
                     BlockCell::new(block_id.clone()),
                     BlockCellLayout::default(),
-                    MsdfText,
-                    MsdfTextAreaConfig::default(),
-                    SdfTextEffects::default(),
+                    KjText,
+                    KjTextEffects::default(),
                     ContentSize::default(),
                     Node {
                         width: Val::Percent(100.0),
@@ -1917,7 +1860,7 @@ pub fn spawn_block_cells(
 /// Sync RoleHeader entities for role transitions.
 ///
 /// Spawns role header entities using the same pattern as BlockCells:
-/// MsdfText + MsdfTextAreaConfig for consistent rendering.
+/// KjText + UiVelloText for consistent rendering.
 pub fn sync_role_headers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
@@ -1978,15 +1921,12 @@ pub fn sync_role_headers(
     }
 
     for (role, block_id) in expected {
-        let color = match role {
+        let _color = match role {
             Role::User => theme.block_user,
             Role::Model => theme.block_assistant,
             Role::System => theme.fg_dim,
             Role::Tool | Role::Asset => theme.block_tool_call,
         };
-
-        let mut config = MsdfTextAreaConfig::default();
-        config.default_color = color;
 
         let entity = commands
             .spawn((
@@ -1995,14 +1935,14 @@ pub fn sync_role_headers(
                     block_id,
                 },
                 RoleHeaderLayout::default(),
-                MsdfText,
-                config,
+                KjText,
                 Node {
                     width: Val::Percent(100.0),
                     min_height: Val::Px(ROLE_HEADER_HEIGHT),
                     margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
                     ..default()
                 },
+                // Role header color is set during init_role_header_buffers
             ))
             .id();
         if let Some(conv) = entities.conversation_container {
@@ -2013,26 +1953,22 @@ pub fn sync_role_headers(
     }
 }
 
-/// Initialize MsdfTextBuffers for RoleHeaders that don't have one.
+/// Initialize UiVelloText for RoleHeaders that don't have one.
 pub fn init_role_header_buffers(
     mut commands: Commands,
-    role_headers: Query<(Entity, &RoleHeader, &MsdfTextAreaConfig), (With<MsdfText>, Without<MsdfTextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
+    role_headers: Query<(Entity, &RoleHeader), (With<KjText>, Without<UiVelloText>)>,
+    font_handles: Res<FontHandles>,
     text_metrics: Res<TextMetrics>,
+    theme: Res<Theme>,
 ) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (entity, header, config) in role_headers.iter() {
-        // Use UI metrics for headers (slightly smaller than content)
-        let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        buffer.set_snap_x(true); // monospace: snap to pixel grid
-        buffer.set_letter_spacing(text_metrics.letter_spacing);
-
-        // Apply the role color from MsdfTextAreaConfig (set during sync_role_headers)
-        buffer.set_color(config.default_color);
+    for (entity, header) in role_headers.iter() {
+        let color = match header.role {
+            Role::User => theme.block_user,
+            Role::Model => theme.block_assistant,
+            Role::System => theme.fg_dim,
+            Role::Tool => theme.block_tool_call,
+            Role::Asset => theme.block_tool_call,
+        };
 
         // Set header text based on role
         let text = match header.role {
@@ -2042,34 +1978,42 @@ pub fn init_role_header_buffers(
             Role::Tool => "── TOOL ──────────────────────",
             Role::Asset => "── ASSET ─────────────────────",
         };
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut font_system, text, attrs, cosmic_text::Shaping::Advanced);
 
-        // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
+        commands.entity(entity).try_insert(UiVelloText {
+            value: text.to_string(),
+            style: bevy_vello::prelude::VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: bevy_color_to_brush(color),
+                font_size: text_metrics.cell_font_size,
+                ..default()
+            },
+            ..default()
+        });
     }
 }
 
-/// Initialize MsdfTextBuffers for BlockCells that don't have one.
+/// Initialize UiVelloText for BlockCells that don't have one.
 pub fn init_block_cell_buffers(
     mut commands: Commands,
-    block_cells: Query<Entity, (With<BlockCell>, With<MsdfText>, Without<MsdfTextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
+    block_cells: Query<Entity, (With<BlockCell>, With<KjText>, Without<UiVelloText>)>,
+    font_handles: Res<FontHandles>,
     text_metrics: Res<TextMetrics>,
 ) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
     for entity in block_cells.iter() {
-        let metrics = text_metrics.scaled_cell_metrics();
-        let buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        // Use try_insert to gracefully handle entity despawns between query and command application
-        commands.entity(entity).try_insert((buffer, MsdfBufferInfo::default()));
+        commands.entity(entity).try_insert(UiVelloText {
+            value: String::new(),
+            style: bevy_vello::prelude::VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: bevy_color_to_brush(Color::WHITE),
+                font_size: text_metrics.cell_font_size,
+                ..default()
+            },
+            ..default()
+        });
     }
 }
 
-/// Sync BlockCell MsdfTextBuffers with their corresponding block content.
+/// Sync BlockCell UiVelloText with their corresponding block content.
 ///
 /// Only updates cells whose content has changed (tracked via version).
 /// When any buffer is updated, bumps LayoutGeneration to trigger re-layout.
@@ -2083,8 +2027,7 @@ pub fn sync_block_cell_buffers(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig, Option<&TimelineVisibility>)>,
-    font_system: Res<SharedFontSystem>,
+    mut block_cells: Query<(&mut BlockCell, &mut UiVelloText, Option<&TimelineVisibility>)>,
     theme: Res<Theme>,
     doc_cache: Res<super::components::DocumentCache>,
     mut layout_gen: ResMut<super::components::LayoutGeneration>,
@@ -2109,17 +2052,13 @@ pub fn sync_block_cell_buffers(
     let needs_update = container.block_cells.iter().any(|e| {
         block_cells
             .get(*e)
-            .map(|(bc, _, _, _)| bc.last_render_version < doc_version)
+            .map(|(bc, _, _)| bc.last_render_version < doc_version)
             .unwrap_or(false)
     });
 
     if !needs_update {
         return;
     }
-
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
 
     // Get ordered blocks and build a borrowed lookup index
     let blocks_ordered = editor.blocks();
@@ -2130,7 +2069,7 @@ pub fn sync_block_cell_buffers(
 
     let mut layout_changed = false;
     for entity in &container.block_cells {
-        let Ok((mut block_cell, mut buffer, mut config, timeline_vis)) = block_cells.get_mut(*entity) else {
+        let Ok((mut block_cell, mut vello_text, timeline_vis)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2144,7 +2083,7 @@ pub fn sync_block_cell_buffers(
         };
         let block = &blocks_ordered[idx];
 
-        // Format and update the buffer
+        // Format and update the text
         // Note: Role headers are now rendered as separate RoleHeader entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
         let local_ctx = doc_cache.active_id();
@@ -2164,42 +2103,18 @@ pub fn sync_block_cell_buffers(
 
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
-        buffer.set_color(base_color);
 
         // Set per-vertex effects: rainbow for user text only.
         // Only insert when changed to avoid triggering Bevy change detection.
         let rainbow = block.kind == BlockKind::Text && block.role == Role::User;
         if block_cell.last_rainbow != rainbow {
-            commands.entity(*entity).insert(SdfTextEffects { rainbow });
+            commands.entity(*entity).insert(KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
         }
 
-        // Use rich text (markdown) for Text blocks, plain text for everything else
-        let base_attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        if block.kind == BlockKind::Text {
-            // Skip expensive markdown parse for huge blocks still streaming —
-            // markdown re-parse happens once when block finishes (status → Done)
-            if text.len() > 50_000 && block.status == Status::Running {
-                buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
-            } else {
-                // Build markdown colors from theme, with base block color as default
-                let md_colors = MarkdownColors {
-                    heading: bevy_to_cosmic_color(theme.md_heading_color),
-                    code: bevy_to_cosmic_color(theme.md_code_fg),
-                    strong: theme.md_strong_color.map(bevy_to_cosmic_color),
-                    code_block: bevy_to_cosmic_color(theme.md_code_block_fg),
-                };
-                let rich_spans = markdown::parse_to_rich_spans(&text);
-                let cosmic_spans = markdown::to_cosmic_spans(&rich_spans, &base_attrs, &md_colors);
-                buffer.set_rich_text(
-                    &mut font_system,
-                    cosmic_spans.into_iter(),
-                    &base_attrs,
-                    cosmic_text::Shaping::Advanced,
-                );
-            }
-        } else {
-            buffer.set_text(&mut font_system, &text, base_attrs, cosmic_text::Shaping::Advanced);
+        // For now, set plain text. Rich markdown styling via Parley spans is Phase 4.
+        if vello_text.value != text {
+            vello_text.value = text.clone();
         }
 
         // Apply timeline visibility opacity (dimmed when viewing historical states)
@@ -2208,7 +2123,10 @@ pub fn sync_block_cell_buffers(
         } else {
             base_color
         };
-        config.default_color = color;
+        let new_brush = bevy_color_to_brush(color);
+        if vello_text.style.brush != new_brush {
+            vello_text.style.brush = new_brush;
+        }
 
         // Mark layout dirty when text length changes — word-wrap line
         // count can only change when the text grows or shrinks.
@@ -2245,13 +2163,11 @@ pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &mut MsdfTextBuffer, Option<&super::block_border::BlockBorderStyle>)>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &UiVelloText, Option<&super::block_border::BlockBorderStyle>)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
     mut scroll_state: ResMut<ConversationScrollState>,
     // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
-    font_system: Res<SharedFontSystem>,
-    mut metrics_cache: ResMut<FontMetricsCache>,
     conv_containers: Query<&ComputedNode, (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
     windows: Query<&Window>,
     layout_gen: Res<super::components::LayoutGeneration>,
@@ -2299,9 +2215,6 @@ pub fn layout_block_cells(
 
     // Note: visible_height is updated in smooth_scroll from ConversationContainer's ComputedNode
 
-    // Lock font system for shaping
-    let mut font_system = font_system.0.lock().unwrap();
-
     // Single blocks() call — build borrowed lookup and role transition map
     let blocks_ordered = editor.blocks();
     let block_lookup: std::collections::HashMap<&kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
@@ -2320,7 +2233,7 @@ pub fn layout_block_cells(
     // Determine indentation: ToolResult blocks with a tool_call_id are nested
 
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, mut buffer, border_style)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout, vello_text, border_style)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
@@ -2357,10 +2270,14 @@ pub fn layout_block_cells(
         let indent = indent_level as f32 * INDENT_WIDTH;
         let wrap_width = base_width - indent;
 
-        // Compute height from visual line count (after text wrapping)
-        // This shapes the buffer if needed and returns accurate wrapped line count
-        // Pixel alignment via metrics_cache helps small text render crisply
-        let line_count = buffer.visual_line_count(&mut font_system, wrap_width, Some(&mut metrics_cache));
+        // Estimate line count from text length and wrap width.
+        // Vello handles actual text shaping; this is a layout height estimate.
+        let char_width = layout.line_height * 0.6; // approximate monospace
+        let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
+        let text = &vello_text.value;
+        let line_count = text.split('\n').map(|line| {
+            if line.is_empty() { 1 } else { (line.len() + chars_per_line - 1) / chars_per_line }
+        }).sum::<usize>().max(1);
         // Height: lines + minimal padding + border padding.
         // We include border padding so content_height matches taffy's content_size
         // (taffy adds Node.padding to min_height for the layout box).
@@ -2539,112 +2456,17 @@ pub fn reorder_conversation_children(
 
 /// Position BlockCell text areas from ComputedNode (flex layout result).
 ///
-/// Follows the same pattern as `position_compose_block`: reads ComputedNode +
-/// UiGlobalTransform to determine screen position, then writes MsdfTextAreaConfig.
-/// This replaces the manual positioning in `apply_block_cell_positions`.
-pub fn position_block_cells_from_flex(
-    mut block_cells: Query<
-        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&CalculatedClip>),
-        With<BlockCell>,
-    >,
-) {
-    for (computed, transform, mut config, clip) in block_cells.iter_mut() {
-        let (_, _, translation) = transform.to_scale_angle_translation();
-        let size = computed.size();
-        let content = computed.content_box();
-
-        // content_box() returns object-centered coordinates (centered around 0,0).
-        // UiGlobalTransform translation is also center-based. Add directly.
-        let new_left = translation.x + content.min.x;
-        let new_top = translation.y + content.min.y;
-
-        // Skip positioning when flex layout hasn't resolved yet
-        // (e.g. after toggling Display::None → Display::Flex on constellation switch).
-        if size.x < 1.0 {
-            continue;
-        }
-
-        let raw_left = new_left as i32;
-        let raw_top = new_top as i32;
-        let raw_right = (translation.x + content.max.x) as i32;
-        let raw_bottom = (translation.y + content.max.y) as i32;
-
-        let new_bounds = if let Some(clip) = clip {
-            crate::text::TextBounds {
-                left: raw_left.max(clip.clip.min.x as i32),
-                top: raw_top.max(clip.clip.min.y as i32),
-                right: raw_right.min(clip.clip.max.x as i32),
-                bottom: raw_bottom.min(clip.clip.max.y as i32),
-            }
-        } else {
-            crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
-        };
-
-        // Compare before writing to avoid triggering Bevy change detection
-        if (config.left - new_left).abs() < 0.5
-            && (config.top - new_top).abs() < 0.5
-            && config.bounds == new_bounds
-        {
-            continue;
-        }
-
-        config.left = new_left;
-        config.top = new_top;
-        config.scale = 1.0;
-        config.bounds = new_bounds;
-    }
-}
+/// With Vello, text position is inherited from Bevy UI layout — no manual
+/// manual positioning needed. This is a no-op kept for plugin
+/// system set compatibility.
+pub fn position_block_cells_from_flex() {}
 
 /// Position RoleHeader text areas from ComputedNode (flex layout result).
-pub fn position_role_headers_from_flex(
-    mut role_headers: Query<
-        (&ComputedNode, &UiGlobalTransform, &mut MsdfTextAreaConfig, Option<&CalculatedClip>),
-        (With<RoleHeader>, Without<BlockCell>),
-    >,
-) {
-    for (computed, transform, mut config, clip) in role_headers.iter_mut() {
-        let (_, _, translation) = transform.to_scale_angle_translation();
-        let size = computed.size();
-        let content = computed.content_box();
-
-        // content_box() returns object-centered coordinates. Add to translation directly.
-        let new_left = translation.x + content.min.x;
-        let new_top = translation.y + content.min.y;
-
-        if size.x < 1.0 {
-            continue;
-        }
-
-        let raw_left = new_left as i32;
-        let raw_top = new_top as i32;
-        let raw_right = (translation.x + content.max.x) as i32;
-        let raw_bottom = (translation.y + content.max.y) as i32;
-
-        let new_bounds = if let Some(clip) = clip {
-            crate::text::TextBounds {
-                left: raw_left.max(clip.clip.min.x as i32),
-                top: raw_top.max(clip.clip.min.y as i32),
-                right: raw_right.min(clip.clip.max.x as i32),
-                bottom: raw_bottom.min(clip.clip.max.y as i32),
-            }
-        } else {
-            crate::text::TextBounds { left: raw_left, top: raw_top, right: raw_right, bottom: raw_bottom }
-        };
-
-        // Compare before writing to avoid triggering Bevy change detection
-        if (config.left - new_left).abs() < 0.5
-            && (config.top - new_top).abs() < 0.5
-            && config.bounds == new_bounds
-        {
-            continue;
-        }
-
-        config.left = new_left;
-        config.top = new_top;
-        config.scale = 1.0;
-        config.bounds = new_bounds;
-    }
-}
+///
+/// With Vello, text position is inherited from Bevy UI layout — no manual
+/// manual positioning needed. This is a no-op kept for plugin
+/// system set compatibility.
+pub fn position_role_headers_from_flex() {}
 
 
 // ============================================================================
@@ -2684,7 +2506,7 @@ pub fn position_role_headers_from_flex(
 /// When a BlockCell is being edited, the cursor should render at that block's
 /// position, not in the PromptCell.
 pub fn update_block_edit_cursor(
-    editing_cells: Query<(&BlockCell, &BlockEditCursor, &BlockCellLayout, &MsdfTextAreaConfig), With<EditingBlockCell>>,
+    editing_cells: Query<(&BlockCell, &BlockEditCursor, &BlockCellLayout, &ComputedNode, &UiGlobalTransform), With<EditingBlockCell>>,
     entities: Res<EditorEntities>,
     focus_area: Res<FocusArea>,
     mut cursor_query: Query<(&mut Node, &mut Visibility), With<CursorMarker>>,
@@ -2692,7 +2514,7 @@ pub fn update_block_edit_cursor(
     text_metrics: Res<TextMetrics>,
 ) {
     // Only when editing a block
-    let Ok((block_cell, cursor, _layout, config)) = editing_cells.single() else {
+    let Ok((block_cell, cursor, _layout, computed, transform)) = editing_cells.single() else {
         return;
     };
 
@@ -2733,11 +2555,17 @@ pub fn update_block_edit_cursor(
         Visibility::Hidden
     };
 
+    // Get block cell position from Bevy UI layout
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = computed.content_box();
+    let cell_left = translation.x + content.min.x;
+    let cell_top = translation.y + content.min.y;
+
     // Position cursor relative to block cell's text area
     let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = config.left + (col as f32 * char_width);
-    let y = config.top + (row as f32 * line_height);
+    let x = cell_left + (col as f32 * char_width);
+    let y = cell_top + (row as f32 * line_height);
 
     node.left = Val::Px(x - 2.0);
     node.top = Val::Px(y);
@@ -2747,171 +2575,88 @@ pub fn update_block_edit_cursor(
 // COMPOSE BLOCK SYSTEMS
 // ============================================================================
 
-/// Initialize MsdfTextBuffer for ComposeBlock entities.
+/// Initialize UiVelloText for ComposeBlock entities.
 pub fn init_compose_block_buffer(
     mut commands: Commands,
-    compose_blocks: Query<Entity, (With<ComposeBlock>, With<MsdfText>, Without<MsdfTextBuffer>)>,
-    font_system: Res<SharedFontSystem>,
+    compose_blocks: Query<Entity, (With<ComposeBlock>, With<KjText>, Without<UiVelloText>)>,
+    font_handles: Res<FontHandles>,
     text_metrics: Res<TextMetrics>,
+    theme: Res<Theme>,
 ) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
     for entity in compose_blocks.iter() {
-        let metrics = text_metrics.scaled_cell_metrics();
-        let mut buffer = MsdfTextBuffer::new(&mut font_system, metrics);
-        buffer.set_snap_x(true); // monospace: snap to pixel grid
-        buffer.set_letter_spacing(text_metrics.letter_spacing);
-
-        // Initialize with placeholder text
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-        buffer.set_text(&mut font_system, "Type here...", attrs, cosmic_text::Shaping::Advanced);
-        // Shape the text so glyphs are populated for MSDF rendering
-        buffer.visual_line_count(&mut font_system, 800.0, None);
-
-        commands.entity(entity).insert((buffer, MsdfBufferInfo::default()));
+        commands.entity(entity).insert(UiVelloText {
+            value: "Type here...".to_string(),
+            style: bevy_vello::prelude::VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: bevy_color_to_brush(theme.fg_dim),
+                font_size: text_metrics.cell_font_size,
+                ..default()
+            },
+            ..default()
+        });
     }
 }
 
 // handle_compose_block_input — DELETED (Phase 5)
 // Migrated to input::systems::handle_compose_input
 
-/// Map a kaish token kind to a cosmic_text color via the theme's syntax palette.
-fn syntax_color_for_token(kind: &crate::kaish::TokenKind, theme: &Theme) -> cosmic_text::Color {
-    use crate::kaish::TokenKind;
-    bevy_to_cosmic_color(match kind {
-        TokenKind::Keyword => theme.syntax.keyword,
-        TokenKind::String => theme.syntax.string,
-        TokenKind::Number => theme.syntax.number,
-        TokenKind::Operator => theme.syntax.operator,
-        TokenKind::Variable => theme.syntax.variable,
-        TokenKind::Flag => theme.syntax.flag,
-        TokenKind::Comment => theme.syntax.comment,
-        TokenKind::Command => theme.syntax.command,
-        TokenKind::Path => theme.syntax.path,
-        TokenKind::Punctuation => theme.syntax.punctuation,
-        TokenKind::Error => theme.syntax.error,
-    })
-}
-
-/// Sync ComposeBlock text to its MsdfTextBuffer.
+/// Sync ComposeBlock text to its UiVelloText.
 ///
-/// In shell mode, runs kaish syntax validation on each keystroke and tints
-/// text red for invalid syntax (but not for incomplete input like `if`).
-/// Valid/incomplete shell input gets per-token syntax highlighting.
+/// In shell mode, applies error tinting for invalid syntax.
+/// Per-token syntax highlighting via Parley spans is Phase 4.
 pub fn sync_compose_block_buffer(
-    font_system: Res<SharedFontSystem>,
     theme: Res<Theme>,
-    mut compose_blocks: Query<(&ComposeBlock, &mut MsdfTextBuffer, &mut MsdfTextAreaConfig), Changed<ComposeBlock>>,
+    mut compose_blocks: Query<(&ComposeBlock, &mut UiVelloText), Changed<ComposeBlock>>,
 ) {
-    let Ok(mut font_system) = font_system.0.lock() else {
-        return;
-    };
-
-    for (compose, mut buffer, mut config) in compose_blocks.iter_mut() {
-        let attrs = cosmic_text::Attrs::new().family(cosmic_text::Family::Name("Noto Sans Mono"));
-
+    for (compose, mut vello_text) in compose_blocks.iter_mut() {
         if compose.is_empty() {
             // Placeholder
-            buffer.set_color(theme.fg_dim);
-            config.default_color = theme.fg_dim;
-            buffer.set_text(&mut font_system, "Type here...", attrs, cosmic_text::Shaping::Advanced);
+            let new_brush = bevy_color_to_brush(theme.fg_dim);
+            if vello_text.style.brush != new_brush {
+                vello_text.style.brush = new_brush;
+            }
+            if vello_text.value != "Type here..." {
+                vello_text.value = "Type here...".to_string();
+            }
         } else if is_shell_command(&compose.text) {
             let stripped = strip_shell_prefix(&compose.text);
             let validation = crate::kaish::validate(stripped);
 
             if !validation.valid && !validation.incomplete {
                 // Hard syntax error — red tint on entire text
-                buffer.set_color(theme.block_tool_error);
-                config.default_color = theme.block_tool_error;
-                buffer.set_text(&mut font_system, &compose.text, attrs, cosmic_text::Shaping::Advanced);
+                let new_brush = bevy_color_to_brush(theme.block_tool_error);
+                if vello_text.style.brush != new_brush {
+                    vello_text.style.brush = new_brush;
+                }
             } else {
-                // Valid or incomplete — syntax highlight with tokenizer
-                let prefix = &compose.text[..compose.text.len() - stripped.len()];
-                let tokens = crate::kaish::tokenize(stripped);
-
-                let mut spans: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
-                // Attrs::color() consumes self, so clone for each span
-                let colored = |c: cosmic_text::Color| attrs.clone().color(c);
-
-                // Prefix char (: or `) in dim color
-                let prefix_color = bevy_to_cosmic_color(theme.syntax.prefix);
-                spans.push((prefix, colored(prefix_color)));
-
-                // Build spans from tokens, filling whitespace gaps with default attrs
-                let default_color = bevy_to_cosmic_color(theme.block_user);
-                let mut cursor = 0;
-                for token in &tokens {
-                    // Gap before this token (whitespace)
-                    if token.start > cursor {
-                        let gap = &stripped[cursor..token.start];
-                        spans.push((gap, colored(default_color)));
-                    }
-                    let text_slice = &stripped[token.start..token.end];
-                    let color = syntax_color_for_token(&token.kind, &theme);
-                    spans.push((text_slice, colored(color)));
-                    cursor = token.end;
+                // Valid or incomplete — plain text for now, syntax highlighting Phase 4
+                let new_brush = bevy_color_to_brush(theme.block_user);
+                if vello_text.style.brush != new_brush {
+                    vello_text.style.brush = new_brush;
                 }
-                // Trailing text after last token
-                if cursor < stripped.len() {
-                    let tail = &stripped[cursor..];
-                    spans.push((tail, colored(default_color)));
-                }
-
-                // Use the base user color for overall buffer color (affects cursor etc.)
-                buffer.set_color(theme.block_user);
-                config.default_color = theme.block_user;
-                buffer.set_rich_text(&mut font_system, spans, &attrs, cosmic_text::Shaping::Advanced);
+            }
+            if vello_text.value != compose.text {
+                vello_text.value = compose.text.clone();
             }
         } else {
             // Plain chat text
-            buffer.set_color(theme.block_user);
-            config.default_color = theme.block_user;
-            buffer.set_text(&mut font_system, &compose.text, attrs, cosmic_text::Shaping::Advanced);
-        };
-
-        // Shape the text so glyphs are populated for MSDF rendering
-        let wrap_width = config.bounds.width().max(100) as f32;
-        buffer.visual_line_count(&mut font_system, wrap_width, None);
+            let new_brush = bevy_color_to_brush(theme.block_user);
+            if vello_text.style.brush != new_brush {
+                vello_text.style.brush = new_brush;
+            }
+            if vello_text.value != compose.text {
+                vello_text.value = compose.text.clone();
+            }
+        }
     }
 }
 
 /// Position the ComposeBlock text area based on its computed UI layout.
 ///
-/// ComposeBlock uses Bevy's flex layout system (unlike BlockCells which use manual positioning).
-/// This system reads the computed position from Bevy's UI layout and updates the
-/// MsdfTextAreaConfig bounds so the MSDF text renders in the correct location.
-pub fn position_compose_block(
-    mut compose_blocks: Query<
-        (&bevy::ui::ComputedNode, &bevy::ui::UiGlobalTransform, &mut MsdfTextAreaConfig),
-        With<ComposeBlock>,
-    >,
-) {
-    for (computed, global_transform, mut config) in compose_blocks.iter_mut() {
-        // UiGlobalTransform gives us the center position in screen space
-        // (origin at top-left, Y increases downward).
-        // Convert to top-left corner for rendering.
-        let (_, _, translation) = global_transform.to_scale_angle_translation();
-        let size = computed.size();
-
-        // Translation is the center of the node, convert to top-left corner
-        let left = translation.x - size.x / 2.0;
-        let top = translation.y - size.y / 2.0;
-
-        // Update MsdfTextAreaConfig position
-        config.left = left;
-        config.top = top;
-
-        // Update bounds for clipping
-        config.bounds = crate::text::TextBounds {
-            left: left as i32,
-            top: top as i32,
-            right: (left + size.x) as i32,
-            bottom: (top + size.y) as i32,
-        };
-    }
-}
+/// With Vello, text position is inherited from Bevy UI layout — no manual
+/// manual positioning needed. This is a no-op kept for plugin
+/// system set compatibility.
+pub fn position_compose_block() {}
 
 /// Position the cursor in the focused ComposeBlock during Input mode.
 ///
@@ -2921,7 +2666,7 @@ pub fn position_compose_block(
 pub fn update_compose_cursor(
     focus_area: Res<FocusArea>,
     entities: Res<EditorEntities>,
-    compose_blocks: Query<(&ComposeBlock, &MsdfTextAreaConfig), With<crate::ui::tiling::PaneFocus>>,
+    compose_blocks: Query<(&ComposeBlock, &ComputedNode, &UiGlobalTransform), With<crate::ui::tiling::PaneFocus>>,
     editing_blocks: Query<Entity, With<EditingBlockCell>>,
     mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
@@ -2938,10 +2683,16 @@ pub fn update_compose_cursor(
     }
 
     let Some(cursor_ent) = entities.cursor else { return };
-    let Ok((compose, config)) = compose_blocks.single() else { return };
+    let Ok((compose, computed, transform)) = compose_blocks.single() else { return };
     let Ok((mut node, mut visibility, material_node)) = cursor_query.get_mut(cursor_ent) else { return };
 
     *visibility = Visibility::Inherited;
+
+    // Get compose block position from Bevy UI layout
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = computed.content_box();
+    let cell_left = translation.x + content.min.x;
+    let cell_top = translation.y + content.min.y;
 
     // Calculate position from ComposeBlock.cursor offset
     let text = &compose.text;
@@ -2953,8 +2704,8 @@ pub fn update_compose_cursor(
     let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
-    node.left = Val::Px(config.left + (col as f32 * char_width) - 2.0);
-    node.top = Val::Px(config.top + (row as f32 * line_height));
+    node.left = Val::Px(cell_left + (col as f32 * char_width) - 2.0);
+    node.top = Val::Px(cell_top + (row as f32 * line_height));
 
     // Update material for Input mode appearance
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {

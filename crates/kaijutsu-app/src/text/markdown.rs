@@ -1,43 +1,39 @@
-//! Markdown → rich-text span conversion for cosmic-text rendering.
+//! Markdown to rich-text span conversion for Vello rendering.
 //!
 //! Uses pulldown-cmark (the same parser as rustdoc) to convert markdown into
-//! styled spans that cosmic-text can render via `set_rich_text()`.
+//! styled spans that can drive Vello text rendering.
 //!
 //! ```text
 //! "**bold** and *italic*"
-//!     ↓ pulldown-cmark events
+//!     | pulldown-cmark events
 //! [RichSpan { bold: true, text: "bold" },
 //!  RichSpan { text: " and " },
 //!  RichSpan { italic: true, text: "italic" }]
-//!     ↓ to_cosmic_spans
-//! [("bold", Attrs::weight(BOLD)),
-//!  (" and ", Attrs::new()),
-//!  ("italic", Attrs::style(Italic))]
 //! ```
 
-use cosmic_text::{Attrs, Family, Style, Weight};
+use bevy::prelude::Color;
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
-/// Theme colors for markdown rendering (cosmic-text Color = packed u32).
+/// Theme colors for markdown rendering using Bevy Color.
 #[derive(Clone, Debug)]
 pub struct MarkdownColors {
     /// Heading text color (bright accent).
-    pub heading: cosmic_text::Color,
+    pub heading: Color,
     /// Inline `code` color.
-    pub code: cosmic_text::Color,
+    pub code: Color,
     /// Bold/strong emphasis color (None = inherit base color).
-    pub strong: Option<cosmic_text::Color>,
+    pub strong: Option<Color>,
     /// Fenced code block color.
-    pub code_block: cosmic_text::Color,
+    pub code_block: Color,
 }
 
 impl Default for MarkdownColors {
     fn default() -> Self {
         Self {
-            heading: cosmic_text::Color::rgb(0xBB, 0x9A, 0xF7),  // Purple accent
-            code: cosmic_text::Color::rgb(0x9E, 0xCE, 0x6A),      // Green
-            strong: None,                                           // Inherit
-            code_block: cosmic_text::Color::rgb(0x7A, 0xA2, 0xF7), // Blue
+            heading: Color::srgb_u8(0xBB, 0x9A, 0xF7),   // Purple accent
+            code: Color::srgb_u8(0x9E, 0xCE, 0x6A),       // Green
+            strong: None,                                    // Inherit
+            code_block: Color::srgb_u8(0x7A, 0xA2, 0xF7),  // Blue
         }
     }
 }
@@ -69,11 +65,11 @@ impl RichSpan {
 /// Parse markdown text into a sequence of styled spans.
 ///
 /// Walks pulldown-cmark events, tracking a style stack for nesting:
-/// - `**bold**` → RichSpan { bold: true }
-/// - `*italic*` → RichSpan { italic: true }
-/// - `` `code` `` → RichSpan { code: true }
-/// - `# Heading` → RichSpan { heading_level: Some(1), bold: true }
-/// - Fenced code blocks → RichSpan { code_block: true }
+/// - `**bold**` -> RichSpan { bold: true }
+/// - `*italic*` -> RichSpan { italic: true }
+/// - `` `code` `` -> RichSpan { code: true }
+/// - `# Heading` -> RichSpan { heading_level: Some(1), bold: true }
+/// - Fenced code blocks -> RichSpan { code_block: true }
 pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
     let parser = Parser::new(text);
     let mut spans = Vec::new();
@@ -89,7 +85,7 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
 
     for event in parser {
         match event {
-            // ── Block-level tags ──
+            // -- Block-level tags --
             Event::Start(Tag::Heading { level, .. }) => {
                 heading_level = Some(heading_level_to_u8(level));
                 bold_depth += 1; // Headings are bold
@@ -148,14 +144,14 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
             }
             Event::End(TagEnd::BlockQuote(_)) => {}
 
-            // ── Inline tags ──
+            // -- Inline tags --
             Event::Start(Tag::Strong) => bold_depth += 1,
             Event::End(TagEnd::Strong) => bold_depth = bold_depth.saturating_sub(1),
 
             Event::Start(Tag::Emphasis) => italic_depth += 1,
             Event::End(TagEnd::Emphasis) => italic_depth = italic_depth.saturating_sub(1),
 
-            Event::Start(Tag::Strikethrough) => {} // No strikethrough in cosmic-text
+            Event::Start(Tag::Strikethrough) => {} // No strikethrough support yet
             Event::End(TagEnd::Strikethrough) => {}
 
             Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {
@@ -163,7 +159,7 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
             }
             Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {}
 
-            // ── Text content ──
+            // -- Text content --
             Event::Text(cow) => {
                 let content = cow.as_ref();
 
@@ -172,7 +168,7 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
                     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
                     let prefix = match item_index.last() {
                         Some(Some(n)) => format!("{indent}{n}. "),
-                        _ => format!("{indent}• "),
+                        _ => format!("{indent}\u{2022} "),
                     };
                     push_span(&mut spans, &prefix);
                     need_item_prefix = false;
@@ -192,7 +188,7 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
                     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
                     let prefix = match item_index.last() {
                         Some(Some(n)) => format!("{indent}{n}. "),
-                        _ => format!("{indent}• "),
+                        _ => format!("{indent}\u{2022} "),
                     };
                     push_span(&mut spans, &prefix);
                     need_item_prefix = false;
@@ -207,9 +203,9 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
 
             Event::SoftBreak => push_span(&mut spans, "\n"),
             Event::HardBreak => push_span(&mut spans, "\n"),
-            Event::Rule => push_span(&mut spans, "────────────────────\n"),
+            Event::Rule => push_span(&mut spans, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n"),
 
-            // HTML passthrough, footnotes, etc. — render as plain text
+            // HTML passthrough, footnotes, etc. -- render as plain text
             Event::Html(cow) | Event::InlineHtml(cow) => {
                 push_span(&mut spans, cow.as_ref());
             }
@@ -221,44 +217,7 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
     spans
 }
 
-/// Convert RichSpans to cosmic-text `(text, Attrs)` pairs for `set_rich_text()`.
-pub fn to_cosmic_spans<'a>(
-    spans: &'a [RichSpan],
-    base_attrs: &Attrs<'a>,
-    colors: &MarkdownColors,
-) -> Vec<(&'a str, Attrs<'a>)> {
-    spans
-        .iter()
-        .map(|span| {
-            let mut attrs = base_attrs.clone();
-
-            if span.bold {
-                attrs = attrs.weight(Weight::BOLD);
-            }
-            if span.italic {
-                attrs = attrs.style(Style::Italic);
-            }
-            if span.code {
-                attrs = attrs.family(Family::Monospace).color(colors.code);
-            }
-            if span.code_block {
-                attrs = attrs.family(Family::Monospace).color(colors.code_block);
-            }
-            if span.heading_level.is_some() {
-                attrs = attrs.weight(Weight::BOLD).color(colors.heading);
-            }
-            if span.bold && !span.code && span.heading_level.is_none() {
-                if let Some(color) = colors.strong {
-                    attrs = attrs.color(color);
-                }
-            }
-
-            (span.text.as_str(), attrs)
-        })
-        .collect()
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────
+// -- Helpers --
 
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     match level {
@@ -295,7 +254,7 @@ fn ends_with_newlines(spans: &[RichSpan], n: usize) -> bool {
     newline_count >= n
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
+// -- Tests --
 
 #[cfg(test)]
 mod tests {
@@ -356,9 +315,9 @@ mod tests {
     fn list_items() {
         let spans = parse_to_rich_spans("- one\n- two\n- three");
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains("• one"));
-        assert!(text.contains("• two"));
-        assert!(text.contains("• three"));
+        assert!(text.contains("\u{2022} one"));
+        assert!(text.contains("\u{2022} two"));
+        assert!(text.contains("\u{2022} three"));
     }
 
     #[test]
@@ -379,14 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn cosmic_spans_bold_attrs() {
-        let spans = parse_to_rich_spans("**bold**");
-        let base = Attrs::new().family(Family::Name("Noto Sans Mono"));
+    fn markdown_colors_default() {
         let colors = MarkdownColors::default();
-        let cosmic = to_cosmic_spans(&spans, &base, &colors);
-
-        // Find the bold span
-        let bold_span = cosmic.iter().find(|(t, _)| *t == "bold");
-        assert!(bold_span.is_some());
+        // Verify the defaults are reasonable Bevy colors
+        assert_ne!(colors.heading, Color::BLACK);
+        assert_ne!(colors.code, Color::BLACK);
+        assert!(colors.strong.is_none());
+        assert_ne!(colors.code_block, Color::BLACK);
     }
 }

@@ -3,7 +3,7 @@
 //! These systems reactively update widget pane text content based on
 //! application state changes (mode, connection, drift contexts).
 //! Uses the tiling reconciler's `WidgetPaneText` marker to find and
-//! update MSDF text content in dock widget panes.
+//! update text content in dock widget panes.
 
 use std::collections::VecDeque;
 
@@ -15,7 +15,8 @@ use crate::cell::ContextSwitchRequested;
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::input::FocusArea;
 use crate::connection::RpcConnectionState;
-use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::text::KjUiText;
+use bevy_vello::prelude::UiVelloText;
 use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
@@ -98,7 +99,7 @@ pub fn update_mode_widget(
     screen: Res<State<crate::ui::screen::Screen>>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !focus_area.is_changed() && !screen.is_changed() {
         return;
@@ -121,9 +122,9 @@ pub fn update_mode_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = name.to_string();
-                msdf_text.color = bevy_to_rgba8(color);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                kj_text.text = name.to_string();
+                kj_text.color = color;
             }
         }
     }
@@ -134,7 +135,7 @@ pub fn update_connection_widget(
     conn_state: Res<RpcConnectionState>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !conn_state.is_changed() {
         return;
@@ -161,9 +162,9 @@ pub fn update_connection_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = text.clone();
-                msdf_text.color = bevy_to_rgba8(color);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                kj_text.text = text.clone();
+                kj_text.color = color;
             }
         }
     }
@@ -190,7 +191,7 @@ pub fn update_contexts_widget(
     widget_panes: Query<(Entity, &WidgetPaneText, &Children)>,
     existing_badges: Query<(Entity, &ContextBadge, Option<&Children>)>,
     aux_entities: Query<Entity, With<BadgeAuxiliary>>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !drift_state.is_changed() && !doc_cache.is_changed() {
         return;
@@ -213,9 +214,9 @@ pub fn update_contexts_widget(
             if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
         }
         for child in widget_children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = format!("← @{}: \"{}\"", notif.source_ctx, notif.preview);
-                msdf_text.color = bevy_to_rgba8(theme.accent);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                kj_text.text = format!("← @{}: \"{}\"", notif.source_ctx, notif.preview);
+                kj_text.color = theme.accent;
             }
         }
         return;
@@ -227,8 +228,8 @@ pub fn update_contexts_widget(
     if !mru_ids.is_empty() {
         // Clear the original text child
         for child in widget_children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                msdf_text.text = String::new();
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                kj_text.text = String::new();
             }
         }
 
@@ -284,10 +285,10 @@ pub fn update_contexts_widget(
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        MsdfUiText::new(&label)
+                        KjUiText::new(&label)
                             .with_font_size(11.0)
                             .with_color(color),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node::default(),
                     ));
                 })
@@ -308,10 +309,10 @@ pub fn update_contexts_widget(
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        MsdfUiText::new(&format!("+{}", remaining))
+                        KjUiText::new(&format!("+{}", remaining))
                             .with_font_size(11.0)
                             .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node::default(),
                     ));
                 })
@@ -332,10 +333,10 @@ pub fn update_contexts_widget(
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        MsdfUiText::new(&format!("·{} staged", staged))
+                        KjUiText::new(&format!("·{} staged", staged))
                             .with_font_size(11.0)
                             .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
+                        UiVelloText::default(),
                         Node::default(),
                     ));
                 })
@@ -355,9 +356,9 @@ pub fn update_contexts_widget(
 
     // Fall back to drift state contexts as single text
     for child in widget_children.iter() {
-        if let Ok(mut msdf_text) = texts.get_mut(child) {
+        if let Ok(mut kj_text) = texts.get_mut(child) {
             if drift_state.contexts.is_empty() {
-                msdf_text.text = String::new();
+                kj_text.text = String::new();
                 continue;
             }
 
@@ -385,8 +386,8 @@ pub fn update_contexts_widget(
                 theme.fg_dim
             };
 
-            msdf_text.text = text;
-            msdf_text.color = bevy_to_rgba8(color);
+            kj_text.text = text;
+            kj_text.color = color;
         }
     }
 }
@@ -398,7 +399,7 @@ pub fn update_hints_widget(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !focus_area.is_changed() && !screen.is_changed() {
         return;
@@ -421,9 +422,9 @@ pub fn update_hints_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                if msdf_text.text != hints {
-                    msdf_text.text = hints.to_string();
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                if kj_text.text != hints {
+                    kj_text.text = hints.to_string();
                 }
             }
         }
@@ -451,7 +452,7 @@ pub fn update_event_pulse_widget(
     mut events: MessageReader<ServerEventMessage>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     let now = time.elapsed_secs_f64();
     let window = 5.0;
@@ -483,10 +484,10 @@ pub fn update_event_pulse_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                if msdf_text.text != text {
-                    msdf_text.text = text.clone();
-                    msdf_text.color = bevy_to_rgba8(color);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                if kj_text.text != text {
+                    kj_text.text = text.clone();
+                    kj_text.color = color;
                 }
             }
         }
@@ -502,7 +503,7 @@ pub fn update_model_badge_widget(
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !drift_state.is_changed() && !doc_cache.is_changed() {
         return;
@@ -532,10 +533,10 @@ pub fn update_model_badge_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                if msdf_text.text != model_text {
-                    msdf_text.text = model_text.clone();
-                    msdf_text.color = bevy_to_rgba8(theme.fg_dim);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                if kj_text.text != model_text {
+                    kj_text.text = model_text.clone();
+                    kj_text.color = theme.fg_dim;
                 }
             }
         }
@@ -565,7 +566,7 @@ pub fn update_agent_activity_widget(
     constellation: Res<Constellation>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     if !constellation.is_changed() {
         return;
@@ -598,10 +599,10 @@ pub fn update_agent_activity_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                if msdf_text.text != text {
-                    msdf_text.text = text.clone();
-                    msdf_text.color = bevy_to_rgba8(color);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                if kj_text.text != text {
+                    kj_text.text = text.clone();
+                    kj_text.color = color;
                 }
             }
         }
@@ -627,7 +628,7 @@ pub fn update_block_activity_widget(
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     widget_panes: Query<(&WidgetPaneText, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
+    mut texts: Query<&mut KjUiText>,
 ) {
     let active_doc = doc_cache.active_id().map(|s| s.to_string());
 
@@ -670,10 +671,10 @@ pub fn update_block_activity_widget(
             continue;
         }
         for child in children.iter() {
-            if let Ok(mut msdf_text) = texts.get_mut(child) {
-                if msdf_text.text != text {
-                    msdf_text.text = text.clone();
-                    msdf_text.color = bevy_to_rgba8(theme.accent);
+            if let Ok(mut kj_text) = texts.get_mut(child) {
+                if kj_text.text != text {
+                    kj_text.text = text.clone();
+                    kj_text.color = theme.accent;
                 }
             }
         }

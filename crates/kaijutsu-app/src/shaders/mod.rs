@@ -6,7 +6,7 @@
 //! - `PulseRingMaterial` - Expanding ring ripple effect
 //! - `ScanlinesMaterial` - Subtle CRT/cyberpunk scanlines
 //! - `HoloBorderMaterial` - Rainbow/gradient animated border
-//! - `TextGlowMaterial` - Luminous backing for text with theme-reactive effects
+//! - `TextGlowMaterial` - REMOVED (Vello migration)
 //!
 //! # Theme-Reactive Shaders
 //!
@@ -33,7 +33,7 @@
 
 pub mod block_border_material;
 pub mod context;
-pub use context::{ShaderEffectContext, ShaderEffectContextPlugin, TextGeometry, TextGlowTarget};
+pub use context::ShaderEffectContextPlugin;
 
 use bevy::{
     prelude::*,
@@ -58,8 +58,6 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<CursorBeamMaterial>::default(),
         ))
         .add_plugins((
-            // Text effects
-            UiMaterialPlugin::<TextGlowMaterial>::default(),
             // Constellation effects
             UiMaterialPlugin::<ConnectionLineMaterial>::default(),
             UiMaterialPlugin::<DriftArcMaterial>::default(),
@@ -74,8 +72,6 @@ impl Plugin for ShaderFxPlugin {
         .add_systems(Update, (
             update_shader_time,
             update_shader_time_effects,
-            sync_effect_context_to_text_glow,
-            sync_text_geometry_to_materials,
         ));
     }
 }
@@ -89,7 +85,6 @@ fn update_shader_time(
     mut scanline_materials: ResMut<Assets<ScanlinesMaterial>>,
     mut holo_materials: ResMut<Assets<HoloBorderMaterial>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
-    mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -110,11 +105,6 @@ fn update_shader_time(
         mat.time.x = t;
     }
     for (_, mat) in cursor_materials.iter_mut() {
-        mat.time.x = t;
-    }
-
-    // Text effects
-    for (_, mat) in text_glow_materials.iter_mut() {
         mat.time.x = t;
     }
 }
@@ -414,93 +404,7 @@ impl UiMaterial for CursorBeamMaterial {
     }
 }
 
-// ============================================================================
-// TEXT GLOW MATERIAL
-// ============================================================================
-
-/// Subtle luminous backing for text - increases contrast and perceived sharpness.
-///
-/// Now theme-reactive: effect parameters come from `ShaderEffectContext` which
-/// syncs from `theme.rhai`. The shader reads these from the `effect` uniform.
-///
-/// Renders behind text to create:
-/// - Soft center glow (backlight effect)
-/// - Optional edge enhancement (sharpening)
-/// - Subtle top-light gradient (improves readability)
-///
-/// # Theme Configuration
-///
-/// In `theme.rhai`:
-/// ```rhai
-/// let effect_glow_radius = 0.3;
-/// let effect_glow_intensity = 0.5;
-/// let effect_breathe_speed = 1.9;
-/// // ... etc
-/// ```
-///
-/// # Usage
-///
-/// Spawn a Node with this material BEHIND your text (ZIndex(-1)):
-/// ```ignore
-/// // Glow backing
-/// commands.spawn((
-///     Node { width: Val::Px(200.0), height: Val::Px(30.0), ..default() },
-///     MaterialNode(materials.add(TextGlowMaterial::default())),
-///     ZIndex(-1),
-/// ));
-/// // Text on top (ZIndex 0, default)
-/// commands.spawn((GlyphonUiText::new("Hello"), ...));
-/// ```
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct TextGlowMaterial {
-    /// Glow color (RGBA) - typically matches or complements text color
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=radius (0.1-0.5), y=intensity (0.5-2.0), z=falloff (1.0-4.0), w=mode (0=glow, >0.5=icy)
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time (updated by update_shader_time system)
-    #[uniform(2)]
-    pub time: Vec4,
-    /// Effect context from theme: [glow_radius, glow_intensity, glow_falloff, sheen_speed]
-    #[uniform(3)]
-    pub effect_glow: Vec4,
-    /// Effect context from theme: [sparkle_threshold, breathe_speed, breathe_amplitude, _reserved]
-    #[uniform(4)]
-    pub effect_anim: Vec4,
-    /// Theme colors: accent (linear space)
-    #[uniform(5)]
-    pub theme_accent: Vec4,
-    /// Text geometry: bounds [x, y, width, height] in screen pixels
-    #[uniform(6)]
-    pub text_bounds: Vec4,
-    /// Text geometry: metrics [baseline, line_height, font_size, ascent]
-    #[uniform(7)]
-    pub text_metrics: Vec4,
-}
-
-impl Default for TextGlowMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.5, 0.6, 0.9, 0.3), // Soft blue, low alpha
-            params: Vec4::new(0.3, 0.8, 2.0, 0.0), // radius, intensity, falloff, mode
-            time: Vec4::ZERO,
-            // Defaults match Theme::default() effect params
-            effect_glow: Vec4::new(0.3, 0.5, 2.5, 0.15),   // radius, intensity, falloff, sheen_speed
-            effect_anim: Vec4::new(0.92, 1.9, 0.1, 0.0),   // sparkle_threshold, breathe_speed, breathe_amplitude
-            theme_accent: Vec4::new(0.34, 0.65, 1.0, 1.0), // Default accent
-            // Geometry defaults (will be populated by sync system if TextGlowTarget present)
-            text_bounds: Vec4::new(0.0, 0.0, 100.0, 20.0), // Placeholder bounds
-            text_metrics: Vec4::new(11.2, 20.0, 14.0, 11.2), // baseline, line_height, font_size, ascent
-        }
-    }
-}
-
-impl UiMaterial for TextGlowMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/text_glow.wgsl".into()
-    }
-}
+// TextGlowMaterial — removed (text_glow.wgsl deleted in Vello migration)
 
 // ============================================================================
 // CONNECTION LINE MATERIAL
@@ -762,74 +666,4 @@ impl UiMaterial for HudPanelMaterial {
     }
 }
 
-/// System: sync ShaderEffectContext → TextGlowMaterial uniforms
-///
-/// Updates all text glow materials with the current effect context from the theme.
-/// This provides theme-reactive behavior without requiring material recreation.
-fn sync_effect_context_to_text_glow(
-    ctx: Res<ShaderEffectContext>,
-    mut text_glow_materials: ResMut<Assets<TextGlowMaterial>>,
-) {
-    // Only update if context changed
-    if !ctx.is_changed() {
-        return;
-    }
-
-    // Pack effect params into Vec4s for uniform binding
-    let effect_glow = Vec4::new(
-        ctx.glow_radius,
-        ctx.glow_intensity,
-        ctx.glow_falloff,
-        ctx.sheen_speed,
-    );
-    let effect_anim = Vec4::new(
-        ctx.sparkle_threshold,
-        ctx.breathe_speed,
-        ctx.breathe_amplitude,
-        0.0, // reserved
-    );
-
-    for (_, mat) in text_glow_materials.iter_mut() {
-        mat.effect_glow = effect_glow;
-        mat.effect_anim = effect_anim;
-        mat.theme_accent = ctx.accent;
-    }
-}
-
-/// System: sync text geometry → TextGlowMaterial uniforms
-///
-/// For each entity with a TextGlowTarget, looks up the target text entity's
-/// position and metrics, then updates the material's geometry uniforms.
-/// This enables position-aware shader effects (baseline glow, per-line effects, etc.)
-fn sync_text_geometry_to_materials(
-    glow_query: Query<(&TextGlowTarget, &MaterialNode<TextGlowMaterial>)>,
-    text_query: Query<(&crate::text::UiTextPositionCache, &crate::text::MsdfUiText)>,
-    mut materials: ResMut<Assets<TextGlowMaterial>>,
-) {
-    for (target, material_node) in glow_query.iter() {
-        // Look up the target text entity
-        let Ok((position, ui_text)) = text_query.get(target.0) else {
-            continue;
-        };
-
-        // Get the material handle and update
-        let Some(mat) = materials.get_mut(material_node.0.id()) else {
-            continue;
-        };
-
-        // Build geometry from position cache and text metrics
-        let geometry = TextGeometry::from_position_and_metrics(
-            position.left,
-            position.top,
-            position.width,
-            position.height,
-            ui_text.metrics.font_size,
-            ui_text.metrics.line_height,
-        );
-
-        // Update material uniforms
-        let (bounds, metrics) = geometry.to_shader_vecs();
-        mat.text_bounds = bounds;
-        mat.text_metrics = metrics;
-    }
-}
+// TextGlow sync systems — removed (TextGlowMaterial deleted in Vello migration)
