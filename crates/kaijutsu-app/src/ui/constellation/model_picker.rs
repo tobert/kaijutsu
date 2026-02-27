@@ -8,13 +8,13 @@
 //! input system (FocusArea::Dialog context).
 
 use bevy::prelude::*;
-use std::sync::{Arc, Mutex};
 
 use crate::connection::RpcActor;
 use crate::input::action::Action;
 use crate::input::events::ActionFired;
 use crate::input::focus::{FocusArea, FocusStack};
-use crate::text::{bevy_to_rgba8, MsdfUiText, UiTextPositionCache};
+use crate::text::{MsdfUiText, UiTextPositionCache};
+use crate::ui::form::{msdf_label, AsyncSlot, ListItem, SelectableList};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -28,12 +28,8 @@ pub struct OpenModelPicker {
 }
 
 // ============================================================================
-// RESOURCES
+// DATA
 // ============================================================================
-
-/// Shared slot for async LLM config fetch result.
-#[derive(Resource, Default)]
-pub struct ModelPickerResult(pub Arc<Mutex<Option<FetchedLlmConfig>>>);
 
 /// Fetched LLM config data.
 #[derive(Clone, Debug)]
@@ -56,22 +52,13 @@ pub struct ModelPickerDialog {
     pub context_name: String,
 }
 
-/// State for model selection within the picker.
-#[derive(Component)]
-pub struct ModelPickerSelection {
-    pub items: Vec<(String, String)>, // (provider, model)
-    pub selected: usize,
-}
-
-/// Marker for a model item row in the picker list.
-#[derive(Component)]
-pub struct ModelPickerItem {
-    pub index: usize,
-}
-
 /// Marker for the "Loading..." text while fetching config.
 #[derive(Component)]
 pub struct ModelPickerLoading;
+
+/// Marker for the list container entity within the dialog.
+#[derive(Component)]
+struct ModelPickerListContainer;
 
 // ============================================================================
 // SYSTEMS
@@ -79,7 +66,7 @@ pub struct ModelPickerLoading;
 
 pub fn setup_model_picker_systems(app: &mut App) {
     app.add_message::<OpenModelPicker>()
-        .init_resource::<ModelPickerResult>()
+        .init_resource::<AsyncSlot<FetchedLlmConfig>>()
         .add_systems(
             Update,
             (
@@ -100,7 +87,7 @@ fn handle_open_model_picker(
     existing: Query<Entity, With<ModelPickerDialog>>,
     theme: Res<Theme>,
     actor: Option<Res<RpcActor>>,
-    result_slot: Res<ModelPickerResult>,
+    result_slot: Res<AsyncSlot<FetchedLlmConfig>>,
 ) {
     if !existing.is_empty() {
         return;
@@ -113,9 +100,7 @@ fn handle_open_model_picker(
         };
 
         focus_stack.push(&mut focus, FocusArea::Dialog);
-
-        // Clear any stale result
-        *result_slot.0.lock().unwrap() = None;
+        result_slot.clear();
 
         // Spawn loading dialog
         commands
@@ -154,18 +139,12 @@ fn handle_open_model_picker(
                         Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
                     ))
                     .with_children(|dialog| {
-                        // TODO: explicit sizes — MsdfUiText doesn't do intrinsic sizing
-                        dialog.spawn((
-                            MsdfUiText::new(format!("Model: @{}", event.context_name))
-                                .with_font_size(16.0)
-                                .with_color(theme.fg),
-                            UiTextPositionCache::default(),
-                            Node {
-                                width: Val::Percent(100.0),
-                                height: Val::Px(18.0),
-                                ..default()
-                            },
-                        ));
+                        msdf_label(
+                            dialog,
+                            &format!("Model: @{}", event.context_name),
+                            16.0,
+                            theme.fg,
+                        );
                         dialog.spawn((
                             ModelPickerLoading,
                             MsdfUiText::new("Loading models...")
@@ -178,12 +157,21 @@ fn handle_open_model_picker(
                                 ..default()
                             },
                         ));
+                        // List container (SelectableList will be inserted here)
+                        dialog.spawn((
+                            ModelPickerListContainer,
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Column,
+                                ..default()
+                            },
+                        ));
                     });
             });
 
-        // Fetch config async via shared slot
+        // Fetch config async
         let handle = actor.handle.clone();
-        let slot = result_slot.0.clone();
+        let slot = result_slot.sender();
 
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
@@ -214,24 +202,17 @@ fn handle_open_model_picker(
 /// Poll the shared result slot. When data arrives, populate the dialog.
 fn poll_model_picker_result(
     mut commands: Commands,
-    theme: Res<Theme>,
-    result_slot: Res<ModelPickerResult>,
-    dialogs: Query<Entity, With<ModelPickerDialog>>,
+    result_slot: Res<AsyncSlot<FetchedLlmConfig>>,
     loading: Query<Entity, With<ModelPickerLoading>>,
-    existing_selection: Query<&ModelPickerSelection>,
+    container_query: Query<Entity, With<ModelPickerListContainer>>,
+    existing_list: Query<&SelectableList, With<ModelPickerListContainer>>,
 ) {
-    // Nothing to do if no dialog or already populated
-    if dialogs.is_empty() || !existing_selection.is_empty() {
+    // Nothing to do if already populated
+    if !existing_list.is_empty() {
         return;
     }
 
-    // Check for result
-    let data = result_slot.0.lock().unwrap().take();
-    let Some(data) = data else {
-        return;
-    };
-
-    let Ok(dialog_entity) = dialogs.single() else {
+    let Some(data) = result_slot.take() else {
         return;
     };
 
@@ -240,97 +221,29 @@ fn poll_model_picker_result(
         commands.entity(entity).despawn();
     }
 
-    // Find current selection index
+    let Ok(container) = container_query.single() else {
+        return;
+    };
+
+    // Build list items
+    let mut items = Vec::new();
     let mut selected = 0;
-    let items: Vec<(String, String)> = data
-        .models
-        .iter()
-        .enumerate()
-        .map(|(i, (provider, model, _))| {
-            if *provider == data.current_provider {
-                selected = i;
-            }
-            (provider.clone(), model.clone())
-        })
-        .collect();
+
+    for (i, (provider, model, _available)) in data.models.iter().enumerate() {
+        if *provider == data.current_provider {
+            selected = i;
+        }
+        items.push(ListItem::new(format!("{}/{}", provider, model)));
+    }
 
     if items.is_empty() {
         return;
     }
 
-    // Add selection state to dialog
-    commands.entity(dialog_entity).insert(ModelPickerSelection {
-        items: items.clone(),
-        selected,
-    });
-
-    // Spawn model items as children of the dialog entity
-    for (i, (provider, model, available)) in data.models.iter().enumerate() {
-        let is_current = i == selected;
-        let color = if !available {
-            theme.fg_dim.with_alpha(0.3)
-        } else if is_current {
-            theme.accent
-        } else {
-            theme.fg
-        };
-        let bg = if is_current {
-            theme.accent.with_alpha(0.15)
-        } else {
-            Color::NONE
-        };
-        let prefix = if is_current { "▸ " } else { "  " };
-
-        let item = commands
-            .spawn((
-                ModelPickerItem { index: i },
-                Node {
-                    padding: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(bg),
-            ))
-            .with_children(|row| {
-                // TODO: explicit size — MsdfUiText no intrinsic sizing
-                row.spawn((
-                    MsdfUiText::new(format!("{}{}/{}", prefix, provider, model))
-                        .with_font_size(13.0)
-                        .with_color(color),
-                    UiTextPositionCache::default(),
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(15.0),
-                        ..default()
-                    },
-                ));
-            })
-            .id();
-
-        commands.entity(dialog_entity).add_child(item);
-    }
-
-    // Hint text
-    let hint = commands
-        .spawn(Node {
-            margin: UiRect::top(Val::Px(8.0)),
-            ..default()
-        })
-        .with_children(|parent| {
-            // TODO: explicit size — MsdfUiText no intrinsic sizing
-            parent.spawn((
-                MsdfUiText::new("j/k: navigate │ Enter: select │ Esc: cancel")
-                    .with_font_size(10.0)
-                    .with_color(theme.fg_dim),
-                UiTextPositionCache::default(),
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(12.0),
-                    ..default()
-                },
-            ));
-        })
-        .id();
-    commands.entity(dialog_entity).add_child(hint);
+    let mut list = SelectableList::new(items, 13.0);
+    list.selected = selected;
+    list.selected_bg_alpha = 0.15;
+    commands.entity(container).insert(list);
 }
 
 /// Handle actions in the model picker (j/k/Enter/Escape via ActionFired).
@@ -339,17 +252,15 @@ fn handle_model_picker_input(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut focus_stack: ResMut<FocusStack>,
-    mut dialogs: Query<(Entity, &ModelPickerDialog, Option<&mut ModelPickerSelection>)>,
-    mut items: Query<(&ModelPickerItem, &mut BackgroundColor, &Children)>,
-    mut texts: Query<&mut MsdfUiText>,
-    theme: Res<Theme>,
+    dialogs: Query<Entity, With<ModelPickerDialog>>,
+    mut list_query: Query<&mut SelectableList, With<ModelPickerListContainer>>,
     actor: Option<Res<RpcActor>>,
 ) {
-    let Ok((dialog_entity, _dialog, selection)) = dialogs.single_mut() else {
+    let Ok(dialog_entity) = dialogs.single() else {
         return;
     };
 
-    let Some(mut selection) = selection else {
+    if list_query.is_empty() {
         // Still loading — only handle Escape/Unfocus
         for ActionFired(action) in actions.read() {
             if matches!(action, Action::Unfocus) {
@@ -357,7 +268,7 @@ fn handle_model_picker_input(
             }
         }
         return;
-    };
+    }
 
     for ActionFired(action) in actions.read() {
         match action {
@@ -366,77 +277,45 @@ fn handle_model_picker_input(
                 return;
             }
             Action::Activate => {
-                let (provider, model) = &selection.items[selection.selected];
-                info!("Model selected: {}/{}", provider, model);
+                if let Ok(list) = list_query.single() {
+                    if let Some(item) = list.selected_item() {
+                        // Parse "provider/model" back into parts
+                        if let Some((provider, model)) = item.label.split_once('/') {
+                            info!("Model selected: {}/{}", provider, model);
 
-                if let Some(ref actor) = actor {
-                    let handle = actor.handle.clone();
-                    let provider = provider.clone();
-                    let model = model.clone();
+                            if let Some(ref actor) = actor {
+                                let handle = actor.handle.clone();
+                                let provider = provider.to_string();
+                                let model = model.to_string();
 
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            match handle.set_default_model(&provider, &model).await {
-                                Ok(true) => info!("Model set to {}/{}", provider, model),
-                                Ok(false) => warn!("set_default_model returned false"),
-                                Err(e) => error!("Failed to set model: {}", e),
+                                bevy::tasks::IoTaskPool::get()
+                                    .spawn(async move {
+                                        match handle.set_default_model(&provider, &model).await {
+                                            Ok(true) => info!("Model set to {}/{}", provider, model),
+                                            Ok(false) => warn!("set_default_model returned false"),
+                                            Err(e) => error!("Failed to set model: {}", e),
+                                        }
+                                    })
+                                    .detach();
                             }
-                        })
-                        .detach();
+                        }
+                    }
                 }
 
                 close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
             }
             Action::FocusNextBlock => {
-                let old_selected = selection.selected;
-                if selection.selected < selection.items.len() - 1 {
-                    selection.selected += 1;
-                }
-                if old_selected != selection.selected {
-                    update_picker_visuals(&selection, &mut items, &mut texts, &theme);
+                if let Ok(mut list) = list_query.single_mut() {
+                    list.select_next();
                 }
             }
             Action::FocusPrevBlock => {
-                let old_selected = selection.selected;
-                if selection.selected > 0 {
-                    selection.selected -= 1;
-                }
-                if old_selected != selection.selected {
-                    update_picker_visuals(&selection, &mut items, &mut texts, &theme);
+                if let Ok(mut list) = list_query.single_mut() {
+                    list.select_prev();
                 }
             }
             _ => {}
-        }
-    }
-}
-
-/// Update visual selection in the model picker list.
-fn update_picker_visuals(
-    selection: &ModelPickerSelection,
-    items: &mut Query<(&ModelPickerItem, &mut BackgroundColor, &Children)>,
-    texts: &mut Query<&mut MsdfUiText>,
-    theme: &Theme,
-) {
-    for (item, mut bg, children) in items.iter_mut() {
-        let is_selected = item.index == selection.selected;
-        *bg = BackgroundColor(if is_selected {
-            theme.accent.with_alpha(0.15)
-        } else {
-            Color::NONE
-        });
-
-        for child in children.iter() {
-            if let Ok(mut text) = texts.get_mut(child) {
-                let (provider, model) = &selection.items[item.index];
-                let prefix = if is_selected { "▸ " } else { "  " };
-                text.text = format!("{}{}/{}", prefix, provider, model);
-                text.color = bevy_to_rgba8(if is_selected {
-                    theme.accent
-                } else {
-                    theme.fg
-                });
-            }
         }
     }
 }

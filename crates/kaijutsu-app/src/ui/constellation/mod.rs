@@ -117,6 +117,9 @@ impl Plugin for ConstellationPlugin {
 
         // Add fork form systems (full-viewport fork configuration)
         fork_form::setup_fork_form_systems(app);
+
+        // Form primitives (selectable list, tree view, form field sync)
+        app.add_plugins(crate::ui::form::FormPlugin);
     }
 }
 
