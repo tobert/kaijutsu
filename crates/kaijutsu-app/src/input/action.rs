@@ -20,6 +20,12 @@ pub enum Action {
     CycleFocusBackward,
     /// Shortcut to focus the compose area (i/Space in Navigation context)
     FocusCompose,
+    /// Summon input overlay in chat mode (i/Space in Navigation)
+    SummonChat,
+    /// Summon input overlay in shell mode (: in Navigation)
+    SummonShell,
+    /// Cycle input mode ring (Tab in TextInput) — chat ↔ shell
+    CycleModeRing,
     /// Context-dependent "go up" (Escape)
     /// - TextInput → Conversation
     /// - Constellation → close, return to Conversation

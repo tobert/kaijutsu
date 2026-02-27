@@ -52,10 +52,35 @@ pub fn handle_focus_cycle(
 pub fn handle_focus_compose(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
+    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    doc_cache: Res<crate::cell::DocumentCache>,
 ) {
     for ActionFired(action) in actions.read() {
-        if matches!(action, Action::FocusCompose) {
+        let mode = match action {
+            Action::FocusCompose | Action::SummonChat => Some(crate::cell::InputMode::Chat),
+            Action::SummonShell => Some(crate::cell::InputMode::Shell),
+            _ => None,
+        };
+        if let Some(mode) = mode {
             *focus = FocusArea::Compose;
+            // Set the overlay mode and restore text from CRDT if available
+            if let Ok(mut overlay) = overlay.single_mut() {
+                overlay.mode = mode;
+                // Restore draft from CRDT InputDocEntry if overlay is empty
+                if overlay.text.is_empty() {
+                    if let Some(ctx_id) = doc_cache.active_id() {
+                        if let Some(cached) = doc_cache.get(ctx_id) {
+                            if let Some(ref input) = cached.input {
+                                let crdt_text = input.text();
+                                if !crdt_text.is_empty() {
+                                    overlay.text = crdt_text;
+                                    overlay.cursor = overlay.text.len();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -618,7 +643,7 @@ pub fn handle_tiling(
 // ============================================================================
 
 use crate::cell::{
-    BlockEditCursor, ComposeBlock, EditingBlockCell, PromptSubmitted,
+    BlockEditCursor, EditingBlockCell, PromptSubmitted,
 };
 use crate::ui::constellation::{
     CameraOrbit, Constellation, ConstellationCamera, ConstellationScene,
@@ -831,41 +856,34 @@ pub fn handle_timeline(
 // TEXT INPUT (COMPOSE + INLINE BLOCK EDITING)
 // ============================================================================
 
-/// Handle text input in Compose area.
+/// Handle text input in the input overlay (Compose area).
 ///
 /// Consumes TextInputReceived for character insertion and ActionFired for
-/// editing actions (Submit, Backspace, Delete, cursor movement).
-/// Auto-detects shell prefix (: or `) for routing on Submit.
+/// editing actions (Submit, Backspace, Delete, cursor movement, CycleModeRing).
+/// Uses `InputOverlay.mode` to determine shell vs chat routing on Submit.
 ///
-/// **Phase 4 — Dual-write to CRDT input document:**
-/// Each local edit is immediately applied to ComposeBlock (zero perceived latency),
-/// then asynchronously pushed to the server via `edit_input` RPC. On submit,
-/// `submit_input` RPC is used instead of local `PromptSubmitted` — the compose
-/// block is cleared only when the server sends `InputCleared`.
+/// Dual-writes to CRDT input document via `edit_input` RPC for persistence.
+/// Submit uses `submit_input` RPC — overlay cleared only on `InputCleared`.
 pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
-    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
+    mut overlay: Query<&mut crate::cell::InputOverlay>,
     mut submit_writer: MessageWriter<PromptSubmitted>,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
     doc_cache: Res<crate::cell::DocumentCache>,
 ) {
-    let Ok(mut compose) = compose_blocks.single_mut() else {
+    let Ok(mut overlay) = overlay.single_mut() else {
         return;
     };
 
-    // Helper: fire-and-forget edit_input to server (async, non-blocking).
-    // Captures cursor position BEFORE the local edit so the server sees
-    // the same offset.
     let ctx_id = doc_cache.active_id();
 
     // Handle text insertion
     for super::events::TextInputReceived(text) in text_events.read() {
-        let pos_before = compose.cursor;
-        compose.insert(text);
+        let pos_before = overlay.cursor;
+        overlay.insert(text);
 
-        // Dual-write: push insert to server
         if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
             let handle = actor.handle.clone();
             let insert_text = text.clone();
@@ -883,41 +901,74 @@ pub fn handle_compose_input(
     // Handle editing actions
     for ActionFired(action) in actions.read() {
         match action {
+            Action::CycleModeRing => {
+                overlay.mode = overlay.mode.next();
+                info!("Input mode: {:?}", overlay.mode);
+            }
             Action::Submit => {
-                if !compose.is_empty() {
-                    // Try CRDT-backed submit via server
+                if !overlay.is_empty() {
                     if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                        let handle = actor.handle.clone();
-                        info!("ComposeBlock submit via submit_input (ctx={})", ctx);
-                        bevy::tasks::IoTaskPool::get()
-                            .spawn(async move {
-                                match handle.submit_input(ctx).await {
-                                    Ok(result) => {
-                                        log::info!(
-                                            "submit_input succeeded: block={:?} shell={}",
-                                            result.block_id, result.is_shell
-                                        );
+                        // For shell mode, prefix text with `:` so server detects it
+                        if overlay.is_shell() {
+                            let shell_text = format!(":{}", overlay.text);
+                            // Rewrite the CRDT to have the prefix before submit
+                            let handle = actor.handle.clone();
+                            let text_len = overlay.text.len() as u64;
+                            let prefix_handle = handle.clone();
+                            bevy::tasks::IoTaskPool::get()
+                                .spawn(async move {
+                                    // Clear and rewrite with prefix
+                                    if let Err(e) = prefix_handle.edit_input(ctx, 0, "", text_len).await {
+                                        log::warn!("edit_input (clear for shell prefix) failed: {e}");
+                                        return;
                                     }
-                                    Err(e) => {
-                                        log::error!("submit_input failed: {e}");
-                                        // Server-side submit failed — the text stays
-                                        // in compose (no InputCleared will arrive).
+                                    if let Err(e) = prefix_handle.edit_input(ctx, 0, &shell_text, 0).await {
+                                        log::warn!("edit_input (shell prefix) failed: {e}");
+                                        return;
                                     }
-                                }
-                            })
-                            .detach();
-                        // Do NOT clear compose locally — wait for InputCleared event.
+                                    match prefix_handle.submit_input(ctx).await {
+                                        Ok(result) => {
+                                            log::info!(
+                                                "submit_input succeeded: block={:?} shell={}",
+                                                result.block_id, result.is_shell
+                                            );
+                                        }
+                                        Err(e) => log::error!("submit_input failed: {e}"),
+                                    }
+                                })
+                                .detach();
+                        } else {
+                            let handle = actor.handle.clone();
+                            info!("InputOverlay submit via submit_input (ctx={})", ctx);
+                            bevy::tasks::IoTaskPool::get()
+                                .spawn(async move {
+                                    match handle.submit_input(ctx).await {
+                                        Ok(result) => {
+                                            log::info!(
+                                                "submit_input succeeded: block={:?} shell={}",
+                                                result.block_id, result.is_shell
+                                            );
+                                        }
+                                        Err(e) => log::error!("submit_input failed: {e}"),
+                                    }
+                                })
+                                .detach();
+                        }
+                        // Do NOT clear locally — wait for InputCleared event.
                     } else {
-                        // Offline fallback: use local PromptSubmitted path
-                        let text = compose.take();
-                        info!("ComposeBlock submitted (offline): {} chars", text.len());
+                        // Offline fallback
+                        let mut text = overlay.take();
+                        if overlay.is_shell() {
+                            text = format!(":{}", text);
+                        }
+                        info!("InputOverlay submitted (offline): {} chars", text.len());
                         submit_writer.write(PromptSubmitted { text });
                     }
                 }
             }
             Action::InsertNewline => {
-                let pos_before = compose.cursor;
-                compose.insert("\n");
+                let pos_before = overlay.cursor;
+                overlay.insert("\n");
 
                 if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
                     let handle = actor.handle.clone();
@@ -932,24 +983,22 @@ pub fn handle_compose_input(
                 }
             }
             Action::Backspace => {
-                // Capture position/deletion info BEFORE local edit
-                let had_selection = compose.selection_range().is_some();
+                let had_selection = overlay.selection_range().is_some();
                 let (del_pos, del_len) = if had_selection {
-                    let range = compose.selection_range().unwrap();
+                    let range = overlay.selection_range().unwrap();
                     (range.start, range.end - range.start)
-                } else if compose.cursor > 0 {
-                    // Find the character boundary like ComposeBlock.backspace does
-                    let prev = compose.text[..compose.cursor]
+                } else if overlay.cursor > 0 {
+                    let prev = overlay.text[..overlay.cursor]
                         .char_indices()
                         .last()
                         .map(|(i, _)| i)
                         .unwrap_or(0);
-                    (prev, compose.cursor - prev)
+                    (prev, overlay.cursor - prev)
                 } else {
                     (0, 0)
                 };
 
-                compose.backspace();
+                overlay.backspace();
 
                 if del_len > 0
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
@@ -967,22 +1016,22 @@ pub fn handle_compose_input(
                 }
             }
             Action::Delete => {
-                let had_selection = compose.selection_range().is_some();
+                let had_selection = overlay.selection_range().is_some();
                 let (del_pos, del_len) = if had_selection {
-                    let range = compose.selection_range().unwrap();
+                    let range = overlay.selection_range().unwrap();
                     (range.start, range.end - range.start)
-                } else if compose.cursor < compose.text.len() {
-                    let next = compose.text[compose.cursor..]
+                } else if overlay.cursor < overlay.text.len() {
+                    let next = overlay.text[overlay.cursor..]
                         .char_indices()
                         .nth(1)
-                        .map(|(i, _)| compose.cursor + i)
-                        .unwrap_or(compose.text.len());
-                    (compose.cursor, next - compose.cursor)
+                        .map(|(i, _)| overlay.cursor + i)
+                        .unwrap_or(overlay.text.len());
+                    (overlay.cursor, next - overlay.cursor)
                 } else {
                     (0, 0)
                 };
 
-                compose.delete();
+                overlay.delete();
 
                 if del_len > 0
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
@@ -999,18 +1048,12 @@ pub fn handle_compose_input(
                         .detach();
                 }
             }
-            Action::CursorLeft => {
-                compose.move_left();
-            }
-            Action::CursorRight => {
-                compose.move_right();
-            }
-            Action::SelectAll => {
-                compose.select_all();
-            }
+            Action::CursorLeft => overlay.move_left(),
+            Action::CursorRight => overlay.move_right(),
+            Action::SelectAll => overlay.select_all(),
             Action::Copy => {
                 if let Some(ref mut clip) = clipboard {
-                    if let Some(text) = compose.selected_text() {
+                    if let Some(text) = overlay.selected_text() {
                         if let Err(e) = clip.0.set_text(text) {
                             warn!("Copy failed: {e}");
                         }
@@ -1019,16 +1062,15 @@ pub fn handle_compose_input(
             }
             Action::Cut => {
                 if let Some(ref mut clip) = clipboard {
-                    if let Some(text) = compose.selected_text() {
-                        // Capture deletion info before modifying
-                        let range = compose.selection_range().unwrap();
+                    if let Some(text) = overlay.selected_text() {
+                        let range = overlay.selection_range().unwrap();
                         let del_pos = range.start;
                         let del_len = range.end - range.start;
 
                         if let Err(e) = clip.0.set_text(text) {
                             warn!("Cut failed: {e}");
                         } else {
-                            compose.delete_selection();
+                            overlay.delete_selection();
 
                             if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
                                 let handle = actor.handle.clone();
@@ -1050,16 +1092,15 @@ pub fn handle_compose_input(
                 if let Some(ref mut clip) = clipboard {
                     match clip.0.get_text() {
                         Ok(text) => {
-                            // If there's a selection, capture the deletion first
-                            let sel_range = compose.selection_range();
+                            let sel_range = overlay.selection_range();
                             let pos_before = if let Some(ref range) = sel_range {
                                 range.start
                             } else {
-                                compose.cursor
+                                overlay.cursor
                             };
                             let del_len = sel_range.as_ref().map(|r| r.end - r.start).unwrap_or(0);
 
-                            compose.insert(&text);
+                            overlay.insert(&text);
 
                             if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
                                 let handle = actor.handle.clone();

@@ -443,28 +443,13 @@ impl TilingTree {
             ],
         };
 
-        // Content area — starts as a single conversation
+        // Content area — starts as a single conversation (direct leaf, no compose)
         let conv_id = next();
-        let compose_id = next();
-        let content_split = TileNode::Split {
-            id: next(),
-            direction: SplitDirection::Column,
-            children: vec![
-                TileNode::Leaf {
-                    id: conv_id,
-                    content: PaneContent::Conversation {
-                        document_id: String::new(), // Set when conversation joins
-                    },
-                },
-                TileNode::Leaf {
-                    id: compose_id,
-                    content: PaneContent::Compose {
-                        target_pane: conv_id,
-                        writing_direction: WritingDirection::Horizontal,
-                    },
-                },
-            ],
-            ratios: vec![1.0, 0.0], // Conversation grows, compose auto-sizes
+        let content = TileNode::Leaf {
+            id: conv_id,
+            content: PaneContent::Conversation {
+                document_id: String::new(), // Set when conversation joins
+            },
         };
 
         // South dock widgets
@@ -511,12 +496,12 @@ impl TilingTree {
             ],
         };
 
-        // Root: Column with [NorthDock, ContentSplit, SouthDock]
+        // Root: Column with [NorthDock, Content, SouthDock]
         let root_id = next();
         let root = TileNode::Split {
             id: root_id,
             direction: SplitDirection::Column,
-            children: vec![north_dock, content_split, south_dock],
+            children: vec![north_dock, content, south_dock],
             ratios: vec![0.0, 1.0, 0.0], // Docks auto-size, content grows
         };
 
@@ -548,10 +533,9 @@ impl TilingTree {
 
     /// Split a conversation pane, inserting a new conversation beside it.
     ///
-    /// Finds the conversation group (Column Split containing the target
-    /// conversation + its compose), then inserts a new conversation group
-    /// as a sibling. If the parent's direction matches, the new group is
-    /// inserted inline; otherwise a wrapper Split is created.
+    /// Conversations are direct leaves (no compose grouping). The new
+    /// conversation is inserted as a sibling in the parent split (inline
+    /// if directions match, wrapped otherwise).
     ///
     /// Returns the PaneId of the new conversation pane.
     pub fn split(
@@ -568,82 +552,61 @@ impl TilingTree {
             return None;
         }
 
-        // Find the conversation group: the Split(Column) parent of the target
-        let (conv_group_id, _conv_idx) = self.root.find_parent(target)?;
+        // Find the parent that contains the target conversation leaf
+        let (parent_id, target_idx) = self.root.find_parent(target)?;
 
-        // Find the grandparent that contains the conversation group
-        let (grandparent_id, group_idx) = self.root.find_parent(conv_group_id)?;
-
-        // Allocate all IDs upfront (before any mutable tree borrows)
+        // Allocate IDs upfront (before mutable tree borrows)
         let new_conv_id = self.next_pane_id();
-        let new_compose_id = self.next_pane_id();
-        let new_group_id = self.next_pane_id();
         let wrapper_id = self.next_pane_id();
 
-        let new_group = TileNode::Split {
-            id: new_group_id,
-            direction: SplitDirection::Column,
-            children: vec![
-                TileNode::Leaf {
-                    id: new_conv_id,
-                    content: PaneContent::Conversation {
-                        document_id: String::new(),
-                    },
-                },
-                TileNode::Leaf {
-                    id: new_compose_id,
-                    content: PaneContent::Compose {
-                        target_pane: new_conv_id,
-                        writing_direction: WritingDirection::Horizontal,
-                    },
-                },
-            ],
-            ratios: vec![1.0, 0.0],
+        let new_leaf = TileNode::Leaf {
+            id: new_conv_id,
+            content: PaneContent::Conversation {
+                document_id: String::new(),
+            },
         };
 
-        // Now mutate the grandparent
-        let grandparent = self.root.find_mut(grandparent_id)?;
+        // Mutate the parent
+        let parent = self.root.find_mut(parent_id)?;
         if let TileNode::Split {
-            direction: gp_dir,
+            direction: parent_dir,
             children,
             ratios,
             ..
-        } = grandparent
+        } = parent
         {
-            if *gp_dir == direction {
-                // Same direction: insert new group after the conversation group.
-                // Halve the target's ratio — preserves other panes' custom sizing.
-                let target_ratio = ratios.get(group_idx).copied().unwrap_or(0.5);
+            if *parent_dir == direction {
+                // Same direction: insert inline, halve target's ratio
+                let target_ratio = ratios.get(target_idx).copied().unwrap_or(0.5);
                 let half = target_ratio / 2.0;
-                if group_idx < ratios.len() {
-                    ratios[group_idx] = half;
+                if target_idx < ratios.len() {
+                    ratios[target_idx] = half;
                 }
-                children.insert(group_idx + 1, new_group);
-                ratios.insert(group_idx + 1, half);
+                children.insert(target_idx + 1, new_leaf);
+                ratios.insert(target_idx + 1, half);
             } else {
-                // Different direction: wrap conv_group + new_group in a new Split
-                let old_child = children.remove(group_idx);
-                let old_ratio = if group_idx < ratios.len() {
-                    ratios.remove(group_idx)
+                // Different direction: wrap target + new leaf in a new Split
+                let old_child = children.remove(target_idx);
+                let old_ratio = if target_idx < ratios.len() {
+                    ratios.remove(target_idx)
                 } else {
                     1.0
                 };
                 let wrapper = TileNode::Split {
                     id: wrapper_id,
                     direction,
-                    children: vec![old_child, new_group],
+                    children: vec![old_child, new_leaf],
                     ratios: vec![0.5, 0.5],
                 };
-                children.insert(group_idx, wrapper);
-                ratios.insert(group_idx, old_ratio);
+                children.insert(target_idx, wrapper);
+                ratios.insert(target_idx, old_ratio);
             }
         } else {
             return None;
         }
 
-        // Normalize ratios for the inline case (ensures content ratios sum to 1.0).
-        // Safe to call unconditionally — the wrapper case already has [0.5, 0.5].
-        if let Some(TileNode::Split { ratios, .. }) = self.root.find_mut(grandparent_id) {
+        // Normalize ratios
+        if let Some(TileNode::Split { ratios, .. }) = self.root.find_mut(parent_id) {
             normalize_ratios(ratios);
         }
 
@@ -651,11 +614,10 @@ impl TilingTree {
         Some(new_conv_id)
     }
 
-    /// Close a conversation pane, removing its entire conversation group.
+    /// Close a conversation pane.
     ///
-    /// If the group's parent becomes a single-child split, it collapses
-    /// (replaces the split with the lone child). Focus moves to a neighbor.
-    /// Returns false if the pane can't be closed (e.g. it's the last one).
+    /// If the parent becomes a single-child split, it collapses.
+    /// Focus moves to a neighbor. Returns false if it's the last pane.
     pub fn close(&mut self, target: PaneId) -> bool {
         // Don't close the last conversation
         let convs = self.root.conversation_panes();
@@ -663,35 +625,29 @@ impl TilingTree {
             return false;
         }
 
-        // Find the conversation group
-        let Some((conv_group_id, _)) = self.root.find_parent(target) else {
-            return false;
-        };
-
-        // Find the grandparent
-        let Some((grandparent_id, group_idx)) = self.root.find_parent(conv_group_id) else {
+        // Find the parent containing the target leaf
+        let Some((parent_id, target_idx)) = self.root.find_parent(target) else {
             return false;
         };
 
         // Determine new focus before mutating
         let new_focus = self.find_close_target(target);
 
-        // Remove the conversation group from grandparent
-        let grandparent = match self.root.find_mut(grandparent_id) {
-            Some(gp) => gp,
+        // Remove the conversation from its parent
+        let parent = match self.root.find_mut(parent_id) {
+            Some(p) => p,
             None => return false,
         };
 
         if let TileNode::Split {
             children, ratios, ..
-        } = grandparent
+        } = parent
         {
-            if group_idx < children.len() {
-                children.remove(group_idx);
-                if group_idx < ratios.len() {
-                    ratios.remove(group_idx);
+            if target_idx < children.len() {
+                children.remove(target_idx);
+                if target_idx < ratios.len() {
+                    ratios.remove(target_idx);
                 }
-                // Redistribute space proportionally to remaining panes
                 normalize_ratios(ratios);
             } else {
                 return false;
@@ -847,19 +803,15 @@ impl TilingTree {
     ///
     /// `delta` is a fraction to shift (positive = grow focused pane,
     /// negative = shrink). Applies to the split that directly contains
-    /// the focused pane's conversation group.
+    /// the focused conversation leaf.
     pub fn resize(&mut self, target: PaneId, delta: f32) -> bool {
         // Need at least 2 conversations for resize to make sense
         if self.root.conversation_panes().len() < 2 {
             return false;
         }
 
-        // Find the conversation group
-        let Some((conv_group_id, _)) = self.root.find_parent(target) else {
-            return false;
-        };
-        // Find the parent split
-        let Some((parent_id, group_idx)) = self.root.find_parent(conv_group_id) else {
+        // Find the parent split containing the target leaf
+        let Some((parent_id, target_idx)) = self.root.find_parent(target) else {
             return false;
         };
 
@@ -873,10 +825,10 @@ impl TilingTree {
                 return false;
             }
             // Find a neighbor to take/give space
-            let neighbor_idx = if group_idx + 1 < ratios.len() {
-                group_idx + 1
-            } else if group_idx > 0 {
-                group_idx - 1
+            let neighbor_idx = if target_idx + 1 < ratios.len() {
+                target_idx + 1
+            } else if target_idx > 0 {
+                target_idx - 1
             } else {
                 return false;
             };
@@ -884,8 +836,7 @@ impl TilingTree {
             let min_ratio = 0.1;
 
             // Apply delta first, then normalize, then clamp, then re-normalize.
-            // Clamping before normalization can distort other ratios.
-            ratios[group_idx] += delta;
+            ratios[target_idx] += delta;
             ratios[neighbor_idx] -= delta;
 
             // First normalize pass
@@ -983,12 +934,11 @@ impl TilingTree {
     /// conversation in the tree if no sibling is found.
     fn find_close_target(&self, target: PaneId) -> Option<PaneId> {
         // Try neighbor in same parent split
-        if let Some((conv_group_id, _)) = self.root.find_parent(target)
-            && let Some((parent_id, group_idx)) = self.root.find_parent(conv_group_id)
+        if let Some((parent_id, target_idx)) = self.root.find_parent(target)
             && let Some(TileNode::Split { children, .. }) = self.root.find(parent_id)
         {
             // Try right neighbor, then left
-            let candidates = [group_idx.wrapping_add(1), group_idx.wrapping_sub(1)];
+            let candidates = [target_idx.wrapping_add(1), target_idx.wrapping_sub(1)];
             for idx in candidates {
                 if let Some(conv) = children.get(idx).and_then(|c| c.first_conversation()) {
                     if conv != target {
@@ -1121,9 +1071,9 @@ pub struct PaneFocus;
 
 /// Per-pane saved state — attached to ConversationContainer entities.
 ///
-/// When focus switches between panes, the outgoing pane's global state
-/// (scroll, compose text) is saved here, and the incoming pane's state
-/// is restored. This lets each pane remember where it was.
+/// When focus switches between panes, the outgoing pane's scroll state
+/// is saved here and the incoming pane's is restored. Input text lives
+/// in the CRDT InputDocEntry (not per-pane state).
 #[derive(Component, Debug, Clone, Default, Reflect)]
 #[reflect(Component)]
 pub struct PaneSavedState {
@@ -1135,10 +1085,6 @@ pub struct PaneSavedState {
     pub scroll_target: f32,
     /// Whether the pane was in follow (auto-scroll) mode.
     pub following: bool,
-    /// Compose block text content.
-    pub compose_text: String,
-    /// Compose block cursor position.
-    pub compose_cursor: usize,
 }
 
 // ============================================================================

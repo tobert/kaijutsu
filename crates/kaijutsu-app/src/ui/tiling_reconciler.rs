@@ -13,27 +13,26 @@
 //! ```
 //!
 //! The content tree maps the TilingTree's Split/Leaf structure to Bevy
-//! flex containers. For a single pane, this is just:
-//!   `ConvGroup(Column) → [ConversationContainer, ComposeBlock]`
+//! flex containers. For a single pane, this is just a ConversationContainer.
 //!
-//! After Super+v split, it becomes:
+//! After Alt+v split, it becomes:
 //! ```text
 //!   SplitContainer(Row)
-//!     ConvGroup1(Column) → [ConversationContainer1, ComposeBlock1]
-//!     ConvGroup2(Column) → [ConversationContainer2, ComposeBlock2]
+//!     ConversationContainer1
+//!     ConversationContainer2
 //! ```
 //!
 //! Focus is tracked via `PaneFocus` marker + accent border on the
-//! focused conversation container.
+//! focused conversation container. Input is an ephemeral overlay
+//! (not part of the tiling tree).
 
 use bevy::prelude::*;
 
 use super::tiling::*;
 use super::theme::Theme;
-use crate::cell::ComposeBlock;
 use crate::cell::ConversationContainer;
 use crate::constants::ZLayer;
-use crate::text::{KjText, KjUiText, KjTextEffects};
+use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
 
 // ============================================================================
@@ -83,7 +82,6 @@ pub fn reconcile_tiling_tree(
     tiling_root: Query<Entity, With<TilingRoot>>,
     conversation_root: Query<(Entity, Option<&Children>), With<super::state::ConversationRoot>>,
     existing_panes: Query<Entity, With<PaneMarker>>,
-    compose_query: Query<(&PaneMarker, &ComposeBlock)>,
     editor_entities: Res<crate::cell::EditorEntities>,
     block_containers: Query<&crate::cell::BlockCellContainer>,
 ) {
@@ -98,16 +96,6 @@ pub fn reconcile_tiling_tree(
     };
     let Ok((conv_root_entity, _conv_children)) = conversation_root.single() else {
         return;
-    };
-
-    // ── Save compose state before despawn ─────────────────────────────
-    let saved_compose: std::collections::HashMap<PaneId, (String, usize)> = if state.initialized {
-        compose_query
-            .iter()
-            .map(|(marker, compose)| (marker.pane_id, (compose.text.clone(), compose.cursor)))
-            .collect()
-    } else {
-        std::collections::HashMap::new()
     };
 
     if state.initialized {
@@ -143,7 +131,7 @@ pub fn reconcile_tiling_tree(
     // SPAWN CONVERSATION CONTENT from TilingTree
     // ════════════════════════════════════════════════════════════════════
 
-    spawn_conversation_content(&mut commands, &tree, &theme, conv_root_entity, &saved_compose);
+    spawn_conversation_content(&mut commands, &tree, &theme, conv_root_entity);
 
     state.last_structural_gen = tree.structural_gen;
     state.last_visual_gen = tree.visual_gen;
@@ -196,7 +184,6 @@ fn spawn_conversation_content(
     tree: &TilingTree,
     theme: &Theme,
     conv_root: Entity,
-    saved_compose: &std::collections::HashMap<PaneId, (String, usize)>,
 ) {
     if let TileNode::Split { children, ratios, .. } = &tree.root {
         for (i, child) in children.iter().enumerate() {
@@ -205,7 +192,7 @@ fn spawn_conversation_content(
                 continue;
             }
             let ratio = ratios.get(i).copied().unwrap_or(1.0);
-            spawn_content_subtree(commands, child, theme, conv_root, tree, ratio, saved_compose);
+            spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
         }
     }
 }
@@ -214,7 +201,6 @@ fn spawn_conversation_content(
 ///
 /// - `Split` nodes → flex containers (Row or Column) with ratio-based sizing
 /// - `Conversation` leaves → ConversationContainer entities
-/// - `Compose` leaves → ComposeBlock entities (with saved text restored)
 /// - Other leaves → ignored (widgets are in docks)
 fn spawn_content_subtree(
     commands: &mut Commands,
@@ -223,7 +209,6 @@ fn spawn_content_subtree(
     parent: Entity,
     tree: &TilingTree,
     flex_grow: f32,
-    saved_compose: &std::collections::HashMap<PaneId, (String, usize)>,
 ) {
     match node {
         TileNode::Split {
@@ -241,10 +226,6 @@ fn spawn_content_subtree(
                 .spawn((
                     PaneMarker {
                         pane_id: *id,
-                        // Split containers use Spacer as a stand-in — they don't have
-                        // meaningful content of their own. No code queries by Spacer to
-                        // find splits specifically, so a dedicated SplitContainer variant
-                        // isn't worth the match-arm cost.
                         content: PaneContent::Spacer,
                     },
                     *id,
@@ -265,7 +246,7 @@ fn spawn_content_subtree(
 
             for (i, child) in children.iter().enumerate() {
                 let child_ratio = ratios.get(i).copied().unwrap_or(1.0);
-                spawn_content_subtree(commands, child, theme, entity, tree, child_ratio, saved_compose);
+                spawn_content_subtree(commands, child, theme, entity, tree, child_ratio);
             }
         }
 
@@ -313,61 +294,6 @@ fn spawn_content_subtree(
                     BorderColor::all(border_color),
                 ));
             if is_focused {
-                entity_cmd.insert(PaneFocus);
-            }
-            let entity = entity_cmd.id();
-            commands.entity(parent).add_child(entity);
-        }
-
-        TileNode::Leaf {
-            id,
-            content:
-                PaneContent::Compose {
-                    target_pane,
-                    writing_direction,
-                },
-        } => {
-            // Restore saved compose text if this pane existed before the rebuild
-            let compose = if let Some((text, cursor)) = saved_compose.get(id) {
-                ComposeBlock {
-                    text: text.clone(),
-                    cursor: *cursor,
-                    selection_anchor: None,
-                }
-            } else {
-                ComposeBlock::default()
-            };
-
-            let is_compose_focused = tree.focused == *target_pane;
-            let mut entity_cmd = commands.spawn((
-                    PaneMarker {
-                        pane_id: *id,
-                        content: PaneContent::Compose {
-                            target_pane: *target_pane,
-                            writing_direction: *writing_direction,
-                        },
-                    },
-                    *id,
-                    compose,
-                    KjText,
-                    KjTextEffects { rainbow: true },
-                    Node {
-                        min_height: Val::Px(60.0),
-                        padding: UiRect::all(Val::Px(12.0)),
-                        margin: UiRect::new(
-                            Val::Px(20.0),
-                            Val::Px(20.0),
-                            Val::Px(8.0),
-                            Val::Px(16.0),
-                        ),
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(4.0)),
-                        ..default()
-                    },
-                    BorderColor::all(theme.compose_border),
-                    BackgroundColor(theme.compose_bg),
-                ));
-            if is_compose_focused {
                 entity_cmd.insert(PaneFocus);
             }
             let entity = entity_cmd.id();
@@ -569,9 +495,7 @@ fn spawn_widget_text(
 
 /// System that maintains the `PaneFocus` marker and updates focus borders.
 ///
-/// Adds `PaneFocus` to both the focused conversation pane AND its paired
-/// compose pane (matched via `PaneContent::Compose { target_pane }`).
-/// This lets queries like `Query<&mut ComposeBlock, With<PaneFocus>>` work.
+/// Adds `PaneFocus` to the focused conversation pane.
 pub fn update_pane_focus(
     mut commands: Commands,
     tree: Res<TilingTree>,
@@ -594,16 +518,6 @@ pub fn update_pane_focus(
         if marker.pane_id == tree.focused {
             commands.entity(entity).insert(PaneFocus);
             break;
-        }
-    }
-
-    // Also add PaneFocus to the compose pane paired with the focused conversation
-    for (entity, marker) in pane_markers.iter() {
-        if let PaneContent::Compose { target_pane, .. } = &marker.content {
-            if *target_pane == tree.focused {
-                commands.entity(entity).insert(PaneFocus);
-                break;
-            }
         }
     }
 
@@ -669,16 +583,16 @@ pub fn sync_tiling_visuals(
 /// System that saves/restores per-pane state when focus changes.
 ///
 /// When the focused pane changes:
-/// 1. **Save** outgoing: scroll state + compose text → old ConversationContainer's PaneSavedState
-/// 2. **Restore** incoming: new PaneSavedState → scroll state + compose text
+/// 1. **Save** outgoing: scroll state → old PaneSavedState
+/// 2. **Restore** incoming: new PaneSavedState → scroll state
 /// 3. If document_id differs, fire ContextSwitchRequested
 pub fn handle_pane_focus_change(
     tree: Res<TilingTree>,
     mut last_focused: Local<Option<PaneId>>,
     mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
     mut saved_states: Query<(&PaneMarker, &mut PaneSavedState), With<ConversationContainer>>,
-    mut compose_blocks: Query<(&PaneMarker, &mut ComposeBlock)>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+    mut focus: ResMut<crate::input::focus::FocusArea>,
 ) {
     // Detect focus change
     let current = tree.focused;
@@ -687,6 +601,11 @@ pub fn handle_pane_focus_change(
         return;
     }
     *last_focused = Some(current);
+
+    // Dismiss overlay on pane switch (Compose → Conversation)
+    if matches!(*focus, crate::input::focus::FocusArea::Compose) {
+        *focus = crate::input::focus::FocusArea::Conversation;
+    }
 
     // Only process if there was a previous pane (skip first frame)
     let Some(old_pane_id) = prev else {
@@ -697,26 +616,11 @@ pub fn handle_pane_focus_change(
 
     // ── Save outgoing pane (only if it still exists) ─────────────────
     if !single_pane {
-        let old_compose = compose_blocks
-            .iter()
-            .find_map(|(marker, compose)| {
-                if let PaneContent::Compose { target_pane, .. } = &marker.content {
-                    if *target_pane == old_pane_id {
-                        return Some((compose.text.clone(), compose.cursor));
-                    }
-                }
-                None
-            });
-
         for (marker, mut saved) in saved_states.iter_mut() {
             if marker.pane_id == old_pane_id {
                 saved.scroll_offset = scroll_state.offset;
                 saved.scroll_target = scroll_state.target_offset;
                 saved.following = scroll_state.following;
-                if let Some((text, cursor)) = &old_compose {
-                    saved.compose_text = text.clone();
-                    saved.compose_cursor = *cursor;
-                }
                 break;
             }
         }
@@ -730,17 +634,6 @@ pub fn handle_pane_focus_change(
             scroll_state.target_offset = saved.scroll_target;
             scroll_state.following = saved.following;
             incoming_doc_id = saved.document_id.clone();
-
-            // Restore compose text
-            for (cm, mut compose) in compose_blocks.iter_mut() {
-                if let PaneContent::Compose { target_pane, .. } = &cm.content {
-                    if *target_pane == current {
-                        compose.text = saved.compose_text.clone();
-                        compose.cursor = saved.compose_cursor;
-                        break;
-                    }
-                }
-            }
             break;
         }
     }

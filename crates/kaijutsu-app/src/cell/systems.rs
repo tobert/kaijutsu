@@ -648,19 +648,17 @@ pub fn handle_prompt_submitted(
     }
 }
 
-/// Restore compose text and flash error border when submit fails.
+/// Restore overlay text and flash error border when submit fails.
 pub fn handle_submit_failed(
     mut commands: Commands,
     mut fail_events: MessageReader<super::components::SubmitFailed>,
-    mut compose_blocks: Query<(Entity, &mut ComposeBlock), With<crate::ui::tiling::PaneFocus>>,
+    mut overlay: Query<(Entity, &mut super::components::InputOverlay), With<super::components::InputOverlayMarker>>,
 ) {
     for failed in fail_events.read() {
         warn!("Submit failed: {}", failed.reason);
-        if let Ok((entity, mut compose)) = compose_blocks.single_mut() {
-            // Restore the text that was taken
-            compose.text = failed.text.clone();
-            compose.cursor = compose.text.len();
-            // Mark compose block for error animation
+        if let Ok((entity, mut overlay)) = overlay.single_mut() {
+            overlay.text = failed.text.clone();
+            overlay.cursor = overlay.text.len();
             commands.entity(entity).insert(super::components::ComposeError {
                 started: std::time::Instant::now(),
             });
@@ -1403,8 +1401,9 @@ pub fn handle_block_events(
 pub fn handle_input_doc_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut doc_cache: ResMut<super::components::DocumentCache>,
-    mut compose_blocks: Query<&mut ComposeBlock, With<crate::ui::tiling::PaneFocus>>,
+    mut overlay: Query<&mut super::components::InputOverlay>,
     mut scroll_state: ResMut<ConversationScrollState>,
+    mut focus: ResMut<crate::input::focus::FocusArea>,
 ) {
     use kaijutsu_client::ServerEvent;
 
@@ -1418,15 +1417,11 @@ pub fn handle_input_doc_events(
                 {
                     if let Err(e) = input.apply_remote_ops(ops) {
                         warn!("Failed to apply remote input ops for {}: {}, dropping input for re-sync", context_id, e);
-                        // Drop the broken input — it will be re-initialized on
-                        // next InputStateReceived or context switch.
                         cached.input = None;
                     }
                 }
-                // Do NOT update ComposeBlock from echoed ops — ComposeBlock is
-                // authoritative for the active context. Server ops are echoes of
-                // our own edit_input calls; syncing them back causes character
-                // loss during fast typing.
+                // Do NOT update InputOverlay from echoed ops — overlay is
+                // authoritative for the active context.
             }
             ServerEvent::InputCleared { context_id } => {
                 // Clear CRDT state
@@ -1436,12 +1431,16 @@ pub fn handle_input_doc_events(
                     input.clear();
                 }
 
-                // Clear compose block only for active context
+                // Clear overlay and dismiss only for active context
                 if doc_cache.active_id() == Some(*context_id) {
-                    if let Ok(mut compose) = compose_blocks.single_mut() {
-                        compose.text.clear();
-                        compose.cursor = 0;
-                        compose.selection_anchor = None;
+                    if let Ok(mut overlay) = overlay.single_mut() {
+                        overlay.text.clear();
+                        overlay.cursor = 0;
+                        overlay.selection_anchor = None;
+                    }
+                    // Dismiss overlay (Compose → Conversation)
+                    if matches!(*focus, crate::input::focus::FocusArea::Compose) {
+                        *focus = crate::input::focus::FocusArea::Conversation;
                     }
                     // Enable follow mode for the incoming response
                     scroll_state.start_following();
@@ -2683,6 +2682,160 @@ pub fn sync_compose_block_buffer(
 /// manual positioning needed. This is a no-op kept for plugin
 /// system set compatibility.
 pub fn position_compose_block() {}
+
+// ============================================================================
+// INPUT OVERLAY — Ephemeral input surface
+// ============================================================================
+
+/// Spawn the singleton InputOverlay entity (root-level, absolute positioned).
+///
+/// Starts hidden (Visibility::Hidden). Shown/hidden by `sync_overlay_visibility`
+/// based on FocusArea::Compose.
+pub fn spawn_input_overlay(
+    mut commands: Commands,
+    existing: Query<Entity, With<super::components::InputOverlayMarker>>,
+    theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
+    text_metrics: Res<TextMetrics>,
+) {
+    if !existing.is_empty() {
+        return;
+    }
+    commands.spawn((
+        super::components::InputOverlayMarker,
+        super::components::InputOverlay::default(),
+        KjText,
+        KjTextEffects { rainbow: true },
+        UiVelloText {
+            value: "[chat] shell │ ".to_string(),
+            style: bevy_vello::prelude::VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: bevy_color_to_brush(theme.fg_dim),
+                font_size: text_metrics.cell_font_size,
+                ..default()
+            },
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(40.0), // Above south dock
+            left: Val::Px(20.0),
+            right: Val::Px(20.0),
+            min_height: Val::Px(40.0),
+            padding: UiRect::all(Val::Px(12.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            ..default()
+        },
+        BorderColor::all(theme.compose_border),
+        BackgroundColor(theme.compose_bg),
+        Visibility::Hidden,
+        ZIndex(crate::constants::ZLayer::MODAL),
+    ));
+    info!("Spawned InputOverlay entity");
+}
+
+/// Show/hide the InputOverlay entity based on FocusArea.
+pub fn sync_overlay_visibility(
+    focus: Res<FocusArea>,
+    mut overlay_query: Query<&mut Visibility, With<super::components::InputOverlayMarker>>,
+) {
+    if !focus.is_changed() {
+        return;
+    }
+    for mut vis in overlay_query.iter_mut() {
+        *vis = if matches!(*focus, FocusArea::Compose) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+/// Sync InputOverlay text to its UiVelloText.
+pub fn sync_input_overlay_buffer(
+    theme: Res<Theme>,
+    mut overlay_query: Query<
+        (&super::components::InputOverlay, &mut UiVelloText),
+        Changed<super::components::InputOverlay>,
+    >,
+) {
+    for (overlay, mut vello_text) in overlay_query.iter_mut() {
+        let display = overlay.display_text();
+        let new_brush = if overlay.is_empty() {
+            bevy_color_to_brush(theme.fg_dim)
+        } else if overlay.is_shell() {
+            // Validate shell syntax
+            let validation = crate::kaish::validate(&overlay.text);
+            if !validation.valid && !validation.incomplete {
+                bevy_color_to_brush(theme.block_tool_error)
+            } else {
+                bevy_color_to_brush(theme.block_user)
+            }
+        } else {
+            bevy_color_to_brush(theme.block_user)
+        };
+
+        if vello_text.style.brush != new_brush {
+            vello_text.style.brush = new_brush;
+        }
+        if vello_text.value != display {
+            vello_text.value = display;
+        }
+    }
+}
+
+/// Position the cursor in the InputOverlay.
+pub fn update_input_overlay_cursor(
+    focus_area: Res<FocusArea>,
+    entities: Res<EditorEntities>,
+    overlay_query: Query<
+        (&super::components::InputOverlay, &ComputedNode, &UiGlobalTransform),
+        With<super::components::InputOverlayMarker>,
+    >,
+    editing_blocks: Query<Entity, With<EditingBlockCell>>,
+    mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
+    mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
+    theme: Res<Theme>,
+    text_metrics: Res<TextMetrics>,
+) {
+    if !matches!(*focus_area, FocusArea::Compose) {
+        return;
+    }
+    if !editing_blocks.is_empty() {
+        return;
+    }
+
+    let Some(cursor_ent) = entities.cursor else { return };
+    let Ok((overlay, computed, transform)) = overlay_query.single() else { return };
+    let Ok((mut node, mut visibility, material_node)) = cursor_query.get_mut(cursor_ent) else { return };
+
+    *visibility = Visibility::Inherited;
+
+    let (_, _, translation) = transform.to_scale_angle_translation();
+    let content = computed.content_box();
+    let cell_left = translation.x + content.min.x;
+    let cell_top = translation.y + content.min.y;
+
+    // Use display_cursor_offset to account for mode ring prefix
+    let display = overlay.display_text();
+    let offset = overlay.display_cursor_offset().min(display.len());
+    let before = &display[..offset];
+    let row = before.matches('\n').count();
+    let col = before.rfind('\n').map(|p| offset - p - 1).unwrap_or(offset);
+
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
+    let line_height = text_metrics.cell_line_height;
+
+    node.left = Val::Px(cell_left + (col as f32 * char_width) - 2.0);
+    node.top = Val::Px(cell_top + (row as f32 * line_height));
+
+    if let Some(material) = cursor_materials.get_mut(&material_node.0) {
+        material.time.y = CursorMode::Beam as u8 as f32;
+        material.color = theme.cursor_insert;
+        material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
+    }
+}
 
 /// Position the cursor in the focused ComposeBlock during Input mode.
 ///

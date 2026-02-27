@@ -18,9 +18,10 @@ mod systems;
 #[allow(unused_imports)]
 pub use components::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
-    CellState, ComposeBlock, ComposeError, ContextSwitchRequested, ConversationContainer,
+    CellState, ComposeError, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditingBlockCell,
-    FocusTarget, FocusedBlockCell, MainCell, PromptSubmitted, SubmitFailed,
+    FocusTarget, FocusedBlockCell, InputMode, InputOverlay, InputOverlayMarker,
+    MainCell, PromptSubmitted, SubmitFailed,
     ViewingConversation,
 };
 pub use plugin::CellPlugin;

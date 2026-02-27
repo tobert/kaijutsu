@@ -144,6 +144,8 @@ impl Plugin for CellPlugin {
             (
                 // Main cell spawning
                 systems::spawn_main_cell,
+                // Input overlay spawning (singleton)
+                systems::spawn_input_overlay,
                 // Track focused pane and re-parent block cells after split
                 systems::track_conversation_container.after(systems::spawn_main_cell),
                 // Block cell spawning (after sync)
@@ -176,9 +178,12 @@ impl Plugin for CellPlugin {
                 systems::sync_block_cell_buffers
                     .after(systems::init_block_cell_buffers)
                     .after(systems::init_role_header_buffers),
-                // Compose block buffer init and sync
+                // Compose block buffer init and sync (legacy — kept for ComposeBlock if any)
                 systems::init_compose_block_buffer,
                 systems::sync_compose_block_buffer.after(systems::init_compose_block_buffer),
+                // Input overlay visibility + buffer sync
+                systems::sync_overlay_visibility,
+                systems::sync_input_overlay_buffer,
                 // Expanded block content sync
                 systems::sync_expanded_block_content,
                 // Highlighting (after buffer sync)
@@ -242,6 +247,8 @@ impl Plugin for CellPlugin {
                 // Compose cursor depends on compose position
                 systems::update_compose_cursor
                     .after(systems::position_compose_block),
+                // Input overlay cursor
+                systems::update_input_overlay_cursor,
                 // Block border systems (depend on block cell positions)
                 block_border::spawn_block_borders
                     .after(systems::position_block_cells_from_flex),

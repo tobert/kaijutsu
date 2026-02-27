@@ -62,7 +62,7 @@ impl Plugin for ScreenPlugin {
             show_conversation_root,
             hide_constellation_container,
             show_cell_text,
-            set_focus_compose,
+            set_focus_conversation,
         ));
 
         // ── ForkForm ──
@@ -177,11 +177,14 @@ fn show_cell_text(
     }
 }
 
-/// Set focus to Compose when entering conversation view.
-fn set_focus_compose(
+/// Set focus to Conversation (navigation mode) when entering conversation view.
+///
+/// Input is now an ephemeral overlay summoned with i/:, not a permanent fixture.
+/// Entering conversation view = navigation mode by default.
+fn set_focus_conversation(
     mut focus: ResMut<crate::input::focus::FocusArea>,
 ) {
-    *focus = crate::input::focus::FocusArea::Compose;
+    *focus = crate::input::focus::FocusArea::Conversation;
 }
 
 /// Hide newly-added cell text entities when not in conversation view.

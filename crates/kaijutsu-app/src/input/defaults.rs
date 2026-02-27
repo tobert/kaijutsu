@@ -52,9 +52,10 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(KeyCode::Tab, InputContext::Navigation, Action::CycleFocusForward, "Cycle focus forward"));
     b.push(Binding::key_mod(KeyCode::Tab, Modifiers::SHIFT, InputContext::Navigation, Action::CycleFocusBackward, "Cycle focus backward"));
 
-    // Quick shortcuts to compose
-    b.push(Binding::key(KeyCode::KeyI, InputContext::Navigation, Action::FocusCompose, "Focus compose"));
-    b.push(Binding::key(KeyCode::Space, InputContext::Navigation, Action::FocusCompose, "Focus compose"));
+    // Summon input overlay
+    b.push(Binding::key(KeyCode::KeyI, InputContext::Navigation, Action::SummonChat, "Summon chat input"));
+    b.push(Binding::key(KeyCode::Space, InputContext::Navigation, Action::SummonChat, "Summon chat input"));
+    b.push(Binding::key_mod(KeyCode::Semicolon, Modifiers::SHIFT, InputContext::Navigation, Action::SummonShell, "Summon shell input"));
 
     // Activate (Enter on focused block → edit, or generic "do the thing")
     b.push(Binding::key(KeyCode::Enter, InputContext::Navigation, Action::Activate, "Activate focused block"));
@@ -145,7 +146,7 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(KeyCode::Enter, InputContext::TextInput, Action::Submit, "Submit"));
     b.push(Binding::key_mod(KeyCode::Enter, Modifiers::SHIFT, InputContext::TextInput, Action::InsertNewline, "Insert newline"));
     b.push(Binding::key(KeyCode::Escape, InputContext::TextInput, Action::Unfocus, "Return to navigation"));
-    b.push(Binding::key(KeyCode::Tab, InputContext::TextInput, Action::CycleFocusForward, "Cycle focus"));
+    b.push(Binding::key(KeyCode::Tab, InputContext::TextInput, Action::CycleModeRing, "Cycle mode ring"));
     b.push(Binding::key(KeyCode::Backspace, InputContext::TextInput, Action::Backspace, "Backspace"));
     b.push(Binding::key(KeyCode::Delete, InputContext::TextInput, Action::Delete, "Delete"));
 
