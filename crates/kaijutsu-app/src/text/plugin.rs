@@ -7,7 +7,7 @@ use bevy::window::PrimaryWindow;
 use bevy_vello::VelloPlugin;
 use bevy_vello::prelude::*;
 
-use super::components::KjUiText;
+use super::components::{KjTextEffects, KjUiText, rainbow_brush};
 use super::resources::{FontHandles, TextMetrics};
 
 /// Plugin that enables Vello text rendering in Bevy.
@@ -28,6 +28,8 @@ impl Plugin for KjTextPlugin {
             .add_systems(Update, (
                 sync_text_metrics_from_window,
                 sync_kj_ui_text,
+                animate_rainbow_text,
+                super::rich::render_rich_text,
             ));
     }
 }
@@ -71,5 +73,30 @@ fn sync_kj_ui_text(
         vello_text.style.font = font_handles.mono.clone();
         vello_text.style.brush = super::components::bevy_color_to_brush(kj_text.color);
         vello_text.style.font_size = kj_text.font_size;
+    }
+}
+
+/// Animate rainbow gradient text each frame.
+///
+/// Entities with `KjTextEffects { rainbow: true }` get a scrolling
+/// linear gradient brush. The phase advances with elapsed time,
+/// creating a smooth cycling rainbow effect.
+fn animate_rainbow_text(
+    time: Res<Time>,
+    mut query: Query<(&KjTextEffects, &mut UiVelloText)>,
+) {
+    // Phase cycles 0→1 over ~4 seconds
+    let phase = (time.elapsed_secs() * 0.25) % 1.0;
+
+    for (effects, mut vello_text) in query.iter_mut() {
+        if !effects.rainbow {
+            continue;
+        }
+        // Alpha from current brush (preserve timeline dimming)
+        let alpha = match &vello_text.style.brush {
+            vello::peniko::Brush::Solid(c) => c.components[3],
+            _ => 1.0,
+        };
+        vello_text.style.brush = rainbow_brush(phase, alpha);
     }
 }

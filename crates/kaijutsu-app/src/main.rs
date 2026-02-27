@@ -131,7 +131,9 @@ fn main() {
         .run();
 }
 
-/// Setup 2D camera for UI
+/// Setup 2D camera for UI.
+///
+/// `VelloView` is required for bevy_vello to render text and scenes on this camera.
 fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     commands.spawn((
         Camera2d,
@@ -139,6 +141,7 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             clear_color: ClearColorConfig::Custom(theme.bg),
             ..default()
         },
+        bevy_vello::render::VelloView,
     ));
 }
 

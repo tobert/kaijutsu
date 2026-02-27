@@ -11,7 +11,7 @@ use super::components::{
 };
 use crate::input::FocusArea;
 use crate::conversation::ActiveContext;
-use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush};
+use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush, parse_rich_content};
 use bevy_vello::prelude::UiVelloText;
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
@@ -2104,28 +2104,50 @@ pub fn sync_block_cell_buffers(
         // Apply block-specific color based on BlockKind and Role
         let base_color = block_color(block, &theme);
 
-        // Set per-vertex effects: rainbow for user text only.
+        // Set per-vertex effects: rainbow for user text only (when enabled in theme).
         // Only insert when changed to avoid triggering Bevy change detection.
-        let rainbow = block.kind == BlockKind::Text && block.role == Role::User;
+        let rainbow = theme.font_rainbow && block.kind == BlockKind::Text && block.role == Role::User;
         if block_cell.last_rainbow != rainbow {
             commands.entity(*entity).insert(KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
         }
 
-        // For now, set plain text. Rich markdown styling via Parley spans is Phase 4.
+        // Set plain text on UiVelloText (used for layout height estimation).
         if vello_text.value != text {
             vello_text.value = text.clone();
         }
 
-        // Apply timeline visibility opacity (dimmed when viewing historical states)
-        let color = if let Some(vis) = timeline_vis {
-            base_color.with_alpha(base_color.alpha() * vis.opacity)
+        // Rich markdown rendering for Model/Text blocks.
+        // parse_rich_content returns None for plain text (no formatting),
+        // which keeps UiVelloText as the sole renderer.
+        let is_rich = block.kind == BlockKind::Text && block.role == Role::Model;
+        if is_rich {
+            if let Some(rich) = parse_rich_content(&text, doc_version) {
+                // Make UiVelloText transparent — UiVelloScene renders the colored text.
+                vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+                commands.entity(*entity).insert(rich);
+            } else {
+                // Plain text: remove any stale RichTextContent
+                commands.entity(*entity).remove::<crate::text::RichTextContent>();
+            }
         } else {
-            base_color
-        };
-        let new_brush = bevy_color_to_brush(color);
-        if vello_text.style.brush != new_brush {
-            vello_text.style.brush = new_brush;
+            // Non-model blocks: ensure no stale RichTextContent
+            commands.entity(*entity).remove::<crate::text::RichTextContent>();
+        }
+
+        // Apply timeline visibility opacity (dimmed when viewing historical states).
+        // Skip brush when rainbow is active (animate_rainbow_text handles it)
+        // or when rich rendering is active (render_rich_text handles it).
+        if !rainbow && !is_rich {
+            let color = if let Some(vis) = timeline_vis {
+                base_color.with_alpha(base_color.alpha() * vis.opacity)
+            } else {
+                base_color
+            };
+            let new_brush = bevy_color_to_brush(color);
+            if vello_text.style.brush != new_brush {
+                vello_text.style.brush = new_brush;
+            }
         }
 
         // Mark layout dirty when text length changes — word-wrap line

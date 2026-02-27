@@ -88,3 +88,38 @@ pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
         (srgba.alpha * 255.0) as u8,
     ]
 }
+
+/// Build a scrolling rainbow gradient brush.
+///
+/// `offset` is a 0.0..1.0 phase that shifts the gradient over time,
+/// creating the scrolling animation effect.
+pub fn rainbow_brush(offset: f32, alpha: f32) -> vello::peniko::Brush {
+    use vello::peniko::Gradient;
+    use vello::peniko::color::DynamicColor;
+
+    fn c(r: u8, g: u8, b: u8, a: f32) -> DynamicColor {
+        vello::peniko::Color::from_rgba8(r, g, b, (a * 255.0) as u8).into()
+    }
+
+    // Tokyo Night palette rainbow — vibrant but theme-cohesive.
+    // 7 stops wrapping red→red for smooth cycling.
+    let palette: [(f32, DynamicColor); 7] = [
+        (0.00, c(247, 118, 142, alpha)), // #f7768e red
+        (0.17, c(224, 175, 104, alpha)), // #e0af68 amber
+        (0.33, c(158, 206, 106, alpha)), // #9ece6a green
+        (0.50, c(125, 207, 255, alpha)), // #7dcfff cyan
+        (0.67, c(122, 162, 247, alpha)), // #7aa2f7 blue
+        (0.83, c(187, 154, 247, alpha)), // #bb9af7 purple
+        (1.00, c(247, 118, 142, alpha)), // wrap back to red
+    ];
+
+    // Shift stops by offset, wrapping around, then sort
+    let mut stops: [(f32, DynamicColor); 7] = palette.map(|(pos, color)| {
+        ((pos + offset) % 1.0, color)
+    });
+    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    Gradient::new_linear((0.0, 0.0), (600.0, 0.0))
+        .with_stops(stops)
+        .into()
+}

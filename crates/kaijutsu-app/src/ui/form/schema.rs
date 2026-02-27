@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
 use crate::ui::form::field::{ActiveFormField, FormField};
-use crate::ui::form::text::{msdf_label, msdf_text};
+use crate::ui::form::text::{vello_label, vello_text};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -143,7 +143,7 @@ fn build_full_viewport(
         })
         .with_children(|content| {
             // Title
-            msdf_label(content, &form.title, 18.0, theme.fg);
+            vello_label(content, &form.title, 18.0, theme.fg);
 
             // Layout container
             match &form.layout {
@@ -223,7 +223,7 @@ fn build_full_viewport(
 
             // Hints
             if !form.hints.is_empty() {
-                msdf_label(content, &form.hints, 11.0, theme.fg_dim);
+                vello_label(content, &form.hints, 11.0, theme.fg_dim);
             }
         })
         .id();
@@ -261,7 +261,7 @@ fn build_modal(
         ))
         .with_children(|dialog| {
             // Title
-            msdf_label(dialog, &form.title, 16.0, theme.fg);
+            vello_label(dialog, &form.title, 16.0, theme.fg);
 
             // Fields
             let all_fields = match &form.layout {
@@ -282,7 +282,7 @@ fn build_modal(
 
             // Hints
             if !form.hints.is_empty() {
-                msdf_label(dialog, &form.hints, 11.0, theme.fg_dim);
+                vello_label(dialog, &form.hints, 11.0, theme.fg_dim);
             }
         })
         .id();
@@ -309,7 +309,7 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
         .with_children(|section| {
             // Label (if non-empty)
             if !desc.label.is_empty() {
-                msdf_label(section, &desc.label, 12.0, theme.fg_dim);
+                vello_label(section, &desc.label, 12.0, theme.fg_dim);
             }
 
             // Bordered container
@@ -413,6 +413,6 @@ fn spawn_button(parent: &mut ChildSpawnerCommands, desc: &ButtonDesc, theme: &Th
             BackgroundColor(bg),
         ))
         .with_children(|btn| {
-            msdf_text(btn, &desc.label, 13.0, text_color, 60.0);
+            vello_text(btn, &desc.label, 13.0, text_color, 60.0);
         });
 }

@@ -1,7 +1,8 @@
-//! Vello text spawn helpers.
+#![allow(dead_code)] // FontHandles-based helpers for future call site migration
+//! Vello text spawn helpers (with explicit font handle).
 //!
-//! Replaces the MSDF `msdf_label`/`msdf_text` helpers with Vello equivalents.
-//! Same API signatures, different internals.
+//! These accept a `Handle<VelloFont>` parameter for explicit font control.
+//! For simpler helpers that use the sync system, see `ui::form::text`.
 
 use bevy::prelude::*;
 use bevy_vello::prelude::*;
