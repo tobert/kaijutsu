@@ -91,10 +91,13 @@ pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
 
 /// Build a scrolling rainbow gradient brush.
 ///
-/// `offset` is a 0.0..1.0 phase that shifts the gradient over time,
-/// creating the scrolling animation effect.
+/// The rainbow flows spatially through the text: each character's color
+/// is determined by its horizontal position. `offset` (0.0..1.0) shifts
+/// the gradient start point over time, creating a smooth scrolling effect.
+///
+/// Uses `Extend::Repeat` so the palette tiles seamlessly across any text width.
 pub fn rainbow_brush(offset: f32, alpha: f32) -> vello::peniko::Brush {
-    use vello::peniko::Gradient;
+    use vello::peniko::{Extend, Gradient};
     use vello::peniko::color::DynamicColor;
 
     fn c(r: u8, g: u8, b: u8, a: f32) -> DynamicColor {
@@ -113,13 +116,16 @@ pub fn rainbow_brush(offset: f32, alpha: f32) -> vello::peniko::Brush {
         (1.00, c(247, 118, 142, alpha)), // wrap back to red
     ];
 
-    // Shift stops by offset, wrapping around, then sort
-    let mut stops: [(f32, DynamicColor); 7] = palette.map(|(pos, color)| {
-        ((pos + offset) % 1.0, color)
-    });
-    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // One full rainbow cycle in pixels. Short enough that even a few
+    // characters show the full spectrum.
+    let cycle_px = 400.0_f64;
 
-    Gradient::new_linear((0.0, 0.0), (600.0, 0.0))
-        .with_stops(stops)
+    // Shift the gradient origin by offset, creating the scroll effect.
+    // Extend::Repeat tiles the palette seamlessly beyond cycle_px.
+    let shift = (offset as f64) * cycle_px;
+
+    Gradient::new_linear((-shift, 0.0), (cycle_px - shift, 0.0))
+        .with_extend(Extend::Repeat)
+        .with_stops(palette)
         .into()
 }

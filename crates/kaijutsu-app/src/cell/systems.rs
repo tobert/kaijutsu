@@ -456,7 +456,9 @@ pub fn update_cursor(
     // Calculate cursor position (uses cache to avoid O(N) scan every frame)
     let (row, col) = cursor_position(&mut editor);
 
-    // Get cell position from Bevy UI layout
+    // Get cell position from Bevy UI layout.
+    // UiGlobalTransform origin is at the node CENTER. content_box().min
+    // gives the offset from center to content area top-left.
     let (_, _, translation) = transform.to_scale_angle_translation();
     let content = computed.content_box();
     let cell_left = translation.x + content.min.x;
@@ -2577,7 +2579,9 @@ pub fn update_block_edit_cursor(
         Visibility::Hidden
     };
 
-    // Get block cell position from Bevy UI layout
+    // Get block cell position from Bevy UI layout.
+    // UiGlobalTransform origin is at the node CENTER. content_box().min
+    // gives the offset from center to content area top-left.
     let (_, _, translation) = transform.to_scale_angle_translation();
     let content = computed.content_box();
     let cell_left = translation.x + content.min.x;
@@ -2710,7 +2714,9 @@ pub fn update_compose_cursor(
 
     *visibility = Visibility::Inherited;
 
-    // Get compose block position from Bevy UI layout
+    // Get compose block position from Bevy UI layout.
+    // UiGlobalTransform origin is at the node CENTER. content_box().min
+    // gives the offset from center to content area top-left.
     let (_, _, translation) = transform.to_scale_angle_translation();
     let content = computed.content_box();
     let cell_left = translation.x + content.min.x;

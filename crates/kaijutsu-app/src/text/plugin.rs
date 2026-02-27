@@ -26,6 +26,7 @@ impl Plugin for KjTextPlugin {
             .init_resource::<TextMetrics>()
             .add_systems(Startup, load_fonts)
             .add_systems(Update, (
+                sync_text_max_advance,
                 sync_text_metrics_from_window,
                 sync_kj_ui_text,
                 animate_rainbow_text,
@@ -73,6 +74,27 @@ fn sync_kj_ui_text(
         vello_text.style.font = font_handles.mono.clone();
         vello_text.style.brush = super::components::bevy_color_to_brush(kj_text.color);
         vello_text.style.font_size = kj_text.font_size;
+    }
+}
+
+/// Sync `max_advance` from the node's content box width.
+///
+/// `UiGlobalTransform` in Bevy UI uses the node CENTER as origin.
+/// `VelloTextAnchor::Center` (default) offsets text by `(-layout_width/2, ...)`.
+/// When `max_advance` equals the content box width, the layout width matches
+/// the content area — so the Center offset places text at the content area
+/// left edge, aligning with cursor positioning via `content_box().min`.
+fn sync_text_max_advance(
+    mut query: Query<(&mut UiVelloText, &ComputedNode)>,
+) {
+    for (mut text, node) in query.iter_mut() {
+        let content_width = node.content_box().width();
+        if content_width > 0.0 {
+            let target = Some(content_width);
+            if text.max_advance != target {
+                text.max_advance = target;
+            }
+        }
     }
 }
 
