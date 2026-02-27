@@ -1,5 +1,9 @@
 //! Full-viewport fork configuration form.
 //!
+//! Two-column layout: left (Name + Model), right (Tools tree).
+//! Tools use a 2-level expanding tree: categories collapse/expand,
+//! individual tools toggle with Space.
+//!
 //! Uses `Screen::ForkForm` for screen-level transitions. The form root is tagged
 //! with `DespawnOnExit(Screen::ForkForm)` for automatic cleanup when leaving.
 //! Camera deactivation happens via `OnExit(Screen::Constellation)` in the screen
@@ -9,6 +13,7 @@
 
 use bevy::prelude::*;
 use kaijutsu_crdt::ContextId;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -50,14 +55,17 @@ pub struct ForkFormRoot {
 pub struct ForkFormState {
     pub name_text: String,
     pub active_field: ForkFormField,
+    // Model selection
     pub selected_model_index: usize,
     pub models: Vec<ModelEntry>,
     pub parent_provider: Option<String>,
     pub parent_model: Option<String>,
     pub models_loaded: bool,
-    pub tools: Vec<ToolEntry>,
+    // Tool tree
+    pub categories: Vec<ToolCategory>,
     pub tools_loaded: bool,
-    pub selected_tool_index: usize,
+    /// Index into the flattened visible list (categories + expanded children).
+    pub tool_cursor: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,11 +83,64 @@ pub struct ModelEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct ToolCategory {
+    pub name: String,
+    pub expanded: bool,
+    pub tools: Vec<ToolEntry>,
+}
+
+impl ToolCategory {
+    fn enabled_count(&self) -> usize {
+        self.tools.iter().filter(|t| t.enabled).count()
+    }
+
+    fn total_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Number of visible rows this category contributes (1 header + children if expanded).
+    fn visible_rows(&self) -> usize {
+        if self.expanded { 1 + self.tools.len() } else { 1 }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ToolEntry {
     pub name: String,
+    #[allow(dead_code)] // Future: tooltip
     pub description: String,
-    pub category: String,
     pub enabled: bool,
+}
+
+/// What the tool cursor is pointing at.
+enum ToolCursorTarget {
+    Category(usize),
+    Tool(usize, usize), // (category_idx, tool_idx)
+}
+
+/// Resolve a flat cursor index to a (category, tool) target.
+fn resolve_tool_cursor(categories: &[ToolCategory], cursor: usize) -> Option<ToolCursorTarget> {
+    let mut pos = 0;
+    for (ci, cat) in categories.iter().enumerate() {
+        if pos == cursor {
+            return Some(ToolCursorTarget::Category(ci));
+        }
+        pos += 1;
+        if cat.expanded {
+            for ti in 0..cat.tools.len() {
+                if pos == cursor {
+                    return Some(ToolCursorTarget::Tool(ci, ti));
+                }
+                pos += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Total number of visible rows in the tool tree.
+fn total_visible_rows(categories: &[ToolCategory]) -> usize {
+    categories.iter().map(|c| c.visible_rows()).sum()
 }
 
 /// Marker for the name input text display.
@@ -102,13 +163,13 @@ struct ForkFormLoadingText;
 #[derive(Component)]
 struct ForkFormNameField;
 
-/// Marker for the tool list container.
+/// Marker for the tool tree container.
 #[derive(Component)]
 struct ForkFormToolContainer;
 
-/// Marker for individual tool items. Index matches ForkFormState.tools.
+/// Marker for a row in the tool tree. Flat index into visible rows.
 #[derive(Component)]
-struct ForkFormToolItem(usize);
+struct ForkFormToolRow(usize);
 
 /// Marker for the "Loading tools..." text.
 #[derive(Component)]
@@ -123,7 +184,7 @@ struct ForkFormModelResult(Arc<Mutex<Option<FetchedModels>>>);
 struct ForkFormToolResult(Arc<Mutex<Option<FetchedTools>>>);
 
 struct FetchedTools {
-    tools: Vec<ToolEntry>,
+    categories: Vec<ToolCategory>,
 }
 
 struct FetchedModels {
@@ -175,8 +236,6 @@ fn handle_open_fork_form(
     for msg in events.read() {
         info!("Opening fork form for context {}", msg.source_context_id.short());
 
-        // Transition to ForkForm screen — OnExit(Constellation) deactivates
-        // the 3D camera automatically. No manual camera hack needed.
         next_screen.set(Screen::ForkForm);
 
         // Clear async slots
@@ -232,24 +291,38 @@ fn handle_open_fork_form(
                 .spawn(async move {
                     match handle2.get_tool_schemas().await {
                         Ok(schemas) => {
-                            let mut tools: Vec<ToolEntry> = schemas
+                            // Group by category using BTreeMap for sorted order
+                            let mut by_category: BTreeMap<String, Vec<ToolEntry>> =
+                                BTreeMap::new();
+                            for s in schemas {
+                                by_category
+                                    .entry(s.category.clone())
+                                    .or_default()
+                                    .push(ToolEntry {
+                                        name: s.name.clone(),
+                                        description: s.description.clone(),
+                                        enabled: true,
+                                    });
+                            }
+                            // Sort tools within each category
+                            let categories: Vec<ToolCategory> = by_category
                                 .into_iter()
-                                .map(|s| ToolEntry {
-                                    name: s.name.clone(),
-                                    description: s.description.clone(),
-                                    category: s.category.clone(),
-                                    enabled: true,
+                                .map(|(name, mut tools)| {
+                                    tools.sort_by(|a, b| a.name.cmp(&b.name));
+                                    ToolCategory {
+                                        name,
+                                        expanded: false,
+                                        tools,
+                                    }
                                 })
                                 .collect();
-                            // Sort by category then name
-                            tools.sort_by(|a, b| {
-                                a.category.cmp(&b.category).then(a.name.cmp(&b.name))
-                            });
-                            *tool_slot.lock().unwrap() = Some(FetchedTools { tools });
+                            *tool_slot.lock().unwrap() =
+                                Some(FetchedTools { categories });
                         }
                         Err(e) => {
                             error!("Failed to fetch tool schemas: {}", e);
-                            *tool_slot.lock().unwrap() = Some(FetchedTools { tools: vec![] });
+                            *tool_slot.lock().unwrap() =
+                                Some(FetchedTools { categories: vec![] });
                         }
                     }
                 })
@@ -257,20 +330,18 @@ fn handle_open_fork_form(
         } else {
             warn!("No RPC actor available, fork form will have no model list");
             *result_slot.0.lock().unwrap() = Some(FetchedModels { providers: vec![] });
-            *tool_result_slot.0.lock().unwrap() = Some(FetchedTools { tools: vec![] });
+            *tool_result_slot.0.lock().unwrap() =
+                Some(FetchedTools { categories: vec![] });
         }
     }
 }
 
 // ============================================================================
-// SPAWN FORM UI
+// SPAWN FORM UI — two-column layout
 // ============================================================================
 
 fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
-    let title = format!(
-        "Fork from {}",
-        msg.source_context_id.short(),
-    );
+    let title = format!("Fork from {}", msg.source_context_id.short());
 
     // Full-viewport root — DespawnOnExit auto-cleans when leaving ForkForm screen
     commands
@@ -287,9 +358,9 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
                 parent_provider: msg.parent_provider.clone(),
                 parent_model: msg.parent_model.clone(),
                 models_loaded: false,
-                tools: Vec::new(),
+                categories: Vec::new(),
                 tools_loaded: false,
-                selected_tool_index: 0,
+                tool_cursor: 0,
             },
             DespawnOnExit(Screen::ForkForm),
             Node {
@@ -307,12 +378,12 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
             ZIndex(crate::constants::ZLayer::MODAL),
         ))
         .with_children(|root| {
-            // Form container (centered, fixed width)
+            // Form container (centered, wide enough for 2 columns)
             root.spawn(Node {
-                width: Val::Px(480.0),
-                max_height: Val::Percent(80.0),
+                width: Val::Px(720.0),
+                max_height: Val::Percent(85.0),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(20.0),
+                row_gap: Val::Px(16.0),
                 padding: UiRect::all(Val::Px(24.0)),
                 ..default()
             })
@@ -330,169 +401,184 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
                     },
                 ));
 
-                // ── Name section ──
+                // ── Two-column row ──
                 form.spawn(Node {
                     width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(6.0),
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(20.0),
                     ..default()
                 })
-                .with_children(|section| {
-                    // Label
-                    section.spawn((
-                        MsdfUiText::new("Name (optional)")
-                            .with_font_size(12.0)
-                            .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(14.0),
+                .with_children(|columns| {
+                    // ══════════════════════════════════════════
+                    // LEFT COLUMN: Name + Model
+                    // ══════════════════════════════════════════
+                    columns
+                        .spawn(Node {
+                            flex_basis: Val::Percent(50.0),
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(16.0),
                             ..default()
-                        },
-                    ));
-
-                    // Input field
-                    section
-                        .spawn((
-                            ForkFormNameField,
-                            Node {
+                        })
+                        .with_children(|left| {
+                            // ── Name section ──
+                            left.spawn(Node {
                                 width: Val::Percent(100.0),
-                                height: Val::Px(36.0),
-                                padding: UiRect::all(Val::Px(8.0)),
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
-                                ..default()
-                            },
-                            BackgroundColor(theme.panel_bg),
-                            BorderColor::all(theme.border),
-                            Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
-                        ))
-                        .with_children(|field| {
-                            field.spawn((
-                                ForkFormNameDisplay,
-                                MsdfUiText::new("hex ID if blank")
-                                    .with_font_size(14.0)
-                                    .with_color(theme.fg_dim),
-                                UiTextPositionCache::default(),
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    height: Val::Px(16.0),
-                                    ..default()
-                                },
-                            ));
-                        });
-                });
-
-                // ── Model section ──
-                form.spawn(Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(6.0),
-                    ..default()
-                })
-                .with_children(|section| {
-                    // Label
-                    section.spawn((
-                        MsdfUiText::new("Model")
-                            .with_font_size(12.0)
-                            .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(14.0),
-                            ..default()
-                        },
-                    ));
-
-                    // Model list container
-                    section
-                        .spawn((
-                            ForkFormModelContainer,
-                            Node {
-                                width: Val::Percent(100.0),
-                                min_height: Val::Px(100.0),
-                                max_height: Val::Px(300.0),
                                 flex_direction: FlexDirection::Column,
-                                padding: UiRect::all(Val::Px(8.0)),
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
-                                row_gap: Val::Px(2.0),
-                                overflow: Overflow::scroll_y(),
+                                row_gap: Val::Px(6.0),
                                 ..default()
-                            },
-                            BackgroundColor(theme.panel_bg),
-                            BorderColor::all(theme.accent),
-                            Outline::new(Val::Px(1.0), Val::ZERO, theme.accent),
-                        ))
-                        .with_children(|list| {
-                            // Loading placeholder
-                            list.spawn((
-                                ForkFormLoadingText,
-                                MsdfUiText::new("Loading models...")
-                                    .with_font_size(14.0)
-                                    .with_color(theme.fg_dim),
-                                UiTextPositionCache::default(),
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    height: Val::Px(16.0),
-                                    ..default()
-                                },
-                            ));
-                        });
-                });
+                            })
+                            .with_children(|section| {
+                                section.spawn((
+                                    MsdfUiText::new("Name (optional)")
+                                        .with_font_size(12.0)
+                                        .with_color(theme.fg_dim),
+                                    UiTextPositionCache::default(),
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(14.0),
+                                        ..default()
+                                    },
+                                ));
+                                section
+                                    .spawn((
+                                        ForkFormNameField,
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            height: Val::Px(36.0),
+                                            padding: UiRect::all(Val::Px(8.0)),
+                                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(theme.panel_bg),
+                                        BorderColor::all(theme.border),
+                                        Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
+                                    ))
+                                    .with_children(|field| {
+                                        field.spawn((
+                                            ForkFormNameDisplay,
+                                            MsdfUiText::new("hex ID if blank")
+                                                .with_font_size(14.0)
+                                                .with_color(theme.fg_dim),
+                                            UiTextPositionCache::default(),
+                                            Node {
+                                                width: Val::Percent(100.0),
+                                                height: Val::Px(16.0),
+                                                ..default()
+                                            },
+                                        ));
+                                    });
+                            });
 
-                // ── Tools section ──
-                form.spawn(Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(6.0),
-                    ..default()
-                })
-                .with_children(|section| {
-                    // Label
-                    section.spawn((
-                        MsdfUiText::new("Tools")
-                            .with_font_size(12.0)
-                            .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(14.0),
-                            ..default()
-                        },
-                    ));
-
-                    // Tool list container
-                    section
-                        .spawn((
-                            ForkFormToolContainer,
-                            Node {
+                            // ── Model section ──
+                            left.spawn(Node {
                                 width: Val::Percent(100.0),
-                                min_height: Val::Px(60.0),
-                                max_height: Val::Px(200.0),
                                 flex_direction: FlexDirection::Column,
-                                padding: UiRect::all(Val::Px(8.0)),
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
-                                row_gap: Val::Px(2.0),
-                                overflow: Overflow::scroll_y(),
+                                row_gap: Val::Px(6.0),
                                 ..default()
-                            },
-                            BackgroundColor(theme.panel_bg),
-                            BorderColor::all(theme.border),
-                            Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
-                        ))
-                        .with_children(|list| {
-                            // Loading placeholder
-                            list.spawn((
-                                ForkFormToolLoadingText,
-                                MsdfUiText::new("Loading tools...")
-                                    .with_font_size(14.0)
+                            })
+                            .with_children(|section| {
+                                section.spawn((
+                                    MsdfUiText::new("Model")
+                                        .with_font_size(12.0)
+                                        .with_color(theme.fg_dim),
+                                    UiTextPositionCache::default(),
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(14.0),
+                                        ..default()
+                                    },
+                                ));
+                                section
+                                    .spawn((
+                                        ForkFormModelContainer,
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            min_height: Val::Px(80.0),
+                                            max_height: Val::Px(300.0),
+                                            flex_direction: FlexDirection::Column,
+                                            padding: UiRect::all(Val::Px(8.0)),
+                                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                                            row_gap: Val::Px(2.0),
+                                            overflow: Overflow::scroll_y(),
+                                            ..default()
+                                        },
+                                        BackgroundColor(theme.panel_bg),
+                                        BorderColor::all(theme.accent),
+                                        Outline::new(Val::Px(1.0), Val::ZERO, theme.accent),
+                                    ))
+                                    .with_children(|list| {
+                                        list.spawn((
+                                            ForkFormLoadingText,
+                                            MsdfUiText::new("Loading models...")
+                                                .with_font_size(14.0)
+                                                .with_color(theme.fg_dim),
+                                            UiTextPositionCache::default(),
+                                            Node {
+                                                width: Val::Percent(100.0),
+                                                height: Val::Px(16.0),
+                                                ..default()
+                                            },
+                                        ));
+                                    });
+                            });
+                        });
+
+                    // ══════════════════════════════════════════
+                    // RIGHT COLUMN: Tools tree
+                    // ══════════════════════════════════════════
+                    columns
+                        .spawn(Node {
+                            flex_basis: Val::Percent(50.0),
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(6.0),
+                            ..default()
+                        })
+                        .with_children(|right| {
+                            right.spawn((
+                                MsdfUiText::new("Tools")
+                                    .with_font_size(12.0)
                                     .with_color(theme.fg_dim),
                                 UiTextPositionCache::default(),
                                 Node {
                                     width: Val::Percent(100.0),
-                                    height: Val::Px(16.0),
+                                    height: Val::Px(14.0),
                                     ..default()
                                 },
                             ));
+                            right
+                                .spawn((
+                                    ForkFormToolContainer,
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        min_height: Val::Px(80.0),
+                                        max_height: Val::Px(420.0),
+                                        flex_direction: FlexDirection::Column,
+                                        padding: UiRect::all(Val::Px(8.0)),
+                                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                                        row_gap: Val::Px(1.0),
+                                        overflow: Overflow::scroll_y(),
+                                        ..default()
+                                    },
+                                    BackgroundColor(theme.panel_bg),
+                                    BorderColor::all(theme.border),
+                                    Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
+                                ))
+                                .with_children(|list| {
+                                    list.spawn((
+                                        ForkFormToolLoadingText,
+                                        MsdfUiText::new("Loading tools...")
+                                            .with_font_size(14.0)
+                                            .with_color(theme.fg_dim),
+                                        UiTextPositionCache::default(),
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            height: Val::Px(16.0),
+                                            ..default()
+                                        },
+                                    ));
+                                });
                         });
                 });
 
@@ -555,9 +641,11 @@ fn spawn_fork_form(commands: &mut Commands, theme: &Theme, msg: &OpenForkForm) {
 
                 // ── Hints ──
                 form.spawn((
-                    MsdfUiText::new("Tab: field | j/k: select | Space: toggle tool | Enter: fork | Esc: cancel")
-                        .with_font_size(11.0)
-                        .with_color(theme.fg_dim),
+                    MsdfUiText::new(
+                        "Tab: field | j/k: select | Space: toggle | Enter: expand/fork | Esc: cancel",
+                    )
+                    .with_font_size(11.0)
+                    .with_color(theme.fg_dim),
                     UiTextPositionCache::default(),
                     Node {
                         width: Val::Percent(100.0),
@@ -615,18 +703,15 @@ fn poll_fork_form_models(
         }
     }
 
-    // Pre-select the inherited model
     let inherited_idx = models.iter().position(|m| m.is_inherited).unwrap_or(0);
     state.selected_model_index = inherited_idx;
     state.models = models.clone();
     state.models_loaded = true;
 
-    // Spawn model item entities into the container
     let Ok(container) = container_query.single() else {
         return;
     };
 
-    // Show hint when no models are available (RPC error or no providers)
     if models.is_empty() {
         let hint_entity = commands
             .spawn((
@@ -642,24 +727,20 @@ fn poll_fork_form_models(
             ))
             .id();
         commands.entity(container).add_child(hint_entity);
-        info!("Fork form: no models available");
         return;
     }
 
     let mut current_provider = String::new();
     for (i, entry) in models.iter().enumerate() {
-        // Provider header when provider changes
         if entry.provider != current_provider {
             current_provider = entry.provider.clone();
             let header_entity = commands
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(18.0),
-                        margin: UiRect::top(if i == 0 { Val::Px(0.0) } else { Val::Px(8.0) }),
-                        ..default()
-                    },
-                ))
+                .spawn(Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(18.0),
+                    margin: UiRect::top(if i == 0 { Val::Px(0.0) } else { Val::Px(8.0) }),
+                    ..default()
+                })
                 .with_children(|row| {
                     row.spawn((
                         MsdfUiText::new(&entry.provider)
@@ -677,7 +758,6 @@ fn poll_fork_form_models(
             commands.entity(container).add_child(header_entity);
         }
 
-        // Model row
         let is_selected = i == inherited_idx;
         let indicator = if is_selected { "\u{25B8} " } else { "  " };
         let suffix = if entry.is_inherited { "  (inherited)" } else { "" };
@@ -730,6 +810,7 @@ fn poll_fork_form_tools(
     mut state_query: Query<&mut ForkFormState>,
     loading_query: Query<Entity, With<ForkFormToolLoadingText>>,
     container_query: Query<Entity, With<ForkFormToolContainer>>,
+    existing_rows: Query<Entity, With<ForkFormToolRow>>,
 ) {
     let Ok(mut state) = state_query.single_mut() else {
         return;
@@ -748,14 +829,14 @@ fn poll_fork_form_tools(
         commands.entity(entity).despawn();
     }
 
-    state.tools = fetched.tools;
+    state.categories = fetched.categories;
     state.tools_loaded = true;
 
     let Ok(container) = container_query.single() else {
         return;
     };
 
-    if state.tools.is_empty() {
+    if state.categories.is_empty() {
         let hint_entity = commands
             .spawn((
                 MsdfUiText::new("No tools available")
@@ -770,63 +851,59 @@ fn poll_fork_form_tools(
             ))
             .id();
         commands.entity(container).add_child(hint_entity);
-        info!("Fork form: no tools available");
         return;
     }
 
-    // Render tools grouped by category
-    let mut current_category = String::new();
-    for (i, entry) in state.tools.iter().enumerate() {
-        // Category header when category changes
-        if entry.category != current_category {
-            current_category = entry.category.clone();
-            let header_entity = commands
-                .spawn(Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(18.0),
-                    margin: UiRect::top(if i == 0 { Val::Px(0.0) } else { Val::Px(6.0) }),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        MsdfUiText::new(&entry.category)
-                            .with_font_size(11.0)
-                            .with_color(theme.fg_dim),
-                        UiTextPositionCache::default(),
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(13.0),
-                            ..default()
-                        },
-                    ));
-                })
-                .id();
-            commands.entity(container).add_child(header_entity);
-        }
+    // Render collapsed category rows
+    for entity in existing_rows.iter() {
+        commands.entity(entity).try_despawn();
+    }
+    rebuild_tool_tree(&mut commands, &theme, &state.categories, state.tool_cursor, container);
 
-        // Tool row
-        let is_selected = i == 0;
-        let checkbox = if entry.enabled { "[x]" } else { "[ ]" };
-        let label = format!("{} {}", checkbox, entry.name);
-        let color = if is_selected { theme.accent } else { theme.fg };
+    info!(
+        "Fork form populated with {} tool categories",
+        state.categories.len()
+    );
+}
 
-        let item_entity = commands
+/// Rebuild all tool tree entities under the container.
+fn rebuild_tool_tree(
+    commands: &mut Commands,
+    theme: &Theme,
+    categories: &[ToolCategory],
+    cursor: usize,
+    container: Entity,
+) {
+
+    let mut flat_idx = 0;
+    for cat in categories {
+        let is_cursor = flat_idx == cursor;
+        let arrow = if cat.expanded { "\u{25BE}" } else { "\u{25B8}" }; // ▾ or ▸
+        let label = format!(
+            "{} {} ({}/{})",
+            arrow,
+            cat.name,
+            cat.enabled_count(),
+            cat.total_count()
+        );
+        let color = if is_cursor { theme.accent } else { theme.fg };
+
+        let row = commands
             .spawn((
-                ForkFormToolItem(i),
+                ForkFormToolRow(flat_idx),
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Px(20.0),
-                    padding: UiRect::left(Val::Px(12.0)),
                     ..default()
                 },
-                BackgroundColor(if is_selected {
+                BackgroundColor(if is_cursor {
                     theme.accent.with_alpha(0.1)
                 } else {
                     Color::NONE
                 }),
             ))
-            .with_children(|row| {
-                row.spawn((
+            .with_children(|r| {
+                r.spawn((
                     MsdfUiText::new(&label)
                         .with_font_size(13.0)
                         .with_color(color),
@@ -839,10 +916,56 @@ fn poll_fork_form_tools(
                 ));
             })
             .id();
-        commands.entity(container).add_child(item_entity);
-    }
+        commands.entity(container).add_child(row);
+        flat_idx += 1;
 
-    info!("Fork form populated with {} tools", state.tools.len());
+        if cat.expanded {
+            for tool in &cat.tools {
+                let is_cursor = flat_idx == cursor;
+                let checkbox = if tool.enabled { "[x]" } else { "[ ]" };
+                let label = format!("  {} {}", checkbox, tool.name);
+                let color = if is_cursor {
+                    theme.accent
+                } else if tool.enabled {
+                    theme.fg
+                } else {
+                    theme.fg_dim
+                };
+
+                let row = commands
+                    .spawn((
+                        ForkFormToolRow(flat_idx),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(20.0),
+                            padding: UiRect::left(Val::Px(8.0)),
+                            ..default()
+                        },
+                        BackgroundColor(if is_cursor {
+                            theme.accent.with_alpha(0.1)
+                        } else {
+                            Color::NONE
+                        }),
+                    ))
+                    .with_children(|r| {
+                        r.spawn((
+                            MsdfUiText::new(&label)
+                                .with_font_size(13.0)
+                                .with_color(color),
+                            UiTextPositionCache::default(),
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(15.0),
+                                ..default()
+                            },
+                        ));
+                    })
+                    .id();
+                commands.entity(container).add_child(row);
+                flat_idx += 1;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -850,17 +973,28 @@ fn poll_fork_form_tools(
 // ============================================================================
 
 fn handle_fork_form_input(
+    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut text_events: MessageReader<TextInputReceived>,
     mut next_screen: ResMut<NextState<Screen>>,
     mut state_query: Query<(&mut ForkFormState, &ForkFormRoot)>,
     mut name_display: Query<&mut MsdfUiText, With<ForkFormNameDisplay>>,
     mut model_items: Query<(&ForkFormModelItem, &mut BackgroundColor, &Children)>,
-    mut tool_items: Query<(&ForkFormToolItem, &mut BackgroundColor, &Children), Without<ForkFormModelItem>>,
-    mut model_texts: Query<&mut MsdfUiText, (Without<ForkFormNameDisplay>, Without<ForkFormLoadingText>, Without<ForkFormToolLoadingText>)>,
-    mut name_field: Query<&mut Outline, (With<ForkFormNameField>, Without<ForkFormModelContainer>, Without<ForkFormToolContainer>)>,
-    mut model_container: Query<&mut Outline, (With<ForkFormModelContainer>, Without<ForkFormNameField>, Without<ForkFormToolContainer>)>,
-    mut tool_container: Query<&mut Outline, (With<ForkFormToolContainer>, Without<ForkFormNameField>, Without<ForkFormModelContainer>)>,
+    mut model_texts: Query<
+        &mut MsdfUiText,
+        (
+            Without<ForkFormNameDisplay>,
+            Without<ForkFormLoadingText>,
+            Without<ForkFormToolLoadingText>,
+        ),
+    >,
+    // Combined outline + entity queries to stay under 16-param limit
+    mut outlines: ParamSet<(
+        Query<&mut Outline, (With<ForkFormNameField>, Without<ForkFormModelContainer>, Without<ForkFormToolContainer>)>,
+        Query<&mut Outline, (With<ForkFormModelContainer>, Without<ForkFormNameField>, Without<ForkFormToolContainer>)>,
+        Query<&mut Outline, (With<ForkFormToolContainer>, Without<ForkFormNameField>, Without<ForkFormModelContainer>)>,
+    )>,
+    tool_queries: (Query<Entity, With<ForkFormToolContainer>>, Query<Entity, With<ForkFormToolRow>>),
     theme: Res<Theme>,
     bootstrap: Res<BootstrapChannel>,
     conn_state: Res<RpcConnectionState>,
@@ -871,8 +1005,8 @@ fn handle_fork_form_input(
     };
 
     let mut text_changed = false;
-    let mut selection_changed = false;
-    let mut tool_selection_changed = false;
+    let mut model_selection_changed = false;
+    let mut tool_tree_changed = false;
 
     // Handle text input
     if state.active_field == ForkFormField::Name {
@@ -885,12 +1019,28 @@ fn handle_fork_form_input(
             }
         }
     } else if state.active_field == ForkFormField::ToolList {
-        // Space toggles tool enabled/disabled
+        // Space toggles tool/category
         for TextInputReceived(text) in text_events.read() {
-            if text.contains(' ') && !state.tools.is_empty() {
-                let idx = state.selected_tool_index;
-                state.tools[idx].enabled = !state.tools[idx].enabled;
-                tool_selection_changed = true;
+            if text.contains(' ') {
+                if let Some(target) = resolve_tool_cursor(&state.categories, state.tool_cursor) {
+                    match target {
+                        ToolCursorTarget::Category(ci) => {
+                            // Toggle all tools in category
+                            let all_enabled =
+                                state.categories[ci].tools.iter().all(|t| t.enabled);
+                            let new_state = !all_enabled;
+                            for tool in &mut state.categories[ci].tools {
+                                tool.enabled = new_state;
+                            }
+                            tool_tree_changed = true;
+                        }
+                        ToolCursorTarget::Tool(ci, ti) => {
+                            state.categories[ci].tools[ti].enabled =
+                                !state.categories[ci].tools[ti].enabled;
+                            tool_tree_changed = true;
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -911,14 +1061,7 @@ fn handle_fork_form_input(
                     ForkFormField::ModelList => ForkFormField::ToolList,
                     ForkFormField::ToolList => ForkFormField::Name,
                 };
-                // Update field borders
-                update_field_borders(
-                    &state,
-                    &theme,
-                    &mut name_field,
-                    &mut model_container,
-                    &mut tool_container,
-                );
+                set_outlines(&state, &theme, &mut outlines);
             }
             Action::CycleFocusBackward => {
                 state.active_field = match state.active_field {
@@ -926,81 +1069,94 @@ fn handle_fork_form_input(
                     ForkFormField::ModelList => ForkFormField::Name,
                     ForkFormField::ToolList => ForkFormField::ModelList,
                 };
-                // Update field borders
-                update_field_borders(
-                    &state,
-                    &theme,
-                    &mut name_field,
-                    &mut model_container,
-                    &mut tool_container,
-                );
+                set_outlines(&state, &theme, &mut outlines);
             }
+            // ── Model list navigation ──
             Action::SpatialNav(dir) if state.active_field == ForkFormField::ModelList => {
-                // j/k (y < 0 = up, y > 0 = down) navigate model list
                 if dir.y < 0.0 && state.selected_model_index > 0 {
                     state.selected_model_index -= 1;
-                    selection_changed = true;
+                    model_selection_changed = true;
                 } else if dir.y > 0.0
                     && state.selected_model_index + 1 < state.models.len()
                 {
                     state.selected_model_index += 1;
-                    selection_changed = true;
+                    model_selection_changed = true;
                 }
             }
             Action::FocusNextBlock if state.active_field == ForkFormField::ModelList => {
-                // j also fires as FocusNextBlock in some contexts
                 if state.selected_model_index + 1 < state.models.len() {
                     state.selected_model_index += 1;
-                    selection_changed = true;
+                    model_selection_changed = true;
                 }
             }
             Action::FocusPrevBlock if state.active_field == ForkFormField::ModelList => {
-                // k also fires as FocusPrevBlock
                 if state.selected_model_index > 0 {
                     state.selected_model_index -= 1;
-                    selection_changed = true;
+                    model_selection_changed = true;
                 }
             }
+            // ── Tool tree navigation ──
             Action::SpatialNav(dir) if state.active_field == ForkFormField::ToolList => {
-                if dir.y < 0.0 && state.selected_tool_index > 0 {
-                    state.selected_tool_index -= 1;
-                    tool_selection_changed = true;
-                } else if dir.y > 0.0
-                    && state.selected_tool_index + 1 < state.tools.len()
-                {
-                    state.selected_tool_index += 1;
-                    tool_selection_changed = true;
+                let max = total_visible_rows(&state.categories);
+                if dir.y < 0.0 && state.tool_cursor > 0 {
+                    state.tool_cursor -= 1;
+                    tool_tree_changed = true;
+                } else if dir.y > 0.0 && state.tool_cursor + 1 < max {
+                    state.tool_cursor += 1;
+                    tool_tree_changed = true;
                 }
             }
             Action::FocusNextBlock if state.active_field == ForkFormField::ToolList => {
-                if state.selected_tool_index + 1 < state.tools.len() {
-                    state.selected_tool_index += 1;
-                    tool_selection_changed = true;
+                let max = total_visible_rows(&state.categories);
+                if state.tool_cursor + 1 < max {
+                    state.tool_cursor += 1;
+                    tool_tree_changed = true;
                 }
             }
             Action::FocusPrevBlock if state.active_field == ForkFormField::ToolList => {
-                if state.selected_tool_index > 0 {
-                    state.selected_tool_index -= 1;
-                    tool_selection_changed = true;
+                if state.tool_cursor > 0 {
+                    state.tool_cursor -= 1;
+                    tool_tree_changed = true;
                 }
             }
+            // ── Activate (Enter) ──
             Action::Activate => {
-                // Submit fork
-                if state.models_loaded {
-                    submit_fork_form(
-                        &state,
-                        form_root,
-                        &bootstrap,
-                        &conn_state,
-                        actor.as_deref(),
-                    );
-                    // DespawnOnExit handles cleanup when screen transitions
-                    next_screen.set(Screen::Constellation);
+                if state.active_field == ForkFormField::ToolList {
+                    // Enter on a category toggles expand/collapse
+                    if let Some(ToolCursorTarget::Category(ci)) =
+                        resolve_tool_cursor(&state.categories, state.tool_cursor)
+                    {
+                        state.categories[ci].expanded = !state.categories[ci].expanded;
+                        tool_tree_changed = true;
+                    } else {
+                        // Enter on a tool row → submit the form
+                        if state.models_loaded {
+                            submit_fork_form(
+                                &state,
+                                form_root,
+                                &bootstrap,
+                                &conn_state,
+                                actor.as_deref(),
+                            );
+                            next_screen.set(Screen::Constellation);
+                        }
+                    }
+                } else {
+                    // Submit fork from Name or Model field
+                    if state.models_loaded {
+                        submit_fork_form(
+                            &state,
+                            form_root,
+                            &bootstrap,
+                            &conn_state,
+                            actor.as_deref(),
+                        );
+                        next_screen.set(Screen::Constellation);
+                    }
                 }
             }
             Action::Unfocus => {
                 info!("Fork form cancelled");
-                // DespawnOnExit handles cleanup when screen transitions
                 next_screen.set(Screen::Constellation);
             }
             _ => {}
@@ -1021,7 +1177,7 @@ fn handle_fork_form_input(
     }
 
     // Update model item visuals
-    if selection_changed {
+    if model_selection_changed {
         for (item, mut bg, children) in model_items.iter_mut() {
             let is_selected = item.0 == state.selected_model_index;
             *bg = if is_selected {
@@ -1030,62 +1186,56 @@ fn handle_fork_form_input(
                 BackgroundColor(Color::NONE)
             };
 
-            // Update text color + indicator
             for child in children.iter() {
                 if let Ok(mut msdf) = model_texts.get_mut(child) {
                     let entry = &state.models[item.0];
                     let indicator = if is_selected { "\u{25B8} " } else { "  " };
                     let suffix = if entry.is_inherited { "  (inherited)" } else { "" };
                     msdf.text = format!("{}{}{}", indicator, entry.model, suffix);
-                    msdf.color = bevy_to_rgba8(if is_selected { theme.accent } else { theme.fg });
+                    msdf.color =
+                        bevy_to_rgba8(if is_selected { theme.accent } else { theme.fg });
                 }
             }
         }
     }
 
-    // Update tool item visuals
-    if tool_selection_changed {
-        for (item, mut bg, children) in tool_items.iter_mut() {
-            let is_selected = item.0 == state.selected_tool_index;
-            *bg = if is_selected {
-                BackgroundColor(theme.accent.with_alpha(0.1))
-            } else {
-                BackgroundColor(Color::NONE)
-            };
-
-            for child in children.iter() {
-                if let Ok(mut msdf) = model_texts.get_mut(child) {
-                    let entry = &state.tools[item.0];
-                    let checkbox = if entry.enabled { "[x]" } else { "[ ]" };
-                    msdf.text = format!("{} {}", checkbox, entry.name);
-                    msdf.color = bevy_to_rgba8(if is_selected {
-                        theme.accent
-                    } else if entry.enabled {
-                        theme.fg
-                    } else {
-                        theme.fg_dim
-                    });
-                }
-            }
+    // Rebuild tool tree if anything changed (expand/collapse, toggle, cursor move)
+    if tool_tree_changed {
+        let (ref tool_container_q, ref tool_rows_q) = tool_queries;
+        for entity in tool_rows_q.iter() {
+            commands.entity(entity).try_despawn();
+        }
+        if let Ok(container) = tool_container_q.single() {
+            rebuild_tool_tree(
+                &mut commands,
+                &theme,
+                &state.categories,
+                state.tool_cursor,
+                container,
+            );
         }
     }
 }
 
-fn update_field_borders(
-    state: &ForkFormState,
-    theme: &Theme,
-    name_field: &mut Query<&mut Outline, (With<ForkFormNameField>, Without<ForkFormModelContainer>, Without<ForkFormToolContainer>)>,
-    model_container: &mut Query<&mut Outline, (With<ForkFormModelContainer>, Without<ForkFormNameField>, Without<ForkFormToolContainer>)>,
-    tool_container: &mut Query<&mut Outline, (With<ForkFormToolContainer>, Without<ForkFormNameField>, Without<ForkFormModelContainer>)>,
-) {
-    if let Ok(mut outline) = name_field.single_mut() {
-        outline.color = if state.active_field == ForkFormField::Name { theme.accent } else { theme.border };
+/// Update outline colors based on active field. Takes a ParamSet to work
+/// within the 16-param system limit.
+fn set_outlines(state: &ForkFormState, theme: &Theme, outlines: &mut ParamSet<(
+    Query<&mut Outline, (With<ForkFormNameField>, Without<ForkFormModelContainer>, Without<ForkFormToolContainer>)>,
+    Query<&mut Outline, (With<ForkFormModelContainer>, Without<ForkFormNameField>, Without<ForkFormToolContainer>)>,
+    Query<&mut Outline, (With<ForkFormToolContainer>, Without<ForkFormNameField>, Without<ForkFormModelContainer>)>,
+)>) {
+    let name_color = if state.active_field == ForkFormField::Name { theme.accent } else { theme.border };
+    let model_color = if state.active_field == ForkFormField::ModelList { theme.accent } else { theme.border };
+    let tool_color = if state.active_field == ForkFormField::ToolList { theme.accent } else { theme.border };
+
+    if let Ok(mut outline) = outlines.p0().single_mut() {
+        outline.color = name_color;
     }
-    if let Ok(mut outline) = model_container.single_mut() {
-        outline.color = if state.active_field == ForkFormField::ModelList { theme.accent } else { theme.border };
+    if let Ok(mut outline) = outlines.p1().single_mut() {
+        outline.color = model_color;
     }
-    if let Ok(mut outline) = tool_container.single_mut() {
-        outline.color = if state.active_field == ForkFormField::ToolList { theme.accent } else { theme.border };
+    if let Ok(mut outline) = outlines.p2().single_mut() {
+        outline.color = tool_color;
     }
 }
 
@@ -1125,8 +1275,9 @@ fn submit_fork_form(
 
     // Collect disabled tools for DenyList
     let disabled_tools: Vec<String> = state
-        .tools
+        .categories
         .iter()
+        .flat_map(|cat| cat.tools.iter())
         .filter(|t| !t.enabled)
         .map(|t| t.name.clone())
         .collect();
@@ -1156,14 +1307,18 @@ fn submit_fork_form(
             info!("Fork created: {}", new_ctx_id);
 
             // Step 2: Set model if different from parent
-            let model_changed = selected_model != parent_model
-                || selected_provider != parent_provider;
+            let model_changed =
+                selected_model != parent_model || selected_provider != parent_provider;
             if model_changed {
-                if let (Some(provider), Some(model)) = (&selected_provider, &selected_model)
-                {
+                if let (Some(provider), Some(model)) = (&selected_provider, &selected_model) {
                     match handle.set_context_model(new_ctx_id, provider, model).await {
                         Ok(true) => {
-                            info!("Model set on {}: {}/{}", new_ctx_id.short(), provider, model)
+                            info!(
+                                "Model set on {}: {}/{}",
+                                new_ctx_id.short(),
+                                provider,
+                                model
+                            )
                         }
                         Ok(false) => warn!("set_context_model returned false"),
                         Err(e) => error!("Failed to set model: {}", e),
@@ -1174,10 +1329,13 @@ fn submit_fork_form(
             // Step 3: Set per-context tool filter if any tools were disabled
             if has_tool_filter {
                 use kaijutsu_client::rpc::ClientToolFilter;
-                match handle.set_context_tool_filter(
-                    new_ctx_id,
-                    ClientToolFilter::DenyList(disabled_tools),
-                ).await {
+                match handle
+                    .set_context_tool_filter(
+                        new_ctx_id,
+                        ClientToolFilter::DenyList(disabled_tools),
+                    )
+                    .await
+                {
                     Ok(true) => info!("Tool filter set on {}", new_ctx_id.short()),
                     Ok(false) => warn!("set_context_tool_filter returned false"),
                     Err(e) => error!("Failed to set tool filter: {}", e),
