@@ -190,7 +190,7 @@ fn setup_ui(
             ))
             .with_children(|content| {
                 // CONVERSATION VIEW (visible immediately — no dashboard)
-                // The tiling reconciler spawns ConversationContainer + ComposeBlock inside
+                // The tiling reconciler spawns ConversationContainer inside
                 content.spawn((
                     ui::state::ConversationRoot,
                     Node {

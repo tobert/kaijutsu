@@ -5,7 +5,7 @@ use bevy::ui::measurement::ContentSize;
 
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
-    CellState, ComposeBlock, ContextId, ConversationScrollState, DriftKind, EditingBlockCell,
+    CellState, ContextId, ConversationScrollState, DriftKind, EditingBlockCell,
     FocusTarget, MainCell, PromptSubmitted, Role, RoleHeader, RoleHeaderLayout,
     Status, ViewingConversation, WorkspaceLayout,
 };
@@ -2189,11 +2189,11 @@ pub fn layout_block_cells(
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &UiVelloText, Option<&super::block_border::BlockBorderStyle>)>,
     mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
     layout: Res<WorkspaceLayout>,
+    text_metrics: Res<TextMetrics>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    // NOTE: InputShadowHeight removed - legacy input layer is gone, ComposeBlock is inline
     conv_containers: Query<&ComputedNode, (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
     windows: Query<&Window>,
-    layout_gen: Res<super::components::LayoutGeneration>,
+    mut layout_gen: ResMut<super::components::LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
     mut last_base_width: Local<f32>,
 ) {
@@ -2211,7 +2211,8 @@ pub fn layout_block_cells(
 
     let mut y_offset = 0.0;
 
-    let margin = layout.workspace_margin_left;
+    // Horizontal decoration on ConversationContainer: 2px border + 16px padding on each side = 36px total.
+    const CONTAINER_H_DECORATION: f32 = 36.0;
 
     // Get pane width from the focused ConversationContainer's ComputedNode.
     // Falls back to window width on first frame before layout runs.
@@ -2223,7 +2224,7 @@ pub fn layout_block_cells(
                 .map(|w| w.resolution.width())
                 .unwrap_or(1280.0)
         });
-    let base_width = base_width - (margin * 2.0);
+    let base_width = base_width - CONTAINER_H_DECORATION;
 
     // === Performance optimization: skip if nothing changed ===
     let width_changed = (base_width - *last_base_width).abs() > 1.0;
@@ -2235,6 +2236,12 @@ pub fn layout_block_cells(
 
     *last_base_width = base_width;
     *last_layout_gen = layout_gen.0;
+
+    // When width changes, bump layout_gen so update_block_cell_nodes picks up new heights.
+    if width_changed && !content_changed {
+        layout_gen.bump();
+        *last_layout_gen = layout_gen.0;
+    }
 
     // Note: visible_height is updated in smooth_scroll from ConversationContainer's ComputedNode
 
@@ -2295,7 +2302,7 @@ pub fn layout_block_cells(
 
         // Estimate line count from text length and wrap width.
         // Vello handles actual text shaping; this is a layout height estimate.
-        let char_width = layout.line_height * 0.6; // approximate monospace
+        let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
         let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
         let text = &vello_text.value;
         let line_count = text.split('\n').map(|line| {
@@ -2335,7 +2342,7 @@ pub fn update_block_cell_nodes(
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
-    // Node values only change when layout changes (block add/remove/line count)
+    // Run when layout_gen changes (content changes or width changes trigger a bump)
     if layout_gen.0 == *last_gen {
         return;
     }
@@ -2382,6 +2389,16 @@ pub fn update_block_cell_nodes(
         };
         if node.margin != target_margin {
             node.margin = target_margin;
+        }
+        // Indented blocks use width:Auto so margin-left shrinks available width
+        // correctly. width:100% + margin-left overflows the container.
+        let target_width = if layout.indent_level > 0 {
+            Val::Auto
+        } else {
+            Val::Percent(100.0)
+        };
+        if node.width != target_width {
+            node.width = target_width;
         }
         if node.padding != target_padding {
             node.padding = target_padding;
@@ -2477,19 +2494,8 @@ pub fn reorder_conversation_children(
     }
 }
 
-/// Position BlockCell text areas from ComputedNode (flex layout result).
-///
-/// With Vello, text position is inherited from Bevy UI layout — no manual
-/// manual positioning needed. This is a no-op kept for plugin
-/// system set compatibility.
-pub fn position_block_cells_from_flex() {}
-
-/// Position RoleHeader text areas from ComputedNode (flex layout result).
-///
-/// With Vello, text position is inherited from Bevy UI layout — no manual
-/// manual positioning needed. This is a no-op kept for plugin
-/// system set compatibility.
-pub fn position_role_headers_from_flex() {}
+// position_block_cells_from_flex — DELETED (Vello handles layout natively)
+// position_role_headers_from_flex — DELETED (Vello handles layout natively)
 
 
 // ============================================================================
@@ -2596,92 +2602,8 @@ pub fn update_block_edit_cursor(
     node.top = Val::Px(y);
 }
 
-// ============================================================================
-// COMPOSE BLOCK SYSTEMS
-// ============================================================================
-
-/// Initialize UiVelloText for ComposeBlock entities.
-pub fn init_compose_block_buffer(
-    mut commands: Commands,
-    compose_blocks: Query<Entity, (With<ComposeBlock>, With<KjText>, Without<UiVelloText>)>,
-    font_handles: Res<FontHandles>,
-    text_metrics: Res<TextMetrics>,
-    theme: Res<Theme>,
-) {
-    for entity in compose_blocks.iter() {
-        commands.entity(entity).insert(UiVelloText {
-            value: "Type here...".to_string(),
-            style: bevy_vello::prelude::VelloTextStyle {
-                font: font_handles.mono.clone(),
-                brush: bevy_color_to_brush(theme.fg_dim),
-                font_size: text_metrics.cell_font_size,
-                ..default()
-            },
-            ..default()
-        });
-    }
-}
-
-// handle_compose_block_input — DELETED (Phase 5)
-// Migrated to input::systems::handle_compose_input
-
-/// Sync ComposeBlock text to its UiVelloText.
-///
-/// In shell mode, applies error tinting for invalid syntax.
-/// Per-token syntax highlighting via Parley spans is Phase 4.
-pub fn sync_compose_block_buffer(
-    theme: Res<Theme>,
-    mut compose_blocks: Query<(&ComposeBlock, &mut UiVelloText), Changed<ComposeBlock>>,
-) {
-    for (compose, mut vello_text) in compose_blocks.iter_mut() {
-        if compose.is_empty() {
-            // Placeholder
-            let new_brush = bevy_color_to_brush(theme.fg_dim);
-            if vello_text.style.brush != new_brush {
-                vello_text.style.brush = new_brush;
-            }
-            if vello_text.value != "Type here..." {
-                vello_text.value = "Type here...".to_string();
-            }
-        } else if is_shell_command(&compose.text) {
-            let stripped = strip_shell_prefix(&compose.text);
-            let validation = crate::kaish::validate(stripped);
-
-            if !validation.valid && !validation.incomplete {
-                // Hard syntax error — red tint on entire text
-                let new_brush = bevy_color_to_brush(theme.block_tool_error);
-                if vello_text.style.brush != new_brush {
-                    vello_text.style.brush = new_brush;
-                }
-            } else {
-                // Valid or incomplete — plain text for now, syntax highlighting Phase 4
-                let new_brush = bevy_color_to_brush(theme.block_user);
-                if vello_text.style.brush != new_brush {
-                    vello_text.style.brush = new_brush;
-                }
-            }
-            if vello_text.value != compose.text {
-                vello_text.value = compose.text.clone();
-            }
-        } else {
-            // Plain chat text
-            let new_brush = bevy_color_to_brush(theme.block_user);
-            if vello_text.style.brush != new_brush {
-                vello_text.style.brush = new_brush;
-            }
-            if vello_text.value != compose.text {
-                vello_text.value = compose.text.clone();
-            }
-        }
-    }
-}
-
-/// Position the ComposeBlock text area based on its computed UI layout.
-///
-/// With Vello, text position is inherited from Bevy UI layout — no manual
-/// manual positioning needed. This is a no-op kept for plugin
-/// system set compatibility.
-pub fn position_compose_block() {}
+// ComposeBlock systems DELETED — ComposeBlock is no longer spawned as a pane.
+// The InputOverlay is the sole compose surface. See spawn_input_overlay below.
 
 // ============================================================================
 // INPUT OVERLAY — Ephemeral input surface
@@ -2837,64 +2759,9 @@ pub fn update_input_overlay_cursor(
     }
 }
 
-/// Position the cursor in the focused ComposeBlock during Input mode.
-///
-/// When in Input mode with no active EditingBlockCell, the cursor beam
-/// should appear at the ComposeBlock's cursor offset. This replaces the
-/// old bubble cursor system.
-pub fn update_compose_cursor(
-    focus_area: Res<FocusArea>,
-    entities: Res<EditorEntities>,
-    compose_blocks: Query<(&ComposeBlock, &ComputedNode, &UiGlobalTransform), With<crate::ui::tiling::PaneFocus>>,
-    editing_blocks: Query<Entity, With<EditingBlockCell>>,
-    mut cursor_query: Query<(&mut Node, &mut Visibility, &MaterialNode<CursorBeamMaterial>), With<CursorMarker>>,
-    mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
-    theme: Res<Theme>,
-    text_metrics: Res<TextMetrics>,
-) {
-    // Only show compose cursor when compose area is focused
-    if !matches!(*focus_area, FocusArea::Compose) {
-        return;
-    }
-    // Don't override if editing a block cell inline
-    if !editing_blocks.is_empty() {
-        return;
-    }
-
-    let Some(cursor_ent) = entities.cursor else { return };
-    let Ok((compose, computed, transform)) = compose_blocks.single() else { return };
-    let Ok((mut node, mut visibility, material_node)) = cursor_query.get_mut(cursor_ent) else { return };
-
-    *visibility = Visibility::Inherited;
-
-    // Get compose block position from Bevy UI layout.
-    // UiGlobalTransform origin is at the node CENTER. content_box().min
-    // gives the offset from center to content area top-left.
-    let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = computed.content_box();
-    let cell_left = translation.x + content.min.x;
-    let cell_top = translation.y + content.min.y;
-
-    // Calculate position from ComposeBlock.cursor offset
-    let text = &compose.text;
-    let offset = compose.cursor.min(text.len());
-    let before = &text[..offset];
-    let row = before.matches('\n').count();
-    let col = before.rfind('\n').map(|p| offset - p - 1).unwrap_or(offset);
-
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
-    let line_height = text_metrics.cell_line_height;
-
-    node.left = Val::Px(cell_left + (col as f32 * char_width) - 2.0);
-    node.top = Val::Px(cell_top + (row as f32 * line_height));
-
-    // Update material for Input mode appearance
-    if let Some(material) = cursor_materials.get_mut(&material_node.0) {
-        material.time.y = CursorMode::Beam as u8 as f32;
-        material.color = theme.cursor_insert;
-        material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
-    }
-}
+// update_compose_cursor — DELETED
+// ComposeBlock is no longer spawned as a pane. Cursor for the compose surface
+// is handled by update_input_overlay_cursor.
 
 #[cfg(test)]
 mod tests {

@@ -21,7 +21,7 @@ pub use components::{
     CellState, ComposeError, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditingBlockCell,
     FocusTarget, FocusedBlockCell, InputMode, InputOverlay, InputOverlayMarker,
-    MainCell, PromptSubmitted, SubmitFailed,
+    MainCell, PromptSubmitted, RoleHeader, SubmitFailed,
     ViewingConversation,
 };
 pub use plugin::CellPlugin;

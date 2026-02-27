@@ -178,9 +178,6 @@ impl Plugin for CellPlugin {
                 systems::sync_block_cell_buffers
                     .after(systems::init_block_cell_buffers)
                     .after(systems::init_role_header_buffers),
-                // Compose block buffer init and sync (legacy — kept for ComposeBlock if any)
-                systems::init_compose_block_buffer,
-                systems::sync_compose_block_buffer.after(systems::init_compose_block_buffer),
                 // Input overlay visibility + buffer sync
                 systems::sync_overlay_visibility,
                 systems::sync_input_overlay_buffer,
@@ -240,18 +237,10 @@ impl Plugin for CellPlugin {
         app.add_systems(
             PostUpdate,
             (
-                // Flex-based positioning (reads UiGlobalTransform)
-                systems::position_block_cells_from_flex,
-                systems::position_role_headers_from_flex,
-                systems::position_compose_block,
-                // Compose cursor depends on compose position
-                systems::update_compose_cursor
-                    .after(systems::position_compose_block),
-                // Input overlay cursor
+                // Input overlay cursor (reads UiGlobalTransform)
                 systems::update_input_overlay_cursor,
-                // Block border systems (depend on block cell positions)
-                block_border::spawn_block_borders
-                    .after(systems::position_block_cells_from_flex),
+                // Block border systems
+                block_border::spawn_block_borders,
                 block_border::layout_block_borders_from_flex
                     .after(block_border::spawn_block_borders),
             )

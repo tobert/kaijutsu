@@ -20,6 +20,7 @@ use bevy::prelude::*;
 
 use super::constellation::{ConstellationContainer, viewport::ConstellationCamera3d};
 use super::state::ConversationRoot;
+use crate::cell::{BlockCell, RoleHeader};
 use crate::text::KjText;
 
 /// Which full-viewport view is currently active.
@@ -155,24 +156,33 @@ fn hide_conversation_root(
     }
 }
 
-/// Hide orphaned cell text when leaving conversation.
+/// Hide block cells and role headers when leaving conversation.
 ///
-/// Block cells and role headers are spawned as root-level entities (no parent)
-/// with screen-space coordinates. Since they're not descendants of
-/// ConversationRoot, Visibility::Hidden doesn't propagate to them.
+/// With Vello, text is rendered ON the Node entity (UiVelloText component
+/// lives on the same entity as Node). Display::None on ConversationRoot
+/// suppresses layout but does not prevent Vello from rendering at the
+/// entity's stale UiGlobalTransform. We must explicitly set Visibility.
 fn hide_cell_text(
-    mut cell_texts: Query<&mut Visibility, (With<KjText>, Without<Node>)>,
+    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleHeader>)>,
+    mut role_headers: Query<&mut Visibility, (With<RoleHeader>, Without<BlockCell>)>,
 ) {
-    for mut vis in cell_texts.iter_mut() {
+    for mut vis in block_cells.iter_mut() {
+        *vis = Visibility::Hidden;
+    }
+    for mut vis in role_headers.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }
 
-/// Show orphaned cell text when entering conversation.
+/// Show block cells and role headers when entering conversation.
 fn show_cell_text(
-    mut cell_texts: Query<&mut Visibility, (With<KjText>, Without<Node>)>,
+    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleHeader>)>,
+    mut role_headers: Query<&mut Visibility, (With<RoleHeader>, Without<BlockCell>)>,
 ) {
-    for mut vis in cell_texts.iter_mut() {
+    for mut vis in block_cells.iter_mut() {
+        *vis = Visibility::Inherited;
+    }
+    for mut vis in role_headers.iter_mut() {
         *vis = Visibility::Inherited;
     }
 }
@@ -187,15 +197,15 @@ fn set_focus_conversation(
     *focus = crate::input::focus::FocusArea::Conversation;
 }
 
-/// Hide newly-added cell text entities when not in conversation view.
+/// Hide newly-added block cells and role headers when not in conversation view.
 ///
 /// Block cells may be created by background sync while the constellation or
 /// fork form is showing. Without this, they'd bleed through until the next
 /// screen transition.
 fn hide_new_cell_text_outside_conversation(
-    mut new_texts: Query<&mut Visibility, (Added<KjText>, Without<Node>)>,
+    mut new_blocks: Query<&mut Visibility, (Added<KjText>, Or<(With<BlockCell>, With<RoleHeader>)>)>,
 ) {
-    for mut vis in new_texts.iter_mut() {
+    for mut vis in new_blocks.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }
