@@ -50,6 +50,8 @@ pub fn handle_agent_activity(
 /// Sync agent badges in the UI.
 ///
 /// Creates/updates/removes badge entities based on registry state.
+/// Phase 3: badge spawning not yet implemented, deregistered from Update schedule.
+#[allow(dead_code)]
 pub fn sync_agent_badges(
     registry: Res<AgentRegistry>,
     mut commands: Commands,

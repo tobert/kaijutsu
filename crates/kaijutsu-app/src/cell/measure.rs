@@ -23,7 +23,7 @@ use crate::ui::tiling::PaneFocus;
 /// **Optimization:** Compares computed height against existing measure before
 /// calling `content_size.set()`, since `.set()` triggers `&mut self` →
 /// Bevy change detection → taffy relayout for ALL nodes.
-pub fn update_msdf_measures(
+pub fn update_block_measures(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<

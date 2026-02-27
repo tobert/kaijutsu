@@ -5,7 +5,7 @@
 //! - State (variables, history, checkpoints)
 //! - Tools (execution engines)
 //! - LLM providers (for model access)
-//! - Control plane (lease, consent mode)
+//! - Control plane (consent mode)
 
 use async_trait::async_trait;
 use std::path::Path;
@@ -20,7 +20,7 @@ use crate::agents::{
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::{LlmRegistry, LlmResult, RigProvider};
+use crate::llm::{LlmRegistry, RigProvider};
 use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
@@ -81,24 +81,6 @@ impl Kernel {
         Self {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
-            tools: RwLock::new(ToolRegistry::new()),
-            tool_config: RwLock::new(ToolConfig::all()),
-            llm: RwLock::new(LlmRegistry::new()),
-            agents: RwLock::new(AgentRegistry::new()),
-            consent_mode: RwLock::new(ConsentMode::default()),
-            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
-            drift: shared_drift_router(),
-        }
-    }
-
-    /// Create a new kernel with a specific ID.
-    pub async fn with_id(id: Uuid, name: impl Into<String>) -> Self {
-        let name = name.into();
-        let vfs = Arc::new(MountTable::new());
-
-        Self {
-            vfs,
-            state: RwLock::new(KernelState::with_id(id, &name)),
             tools: RwLock::new(ToolRegistry::new()),
             tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
@@ -359,25 +341,6 @@ impl Kernel {
     /// List registered LLM providers.
     pub async fn list_llm_providers(&self) -> Vec<String> {
         self.llm.read().await.list().into_iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Send a prompt to the default LLM provider.
-    ///
-    /// This is the simplest way to get a response from an LLM.
-    pub async fn prompt(&self, prompt: &str) -> LlmResult<String> {
-        self.llm.read().await.prompt(prompt).await
-    }
-
-    /// Send a prompt to a specific LLM provider.
-    pub async fn prompt_with(&self, provider_name: &str, model: &str, prompt: &str) -> LlmResult<String> {
-        let provider = self
-            .llm
-            .read()
-            .await
-            .get(provider_name)
-            .ok_or_else(|| crate::llm::LlmError::Unavailable(format!("provider not found: {}", provider_name)))?;
-
-        provider.prompt(model, prompt).await
     }
 
     // ========================================================================
@@ -644,7 +607,7 @@ mod tests {
         let kernel = Kernel::new("test").await;
 
         // Should fail gracefully without provider
-        let result = kernel.prompt("Hello").await;
+        let result = kernel.llm().read().await.prompt("Hello").await;
         assert!(result.is_err());
     }
 

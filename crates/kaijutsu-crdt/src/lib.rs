@@ -22,20 +22,20 @@
 //! - **Drift**: Cross-context content transfer
 //! - **File**: File content tracked in a context
 
-mod block;
 pub mod block_store;
 pub(crate) mod content;
 mod dag;
 mod document;
 mod error;
-pub mod ids;
 mod ops;
 
 // Re-export types from kaijutsu-types
-pub use block::{
-    BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder,
-    BlockHeader, DriftKind, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
-    Role, Status, ToolKind,
+pub use kaijutsu_types::{
+    BlockFilter, BlockHeader, BlockId, BlockKind, BlockQuery, BlockSnapshot,
+    BlockSnapshotBuilder, DriftKind, MAX_DAG_DEPTH, OutputData, OutputEntryType,
+    OutputNode, Role, Status, ToolKind,
+    ContextId, KernelId, PrefixError, PrefixResolvable, PrincipalId, SessionId,
+    resolve_context_prefix,
 };
 
 // New architecture
@@ -47,10 +47,6 @@ pub use dag::ConversationDAG;
 pub use document::{BlockDocument, DocumentSnapshot};
 
 pub use error::CrdtError;
-pub use ids::{
-    ContextId, KernelId, PrefixError, PrefixResolvable, PrincipalId, SessionId,
-    resolve_context_prefix,
-};
 pub use ops::{Frontier, SerializedOps, SerializedOpsOwned, LV};
 
 /// Result type for CRDT operations.

@@ -50,20 +50,6 @@ impl KjUiText {
         self
     }
 
-    /// Convert to a `UiVelloText` using the given font handle.
-    #[allow(dead_code)] // Available for spawn sites that want explicit control
-    pub fn to_vello_text(&self, font: Handle<VelloFont>) -> UiVelloText {
-        UiVelloText {
-            value: self.text.clone(),
-            style: VelloTextStyle {
-                font,
-                brush: bevy_color_to_brush(self.color),
-                font_size: self.font_size,
-                ..default()
-            },
-            ..default()
-        }
-    }
 }
 
 /// Convert a Bevy `Color` to a Vello `Brush::Solid`.
@@ -75,18 +61,6 @@ pub fn bevy_color_to_brush(color: Color) -> vello::peniko::Brush {
         (srgba.blue * 255.0) as u8,
         (srgba.alpha * 255.0) as u8,
     ))
-}
-
-/// Convert Bevy Color to RGBA8 array.
-#[allow(dead_code)]
-pub fn bevy_to_rgba8(color: Color) -> [u8; 4] {
-    let srgba = color.to_srgba();
-    [
-        (srgba.red * 255.0) as u8,
-        (srgba.green * 255.0) as u8,
-        (srgba.blue * 255.0) as u8,
-        (srgba.alpha * 255.0) as u8,
-    ]
 }
 
 /// Build a scrolling rainbow gradient brush.

@@ -35,7 +35,7 @@ impl std::fmt::Display for PaneId {
 // PANE CONTENT — What a pane displays
 // ============================================================================
 
-/// Writing direction for compose panes (cosmic-text supports both).
+/// Writing direction for compose panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
 pub enum WritingDirection {
     #[default]

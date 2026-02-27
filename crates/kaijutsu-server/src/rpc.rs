@@ -2295,131 +2295,39 @@ impl kernel::Server for KernelImpl {
     }
 
     // =========================================================================
-    // Blob Storage
+    // Blob Storage (schema ordinals kept for wire compat, handlers removed)
     // =========================================================================
 
     fn write_blob(
         self: Rc<Self>,
-        params: kernel::WriteBlobParams,
-        mut results: kernel::WriteBlobResults,
+        _params: kernel::WriteBlobParams,
+        _results: kernel::WriteBlobResults,
     ) -> Promise<(), capnp::Error> {
-        // Extract and copy data before async block
-        let params_reader = pry!(params.get());
-        let data = pry!(params_reader.get_data()).to_vec();
-        let content_type = pry!(pry!(params_reader.get_content_type()).to_str()).to_owned();
-
-        let connection = self.connection.clone();
-
-        let span = tracing::info_span!("rpc", method = "write_blob");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
-
-            let blob_info = kaish.write_blob(&data, &content_type).await
-                .map_err(|e| capnp::Error::failed(format!("write_blob failed: {}", e)))?;
-
-            let mut ref_builder = results.get().init_ref();
-            ref_builder.set_id(&blob_info.id);
-            ref_builder.set_size(blob_info.size);
-            ref_builder.set_content_type(&blob_info.content_type);
-
-            Ok(())
-        }.instrument(span))
+        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
     }
 
     fn read_blob(
         self: Rc<Self>,
-        params: kernel::ReadBlobParams,
-        mut results: kernel::ReadBlobResults,
+        _params: kernel::ReadBlobParams,
+        _results: kernel::ReadBlobResults,
     ) -> Promise<(), capnp::Error> {
-        let id = match params.get().and_then(|p| p.get_id()) {
-            Ok(id) => match id.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid id: {}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("missing id: {}", e))),
-        };
-
-        let connection = self.connection.clone();
-
-        let span = tracing::info_span!("rpc", method = "read_blob");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
-
-            let data = kaish.read_blob(&id).await
-                .map_err(|e| capnp::Error::failed(format!("read_blob failed: {}", e)))?;
-
-            results.get().set_data(&data);
-            Ok(())
-        }.instrument(span))
+        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
     }
 
     fn delete_blob(
         self: Rc<Self>,
-        params: kernel::DeleteBlobParams,
-        mut results: kernel::DeleteBlobResults,
+        _params: kernel::DeleteBlobParams,
+        _results: kernel::DeleteBlobResults,
     ) -> Promise<(), capnp::Error> {
-        let id = match params.get().and_then(|p| p.get_id()) {
-            Ok(id) => match id.to_str() {
-                Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid id: {}", e))),
-            },
-            Err(e) => return Promise::err(capnp::Error::failed(format!("missing id: {}", e))),
-        };
-
-        let connection = self.connection.clone();
-
-        let span = tracing::info_span!("rpc", method = "delete_blob");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
-
-            let success = kaish.delete_blob(&id).await
-                .map_err(|e| capnp::Error::failed(format!("delete_blob failed: {}", e)))?;
-
-            results.get().set_success(success);
-            Ok(())
-        }.instrument(span))
+        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
     }
 
     fn list_blobs(
         self: Rc<Self>,
         _params: kernel::ListBlobsParams,
-        mut results: kernel::ListBlobsResults,
+        _results: kernel::ListBlobsResults,
     ) -> Promise<(), capnp::Error> {
-        let connection = self.connection.clone();
-
-        let span = tracing::info_span!("rpc", method = "list_blobs");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
-
-            let blobs = kaish.list_blobs().await
-                .map_err(|e| capnp::Error::failed(format!("list_blobs failed: {}", e)))?;
-
-            let mut refs_builder = results.get().init_refs(blobs.len() as u32);
-            for (i, blob) in blobs.iter().enumerate() {
-                let mut ref_builder = refs_builder.reborrow().get(i as u32);
-                ref_builder.set_id(&blob.id);
-                ref_builder.set_size(blob.size);
-                ref_builder.set_content_type(&blob.content_type);
-            }
-
-            Ok(())
-        }.instrument(span))
+        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
     }
 
     fn push_ops(
@@ -5241,7 +5149,7 @@ fn tool_kind_for_category(category: &str) -> TypesToolKind {
 async fn process_llm_stream(
     provider: Arc<RigProvider>,
     documents: SharedBlockStore,
-    cell_id: ContextId,
+    context_id: ContextId,
     content: String,
     model_name: String,
     kernel: Arc<Kernel>,
@@ -5250,12 +5158,13 @@ async fn process_llm_stream(
     system_prompt: String,
     max_output_tokens: u64,
     conversation_cache: Arc<ConversationCache>,
+    // TODO: use for per-user attribution on model-generated blocks
     _user_agent_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ToolContext,
 ) {
     // Get per-context lock — held for the entire stream, serializing
     // concurrent prompts to the same context (Fix D+E).
-    let cache_lock = conversation_cache.get_or_create(cell_id);
+    let cache_lock = conversation_cache.get_or_create(context_id);
     let mut messages = cache_lock.lock().await;
 
     // Always re-hydrate from blocks — ensures shell commands, MCP tool calls,
@@ -5263,24 +5172,24 @@ async fn process_llm_stream(
     // block_snapshots() reads from in-memory DashMap, sub-millisecond for typical conversations.
     // The user block was already inserted before this function was called, so
     // hydrated messages include it — no explicit push needed.
-    match documents.block_snapshots(cell_id) {
+    match documents.block_snapshots(context_id) {
         Ok(blocks) => {
             let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
             log::info!(
                 "Hydrated {} messages from {} blocks for context {}",
-                hydrated.len(), blocks.len(), cell_id
+                hydrated.len(), blocks.len(), context_id
             );
             *messages = hydrated;
         }
         Err(e) => {
             // Hydration failed — fall back to appending the user message to
             // whatever the cache currently holds (may be stale or empty).
-            log::warn!("Could not hydrate cache for {}: {}, falling back to cache + append", cell_id, e);
+            log::warn!("Could not hydrate cache for {}: {}, falling back to cache + append", context_id, e);
             messages.push(LlmMessage::user(&content));
         }
     }
 
-    log::info!("Sending {} messages for context {}", messages.len(), cell_id);
+    log::info!("Sending {} messages for context {}", messages.len(), context_id);
 
     // Track total iterations to prevent infinite loops
     let max_iterations = 20;
@@ -5294,7 +5203,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Some(PrincipalId::system()));
+            let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Some(PrincipalId::system()));
             break;
         }
 
@@ -5314,7 +5223,7 @@ async fn process_llm_stream(
             }
             Err(e) => {
                 log::error!("Failed to start LLM stream: {}", e);
-                let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
+                let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
                 return;
             }
         };
@@ -5333,7 +5242,7 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Some(PrincipalId::system())) {
+                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5344,7 +5253,7 @@ async fn process_llm_stream(
 
                 StreamEvent::ThinkingDelta(text) => {
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text_as(cell_id, block_id, &text, Some(PrincipalId::system())) {
+                        if let Err(e) = documents.append_text_as(context_id, block_id, &text, Some(PrincipalId::system())) {
                             log::error!("Failed to append thinking text: {}", e);
                         }
                     }
@@ -5355,7 +5264,7 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Some(PrincipalId::system())) {
+                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5369,7 +5278,7 @@ async fn process_llm_stream(
                     assistant_text.push_str(&text);
 
                     if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text_as(cell_id, block_id, &text, Some(PrincipalId::system())) {
+                        if let Err(e) = documents.append_text_as(context_id, block_id, &text, Some(PrincipalId::system())) {
                             log::error!("Failed to append text: {}", e);
                         }
                     }
@@ -5394,7 +5303,7 @@ async fn process_llm_stream(
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(cell_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone())) {
+                    match documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), Some(block_id));
@@ -5420,7 +5329,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block_as(cell_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Some(PrincipalId::system()));
+                    let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Some(PrincipalId::system()));
                     return;
                 }
             }
@@ -5459,7 +5368,7 @@ async fn process_llm_stream(
             .map(|(tool_use_id, tool_name, input, tool_kind)| {
                 let kernel = kernel.clone();
                 let documents = documents.clone();
-                let cell_id = cell_id;
+                let context_id = context_id;
                 let tool_ctx = tool_ctx.clone();
                 // Option<Option<BlockId>>: None = not in map (shouldn't happen),
                 // Some(None) = insertion failed, Some(Some(id)) = normal
@@ -5499,11 +5408,11 @@ async fn process_llm_stream(
                     let mut result_block_id = None;
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result_as(
-                            cell_id, tcb_id, Some(tcb_id), "", false, None,
+                            context_id, tcb_id, Some(tcb_id), "", false, None,
                             Some(tool_kind), Some(PrincipalId::system()), Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
-                                let _ = documents.set_status(cell_id, &id, Status::Running);
+                                let _ = documents.set_status(context_id, &id, Status::Running);
                                 result_block_id = Some(id);
                             }
                             Err(e) => log::warn!(
@@ -5539,7 +5448,7 @@ async fn process_llm_stream(
                     if let Some(ref rb_id) = result_block_id {
                         if !result_content.is_empty() {
                             if let Err(e) = documents.edit_text_as(
-                                cell_id, rb_id, 0, &result_content, 0,
+                                context_id, rb_id, 0, &result_content, 0,
                                 Some(PrincipalId::system()),
                             ) {
                                 log::error!("Failed to write tool result text: {}", e);
@@ -5548,11 +5457,11 @@ async fn process_llm_stream(
 
                         // Step 6: Set final status on result and call blocks
                         let final_status = if is_error { Status::Error } else { Status::Done };
-                        let _ = documents.set_status(cell_id, rb_id, final_status);
+                        let _ = documents.set_status(context_id, rb_id, final_status);
                     }
                     if let Some(ref tcb_id) = tool_call_block_id {
                         let final_status = if is_error { Status::Error } else { Status::Done };
-                        let _ = documents.set_status(cell_id, tcb_id, final_status);
+                        let _ = documents.set_status(context_id, tcb_id, final_status);
                     }
 
                     // Step 7: Return for conversation history
@@ -5594,14 +5503,14 @@ async fn process_llm_stream(
 
     // Conversation history is already persisted in the per-context lock.
     // The MutexGuard drops when this function returns.
-    log::info!("Conversation cache updated: {} messages for cell {}", messages.len(), cell_id);
+    log::info!("Conversation cache updated: {} messages for cell {}", messages.len(), context_id);
 
     // Save final state after streaming completes
-    if let Err(e) = documents.save_snapshot(cell_id) {
-        log::warn!("Failed to save snapshot for cell {}: {}", cell_id, e);
+    if let Err(e) = documents.save_snapshot(context_id) {
+        log::warn!("Failed to save snapshot for cell {}: {}", context_id, e);
     }
 
-    log::info!("LLM stream processing complete for cell {}", cell_id);
+    log::info!("LLM stream processing complete for cell {}", context_id);
 }
 
 // ============================================================================

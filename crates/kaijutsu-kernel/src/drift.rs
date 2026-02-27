@@ -31,8 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use kaijutsu_crdt::ids::{resolve_context_prefix, PrefixError};
-use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, Role};
+use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix};
 
 use crate::block_store::SharedBlockStore;
 use crate::llm::config::ToolFilter;

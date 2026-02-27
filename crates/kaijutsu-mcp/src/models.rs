@@ -234,22 +234,6 @@ pub struct BlockDiffRequest {
     pub original: Option<String>,
 }
 
-/// Preview recent operations that could be undone (dry-run only).
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DocUndoRequest {
-    /// Document ID to inspect
-    #[schemars(description = "Document ID to inspect for recent operations")]
-    pub document_id: String,
-    /// Number of recent blocks to show
-    #[schemars(description = "Number of recent blocks to preview (default: 3)")]
-    #[serde(default = "default_undo_steps")]
-    pub steps: u32,
-}
-
-fn default_undo_steps() -> u32 {
-    3
-}
-
 // ============================================================================
 // Kaish Execution Types
 // ============================================================================

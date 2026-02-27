@@ -119,13 +119,6 @@ pub enum RpcResultMessage {
         new_block_id: Option<kaijutsu_crdt::BlockId>,
         error: Option<String>,
     },
-    /// Kernel list received (for dashboard). `generation` prevents stale results
-    /// from a previous actor overwriting the current state.
-    KernelList { kernels: Vec<KernelInfo>, generation: u64 },
-    /// Context list received (for dashboard).
-    ContextList { contexts: Vec<kaijutsu_client::ContextInfo>, generation: u64 },
-    /// Context memberships received (for dashboard).
-    MyContextsList { memberships: Vec<ContextMembership>, generation: u64 },
     /// Drift contexts list received (from periodic polling).
     DriftContextsReceived {
         contexts: Vec<kaijutsu_client::ContextInfo>,

@@ -145,7 +145,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             KaijutsuMcp::connect(
                 &args.host,
                 args.port,
-                &args.kernel,
                 &args.context_name,
                 detected_session_id.as_deref(),
             ).await?

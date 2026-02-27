@@ -230,7 +230,6 @@ impl KaijutsuMcp {
     pub async fn connect(
         host: &str,
         port: u16,
-        _kernel_id: &str,
         context_name: &str,
         cc_session_id: Option<&str>,
     ) -> Result<Self, anyhow::Error> {
@@ -1698,61 +1697,6 @@ impl KaijutsuMcp {
         }).to_string()
     }
 
-    // ========================================================================
-    // Undo
-    // ========================================================================
-
-    #[tool(description = "Preview recent operations on a document (dry-run only). Shows what blocks were recently added, useful for understanding document history.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
-    #[tracing::instrument(skip(self, req), name = "mcp.doc_undo")]
-    fn doc_undo(&self, Parameters(req): Parameters<DocUndoRequest>) -> String {
-        let context_id = match ContextId::parse(&req.document_id) {
-            Ok(id) => id,
-            Err(e) => return format!("Error: invalid document ID '{}': {}", req.document_id, e),
-        };
-
-        let entry = match self.store().get(context_id) {
-            Some(e) => e,
-            None => return format!("Error: document '{}' not found", req.document_id),
-        };
-
-        let blocks = entry.doc.blocks_ordered();
-        let steps = req.steps.min(blocks.len() as u32) as usize;
-
-        let mut output = String::new();
-        output.push_str(&format!("doc_undo {} --dry-run\n", req.document_id));
-        output.push_str(&format!("{}\n", "─".repeat(40)));
-        output.push_str(&format!("Preview of {} most recent block{}:\n\n",
-            steps, if steps == 1 { "" } else { "s" }));
-
-        if blocks.is_empty() {
-            output.push_str("(no blocks in document)\n");
-            return output;
-        }
-
-        // Show most recent blocks (in reverse order - newest first)
-        for (idx, snapshot) in blocks.iter().rev().take(steps).enumerate() {
-            let content_preview = if snapshot.content.len() > 50 {
-                let truncated: String = snapshot.content.chars().take(50).collect();
-                format!("{}...", truncated.replace('\n', "\\n"))
-            } else {
-                snapshot.content.replace('\n', "\\n")
-            };
-
-            output.push_str(&format!("  {}. [{}] {} \"{}\" at pos {}\n",
-                idx + 1,
-                snapshot.author().to_hex(),
-                snapshot.kind.as_str(),
-                content_preview,
-                snapshot.id.seq
-            ));
-        }
-
-        output.push_str(&format!("\n⚠️  Undo is not yet implemented. This is a dry-run preview only.\n"));
-        output.push_str(&format!("    Full undo would require storing undo stack or computing inverse operations.\n"));
-
-        output
-    }
 
     // ========================================================================
     // Input Document Tools (CRDT compose scratchpad)
@@ -3003,44 +2947,6 @@ mod tests {
 
         assert!(result.contains("No original text provided"));
         assert!(result.contains("3 lines"));
-    }
-
-    #[tokio::test]
-    async fn test_doc_undo() {
-        let mcp = KaijutsuMcp::new();
-
-        let doc_id = create_test_doc(&mcp, "conversation");
-
-        // Create a few blocks
-        mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("First block".to_string()),
-        })).await;
-
-        mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "model".to_string(),
-            kind: "text".to_string(),
-            content: Some("Second block".to_string()),
-        })).await;
-
-        // Test doc_undo dry-run
-        let result = mcp.doc_undo(Parameters(DocUndoRequest {
-            document_id: doc_id,
-            steps: 2,
-        }));
-
-        assert!(result.contains("doc_undo"));
-        assert!(result.contains("--dry-run"));
-        assert!(result.contains("2 most recent blocks"));
-        assert!(result.contains("text"));
-        assert!(result.contains("not yet implemented"));
     }
 
     #[tokio::test]

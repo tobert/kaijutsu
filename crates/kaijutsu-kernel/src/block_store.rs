@@ -225,8 +225,6 @@ impl BlockStore {
                         id: id_hex.clone(),
                         kind,
                         language: language.clone(),
-                        position_col: None,
-                        position_row: None,
                         parent_document: None,
                         created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
                     };
@@ -353,8 +351,6 @@ impl BlockStore {
                 id: new_id.to_hex(),
                 kind,
                 language: language.clone(),
-                position_col: None,
-                position_row: None,
                 parent_document: Some(source_id.to_hex()),
                 created_at: 0, // DB default handles timestamp
             };
@@ -426,8 +422,6 @@ impl BlockStore {
                 id: new_id.to_hex(),
                 kind,
                 language: language.clone(),
-                position_col: None,
-                position_row: None,
                 parent_document: Some(source_id.to_hex()),
                 created_at: 0, // DB default handles timestamp
             };
@@ -489,8 +483,6 @@ impl BlockStore {
                 id: new_id.to_hex(),
                 kind,
                 language: language.clone(),
-                position_col: None,
-                position_row: None,
                 parent_document: Some(source_id.to_hex()),
                 created_at: 0,
             };

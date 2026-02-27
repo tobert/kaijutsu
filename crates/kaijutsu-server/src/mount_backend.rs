@@ -1,8 +1,8 @@
 //! MountBackend: Routes file ops through kaijutsu's MountTable.
 //!
-//! Replaces `CompositeBackend` by delegating filesystem operations to the
-//! kaijutsu kernel's `MountTable` (which routes to `LocalBackend` for real
-//! files) and tool dispatch to the CRDT backends.
+//! Delegates filesystem operations to the kaijutsu kernel's `MountTable`
+//! (which routes to `LocalBackend` for real files) and tool dispatch to
+//! the CRDT backends.
 //!
 //! # Architecture
 //!

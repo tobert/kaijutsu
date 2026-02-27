@@ -45,7 +45,7 @@ pub use block_tools::{
     CursorEvent, CursorPosition, CursorTracker,
 };
 pub use control::ConsentMode;
-pub use db::{DocumentDb, DocumentKind, DocumentMeta, OpRecord, Snapshot};
+pub use db::{DocumentDb, DocumentKind, DocumentMeta, Snapshot};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
@@ -61,7 +61,7 @@ pub use llm::{
     // Streaming
     StreamEvent, StreamRequest, RigStreamAdapter, LlmStream,
     // Configuration
-    ProviderConfig, ToolConfig, ToolFilter, ContextSegment,
+    ProviderConfig, ToolConfig, ToolFilter,
     LlmConfig, ModelAlias, ModelsConfig, EmbeddingModelConfig,
     initialize_llm_registry, load_llm_config, load_models_config,
     // Default model
@@ -100,7 +100,7 @@ pub use file_tools::{
 pub use rmcp::model::ResourceContents as McpResourceContents;
 pub use flows::{
     BlockFlow, FlowBus, FlowMessage, HasSubject, OpSource, SharedBlockFlowBus, Subscription,
-    matches_pattern, shared_block_flow_bus,
+    shared_block_flow_bus,
     // Resource flow types
     ResourceFlow, SharedResourceFlowBus, shared_resource_flow_bus,
     // Progress flow types

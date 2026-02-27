@@ -19,10 +19,7 @@ impl Plugin for AgentsPlugin {
         // Add systems
         app.add_systems(
             Update,
-            (
-                systems::handle_agent_activity,
-                systems::sync_agent_badges,
-            ),
+            systems::handle_agent_activity,
         );
     }
 }

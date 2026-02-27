@@ -147,20 +147,6 @@ impl SshServerConfig {
         }
     }
 
-    /// Create config with default auth database path
-    pub fn with_default_auth_db(mut self) -> Self {
-        self.auth_db_path = Some(AuthDb::default_path());
-        self.allow_anonymous = false; // Production: require known keys
-        self
-    }
-
-    /// Create config with specific auth database path
-    pub fn with_auth_db(mut self, path: PathBuf) -> Self {
-        self.auth_db_path = Some(path);
-        self.allow_anonymous = false;
-        self
-    }
-
     /// Use a persistent host key at the given path.
     pub fn with_host_key_path(mut self, path: PathBuf) -> Self {
         self.key_source = KeySource::Persistent(path);

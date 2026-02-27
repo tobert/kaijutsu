@@ -13,6 +13,7 @@
 use diamond_types_extended::{Document, AgentId, Frontier, SerializedOps, SerializedOpsOwned, Uuid};
 
 use crate::{BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, ToolKind};
+use crate::content::order_midpoint;
 
 // =========================================================================
 // CRDT Map Key Constants
@@ -52,54 +53,6 @@ const KEY_OUTPUT: &str = "output";
 const KEY_SOURCE_CONTEXT: &str = "source_context";
 const KEY_SOURCE_MODEL: &str = "source_model";
 const KEY_DRIFT_KIND: &str = "drift_kind";
-
-/// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
-/// Lexicographically ordered: '0' < '9' < 'A' < 'Z' < 'a' < 'z'.
-const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-/// Get the index of a character in the BASE62 charset.
-fn base62_index(c: u8) -> usize {
-    BASE62.iter().position(|&b| b == c).unwrap_or(0)
-}
-
-/// Compute a lexicographic midpoint between two base-62 strings.
-///
-/// Empty string `""` sorts before everything. Both `a` and `b` must satisfy `a < b`
-/// lexicographically. The result is guaranteed to satisfy `a < result < b`.
-fn order_midpoint(a: &str, b: &str) -> String {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let max_len = a_bytes.len().max(b_bytes.len());
-
-    let mut result = Vec::new();
-
-    for i in 0..=max_len {
-        let a_val = if i < a_bytes.len() { base62_index(a_bytes[i]) } else { 0 };
-        let b_val = if i < b_bytes.len() { base62_index(b_bytes[i]) } else { 62 };
-
-        if a_val + 1 < b_val {
-            // There's room between a and b at this position
-            let mid = (a_val + b_val) / 2;
-            result.push(BASE62[mid]);
-            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
-        } else if a_val == b_val {
-            // Same character — carry it and continue to next position
-            result.push(BASE62[a_val]);
-        } else {
-            // a_val + 1 == b_val (adjacent): carry a_val and find midpoint in next position
-            result.push(BASE62[a_val]);
-            // Now we need midpoint between a[i+1..] and "z" (end of range)
-            let a_next = if i + 1 < a_bytes.len() { base62_index(a_bytes[i + 1]) } else { 0 };
-            let mid = (a_next + 62) / 2;
-            result.push(BASE62[mid]);
-            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
-        }
-    }
-
-    // Fallback: append midpoint character
-    result.push(BASE62[31]); // 'V'
-    String::from_utf8(result).unwrap_or_else(|_| "V".to_string())
-}
 
 /// Block document backed by diamond-types-extended Document.
 ///
@@ -745,29 +698,17 @@ impl BlockDocument {
     /// This is used when receiving blocks from the server via block events.
     /// The snapshot contains all fields including the pre-assigned block ID.
     ///
-    /// **Deprecation note:** Passing a snapshot with a nil `context_id` as a
-    /// sentinel for "generate an ID locally" still works but is deprecated.
     /// Use [`insert_drift_block`] instead for drift blocks.
     pub fn insert_from_snapshot(
         &mut self,
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
-        // Generate a local ID if the snapshot has a placeholder (nil context_id).
-        // This happens for drift blocks built by DriftRouter::build_drift_block().
-        let block_id = if snapshot.id.context_id.is_nil() {
-            tracing::warn!(
-                "insert_from_snapshot called with nil context_id — \
-                 this is deprecated, use insert_drift_block() instead"
-            );
-            self.new_block_id()
-        } else {
-            // Update next_seq if needed to avoid collisions with remote IDs
-            if snapshot.id.agent_id == self.agent_id {
-                self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
-            }
-            snapshot.id
-        };
+        // Update next_seq if needed to avoid collisions with remote IDs
+        let block_id = snapshot.id;
+        if snapshot.id.agent_id == self.agent_id {
+            self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
+        }
 
         self.insert_block_with_id(
             block_id,
@@ -1270,17 +1211,6 @@ impl BlockDocument {
     /// forked by Charlie still shows Alice and Claude as the authors.
     pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
         Self::fork_blocks(new_context_id, new_agent_id, self.blocks_ordered())
-    }
-
-    /// Fork the document at a specific version, excluding blocks created after that version.
-    ///
-    /// Preserves original authorship — see [`fork`] for details.
-    pub fn fork_at_version(&self, new_context_id: ContextId, new_agent_id: PrincipalId, at_version: u64) -> Self {
-        let blocks: Vec<_> = self.blocks_ordered()
-            .into_iter()
-            .filter(|b| b.created_at <= at_version)
-            .collect();
-        Self::fork_blocks(new_context_id, new_agent_id, blocks)
     }
 
     /// Internal: copy blocks into a new document, preserving original authorship.

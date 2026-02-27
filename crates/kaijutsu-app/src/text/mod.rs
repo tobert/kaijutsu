@@ -4,7 +4,6 @@
 //! Parley for text layout and Vello for vector path rendering.
 
 pub mod components;
-pub mod helpers;
 pub mod markdown;
 pub mod rich;
 mod plugin;

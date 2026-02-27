@@ -5,8 +5,7 @@
 //!
 //! Each cell has:
 //! - A unique ID
-//! - A kind (code, markdown, output, system)
-//! - A cosmic-text Editor for text manipulation
+//! - A BlockStore for CRDT-backed content
 //! - A position in the workspace grid
 //!
 pub mod block_border;

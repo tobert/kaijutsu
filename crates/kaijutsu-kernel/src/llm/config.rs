@@ -210,54 +210,6 @@ impl ToolConfig {
     }
 }
 
-/// Tracking for context model transitions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextSegment {
-    /// Document ID for this segment.
-    pub doc_id: String,
-
-    /// Provider used for this segment.
-    pub provider: String,
-
-    /// Model used for this segment.
-    pub model: String,
-
-    /// Parent document ID (if forked from another context).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_doc_id: Option<String>,
-}
-
-impl ContextSegment {
-    /// Create a new context segment.
-    pub fn new(
-        doc_id: impl Into<String>,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        Self {
-            doc_id: doc_id.into(),
-            provider: provider.into(),
-            model: model.into(),
-            parent_doc_id: None,
-        }
-    }
-
-    /// Create a forked context segment.
-    pub fn forked(
-        doc_id: impl Into<String>,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-        parent_doc_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            doc_id: doc_id.into(),
-            provider: provider.into(),
-            model: model.into(),
-            parent_doc_id: Some(parent_doc_id.into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,13 +296,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_context_segment() {
-        let segment = ContextSegment::new("doc-1", "anthropic", "claude-sonnet-4");
-        assert_eq!(segment.doc_id, "doc-1");
-        assert!(segment.parent_doc_id.is_none());
-
-        let forked = ContextSegment::forked("doc-2", "gemini", "gemini-2.0-pro", "doc-1");
-        assert_eq!(forked.parent_doc_id, Some("doc-1".into()));
-    }
 }

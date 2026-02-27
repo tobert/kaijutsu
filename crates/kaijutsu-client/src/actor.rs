@@ -80,7 +80,6 @@ enum RpcCommand {
     DriftMerge { source_ctx: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
 
     // ── Context ──────────────────────────────────────────────────────────
-    GetJoinedContextId { reply: oneshot::Sender<Result<Option<ContextId>, ActorError>> },
     GetContextId { reply: oneshot::Sender<Result<(ContextId, String), ActorError>> },
     ListContexts { reply: oneshot::Sender<Result<Vec<ContextInfo>, ActorError>> },
     CreateContext { label: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
@@ -155,7 +154,6 @@ impl RpcCommand {
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftPull { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::GetJoinedContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -684,12 +682,6 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::Whoami { reply }).await
     }
 
-    /// Get the context ID returned by join_context (server-authoritative).
-    #[tracing::instrument(skip(self))]
-    pub async fn joined_context_id(&self) -> Result<Option<ContextId>, ActorError> {
-        self.send(|reply| RpcCommand::GetJoinedContextId { reply }).await
-    }
-
     /// List available kernels.
     #[tracing::instrument(skip(self))]
     pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, ActorError> {
@@ -977,10 +969,6 @@ impl RpcActor {
 
                     // Local queries and world-level commands — handle inline
                     match cmd {
-                        RpcCommand::GetJoinedContextId { reply } => {
-                            let _ = reply.send(Ok(self.joined_context_id));
-                            continue;
-                        }
                         RpcCommand::Whoami { reply } => {
                             let result = conn.client.whoami().await
                                 .map_err(|e| ActorError::Rpc(e.to_string()));
@@ -1044,9 +1032,6 @@ async fn dispatch_command(
         }
 
         // ── Context ──────────────────────────────────────────────
-        RpcCommand::GetJoinedContextId { reply } => {
-            let _ = reply.send(Err(ActorError::Rpc("local command in kernel dispatch".into())));
-        }
         RpcCommand::GetContextId { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_context_id());
         }

@@ -313,8 +313,6 @@ impl SshClient {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SshError {
-    #[error("SSH not yet implemented")]
-    NotImplemented,
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
     #[error("Auth failed: {0}")]

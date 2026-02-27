@@ -342,6 +342,10 @@ impl BlockKind {
     }
 
     /// Check if this block type has editable text content via Text CRDT.
+    ///
+    /// Currently returns true for all variants — every block kind uses the
+    /// DTE text CRDT for its content field. This may become variant-specific
+    /// if we add binary-only block kinds in the future.
     pub fn has_text_crdt(&self) -> bool {
         true
     }
@@ -424,6 +428,7 @@ pub enum DriftKind {
     /// LLM-summarized before transfer.
     Distill,
     /// Git commit recorded as conversation provenance.
+    /// Reserved — no live producer after git backend deletion (commit 0ec3210).
     Commit,
 }
 

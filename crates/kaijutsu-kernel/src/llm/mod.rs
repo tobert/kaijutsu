@@ -37,7 +37,7 @@ pub mod rhai_config;
 pub mod stream;
 
 // Re-export key types
-pub use config::{ContextSegment, ProviderConfig, ToolConfig, ToolFilter};
+pub use config::{ProviderConfig, ToolConfig, ToolFilter};
 pub use rhai_config::{
     LlmConfig, ModelAlias, ModelsConfig, EmbeddingModelConfig,
     initialize_llm_registry, load_llm_config, load_models_config,
@@ -663,21 +663,6 @@ impl LlmRegistry {
         models
     }
 
-    /// Deep-copy the registry state for fork/thread.
-    ///
-    /// Clones all provider `Arc`s, default settings, and aliases so the
-    /// child kernel inherits the parent's runtime LLM configuration
-    /// (including any changes made via `setDefaultProvider`/`setDefaultModel`).
-    pub fn clone_state(&self) -> Self {
-        Self {
-            providers: self.providers.clone(),
-            default_provider: self.default_provider.clone(),
-            default_model: self.default_model.clone(),
-            model_aliases: self.model_aliases.clone(),
-            provider_configs: self.provider_configs.clone(),
-        }
-    }
-
     /// Quick prompt using default provider and model.
     #[tracing::instrument(skip(self, prompt))]
     pub async fn prompt(&self, prompt: &str) -> LlmResult<String> {
@@ -956,38 +941,6 @@ mod tests {
 
         assert!(registry.default_provider().is_some());
         assert_eq!(registry.list(), vec!["anthropic"]);
-    }
-
-    #[test]
-    fn test_clone_state() {
-        let mut registry = LlmRegistry::new();
-        let provider = Arc::new(RigProvider::Anthropic(
-            anthropic::Client::new("fake").unwrap(),
-        ));
-        registry.register("anthropic", provider);
-        registry.set_default("anthropic");
-        registry.set_default_model("claude-sonnet-4-5-20250929");
-
-        let mut aliases = HashMap::new();
-        aliases.insert("fast".to_string(), rhai_config::ModelAlias {
-            provider: "anthropic".to_string(),
-            model: "claude-haiku-4-5-20251001".to_string(),
-        });
-        registry.set_model_aliases(aliases);
-
-        // Clone state
-        let mut cloned = registry.clone_state();
-
-        // Cloned has same providers, defaults, and aliases
-        assert!(cloned.get("anthropic").is_some());
-        assert_eq!(cloned.default_provider_name(), Some("anthropic"));
-        assert_eq!(cloned.default_model(), Some("claude-sonnet-4-5-20250929"));
-        assert!(cloned.resolve_alias("fast").is_some());
-
-        // Mutations are independent
-        cloned.set_default_model("claude-haiku-4-5-20251001");
-        assert_eq!(cloned.default_model(), Some("claude-haiku-4-5-20251001"));
-        assert_eq!(registry.default_model(), Some("claude-sonnet-4-5-20250929"));
     }
 
     #[test]

@@ -357,15 +357,6 @@ pub enum AgentError {
     /// Agent not found.
     #[error("agent not found: {0}")]
     NotFound(String),
-    /// Agent doesn't have the required capability.
-    #[error("agent lacks capability: {0}")]
-    MissingCapability(String),
-    /// Agent is busy.
-    #[error("agent is busy")]
-    Busy,
-    /// Agent is offline.
-    #[error("agent is offline")]
-    Offline,
 }
 
 /// Shared agent registry (Arc-wrapped for async access).

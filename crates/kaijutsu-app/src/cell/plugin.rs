@@ -187,8 +187,8 @@ impl Plugin for CellPlugin {
                 // Block border style determination (after buffer sync)
                 block_border::determine_block_border_style
                     .after(systems::sync_block_cell_buffers),
-                // MSDF measure update (after buffer sync, feeds into taffy layout)
-                super::measure::update_msdf_measures
+                // Block measure update (after buffer sync, feeds into taffy layout)
+                super::measure::update_block_measures
                     .after(systems::sync_block_cell_buffers),
             )
                 .in_set(CellPhase::Buffer),

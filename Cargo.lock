@@ -5390,7 +5390,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -5485,7 +5484,6 @@ dependencies = [
  "capnpc",
  "dashmap",
  "futures",
- "git2",
  "hostname",
  "kaijutsu-client",
  "kaijutsu-crdt",

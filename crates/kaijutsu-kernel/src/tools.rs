@@ -1,6 +1,6 @@
 //! Tool registry and execution engines.
 //!
-//! Tools are capabilities that can be equipped to a kernel.
+//! Tools are capabilities registered on a kernel.
 //! Execution engines provide different ways to run code.
 
 use async_trait::async_trait;
@@ -320,7 +320,7 @@ pub trait ExecutionEngine: Send + Sync {
 pub struct ToolRegistry {
     /// Available tools.
     tools: HashMap<String, ToolInfo>,
-    /// Execution engines (stored separately from equipped state).
+    /// Execution engines.
     engines: HashMap<String, Arc<dyn ExecutionEngine>>,
     /// Default execution engine name.
     default_engine: Option<String>,

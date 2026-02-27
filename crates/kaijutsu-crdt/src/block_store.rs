@@ -554,18 +554,10 @@ impl BlockStore {
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
-        let block_id = if snapshot.id.context_id.is_nil() {
-            tracing::warn!(
-                "insert_from_snapshot called with nil context_id — \
-                 this is deprecated, use insert_drift_block() instead"
-            );
-            self.new_block_id()
-        } else {
-            if snapshot.id.agent_id == self.agent_id {
-                self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
-            }
-            snapshot.id
-        };
+        let block_id = snapshot.id;
+        if snapshot.id.agent_id == self.agent_id {
+            self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
+        }
 
         if self.blocks.contains_key(&block_id) {
             return Err(CrdtError::DuplicateBlock(block_id));
