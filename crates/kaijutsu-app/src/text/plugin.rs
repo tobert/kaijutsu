@@ -79,11 +79,13 @@ fn sync_kj_ui_text(
 
 /// Sync `max_advance` from the node's content box width.
 ///
-/// `UiGlobalTransform` in Bevy UI uses the node CENTER as origin.
-/// `VelloTextAnchor::Center` (default) offsets text by `(-layout_width/2, ...)`.
-/// When `max_advance` equals the content box width, the layout width matches
-/// the content area — so the Center offset places text at the content area
-/// left edge, aligning with cursor positioning via `content_box().min`.
+/// Constrains parley text layout to the node's available width, enabling
+/// word wrapping for long lines. Without this, text would overflow the node.
+///
+/// For block cells/role headers: alignment is handled by `UiTransform`
+/// (x: -50% shifts center→left) + `VelloTextAnchor::Left` (dy: -height/2).
+/// For widgets/overlay: `VelloTextAnchor::Center` (default) relies on
+/// `max_advance` ≈ node width for approximate centering.
 fn sync_text_max_advance(
     mut query: Query<(&mut UiVelloText, &ComputedNode)>,
 ) {

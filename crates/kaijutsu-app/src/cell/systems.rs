@@ -12,7 +12,7 @@ use super::components::{
 use crate::input::FocusArea;
 use crate::conversation::ActiveContext;
 use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush, parse_rich_content};
-use bevy_vello::prelude::UiVelloText;
+use bevy_vello::prelude::{UiVelloText, VelloTextAnchor};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -1827,6 +1827,12 @@ pub fn spawn_block_cells(
                         width: Val::Percent(100.0),
                         ..default()
                     },
+                    // UiGlobalTransform is at node center; shift x to left edge.
+                    // Combined with VelloTextAnchor::Left for correct vertical offset.
+                    UiTransform {
+                        translation: Val2 { x: Val::Percent(-50.0), y: Val::Auto },
+                        ..UiTransform::IDENTITY
+                    },
                     TimelineVisibility {
                         created_at_version: current_version,
                         opacity: 1.0,
@@ -1943,6 +1949,11 @@ pub fn sync_role_headers(
                     margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
                     ..default()
                 },
+                // UiGlobalTransform is at node center; shift x to left edge.
+                UiTransform {
+                    translation: Val2 { x: Val::Percent(-50.0), y: Val::Auto },
+                    ..UiTransform::IDENTITY
+                },
                 // Role header color is set during init_role_header_buffers
             ))
             .id();
@@ -1980,16 +1991,19 @@ pub fn init_role_header_buffers(
             Role::Asset => "── ASSET ─────────────────────",
         };
 
-        commands.entity(entity).try_insert(UiVelloText {
-            value: text.to_string(),
-            style: bevy_vello::prelude::VelloTextStyle {
-                font: font_handles.mono.clone(),
-                brush: bevy_color_to_brush(color),
-                font_size: text_metrics.cell_font_size,
+        commands.entity(entity).try_insert((
+            UiVelloText {
+                value: text.to_string(),
+                style: bevy_vello::prelude::VelloTextStyle {
+                    font: font_handles.mono.clone(),
+                    brush: bevy_color_to_brush(color),
+                    font_size: text_metrics.cell_font_size,
+                    ..default()
+                },
                 ..default()
             },
-            ..default()
-        });
+            VelloTextAnchor::Left,
+        ));
     }
 }
 
@@ -2001,16 +2015,19 @@ pub fn init_block_cell_buffers(
     text_metrics: Res<TextMetrics>,
 ) {
     for entity in block_cells.iter() {
-        commands.entity(entity).try_insert(UiVelloText {
-            value: String::new(),
-            style: bevy_vello::prelude::VelloTextStyle {
-                font: font_handles.mono.clone(),
-                brush: bevy_color_to_brush(Color::WHITE),
-                font_size: text_metrics.cell_font_size,
+        commands.entity(entity).try_insert((
+            UiVelloText {
+                value: String::new(),
+                style: bevy_vello::prelude::VelloTextStyle {
+                    font: font_handles.mono.clone(),
+                    brush: bevy_color_to_brush(Color::WHITE),
+                    font_size: text_metrics.cell_font_size,
+                    ..default()
+                },
                 ..default()
             },
-            ..default()
-        });
+            VelloTextAnchor::Left,
+        ));
     }
 }
 
