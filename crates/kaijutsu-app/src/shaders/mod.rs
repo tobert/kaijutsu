@@ -31,7 +31,6 @@
 //! ));
 //! ```
 
-pub mod block_border_material;
 pub mod context;
 pub use context::ShaderEffectContextPlugin;
 
@@ -66,8 +65,6 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<RingGuideMaterial>::default(),
             // HUD panel effects
             UiMaterialPlugin::<HudPanelMaterial>::default(),
-            // Block border material
-            UiMaterialPlugin::<block_border_material::BlockBorderMaterial>::default(),
         ))
         .add_systems(Update, (
             update_shader_time,
@@ -120,7 +117,6 @@ fn update_shader_time_effects(
     mut star_field_materials: ResMut<Assets<StarFieldMaterial>>,
     mut ring_guide_materials: ResMut<Assets<RingGuideMaterial>>,
     mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
-    mut block_border_materials: ResMut<Assets<block_border_material::BlockBorderMaterial>>,
 ) {
     let t = time.elapsed_secs();
 
@@ -143,11 +139,6 @@ fn update_shader_time_effects(
 
     // HUD panel effects
     for (_, mat) in hud_panel_materials.iter_mut() {
-        mat.time.x = t;
-    }
-
-    // Block border effects
-    for (_, mat) in block_border_materials.iter_mut() {
         mat.time.x = t;
     }
 }

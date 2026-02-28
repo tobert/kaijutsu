@@ -36,7 +36,7 @@ use super::components::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
     DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
-    PendingContextSwitch, PromptSubmitted, RoleHeaderLayout, SubmitFailed,
+    PendingContextSwitch, PromptSubmitted, RoleGroupBorderLayout, SubmitFailed,
     ViewingConversation, WorkspaceLayout,
 };
 use super::block_border;
@@ -67,7 +67,7 @@ impl Plugin for CellPlugin {
             .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
-            .register_type::<RoleHeaderLayout>()
+            .register_type::<RoleGroupBorderLayout>()
             .register_type::<block_border::BlockBorderStyle>();
 
         // Configure SystemSet execution order
@@ -150,7 +150,7 @@ impl Plugin for CellPlugin {
                 systems::track_conversation_container.after(systems::spawn_main_cell),
                 // Block cell spawning (after sync)
                 systems::spawn_block_cells,
-                // Role header sync (after block cells)
+                // Role group border sync (after block cells)
                 systems::sync_role_headers.after(systems::spawn_block_cells),
                 // Expanded block view spawning
                 systems::spawn_expanded_block_view,
@@ -174,10 +174,8 @@ impl Plugin for CellPlugin {
                 systems::compute_cell_heights,
                 // Block cell buffer init and sync
                 systems::init_block_cell_buffers,
-                systems::init_role_header_buffers,
                 systems::sync_block_cell_buffers
-                    .after(systems::init_block_cell_buffers)
-                    .after(systems::init_role_header_buffers),
+                    .after(systems::init_block_cell_buffers),
                 // Input overlay visibility + buffer sync
                 systems::sync_overlay_visibility,
                 systems::sync_input_overlay_buffer,
@@ -186,7 +184,7 @@ impl Plugin for CellPlugin {
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
                 systems::highlight_focused_block.after(systems::sync_block_cell_buffers),
-                // Block border style determination (after buffer sync)
+                // Block border style determination (after buffer sync, now with labels)
                 block_border::determine_block_border_style
                     .after(systems::sync_block_cell_buffers),
                 // Block measure update (after buffer sync, feeds into taffy layout)
@@ -224,7 +222,6 @@ impl Plugin for CellPlugin {
             (
                 // Compose error border animation
                 systems::animate_compose_error,
-                block_border::update_block_border_state,
                 block_border::cleanup_block_borders,
             )
                 .in_set(CellPhase::Layout),
@@ -239,10 +236,14 @@ impl Plugin for CellPlugin {
             (
                 // Input overlay cursor (reads UiGlobalTransform)
                 systems::update_input_overlay_cursor,
-                // Block border systems
-                block_border::spawn_block_borders,
-                block_border::layout_block_borders_from_flex
-                    .after(block_border::spawn_block_borders),
+                // Vello border systems (spawn → update → animate)
+                block_border::spawn_vello_borders,
+                block_border::update_vello_borders
+                    .after(block_border::spawn_vello_borders),
+                block_border::animate_vello_borders
+                    .after(block_border::update_vello_borders),
+                // Role group border scene updates
+                systems::update_role_group_scenes,
             )
                 .after(bevy::ui::UiSystems::Layout),
         );

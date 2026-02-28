@@ -10,6 +10,7 @@
 //!
 pub mod block_border;
 mod components;
+pub mod fieldset;
 mod measure;
 pub mod plugin;
 mod systems;
@@ -21,7 +22,7 @@ pub use components::{
     CellState, ComposeError, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditingBlockCell,
     FocusTarget, FocusedBlockCell, InputMode, InputOverlay, InputOverlayMarker,
-    MainCell, PromptSubmitted, RoleHeader, SubmitFailed,
+    MainCell, PromptSubmitted, RoleGroupBorder, SubmitFailed,
     ViewingConversation,
 };
 pub use plugin::CellPlugin;

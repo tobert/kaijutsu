@@ -1,23 +1,25 @@
-//! Shader-rendered block borders.
+//! Vello-rendered block borders (fieldset/legend style).
 //!
-//! Single `MaterialNode<BlockBorderMaterial>` per bordered block — no 9-slice overhead.
-//! Supports full rectangle, top-accent, and dashed borders with chase/pulse/breathe animations.
+//! Each bordered block gets a `UiVelloScene` child that draws a fieldset
+//! border with label gaps. Replaces the previous `BlockBorderMaterial` shader.
 
 use bevy::prelude::*;
+use bevy_vello::prelude::UiVelloScene;
 
 use super::components::{
-    BlockCell, BlockCellLayout, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell, Role,
-    BlockCellContainer,
+    BlockCell, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell,
+    BlockCellContainer, Role,
 };
+use super::fieldset;
 use super::systems::EditorEntities;
-use crate::shaders::block_border_material::BlockBorderMaterial;
+use crate::text::FontHandles;
 use crate::ui::theme::Theme;
 
 // ============================================================================
 // COMPONENTS
 // ============================================================================
 
-/// Visual style for a block's shader border.
+/// Visual style for a block's border.
 #[derive(Component, Debug, Clone, PartialEq, Reflect)]
 #[reflect(Component)]
 pub struct BlockBorderStyle {
@@ -28,6 +30,12 @@ pub struct BlockBorderStyle {
     /// Padding inside the border (clearance for text).
     pub padding: BorderPadding,
     pub animation: BorderAnimation,
+    /// Top label text (e.g. "tool call: grep", "thinking", "drift: push").
+    #[reflect(ignore)]
+    pub top_label: Option<String>,
+    /// Bottom label text (e.g. "running", "done", "error").
+    #[reflect(ignore)]
+    pub bottom_label: Option<String>,
 }
 
 /// Simplified padding (top, bottom, left, right in pixels).
@@ -51,7 +59,7 @@ impl Default for BorderPadding {
 }
 
 impl BorderPadding {
-    #[allow(dead_code)] // Phase 2: may be used for scroll height calculations
+    #[allow(dead_code)]
     pub fn vertical(&self) -> f32 {
         self.top + self.bottom
     }
@@ -81,7 +89,7 @@ pub enum BorderAnimation {
     Breathe,
 }
 
-/// Links a BlockCell to its border MaterialNode entity.
+/// Links a BlockCell to its border child entity (UiVelloScene).
 #[derive(Component)]
 pub struct BlockBorderEntity(pub Entity);
 
@@ -172,6 +180,19 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                 Status::Pending => (BorderAnimation::Chase, theme.block_border_tool_call),
                 _ => (BorderAnimation::None, theme.block_border_tool_call.with_alpha(0.5)),
             };
+            let tool_name = if block.content.is_empty() {
+                "tool call".to_string()
+            } else {
+                // First line often has tool name
+                let first_line = block.content.lines().next().unwrap_or("tool call");
+                format!("tool call: {}", first_line.chars().take(30).collect::<String>())
+            };
+            let status_label = match block.status {
+                Status::Running => Some("running".to_string()),
+                Status::Pending => Some("pending".to_string()),
+                Status::Done => None, // done tools don't need a status label
+                Status::Error => Some("error".to_string()),
+            };
             Some(BlockBorderStyle {
                 kind: BorderKind::Full,
                 color,
@@ -179,6 +200,8 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                 corner_radius: theme.block_border_corner_radius,
                 padding,
                 animation,
+                top_label: Some(tool_name),
+                bottom_label: status_label,
             })
         }
         BlockKind::ToolResult => {
@@ -194,6 +217,8 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                     corner_radius: theme.block_border_corner_radius,
                     padding,
                     animation: BorderAnimation::Pulse,
+                    top_label: Some("result".to_string()),
+                    bottom_label: Some("error".to_string()),
                 })
             } else {
                 let line_count = content.lines().count();
@@ -209,6 +234,8 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                     corner_radius: theme.block_border_corner_radius,
                     padding,
                     animation: BorderAnimation::None,
+                    top_label: Some("result".to_string()),
+                    bottom_label: None,
                 })
             }
         }
@@ -223,11 +250,19 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                     corner_radius: theme.block_border_corner_radius,
                     padding,
                     animation: BorderAnimation::Breathe,
+                    top_label: Some("thinking".to_string()),
+                    bottom_label: None,
                 })
             }
         }
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Pull) | Some(DriftKind::Distill) | Some(DriftKind::Merge) => {
+                let drift_label = match block.drift_kind {
+                    Some(DriftKind::Pull) => "drift: pull",
+                    Some(DriftKind::Distill) => "drift: distill",
+                    Some(DriftKind::Merge) => "drift: merge",
+                    _ => "drift",
+                };
                 Some(BlockBorderStyle {
                     kind: BorderKind::Full,
                     color: theme.block_border_drift,
@@ -235,6 +270,8 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                     corner_radius: theme.block_border_corner_radius,
                     padding,
                     animation: BorderAnimation::None,
+                    top_label: Some(drift_label.to_string()),
+                    bottom_label: None,
                 })
             }
             _ => None,
@@ -255,6 +292,8 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
                 corner_radius: theme.block_border_corner_radius,
                 padding,
                 animation: BorderAnimation::None,
+                top_label: None,
+                bottom_label: None,
             })
         }
         // File, Drift Push/Commit — no border
@@ -262,22 +301,14 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
     }
 }
 
-/// Spawn MaterialNode<BlockBorderMaterial> for BlockCells that have a style but no entity.
-pub fn spawn_block_borders(
+/// Spawn UiVelloScene border entity for BlockCells that have a style but no border entity.
+///
+/// Runs in PostUpdate (after UiSystems::Layout so ComputedNode is available).
+pub fn spawn_vello_borders(
     mut commands: Commands,
     block_cells: Query<(Entity, &BlockBorderStyle), Without<BlockBorderEntity>>,
-    mut materials: ResMut<Assets<BlockBorderMaterial>>,
-    theme: Res<Theme>,
 ) {
-    for (entity, style) in block_cells.iter() {
-        let material = BlockBorderMaterial::from_style(style, &theme);
-        let handle = materials.add(material);
-
-        // Border sits inside BlockCell with inset margin. Text is already inset
-        // by BlockBorderStyle.padding from the BlockCell edge, so the border lands
-        // between the cell edge and the text content.
-        // Border fills BlockCell exactly. The ConversationContainer's 16px
-        // horizontal padding provides the visual margin from the window edge.
+    for (entity, _style) in block_cells.iter() {
         let border_entity = commands
             .spawn((
                 Node {
@@ -288,126 +319,97 @@ pub fn spawn_block_borders(
                     height: Val::Percent(100.0),
                     ..default()
                 },
-                MaterialNode(handle),
+                UiVelloScene::default(),
                 ZIndex(-1), // Render behind text
             ))
             .id();
 
-        // Make border a child of the BlockCell so it scrolls/clips with it
         commands.entity(entity).insert(BlockBorderEntity(border_entity));
         commands.entity(entity).add_child(border_entity);
     }
 }
 
-/// Position border nodes to match their associated BlockCell bounds.
-#[allow(dead_code)] // Legacy — kept for rollback reference during flex migration
-pub fn layout_block_borders(
-    block_cells: Query<(&BlockCellLayout, &BlockBorderStyle, &BlockBorderEntity)>,
-    mut border_nodes: Query<(&mut Node, &mut Visibility)>,
-    mut materials: ResMut<Assets<BlockBorderMaterial>>,
-    border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
-    layout: Res<crate::cell::components::WorkspaceLayout>,
-    scroll_state: Res<crate::cell::components::ConversationScrollState>,
-    dag_view: Query<
-        (&ComputedNode, &UiGlobalTransform),
-        (
-            With<super::components::ConversationContainer>,
-            With<crate::ui::tiling::PaneFocus>,
-        ),
-    >,
-) {
-    let Ok((node, transform)) = dag_view.single() else {
-        return;
-    };
-    let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = node.content_box();
-    let visible_top = translation.y + content.min.y;
-    let visible_bottom = translation.y + content.max.y;
-    let base_width = content.width();
-    let margin = layout.workspace_margin_left;
-
-    for (block_layout, style, border_ent) in block_cells.iter() {
-        let Ok((mut node, mut visibility)) = border_nodes.get_mut(border_ent.0) else {
-            continue;
-        };
-
-        let indent = block_layout.indent_level as f32 * super::systems::INDENT_WIDTH;
-        let left = margin + indent;
-        let width = base_width - indent;
-        let content_top = visible_top + block_layout.y_offset - scroll_state.offset;
-
-        // Full border bounds (unclamped)
-        let border_top = content_top - style.padding.top;
-        let border_bottom = content_top + block_layout.height + style.padding.bottom;
-
-        // Clamp to visible conversation area
-        let clamped_top = border_top.max(visible_top);
-        let clamped_bottom = border_bottom.min(visible_bottom);
-
-        // Hide borders entirely outside the visible area
-        if clamped_top >= clamped_bottom {
-            *visibility = Visibility::Hidden;
-            continue;
-        }
-        *visibility = Visibility::Inherited;
-
-        let w = width + style.padding.left + style.padding.right;
-        let h = clamped_bottom - clamped_top;
-
-        // Position and size the border node (clamped to visible area)
-        node.left = Val::Px(left - style.padding.left);
-        node.top = Val::Px(clamped_top);
-        node.width = Val::Px(w);
-        node.height = Val::Px(h);
-
-        // Update dimensions uniform for aspect-correct rendering
-        if let Ok(mat_node) = border_material_query.get(border_ent.0) {
-            if let Some(mat) = materials.get_mut(mat_node.0.id()) {
-                mat.dimensions = Vec4::new(w, h, 0.0, 0.0);
-            }
-        }
-    }
-}
-
-/// Position border nodes from parent BlockCell's ComputedNode (flex layout).
+/// Rebuild border scenes when style or size changes.
 ///
-/// Since borders are now children of BlockCells, they just need to be sized
-/// relative to their parent. No manual scroll/visibility clamping needed.
-pub fn layout_block_borders_from_flex(
-    border_nodes: Query<
-        (&ComputedNode, &MaterialNode<BlockBorderMaterial>),
-        Changed<ComputedNode>,
+/// Runs in PostUpdate (after UiSystems::Layout).
+pub fn update_vello_borders(
+    block_cells: Query<
+        (&BlockBorderStyle, &BlockBorderEntity, &ComputedNode),
+        Or<(Changed<BlockBorderStyle>, Changed<ComputedNode>)>,
     >,
-    mut materials: ResMut<Assets<BlockBorderMaterial>>,
+    mut scenes: Query<&mut UiVelloScene>,
+    fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
+    font_handles: Res<FontHandles>,
 ) {
-    for (computed, mat_node) in border_nodes.iter() {
+    let font = fonts.get(&font_handles.mono);
+
+    for (style, border_ent, computed) in block_cells.iter() {
+        let Ok(mut scene_component) = scenes.get_mut(border_ent.0) else {
+            continue;
+        };
+
         let size = computed.size();
-        // Update dimensions uniform for aspect-correct shader rendering.
-        // Border uses 100% sizing so Bevy handles layout; we just tell the shader
-        // the pixel size. Only fires when ComputedNode changes (resize, not scroll).
-        if let Some(mat) = materials.get_mut(mat_node.0.id()) {
-            mat.dimensions = Vec4::new(size.x, size.y, 0.0, 0.0);
+        if size.x < 1.0 || size.y < 1.0 {
+            continue;
         }
+
+        let mut scene = bevy_vello::vello::Scene::new();
+        fieldset::build_fieldset_border(
+            &mut scene,
+            size.x as f64,
+            size.y as f64,
+            style,
+            style.top_label.as_deref(),
+            style.bottom_label.as_deref(),
+            font,
+            0.0, // initial time — animate_vello_borders handles ongoing animation
+        );
+
+        *scene_component = UiVelloScene::from(scene);
     }
 }
 
-/// Update material properties when BlockBorderStyle changes (e.g. Running → Done).
-pub fn update_block_border_state(
-    block_cells: Query<(&BlockBorderStyle, &BlockBorderEntity), Changed<BlockBorderStyle>>,
-    border_material_query: Query<&MaterialNode<BlockBorderMaterial>>,
-    mut materials: ResMut<Assets<BlockBorderMaterial>>,
-    theme: Res<Theme>,
+/// Animate borders every frame for blocks with active animations.
+///
+/// Runs in PostUpdate (after update_vello_borders).
+pub fn animate_vello_borders(
+    time: Res<Time>,
+    block_cells: Query<(&BlockBorderStyle, &BlockBorderEntity, &ComputedNode)>,
+    mut scenes: Query<&mut UiVelloScene>,
+    fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
+    font_handles: Res<FontHandles>,
 ) {
-    for (style, border_ent) in block_cells.iter() {
-        let Ok(mat_node) = border_material_query.get(border_ent.0) else {
+    let t = time.elapsed_secs();
+    let font = fonts.get(&font_handles.mono);
+
+    for (style, border_ent, computed) in block_cells.iter() {
+        // Only animate blocks with active animations
+        if style.animation == BorderAnimation::None {
             continue;
-        };
-        let Some(mat) = materials.get_mut(mat_node.0.id()) else {
+        }
+
+        let Ok(mut scene_component) = scenes.get_mut(border_ent.0) else {
             continue;
         };
 
-        // Update material from new style
-        *mat = BlockBorderMaterial::from_style_with_dimensions(style, &theme, mat.dimensions);
+        let size = computed.size();
+        if size.x < 1.0 || size.y < 1.0 {
+            continue;
+        }
+
+        let mut scene = bevy_vello::vello::Scene::new();
+        fieldset::build_fieldset_border(
+            &mut scene,
+            size.x as f64,
+            size.y as f64,
+            style,
+            style.top_label.as_deref(),
+            style.bottom_label.as_deref(),
+            font,
+            t,
+        );
+
+        *scene_component = UiVelloScene::from(scene);
     }
 }
 
@@ -425,11 +427,5 @@ pub fn cleanup_block_borders(
         commands.entity(entity).remove::<BlockBorderEntity>();
     }
 
-    // Case 2: Check for orphaned border entities
-    // (Handled by Bevy's despawn cascading if we parent correctly,
-    // but we don't parent — border nodes are top-level for absolute positioning)
-    // This is covered by the RemovedComponents approach, but for simplicity
-    // we rely on case 1 + the fact that spawn_block_cells despawns the BlockCell
-    // entity which triggers Without<BlockBorderStyle> on the next frame.
     let _ = all_border_refs; // suppress unused warning — presence in query is the point
 }

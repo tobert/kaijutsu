@@ -6,7 +6,7 @@ use bevy::ui::measurement::ContentSize;
 use super::components::{
     BlockEditCursor, BlockKind, BlockSnapshot, Cell, CellEditor, CellPosition,
     CellState, ContextId, ConversationScrollState, DriftKind, EditingBlockCell,
-    FocusTarget, MainCell, PromptSubmitted, Role, RoleHeader, RoleHeaderLayout,
+    FocusTarget, MainCell, PromptSubmitted, Role, RoleGroupBorder, RoleGroupBorderLayout,
     Status, ViewingConversation, WorkspaceLayout,
 };
 use crate::input::FocusArea;
@@ -1864,17 +1864,16 @@ pub fn spawn_block_cells(
     container.block_cells = new_order;
 }
 
-/// Sync RoleHeader entities for role transitions.
+/// Sync RoleGroupBorder entities for role transitions.
 ///
-/// Spawns role header entities using the same pattern as BlockCells:
-/// KjText + UiVelloText for consistent rendering.
+/// Spawns role group border entities with `UiVelloScene` for Vello-drawn
+/// horizontal lines with inset role labels.
 pub fn sync_role_headers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
-    role_header_query: Query<&RoleHeader>,
-    theme: Res<Theme>,
+    role_header_query: Query<&RoleGroupBorder>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
@@ -1928,33 +1927,20 @@ pub fn sync_role_headers(
     }
 
     for (role, block_id) in expected {
-        let _color = match role {
-            Role::User => theme.block_user,
-            Role::Model => theme.block_assistant,
-            Role::System => theme.fg_dim,
-            Role::Tool | Role::Asset => theme.block_tool_call,
-        };
-
         let entity = commands
             .spawn((
-                RoleHeader {
+                RoleGroupBorder {
                     role,
                     block_id,
                 },
-                RoleHeaderLayout::default(),
-                KjText,
+                RoleGroupBorderLayout::default(),
                 Node {
                     width: Val::Percent(100.0),
                     min_height: Val::Px(ROLE_HEADER_HEIGHT),
                     margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
                     ..default()
                 },
-                // UiGlobalTransform is at node center; shift x to left edge.
-                UiTransform {
-                    translation: Val2 { x: Val::Percent(-50.0), y: Val::Auto },
-                    ..UiTransform::IDENTITY
-                },
-                // Role header color is set during init_role_header_buffers
+                bevy_vello::prelude::UiVelloScene::default(),
             ))
             .id();
         if let Some(conv) = entities.conversation_container {
@@ -1965,45 +1951,52 @@ pub fn sync_role_headers(
     }
 }
 
-/// Initialize UiVelloText for RoleHeaders that don't have one.
-pub fn init_role_header_buffers(
-    mut commands: Commands,
-    role_headers: Query<(Entity, &RoleHeader), (With<KjText>, Without<UiVelloText>)>,
+/// Rebuild role group border Vello scenes when ComputedNode changes.
+///
+/// Draws a horizontal line with inset role label using the fieldset module.
+pub fn update_role_group_scenes(
+    mut role_borders: Query<
+        (&RoleGroupBorder, &mut bevy_vello::prelude::UiVelloScene, &ComputedNode),
+        Changed<ComputedNode>,
+    >,
+    fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
-    text_metrics: Res<TextMetrics>,
     theme: Res<Theme>,
 ) {
-    for (entity, header) in role_headers.iter() {
-        let color = match header.role {
+    let font = fonts.get(&font_handles.mono);
+
+    for (border, mut scene_component, computed) in role_borders.iter_mut() {
+        let size = computed.size();
+        if size.x < 1.0 || size.y < 1.0 {
+            continue;
+        }
+
+        let color = match border.role {
             Role::User => theme.block_user,
             Role::Model => theme.block_assistant,
             Role::System => theme.fg_dim,
-            Role::Tool => theme.block_tool_call,
-            Role::Asset => theme.block_tool_call,
+            Role::Tool | Role::Asset => theme.block_tool_call,
         };
 
-        // Set header text based on role
-        let text = match header.role {
-            Role::User => "── USER ──────────────────────",
-            Role::Model => "── ASSISTANT ─────────────────",
-            Role::System => "── SYSTEM ────────────────────",
-            Role::Tool => "── TOOL ──────────────────────",
-            Role::Asset => "── ASSET ─────────────────────",
+        let label = match border.role {
+            Role::User => "USER",
+            Role::Model => "ASSISTANT",
+            Role::System => "SYSTEM",
+            Role::Tool => "TOOL",
+            Role::Asset => "ASSET",
         };
 
-        commands.entity(entity).try_insert((
-            UiVelloText {
-                value: text.to_string(),
-                style: bevy_vello::prelude::VelloTextStyle {
-                    font: font_handles.mono.clone(),
-                    brush: bevy_color_to_brush(color),
-                    font_size: text_metrics.cell_font_size,
-                    ..default()
-                },
-                ..default()
-            },
-            VelloTextAnchor::Left,
-        ));
+        let mut scene = bevy_vello::vello::Scene::new();
+        super::fieldset::build_role_group_line(
+            &mut scene,
+            size.x as f64,
+            size.y as f64,
+            label,
+            color,
+            font,
+        );
+
+        *scene_component = bevy_vello::prelude::UiVelloScene::from(scene);
     }
 }
 
@@ -2102,7 +2095,7 @@ pub fn sync_block_cell_buffers(
         let block = &blocks_ordered[idx];
 
         // Format and update the text
-        // Note: Role headers are now rendered as separate RoleHeader entities,
+        // Note: Role headers are now rendered as separate RoleGroupBorder entities,
         // no longer prepended inline. See layout_block_cells for space reservation.
         let local_ctx = doc_cache.active_id();
         let text = format_single_block(block, local_ctx);
@@ -2204,7 +2197,7 @@ pub fn layout_block_cells(
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &UiVelloText, Option<&super::block_border::BlockBorderStyle>)>,
-    mut role_headers: Query<(&RoleHeader, &mut RoleHeaderLayout)>,
+    mut role_headers: Query<(&RoleGroupBorder, &mut RoleGroupBorderLayout)>,
     layout: Res<WorkspaceLayout>,
     text_metrics: Res<TextMetrics>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -2355,7 +2348,7 @@ pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(&BlockCellLayout, &mut Node, Option<&super::block_border::BlockBorderStyle>), With<BlockCell>>,
-    mut role_header_nodes: Query<&mut Node, (With<RoleHeader>, Without<BlockCell>)>,
+    mut role_header_nodes: Query<&mut Node, (With<RoleGroupBorder>, Without<BlockCell>)>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
@@ -2445,7 +2438,7 @@ pub fn reorder_conversation_children(
     mut commands: Commands,
     containers: Query<&BlockCellContainer>,
     main_cells: Query<&CellEditor, With<MainCell>>,
-    role_headers: Query<&RoleHeader>,
+    role_headers: Query<&RoleGroupBorder>,
     children_query: Query<&Children>,
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,

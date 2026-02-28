@@ -1138,25 +1138,27 @@ pub struct BlockCellLayout {
 }
 
 // ============================================================================
-// ROLE HEADER COMPONENTS
+// ROLE GROUP BORDER COMPONENTS
 // ============================================================================
 
-/// Role header entity that appears before first block of each turn.
-/// Rendered as a styled, distinct header separate from block content.
+/// Role group border entity that appears before first block of each turn.
+/// Rendered as a Vello-drawn horizontal line with inset role label.
+///
+/// Replaces the old text-based RoleHeader ("── USER ──────────").
 ///
 /// Note: Not fully reflectable due to BlockId lacking Default.
 #[derive(Component, Debug, Clone)]
-pub struct RoleHeader {
+pub struct RoleGroupBorder {
     /// The role this header represents.
     pub role: kaijutsu_crdt::Role,
     /// The block ID this header precedes (for layout positioning).
     pub block_id: BlockId,
 }
 
-/// Layout information for a role header.
+/// Layout information for a role group border.
 #[derive(Component, Debug, Default, Reflect)]
 #[reflect(Component)]
-pub struct RoleHeaderLayout {
+pub struct RoleGroupBorderLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
 }

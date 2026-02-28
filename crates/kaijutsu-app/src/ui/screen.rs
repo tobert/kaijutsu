@@ -20,7 +20,7 @@ use bevy::prelude::*;
 
 use super::constellation::{ConstellationContainer, viewport::ConstellationCamera3d};
 use super::state::ConversationRoot;
-use crate::cell::{BlockCell, RoleHeader};
+use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::text::KjText;
 
 /// Which full-viewport view is currently active.
@@ -163,8 +163,8 @@ fn hide_conversation_root(
 /// suppresses layout but does not prevent Vello from rendering at the
 /// entity's stale UiGlobalTransform. We must explicitly set Visibility.
 fn hide_cell_text(
-    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleHeader>)>,
-    mut role_headers: Query<&mut Visibility, (With<RoleHeader>, Without<BlockCell>)>,
+    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
+    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
 ) {
     for mut vis in block_cells.iter_mut() {
         *vis = Visibility::Hidden;
@@ -176,8 +176,8 @@ fn hide_cell_text(
 
 /// Show block cells and role headers when entering conversation.
 fn show_cell_text(
-    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleHeader>)>,
-    mut role_headers: Query<&mut Visibility, (With<RoleHeader>, Without<BlockCell>)>,
+    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
+    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
 ) {
     for mut vis in block_cells.iter_mut() {
         *vis = Visibility::Inherited;
@@ -203,7 +203,10 @@ fn set_focus_conversation(
 /// fork form is showing. Without this, they'd bleed through until the next
 /// screen transition.
 fn hide_new_cell_text_outside_conversation(
-    mut new_blocks: Query<&mut Visibility, (Added<KjText>, Or<(With<BlockCell>, With<RoleHeader>)>)>,
+    mut new_blocks: Query<&mut Visibility, Or<(
+        (Added<KjText>, With<BlockCell>),
+        Added<RoleGroupBorder>,
+    )>>,
 ) {
     for mut vis in new_blocks.iter_mut() {
         *vis = Visibility::Hidden;
