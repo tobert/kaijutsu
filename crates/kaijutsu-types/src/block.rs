@@ -57,22 +57,27 @@ impl BlockId {
         }
     }
 
-    /// Convert to a compact string key: `"{context_hex}:{principal_hex}:{seq}"`.
+    /// Convert to a compact string key: `"{context_hex}_{principal_hex}_{seq}"`.
     ///
-    /// Uses `:` as delimiter — safe because UUIDs are hex-only, and avoids
-    /// collision with `/` used as path separator in CRDT engines.
+    /// Uses `_` as delimiter — safe because UUIDs are hex-only, avoids
+    /// collision with `/` used as path separator in CRDT engines, and
+    /// satisfies the Anthropic API tool_use_id pattern `^[a-zA-Z0-9_-]+$`.
     pub fn to_key(&self) -> String {
         format!(
-            "{}:{}:{}",
+            "{}_{}_{}",
             self.context_id.to_hex(),
             self.agent_id.to_hex(),
             self.seq
         )
     }
 
-    /// Parse from key string: `"{context_hex}:{principal_hex}:{seq}"`.
+    /// Parse from key string: `"{context_hex}_{principal_hex}_{seq}"`.
+    ///
+    /// Also accepts legacy `:` delimiter for backward compatibility.
     pub fn from_key(key: &str) -> Option<Self> {
-        let parts: Vec<&str> = key.splitn(3, ':').collect();
+        // Try `_` first (current format), fall back to `:` (legacy)
+        let delimiter = if key.contains('_') { '_' } else { ':' };
+        let parts: Vec<&str> = key.splitn(3, delimiter).collect();
         if parts.len() != 3 {
             return None;
         }
@@ -1226,8 +1231,8 @@ mod tests {
         let agent = test_agent();
         let id = BlockId::new(ctx, agent, 99);
         let key = id.to_key();
-        // Format: "{32-hex}:{32-hex}:{seq}"
-        let parts: Vec<&str> = key.splitn(3, ':').collect();
+        // Format: "{32-hex}_{32-hex}_{seq}" — API-safe (matches ^[a-zA-Z0-9_-]+$)
+        let parts: Vec<&str> = key.splitn(3, '_').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].len(), 32); // context hex
         assert_eq!(parts[1].len(), 32); // agent hex
@@ -1237,8 +1242,22 @@ mod tests {
     #[test]
     fn test_block_id_from_key_rejects_bad_input() {
         assert!(BlockId::from_key("").is_none());
-        assert!(BlockId::from_key("a:b").is_none());
-        assert!(BlockId::from_key("not-a-uuid:not-a-uuid:1").is_none());
+        assert!(BlockId::from_key("a_b").is_none());
+        assert!(BlockId::from_key("not-a-uuid_not-a-uuid_1").is_none());
+    }
+
+    #[test]
+    fn test_block_id_from_key_accepts_legacy_colon_format() {
+        // Legacy `:` delimiter should still parse for backward compatibility
+        let id = BlockId::new(test_context(), test_agent(), 7);
+        let legacy_key = format!(
+            "{}:{}:{}",
+            id.context_id.to_hex(),
+            id.agent_id.to_hex(),
+            id.seq
+        );
+        let parsed = BlockId::from_key(&legacy_key).unwrap();
+        assert_eq!(id, parsed);
     }
 
     #[test]
