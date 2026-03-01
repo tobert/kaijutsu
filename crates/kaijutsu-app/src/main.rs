@@ -29,6 +29,7 @@ mod kaish;
 mod shaders;
 mod text;
 mod ui;
+mod view;
 
 // Re-export client crate's generated code
 pub use kaijutsu_client::kaijutsu_capnp;

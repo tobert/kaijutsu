@@ -1,20 +1,15 @@
-//! Cell module - the universal primitive for content.
+//! Cell module — facade re-exporting from view/ during migration.
 //!
-//! Cells are the fundamental unit of content in Kaijutsu. Everything is a cell:
-//! code, markdown, conversation messages, tool output, etc.
-//!
-//! Each cell has:
-//! - A unique ID
-//! - A BlockStore for CRDT-backed content
-//! - A position in the workspace grid
-//!
+//! All component types now live in `crate::view`. This module re-exports
+//! them so existing `crate::cell::X` imports continue to work.
+
 pub mod block_border;
 mod components;
 pub mod fieldset;
 pub mod plugin;
 mod systems;
 
-// Re-export public API
+// Re-export public API — types from view/ via components facade
 #[allow(unused_imports)]
 pub use components::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, Cell, CellEditor,
@@ -26,4 +21,3 @@ pub use components::{
 };
 pub use plugin::CellPlugin;
 pub use systems::EditorEntities;
-// CellPhase is pub in plugin.rs but not re-exported - use cell::plugin::CellPhase if needed
