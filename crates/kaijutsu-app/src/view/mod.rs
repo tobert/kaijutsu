@@ -23,6 +23,5 @@ pub mod sync;
 
 // Re-export all public types
 pub use components::*;
-pub use cursor::CursorMarker;
-pub use document::{CachedDocument, DocumentCache};
+pub use document::DocumentCache;
 pub use lifecycle::EditorEntities;

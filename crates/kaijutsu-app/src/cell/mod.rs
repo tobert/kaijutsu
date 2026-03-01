@@ -9,8 +9,7 @@ pub mod plugin;
 // Re-export everything from view/ so crate::cell::X still resolves
 #[allow(unused_imports)]
 pub use crate::view::*;
-pub use crate::view::document::{CachedDocument, DocumentCache};
+pub use crate::view::document::CachedDocument;
 pub use crate::view::lifecycle::EditorEntities;
-pub use crate::view::cursor::CursorMarker;
 
 pub use plugin::CellPlugin;

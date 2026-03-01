@@ -202,7 +202,7 @@ pub fn spawn_block_cells(
             // update_block_cell_nodes via Node margin.
             let entity = commands
                 .spawn((
-                    BlockCell::new(block_id.clone()),
+                    BlockCell::new(*block_id),
                     BlockCellLayout::default(),
                     KjText,
                     KjTextEffects::default(),
@@ -221,7 +221,7 @@ pub fn spawn_block_cells(
             if let Some(conv) = conv_entity {
                 if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
             }
-            container.add(block_id.clone(), entity);
+            container.add(*block_id, entity);
             had_additions = true;
         }
     }
@@ -276,7 +276,7 @@ pub fn sync_role_headers(
     let mut prev_role: Option<kaijutsu_crdt::Role> = None;
     for block in &blocks {
         if prev_role != Some(block.role) {
-            expected.push((block.role, block.id.clone()));
+            expected.push((block.role, block.id));
         }
         prev_role = Some(block.role);
     }

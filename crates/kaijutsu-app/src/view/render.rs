@@ -360,7 +360,7 @@ pub fn reorder_conversation_children(
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
         if let Ok(header) = role_headers.get(header_ent) {
-            header_map.insert(header.block_id.clone(), header_ent);
+            header_map.insert(header.block_id, header_ent);
         }
     }
 
@@ -519,7 +519,7 @@ pub fn highlight_focused_block(
     let blocks: std::collections::HashMap<_, _> = editor
         .blocks()
         .into_iter()
-        .map(|b| (b.id.clone(), b))
+        .map(|b| (b.id, b))
         .collect();
 
     for (block_cell, mut vello_text) in focused_cells.iter_mut() {
