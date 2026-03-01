@@ -36,10 +36,9 @@ pub mod fork_form;
 pub mod hyper;
 #[allow(dead_code)] // Phase 2: layout engine used by viewport
 pub mod layout;
+mod legend;
 pub mod model_picker;
 mod navigation;
-#[allow(dead_code)] // Phase 3+: 2D systems kept for reference/reuse
-mod render;
 mod render3d;
 pub(crate) mod viewport;
 
@@ -97,8 +96,8 @@ impl Plugin for ConstellationPlugin {
                     .chain(),
             );
 
-        // Add rendering systems from the render module
-        render::setup_constellation_rendering(app);
+        // Constellation container + legend panel (extracted from deleted render.rs)
+        legend::setup_legend_systems(app);
 
         // Add 3D viewport systems (Phase 1.5+)
         viewport::setup_viewport_systems(app);

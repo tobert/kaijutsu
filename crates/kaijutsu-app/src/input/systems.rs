@@ -85,20 +85,17 @@ pub fn handle_focus_compose(
     }
 }
 
-use crate::ui::state::ViewStack;
-
 /// Handle Unfocus action (Escape — context-dependent "go up").
 ///
 /// Escape precedence:
 /// 1. FocusArea::Dialog → ignored (handled by dialog systems via FocusStack)
-/// 2. ViewStack overlay active → pop view, keep FocusArea
+/// 2. Screen::Constellation → go to Conversation
 /// 3. FocusArea::EditingBlock → clean up markers, FocusArea::Conversation
 /// 4. FocusArea::Compose → FocusArea::Conversation
 pub fn handle_unfocus(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    mut view_stack: ResMut<ViewStack>,
     screen: Res<State<crate::ui::screen::Screen>>,
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     editing_cells: Query<(Entity, &BlockEditCursor), With<EditingBlockCell>>,
@@ -123,14 +120,7 @@ pub fn handle_unfocus(
             continue;
         }
 
-        // 3. Pop ViewStack if an overlay view is active (ExpandedBlock, etc)
-        if !view_stack.is_at_root() {
-            info!("Escape: popping view stack");
-            view_stack.pop();
-            continue;
-        }
-
-        // 4. Normal focus transitions
+        // 3. Normal focus transitions
         match focus.as_ref() {
             FocusArea::EditingBlock => {
                 // Extract ops and push to server before cleanup
@@ -492,24 +482,13 @@ pub fn handle_scroll(
 // EXPAND / COLLAPSE / VIEW POP
 // ============================================================================
 
-/// Handle ExpandBlock action (f key on focused block → full-screen reader).
-///
-/// Guarded to Conversation focus — ExpandBlock is Navigation-only.
+/// Handle ExpandBlock action (placeholder — ExpandedBlockView was removed).
 pub fn handle_expand_block(
     mut actions: MessageReader<ActionFired>,
-    focus: Res<FocusTarget>,
-    mut view_stack: ResMut<crate::ui::state::ViewStack>,
 ) {
     for ActionFired(action) in actions.read() {
-        if !matches!(action, Action::ExpandBlock) {
-            continue;
-        }
-
-        if let Some(ref block_id) = focus.block_id {
-            view_stack.push(crate::ui::state::View::ExpandedBlock {
-                block_id: block_id.clone(),
-            });
-            info!("Expanded block: {:?}", block_id);
+        if matches!(action, Action::ExpandBlock) {
+            info!("ExpandBlock action received (view removed)");
         }
     }
 }

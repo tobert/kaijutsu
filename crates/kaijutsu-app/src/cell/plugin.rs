@@ -152,8 +152,6 @@ impl Plugin for CellPlugin {
                 systems::spawn_block_cells,
                 // Role group border sync (after block cells)
                 systems::sync_role_headers.after(systems::spawn_block_cells),
-                // Expanded block view spawning
-                systems::spawn_expanded_block_view,
                 // Cursor spawning
                 systems::spawn_cursor,
                 // ApplyDeferred to flush spawn commands
@@ -183,8 +181,6 @@ impl Plugin for CellPlugin {
                 // Input overlay visibility + buffer sync
                 systems::sync_overlay_visibility,
                 systems::sync_input_overlay_buffer,
-                // Expanded block content sync
-                systems::sync_expanded_block_content,
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
                 systems::highlight_focused_block.after(systems::sync_block_cell_buffers),

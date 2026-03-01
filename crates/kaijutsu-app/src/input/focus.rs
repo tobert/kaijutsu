@@ -16,17 +16,6 @@ use bevy::prelude::*;
 /// - `push()`: Save current FocusArea, switch to Dialog
 /// - `pop()`: Restore previous FocusArea
 /// - Used by: model_picker, create_dialog
-///
-/// ### ViewStack (Content Navigation)
-/// Manages which content view is displayed (conversation, expanded block, etc.).
-/// - `push()`: Show overlay view (ExpandedBlock)
-/// - `pop()`: Return to previous view
-/// - Used by: handle_expand_block, handle_unfocus (Escape)
-///
-/// They are orthogonal:
-/// - FocusStack is about *who gets keyboard input*
-/// - ViewStack is about *what content is visible*
-/// - A dialog (FocusStack) can be open over an expanded block (ViewStack)
 #[derive(Resource, Default, Reflect)]
 #[reflect(Resource)]
 pub struct FocusStack(pub Vec<FocusArea>);

@@ -358,19 +358,12 @@ use crate::shaders::{CursorBeamMaterial, CursorMode};
 pub struct CursorMarker;
 
 /// Consolidated resource tracking editor-related singleton entities.
-///
-/// Replaces the previous separate resources:
-/// - `CursorEntity` → `entities.cursor`
-/// - `MainCellEntity` → `entities.main_cell`
-/// - `ExpandedBlockEntity` → `entities.expanded_view`
 #[derive(Resource, Default)]
 pub struct EditorEntities {
     /// The cursor UI entity (shader-based).
     pub cursor: Option<Entity>,
     /// The main conversation cell entity.
     pub main_cell: Option<Entity>,
-    /// The expanded block overlay view entity.
-    pub expanded_view: Option<Entity>,
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
 }
@@ -854,145 +847,7 @@ pub fn highlight_focused_block(
     // override takes precedence.
 }
 
-// handle_expand_block + handle_view_pop — DELETED (Phase 5)
-// Migrated to input::systems::handle_expand_block + handle_view_pop
-
-// ============================================================================
-// EXPANDED BLOCK VIEW (Phase 4)
-// ============================================================================
-
-use crate::ui::state::{ExpandedBlockView, ViewStack};
-
-/// Spawn the ExpandedBlockView when ViewStack enters ExpandedBlock state.
-pub fn spawn_expanded_block_view(
-    mut commands: Commands,
-    view_stack: Res<ViewStack>,
-    mut entities: ResMut<EditorEntities>,
-    existing_views: Query<Entity, With<ExpandedBlockView>>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    font_handles: Res<FontHandles>,
-    text_metrics: Res<TextMetrics>,
-    theme: Res<Theme>,
-) {
-    // Check if we need to spawn or despawn
-    let should_show = view_stack.has_expanded_block();
-
-    if should_show && entities.expanded_view.is_none() {
-        // Spawn the expanded block view
-        let Some(block_id) = view_stack.expanded_block_id() else {
-            return;
-        };
-
-        // Get the block content from MainCell
-        let Some(main_ent) = entities.main_cell else {
-            return;
-        };
-        let Ok(editor) = main_cells.get(main_ent) else {
-            return;
-        };
-
-        let blocks = editor.blocks();
-        let Some(block) = blocks.iter().find(|b| &b.id == block_id) else {
-            warn!("Expanded block not found: {:?}", block_id);
-            return;
-        };
-
-        let color = block_color(block, &theme);
-
-        // Spawn the view entity with Vello text
-        let entity = commands
-            .spawn((
-                ExpandedBlockView,
-                KjText,
-                UiVelloText {
-                    value: block.content.clone(),
-                    style: bevy_vello::prelude::VelloTextStyle {
-                        font: font_handles.mono.clone(),
-                        brush: bevy_color_to_brush(color),
-                        font_size: text_metrics.cell_font_size,
-                        ..default()
-                    },
-                    ..default()
-                },
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(40.0),
-                    top: Val::Px(60.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-                Visibility::Inherited,
-                // Store block info for updates
-                ExpandedBlockInfo {
-                    block_id: block_id.clone(),
-                    block_kind: block.kind,
-                },
-            ))
-            .id();
-
-        entities.expanded_view = Some(entity);
-        info!("Spawned ExpandedBlockView for {:?}", block_id);
-    } else if !should_show && entities.expanded_view.is_some() {
-        // Despawn when leaving ExpandedBlock view
-        for entity in existing_views.iter() {
-            if let Ok(mut ec) = commands.get_entity(entity) { ec.despawn(); }
-        }
-        entities.expanded_view = None;
-        info!("Despawned ExpandedBlockView");
-    }
-}
-
-/// Stores info about the currently expanded block.
-#[derive(Component)]
-pub struct ExpandedBlockInfo {
-    pub block_id: kaijutsu_crdt::BlockId,
-    #[allow(dead_code)]
-    pub block_kind: BlockKind,
-}
-
-/// Update the ExpandedBlockView content when the block changes.
-pub fn sync_expanded_block_content(
-    view_stack: Res<ViewStack>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    mut expanded_views: Query<
-        (&ExpandedBlockInfo, &mut UiVelloText),
-        With<ExpandedBlockView>,
-    >,
-    theme: Res<Theme>,
-) {
-    if !view_stack.has_expanded_block() {
-        return;
-    }
-
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-    let Ok(editor) = main_cells.get(main_ent) else {
-        return;
-    };
-
-    let blocks = editor.blocks();
-
-    for (info, mut vello_text) in expanded_views.iter_mut() {
-        let Some(block) = blocks.iter().find(|b| b.id == info.block_id) else {
-            continue;
-        };
-
-        // Update text if changed
-        if vello_text.value != block.content {
-            vello_text.value = block.content.clone();
-        }
-
-        // Update color
-        let color = block_color(block, &theme);
-        let new_brush = bevy_color_to_brush(color);
-        if vello_text.style.brush != new_brush {
-            vello_text.style.brush = new_brush;
-        }
-    }
-}
+// ExpandedBlockView — DELETED (ViewStack removed)
 
 // ============================================================================
 // MAIN CELL SYSTEMS

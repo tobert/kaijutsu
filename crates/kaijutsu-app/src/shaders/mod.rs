@@ -1,38 +1,8 @@
 //! Shader effects for Kaijutsu UI
 //!
-//! This module provides custom `UiMaterial` implementations for various visual effects:
-//! - `GlowBorderMaterial` - Animated glowing border for focused elements (legacy)
-//! - `ShimmerMaterial` - Sparkle/twinkle overlay for active states
-//! - `PulseRingMaterial` - Expanding ring ripple effect
-//! - `ScanlinesMaterial` - Subtle CRT/cyberpunk scanlines
-//! - `HoloBorderMaterial` - Rainbow/gradient animated border
-//! - `TextGlowMaterial` - REMOVED (Vello migration)
-//!
-//! # Theme-Reactive Shaders
-//!
-//! The `ShaderEffectContext` resource syncs theme configuration to shaders.
-//! Materials that want theme-reactive behavior read from this context.
-//!
-//! ```text
-//! theme.rhai → Theme → ShaderEffectContext → Material uniforms → GPU
-//! ```
-//!
-//! # Usage
-//!
-//! Add `ShaderFxPlugin` to your app, then spawn UI nodes with `MaterialNode<T>`:
-//!
-//! ```ignore
-//! commands.spawn((
-//!     Node { width: Val::Px(200.0), height: Val::Px(100.0), ..default() },
-//!     MaterialNode(materials.add(GlowBorderMaterial {
-//!         color: Vec4::new(0.34, 0.65, 1.0, 1.0),
-//!         ..default()
-//!     })),
-//! ));
-//! ```
-
-pub mod context;
-pub use context::ShaderEffectContextPlugin;
+//! Custom `UiMaterial` implementations:
+//! - `CursorBeamMaterial` - Glowing cursor beam (beam/block/underline modes)
+//! - `ConstellationCardMaterial` - Rounded card for constellation nodes
 
 use bevy::{
     prelude::*,
@@ -40,308 +10,31 @@ use bevy::{
     shader::ShaderRef,
 };
 
-/// Plugin that registers all shader effect materials.
+/// Plugin that registers shader effect materials.
 pub struct ShaderFxPlugin;
 
 impl Plugin for ShaderFxPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
-            // Shared effect context (theme → GPU)
-            ShaderEffectContextPlugin,
-            // Legacy materials
-            UiMaterialPlugin::<GlowBorderMaterial>::default(),
-            UiMaterialPlugin::<ShimmerMaterial>::default(),
-            UiMaterialPlugin::<PulseRingMaterial>::default(),
-            UiMaterialPlugin::<ScanlinesMaterial>::default(),
-            UiMaterialPlugin::<HoloBorderMaterial>::default(),
             UiMaterialPlugin::<CursorBeamMaterial>::default(),
-        ))
-        .add_plugins((
-            // Constellation effects
-            UiMaterialPlugin::<ConnectionLineMaterial>::default(),
-            UiMaterialPlugin::<DriftArcMaterial>::default(),
             UiMaterialPlugin::<ConstellationCardMaterial>::default(),
-            UiMaterialPlugin::<StarFieldMaterial>::default(),
-            UiMaterialPlugin::<RingGuideMaterial>::default(),
-            // HUD panel effects
-            UiMaterialPlugin::<HudPanelMaterial>::default(),
         ))
-        .add_systems(Update, (
-            update_shader_time,
-            update_shader_time_effects,
-        ));
+        .add_systems(Update, update_shader_time);
     }
 }
 
-/// System to update time uniforms on core shader materials.
+/// Update time uniforms on shader materials.
 fn update_shader_time(
     time: Res<Time>,
-    mut glow_materials: ResMut<Assets<GlowBorderMaterial>>,
-    mut shimmer_materials: ResMut<Assets<ShimmerMaterial>>,
-    mut pulse_materials: ResMut<Assets<PulseRingMaterial>>,
-    mut scanline_materials: ResMut<Assets<ScanlinesMaterial>>,
-    mut holo_materials: ResMut<Assets<HoloBorderMaterial>>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
+    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
 ) {
     let t = time.elapsed_secs();
-
-    // Legacy materials
-    for (_, mat) in glow_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in shimmer_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in pulse_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in scanline_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in holo_materials.iter_mut() {
-        mat.time.x = t;
-    }
     for (_, mat) in cursor_materials.iter_mut() {
         mat.time.x = t;
     }
-}
-
-/// System to update time uniforms on constellation/HUD/block border materials.
-///
-/// Split from `update_shader_time` to stay under Bevy's 16-parameter system limit.
-fn update_shader_time_effects(
-    time: Res<Time>,
-    mut connection_materials: ResMut<Assets<ConnectionLineMaterial>>,
-    mut drift_arc_materials: ResMut<Assets<DriftArcMaterial>>,
-    mut constellation_card_materials: ResMut<Assets<ConstellationCardMaterial>>,
-    mut star_field_materials: ResMut<Assets<StarFieldMaterial>>,
-    mut ring_guide_materials: ResMut<Assets<RingGuideMaterial>>,
-    mut hud_panel_materials: ResMut<Assets<HudPanelMaterial>>,
-) {
-    let t = time.elapsed_secs();
-
-    // Constellation effects
-    for (_, mat) in connection_materials.iter_mut() {
+    for (_, mat) in card_materials.iter_mut() {
         mat.time.x = t;
-    }
-    for (_, mat) in drift_arc_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in constellation_card_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in star_field_materials.iter_mut() {
-        mat.time.x = t;
-    }
-    for (_, mat) in ring_guide_materials.iter_mut() {
-        mat.time.x = t;
-    }
-
-    // HUD panel effects
-    for (_, mat) in hud_panel_materials.iter_mut() {
-        mat.time.x = t;
-    }
-}
-
-// ============================================================================
-// GLOW BORDER MATERIAL
-// ============================================================================
-
-/// Cyberpunk corner bracket effect for cell frames.
-///
-/// Creates glowing L-shaped brackets at each corner with animated pulse.
-/// Lavender/cyan color palette, fully transparent in the middle.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct GlowBorderMaterial {
-    /// Base glow color (RGBA) - blended with lavender
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=glow_radius, y=glow_intensity, z=pulse_speed, w=bracket_length (0-1)
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time (other components unused, for alignment)
-    #[uniform(2)]
-    pub time: Vec4,
-}
-
-impl Default for GlowBorderMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.7, 0.5, 0.9, 1.0), // Lavender
-            params: Vec4::new(0.15, 1.2, 1.5, 0.25), // radius, intensity, speed, bracket_length
-            time: Vec4::ZERO,
-        }
-    }
-}
-
-impl UiMaterial for GlowBorderMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/glow_border.wgsl".into()
-    }
-}
-
-// ============================================================================
-// SHIMMER MATERIAL
-// ============================================================================
-
-/// Sparkle/twinkle effect overlay for active states.
-///
-/// Creates randomly twinkling star-like points across the surface.
-/// Good for "thinking" or "processing" indicators.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct ShimmerMaterial {
-    /// Sparkle color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=density, y=speed, z=brightness, w=size
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(2)]
-    pub time: Vec4,
-}
-
-impl Default for ShimmerMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(1.0, 1.0, 1.0, 0.9),
-            params: Vec4::new(8.0, 3.0, 1.0, 0.08), // density, speed, brightness, size
-            time: Vec4::ZERO,
-        }
-    }
-}
-
-impl UiMaterial for ShimmerMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/shimmer.wgsl".into()
-    }
-}
-
-// ============================================================================
-// PULSE RING MATERIAL
-// ============================================================================
-
-/// Expanding ring/ripple effect for focus or notification.
-///
-/// Creates concentric rings that expand outward from the center.
-/// Good for drawing attention or indicating activity.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct PulseRingMaterial {
-    /// Ring color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=ring_count, y=ring_width, z=speed, w=max_radius
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time, y=fade_start
-    #[uniform(2)]
-    pub time: Vec4,
-}
-
-impl Default for PulseRingMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.34, 0.65, 1.0, 0.6), // Cyan, semi-transparent
-            params: Vec4::new(2.0, 0.05, 0.5, 1.2), // count, width, speed, max_radius
-            time: Vec4::new(0.0, 0.5, 0.0, 0.0),    // time, fade_start
-        }
-    }
-}
-
-impl UiMaterial for PulseRingMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/pulse_ring.wgsl".into()
-    }
-}
-
-// ============================================================================
-// SCANLINES MATERIAL
-// ============================================================================
-
-/// Subtle CRT/cyberpunk scanline overlay.
-///
-/// Adds retro scanline effect with optional scroll, flicker, and noise.
-/// Use sparingly for cyberpunk aesthetic.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct ScanlinesMaterial {
-    /// Tint color (RGBA)
-    #[uniform(0)]
-    pub tint: Vec4,
-    /// Params1: x=line_count, y=line_intensity, z=scroll_speed, w=flicker
-    #[uniform(1)]
-    pub params1: Vec4,
-    /// Params2: x=noise_amount, y=curvature, z=time, w=unused
-    #[uniform(2)]
-    pub params2: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(3)]
-    pub time: Vec4,
-}
-
-impl Default for ScanlinesMaterial {
-    fn default() -> Self {
-        Self {
-            tint: Vec4::new(1.0, 1.0, 1.0, 0.15), // Very subtle
-            params1: Vec4::new(100.0, 0.1, 0.0, 0.0), // count, intensity, scroll, flicker
-            params2: Vec4::new(0.0, 0.0, 0.0, 0.0),   // noise, curvature
-            time: Vec4::ZERO,
-        }
-    }
-}
-
-impl UiMaterial for ScanlinesMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/scanlines.wgsl".into()
-    }
-}
-
-// ============================================================================
-// HOLO BORDER MATERIAL
-// ============================================================================
-
-/// Animated rainbow/gradient border with holographic shimmer.
-///
-/// Creates a border that cycles through colors with a holographic effect.
-/// Modes: 0 = rainbow, 1 = cyber (pink/cyan), 2 = custom blend
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct HoloBorderMaterial {
-    /// Base color (RGBA)
-    #[uniform(0)]
-    pub base_color: Vec4,
-    /// Params1: x=saturation, y=speed, z=border_width, w=shimmer_scale
-    #[uniform(1)]
-    pub params1: Vec4,
-    /// Params2: x=rainbow_spread, y=mode, z=unused, w=unused
-    #[uniform(2)]
-    pub params2: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(3)]
-    pub time: Vec4,
-}
-
-/// Holo border color modes
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // Builder pattern for shader configuration
-pub enum HoloMode {
-    Rainbow = 0,
-    Cyber = 1,
-    Custom = 2,
-}
-
-impl Default for HoloBorderMaterial {
-    fn default() -> Self {
-        Self {
-            base_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
-            params1: Vec4::new(0.8, 0.3, 0.03, 20.0), // sat, speed, width, shimmer
-            params2: Vec4::new(1.0, HoloMode::Cyber as u8 as f32, 0.0, 0.0), // spread, mode
-            time: Vec4::ZERO,
-        }
-    }
-}
-
-impl UiMaterial for HoloBorderMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/holo_border.wgsl".into()
     }
 }
 
@@ -381,114 +74,15 @@ impl Default for CursorBeamMaterial {
     fn default() -> Self {
         Self {
             color: Vec4::new(1.0, 0.5, 0.75, 0.95), // Hot pink
-            // params: x=orb_size, y=intensity, z=wander_speed, w=blink_rate
             params: Vec4::new(0.25, 1.2, 2.0, 0.0),
             time: Vec4::new(0.0, 1.0, 0.0, 0.0), // time, mode (default block)
         }
     }
 }
 
-
 impl UiMaterial for CursorBeamMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/cursor_beam.wgsl".into()
-    }
-}
-
-// TextGlowMaterial — removed (text_glow.wgsl deleted in Vello migration)
-
-// ============================================================================
-// CONNECTION LINE MATERIAL
-// ============================================================================
-
-/// Glowing line effect for constellation connections.
-///
-/// Renders a line between two points with animated glow, energy flow,
-/// and activity-based intensity. Used for connecting constellation nodes.
-///
-/// The shader corrects for aspect ratio to ensure circular (not elliptical) glow.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct ConnectionLineMaterial {
-    /// Line color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=glow_width, y=intensity, z=flow_speed, w=unused
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time, y=activity_level (0-1)
-    #[uniform(2)]
-    pub time: Vec4,
-    /// Endpoints: x0, y0, x1, y1 (normalized 0-1 relative to the material's node)
-    #[uniform(3)]
-    pub endpoints: Vec4,
-    /// Dimensions: x=width, y=height, z=aspect (w/h), w=falloff
-    /// Used to correct for non-square containers
-    #[uniform(4)]
-    pub dimensions: Vec4,
-}
-
-impl Default for ConnectionLineMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.34, 0.65, 1.0, 0.6), // Cyan
-            params: Vec4::new(0.08, 0.8, 0.5, 0.0), // glow_width, intensity, flow_speed, unused
-            time: Vec4::new(0.0, 0.5, 0.0, 0.0),    // time, activity
-            endpoints: Vec4::new(0.0, 0.5, 1.0, 0.5), // Horizontal line by default
-            dimensions: Vec4::new(100.0, 100.0, 1.0, 4.0), // width, height, aspect, falloff
-        }
-    }
-}
-
-
-impl UiMaterial for ConnectionLineMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/connection_line.wgsl".into()
-    }
-}
-
-// ============================================================================
-// DRIFT ARC MATERIAL
-// ============================================================================
-
-/// Quadratic Bezier arc for constellation drift connections.
-///
-/// Renders a curved arc between two points with animated particle flow.
-/// The control point is computed in the shader: perpendicular to the midpoint
-/// at `curve_amount` × endpoint distance.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct DriftArcMaterial {
-    /// Arc color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=glow_width, y=intensity, z=flow_speed, w=curve_amount
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time, y=activity_level (0-1)
-    #[uniform(2)]
-    pub time: Vec4,
-    /// Endpoints: x0, y0, x1, y1 (normalized 0-1 relative to bounding box)
-    #[uniform(3)]
-    pub endpoints: Vec4,
-    /// Dimensions: x=width, y=height, z=aspect (w/h), w=falloff
-    #[uniform(4)]
-    pub dimensions: Vec4,
-}
-
-impl Default for DriftArcMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.34, 0.65, 1.0, 0.6),
-            params: Vec4::new(0.08, 0.8, 0.5, 0.3), // glow_width, intensity, flow_speed, curve_amount
-            time: Vec4::new(0.0, 0.5, 0.0, 0.0),
-            endpoints: Vec4::new(0.0, 0.5, 1.0, 0.5),
-            dimensions: Vec4::new(100.0, 100.0, 1.0, 4.0),
-        }
-    }
-}
-
-impl UiMaterial for DriftArcMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/drift_arc.wgsl".into()
     }
 }
 
@@ -522,11 +116,11 @@ pub struct ConstellationCardMaterial {
 impl Default for ConstellationCardMaterial {
     fn default() -> Self {
         Self {
-            color: Vec4::new(0.49, 0.98, 1.0, 0.8), // Dim cyan
-            params: Vec4::new(1.5, 6.0, 0.3, 0.5),  // thickness, corner_radius, glow_radius, glow_intensity
+            color: Vec4::new(0.49, 0.98, 1.0, 0.8),
+            params: Vec4::new(1.5, 6.0, 0.3, 0.5),
             time: Vec4::ZERO,
             mode: Vec4::ZERO,
-            dimensions: Vec4::new(180.0, 130.0, 1.0, 0.0), // width, height, opacity, focused
+            dimensions: Vec4::new(180.0, 130.0, 1.0, 0.0),
         }
     }
 }
@@ -536,125 +130,3 @@ impl UiMaterial for ConstellationCardMaterial {
         "shaders/constellation_card.wgsl".into()
     }
 }
-
-// ============================================================================
-// STAR FIELD MATERIAL
-// ============================================================================
-
-/// Procedural star field background for constellation view.
-///
-/// Hash-based star positions with brightness variation, subtle twinkle,
-/// and color temperature. Camera offset creates a parallax depth effect.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct StarFieldMaterial {
-    /// Parameters: x=density, y=twinkle_speed, z=brightness, w=star_size
-    #[uniform(0)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(1)]
-    pub time: Vec4,
-    /// Dimensions: x=width_px, y=height_px, z=camera_offset_x, w=camera_offset_y
-    #[uniform(2)]
-    pub dimensions: Vec4,
-}
-
-impl Default for StarFieldMaterial {
-    fn default() -> Self {
-        Self {
-            params: Vec4::new(10.0, 0.3, 1.5, 0.035), // density, twinkle_speed, brightness, star_size
-            time: Vec4::ZERO,
-            dimensions: Vec4::new(1280.0, 800.0, 0.0, 0.0),
-        }
-    }
-}
-
-impl UiMaterial for StarFieldMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/star_field.wgsl".into()
-    }
-}
-
-// ============================================================================
-// RING GUIDE MATERIAL
-// ============================================================================
-
-/// Faint dashed concentric circles at ring boundaries for constellation layout.
-///
-/// Draws rings matching the radial tree layout algorithm's radii,
-/// updated each frame with camera offset/zoom for proper centering.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct RingGuideMaterial {
-    /// Parameters: x=base_radius, y=ring_spacing, z=max_rings, w=dash_count
-    #[uniform(0)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(1)]
-    pub time: Vec4,
-    /// Camera: x=offset_x, y=offset_y, z=zoom, w=line_opacity
-    #[uniform(2)]
-    pub camera: Vec4,
-    /// Dimensions: x=width_px, y=height_px
-    #[uniform(3)]
-    pub dimensions: Vec4,
-}
-
-impl Default for RingGuideMaterial {
-    fn default() -> Self {
-        Self {
-            params: Vec4::new(120.0, 160.0, 4.0, 24.0), // base_radius, ring_spacing, max_rings, dash_count
-            time: Vec4::ZERO,
-            camera: Vec4::new(0.0, 0.0, 1.0, 0.12), // offset_x, offset_y, zoom, line_opacity
-            dimensions: Vec4::new(1280.0, 800.0, 0.0, 0.0),
-        }
-    }
-}
-
-impl UiMaterial for RingGuideMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/ring_guide.wgsl".into()
-    }
-}
-
-// ============================================================================
-// HUD PANEL MATERIAL
-// ============================================================================
-
-/// Panel background with edge glow for HUD widgets.
-///
-/// Creates a rectangular panel with subtle edge glow effects.
-/// Used by the HUD system for Panel-style widgets.
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct HudPanelMaterial {
-    /// Base panel color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Edge glow color (RGBA)
-    #[uniform(1)]
-    pub glow_color: Vec4,
-    /// Parameters: x=glow_intensity, y=border_radius, z=pulse_speed, w=reserved
-    #[uniform(2)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time
-    #[uniform(3)]
-    pub time: Vec4,
-}
-
-impl Default for HudPanelMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(0.05, 0.05, 0.1, 0.85), // Dark panel background
-            glow_color: Vec4::new(0.34, 0.65, 1.0, 0.8), // Cyan glow
-            params: Vec4::new(0.5, 0.0, 1.5, 0.0), // intensity, radius, speed
-            time: Vec4::ZERO,
-        }
-    }
-}
-
-
-impl UiMaterial for HudPanelMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/hud_panel.wgsl".into()
-    }
-}
-
-// TextGlow sync systems — removed (TextGlowMaterial deleted in Vello migration)
