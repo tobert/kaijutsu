@@ -42,6 +42,11 @@ use super::components::{
 use super::block_border;
 use super::systems;
 
+// Phase 3: New Vello-native rendering systems from view/ module.
+// These replace cell/systems equivalents — TopLeft anchor, no UiTransform.
+use crate::view::lifecycle as view_lifecycle;
+use crate::view::render as view_render;
+
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
 
@@ -138,57 +143,57 @@ impl Plugin for CellPlugin {
 
         // ====================================================================
         // CellPhase::Spawn - Entity spawning + ApplyDeferred
+        // Phase 3: spawn systems from view/lifecycle (TopLeft anchor, no UiTransform)
         // ====================================================================
         app.add_systems(
             Update,
             (
-                // Main cell spawning
-                systems::spawn_main_cell,
+                // Main cell spawning (view/)
+                view_lifecycle::spawn_main_cell,
                 // Input overlay spawning (singleton)
                 systems::spawn_input_overlay,
-                // Track focused pane and re-parent block cells after split
-                systems::track_conversation_container.after(systems::spawn_main_cell),
-                // Block cell spawning (after sync)
-                systems::spawn_block_cells,
-                // Role group border sync (after block cells)
-                systems::sync_role_headers.after(systems::spawn_block_cells),
+                // Track focused pane and re-parent block cells after split (view/)
+                view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
+                // Block cell spawning — NO UiTransform (view/)
+                view_lifecycle::spawn_block_cells,
+                // Role group border sync (view/)
+                view_lifecycle::sync_role_headers.after(view_lifecycle::spawn_block_cells),
                 // Cursor spawning
                 systems::spawn_cursor,
                 // ApplyDeferred to flush spawn commands
-                ApplyDeferred.after(systems::sync_role_headers),
+                ApplyDeferred.after(view_lifecycle::sync_role_headers),
             )
                 .in_set(CellPhase::Spawn),
         );
 
         // ====================================================================
         // CellPhase::Buffer - Text buffer init/sync, highlighting
+        // Phase 3: buffer systems from view/render (TopLeft anchor)
         // ====================================================================
         app.add_systems(
             Update,
             (
-                // Cell buffer init and sync
+                // Cell buffer init and sync (stays in cell/ — non-block cells)
                 systems::init_cell_buffers,
                 systems::sync_cell_buffers.after(systems::init_cell_buffers),
                 systems::compute_cell_heights,
-                // Block cell buffer init and sync
-                // ApplyDeferred flushes init's UiVelloText insert so sync_block_cell_buffers
-                // can set real text on the same frame. Without this, bevy_vello computes
-                // ContentSize from empty text (height=0) on the init frame.
-                systems::init_block_cell_buffers,
-                ApplyDeferred.after(systems::init_block_cell_buffers),
-                systems::sync_block_cell_buffers
-                    .after(systems::init_block_cell_buffers),
+                // Block cell buffer init and sync (view/ — TopLeft anchor)
+                // ApplyDeferred flushes init's UiVelloText insert so sync can
+                // set real text on the same frame.
+                view_render::init_block_cell_buffers,
+                ApplyDeferred.after(view_render::init_block_cell_buffers),
+                view_render::sync_block_cell_buffers
+                    .after(view_render::init_block_cell_buffers),
                 // Input overlay visibility + buffer sync
                 systems::sync_overlay_visibility,
                 systems::sync_input_overlay_buffer,
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
-                systems::highlight_focused_block.after(systems::sync_block_cell_buffers),
-                // Block border style determination (after buffer sync, now with labels)
+                view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
+                // Block border style determination (after buffer sync)
                 block_border::determine_block_border_style
-                    .after(systems::sync_block_cell_buffers),
-                // Flush BlockBorderStyle inserts so update_block_cell_nodes
-                // can read padding on the same frame (prevents 1-frame zero-padding).
+                    .after(view_render::sync_block_cell_buffers),
+                // Flush BlockBorderStyle inserts
                 ApplyDeferred
                     .after(block_border::determine_block_border_style),
             )
@@ -199,18 +204,19 @@ impl Plugin for CellPlugin {
         // CellPhase::Layout - Measure heights, scroll, position entities
         // ====================================================================
         // Layout phase part 1: measure, scroll, position
+        // Phase 3: layout systems from view/render
         app.add_systems(
             Update,
             (
-                // Block cell layout (computes heights, updates content_height)
-                systems::layout_block_cells,
-                // Sync heights to Node for flex layout
-                systems::update_block_cell_nodes.after(systems::layout_block_cells),
-                // Reorder children to match document order
-                systems::reorder_conversation_children.after(systems::update_block_cell_nodes),
-                // Smooth scroll (uses content_height from layout)
-                systems::smooth_scroll.after(systems::layout_block_cells),
-                // Cursor positioning (blinking, doesn't need UiGlobalTransform)
+                // Block cell layout — indentation levels (view/)
+                view_render::layout_block_cells,
+                // Sync indentation to Node for flex layout (view/)
+                view_render::update_block_cell_nodes.after(view_render::layout_block_cells),
+                // Reorder children to match document order (view/)
+                view_render::reorder_conversation_children.after(view_render::update_block_cell_nodes),
+                // Smooth scroll (stays in cell/ — Phase 5)
+                systems::smooth_scroll.after(view_render::layout_block_cells),
+                // Cursor positioning (stays in cell/ — Phase 5)
                 systems::update_cursor,
                 systems::update_block_edit_cursor.after(systems::update_cursor),
             )
@@ -232,22 +238,23 @@ impl Plugin for CellPlugin {
         // PostUpdate — Systems that read UiGlobalTransform (set by UiSystems::Layout)
         // Must run in PostUpdate so layout values are fresh, not one frame behind.
         // ====================================================================
+        // Phase 3: PostUpdate systems from view/render
         app.add_systems(
             PostUpdate,
             (
-                // Input overlay cursor (reads UiGlobalTransform)
+                // Input overlay cursor (reads UiGlobalTransform — stays in cell/)
                 systems::update_input_overlay_cursor,
-                // Read back actual block heights from Taffy layout
-                systems::readback_block_heights,
+                // Read back actual block heights from Taffy layout (view/)
+                view_render::readback_block_heights,
                 // Vello border systems (spawn → update → animate)
                 block_border::spawn_vello_borders
-                    .after(systems::readback_block_heights),
+                    .after(view_render::readback_block_heights),
                 block_border::update_vello_borders
                     .after(block_border::spawn_vello_borders),
                 block_border::animate_vello_borders
                     .after(block_border::update_vello_borders),
-                // Role group border scene updates
-                systems::update_role_group_scenes,
+                // Role group border scene updates (view/)
+                view_render::update_role_group_scenes,
             )
                 .after(bevy::ui::UiSystems::Layout),
         );

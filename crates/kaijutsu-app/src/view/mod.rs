@@ -3,10 +3,18 @@
 //! Owns all component types for the conversation view. During migration,
 //! `cell/mod.rs` re-exports from here so existing `crate::cell::X` imports
 //! continue to resolve.
+//!
+//! Phase 3 adds the core rendering systems:
+//! - `format` — pure formatting functions (block_color, format_single_block)
+//! - `lifecycle` — spawn/despawn block cell entities (TopLeft anchor, no UiTransform)
+//! - `render` — buffer sync (text → UiVelloText), layout readback
 
 mod components;
 pub mod document;
 pub mod fieldset;
+pub mod format;
+pub mod lifecycle;
+pub mod render;
 
 // Re-export all public types for the facade
 pub use components::*;
