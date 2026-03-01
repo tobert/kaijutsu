@@ -12,13 +12,14 @@ mod systems;
 // Re-export public API — types from components (which will delegate to view/ in Phase 6)
 #[allow(unused_imports)]
 pub use components::{
-    BlockCell, BlockCellContainer, BlockCellLayout, BlockEditCursor, BlockId, BlockKind,
-    BlockSnapshot, Cell, CellEditor, CellId, CellPosition, CellState, ComposeError,
-    ContextId, ContextSwitchRequested, ConversationContainer, ConversationScrollState,
-    DocumentCache, DriftKind, EditingBlockCell, FocusTarget, FocusedBlockCell, InputMode,
-    InputOverlay, InputOverlayMarker, LayoutGeneration, MainCell, PendingContextSwitch,
-    PrincipalId, PromptSubmitted, Role, RoleGroupBorder, RoleGroupBorderLayout,
-    SessionAgent, Status, SubmitFailed, ViewingConversation, WorkspaceLayout,
+    BlockCell, BlockCellContainer, BlockCellLayout, BlockCursor, BlockEditCursor, BlockId,
+    BlockKind, BlockSnapshot, CachedDocument, Cell, CellEditor, CellId, CellPosition,
+    CellState, ComposeError, ContextId, ContextSwitchRequested, ConversationContainer,
+    ConversationScrollState, DocumentCache, DriftKind, EditingBlockCell, FocusTarget,
+    FocusedBlockCell, InputMode, InputOverlay, InputOverlayMarker, LayoutGeneration,
+    MainCell, PendingContextSwitch, PrincipalId, PromptSubmitted, Role, RoleGroupBorder,
+    RoleGroupBorderLayout, SessionAgent, Status, SubmitFailed, ViewingConversation,
+    WorkspaceLayout,
 };
 pub use plugin::CellPlugin;
 pub use systems::EditorEntities;

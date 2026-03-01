@@ -14,7 +14,10 @@ pub mod document;
 pub mod fieldset;
 pub mod format;
 pub mod lifecycle;
+pub mod overlay;
 pub mod render;
+pub mod submit;
+pub mod sync;
 
 // Re-export all public types for the facade
 pub use components::*;

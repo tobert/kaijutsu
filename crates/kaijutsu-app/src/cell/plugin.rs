@@ -42,10 +42,12 @@ use super::components::{
 use super::block_border;
 use super::systems;
 
-// Phase 3: New Vello-native rendering systems from view/ module.
-// These replace cell/systems equivalents — TopLeft anchor, no UiTransform.
+// Phase 3+4: Systems from view/ module replace cell/systems equivalents.
 use crate::view::lifecycle as view_lifecycle;
+use crate::view::overlay as view_overlay;
 use crate::view::render as view_render;
+use crate::view::submit as view_submit;
+use crate::view::sync as view_sync;
 
 /// Plugin that enables cell-based editing in the workspace.
 pub struct CellPlugin;
@@ -111,32 +113,32 @@ impl Plugin for CellPlugin {
 
         // ====================================================================
         // CellPhase::Sync - Server events, document sync
+        // Phase 4: sync + submit systems from view/
         // ====================================================================
         app.add_systems(
             Update,
             (
-                // Block event handling (server → client sync, routes through DocumentCache)
-                systems::handle_block_events,
-                // Input document events (InputTextOps, InputCleared → ComposeBlock sync)
-                systems::handle_input_doc_events.after(systems::handle_block_events),
-                // Context switching (reads ContextSwitchRequested, swaps active cache entry)
-                systems::handle_context_switch.after(systems::handle_block_events),
-                // Handle prompt submission (after context switch to avoid routing to wrong context)
-                systems::handle_prompt_submitted
-                    .after(systems::handle_context_switch),
-                // Restore text + flash border on submit failure
-                systems::handle_submit_failed
-                    .after(systems::handle_prompt_submitted),
-                // Sync main cell to conversation (after block events, context switch, and prompt submission)
-                systems::sync_main_cell_to_conversation
-                    .after(systems::handle_block_events)
-                    .after(systems::handle_context_switch)
-                    .after(systems::handle_prompt_submitted),
-                // Staleness detection (after block events and context switch)
-                systems::check_cache_staleness
-                    .after(systems::handle_block_events)
-                    .after(systems::handle_context_switch),
-                // Block navigation, expand, scroll handled by InputPlugin
+                // Block event handling (view/sync)
+                view_sync::handle_block_events,
+                // Input document events (view/sync)
+                view_sync::handle_input_doc_events.after(view_sync::handle_block_events),
+                // Context switching (view/sync)
+                view_sync::handle_context_switch.after(view_sync::handle_block_events),
+                // Handle prompt submission (view/submit)
+                view_submit::handle_prompt_submitted
+                    .after(view_sync::handle_context_switch),
+                // Restore text + flash border on submit failure (view/submit)
+                view_submit::handle_submit_failed
+                    .after(view_submit::handle_prompt_submitted),
+                // Sync main cell to conversation (view/sync)
+                view_sync::sync_main_cell_to_conversation
+                    .after(view_sync::handle_block_events)
+                    .after(view_sync::handle_context_switch)
+                    .after(view_submit::handle_prompt_submitted),
+                // Staleness detection (view/sync)
+                view_sync::check_cache_staleness
+                    .after(view_sync::handle_block_events)
+                    .after(view_sync::handle_context_switch),
             )
                 .in_set(CellPhase::Sync),
         );
@@ -150,8 +152,8 @@ impl Plugin for CellPlugin {
             (
                 // Main cell spawning (view/)
                 view_lifecycle::spawn_main_cell,
-                // Input overlay spawning (singleton)
-                systems::spawn_input_overlay,
+                // Input overlay spawning (view/overlay)
+                view_overlay::spawn_input_overlay,
                 // Track focused pane and re-parent block cells after split (view/)
                 view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
                 // Block cell spawning — NO UiTransform (view/)
@@ -184,9 +186,9 @@ impl Plugin for CellPlugin {
                 ApplyDeferred.after(view_render::init_block_cell_buffers),
                 view_render::sync_block_cell_buffers
                     .after(view_render::init_block_cell_buffers),
-                // Input overlay visibility + buffer sync
-                systems::sync_overlay_visibility,
-                systems::sync_input_overlay_buffer,
+                // Input overlay visibility + buffer sync (view/overlay)
+                view_overlay::sync_overlay_visibility,
+                view_overlay::sync_input_overlay_buffer,
                 // Highlighting (after buffer sync)
                 systems::highlight_focused_cell.after(systems::sync_cell_buffers),
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
@@ -227,8 +229,8 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
-                // Compose error border animation
-                systems::animate_compose_error,
+                // Compose error border animation (view/submit)
+                view_submit::animate_compose_error,
                 block_border::cleanup_block_borders,
             )
                 .in_set(CellPhase::Layout),
