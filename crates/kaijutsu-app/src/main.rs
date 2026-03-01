@@ -111,7 +111,7 @@ fn main() {
         // Tiling WM — layout tree, reconciler, and widget update systems
         .add_plugins(ui::tiling::TilingPlugin)
         .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)
-        .add_plugins(ui::tiling_widgets::TilingWidgetsPlugin)
+        .add_plugins(ui::dock::DockPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(ui::drift::DriftPlugin)
         // Timeline navigation - temporal scrubbing through history
@@ -148,17 +148,16 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
 
 /// Set up the structural UI skeleton.
 ///
-/// The tiling reconciler populates docks and conversation content.
-/// This function spawns the fixed structure that the reconciler needs:
+/// Docks are spawned by `DockPlugin` (PostStartup). The tiling reconciler
+/// populates conversation content within the content area.
 ///
 /// ```text
 /// TilingRoot (column, 100%x100%)
-///   [NorthDock — spawned by tiling reconciler]
+///   [NorthDock — spawned by DockPlugin]
 ///   ContentArea (column, flex-grow: 1)
 ///     ConversationRoot (100%, visible immediately)
 ///       [ConversationContainer — spawned by tiling reconciler]
-///       [ComposeBlock — spawned by tiling reconciler]
-///   [SouthDock — spawned by tiling reconciler]
+///   [SouthDock — spawned by DockPlugin]
 /// ```
 fn setup_ui(
     mut commands: Commands,

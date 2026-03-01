@@ -3,13 +3,15 @@
 //! Everything on screen is a **Pane** with a `PaneContent`. The `TilingTree`
 //! resource owns the layout tree and the reconciler turns it into Bevy entities.
 //!
-//! ## Three Screen Primitives
+//! Dock bars (North/South) are handled separately by `DockPlugin` — they use
+//! Vello scenes instead of the tiling tree.
 //!
-//! | Primitive | PaneContent variants               | Examples                     |
-//! |-----------|------------------------------------|------------------------------|
-//! | Views     | Conversation, Dashboard, Editor    | DagView, code viewer         |
-//! | Inputs    | Compose, Shell                     | Chat prompt, kaish input     |
-//! | Widgets   | Title, Mode, Connection, Contexts… | Status bar items             |
+//! ## Screen Primitives
+//!
+//! | Primitive | PaneContent variants       | Examples                     |
+//! |-----------|----------------------------|------------------------------|
+//! | Views     | Conversation, Editor       | DagView, code viewer         |
+//! | Inputs    | Compose, Shell             | Chat prompt, kaish input     |
 
 use bevy::prelude::*;
 
@@ -51,7 +53,6 @@ pub enum PaneContent {
     // ── Views ──────────────────────────────────────────────────────────
     /// A CRDT conversation view bound to a document.
     Conversation { document_id: String },
-    // Dashboard variant removed — app starts directly in conversation view.
     /// A text file editor.
     #[allow(dead_code)] // Phase 4: tab containers for stacking views
     Editor { path: String },
@@ -67,72 +68,9 @@ pub enum PaneContent {
     #[allow(dead_code)] // Phase 4: shell pane content type
     Shell,
 
-    // ── Widgets ────────────────────────────────────────────────────────
-    /// Application title (e.g. "会術 Kaijutsu").
-    Title,
-    /// Vim-style mode indicator (NORMAL / CHAT / SHELL / VISUAL).
-    Mode,
-    /// Connection status (reactive to RpcConnectionState).
-    Connection,
-    /// Drift context badge strip.
-    Contexts,
-    /// Context-sensitive key hints.
-    Hints,
-    /// Server event rate pulse (North dock).
-    EventPulse,
-    /// Active context model name badge (South dock).
-    ModelBadge,
-    /// Agent activity summary across constellation nodes (South dock).
-    AgentActivity,
-    /// Running/pending block count for active document (South dock).
-    BlockActivity,
-    /// Static or templated text.
-    Text { template: String },
+    // ── Layout ────────────────────────────────────────────────────────
     /// Flexible spacer — grows to fill remaining space.
     Spacer,
-}
-
-// ============================================================================
-// DOCK WIDGET — Declarative dock configuration
-// ============================================================================
-
-/// A widget type for the DockLayout resource.
-///
-/// Maps 1:1 to PaneContent widget variants. Used by `DockLayout` to
-/// declaratively configure what appears in each dock, and by
-/// `TilingTree::rebuild_docks()` to rebuild dock children.
-#[derive(Debug, Clone, PartialEq, Reflect)]
-pub enum DockWidget {
-    Title,
-    Mode,
-    Connection,
-    Contexts,
-    Hints,
-    AgentActivity,
-    BlockActivity,
-    EventPulse,
-    ModelBadge,
-    Text { template: String },
-    Spacer,
-}
-
-impl DockWidget {
-    /// Convert to the corresponding PaneContent variant.
-    pub fn to_pane_content(&self) -> PaneContent {
-        match self {
-            DockWidget::Title => PaneContent::Title,
-            DockWidget::Mode => PaneContent::Mode,
-            DockWidget::Connection => PaneContent::Connection,
-            DockWidget::Contexts => PaneContent::Contexts,
-            DockWidget::Hints => PaneContent::Hints,
-            DockWidget::AgentActivity => PaneContent::AgentActivity,
-            DockWidget::BlockActivity => PaneContent::BlockActivity,
-            DockWidget::EventPulse => PaneContent::EventPulse,
-            DockWidget::ModelBadge => PaneContent::ModelBadge,
-            DockWidget::Text { template } => PaneContent::Text { template: template.clone() },
-            DockWidget::Spacer => PaneContent::Spacer,
-        }
-    }
 }
 
 impl PaneContent {
@@ -182,20 +120,6 @@ impl FocusDirection {
 }
 
 // ============================================================================
-// DOCK EDGE
-// ============================================================================
-
-/// Which edge a Dock node attaches to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Reflect)]
-pub enum Edge {
-    North,
-    #[default]
-    South,
-    East,
-    West,
-}
-
-// ============================================================================
 // TILE NODE — The recursive tree
 // ============================================================================
 
@@ -215,12 +139,6 @@ pub enum TileNode {
         id: PaneId,
         content: PaneContent,
     },
-    /// A dock attached to a screen edge, children auto-sized.
-    Dock {
-        id: PaneId,
-        edge: Edge,
-        children: Vec<TileNode>,
-    },
 }
 
 impl TileNode {
@@ -229,7 +147,6 @@ impl TileNode {
         match self {
             TileNode::Split { id, .. } => *id,
             TileNode::Leaf { id, .. } => *id,
-            TileNode::Dock { id, .. } => *id,
         }
     }
 
@@ -238,7 +155,7 @@ impl TileNode {
     pub fn collect_ids(&self, out: &mut Vec<PaneId>) {
         out.push(self.id());
         match self {
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 for child in children {
                     child.collect_ids(out);
                 }
@@ -253,7 +170,7 @@ impl TileNode {
             return Some(self);
         }
         match self {
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 for child in children {
                     if let Some(found) = child.find(target) {
                         return Some(found);
@@ -271,7 +188,7 @@ impl TileNode {
             return Some(self);
         }
         match self {
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 for child in children {
                     if let Some(found) = child.find_mut(target) {
                         return Some(found);
@@ -287,7 +204,7 @@ impl TileNode {
     /// Returns (parent_node, index_of_child).
     pub fn find_parent(&self, target: PaneId) -> Option<(PaneId, usize)> {
         match self {
-            TileNode::Split { id, children, .. } | TileNode::Dock { id, children, .. } => {
+            TileNode::Split { id, children, .. } => {
                 for (i, child) in children.iter().enumerate() {
                     if child.id() == target {
                         return Some((*id, i));
@@ -316,7 +233,7 @@ impl TileNode {
             return true;
         }
         match self {
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 children.iter().any(|c| c.contains_pane(target))
             }
             TileNode::Leaf { .. } => false,
@@ -330,7 +247,7 @@ impl TileNode {
                 id,
                 content: PaneContent::Conversation { .. },
             } => Some(*id),
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 children.iter().find_map(|c| c.first_conversation())
             }
             TileNode::Leaf { .. } => None,
@@ -344,7 +261,7 @@ impl TileNode {
                 id,
                 content: PaneContent::Conversation { .. },
             } => Some(*id),
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 children.iter().rev().find_map(|c| c.last_conversation())
             }
             TileNode::Leaf { .. } => None,
@@ -359,7 +276,7 @@ impl TileNode {
             } => {
                 out.push((*id, document_id.as_str()));
             }
-            TileNode::Split { children, .. } | TileNode::Dock { children, .. } => {
+            TileNode::Split { children, .. } => {
                 for child in children {
                     child.collect_conversations(out);
                 }
@@ -410,105 +327,23 @@ impl TilingTree {
         id
     }
 
-    /// Create the default layout: North dock, single conversation, South dock.
+    /// Create the default layout: single conversation pane.
+    ///
+    /// Docks are spawned separately by `DockPlugin`.
     pub fn default_layout() -> Self {
-        let mut next_id = 0u64;
-        let mut next = || {
-            let id = PaneId(next_id);
-            next_id += 1;
-            id
-        };
+        let conv_id = PaneId(0);
 
-        // North dock widgets
-        let north_dock = TileNode::Dock {
-            id: next(),
-            edge: Edge::North,
-            children: vec![
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Title,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Spacer,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::EventPulse,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Connection,
-                },
-            ],
-        };
-
-        // Content area — starts as a single conversation (direct leaf, no compose)
-        let conv_id = next();
-        let content = TileNode::Leaf {
+        let root = TileNode::Leaf {
             id: conv_id,
             content: PaneContent::Conversation {
-                document_id: String::new(), // Set when conversation joins
+                document_id: String::new(),
             },
-        };
-
-        // South dock widgets
-        let south_dock = TileNode::Dock {
-            id: next(),
-            edge: Edge::South,
-            children: vec![
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Mode,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::ModelBadge,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Spacer,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::AgentActivity,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::BlockActivity,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Spacer,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Contexts,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Spacer,
-                },
-                TileNode::Leaf {
-                    id: next(),
-                    content: PaneContent::Hints,
-                },
-            ],
-        };
-
-        // Root: Column with [NorthDock, Content, SouthDock]
-        let root_id = next();
-        let root = TileNode::Split {
-            id: root_id,
-            direction: SplitDirection::Column,
-            children: vec![north_dock, content, south_dock],
-            ratios: vec![0.0, 1.0, 0.0], // Docks auto-size, content grows
         };
 
         Self {
             root,
-            next_id,
-            focused: conv_id, // Start focused on conversation
+            next_id: 1,
+            focused: conv_id,
             previous_focused: None,
             structural_gen: 0,
             visual_gen: 0,
@@ -550,6 +385,35 @@ impl TilingTree {
             }
         } else {
             return None;
+        }
+
+        // Handle the case where root IS the target leaf (no parent split)
+        if self.root.id() == target && matches!(self.root, TileNode::Leaf { .. }) {
+            let new_conv_id = self.next_pane_id();
+            let wrapper_id = self.next_pane_id();
+            let old_root = std::mem::replace(
+                &mut self.root,
+                TileNode::Leaf {
+                    id: PaneId(0),
+                    content: PaneContent::Spacer,
+                },
+            );
+            self.root = TileNode::Split {
+                id: wrapper_id,
+                direction,
+                children: vec![
+                    old_root,
+                    TileNode::Leaf {
+                        id: new_conv_id,
+                        content: PaneContent::Conversation {
+                            document_id: String::new(),
+                        },
+                    },
+                ],
+                ratios: vec![0.5, 0.5],
+            };
+            self.bump_structural();
+            return Some(new_conv_id);
         }
 
         // Find the parent that contains the target conversation leaf
@@ -887,43 +751,6 @@ impl TilingTree {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // DOCK MANAGEMENT
-    // ════════════════════════════════════════════════════════════════════
-
-    /// Rebuild dock children from DockWidget lists.
-    ///
-    /// Walks the tree to find North and South Dock nodes, replaces their
-    /// children with new leaves built from the provided widget lists,
-    /// and bumps structural_gen to trigger the reconciler.
-    pub fn rebuild_docks(&mut self, north: &[DockWidget], south: &[DockWidget]) {
-        fn rebuild_dock_node(node: &mut TileNode, edge: Edge, widgets: &[DockWidget], next_id: &mut u64) {
-            match node {
-                TileNode::Dock { edge: e, children, .. } if *e == edge => {
-                    children.clear();
-                    for widget in widgets {
-                        let id = PaneId(*next_id);
-                        *next_id += 1;
-                        children.push(TileNode::Leaf {
-                            id,
-                            content: widget.to_pane_content(),
-                        });
-                    }
-                }
-                TileNode::Split { children, .. } => {
-                    for child in children.iter_mut() {
-                        rebuild_dock_node(child, edge, widgets, next_id);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        rebuild_dock_node(&mut self.root, Edge::North, north, &mut self.next_id);
-        rebuild_dock_node(&mut self.root, Edge::South, south, &mut self.next_id);
-        self.bump_structural();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
     // HELPERS
     // ════════════════════════════════════════════════════════════════════
 
@@ -1102,9 +929,7 @@ impl Plugin for TilingPlugin {
             .register_type::<PaneId>()
             .register_type::<PaneContent>()
             .register_type::<SplitDirection>()
-            .register_type::<Edge>()
             .register_type::<WritingDirection>()
-            .register_type::<DockWidget>()
             .register_type::<PaneMarker>()
             .register_type::<PaneFocus>()
             .register_type::<PaneSavedState>()
@@ -1140,7 +965,8 @@ mod tests {
         let tree = TilingTree::default_layout();
         let mut ids = Vec::new();
         tree.root.collect_ids(&mut ids);
-        assert!(ids.len() >= 15, "Default layout should have many nodes");
+        // Default layout is a single conversation leaf (docks are in DockPlugin now)
+        assert_eq!(ids.len(), 1, "Default layout should have one node");
         // All IDs should be unique
         let deduped: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), deduped.len(), "All PaneIds should be unique");

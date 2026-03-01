@@ -44,7 +44,7 @@ pub mod sequence;
 pub mod systems;
 
 // Re-export core types for ergonomic use.
-// FocusArea is consumed by cell, tiling_widgets, timeline, conversation, frame_assembly.
+// FocusArea is consumed by cell, dock, timeline, conversation, frame_assembly.
 // others are pub API for future external consumers.
 pub use focus::FocusArea;
 #[allow(unused_imports)]

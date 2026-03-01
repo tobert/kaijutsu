@@ -2,14 +2,15 @@
 //!
 //! ## Architecture
 //!
-//! `setup_ui` spawns the structural skeleton. The reconciler populates it:
+//! `setup_ui` spawns the structural skeleton. The reconciler populates
+//! conversation content within ConversationRoot:
 //! ```text
 //! TilingRoot (column)
-//!   [NorthDock — spawned by reconciler]
+//!   [NorthDock — spawned by DockPlugin]
 //!   ContentArea (column, flex-grow: 1)
 //!     ConversationRoot (100%)
 //!       [Content tree — recursively spawned by reconciler]
-//!   [SouthDock — spawned by reconciler]
+//!   [SouthDock — spawned by DockPlugin]
 //! ```
 //!
 //! The content tree maps the TilingTree's Split/Leaf structure to Bevy
@@ -31,7 +32,6 @@ use bevy::prelude::*;
 use super::tiling::*;
 use super::theme::Theme;
 use crate::cell::ConversationContainer;
-use crate::constants::ZLayer;
 use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
 
@@ -91,7 +91,7 @@ pub fn reconcile_tiling_tree(
     }
 
     // Need the structural entities to exist
-    let Ok(root_entity) = tiling_root.single() else {
+    let Ok(_root_entity) = tiling_root.single() else {
         return;
     };
     let Ok((conv_root_entity, _conv_children)) = conversation_root.single() else {
@@ -121,13 +121,6 @@ pub fn reconcile_tiling_tree(
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // SPAWN DOCKS from TilingTree
-    // ════════════════════════════════════════════════════════════════════
-
-    // Walk the tree to find dock nodes and spawn them
-    spawn_docks(&mut commands, &tree.root, &theme, root_entity);
-
-    // ════════════════════════════════════════════════════════════════════
     // SPAWN CONVERSATION CONTENT from TilingTree
     // ════════════════════════════════════════════════════════════════════
 
@@ -143,56 +136,26 @@ pub fn reconcile_tiling_tree(
     );
 }
 
-/// Walk the tree and spawn Dock nodes as children of root_entity.
-///
-/// North docks are inserted at index 0 (before ContentArea),
-/// South docks are appended (after ContentArea). This ensures
-/// the flex column renders: NorthDock → ContentArea → SouthDock.
-fn spawn_docks(
-    commands: &mut Commands,
-    node: &TileNode,
-    theme: &Theme,
-    root_entity: Entity,
-) {
-    match node {
-        TileNode::Dock { id, edge, children } => {
-            let dock_entity = spawn_dock(commands, *id, *edge, children, theme);
-            match edge {
-                Edge::North => {
-                    commands.entity(root_entity).insert_children(0, &[dock_entity]);
-                }
-                _ => {
-                    commands.entity(root_entity).add_child(dock_entity);
-                }
-            }
-        }
-        TileNode::Split { children, .. } => {
-            for child in children {
-                spawn_docks(commands, child, theme, root_entity);
-            }
-        }
-        TileNode::Leaf { .. } => {}
-    }
-}
-
 /// Spawn conversation content into ConversationRoot.
 ///
-/// Walks the TilingTree's root children, skipping Dock nodes (handled separately),
-/// and recursively builds the flex container tree for Split/Leaf content panes.
+/// Walks the TilingTree root and recursively builds the flex container tree
+/// for Split/Leaf content panes.
 fn spawn_conversation_content(
     commands: &mut Commands,
     tree: &TilingTree,
     theme: &Theme,
     conv_root: Entity,
 ) {
-    if let TileNode::Split { children, ratios, .. } = &tree.root {
-        for (i, child) in children.iter().enumerate() {
-            // Skip docks — they're handled by spawn_docks
-            if matches!(child, TileNode::Dock { .. }) {
-                continue;
+    match &tree.root {
+        TileNode::Split { children, ratios, .. } => {
+            for (i, child) in children.iter().enumerate() {
+                let ratio = ratios.get(i).copied().unwrap_or(1.0);
+                spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
             }
-            let ratio = ratios.get(i).copied().unwrap_or(1.0);
-            spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
+        }
+        TileNode::Leaf { .. } => {
+            // Root is a single leaf — spawn it directly
+            spawn_content_subtree(commands, &tree.root, theme, conv_root, tree, 1.0);
         }
     }
 }
@@ -300,193 +263,8 @@ fn spawn_content_subtree(
             commands.entity(parent).add_child(entity);
         }
 
-        _ => {} // Docks handled separately, other leaves ignored
+        _ => {} // Non-conversation leaves ignored
     }
-}
-
-// ============================================================================
-// DOCK SPAWNING
-// ============================================================================
-
-/// Spawn a dock container with its widget children.
-fn spawn_dock(
-    commands: &mut Commands,
-    id: PaneId,
-    edge: Edge,
-    children: &[TileNode],
-    theme: &Theme,
-) -> Entity {
-    let border = match edge {
-        Edge::North => UiRect::bottom(Val::Px(1.0)),
-        Edge::South => UiRect::top(Val::Px(1.0)),
-        Edge::East => UiRect::left(Val::Px(1.0)),
-        Edge::West => UiRect::right(Val::Px(1.0)),
-    };
-
-    let padding = match edge {
-        Edge::North => UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-        Edge::South => UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
-        _ => UiRect::all(Val::Px(4.0)),
-    };
-
-    let mut dock_cmd = commands.spawn((
-        PaneMarker {
-            pane_id: id,
-            content: PaneContent::Spacer,
-        },
-        id,
-        Node {
-            width: Val::Percent(100.0),
-            height: Val::Auto,
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            padding,
-            border,
-            ..default()
-        },
-        BorderColor::all(theme.border),
-        ZIndex(ZLayer::HUD),
-    ));
-
-    dock_cmd.with_children(|parent| {
-        for child in children {
-            spawn_dock_child(parent, child, theme);
-        }
-    });
-
-    dock_cmd.id()
-}
-
-/// Spawn a dock child (widget leaf or spacer).
-fn spawn_dock_child(
-    parent: &mut ChildSpawnerCommands,
-    node: &TileNode,
-    theme: &Theme,
-) {
-    let TileNode::Leaf { id, content } = node else {
-        return; // Only leaves in docks
-    };
-
-    match content {
-        PaneContent::Title => {
-            spawn_widget_text(parent, *id, content, theme, "会術 Kaijutsu", 24.0, theme.accent, true);
-        }
-        PaneContent::Mode => {
-            spawn_widget_text(parent, *id, content, theme, "NORMAL", 14.0, theme.mode_normal, true);
-        }
-        PaneContent::Connection => {
-            spawn_widget_text(parent, *id, content, theme, "Connecting...", 14.0, theme.fg_dim, false);
-        }
-        PaneContent::Contexts => {
-            spawn_widget_text(parent, *id, content, theme, "", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::Hints => {
-            spawn_widget_text(parent, *id, content, theme, "Enter: submit │ Shift+Enter: newline │ Esc: normal", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::EventPulse => {
-            spawn_widget_text(parent, *id, content, theme, "quiet", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::ModelBadge => {
-            spawn_widget_text(parent, *id, content, theme, "—", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::AgentActivity => {
-            spawn_widget_text(parent, *id, content, theme, "", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::BlockActivity => {
-            spawn_widget_text(parent, *id, content, theme, "", 11.0, theme.fg_dim, false);
-        }
-        PaneContent::Spacer => {
-            parent.spawn((
-                PaneMarker {
-                    pane_id: *id,
-                    content: PaneContent::Spacer,
-                },
-                *id,
-                Node {
-                    flex_grow: 1.0,
-                    ..default()
-                },
-            ));
-        }
-        PaneContent::Text { template } => {
-            spawn_widget_text(parent, *id, content, theme, template, 14.0, theme.fg, false);
-        }
-        _ => {} // Non-widget content shouldn't be in docks
-    }
-}
-
-// ============================================================================
-// WIDGET SPAWNER
-// ============================================================================
-
-/// Marker for widget text content in the tiling system.
-///
-/// Used by tiling_widgets systems to find and update text.
-#[derive(Component, Debug, Clone)]
-pub struct WidgetPaneText {
-    pub widget_type: PaneContent,
-}
-
-/// Spawn a widget with Vello text as a child entity.
-fn spawn_widget_text(
-    parent: &mut ChildSpawnerCommands,
-    id: PaneId,
-    content: &PaneContent,
-    theme: &Theme,
-    initial_text: &str,
-    font_size: f32,
-    color: Color,
-    has_padding: bool,
-) {
-    let (min_width, min_height) = match content {
-        PaneContent::Title => (180.0, 36.0),
-        PaneContent::Mode => (80.0, 20.0),
-        PaneContent::Connection => (200.0, 20.0),
-        PaneContent::Contexts => (200.0, 16.0),
-        PaneContent::Hints => (400.0, 16.0),
-        PaneContent::EventPulse => (60.0, 16.0),
-        PaneContent::ModelBadge => (80.0, 16.0),
-        PaneContent::AgentActivity => (60.0, 16.0),
-        PaneContent::BlockActivity => (60.0, 16.0),
-        _ => (60.0, 16.0),
-    };
-
-    parent
-        .spawn((
-            PaneMarker {
-                pane_id: id,
-                content: content.clone(),
-            },
-            id,
-            WidgetPaneText {
-                widget_type: content.clone(),
-            },
-            Node {
-                padding: if has_padding {
-                    UiRect::all(Val::Px(8.0))
-                } else {
-                    UiRect::ZERO
-                },
-                min_width: Val::Px(min_width),
-                min_height: Val::Px(min_height),
-                ..default()
-            },
-            BackgroundColor(if has_padding { theme.panel_bg } else { Color::NONE }),
-        ))
-        .with_children(|text_parent| {
-            text_parent.spawn((
-                KjUiText::new(initial_text)
-                    .with_font_size(font_size)
-                    .with_color(color),
-                UiVelloText::default(),
-                Node {
-                    min_width: Val::Px(if has_padding { min_width - 16.0 } else { min_width }),
-                    min_height: Val::Px(min_height),
-                    ..default()
-                },
-            ));
-        });
 }
 
 // ============================================================================

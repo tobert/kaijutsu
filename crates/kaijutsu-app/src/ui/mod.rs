@@ -1,5 +1,6 @@
 pub mod constellation;
 pub mod debug;
+pub mod dock;
 pub mod form;
 pub mod drift;
 pub mod screen;
@@ -8,5 +9,4 @@ pub mod theme;
 pub mod theme_loader;
 pub mod tiling;
 pub mod tiling_reconciler;
-pub mod tiling_widgets;
 pub mod timeline;
