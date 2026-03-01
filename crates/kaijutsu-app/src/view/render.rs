@@ -10,9 +10,9 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor,
-    EditorEntities, LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout,
-    ConversationScrollState, FocusedBlockCell,
+    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor, CellState,
+    EditorEntities, FocusTarget, LayoutGeneration, MainCell, RoleGroupBorder,
+    RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell, WorkspaceLayout,
 };
 use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
@@ -538,4 +538,126 @@ pub fn highlight_focused_block(
             }
         }
     }
+}
+
+// ============================================================================
+// NON-BLOCK CELL SYSTEMS (kept from cell/systems.rs)
+// ============================================================================
+
+/// Initialize text for cells that don't have UiVelloText yet.
+/// No-op — Vello text entities are complete at spawn time.
+pub fn init_cell_buffers() {}
+
+/// Sync UiVelloText from CellEditor when dirty.
+///
+/// For cells with content blocks, clears the text (BlockCells render per-block).
+/// For plain text cells, uses the text directly.
+pub fn sync_cell_buffers(
+    mut cells: Query<(&CellEditor, &mut UiVelloText, Option<&BlockCellContainer>), Changed<CellEditor>>,
+) {
+    for (editor, mut vello_text, container) in cells.iter_mut() {
+        if container.is_some_and(|c| !c.block_cells.is_empty()) {
+            if !vello_text.value.is_empty() {
+                vello_text.value.clear();
+            }
+            continue;
+        }
+
+        let display_text = if editor.has_blocks() {
+            super::format::format_blocks_for_display(&editor.blocks())
+        } else {
+            editor.text()
+        };
+
+        if vello_text.value != display_text {
+            vello_text.value = display_text;
+        }
+    }
+}
+
+/// Compute cell heights based on content (non-MainCell only).
+pub fn compute_cell_heights(
+    mut cells: Query<(&CellEditor, &mut CellState, Option<&MainCell>), Changed<CellEditor>>,
+    text_metrics: Res<TextMetrics>,
+    layout: Res<WorkspaceLayout>,
+) {
+    for (editor, mut state, main_cell) in cells.iter_mut() {
+        if main_cell.is_some() {
+            continue;
+        }
+
+        let display_text = if editor.has_blocks() {
+            super::format::format_blocks_for_display(&editor.blocks())
+        } else {
+            editor.text()
+        };
+        let line_count = display_text.lines().count().max(1);
+        let content_height = (line_count as f32) * text_metrics.cell_line_height + 4.0;
+        let height = content_height.max(layout.min_cell_height);
+        state.computed_height = if layout.max_cell_height > 0.0 {
+            height.min(layout.max_cell_height)
+        } else {
+            height
+        };
+    }
+}
+
+/// Visual indication for focused cell.
+pub fn highlight_focused_cell(
+    focus: Res<FocusTarget>,
+    mut cells: Query<(Entity, &mut UiVelloText), With<Cell>>,
+    theme: Option<Res<Theme>>,
+) {
+    let Some(ref theme) = theme else {
+        warn_once!("Theme resource unavailable for cell highlighting");
+        return;
+    };
+
+    for (entity, mut vello_text) in cells.iter_mut() {
+        let color = if Some(entity) == focus.entity {
+            theme.accent
+        } else {
+            theme.fg_dim
+        };
+        let new_brush = bevy_color_to_brush(color);
+        if vello_text.style.brush != new_brush {
+            vello_text.style.brush = new_brush;
+        }
+    }
+}
+
+/// Click to focus a cell.
+pub fn click_to_focus(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    cells: Query<(Entity, &ComputedNode, &UiGlobalTransform), With<Cell>>,
+    mut focus: ResMut<FocusTarget>,
+) {
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let Some(cursor_pos) = windows.iter().next().and_then(|w| w.cursor_position()) else {
+        return;
+    };
+
+    for (entity, computed, transform) in cells.iter() {
+        let (_, _, translation) = transform.to_scale_angle_translation();
+        let size = computed.size();
+        let left = translation.x - size.x / 2.0;
+        let top = translation.y - size.y / 2.0;
+        let right = left + size.x;
+        let bottom = top + size.y;
+
+        if cursor_pos.x >= left
+            && cursor_pos.x <= right
+            && cursor_pos.y >= top
+            && cursor_pos.y <= bottom
+        {
+            focus.entity = Some(entity);
+            return;
+        }
+    }
+
+    focus.entity = None;
 }
