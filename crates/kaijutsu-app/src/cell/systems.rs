@@ -1827,11 +1827,12 @@ pub fn spawn_block_cells(
                         width: Val::Percent(100.0),
                         ..default()
                     },
-                    // UiGlobalTransform is at node center; shift to top-left corner.
-                    // x: -50% shifts center→left edge, y: -50% shifts center→top edge.
-                    // VelloTextAnchor::TopLeft renders text from this origin downward.
+                    // UiGlobalTransform is at node center; shift x to left edge.
+                    // y stays at center — VelloTextAnchor::Left vertically centers text,
+                    // which is correct when block height ≈ text height.
+                    // (y:-50% would top-align but bleeds past scroll clip bounds.)
                     UiTransform {
-                        translation: Val2 { x: Val::Percent(-50.0), y: Val::Percent(-50.0) },
+                        translation: Val2 { x: Val::Percent(-50.0), y: Val::Auto },
                         ..UiTransform::IDENTITY
                     },
                     TimelineVisibility {
@@ -2020,7 +2021,7 @@ pub fn init_block_cell_buffers(
                 },
                 ..default()
             },
-            VelloTextAnchor::TopLeft,
+            VelloTextAnchor::Left,
         ));
     }
 }

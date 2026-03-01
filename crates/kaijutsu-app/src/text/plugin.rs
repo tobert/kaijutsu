@@ -82,8 +82,8 @@ fn sync_kj_ui_text(
 /// Constrains parley text layout to the node's available width, enabling
 /// word wrapping for long lines. Without this, text would overflow the node.
 ///
-/// For block cells: `UiTransform` (x: -50%, y: -50%) shifts center→top-left +
-/// `VelloTextAnchor::TopLeft` renders text from that origin downward.
+/// For block cells: `UiTransform` (x: -50%) shifts center→left edge +
+/// `VelloTextAnchor::Left` (dy: -text_height/2) vertically centers text.
 /// For widgets/overlay: `VelloTextAnchor::Center` (default) relies on
 /// `max_advance` ≈ node width for approximate centering.
 fn sync_text_max_advance(
