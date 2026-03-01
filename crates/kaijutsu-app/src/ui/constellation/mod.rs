@@ -206,7 +206,6 @@ impl Constellation {
             parent_id: None, // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO, // Will be calculated by layout
             activity: ActivityState::default(),
-            entity: None,
             model: None,
             provider: None,
             joined: true,
@@ -233,7 +232,6 @@ impl Constellation {
             parent_id: ctx_info.parent_id.as_ref().map(|p| p.to_string()),
             position: Vec2::ZERO,
             activity: ActivityState::Idle,
-            entity: None,
             model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
             provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
             joined: false,
@@ -306,8 +304,6 @@ pub struct ContextNode {
     pub position: Vec2,
     /// Current activity state (affects visual rendering)
     pub activity: ActivityState,
-    /// Entity ID when spawned
-    pub entity: Option<Entity>,
     /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
     pub model: Option<String>,
     /// LLM provider name (e.g. "anthropic", "google", "deepseek") for agent coloring

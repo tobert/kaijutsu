@@ -269,18 +269,6 @@ pub struct Theme {
     pub constellation_node_glow_streaming: Color,
     /// Node glow color for error state
     pub constellation_node_glow_error: Color,
-    /// Card width in pixels
-    pub constellation_card_width: f32,
-    /// Card height in pixels
-    pub constellation_card_height: f32,
-    /// Card border thickness in pixels
-    pub constellation_card_border_thickness: f32,
-    /// Card corner radius in pixels
-    pub constellation_card_corner_radius: f32,
-    /// Card glow radius (0.0-1.0)
-    pub constellation_card_glow_radius: f32,
-    /// Card glow intensity (0.0-1.0)
-    pub constellation_card_glow_intensity: f32,
     /// Connection line glow intensity (0.0-1.0)
     pub constellation_connection_glow: f32,
     /// Connection line color
@@ -503,12 +491,6 @@ impl Default for Theme {
             constellation_node_glow_active: Color::srgba(0.478, 0.635, 0.969, 0.6), // #7aa2f7
             constellation_node_glow_streaming: Color::srgba(0.620, 0.808, 0.416, 0.8), // #9ece6a
             constellation_node_glow_error: Color::srgba(0.969, 0.463, 0.557, 0.7), // #f7768e
-            constellation_card_width: 180.0,
-            constellation_card_height: 130.0,
-            constellation_card_border_thickness: 2.0,
-            constellation_card_corner_radius: 6.0,
-            constellation_card_glow_radius: 0.4,
-            constellation_card_glow_intensity: 0.7,
             constellation_connection_glow: 0.3,
             constellation_connection_color: Color::srgba(0.231, 0.259, 0.380, 0.5), // #3b4261
             constellation_particle_budget: 500,
@@ -550,12 +532,6 @@ impl Default for Theme {
     }
 }
 
-/// Helper to convert Bevy Color to Vec4 (for shader uniforms).
-pub fn color_to_vec4(color: Color) -> Vec4 {
-    let srgba = color.to_srgba();
-    Vec4::new(srgba.red, srgba.green, srgba.blue, srgba.alpha)
-}
-
 /// Map a provider string to an agent color from the theme.
 ///
 /// Uses substring matching: "anthropic" or "claude" → claude color, etc.
@@ -576,12 +552,6 @@ pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color 
     } else {
         theme.agent_color_default
     }
-}
-
-/// Helper to convert Bevy Color to linear Vec4 (for GPU storage buffers).
-pub fn color_to_linear_vec4(color: Color) -> Vec4 {
-    let linear = color.to_linear();
-    Vec4::new(linear.red, linear.green, linear.blue, linear.alpha)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

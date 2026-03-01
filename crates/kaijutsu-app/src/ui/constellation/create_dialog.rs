@@ -11,9 +11,6 @@ use kaijutsu_crdt::ContextId;
 use uuid::Uuid;
 
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
-use crate::text::KjUiText;
-use bevy_vello::prelude::UiVelloText;
-use crate::ui::theme::Theme;
 
 use super::NewContextConfig;
 
@@ -117,104 +114,6 @@ fn create_empty(
 pub fn setup_create_dialog_systems(app: &mut App) {
     app.register_type::<CreateContextNode>()
         .add_systems(Update, handle_create_node_click);
-}
-
-/// Spawn the "New" context tile (called from render.rs)
-pub fn spawn_create_context_node(
-    commands: &mut Commands,
-    container_entity: Entity,
-    theme: &Theme,
-    card_materials: &mut Assets<crate::shaders::ConstellationCardMaterial>,
-) {
-    use crate::shaders::ConstellationCardMaterial;
-    use crate::ui::theme::color_to_vec4;
-
-    let card_w = theme.constellation_card_width;
-    let card_h = theme.constellation_card_height;
-
-    // Create a distinct material for the New tile (dimmer, subtle)
-    let material = card_materials.add(ConstellationCardMaterial {
-        color: color_to_vec4(theme.fg_dim.with_alpha(0.4)),
-        params: Vec4::new(1.0, 6.0, 0.2, 0.3), // Thinner border, subtle glow
-        time: Vec4::ZERO,
-        mode: Vec4::ZERO, // No activity dot
-        dimensions: Vec4::new(card_w, card_h, 0.6, 0.0), // Dimmer opacity
-    });
-
-    let node_entity = commands
-        .spawn((
-            CreateContextNode,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                top: Val::Px(0.0),
-                width: Val::Px(card_w),
-                height: Val::Px(card_h),
-                ..default()
-            },
-            MaterialNode(material),
-            Interaction::None,
-        ))
-        .with_children(|parent| {
-            // "New" text in the center
-            parent.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-            ))
-            .with_children(|center| {
-                // TODO: explicit size — KjUiText no intrinsic sizing
-                center.spawn((
-                    KjUiText::new("New")
-                        .with_font_size(14.0)
-                        .with_color(theme.fg_dim),
-                    UiVelloText::default(),
-                    Node {
-                        width: Val::Px(40.0),
-                        height: Val::Px(16.0),
-                        ..default()
-                    },
-                ));
-            });
-
-            // Key hint label below
-            parent
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        bottom: Val::Px(-20.0),
-                        left: Val::Percent(50.0),
-                        margin: UiRect::left(Val::Px(-40.0)),
-                        width: Val::Px(80.0),
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                    BackgroundColor(theme.panel_bg.with_alpha(0.7)),
-                ))
-                .with_children(|label_bg| {
-                    // TODO: explicit size — KjUiText no intrinsic sizing
-                    label_bg.spawn((
-                        KjUiText::new("n")
-                            .with_font_size(10.0)
-                            .with_color(theme.fg_dim),
-                        UiVelloText::default(),
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(12.0),
-                            ..default()
-                        },
-                    ));
-                });
-        })
-        .id();
-
-    commands.entity(container_entity).add_child(node_entity);
-    info!("Spawned create context (New) tile");
 }
 
 /// Handle clicks on the "New" tile — instant context creation, no dialog.
