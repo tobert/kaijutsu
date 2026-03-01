@@ -29,17 +29,15 @@ pub enum CellPhase {
 }
 
 use crate::ui::tiling_reconciler::TilingPhase;
-use super::components::{
+use crate::view::{
     BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
     DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
     PendingContextSwitch, PromptSubmitted, RoleGroupBorderLayout, SubmitFailed,
-    ViewingConversation, WorkspaceLayout,
+    ViewingConversation, WorkspaceLayout, EditorEntities,
 };
 use super::block_border;
-use super::systems;
 
-// All systems now live in view/ modules. cell/systems.rs is dead code.
 use crate::view::cursor as view_cursor;
 use crate::view::lifecycle as view_lifecycle;
 use crate::view::overlay as view_overlay;
@@ -94,7 +92,7 @@ impl Plugin for CellPlugin {
             .init_resource::<SessionAgent>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
-            .init_resource::<systems::EditorEntities>();
+            .init_resource::<EditorEntities>();
 
         // ====================================================================
         // CellPhase::Input — click-to-focus only

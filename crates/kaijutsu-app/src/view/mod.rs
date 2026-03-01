@@ -9,7 +9,7 @@
 //! - `lifecycle` — spawn/despawn block cell entities (TopLeft anchor, no UiTransform)
 //! - `render` — buffer sync (text → UiVelloText), layout readback
 
-mod components;
+pub mod components;
 pub mod document;
 pub mod fieldset;
 pub mod cursor;
@@ -21,6 +21,8 @@ pub mod scroll;
 pub mod submit;
 pub mod sync;
 
-// Re-export all public types for the facade
+// Re-export all public types
 pub use components::*;
+pub use cursor::CursorMarker;
 pub use document::{CachedDocument, DocumentCache};
+pub use lifecycle::EditorEntities;

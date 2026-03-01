@@ -10,8 +10,19 @@ use bevy::ui::measurement::ContentSize;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor, CellPosition, CellState,
-    EditorEntities, LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout,
+    LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout,
 };
+
+/// Consolidated resource tracking editor-related singleton entities.
+#[derive(Resource, Default)]
+pub struct EditorEntities {
+    /// The cursor UI entity.
+    pub cursor: Option<Entity>,
+    /// The main conversation cell entity.
+    pub main_cell: Option<Entity>,
+    /// The ConversationContainer entity (flex parent for BlockCells).
+    pub conversation_container: Option<Entity>,
+}
 use crate::text::{KjText, KjTextEffects};
 use crate::ui::timeline::TimelineVisibility;
 

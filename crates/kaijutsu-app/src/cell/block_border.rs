@@ -6,12 +6,11 @@
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
 
-use super::components::{
+use crate::view::{
     BlockCell, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell,
-    BlockCellContainer, Role,
+    BlockCellContainer, EditorEntities, Role,
 };
-use super::fieldset;
-use super::systems::EditorEntities;
+use crate::view::fieldset;
 use crate::text::FontHandles;
 use crate::ui::theme::Theme;
 
