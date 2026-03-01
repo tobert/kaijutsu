@@ -3,6 +3,11 @@
 //! Sets `ContentSize` on BlockCells using `FixedMeasure` with estimated
 //! heights from text length. This lets Bevy's taffy layout engine
 //! compute correct heights for BlockCells without manual height tracking.
+//!
+//! **Important:** Width and char_width calculations MUST match
+//! `layout_block_cells` in systems.rs. If they diverge, Taffy gets two
+//! conflicting height signals (ContentSize vs min_height) and picks the
+//! larger one, causing blocks to be taller than their text.
 
 use bevy::prelude::*;
 use bevy::ui::measurement::{ContentSize, FixedMeasure, NodeMeasure};
@@ -11,8 +16,13 @@ use bevy_vello::prelude::UiVelloText;
 use super::components::{
     BlockCell, BlockCellContainer, ConversationContainer, WorkspaceLayout,
 };
-use super::systems::EditorEntities;
+use super::systems::{EditorEntities, MONOSPACE_WIDTH_RATIO};
+use crate::text::TextMetrics;
 use crate::ui::tiling::PaneFocus;
+
+/// Horizontal decoration on ConversationContainer: 2px border + 16px padding
+/// on each side = 36px total. Must match the value in `layout_block_cells`.
+const CONTAINER_H_DECORATION: f32 = 36.0;
 
 /// Update `ContentSize` on BlockCells with estimated line counts.
 ///
@@ -31,6 +41,7 @@ pub fn update_block_measures(
         With<BlockCell>,
     >,
     layout: Res<WorkspaceLayout>,
+    text_metrics: Res<TextMetrics>,
     conv_containers: Query<
         &ComputedNode,
         (With<ConversationContainer>, With<PaneFocus>),
@@ -48,7 +59,8 @@ pub fn update_block_measures(
         return;
     };
 
-    let margin = layout.workspace_margin_left;
+    // Use the same width calculation as layout_block_cells:
+    // container outer width minus padding+border on each side.
     let base_width = conv_containers
         .iter()
         .next()
@@ -61,7 +73,7 @@ pub fn update_block_measures(
                 .map(|w| w.resolution.width())
                 .unwrap_or(1280.0)
         });
-    let base_width = base_width - (margin * 2.0);
+    let base_width = base_width - CONTAINER_H_DECORATION;
 
     let width_changed = (base_width - *last_base_width).abs() > 1.0;
     let content_changed = layout_gen.0 != *last_gen;
@@ -71,6 +83,9 @@ pub fn update_block_measures(
     }
     *last_gen = layout_gen.0;
     *last_base_width = base_width;
+
+    // Same char_width formula as layout_block_cells
+    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
 
     for entity in &container.block_cells {
         let Ok((vello_text, mut content_size)) = block_cells.get_mut(*entity) else {
@@ -84,7 +99,6 @@ pub fn update_block_measures(
         let wrap_width = base_width;
 
         // Estimate line count from text length and wrap width
-        let char_width = layout.line_height * 0.6; // approximate monospace
         let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
         let text = &vello_text.value;
         let line_count = text.split('\n').map(|line| {

@@ -372,7 +372,7 @@ pub struct EditorEntities {
 // Font metrics are now read from TextMetrics resource instead of hardcoded constants.
 // This ensures cursor positioning matches actual text rendering.
 // Monospace char width is approximately 0.6x the font size.
-const MONOSPACE_WIDTH_RATIO: f32 = 0.6;
+pub(crate) const MONOSPACE_WIDTH_RATIO: f32 = 0.6;
 
 /// Spawn the cursor entity if it doesn't exist.
 pub fn spawn_cursor(
@@ -1827,10 +1827,11 @@ pub fn spawn_block_cells(
                         width: Val::Percent(100.0),
                         ..default()
                     },
-                    // UiGlobalTransform is at node center; shift x to left edge.
-                    // Combined with VelloTextAnchor::Left for correct vertical offset.
+                    // UiGlobalTransform is at node center; shift to top-left corner.
+                    // x: -50% shifts center→left edge, y: -50% shifts center→top edge.
+                    // VelloTextAnchor::TopLeft renders text from this origin downward.
                     UiTransform {
-                        translation: Val2 { x: Val::Percent(-50.0), y: Val::Auto },
+                        translation: Val2 { x: Val::Percent(-50.0), y: Val::Percent(-50.0) },
                         ..UiTransform::IDENTITY
                     },
                     TimelineVisibility {
@@ -2019,7 +2020,7 @@ pub fn init_block_cell_buffers(
                 },
                 ..default()
             },
-            VelloTextAnchor::Left,
+            VelloTextAnchor::TopLeft,
         ));
     }
 }
