@@ -43,7 +43,8 @@ fn load_fonts(
 ) {
     font_handles.mono = asset_server.load("fonts/NotoMono-Regular.ttf");
     font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
-    info!("Loaded Vello fonts: NotoMono, NotoSerif");
+    font_handles.cjk = asset_server.load("fonts/NotoSansCJKJP-Light.ttf");
+    info!("Loaded Vello fonts: NotoMono, NotoSerif, NotoSansCJKJP");
 }
 
 /// Measure actual line height from the loaded font.

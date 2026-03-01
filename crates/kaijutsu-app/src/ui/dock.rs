@@ -306,7 +306,8 @@ pub fn render_north_dock(
     let pad_h = 16.0_f64;
     let pad_v = 6.0_f64;
 
-    // Left group: title
+    // Left group: title (CJK font for kanji, falls back to mono)
+    let title_font = fonts.get(&font_handles.cjk).unwrap_or(font);
     let title_brush = bevy_color_to_brush(theme.accent);
     draw_dock_text(
         &mut scene,
@@ -314,7 +315,7 @@ pub fn render_north_dock(
         pad_h,
         pad_v,
         dock_state.title.font_size,
-        font,
+        title_font,
         &title_brush,
     );
 

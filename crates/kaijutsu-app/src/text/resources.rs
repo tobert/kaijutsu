@@ -10,6 +10,8 @@ pub struct FontHandles {
     pub mono: Handle<VelloFont>,
     /// Serif font (secondary — headings, prose).
     pub serif: Handle<VelloFont>,
+    /// CJK font (Noto Sans CJK JP Light — Japanese/Chinese/Korean glyphs).
+    pub cjk: Handle<VelloFont>,
 }
 
 impl Default for FontHandles {
@@ -17,6 +19,7 @@ impl Default for FontHandles {
         Self {
             mono: Handle::default(),
             serif: Handle::default(),
+            cjk: Handle::default(),
         }
     }
 }
