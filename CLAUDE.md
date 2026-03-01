@@ -363,7 +363,7 @@ kaijutsu/
 │   ├── kaijutsu-kernel/     # Kernel, VFS, ToolRegistry, McpServerPool, FlowBus
 │   ├── kaijutsu-client/     # RPC client library
 │   ├── kaijutsu-server/     # SSH server, EmbeddedKaish, KaijutsuBackend
-│   ├── kaijutsu-app/        # Bevy 0.18 GUI with MSDF text rendering
+│   ├── kaijutsu-app/        # Bevy 0.18 GUI with Vello text rendering
 │   ├── kaijutsu-mcp/        # MCP server (25 tools: docs/blocks/drift/execution/identity)
 │   └── kaijutsu-telemetry/  # OpenTelemetry (W3C context propagation, sampling)
 └── docs/
@@ -461,30 +461,30 @@ When Claude runs in a graphical session, use `mcp__bevy_brp__*` tools directly i
 
 ### BRP-Reflectable Types for Debugging
 
-Many cell and UI components are registered for BRP reflection, enabling runtime inspection:
+Many view and UI components are registered for BRP reflection, enabling runtime inspection.
+Types live in `view/components.rs`; `cell/` is a facade that re-exports from `view/`.
 
 **Resources** (use `world_get_resources`):
-- `kaijutsu_app::cell::components::WorkspaceLayout` — margins, line height, cell limits
-- `kaijutsu_app::cell::components::FocusedCell` — which entity has keyboard focus
-- `kaijutsu_app::cell::components::ConversationScrollState` — scroll offset, content height, following mode
+- `kaijutsu_app::view::components::WorkspaceLayout` — margins, cell limits
+- `kaijutsu_app::view::components::ConversationScrollState` — scroll offset, content height, following mode
 - `kaijutsu_app::input::focus::FocusArea` — Compose/Constellation/Dialog (replaced CurrentMode)
 
 **Components** (use `world_query` with filter):
 - `Cell`, `CellId`, `CellPosition`, `CellState` — cell identity and visual state
 - `ViewingConversation` — conversation_id, last_sync_version (0 = empty doc)
 - `BlockCellContainer` — block_cells Vec<Entity>, role_headers (HashMap is ignored)
-- `BlockCellLayout`, `RoleHeaderLayout` — y_offset, height, indent for layout debugging
+- `BlockCellLayout`, `RoleGroupBorderLayout` — y_offset, height, indent for layout debugging
 
 **Not reflectable** (contain CRDT types without Default):
-- `CellEditor` — contains BlockDocument
+- `CellEditor` — contains BlockStore
 - `BlockCell` — contains BlockId
-- `RoleHeader` — contains BlockId
+- `RoleGroupBorder` — contains BlockId
 
 Example debug query:
 ```
 mcp__bevy_brp__world_query(
-  data={"components": ["kaijutsu_app::cell::components::BlockCellContainer"]},
-  filter={"with": ["kaijutsu_app::cell::components::MainCell"]}
+  data={"components": ["kaijutsu_app::view::components::BlockCellContainer"]},
+  filter={"with": ["kaijutsu_app::view::components::MainCell"]}
 )
 ```
 
@@ -552,30 +552,14 @@ fn handle_input(mut keyboard: MessageReader<KeyboardInput>) {
 - Apple removed subpixel AA entirely in macOS Mojave (2018)
 - The "ClearType look" comes from stem darkening + gamma correction, not subpixels
 
-### MTSDF Over Direct Vector
+### Vello Text Rendering (Current)
 
-Dense code text (10k+ glyphs at 4K) is too ALU-heavy for per-pixel Bézier evaluation on integrated GPUs. MTSDF provides:
+Text rendering uses `bevy_vello` (local fork at `~/src/research/bevy_vello`) with Parley for text layout.
+MSDF pipeline was deleted. Key architecture:
 
-- Constant-time fragment shader regardless of glyph complexity
-- Scalable rendering at any zoom level
-- Support for effects (glow, weight variation) without re-rasterizing
-
-### Core Quality Techniques
-
-| Technique | Implementation |
-|-----------|---------------|
-| **Stem darkening** | `stem_darkening` uniform (0.15 default) shifts SDF bias inversely proportional to font size. The #1 technique for ClearType-quality at 12-16px. |
-| **Shader hinting** | Gradient-based stroke detection (astiopin/webgl_fonts). Sharpens horizontal strokes, softens vertical for balanced weight. |
-| **Semantic weighting** | `importance` field on glyphs (0.0 = faded, 0.5 = normal, 1.0 = bold). Enables cursor proximity emphasis and agent activity highlighting. |
-| **Pixel alignment** | CPU-side baseline snapping + x-height grid fitting in `MsdfTextBuffer::update_glyphs()`. |
-
-### TAA Investigation
-
-Bevy 0.18 has TAA in `bevy_anti_alias::taa`. Key components:
-
-- `TemporalAntiAliasing` component enables TAA on cameras
-- `TemporalJitter` applies Halton(2,3) sequence offsets (8 samples)
-- Requires `DepthPrepass` + `MotionVectorPrepass`
-- Text could potentially use TAA for temporal super-resolution on static text
-
-**Note:** TAA is designed for 3D scenes. Integration with 2D text overlay would require investigation.
+- `VelloTextAnchor::TopLeft` — text starts at content box top-left
+- Bevy flex layout handles all positioning (no `UiTransform` hacks)
+- Parley measures text height via `ContentSize` — no manual height estimation
+- `readback_block_heights` in PostUpdate reads actual Taffy-computed sizes
+- Block indentation via `Node { margin }`, not transforms
+- Only 2 shader materials remain: `CursorBeamMaterial`, `ConstellationCardMaterial`
