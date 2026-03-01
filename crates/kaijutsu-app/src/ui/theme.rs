@@ -232,6 +232,17 @@ pub struct Theme {
     pub md_strong_color: Option<Color>,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Sparkline Rendering
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Height of sparkline mini-charts in pixels.
+    pub sparkline_height: f32,
+    /// Sparkline line color.
+    pub sparkline_line_color: Color,
+    /// Sparkline fill color (area under the curve). None = no fill.
+    pub sparkline_fill_color: Option<Color>,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Font Effects
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -474,6 +485,11 @@ impl Default for Theme {
             md_code_fg: Color::srgb(0.620, 0.808, 0.416),       // #9ece6a green
             md_code_block_fg: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             md_strong_color: None,
+
+            // Sparkline rendering
+            sparkline_height: 48.0,
+            sparkline_line_color: Color::srgb(0.490, 0.812, 1.00), // #7dcfff Tokyo Night cyan
+            sparkline_fill_color: Some(Color::srgba(0.490, 0.812, 1.00, 0.15)), // cyan 15% alpha
 
             // Font effects
             font_rainbow: true,

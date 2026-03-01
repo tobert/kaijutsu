@@ -1,13 +1,11 @@
-//! Rich text rendering via Parley + Vello.
+//! Rich content rendering via Parley + Vello.
 //!
-//! Renders markdown-styled text with per-span coloring by:
-//! 1. Parsing markdown → `Vec<RichSpan>` (via `markdown::parse_to_rich_spans`)
-//! 2. Building a Parley layout from the plain text (via `VelloFont::layout`)
-//! 3. Rendering glyph runs with per-span brushes (color from theme)
+//! Supports multiple content formats via `RichContentKind`:
+//! - **Markdown**: per-span brush coloring (headings, code, bold, etc.)
+//! - **Sparkline**: inline timeseries mini-charts (pure Vello vector paths)
 //!
-//! Since we use monospace fonts, glyph positions are identical regardless of
-//! style. Only the brush (color) varies per span — no need for per-span Parley
-//! styles, which would require access to bevy_vello's internal FontContext.
+//! Detection is centralized in `detect_rich_content()` — tries sparkline first
+//! (more specific fence pattern), then falls back to markdown.
 
 use bevy::prelude::*;
 use bevy_vello::prelude::*;
@@ -16,6 +14,7 @@ use vello::kurbo::Affine;
 use vello::peniko::{Brush, Fill};
 
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
+use super::sparkline::{SparklineData, SparklineColors, try_parse_sparkline, build_sparkline_paths, render_sparkline_scene};
 use super::components::bevy_color_to_brush;
 
 /// Per-span brush mapping: byte range → Brush.
@@ -28,21 +27,41 @@ struct SpanBrush {
     brush: Brush,
 }
 
-/// Rich text content for a block cell.
+/// Rich content for a block cell — dispatches rendering by format.
 ///
 /// When present on a block cell entity alongside `UiVelloText`,
-/// the `render_rich_text` system will build a `UiVelloScene` with
-/// per-span colored text.
+/// the `render_rich_content` system will render the appropriate format.
 #[derive(Component)]
-pub struct RichTextContent {
-    /// Parsed markdown spans.
-    pub spans: Vec<RichSpan>,
-    /// Concatenated plain text (matches UiVelloText.value).
-    pub plain_text: String,
+pub struct RichContent {
+    pub kind: RichContentKind,
     /// Version tracking — skip re-render when unchanged.
     pub version: u64,
     /// Last rendered version.
     pub last_render_version: u64,
+}
+
+impl RichContent {
+    /// Desired height for non-text content (sparklines).
+    ///
+    /// Returns `Some(height)` for formats that need explicit sizing
+    /// (no Parley text to measure). Returns `None` for text-based formats.
+    pub fn desired_height(&self, theme: &crate::ui::theme::Theme) -> Option<f32> {
+        match &self.kind {
+            RichContentKind::Markdown { .. } => None,
+            RichContentKind::Sparkline(_) => Some(theme.sparkline_height),
+        }
+    }
+}
+
+/// The actual content variant being rendered.
+pub enum RichContentKind {
+    /// Markdown with per-span brush coloring.
+    Markdown {
+        spans: Vec<RichSpan>,
+        plain_text: String,
+    },
+    /// Inline timeseries mini-chart.
+    Sparkline(SparklineData),
 }
 
 /// Build a `Vec<SpanBrush>` from parsed spans + theme colors.
@@ -155,29 +174,18 @@ fn render_layout_with_brushes(
     }
 }
 
-/// System: render `RichTextContent` blocks as `UiVelloScene`.
+/// System: render `RichContent` blocks as `UiVelloScene`.
 ///
-/// For entities that have both `UiVelloText` (for layout measurement) and
-/// `RichTextContent` (parsed markdown), this system:
-/// 1. Builds a Parley layout from the plain text
-/// 2. Maps spans to per-run brushes
-/// 3. Renders to a `vello::Scene`
-/// 4. Inserts/updates `UiVelloScene` on the entity
-///
-/// The `UiVelloText.style.brush` is set to transparent so only the
-/// scene renders visually. The UiVelloText still provides content sizing
-/// for layout_block_cells.
-pub fn render_rich_text(
+/// Dispatches on `RichContentKind`:
+/// - **Markdown**: builds Parley layout with per-span brushes
+/// - **Sparkline**: renders Vello vector paths (line + fill)
+pub fn render_rich_content(
     mut commands: Commands,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<super::resources::FontHandles>,
     theme: Res<crate::ui::theme::Theme>,
-    mut query: Query<(Entity, &mut RichTextContent, &UiVelloText, &ComputedNode)>,
+    mut query: Query<(Entity, &mut RichContent, &UiVelloText, &ComputedNode)>,
 ) {
-    let Some(font) = fonts.get(&font_handles.mono) else {
-        return;
-    };
-
     let md_colors = MarkdownColors {
         heading: theme.md_heading_color,
         code: theme.md_code_fg,
@@ -185,52 +193,77 @@ pub fn render_rich_text(
         code_block: theme.md_code_block_fg,
     };
 
+    let sparkline_colors = SparklineColors {
+        line: theme.sparkline_line_color,
+        fill: theme.sparkline_fill_color,
+    };
+
     for (entity, mut rich, vello_text, node) in query.iter_mut() {
         if rich.version == rich.last_render_version {
             continue;
         }
 
-        // Use computed node width for word wrapping
-        let max_advance = {
-            let w = node.size().x;
-            if w > 0.0 { Some(w) } else { None }
-        };
-
-        // Build layout using VelloFont (same as UiVelloText's internal layout)
-        let layout = font.layout(
-            &rich.plain_text,
-            &vello_text.style,
-            vello_text.text_align,
-            max_advance,
-        );
-
-        // Map markdown spans → brush per byte range
-        let span_brushes = build_span_brushes(
-            &rich.spans,
-            theme.block_assistant, // base color for Model/Text blocks
-            &md_colors,
-        );
-
-        let fallback_brush = bevy_color_to_brush(theme.block_assistant);
-
-        // Render layout to scene with per-span brushes
         let mut scene = vello::Scene::new();
-        render_layout_with_brushes(&mut scene, &layout, &span_brushes, &fallback_brush);
+
+        match &rich.kind {
+            RichContentKind::Markdown { spans, plain_text } => {
+                let Some(font) = fonts.get(&font_handles.mono) else {
+                    continue;
+                };
+
+                let max_advance = {
+                    let w = node.size().x;
+                    if w > 0.0 { Some(w) } else { None }
+                };
+
+                let layout = font.layout(
+                    plain_text,
+                    &vello_text.style,
+                    vello_text.text_align,
+                    max_advance,
+                );
+
+                let span_brushes = build_span_brushes(
+                    spans,
+                    theme.block_assistant,
+                    &md_colors,
+                );
+
+                let fallback_brush = bevy_color_to_brush(theme.block_assistant);
+                render_layout_with_brushes(&mut scene, &layout, &span_brushes, &fallback_brush);
+            }
+            RichContentKind::Sparkline(data) => {
+                let w = node.size().x as f64;
+                let h = theme.sparkline_height as f64;
+                if w > 0.0 && h > 0.0 {
+                    let paths = build_sparkline_paths(data, w, h, 4.0);
+                    render_sparkline_scene(&mut scene, &paths, &sparkline_colors);
+                }
+            }
+        }
 
         commands.entity(entity).insert(UiVelloScene::from(scene));
-
         rich.last_render_version = rich.version;
     }
 }
 
-/// Parse a block's content into `RichTextContent` if it contains markdown.
+/// Detect rich content from a block's text.
 ///
-/// Called from `sync_block_cell_buffers` for Model/Text blocks.
-/// Returns None for plain text that has no markdown formatting.
-pub fn parse_rich_content(text: &str, version: u64) -> Option<RichTextContent> {
+/// Tries sparkline first (more specific fence pattern), then markdown.
+/// Returns `None` for plain text with no formatting.
+pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
+    // Try sparkline first — more specific pattern
+    if let Some(data) = try_parse_sparkline(text) {
+        return Some(RichContent {
+            kind: RichContentKind::Sparkline(data),
+            version,
+            last_render_version: 0,
+        });
+    }
+
+    // Fall back to markdown
     let spans = parse_to_rich_spans(text);
 
-    // Skip rich rendering for trivially plain text (all spans are unstyled)
     let has_formatting = spans.iter().any(|s| {
         s.bold || s.italic || s.code || s.code_block || s.heading_level.is_some()
     });
@@ -239,12 +272,10 @@ pub fn parse_rich_content(text: &str, version: u64) -> Option<RichTextContent> {
         return None;
     }
 
-    // Concatenate span text to rebuild the plain text
     let plain_text: String = spans.iter().map(|s| s.text.as_str()).collect();
 
-    Some(RichTextContent {
-        spans,
-        plain_text,
+    Some(RichContent {
+        kind: RichContentKind::Markdown { spans, plain_text },
         version,
         last_render_version: 0,
     })

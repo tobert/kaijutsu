@@ -31,7 +31,7 @@ impl Plugin for KjTextPlugin {
                 update_text_metrics_from_font,
                 sync_kj_ui_text,
                 animate_rainbow_text,
-                super::rich::render_rich_text,
+                super::rich::render_rich_content,
             ));
     }
 }

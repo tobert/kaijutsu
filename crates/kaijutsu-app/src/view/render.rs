@@ -151,17 +151,22 @@ pub fn sync_block_cell_buffers(
             vello_text.value = text.clone();
         }
 
-        // Rich markdown rendering for Model/Text blocks
+        // Rich content rendering for Model/Text blocks (markdown, sparklines)
         let is_rich = block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::Model;
         if is_rich {
-            if let Some(rich) = crate::text::parse_rich_content(&text, doc_version) {
+            if let Some(rich) = crate::text::detect_rich_content(&text, doc_version) {
+                // For sparklines: clear text so Parley won't fight min_height
+                let is_sparkline = matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
+                if is_sparkline {
+                    vello_text.value = String::new();
+                }
                 vello_text.style.brush = bevy_color_to_brush(Color::NONE);
                 commands.entity(*entity).insert(rich);
             } else {
-                commands.entity(*entity).remove::<crate::text::RichTextContent>();
+                commands.entity(*entity).remove::<crate::text::RichContent>();
             }
         } else {
-            commands.entity(*entity).remove::<crate::text::RichTextContent>();
+            commands.entity(*entity).remove::<crate::text::RichContent>();
         }
 
         // Apply color (skip when rainbow or rich is active)
@@ -253,14 +258,21 @@ pub fn layout_block_cells(
 
 /// Sync BlockCellLayout indentation to Bevy Node for flex layout.
 ///
-/// Sets margin (indent), width, and padding on block cell nodes. Heights are
-/// determined by Parley text measurement via bevy_vello's ContentSize.
+/// Sets margin (indent), width, min_height, and padding on block cell nodes.
+/// Text block heights are determined by Parley via ContentSize.
+/// Non-text rich content (sparklines) gets explicit min_height from the theme.
 pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut Node, Option<&crate::cell::block_border::BlockBorderStyle>), With<BlockCell>>,
+    mut block_cells: Query<(
+        &BlockCellLayout,
+        &mut Node,
+        Option<&crate::cell::block_border::BlockBorderStyle>,
+        Option<&crate::text::RichContent>,
+    ), With<BlockCell>>,
     mut role_header_nodes: Query<&mut Node, (With<RoleGroupBorder>, Without<BlockCell>)>,
     layout_gen: Res<LayoutGeneration>,
+    theme: Res<Theme>,
     mut last_gen: Local<u64>,
 ) {
     if layout_gen.0 == *last_gen {
@@ -276,7 +288,7 @@ pub fn update_block_cell_nodes(
     };
 
     for entity in &container.block_cells {
-        let Ok((layout, mut node, border_style)) = block_cells.get_mut(*entity) else {
+        let Ok((layout, mut node, border_style, rich_content)) = block_cells.get_mut(*entity) else {
             continue;
         };
         let target_padding = if let Some(style) = border_style {
@@ -308,6 +320,15 @@ pub fn update_block_cell_nodes(
         }
         if node.padding != target_padding {
             node.padding = target_padding;
+        }
+
+        // Set explicit min_height for non-text rich content (sparklines)
+        let target_min_height = rich_content
+            .and_then(|rc| rc.desired_height(&theme))
+            .map(Val::Px)
+            .unwrap_or(Val::Auto);
+        if node.min_height != target_min_height {
+            node.min_height = target_min_height;
         }
     }
 
