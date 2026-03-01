@@ -12,7 +12,7 @@ use super::components::{
 use crate::input::FocusArea;
 use crate::conversation::ActiveContext;
 use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush, parse_rich_content};
-use bevy_vello::prelude::{UiVelloText, VelloTextAnchor};
+use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 
@@ -240,12 +240,12 @@ pub fn sync_cell_buffers(
 /// computes CellState.computed_height for non-MainCell cells.
 pub fn compute_cell_heights(
     mut cells: Query<(&CellEditor, &mut CellState, Option<&MainCell>), Changed<CellEditor>>,
+    text_metrics: Res<TextMetrics>,
     layout: Res<WorkspaceLayout>,
 ) {
     for (editor, mut state, main_cell) in cells.iter_mut() {
-        // MainCell content height is computed by layout_block_cells
-        // which accounts for per-block visual wrapping, indentation,
-        // role headers, and spacing. Skip it here to avoid competing writes.
+        // MainCell content height is computed by readback_block_heights (PostUpdate)
+        // which reads real Parley-measured heights from Taffy. Skip here.
         if main_cell.is_some() {
             continue;
         }
@@ -256,7 +256,13 @@ pub fn compute_cell_heights(
             editor.text()
         };
         let line_count = display_text.lines().count().max(1);
-        state.computed_height = layout.height_for_lines(line_count);
+        let content_height = (line_count as f32) * text_metrics.cell_line_height + 4.0;
+        let height = content_height.max(layout.min_cell_height);
+        state.computed_height = if layout.max_cell_height > 0.0 {
+            height.min(layout.max_cell_height)
+        } else {
+            height
+        };
     }
 }
 
@@ -2007,12 +2013,23 @@ pub fn init_block_cell_buffers(
     mut commands: Commands,
     block_cells: Query<Entity, (With<BlockCell>, With<KjText>, Without<UiVelloText>)>,
     font_handles: Res<FontHandles>,
+    fonts: Res<Assets<VelloFont>>,
     text_metrics: Res<TextMetrics>,
 ) {
+    // Wait until the font asset is actually loaded. If we insert UiVelloText
+    // before the font is ready, bevy_vello's content sizing skips the entity
+    // (can't get font → continue). ContentSize stays at 0, and since neither
+    // UiVelloText nor ComputedNode change afterward, bevy_vello never re-runs.
+    // Deferring insertion until the font is loaded ensures bevy_vello computes
+    // a real height on the first PostUpdate pass after insertion.
+    if fonts.get(&font_handles.mono).is_none() {
+        return;
+    }
+
     for entity in block_cells.iter() {
         commands.entity(entity).try_insert((
             UiVelloText {
-                value: String::new(),
+                value: "IF_YOU_SEE_THIS_THERE_IS_A_BUG".to_string(),
                 style: bevy_vello::prelude::VelloTextStyle {
                     font: font_handles.mono.clone(),
                     brush: bevy_color_to_brush(Color::WHITE),
@@ -2187,28 +2204,26 @@ pub fn sync_block_cell_buffers(
 ///
 /// Computes heights and positions for each block, accounting for:
 /// - Block content height (using visual line count after wrapping)
-/// - Spacing between blocks
 /// - Indentation for nested tool results
-/// - Space for turn headers before first block of each turn
 ///
-/// **Performance optimization:** This system tracks the last layout generation
-/// and window size. It skips expensive recomputation when neither content nor
-/// window has changed. This makes scrolling feel instant regardless of block count.
+/// Heights and scroll content_height are set by `readback_block_heights` in
+/// PostUpdate after Parley/Taffy have measured and laid out the actual text.
+///
+/// **Performance optimization:** Skips recomputation when layout generation
+/// hasn't changed (no new blocks).
 pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout, &UiVelloText, Option<&super::block_border::BlockBorderStyle>)>,
-    mut role_headers: Query<(&RoleGroupBorder, &mut RoleGroupBorderLayout)>,
-    layout: Res<WorkspaceLayout>,
-    text_metrics: Res<TextMetrics>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-    conv_containers: Query<&ComputedNode, (With<super::components::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
-    windows: Query<&Window>,
-    mut layout_gen: ResMut<super::components::LayoutGeneration>,
+    mut block_cells: Query<(&BlockCell, &mut BlockCellLayout)>,
+    layout_gen: Res<super::components::LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
-    mut last_base_width: Local<f32>,
 ) {
+    if layout_gen.0 == *last_layout_gen {
+        return;
+    }
+    *last_layout_gen = layout_gen.0;
+
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -2221,83 +2236,21 @@ pub fn layout_block_cells(
         return;
     };
 
-    let mut y_offset = 0.0;
-
-    // Horizontal decoration on ConversationContainer: 2px border + 16px padding on each side = 36px total.
-    const CONTAINER_H_DECORATION: f32 = 36.0;
-
-    // Get pane width from the focused ConversationContainer's ComputedNode.
-    // Falls back to window width on first frame before layout runs.
-    let base_width = conv_containers.iter().next()
-        .map(|node| node.size().x)
-        .filter(|w| *w > 0.0)
-        .unwrap_or_else(|| {
-            windows.iter().next()
-                .map(|w| w.resolution.width())
-                .unwrap_or(1280.0)
-        });
-    let base_width = base_width - CONTAINER_H_DECORATION;
-
-    // === Performance optimization: skip if nothing changed ===
-    let width_changed = (base_width - *last_base_width).abs() > 1.0;
-    let content_changed = layout_gen.0 != *last_layout_gen;
-
-    if !width_changed && !content_changed {
-        return;
-    }
-
-    *last_base_width = base_width;
-    *last_layout_gen = layout_gen.0;
-
-    // When width changes, bump layout_gen so update_block_cell_nodes picks up new heights.
-    if width_changed && !content_changed {
-        layout_gen.bump();
-        *last_layout_gen = layout_gen.0;
-    }
-
-    // Note: visible_height is updated in smooth_scroll from ConversationContainer's ComputedNode
-
-    // Single blocks() call — build borrowed lookup and role transition map
+    // Single blocks() call — build lookup for indent computation
     let blocks_ordered = editor.blocks();
     let block_lookup: std::collections::HashMap<&kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
         blocks_ordered.iter().map(|b| (&b.id, b)).collect();
 
-    // Track role transitions for inline headers
-    let mut prev_role: Option<Role> = None;
-    let mut block_is_role_transition: std::collections::HashMap<&kaijutsu_crdt::BlockId, bool> =
-        std::collections::HashMap::new();
-    for block in &blocks_ordered {
-        let is_transition = prev_role != Some(block.role);
-        block_is_role_transition.insert(&block.id, is_transition);
-        prev_role = Some(block.role);
-    }
-
-    // Determine indentation: ToolResult blocks with a tool_call_id are nested
-
     for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout, vello_text, border_style)) = block_cells.get_mut(*entity) else {
+        let Ok((block_cell, mut block_layout)) = block_cells.get_mut(*entity) else {
             continue;
         };
 
-        // Check if this is a role transition - if so, position the role header and add space
-        if block_is_role_transition.get(&block_cell.block_id) == Some(&true) {
-            // Find and position the role header for this block
-            for (header, mut header_layout) in role_headers.iter_mut() {
-                if header.block_id == block_cell.block_id {
-                    header_layout.y_offset = y_offset;
-                    break;
-                }
-            }
-            y_offset += ROLE_HEADER_HEIGHT + ROLE_HEADER_SPACING;
-        }
-
         // Determine indentation level based on parent_id (DAG nesting)
         let indent_level = if let Some(block) = block_lookup.get(&block_cell.block_id) {
-            // ToolResult blocks with a tool_call_id are nested under the tool call
             if block.kind == BlockKind::ToolResult && block.tool_call_id.is_some() {
                 1
             } else if block.parent_id.is_some() {
-                // Any block with a parent_id gets indented
                 1
             } else {
                 0
@@ -2306,46 +2259,17 @@ pub fn layout_block_cells(
             0
         };
 
-        // Calculate wrap width accounting for indentation.
-        // Border padding is on Node.padding — taffy subtracts it from available
-        // width automatically, so we don't account for it here.
-        let indent = indent_level as f32 * INDENT_WIDTH;
-        let wrap_width = base_width - indent;
-
-        // Estimate line count from text length and wrap width.
-        // Vello handles actual text shaping; this is a layout height estimate.
-        let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
-        let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
-        let text = &vello_text.value;
-        let line_count = text.split('\n').map(|line| {
-            if line.is_empty() { 1 } else { (line.len() + chars_per_line - 1) / chars_per_line }
-        }).sum::<usize>().max(1);
-        // Height: lines + minimal padding + border padding.
-        // We include border padding so content_height matches taffy's content_size
-        // (taffy adds Node.padding to min_height for the layout box).
-        // TODO(dedup): inline height formula duplicates WorkspaceLayout::height_for_lines
-        let padding_v = border_style
-            .map(|s| s.padding.top + s.padding.bottom)
-            .unwrap_or(0.0);
-        let height = (line_count as f32) * layout.line_height + 4.0 + padding_v;
-
-        block_layout.y_offset = y_offset;
-        block_layout.height = height;
-        block_layout.indent_level = indent_level;
-
-        y_offset += height + BLOCK_SPACING;
-    }
-
-    // Update scroll state with total content height (guard to avoid spurious change detection)
-    if (scroll_state.content_height - y_offset).abs() > 0.5 {
-        scroll_state.content_height = y_offset;
+        if block_layout.indent_level != indent_level {
+            block_layout.indent_level = indent_level;
+        }
     }
 }
 
-/// Sync BlockCellLayout heights/indentation to Bevy Node for flex layout.
+/// Sync BlockCellLayout indentation to Bevy Node for flex layout.
 ///
-/// After `layout_block_cells` computes heights, this system writes them to the
-/// Node component so Bevy's flex layout knows how tall each block should be.
+/// Sets margin (indent), width, and padding on block cell nodes. Heights are
+/// determined by Parley text measurement via bevy_vello's ContentSize, not by
+/// min_height — Taffy sizes boxes from the real text metrics.
 pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
@@ -2354,7 +2278,6 @@ pub fn update_block_cell_nodes(
     layout_gen: Res<super::components::LayoutGeneration>,
     mut last_gen: Local<u64>,
 ) {
-    // Run when layout_gen changes (content changes or width changes trigger a bump)
     if layout_gen.0 == *last_gen {
         return;
     }
@@ -2373,27 +2296,17 @@ pub fn update_block_cell_nodes(
         };
         // Set padding from border style so text sits inside the content box
         // while the border (absolute child at 100%×100%) fills the border box.
-        let (target_padding, padding_v) = if let Some(style) = border_style {
-            (UiRect {
+        let target_padding = if let Some(style) = border_style {
+            UiRect {
                 left: Val::Px(style.padding.left),
                 right: Val::Px(style.padding.right),
                 top: Val::Px(style.padding.top),
                 bottom: Val::Px(style.padding.bottom),
-            }, style.padding.top + style.padding.bottom)
+            }
         } else {
-            (UiRect::ZERO, 0.0)
+            UiRect::ZERO
         };
 
-        // min_height is the content-area height. layout.height includes padding_v
-        // (for accurate scroll content_height), so subtract it here — taffy adds
-        // Node.padding on top of min_height to get the border-box height.
-        let content_height = layout.height - padding_v;
-        let target_height = Val::Px(content_height);
-
-        // Compare before writing to avoid triggering Bevy change detection → taffy relayout
-        if node.min_height != target_height {
-            node.min_height = target_height;
-        }
         let target_margin = UiRect {
             left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH),
             bottom: Val::Px(BLOCK_SPACING),
@@ -2417,12 +2330,9 @@ pub fn update_block_cell_nodes(
         }
     }
 
-    // Role header nodes already have fixed height from spawn, but update if needed
+    // Role header nodes: margin for spacing, no min_height override
     for entity in &container.role_headers {
         if let Ok(mut node) = role_header_nodes.get_mut(*entity) {
-            if node.min_height != Val::Px(ROLE_HEADER_HEIGHT) {
-                node.min_height = Val::Px(ROLE_HEADER_HEIGHT);
-            }
             let target = UiRect::bottom(Val::Px(ROLE_HEADER_SPACING));
             if node.margin != target {
                 node.margin = target;
@@ -2503,6 +2413,73 @@ pub fn reorder_conversation_children(
 
     if !order_matches {
         if let Ok(mut ec) = commands.get_entity(conv_entity) { ec.replace_children(&ordered_children); }
+    }
+}
+
+/// Read back actual block heights from Taffy layout (PostUpdate).
+///
+/// Runs after `UiSystems::Layout` so Parley has measured text and Taffy has
+/// sized all boxes. Reads `ComputedNode` from the ConversationContainer's
+/// children (block cells + role headers in flex order) and:
+/// - Writes `BlockCellLayout.height` and `.y_offset` for scroll-to-block
+/// - Writes `RoleGroupBorderLayout.y_offset` for BRP debugging
+/// - Writes `ConversationScrollState.content_height` from accumulated heights
+///
+/// This is the sole source of truth for block heights — no heuristic estimation.
+pub fn readback_block_heights(
+    entities: Res<EditorEntities>,
+    children_query: Query<&Children>,
+    block_cells: Query<(&ComputedNode, &Node), With<BlockCell>>,
+    role_headers: Query<(&ComputedNode, &Node), (With<RoleGroupBorder>, Without<BlockCell>)>,
+    mut block_layouts: Query<&mut BlockCellLayout, With<BlockCell>>,
+    mut header_layouts: Query<&mut RoleGroupBorderLayout, Without<BlockCell>>,
+    mut scroll_state: ResMut<ConversationScrollState>,
+) {
+    let Some(conv_entity) = entities.conversation_container else {
+        return;
+    };
+    let Ok(children) = children_query.get(conv_entity) else {
+        return;
+    };
+
+    let mut y_offset: f32 = 0.0;
+
+    for child in children.iter() {
+        if let Ok((computed, node)) = block_cells.get(child) {
+            let height = computed.size().y;
+            let margin_bottom = match node.margin.bottom {
+                Val::Px(px) => px,
+                _ => 0.0,
+            };
+
+            if let Ok(mut layout) = block_layouts.get_mut(child) {
+                if (layout.y_offset - y_offset).abs() > 0.5 || (layout.height - height).abs() > 0.5 {
+                    layout.y_offset = y_offset;
+                    layout.height = height;
+                }
+            }
+
+            y_offset += height + margin_bottom;
+        } else if let Ok((computed, node)) = role_headers.get(child) {
+            let height = computed.size().y;
+            let margin_bottom = match node.margin.bottom {
+                Val::Px(px) => px,
+                _ => 0.0,
+            };
+
+            if let Ok(mut layout) = header_layouts.get_mut(child) {
+                if (layout.y_offset - y_offset).abs() > 0.5 {
+                    layout.y_offset = y_offset;
+                }
+            }
+
+            y_offset += height + margin_bottom;
+        }
+    }
+
+    // Update scroll content_height (guard against spurious change detection)
+    if (scroll_state.content_height - y_offset).abs() > 0.5 {
+        scroll_state.content_height = y_offset;
     }
 }
 

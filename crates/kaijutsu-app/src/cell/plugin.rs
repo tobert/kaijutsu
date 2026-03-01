@@ -173,7 +173,11 @@ impl Plugin for CellPlugin {
                 systems::sync_cell_buffers.after(systems::init_cell_buffers),
                 systems::compute_cell_heights,
                 // Block cell buffer init and sync
+                // ApplyDeferred flushes init's UiVelloText insert so sync_block_cell_buffers
+                // can set real text on the same frame. Without this, bevy_vello computes
+                // ContentSize from empty text (height=0) on the init frame.
                 systems::init_block_cell_buffers,
+                ApplyDeferred.after(systems::init_block_cell_buffers),
                 systems::sync_block_cell_buffers
                     .after(systems::init_block_cell_buffers),
                 // Input overlay visibility + buffer sync
@@ -187,9 +191,10 @@ impl Plugin for CellPlugin {
                 // Block border style determination (after buffer sync, now with labels)
                 block_border::determine_block_border_style
                     .after(systems::sync_block_cell_buffers),
-                // Block measure update (after buffer sync, feeds into taffy layout)
-                super::measure::update_block_measures
-                    .after(systems::sync_block_cell_buffers),
+                // Flush BlockBorderStyle inserts so update_block_cell_nodes
+                // can read padding on the same frame (prevents 1-frame zero-padding).
+                ApplyDeferred
+                    .after(block_border::determine_block_border_style),
             )
                 .in_set(CellPhase::Buffer),
         );
@@ -236,8 +241,11 @@ impl Plugin for CellPlugin {
             (
                 // Input overlay cursor (reads UiGlobalTransform)
                 systems::update_input_overlay_cursor,
+                // Read back actual block heights from Taffy layout
+                systems::readback_block_heights,
                 // Vello border systems (spawn → update → animate)
-                block_border::spawn_vello_borders,
+                block_border::spawn_vello_borders
+                    .after(systems::readback_block_heights),
                 block_border::update_vello_borders
                     .after(block_border::spawn_vello_borders),
                 block_border::animate_vello_borders

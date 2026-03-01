@@ -28,6 +28,7 @@ impl Plugin for KjTextPlugin {
             .add_systems(Update, (
                 sync_text_max_advance,
                 sync_text_metrics_from_window,
+                update_text_metrics_from_font,
                 sync_kj_ui_text,
                 animate_rainbow_text,
                 super::rich::render_rich_text,
@@ -43,6 +44,41 @@ fn load_fonts(
     font_handles.mono = asset_server.load("fonts/NotoMono-Regular.ttf");
     font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
     info!("Loaded Vello fonts: NotoMono, NotoSerif");
+}
+
+/// Measure actual line height from the loaded font.
+///
+/// Fires once after the mono font asset loads, replacing the default 24.0
+/// with the real Parley-measured line height. This ensures cursor positioning
+/// matches what bevy_vello renders.
+fn update_text_metrics_from_font(
+    font_handles: Res<FontHandles>,
+    fonts: Res<Assets<VelloFont>>,
+    mut text_metrics: ResMut<TextMetrics>,
+) {
+    if text_metrics.cell_line_height_from_font {
+        return;
+    }
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return;
+    };
+    let style = VelloTextStyle {
+        font_size: text_metrics.cell_font_size,
+        font: font_handles.mono.clone(),
+        ..default()
+    };
+    let layout = font.layout("X", &style, VelloTextAlign::Left, None);
+    if let Some(line) = layout.lines().next() {
+        let measured = line.metrics().line_height;
+        if measured > 0.0 {
+            info!(
+                "TextMetrics: cell_line_height updated from font: {:.1} → {:.1}",
+                text_metrics.cell_line_height, measured
+            );
+            text_metrics.cell_line_height = measured;
+            text_metrics.cell_line_height_from_font = true;
+        }
+    }
 }
 
 /// Sync DPI scale factor from the primary window.

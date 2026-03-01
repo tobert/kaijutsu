@@ -464,8 +464,6 @@ pub struct WorkspaceLayout {
     pub workspace_margin_left: f32,
     /// Top margin for the workspace
     pub workspace_margin_top: f32,
-    /// Line height for computing dynamic heights
-    pub line_height: f32,
     /// Minimum height for prompt cell
     pub prompt_min_height: f32,
 }
@@ -477,21 +475,7 @@ impl Default for WorkspaceLayout {
             max_cell_height: 400.0,
             workspace_margin_left: 20.0,
             workspace_margin_top: 70.0, // Space for compact header
-            line_height: 24.0, // Must match TextMetrics.cell_line_height for correct block sizing
             prompt_min_height: 50.0,
-        }
-    }
-}
-
-impl WorkspaceLayout {
-    /// Calculate dynamic cell height based on line count.
-    pub fn height_for_lines(&self, line_count: usize) -> f32 {
-        let content_height = (line_count as f32) * self.line_height + 4.0; // tight padding
-        let height = content_height.max(self.min_cell_height);
-        if self.max_cell_height > 0.0 {
-            height.min(self.max_cell_height)
-        } else {
-            height
         }
     }
 }
