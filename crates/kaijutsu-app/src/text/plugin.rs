@@ -115,13 +115,8 @@ fn sync_kj_ui_text(
 
 /// Sync `max_advance` from the node's content box width.
 ///
-/// Constrains parley text layout to the node's available width, enabling
+/// Constrains Parley text layout to the node's available width, enabling
 /// word wrapping for long lines. Without this, text would overflow the node.
-///
-/// For block cells: `UiTransform` (x: -50%) shifts center→left edge +
-/// `VelloTextAnchor::Left` (dy: -text_height/2) vertically centers text.
-/// For widgets/overlay: `VelloTextAnchor::Center` (default) relies on
-/// `max_advance` ≈ node width for approximate centering.
 fn sync_text_max_advance(
     mut query: Query<(&mut UiVelloText, &ComputedNode)>,
 ) {

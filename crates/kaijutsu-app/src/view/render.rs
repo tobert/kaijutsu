@@ -10,9 +10,9 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor, CellState,
+    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor,
     EditorEntities, FocusTarget, LayoutGeneration, MainCell, RoleGroupBorder,
-    RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell, WorkspaceLayout,
+    RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell,
 };
 use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
@@ -565,9 +565,6 @@ pub fn highlight_focused_block(
 // NON-BLOCK CELL SYSTEMS (kept from cell/systems.rs)
 // ============================================================================
 
-/// Initialize text for cells that don't have UiVelloText yet.
-/// No-op — Vello text entities are complete at spawn time.
-pub fn init_cell_buffers() {}
 
 /// Sync UiVelloText from CellEditor when dirty.
 ///
@@ -593,33 +590,6 @@ pub fn sync_cell_buffers(
         if vello_text.value != display_text {
             vello_text.value = display_text;
         }
-    }
-}
-
-/// Compute cell heights based on content (non-MainCell only).
-pub fn compute_cell_heights(
-    mut cells: Query<(&CellEditor, &mut CellState, Option<&MainCell>), Changed<CellEditor>>,
-    text_metrics: Res<TextMetrics>,
-    layout: Res<WorkspaceLayout>,
-) {
-    for (editor, mut state, main_cell) in cells.iter_mut() {
-        if main_cell.is_some() {
-            continue;
-        }
-
-        let display_text = if editor.has_blocks() {
-            super::format::format_blocks_for_display(&editor.blocks())
-        } else {
-            editor.text()
-        };
-        let line_count = display_text.lines().count().max(1);
-        let content_height = (line_count as f32) * text_metrics.cell_line_height + 4.0;
-        let height = content_height.max(layout.min_cell_height);
-        state.computed_height = if layout.max_cell_height > 0.0 {
-            height.min(layout.max_cell_height)
-        } else {
-            height
-        };
     }
 }
 

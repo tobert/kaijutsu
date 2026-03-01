@@ -153,9 +153,7 @@ impl Plugin for CellPlugin {
             Update,
             (
                 // Non-block cell buffers
-                view_render::init_cell_buffers,
-                view_render::sync_cell_buffers.after(view_render::init_cell_buffers),
-                view_render::compute_cell_heights,
+                view_render::sync_cell_buffers,
                 // Block cell buffers (TopLeft anchor)
                 view_render::init_block_cell_buffers,
                 ApplyDeferred.after(view_render::init_block_cell_buffers),

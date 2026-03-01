@@ -57,13 +57,6 @@ impl Default for BorderPadding {
     }
 }
 
-impl BorderPadding {
-    #[allow(dead_code)]
-    pub fn vertical(&self) -> f32 {
-        self.top + self.bottom
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
 pub enum BorderKind {
     /// Complete rectangle border.
