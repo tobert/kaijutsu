@@ -7,7 +7,7 @@
 //!
 //! Uses kaish-kernel's lexer and parser directly without spawning a subprocess.
 //!
-//! Integrated into the ComposeBlock: shell mode input is validated on each
+//! Integrated into the InputOverlay: shell mode input is validated on each
 //! keystroke, tinting text red for syntax errors.
 
 use kaish_kernel::lexer::{Token, TokenCategory};
@@ -26,7 +26,7 @@ pub struct ValidationResult {
 }
 
 /// A syntax error with location information.
-#[allow(dead_code)] // Future: error position highlighting in ComposeBlock
+#[allow(dead_code)] // Future: error position highlighting in InputOverlay
 #[derive(Debug, Clone)]
 pub struct SyntaxError {
     /// Byte offset of the start of the error.

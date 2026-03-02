@@ -10,8 +10,8 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor,
-    EditorEntities, FocusTarget, LayoutGeneration, MainCell, RoleGroupBorder,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor,
+    EditorEntities, LayoutGeneration, MainCell, RoleGroupBorder,
     RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell,
 };
 use crate::text::{KjText, FontHandles, bevy_color_to_brush};
@@ -69,9 +69,9 @@ pub fn sync_block_cell_buffers(
     // Quick dirty check before allocating. 
     // We must run if the document has a new version, OR if any cell 
     // in the container has never been rendered (None).
-    let needs_update = container.block_cells.iter().any(|e| {
+    let needs_update = container.entities().any(|e| {
         block_cells
-            .get(*e)
+            .get(e)
             .map(|(bc, _, _)| bc.last_render_version.map_or(true, |v| v < doc_version))
             .unwrap_or(false)
     });
@@ -87,8 +87,8 @@ pub fn sync_block_cell_buffers(
         .collect();
 
     let mut layout_changed = false;
-    for entity in &container.block_cells {
-        let Ok((mut block_cell, mut vello_text, timeline_vis)) = block_cells.get_mut(*entity) else {
+    for &entity in container.block_cells.values() {
+        let Ok((mut block_cell, mut vello_text, timeline_vis)) = block_cells.get_mut(entity) else {
             continue;
         };
 
@@ -120,7 +120,7 @@ pub fn sync_block_cell_buffers(
         // Rainbow effect for user text
         let rainbow = theme.font_rainbow && block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::User;
         if block_cell.last_rainbow != rainbow {
-            commands.entity(*entity).insert(crate::text::KjTextEffects { rainbow });
+            commands.entity(entity).insert(crate::text::KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
         }
 
@@ -141,12 +141,12 @@ pub fn sync_block_cell_buffers(
                     vello_text.value = String::new();
                 }
                 vello_text.style.brush = bevy_color_to_brush(Color::NONE);
-                commands.entity(*entity).insert(rich);
+                commands.entity(entity).insert(rich);
             } else {
-                commands.entity(*entity).remove::<crate::text::RichContent>();
+                commands.entity(entity).remove::<crate::text::RichContent>();
             }
         } else {
-            commands.entity(*entity).remove::<crate::text::RichContent>();
+            commands.entity(entity).remove::<crate::text::RichContent>();
         }
 
         // Apply color (skip when rainbow or rich content is active)
@@ -213,8 +213,8 @@ pub fn layout_block_cells(
     let block_lookup: std::collections::HashMap<&kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
         blocks_ordered.iter().map(|b| (&b.id, b)).collect();
 
-    for entity in &container.block_cells {
-        let Ok((block_cell, mut block_layout)) = block_cells.get_mut(*entity) else {
+    for &entity in container.block_cells.values() {
+        let Ok((block_cell, mut block_layout)) = block_cells.get_mut(entity) else {
             continue;
         };
 
@@ -267,8 +267,8 @@ pub fn update_block_cell_nodes(
         return;
     };
 
-    for entity in &container.block_cells {
-        let Ok((layout, mut node, border_style, rich_content)) = block_cells.get_mut(*entity) else {
+    for &entity in container.block_cells.values() {
+        let Ok((layout, mut node, border_style, rich_content)) = block_cells.get_mut(entity) else {
             continue;
         };
         let target_padding = if let Some(style) = border_style {
@@ -542,94 +542,3 @@ pub fn highlight_focused_block(
     }
 }
 
-// ============================================================================
-// NON-BLOCK CELL SYSTEMS (kept from cell/systems.rs)
-// ============================================================================
-
-
-/// Sync UiVelloText from CellEditor when dirty.
-///
-/// For cells with content blocks, clears the text (BlockCells render per-block).
-/// For plain text cells, uses the text directly.
-pub fn sync_cell_buffers(
-    mut cells: Query<(&CellEditor, &mut UiVelloText, Option<&BlockCellContainer>), Changed<CellEditor>>,
-) {
-    for (editor, mut vello_text, container) in cells.iter_mut() {
-        if container.is_some_and(|c| !c.block_cells.is_empty()) {
-            if !vello_text.value.is_empty() {
-                vello_text.value.clear();
-            }
-            continue;
-        }
-
-        let display_text = if editor.has_blocks() {
-            super::format::format_blocks_for_display(&editor.blocks())
-        } else {
-            editor.text()
-        };
-
-        if vello_text.value != display_text {
-            vello_text.value = display_text;
-        }
-    }
-}
-
-/// Visual indication for focused cell.
-pub fn highlight_focused_cell(
-    focus: Res<FocusTarget>,
-    mut cells: Query<(Entity, &mut UiVelloText), With<Cell>>,
-    theme: Option<Res<Theme>>,
-) {
-    let Some(ref theme) = theme else {
-        warn_once!("Theme resource unavailable for cell highlighting");
-        return;
-    };
-
-    for (entity, mut vello_text) in cells.iter_mut() {
-        let color = if Some(entity) == focus.entity {
-            theme.accent
-        } else {
-            theme.fg_dim
-        };
-        let new_brush = bevy_color_to_brush(color);
-        if vello_text.style.brush != new_brush {
-            vello_text.style.brush = new_brush;
-        }
-    }
-}
-
-/// Click to focus a cell.
-pub fn click_to_focus(
-    mouse: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window>,
-    cells: Query<(Entity, &ComputedNode, &UiGlobalTransform), With<Cell>>,
-    mut focus: ResMut<FocusTarget>,
-) {
-    if !mouse.just_pressed(MouseButton::Left) {
-        return;
-    }
-
-    let Some(cursor_pos) = windows.iter().next().and_then(|w| w.cursor_position()) else {
-        return;
-    };
-
-    for (entity, computed, transform) in cells.iter() {
-        let (_, _, translation) = transform.to_scale_angle_translation();
-        let size = computed.size();
-        let left = translation.x - size.x / 2.0;
-        let top = translation.y - size.y / 2.0;
-        let right = left + size.x;
-        let bottom = top + size.y;
-
-        if cursor_pos.x >= left
-            && cursor_pos.x <= right
-            && cursor_pos.y >= top
-            && cursor_pos.y <= bottom
-        {
-            focus.entity = Some(entity);
-            return;
-        }
-    }
-
-    focus.entity = None;
-}

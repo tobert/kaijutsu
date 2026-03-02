@@ -312,7 +312,7 @@ pub fn handle_toggle_constellation(
 // ============================================================================
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, CellState,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor,
     ConversationScrollState, EditorEntities, FocusTarget, FocusedBlockCell, MainCell,
 };
 
@@ -499,7 +499,7 @@ pub fn handle_expand_block(
 pub fn handle_collapse_toggle(
     mut actions: MessageReader<ActionFired>,
     focus: Res<FocusTarget>,
-    mut cells: Query<(&mut CellEditor, &mut CellState)>,
+    mut cells: Query<&mut CellEditor>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::CollapseToggle) {
@@ -510,7 +510,7 @@ pub fn handle_collapse_toggle(
             continue;
         };
 
-        let Ok((mut editor, _cell_state)) = cells.get_mut(focused_entity) else {
+        let Ok(mut editor) = cells.get_mut(focused_entity) else {
             continue;
         };
 
@@ -522,27 +522,22 @@ pub fn handle_collapse_toggle(
             .map(|b| b.id.clone())
             .collect();
 
-        if !thinking_blocks.is_empty() {
-            for block_id in &thinking_blocks {
-                editor.toggle_block_collapse(block_id);
-            }
-            let collapsed = editor
-                .blocks()
-                .iter()
-                .find(|b| matches!(b.kind, kaijutsu_crdt::BlockKind::Thinking))
-                .map(|b| b.collapsed)
-                .unwrap_or(false);
-            info!(
-                "Thinking blocks: {}",
-                if collapsed { "collapsed" } else { "expanded" }
-            );
-        } else {
-            // Toggle collapse on entire cell
-            let Ok((_editor, mut cell_state)) = cells.get_mut(focused_entity) else {
-                continue;
-            };
-            cell_state.collapsed = !cell_state.collapsed;
+        if thinking_blocks.is_empty() {
+            continue;
         }
+        for block_id in &thinking_blocks {
+            editor.toggle_block_collapse(block_id);
+        }
+        let collapsed = editor
+            .blocks()
+            .iter()
+            .find(|b| matches!(b.kind, kaijutsu_crdt::BlockKind::Thinking))
+            .map(|b| b.collapsed)
+            .unwrap_or(false);
+        info!(
+            "Thinking blocks: {}",
+            if collapsed { "collapsed" } else { "expanded" }
+        );
     }
 }
 

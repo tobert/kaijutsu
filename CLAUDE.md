@@ -465,14 +465,12 @@ Many view and UI components are registered for BRP reflection, enabling runtime 
 Types live in `view/components.rs`; `cell/` is a facade that re-exports from `view/`.
 
 **Resources** (use `world_get_resources`):
-- `kaijutsu_app::view::components::WorkspaceLayout` — margins, cell limits
 - `kaijutsu_app::view::components::ConversationScrollState` — scroll offset, content height, following mode
 - `kaijutsu_app::input::focus::FocusArea` — Compose/Constellation/Dialog (replaced CurrentMode)
 
 **Components** (use `world_query` with filter):
-- `Cell`, `CellId`, `CellPosition`, `CellState` — cell identity and visual state
 - `ViewingConversation` — conversation_id, last_sync_version (0 = empty doc)
-- `BlockCellContainer` — block_cells Vec<Entity>, role_headers (HashMap is ignored)
+- `BlockCellContainer` — IndexMap<BlockId, Entity> + role_headers (IndexMap is ignored by reflect)
 - `BlockCellLayout`, `RoleGroupBorderLayout` — y_offset, height, indent for layout debugging
 
 **Not reflectable** (contain CRDT types without Default):

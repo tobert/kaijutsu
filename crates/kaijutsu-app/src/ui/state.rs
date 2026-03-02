@@ -26,18 +26,15 @@ impl Plugin for AppScreenPlugin {
     }
 }
 
-/// Handle ContextJoined events to create conversation metadata.
+/// Handle ContextJoined events — log for diagnostics.
+///
+/// Document cache management happens in `handle_block_events` (view/sync.rs).
 fn handle_context_joined(
     mut result_events: MessageReader<crate::connection::RpcResultMessage>,
-    mut context_order: ResMut<crate::conversation::ContextOrder>,
-    mut active_ctx: ResMut<crate::conversation::ActiveContext>,
 ) {
     for result in result_events.read() {
         if let crate::connection::RpcResultMessage::ContextJoined { membership, .. } = result {
-            let ctx_id = membership.context_id;
-            context_order.add(ctx_id);
-            active_ctx.0 = Some(ctx_id);
-            info!("Context joined: {}", ctx_id);
+            info!("Context joined: {}", membership.context_id);
         }
     }
 }

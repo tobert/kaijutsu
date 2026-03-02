@@ -8,15 +8,13 @@
 use bevy::prelude::*;
 
 use crate::input::FocusArea;
-use crate::conversation::{ContextOrder, ActiveContext};
-use crate::cell::ContextSwitchRequested;
+use crate::cell::{ContextSwitchRequested, DocumentCache};
 
 /// Handle conversation quick-switch shortcuts (Ctrl+1/2/3).
 pub fn handle_conversation_shortcuts(
     keys: Res<ButtonInput<KeyCode>>,
     focus_area: Res<FocusArea>,
-    mut context_order: ResMut<ContextOrder>,
-    mut active_ctx: ResMut<ActiveContext>,
+    doc_cache: Res<DocumentCache>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
 ) {
     // Only when navigating (not typing text)
@@ -29,7 +27,7 @@ pub fn handle_conversation_shortcuts(
         return;
     }
 
-    let ids = context_order.ids().to_vec();
+    let ids = doc_cache.mru_ids();
 
     let target = if keys.just_pressed(KeyCode::Digit1) && !ids.is_empty() {
         Some(ids[0])
@@ -42,8 +40,6 @@ pub fn handle_conversation_shortcuts(
     };
 
     if let Some(ctx_id) = target {
-        active_ctx.0 = Some(ctx_id);
-        context_order.move_to_front(ctx_id);
         switch_writer.write(ContextSwitchRequested { context_id: ctx_id });
         info!("Switched to context {}", ctx_id.short());
     }

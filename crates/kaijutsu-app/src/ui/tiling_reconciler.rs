@@ -103,7 +103,7 @@ pub fn reconcile_tiling_tree(
         // Without this, despawn() recursively kills block cell children.
         if let Some(main_ent) = editor_entities.main_cell {
             if let Ok(container) = block_containers.get(main_ent) {
-                for &entity in container.block_cells.iter().chain(container.role_headers.iter()) {
+                for &entity in container.block_cells.values().chain(container.role_headers.iter()) {
                     commands.entity(entity).remove_parent_in_place();
                 }
                 info!(

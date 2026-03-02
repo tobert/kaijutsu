@@ -30,11 +30,11 @@ pub enum CellPhase {
 
 use crate::ui::tiling_reconciler::TilingPhase;
 use crate::view::{
-    BlockCellContainer, BlockCellLayout, Cell, CellId, CellPosition, CellState,
+    BlockCellContainer, BlockCellLayout,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
     DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
     PendingContextSwitch, PromptSubmitted, RoleGroupBorderLayout, SubmitFailed,
-    ViewingConversation, WorkspaceLayout, EditorEntities,
+    ViewingConversation, EditorEntities,
 };
 use super::block_border;
 
@@ -61,13 +61,8 @@ impl Plugin for CellPlugin {
             .register_type::<ConversationContainer>()
             .register_type::<MainCell>()
             .register_type::<PromptSubmitted>()
-            .register_type::<CellId>()
-            .register_type::<Cell>()
             .register_type::<ViewingConversation>()
-            .register_type::<CellPosition>()
-            .register_type::<CellState>()
             .register_type::<FocusTarget>()
-            .register_type::<WorkspaceLayout>()
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
             .register_type::<RoleGroupBorderLayout>()
@@ -86,24 +81,12 @@ impl Plugin for CellPlugin {
         );
 
         app.init_resource::<FocusTarget>()
-            .init_resource::<WorkspaceLayout>()
             .init_resource::<ConversationScrollState>()
             .init_resource::<LayoutGeneration>()
             .init_resource::<SessionAgent>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
             .init_resource::<EditorEntities>();
-
-        // ====================================================================
-        // CellPhase::Input — click-to-focus only
-        // ====================================================================
-        app.add_systems(
-            Update,
-            (
-                view_render::click_to_focus,
-            )
-                .in_set(CellPhase::Input),
-        );
 
         // ====================================================================
         // CellPhase::Sync — server events, document sync, prompt submission
@@ -152,8 +135,6 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
-                // Non-block cell buffers
-                view_render::sync_cell_buffers,
                 // Block cell buffers (TopLeft anchor)
                 view_render::init_block_cell_buffers,
                 ApplyDeferred.after(view_render::init_block_cell_buffers),
@@ -163,7 +144,6 @@ impl Plugin for CellPlugin {
                 view_overlay::sync_overlay_visibility,
                 view_overlay::sync_input_overlay_buffer,
                 // Highlighting
-                view_render::highlight_focused_cell.after(view_render::sync_cell_buffers),
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
                 // Block border style
                 block_border::determine_block_border_style

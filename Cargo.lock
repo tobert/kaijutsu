@@ -5327,6 +5327,7 @@ dependencies = [
  "futures",
  "hostname",
  "image",
+ "indexmap",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",

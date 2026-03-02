@@ -23,7 +23,6 @@ mod cell;
 mod commands;
 mod connection;
 mod constants;
-mod conversation;
 mod input;
 mod kaish;
 mod shaders;
@@ -98,8 +97,6 @@ fn main() {
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin)
-        // Conversation management
-        .add_plugins(conversation::ConversationPlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (Constellation/Conversation/ForkForm transitions)

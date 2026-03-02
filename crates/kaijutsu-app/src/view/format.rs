@@ -51,21 +51,6 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
     }
 }
 
-/// Format content blocks for display.
-///
-/// Delegates to `format_single_block` for each block, joining with blank lines.
-pub(crate) fn format_blocks_for_display(blocks: &[BlockSnapshot]) -> String {
-    if blocks.is_empty() {
-        return String::new();
-    }
-
-    blocks
-        .iter()
-        .map(|b| format_single_block(b, None))
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 /// Strip provider prefix from model name for compact display.
 ///
 /// `"anthropic/claude-sonnet-4-5"` → `"claude-sonnet-4-5"`

@@ -11,7 +11,6 @@ use crate::cell::{
     MainCell, ViewingConversation,
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
-use crate::conversation::ActiveContext;
 
 /// Handle block events from the server, routing through DocumentCache.
 ///
@@ -26,7 +25,6 @@ pub fn handle_block_events(
     mut scroll_state: ResMut<ConversationScrollState>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     layout_gen: Res<LayoutGeneration>,
-    mut active_ctx: ResMut<ActiveContext>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
@@ -123,12 +121,6 @@ pub fn handle_block_events(
                 });
             }
 
-            if doc_cache.active_id() == Some(ctx_id) {
-                if active_ctx.id() != Some(ctx_id) {
-                    info!("Updating active_ctx to context_id: {} (was {:?})", ctx_id, active_ctx.id());
-                    active_ctx.0 = Some(ctx_id);
-                }
-            }
         }
         RpcResultMessage::InputStateReceived { context_id, state } => {
             let ctx_id = *context_id;
@@ -309,7 +301,6 @@ pub fn handle_context_switch(
     mut switch_events: MessageReader<crate::cell::ContextSwitchRequested>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut scroll_state: ResMut<ConversationScrollState>,
-    mut active_ctx: ResMut<ActiveContext>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
@@ -350,7 +341,6 @@ pub fn handle_context_switch(
         doc_cache.set_active(ctx_id);
 
         if let Some(cached) = doc_cache.get(ctx_id) {
-            active_ctx.0 = Some(ctx_id);
             scroll_state.offset = cached.scroll_offset;
             scroll_state.target_offset = cached.scroll_offset;
             scroll_state.following = false;

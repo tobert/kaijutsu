@@ -124,8 +124,8 @@ pub fn determine_block_border_style(
         .map(|b| (b.id.clone(), b))
         .collect();
 
-    for entity in &container.block_cells {
-        let Ok((ent, block_cell, existing_style)) = block_cells.get(*entity) else {
+    for &entity in container.block_cells.values() {
+        let Ok((ent, block_cell, existing_style)) = block_cells.get(entity) else {
             continue;
         };
 

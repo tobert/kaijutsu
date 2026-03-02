@@ -12,7 +12,7 @@ use bevy::camera::visibility::VisibilityClass;
 use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor, CellPosition, CellState,
+    BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor,
     LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout,
 };
 
@@ -68,9 +68,6 @@ pub fn spawn_main_cell(
 
     entities.conversation_container = Some(conv_entity);
 
-    let cell = Cell::new();
-    let cell_id = cell.id.clone();
-
     let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
 
     // MainCell does NOT get UiVelloText directly.
@@ -78,19 +75,13 @@ pub fn spawn_main_cell(
     // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
         .spawn((
-            cell,
             CellEditor::default().with_text(welcome_text),
-            CellState {
-                computed_height: 400.0,
-                collapsed: false,
-            },
-            CellPosition::new(0),
             MainCell,
         ))
         .id();
 
     entities.main_cell = Some(entity);
-    info!("Spawned main kernel cell with id {:?}", cell_id.0);
+    info!("Spawned main kernel cell");
 }
 
 /// Track the focused ConversationContainer and re-parent block cells when it changes.
@@ -122,7 +113,7 @@ pub fn track_conversation_container(
     // all existing block cells must move to the new container.
     if let Ok(container) = containers.get(main_ent) {
         trace!("Re-parenting {} block cells to new container {:?}", container.block_cells.len(), focused);
-        for &block_ent in &container.block_cells {
+        for &block_ent in container.block_cells.values() {
             commands.entity(focused).add_child(block_ent);
         }
         for &header_ent in &container.role_headers {
@@ -187,7 +178,7 @@ pub fn spawn_block_cells(
         existing_block_cells.iter().collect();
     let stale: Vec<Entity> = container
         .block_cells
-        .iter()
+        .values()
         .filter(|e| !live_entities.contains(e))
         .copied()
         .collect();
@@ -200,7 +191,7 @@ pub fn spawn_block_cells(
 
     // Despawn removed blocks
     let to_remove: Vec<_> = container
-        .block_to_entity
+        .block_cells
         .iter()
         .filter(|(id, _)| !current_ids.contains(id))
         .map(|(_, e)| *e)
@@ -283,13 +274,16 @@ pub fn spawn_block_cells(
     }
 
     // Reorder container.block_cells to match document order
-    let mut new_order = Vec::with_capacity(current_blocks.len());
-    for block_id in &current_blocks {
-        if let Some(entity) = container.get_entity(block_id) {
-            new_order.push(entity);
-        }
-    }
-    container.block_cells = new_order;
+    let block_order: std::collections::HashMap<&BlockId, usize> = current_blocks
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect();
+    container.block_cells.sort_by(|a, _, b, _| {
+        let a_idx = block_order.get(a).copied().unwrap_or(usize::MAX);
+        let b_idx = block_order.get(b).copied().unwrap_or(usize::MAX);
+        a_idx.cmp(&b_idx)
+    });
 }
 
 /// Sync RoleGroupBorder entities for role transitions.

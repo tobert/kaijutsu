@@ -1,6 +1,6 @@
 //! Input overlay — ephemeral compose surface.
 //!
-//! The InputOverlay is the sole compose surface (ComposeBlock was deleted).
+//! The InputOverlay is the sole compose surface.
 //! It's an absolute-positioned UI entity, shown/hidden based on FocusArea.
 
 use bevy::prelude::*;
