@@ -232,7 +232,7 @@ fn spawn_content_subtree(
                         },
                     },
                     *id,
-                    ConversationContainer,
+                    crate::cell::ConversationContainer,
                     PaneSavedState {
                         document_id: document_id.clone(),
                         ..default()
@@ -245,10 +245,7 @@ fn spawn_content_subtree(
                             Val::Auto
                         },
                         flex_direction: FlexDirection::Column,
-                        overflow: Overflow {
-                            x: OverflowAxis::Clip,
-                            y: OverflowAxis::Scroll,
-                        },
+                        overflow: Overflow::scroll_y(),
                         padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
                         border: UiRect::all(Val::Px(2.0)),
                         ..default()
