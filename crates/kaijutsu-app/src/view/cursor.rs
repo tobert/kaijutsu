@@ -18,8 +18,21 @@ use crate::ui::theme::Theme;
 #[derive(Component)]
 pub struct CursorMarker;
 
-/// Monospace char width ratio (approximately 0.6x font size).
-pub(crate) const MONOSPACE_WIDTH_RATIO: f32 = 0.6;
+/// Calculate row and column from text and cursor offset.
+///
+/// This is the shared helper for cursor positioning. O(N) string scan
+/// but only runs when cursor position changes (caching at call sites).
+#[inline]
+pub fn cursor_row_col(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let before = &text[..offset];
+    let row = before.matches('\n').count();
+    let col = before
+        .rfind('\n')
+        .map(|pos| offset - pos - 1)
+        .unwrap_or(offset);
+    (row, col)
+}
 
 /// Spawn the cursor entity if it doesn't exist.
 pub fn spawn_cursor(
@@ -41,7 +54,7 @@ pub fn spawn_cursor(
         time: Vec4::new(0.0, CursorMode::Block as u8 as f32, 0.0, 0.0),
     });
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
+    let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
     let entity = commands
@@ -102,7 +115,7 @@ pub fn update_cursor(
     let cell_left = translation.x + content.min.x;
     let cell_top = translation.y + content.min.y;
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
+    let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = cell_left + (col as f32 * char_width);
     let y = cell_top + (row as f32 * line_height);
@@ -151,14 +164,8 @@ fn compute_cursor_position(editor: &CellEditor) -> (usize, usize) {
         let text = &block.content;
 
         if &block.id == cursor_block_id {
-            let offset = editor.cursor.offset.min(text.len());
-            let before_cursor = &text[..offset];
-            row += before_cursor.matches('\n').count();
-            let col = before_cursor
-                .rfind('\n')
-                .map(|pos| offset - pos - 1)
-                .unwrap_or(offset);
-            return (row, col);
+            let (block_row, col) = cursor_row_col(text, editor.cursor.offset);
+            return (row + block_row, col);
         }
 
         row += text.matches('\n').count();
@@ -203,14 +210,7 @@ pub fn update_block_edit_cursor(
         return;
     };
 
-    let text = &block.content;
-    let offset = cursor.offset.min(text.len());
-    let before_cursor = &text[..offset];
-    let row = before_cursor.matches('\n').count();
-    let col = before_cursor
-        .rfind('\n')
-        .map(|pos| offset - pos - 1)
-        .unwrap_or(offset);
+    let (row, col) = cursor_row_col(&block.content, cursor.offset);
 
     *visibility = if focus_area.is_text_input() {
         Visibility::Inherited
@@ -223,7 +223,7 @@ pub fn update_block_edit_cursor(
     let cell_left = translation.x + content.min.x;
     let cell_top = translation.y + content.min.y;
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
+    let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     let x = cell_left + (col as f32 * char_width);
     let y = cell_top + (row as f32 * line_height);
@@ -265,12 +265,9 @@ pub fn update_input_overlay_cursor(
     let cell_top = translation.y + content.min.y;
 
     let display = overlay.display_text();
-    let offset = overlay.display_cursor_offset().min(display.len());
-    let before = &display[..offset];
-    let row = before.matches('\n').count();
-    let col = before.rfind('\n').map(|p| offset - p - 1).unwrap_or(offset);
+    let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
 
-    let char_width = text_metrics.cell_font_size * MONOSPACE_WIDTH_RATIO + text_metrics.letter_spacing;
+    let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
     node.left = Val::Px(cell_left + (col as f32 * char_width) - 2.0);

@@ -143,6 +143,7 @@ impl Plugin for CellPlugin {
                 // Input overlay
                 view_overlay::sync_overlay_visibility,
                 view_overlay::sync_input_overlay_buffer,
+                view_overlay::sync_overlay_max_advance,
                 // Highlighting
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
                 // Block border style

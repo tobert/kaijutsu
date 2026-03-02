@@ -4,6 +4,7 @@
 //! It's an absolute-positioned UI entity, shown/hidden based on FocusArea.
 
 use bevy::prelude::*;
+use bevy::ui::ComputedNode;
 use bevy_vello::prelude::UiVelloText;
 
 use crate::cell::{InputOverlay, InputOverlayMarker};
@@ -104,6 +105,27 @@ pub fn sync_input_overlay_buffer(
         }
         if vello_text.value != display {
             vello_text.value = display;
+        }
+    }
+}
+
+/// Keep InputOverlay's `max_advance` in sync with its `ComputedNode` width.
+///
+/// This prevents long compose text from overflowing or wrapping unexpectedly.
+/// Runs on `Changed<ComputedNode>` to handle window resizes.
+pub fn sync_overlay_max_advance(
+    mut overlay_query: Query<
+        (&mut UiVelloText, &ComputedNode),
+        (With<InputOverlayMarker>, Changed<ComputedNode>),
+    >,
+) {
+    for (mut vello_text, computed_node) in overlay_query.iter_mut() {
+        let width = computed_node.size().x;
+        if width > 0.0 {
+            let new_advance = Some(width);
+            if vello_text.max_advance != new_advance {
+                vello_text.max_advance = new_advance;
+            }
         }
     }
 }

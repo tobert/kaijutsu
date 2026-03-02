@@ -25,12 +25,13 @@ impl Plugin for KjTextPlugin {
             .init_resource::<TextMetrics>()
             .add_systems(Startup, load_fonts)
             .add_systems(Update, (
-                sync_text_max_advance,
                 sync_text_metrics_from_window,
                 update_text_metrics_from_font,
                 animate_rainbow_text,
                 // render_rich_content is registered in CellPlugin (CellPhase::Buffer)
                 // so it runs after sync_block_cell_buffers + ApplyDeferred.
+                // NOTE: sync_text_max_advance is in view/render.rs (CellPhase::Layout)
+                // with Changed<ComputedNode> filter — intentionally not here.
             ));
     }
 }
@@ -46,17 +47,18 @@ fn load_fonts(
     info!("Loaded Vello fonts: NotoMono, NotoSerif, NotoSansCJKJP");
 }
 
-/// Measure actual line height from the loaded font.
+/// Measure actual line height and character width from the loaded font.
 ///
-/// Fires once after the mono font asset loads, replacing the default 24.0
-/// with the real Parley-measured line height. This ensures cursor positioning
-/// matches what bevy_vello renders.
+/// Fires once after the mono font asset loads, replacing the defaults with
+/// real Parley-measured metrics. This ensures cursor positioning matches
+/// what bevy_vello renders — critical for accurate cursor placement.
 fn update_text_metrics_from_font(
     font_handles: Res<FontHandles>,
     fonts: Res<Assets<VelloFont>>,
     mut text_metrics: ResMut<TextMetrics>,
 ) {
-    if text_metrics.cell_line_height_from_font {
+    // Early exit if both metrics are already measured
+    if text_metrics.cell_line_height_from_font && text_metrics.cell_char_width_from_font {
         return;
     }
     let Some(font) = fonts.get(&font_handles.mono) else {
@@ -67,16 +69,38 @@ fn update_text_metrics_from_font(
         font: font_handles.mono.clone(),
         ..default()
     };
-    let layout = font.layout("X", &style, VelloTextAlign::Left, None);
-    if let Some(line) = layout.lines().next() {
-        let measured = line.metrics().line_height;
-        if measured > 0.0 {
-            info!(
-                "TextMetrics: cell_line_height updated from font: {:.1} → {:.1}",
-                text_metrics.cell_line_height, measured
-            );
-            text_metrics.cell_line_height = measured;
-            text_metrics.cell_line_height_from_font = true;
+
+    // Measure line height from "X"
+    if !text_metrics.cell_line_height_from_font {
+        let layout = font.layout("X", &style, VelloTextAlign::Left, None);
+        if let Some(line) = layout.lines().next() {
+            let measured = line.metrics().line_height;
+            if measured > 0.0 {
+                info!(
+                    "TextMetrics: cell_line_height updated from font: {:.1} → {:.1}",
+                    text_metrics.cell_line_height, measured
+                );
+                text_metrics.cell_line_height = measured;
+                text_metrics.cell_line_height_from_font = true;
+            }
+        }
+    }
+
+    // Measure character width from "M" (standard em-width reference)
+    if !text_metrics.cell_char_width_from_font {
+        let layout = font.layout("M", &style, VelloTextAlign::Left, None);
+        if let Some(line) = layout.lines().next() {
+            if let Some(run) = line.runs().next() {
+                let advance = run.advance();
+                if advance > 0.0 {
+                    info!(
+                        "TextMetrics: cell_char_width updated from font: {:.1} → {:.1}",
+                        text_metrics.cell_char_width, advance
+                    );
+                    text_metrics.cell_char_width = advance;
+                    text_metrics.cell_char_width_from_font = true;
+                }
+            }
         }
     }
 }
@@ -94,24 +118,6 @@ fn sync_text_metrics_from_window(
     if (text_metrics.scale_factor - scale).abs() > 0.01 {
         text_metrics.scale_factor = scale;
         info!("TextMetrics scale_factor updated: {:.2}", scale);
-    }
-}
-
-/// Sync `max_advance` from the node's content box width.
-///
-/// Constrains Parley text layout to the node's available width, enabling
-/// word wrapping for long lines. Without this, text would overflow the node.
-fn sync_text_max_advance(
-    mut query: Query<(&mut UiVelloText, &ComputedNode)>,
-) {
-    for (mut text, node) in query.iter_mut() {
-        let content_width = node.content_box().width();
-        if content_width > 0.0 {
-            let target = Some(content_width);
-            if text.max_advance != target {
-                text.max_advance = target;
-            }
-        }
     }
 }
 
