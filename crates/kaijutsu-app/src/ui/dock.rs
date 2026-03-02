@@ -19,6 +19,31 @@ use crate::cell::ContextSwitchRequested;
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::connection::RpcConnectionState;
 use crate::input::FocusArea;
+use crate::text::sparkline::{build_sparkline_paths, SparklineColors, SparklineData};
+
+/// A dock sparkline — ring-buffer time series with fixed capacity.
+#[derive(Clone, Debug)]
+pub struct DockSparkline {
+    pub data: SparklineData,
+    capacity: usize,
+}
+
+impl DockSparkline {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            data: SparklineData { values: Vec::with_capacity(capacity), label: None },
+            capacity,
+        }
+    }
+
+    /// Push a new sample, evicting the oldest if at capacity.
+    pub fn push(&mut self, value: f64) {
+        if self.data.values.len() >= self.capacity {
+            self.data.values.remove(0);
+        }
+        self.data.values.push(value);
+    }
+}
 use crate::text::{bevy_color_to_brush, FontHandles};
 use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
@@ -61,6 +86,10 @@ pub struct DockState {
     pub event_pulse: DockText,
     pub connection: DockText,
 
+    // North dock sparklines
+    pub event_spark: DockSparkline,
+    pub activity_spark: DockSparkline,
+
     // South dock
     pub mode: DockText,
     pub model_badge: DockText,
@@ -88,6 +117,8 @@ impl Default for DockState {
                 color: Color::WHITE,
                 font_size: 14.0,
             },
+            event_spark: DockSparkline::new(40),
+            activity_spark: DockSparkline::new(40),
             mode: DockText {
                 text: "INPUT".into(),
                 color: Color::WHITE,
@@ -227,6 +258,44 @@ fn measure_text_or_heuristic(text: &str, font_size: f32, font: Option<&VelloFont
     }
 }
 
+/// Draw a sparkline at (x, y) in a Vello scene.
+///
+/// Builds paths from `data` and strokes/fills with `line_color` and a fill at `fill_alpha`.
+fn draw_sparkline_at(
+    scene: &mut vello::Scene,
+    data: &SparklineData,
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+    line_color: Color,
+    fill_alpha: f32,
+) {
+    use vello::kurbo::{Cap, Join, Stroke};
+
+    let colors = SparklineColors {
+        line: line_color,
+        fill: Some(line_color.with_alpha(fill_alpha)),
+    };
+    let paths = build_sparkline_paths(data, width, height, 2.0);
+    let transform = Affine::translate((x, y));
+
+    let line_brush = bevy_color_to_brush(colors.line);
+    let stroke = Stroke {
+        width: 1.5,
+        join: Join::Round,
+        start_cap: Cap::Round,
+        end_cap: Cap::Round,
+        ..Default::default()
+    };
+
+    if let (Some(fill_path), Some(fill_color)) = (&paths.fill, &colors.fill) {
+        let fill_brush = bevy_color_to_brush(*fill_color);
+        scene.fill(Fill::NonZero, transform, &fill_brush, None, fill_path);
+    }
+    scene.stroke(&stroke, transform, &line_brush, None, &paths.line);
+}
+
 // ============================================================================
 // STARTUP SYSTEM
 // ============================================================================
@@ -319,7 +388,7 @@ pub fn render_north_dock(
         &title_brush,
     );
 
-    // Right group: pulse + gap + connection (right-aligned)
+    // Right group: sparklines + pulse + gap + connection (right-aligned)
     let gap = 12.0_f64;
     let conn_brush = bevy_color_to_brush(dock_state.connection.color);
     let conn_w = measure_text(&dock_state.connection.text, dock_state.connection.font_size, font);
@@ -327,14 +396,45 @@ pub fn render_north_dock(
     let pulse_brush = bevy_color_to_brush(dock_state.event_pulse.color);
     let pulse_w = measure_text(&dock_state.event_pulse.text, dock_state.event_pulse.font_size, font);
 
-    let right_total = pulse_w + gap + conn_w;
+    // Sparkline dimensions
+    let spark_w = 80.0_f64;
+    let spark_h = 20.0_f64;
+    let spark_gap = 8.0_f64;
+    let sparks_total = spark_w + spark_gap + spark_w + gap;
+
+    let right_total = sparks_total + pulse_w + gap + conn_w;
     let right_x = (width - pad_h - right_total).max(pad_h);
+
+    // Draw sparklines
+    let spark_y = (36.0 - spark_h) / 2.0; // vertically center in 36px dock
+    draw_sparkline_at(
+        &mut scene,
+        &dock_state.event_spark.data,
+        spark_w,
+        spark_h,
+        right_x,
+        spark_y,
+        theme.accent,
+        0.15,
+    );
+    draw_sparkline_at(
+        &mut scene,
+        &dock_state.activity_spark.data,
+        spark_w,
+        spark_h,
+        right_x + spark_w + spark_gap,
+        spark_y,
+        theme.fg_dim,
+        0.10,
+    );
+
+    let text_right_x = right_x + sparks_total;
 
     if !dock_state.event_pulse.text.is_empty() {
         draw_dock_text(
             &mut scene,
             &dock_state.event_pulse.text,
-            right_x,
+            text_right_x,
             pad_v + 4.0, // slightly lower for smaller text
             dock_state.event_pulse.font_size,
             font,
@@ -345,7 +445,7 @@ pub fn render_north_dock(
     draw_dock_text(
         &mut scene,
         &dock_state.connection.text,
-        right_x + pulse_w + gap,
+        text_right_x + pulse_w + gap,
         pad_v,
         dock_state.connection.font_size,
         font,
@@ -750,6 +850,7 @@ pub fn update_hints(
 #[derive(Default)]
 pub(crate) struct EventPulseState {
     timestamps: VecDeque<f64>,
+    last_spark_sample: f64,
 }
 
 /// Update event pulse — shows server event rate in a rolling 5s window.
@@ -786,6 +887,12 @@ pub fn update_event_pulse(
     if dock.event_pulse.text != text {
         dock.event_pulse.text = text;
         dock.event_pulse.color = color;
+    }
+
+    // Sample event rate for sparkline every 250ms
+    if now - state.last_spark_sample >= 0.25 {
+        state.last_spark_sample = now;
+        dock.event_spark.push(total as f64);
     }
 }
 
@@ -877,11 +984,13 @@ pub fn update_agent_activity(
 pub(crate) struct BlockActivityCounts {
     running: u32,
     last_active_doc: Option<String>,
+    last_spark_sample: f64,
 }
 
 /// Update block activity — shows running block count for active document.
 pub fn update_block_activity(
     mut state: Local<BlockActivityCounts>,
+    time: Res<Time>,
     mut events: MessageReader<ServerEventMessage>,
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
@@ -925,7 +1034,15 @@ pub fn update_block_activity(
         dock.block_activity.text = text;
         dock.block_activity.color = theme.accent;
     }
+
+    // Sample running block count for sparkline every 250ms
+    let now = time.elapsed_secs_f64();
+    if now - state.last_spark_sample >= 0.25 {
+        state.last_spark_sample = now;
+        dock.activity_spark.push(state.running as f64);
+    }
 }
+
 
 // ============================================================================
 // PLUGIN
