@@ -16,7 +16,6 @@ use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
 
 use super::bootstrap::{self, BootstrapChannel, BootstrapCommand};
-use crate::constants::DEFAULT_KERNEL_ID;
 
 // ============================================================================
 // Resources
@@ -43,6 +42,8 @@ pub struct RpcConnectionState {
     pub ssh_config: SshConfig,
     /// Reconnect attempt counter (0 = connected or idle)
     pub reconnect_attempt: u32,
+    /// Server-authoritative kernel ID (set on connect)
+    pub kernel_id: Option<KernelId>,
     /// Context ID from server's join_context (server-authoritative)
     pub context_id: Option<ContextId>,
 }
@@ -151,10 +152,11 @@ impl Plugin for ActorPlugin {
         // Spawn the bootstrap thread
         let bootstrap_channel = bootstrap::spawn_bootstrap_thread();
 
-        // Send initial SpawnActor command
+        // Send initial SpawnActor command — kernel_id is a placeholder;
+        // the actor replaces it with the server-authoritative ID on connect.
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: SshConfig::default(),
-            kernel_id: DEFAULT_KERNEL_ID.to_string(),
+            kernel_id: KernelId::nil(),
             context_id: None,
             instance: "bevy-client".to_string(),
         });
@@ -210,7 +212,6 @@ fn poll_bootstrap_results(
                 // emit ContextJoined. Otherwise just get identity.
                 let h = handle.clone();
                 let tx = result_channel.sender();
-                let kernel_id_str = kernel_id.clone();
                 let ctx_id = context_id;
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
@@ -238,11 +239,12 @@ fn poll_bootstrap_results(
                         };
 
                         // 3. Construct ContextMembership from what we know
+                        // kernel_id here is the placeholder — the real one arrives
+                        // via ConnectionStatus::Connected and is stored on RpcConnectionState
                         let nick = identity.map(|id| id.username).unwrap_or_default();
                         let membership = ContextMembership {
                             context_id: ctx_id,
-                            kernel_id: KernelId::parse(&kernel_id_str)
-                                .unwrap_or_else(|_| KernelId::nil()),
+                            kernel_id,
                             nick,
                             instance: "bevy-client".to_string(),
                         };
@@ -363,9 +365,10 @@ fn update_connection_state(
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
-            kaijutsu_client::ConnectionStatus::Connected { context_id } => {
+            kaijutsu_client::ConnectionStatus::Connected { kernel_id, context_id } => {
                 state.connected = true;
                 state.reconnect_attempt = 0;
+                state.kernel_id = Some(*kernel_id);
                 state.context_id = *context_id;
             }
             kaijutsu_client::ConnectionStatus::Disconnected => {

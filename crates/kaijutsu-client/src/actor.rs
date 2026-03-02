@@ -817,6 +817,7 @@ impl RpcActor {
                 self.reconnect_attempts = 0;
                 self.next_reconnect_at = None;
                 let _ = self.status_tx.send(ConnectionStatus::Connected {
+                    kernel_id: self.kernel_id,
                     context_id: self.joined_context_id,
                 });
                 Ok(())
@@ -863,13 +864,16 @@ impl RpcActor {
                 ActorError::ConnectionLost(msg)
             })?;
 
-        let (kernel, _kernel_id) = client.attach_kernel()
+        let (kernel, server_kernel_id) = client.attach_kernel()
             .await
             .map_err(|e| {
                 let msg = format!("attach_kernel: {e}");
                 let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
                 ActorError::Rpc(msg)
             })?;
+
+        // Store the server-authoritative kernel ID
+        self.kernel_id = server_kernel_id;
 
         // Join context if one was specified
         let joined_ctx = if let Some(ctx_id) = &self.context_id {

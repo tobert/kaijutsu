@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use capnp::capability::Promise;
-use kaijutsu_crdt::ContextId;
+use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
@@ -93,7 +93,7 @@ pub enum ServerEvent {
 /// Subscribe via [`ActorHandle::subscribe_status()`](crate::ActorHandle::subscribe_status).
 #[derive(Clone, Debug)]
 pub enum ConnectionStatus {
-    Connected { context_id: Option<ContextId> },
+    Connected { kernel_id: KernelId, context_id: Option<ContextId> },
     Disconnected,
     Reconnecting { attempt: u32 },
     Error(String),

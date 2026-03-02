@@ -8,6 +8,7 @@
 
 use bevy::prelude::*;
 use kaijutsu_crdt::ContextId;
+use kaijutsu_types::KernelId;
 use uuid::Uuid;
 
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
@@ -38,24 +39,19 @@ pub fn create_or_fork_context(
     conn_state: &RpcConnectionState,
     actor: Option<&RpcActor>,
 ) {
-    let kernel_id = conn_state
-        .current_kernel
-        .as_ref()
-        .map(|k| k.id.to_string())
-        .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+    let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
     let context_label = Uuid::new_v4().to_string()[..8].to_string();
 
     if let Some(ref parent) = config.parent_context {
         if let Ok(parent_ctx_id) = ContextId::parse(parent) {
             let Some(actor) = actor else {
                 error!("Cannot fork from parent: no active RPC actor");
-                create_empty(bootstrap, conn_state, &kernel_id, &context_label);
+                create_empty(bootstrap, conn_state, kernel_id, &context_label);
                 return;
             };
             let handle = actor.handle.clone();
             let fork_label = context_label.clone();
             let config = conn_state.ssh_config.clone();
-            let kernel_id = kernel_id.clone();
             let bootstrap_tx = bootstrap.tx.clone();
 
             bevy::tasks::IoTaskPool::get()
@@ -77,10 +73,10 @@ pub fn create_or_fork_context(
                 .detach();
         } else {
             warn!("Parent context '{}' not in cache, creating empty", parent);
-            create_empty(bootstrap, conn_state, &kernel_id, &context_label);
+            create_empty(bootstrap, conn_state, kernel_id, &context_label);
         }
     } else {
-        create_empty(bootstrap, conn_state, &kernel_id, &context_label);
+        create_empty(bootstrap, conn_state, kernel_id, &context_label);
     }
 }
 
@@ -91,7 +87,7 @@ pub fn create_or_fork_context(
 fn create_empty(
     bootstrap: &BootstrapChannel,
     conn_state: &RpcConnectionState,
-    kernel_id: &str,
+    kernel_id: KernelId,
     label: &str,
 ) {
     let instance = Uuid::new_v4().to_string();
@@ -100,7 +96,7 @@ fn create_empty(
     info!("Creating empty context: {} (label: {}, instance: {})", ctx_id, label, instance);
     let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
         config: conn_state.ssh_config.clone(),
-        kernel_id: kernel_id.to_string(),
+        kernel_id,
         context_id: Some(ctx_id),
         instance,
     });

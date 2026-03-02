@@ -4,6 +4,7 @@
 //! the DocumentCache to the MainCell's CellEditor for rendering.
 
 use bevy::prelude::*;
+use kaijutsu_types::KernelId;
 
 use crate::cell::{
     CachedDocument, CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration,
@@ -324,11 +325,7 @@ pub fn handle_context_switch(
             info!("Context switch: cache miss for {}, spawning actor to join", ctx_id);
             pending_switch.0 = Some(ctx_id);
 
-            let kernel_id = conn_state
-                .current_kernel
-                .as_ref()
-                .map(|k| k.id.to_string())
-                .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+            let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
 
             let instance = uuid::Uuid::new_v4().to_string();
             let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {

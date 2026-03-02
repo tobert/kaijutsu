@@ -9,6 +9,7 @@ use std::thread;
 use bevy::prelude::*;
 use kaijutsu_client::{ActorHandle, SshConfig};
 use kaijutsu_crdt::ContextId;
+use kaijutsu_types::KernelId;
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -21,7 +22,7 @@ pub enum BootstrapCommand {
     /// Spawn a new actor for the given kernel/context.
     SpawnActor {
         config: SshConfig,
-        kernel_id: String,
+        kernel_id: KernelId,
         context_id: Option<ContextId>,
         instance: String,
     },
@@ -34,7 +35,7 @@ pub enum BootstrapResult {
     ActorReady {
         handle: ActorHandle,
         generation: u64,
-        kernel_id: String,
+        kernel_id: KernelId,
         context_id: Option<ContextId>,
     },
     /// Spawn failed (e.g. initial SSH connect failure).
@@ -122,11 +123,9 @@ fn bootstrap_thread(
                             // SSH handshake is ~10-50ms localhost, ~100-300ms remote.
                             // Future optimization: coordinate handoff locally within
                             // this LocalSet if latency becomes an issue.
-                            let kid = kaijutsu_types::KernelId::parse(&kernel_id)
-                                .unwrap_or_else(|_| kaijutsu_types::KernelId::new());
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
-                                kid,
+                                kernel_id,
                                 context_id,
                                 instance,
                                 None,

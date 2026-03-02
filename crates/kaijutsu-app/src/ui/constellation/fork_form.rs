@@ -13,6 +13,7 @@
 
 use bevy::prelude::*;
 use kaijutsu_crdt::ContextId;
+use kaijutsu_types::KernelId;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -644,11 +645,7 @@ fn submit_if_ready(
     let handle = actor.handle.clone();
     let source_ctx_id = form_root.source_context_id;
     let config = conn_state.ssh_config.clone();
-    let kernel_id = conn_state
-        .current_kernel
-        .as_ref()
-        .map(|k| k.id.to_string())
-        .unwrap_or_else(|| crate::constants::DEFAULT_KERNEL_ID.to_string());
+    let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
     let bootstrap_tx = bootstrap.tx.clone();
 
     let selected_provider = selected_model.as_ref().map(|(p, _)| p.clone());
