@@ -33,11 +33,13 @@ pub fn setup_legend_systems(app: &mut App) {
 
 /// Spawn the constellation container as a full-size flex child of ContentArea.
 ///
-/// Starts with `Display::None` — toggled by `sync_constellation_visibility`.
+/// Visibility matches the current screen state at spawn time so we don't
+/// depend on `OnEnter` having already fired.
 fn spawn_constellation_container(
     mut commands: Commands,
     existing: Query<Entity, With<ConstellationContainer>>,
     content_area: Query<Entity, With<crate::ui::state::ContentArea>>,
+    screen: Res<State<Screen>>,
 ) {
     if !existing.is_empty() {
         return;
@@ -47,18 +49,23 @@ fn spawn_constellation_container(
         return;
     };
 
+    let vis = if *screen.get() == Screen::Constellation {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+
     let constellation_entity = commands
         .spawn((
             ConstellationContainer,
             Node {
+                position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
-                flex_grow: 1.0,
                 overflow: Overflow::clip(),
-                display: Display::None,
                 ..default()
             },
-            Visibility::Hidden,
+            vis,
             BackgroundColor(Color::NONE),
         ))
         .id();

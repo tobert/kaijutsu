@@ -192,6 +192,7 @@ fn setup_ui(
                 content.spawn((
                     ui::state::ConversationRoot,
                     Node {
+                        position_type: PositionType::Absolute,
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
