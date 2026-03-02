@@ -6,11 +6,13 @@
 use bevy::prelude::*;
 
 /// Marker for the main content area
-#[derive(Component)]
+#[derive(Component, Reflect, Default)]
+#[reflect(Component)]
 pub struct ContentArea;
 
 /// Marker for the conversation view root
-#[derive(Component)]
+#[derive(Component, Reflect, Default)]
+#[reflect(Component)]
 pub struct ConversationRoot;
 
 /// Plugin for app state management
@@ -18,7 +20,9 @@ pub struct AppScreenPlugin;
 
 impl Plugin for AppScreenPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, handle_context_joined);
+        app.register_type::<ContentArea>()
+            .register_type::<ConversationRoot>()
+            .add_systems(Update, handle_context_joined);
     }
 }
 
