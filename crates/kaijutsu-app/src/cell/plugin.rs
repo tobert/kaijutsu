@@ -200,22 +200,21 @@ impl Plugin for CellPlugin {
         );
 
         // ====================================================================
-        // PostUpdate — reads UiGlobalTransform after UiSystems::Layout
+        // PostUpdate — Content sizing, Layout, then readback
         // ====================================================================
         app.add_systems(
             PostUpdate,
             (
-                view_cursor::update_input_overlay_cursor,
-                view_render::readback_block_heights,
+                view_cursor::update_input_overlay_cursor.after(bevy::ui::UiSystems::Layout),
+                view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
                 block_border::spawn_vello_borders
                     .after(view_render::readback_block_heights),
                 block_border::update_vello_borders
                     .after(block_border::spawn_vello_borders),
                 block_border::animate_vello_borders
                     .after(block_border::update_vello_borders),
-                view_render::update_role_group_scenes,
-            )
-                .after(bevy::ui::UiSystems::Layout),
+                view_render::update_role_group_scenes.after(bevy::ui::UiSystems::Layout),
+            ),
         );
     }
 }
