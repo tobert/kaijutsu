@@ -150,6 +150,10 @@ impl Plugin for CellPlugin {
                     .after(view_render::sync_block_cell_buffers),
                 ApplyDeferred
                     .after(block_border::determine_block_border_style),
+                // Rich content rendering — must run AFTER ApplyDeferred so the
+                // RichContent component inserted by sync_block_cell_buffers is visible.
+                crate::text::rich::render_rich_content
+                    .after(block_border::determine_block_border_style),
             )
                 .in_set(CellPhase::Buffer),
         );

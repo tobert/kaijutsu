@@ -132,8 +132,9 @@ pub fn sync_block_cell_buffers(
         }
 
         // Rich content rendering for Model/Text blocks (markdown, sparklines)
-        let is_rich = block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::Model;
-        if is_rich {
+        let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::Model;
+        let mut actually_rich = false;
+        if is_rich_candidate {
             if let Some(rich) = crate::text::detect_rich_content(&text, doc_version) {
                 // For sparklines: clear text so Parley won't fight min_height
                 let is_sparkline = matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
@@ -142,15 +143,18 @@ pub fn sync_block_cell_buffers(
                 }
                 vello_text.style.brush = bevy_color_to_brush(Color::NONE);
                 commands.entity(entity).insert(rich);
+                actually_rich = true;
             } else {
                 commands.entity(entity).remove::<crate::text::RichContent>();
+                commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
             }
         } else {
             commands.entity(entity).remove::<crate::text::RichContent>();
+            commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
         }
 
-        // Apply color (skip when rainbow or rich content is active)
-        if !rainbow && !is_rich {
+        // Apply color (skip when rainbow or actively rendering rich content)
+        if !rainbow && !actually_rich {
             let color = if let Some(vis) = timeline_vis {
                 base_color.with_alpha(base_color.alpha() * vis.opacity)
             } else {
