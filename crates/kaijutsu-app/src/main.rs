@@ -195,7 +195,6 @@ fn setup_ui(
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        display: Display::None,
                         ..default()
                     },
                     Visibility::Hidden,

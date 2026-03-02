@@ -13,7 +13,7 @@
 //! ## Design
 //!
 //! Long-lived entities (3D scene, containers, block cells) persist across transitions
-//! and are shown/hidden via Display + Visibility + camera `is_active`. Screen-scoped
+//! and are shown/hidden via Visibility + camera `is_active`. Screen-scoped
 //! entities (fork form UI) use `DespawnOnExit` for automatic cleanup.
 
 use bevy::prelude::*;
@@ -103,64 +103,55 @@ fn deactivate_constellation_camera(
     }
 }
 
-/// Show the constellation container (Display::Flex + Visibility::Inherited).
+/// Show the constellation container.
 fn show_constellation_container(
     mut containers: Query<
-        (&mut Node, &mut Visibility),
+        &mut Visibility,
         (With<ConstellationContainer>, Without<ConversationRoot>),
     >,
 ) {
-    for (mut node, mut vis) in containers.iter_mut() {
-        node.display = Display::Flex;
+    for mut vis in containers.iter_mut() {
         *vis = Visibility::Inherited;
     }
 }
 
-/// Hide the constellation container (Display::None + Visibility::Hidden).
+/// Hide the constellation container.
 fn hide_constellation_container(
     mut containers: Query<
-        (&mut Node, &mut Visibility),
+        &mut Visibility,
         (With<ConstellationContainer>, Without<ConversationRoot>),
     >,
 ) {
-    for (mut node, mut vis) in containers.iter_mut() {
-        node.display = Display::None;
+    for mut vis in containers.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }
 
-/// Show the conversation root (Display::Flex + Visibility::Inherited).
+/// Show the conversation root.
 fn show_conversation_root(
     mut roots: Query<
-        (&mut Node, &mut Visibility),
+        &mut Visibility,
         (With<ConversationRoot>, Without<ConstellationContainer>),
     >,
 ) {
-    for (mut node, mut vis) in roots.iter_mut() {
-        node.display = Display::Flex;
+    for mut vis in roots.iter_mut() {
         *vis = Visibility::Inherited;
     }
 }
 
-/// Hide the conversation root (Display::None + Visibility::Hidden).
+/// Hide the conversation root.
 fn hide_conversation_root(
     mut roots: Query<
-        (&mut Node, &mut Visibility),
+        &mut Visibility,
         (With<ConversationRoot>, Without<ConstellationContainer>),
     >,
 ) {
-    for (mut node, mut vis) in roots.iter_mut() {
-        node.display = Display::None;
+    for mut vis in roots.iter_mut() {
         *vis = Visibility::Hidden;
     }
 }
 
 /// Hide block cells and role headers when leaving conversation.
-///
-/// With Vello, text is rendered ON the Node entity (UiVelloText component
-/// lives on the same entity as Node). Display::None on ConversationRoot
-/// suppresses layout but does not prevent Vello from rendering at the
-/// entity's stale UiGlobalTransform. We must explicitly set Visibility.
 fn hide_cell_text(
     mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
     mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
