@@ -1,7 +1,8 @@
 //! Vello-rendered block borders (fieldset/legend style).
 //!
-//! Each bordered block gets a `UiVelloScene` child that draws a fieldset
-//! border with label gaps. Replaces the previous `BlockBorderMaterial` shader.
+//! Each bordered block gets a `UiVelloScene` on the same entity, drawing a fieldset
+//! border. The scene is NOT a child entity — child entities would cause Taffy to
+//! ignore ContentSize from UiVelloText, collapsing block height to just padding.
 
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
@@ -81,9 +82,13 @@ pub enum BorderAnimation {
     Breathe,
 }
 
-/// Links a BlockCell to its border child entity (UiVelloScene).
+/// Marker that the block cell has a `UiVelloScene` border drawn on it.
+///
+/// The border is rendered directly on the BlockCell entity (not a child),
+/// so that Taffy continues to use `ContentSize` from `UiVelloText` for sizing.
+/// (Child entities turn the parent into a container, causing Taffy to ignore ContentSize.)
 #[derive(Component)]
-pub struct BlockBorderEntity(pub Entity);
+pub struct BlockBorderActive;
 
 // ============================================================================
 // SYSTEMS
@@ -293,31 +298,23 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
     }
 }
 
-/// Spawn UiVelloScene border entity for BlockCells that have a style but no border entity.
+/// Add `UiVelloScene` directly to BlockCells that have a border style.
+///
+/// The scene is rendered on the same entity as `UiVelloText` so Taffy continues
+/// to use `ContentSize` (from bevy_vello's text measurement) for height sizing.
+/// Using a child entity would make Taffy treat the block as a container and
+/// ignore ContentSize, collapsing the height to just the padding (3-4px).
 ///
 /// Runs in PostUpdate (after UiSystems::Layout so ComputedNode is available).
 pub fn spawn_vello_borders(
     mut commands: Commands,
-    block_cells: Query<(Entity, &BlockBorderStyle), Without<BlockBorderEntity>>,
+    block_cells: Query<Entity, (With<BlockBorderStyle>, Without<BlockBorderActive>)>,
 ) {
-    for (entity, _style) in block_cells.iter() {
-        let border_entity = commands
-            .spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    top: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-                UiVelloScene::default(),
-                ZIndex(-1), // Render behind text
-            ))
-            .id();
-
-        commands.entity(entity).insert(BlockBorderEntity(border_entity));
-        commands.entity(entity).add_child(border_entity);
+    for entity in block_cells.iter() {
+        commands.entity(entity).insert((
+            UiVelloScene::default(),
+            BlockBorderActive,
+        ));
     }
 }
 
@@ -325,21 +322,16 @@ pub fn spawn_vello_borders(
 ///
 /// Runs in PostUpdate (after UiSystems::Layout).
 pub fn update_vello_borders(
-    block_cells: Query<
-        (&BlockBorderStyle, &BlockBorderEntity, &ComputedNode),
+    mut block_cells: Query<
+        (&BlockBorderStyle, &mut UiVelloScene, &ComputedNode),
         Or<(Changed<BlockBorderStyle>, Changed<ComputedNode>)>,
     >,
-    mut scenes: Query<&mut UiVelloScene>,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
 ) {
     let font = fonts.get(&font_handles.mono);
 
-    for (style, border_ent, computed) in block_cells.iter() {
-        let Ok(mut scene_component) = scenes.get_mut(border_ent.0) else {
-            continue;
-        };
-
+    for (style, mut scene_component, computed) in block_cells.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 || size.y < 1.0 {
             continue;
@@ -366,23 +358,18 @@ pub fn update_vello_borders(
 /// Runs in PostUpdate (after update_vello_borders).
 pub fn animate_vello_borders(
     time: Res<Time>,
-    block_cells: Query<(&BlockBorderStyle, &BlockBorderEntity, &ComputedNode)>,
-    mut scenes: Query<&mut UiVelloScene>,
+    mut block_cells: Query<(&BlockBorderStyle, &mut UiVelloScene, &ComputedNode)>,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
 ) {
     let t = time.elapsed_secs();
     let font = fonts.get(&font_handles.mono);
 
-    for (style, border_ent, computed) in block_cells.iter() {
+    for (style, mut scene_component, computed) in block_cells.iter_mut() {
         // Only animate blocks with active animations
         if style.animation == BorderAnimation::None {
             continue;
         }
-
-        let Ok(mut scene_component) = scenes.get_mut(border_ent.0) else {
-            continue;
-        };
 
         let size = computed.size();
         if size.x < 1.0 || size.y < 1.0 {
@@ -405,19 +392,13 @@ pub fn animate_vello_borders(
     }
 }
 
-/// Clean up border entities when BlockCell loses its style or is despawned.
+/// Clean up border scenes when BlockCell loses its style.
 pub fn cleanup_block_borders(
     mut commands: Commands,
-    // BlockCells that have a border entity but no style
-    removed_style: Query<(Entity, &BlockBorderEntity), Without<BlockBorderStyle>>,
-    // Orphaned border entities (their parent BlockCell was despawned)
-    all_border_refs: Query<&BlockBorderEntity>,
+    // BlockCells that have BlockBorderActive but no BlockBorderStyle
+    removed_style: Query<Entity, (With<BlockBorderActive>, Without<BlockBorderStyle>)>,
 ) {
-    // Case 1: Style removed but entity still has BlockBorderEntity
-    for (entity, border_ent) in removed_style.iter() {
-        commands.entity(border_ent.0).try_despawn();
-        commands.entity(entity).remove::<BlockBorderEntity>();
+    for entity in removed_style.iter() {
+        commands.entity(entity).remove::<(UiVelloScene, BlockBorderActive)>();
     }
-
-    let _ = all_border_refs; // suppress unused warning — presence in query is the point
 }
