@@ -175,6 +175,14 @@ pub fn spawn_block_cells(
 
     // Purge stale entity references — the tiling reconciler despawns pane
     // children recursively, which kills block cells without telling the container.
+    let live_count = existing_block_cells.iter().count();
+    let container_count = container.block_cells.len();
+    if container_count > 0 && live_count != container_count {
+        warn!(
+            "spawn_block_cells: container has {} refs, {} alive BlockCells, {} editor blocks",
+            container_count, live_count, current_blocks.len()
+        );
+    }
     let live_entities: std::collections::HashSet<Entity> =
         existing_block_cells.iter().collect();
     let stale: Vec<Entity> = container
