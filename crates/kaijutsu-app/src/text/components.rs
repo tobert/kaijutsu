@@ -21,35 +21,17 @@ pub struct KjTextEffects {
     pub rainbow: bool,
 }
 
-/// Convenience wrapper for UI text with kaijutsu defaults.
+/// Build a `VelloTextStyle` from font handle, color, and size.
 ///
-/// Widget systems update this; sync system propagates to UiVelloText.
-#[derive(Component, Clone)]
-pub struct KjUiText {
-    pub text: String,
-    pub color: Color,
-    pub font_size: f32,
-}
-
-impl KjUiText {
-    pub fn new(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            color: Color::WHITE,
-            font_size: 16.0,
-        }
+/// Replaces the per-frame sync that `KjUiText` + `sync_kj_ui_text` used to do.
+/// Call this at spawn time to construct a fully-styled `UiVelloText`.
+pub fn vello_style(font: &Handle<VelloFont>, color: Color, font_size: f32) -> VelloTextStyle {
+    VelloTextStyle {
+        font: font.clone(),
+        brush: bevy_color_to_brush(color),
+        font_size,
+        ..default()
     }
-
-    pub fn with_color(mut self, color: Color) -> Self {
-        self.color = color;
-        self
-    }
-
-    pub fn with_font_size(mut self, size: f32) -> Self {
-        self.font_size = size;
-        self
-    }
-
 }
 
 /// Convert a Bevy `Color` to a Vello `Brush::Solid`.

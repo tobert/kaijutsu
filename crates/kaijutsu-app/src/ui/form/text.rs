@@ -1,24 +1,30 @@
 //! Vello text spawn helpers.
 //!
-//! Collapses the `KjUiText` + `UiVelloText` + `Node` spawn pattern
-//! into single function calls: `vello_label`, `vello_label_with`, `vello_text`.
+//! Build styled `UiVelloText` directly at spawn time — no intermediate wrapper.
+//! Heights use `Val::Auto` so bevy_vello's `ContentSize` drives layout.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::UiVelloText;
+use bevy_vello::prelude::{UiVelloText, VelloFont};
 
-use crate::text::KjUiText;
+use crate::text::vello_style;
 
-/// Spawn a full-width text label as a child. Height auto-derived from font size.
-pub fn vello_label(parent: &mut ChildSpawnerCommands, text: &str, font_size: f32, color: Color) -> Entity {
+/// Spawn a full-width text label as a child. Height driven by ContentSize.
+pub fn vello_label(
+    parent: &mut ChildSpawnerCommands,
+    font: &Handle<VelloFont>,
+    text: &str,
+    font_size: f32,
+    color: Color,
+) -> Entity {
     parent
         .spawn((
-            KjUiText::new(text)
-                .with_font_size(font_size)
-                .with_color(color),
-            UiVelloText::default(),
+            UiVelloText {
+                value: text.into(),
+                style: vello_style(font, color, font_size),
+                ..default()
+            },
             Node {
                 width: Val::Percent(100.0),
-                height: Val::Px((font_size * 1.2).ceil()),
                 ..default()
             },
         ))
@@ -29,6 +35,7 @@ pub fn vello_label(parent: &mut ChildSpawnerCommands, text: &str, font_size: f32
 #[allow(dead_code)] // Available for forms that need marker components on labels
 pub fn vello_label_with<M: Component>(
     parent: &mut ChildSpawnerCommands,
+    font: &Handle<VelloFont>,
     marker: M,
     text: &str,
     font_size: f32,
@@ -37,13 +44,13 @@ pub fn vello_label_with<M: Component>(
     parent
         .spawn((
             marker,
-            KjUiText::new(text)
-                .with_font_size(font_size)
-                .with_color(color),
-            UiVelloText::default(),
+            UiVelloText {
+                value: text.into(),
+                style: vello_style(font, color, font_size),
+                ..default()
+            },
             Node {
                 width: Val::Percent(100.0),
-                height: Val::Px((font_size * 1.2).ceil()),
                 ..default()
             },
         ))
@@ -53,6 +60,7 @@ pub fn vello_label_with<M: Component>(
 /// Spawn a fixed-width text entity (for button labels, badges, etc.).
 pub fn vello_text(
     parent: &mut ChildSpawnerCommands,
+    font: &Handle<VelloFont>,
     text: &str,
     font_size: f32,
     color: Color,
@@ -60,13 +68,13 @@ pub fn vello_text(
 ) -> Entity {
     parent
         .spawn((
-            KjUiText::new(text)
-                .with_font_size(font_size)
-                .with_color(color),
-            UiVelloText::default(),
+            UiVelloText {
+                value: text.into(),
+                style: vello_style(font, color, font_size),
+                ..default()
+            },
             Node {
                 width: Val::Px(width),
-                height: Val::Px((font_size * 1.2).ceil()),
                 ..default()
             },
         ))

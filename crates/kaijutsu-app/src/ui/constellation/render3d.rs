@@ -22,8 +22,8 @@ use super::{
     viewport::{ViewportState, ConstellationCamera3d, TestSphere},
 };
 use crate::ui::screen::Screen;
-use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
+use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::{Theme, agent_color_for_provider};
 
 /// The render layer used for all constellation 3D content.
@@ -397,6 +397,7 @@ fn update_node_labels(
     constellation: Res<Constellation>,
     screen: Res<State<Screen>>,
     viewport_state: Res<ViewportState>,
+    font_handles: Res<FontHandles>,
     cameras: Query<(&Camera, &GlobalTransform), With<ConstellationCamera3d>>,
     nodes_3d: Query<(&Node3d, &Transform), Without<EdgeMesh>>,
     mut labels: Query<(Entity, &mut NodeLabel3d, &mut Node)>,
@@ -469,13 +470,13 @@ fn update_node_labels(
                 ))
                 .with_children(|parent| {
                     parent.spawn((
-                        KjUiText::new(&label_text)
-                            .with_font_size(10.0)
-                            .with_color(Color::srgba(0.8, 0.85, 0.9, 0.9)),
-                        UiVelloText::default(),
+                        UiVelloText {
+                            value: label_text.clone(),
+                            style: vello_style(&font_handles.mono, Color::srgba(0.8, 0.85, 0.9, 0.9), 10.0),
+                            ..default()
+                        },
                         Node {
                             min_width: Val::Px(80.0),
-                            min_height: Val::Px(14.0),
                             ..default()
                         },
                     ));

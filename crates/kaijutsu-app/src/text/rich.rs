@@ -3,15 +3,18 @@
 //! Supports multiple content formats via `RichContentKind`:
 //! - **Markdown**: per-span brush coloring (headings, code, bold, etc.)
 //! - **Sparkline**: inline timeseries mini-charts (pure Vello vector paths)
+//! - **SVG**: inline vector graphics (via bevy_vello's `load_svg_from_str`)
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
-//! (more specific fence pattern), then falls back to markdown.
+//! (more specific fence pattern), then SVG, then falls back to markdown.
 
 use bevy::prelude::*;
 use bevy_vello::prelude::*;
 use bevy_vello::parley;
 use vello::kurbo::Affine;
 use vello::peniko::{Brush, Fill};
+
+use std::sync::Arc;
 
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
 use super::sparkline::{SparklineData, SparklineColors, try_parse_sparkline, build_sparkline_paths, render_sparkline_scene};
@@ -41,7 +44,7 @@ pub struct RichContent {
 }
 
 impl RichContent {
-    /// Desired height for non-text content (sparklines).
+    /// Desired height for non-text content (sparklines, SVGs).
     ///
     /// Returns `Some(height)` for formats that need explicit sizing
     /// (no Parley text to measure). Returns `None` for text-based formats.
@@ -49,6 +52,7 @@ impl RichContent {
         match &self.kind {
             RichContentKind::Markdown { .. } => None,
             RichContentKind::Sparkline(_) => Some(theme.sparkline_height),
+            RichContentKind::Svg { height, .. } => Some(*height),
         }
     }
 }
@@ -62,6 +66,15 @@ pub enum RichContentKind {
     },
     /// Inline timeseries mini-chart.
     Sparkline(SparklineData),
+    /// Inline SVG vector graphic.
+    Svg {
+        /// Pre-parsed Vello scene from the SVG content.
+        scene: Arc<vello::Scene>,
+        /// Original SVG width (for aspect-ratio scaling).
+        width: f32,
+        /// Display height (capped to a reasonable maximum).
+        height: f32,
+    },
 }
 
 /// Build a `Vec<SpanBrush>` from parsed spans + theme colors.
@@ -240,6 +253,17 @@ pub fn render_rich_content(
                     render_sparkline_scene(&mut scene, &paths, &sparkline_colors);
                 }
             }
+            RichContentKind::Svg { scene: svg_scene, width: svg_w, height: svg_h } => {
+                let container_w = node.size().x;
+                if container_w > 0.0 && *svg_w > 0.0 {
+                    // Scale SVG to fit container width while preserving aspect ratio
+                    let scale = (container_w / svg_w).min(1.0) as f64;
+                    scene.append(svg_scene, Some(Affine::scale(scale)));
+                } else {
+                    let _ = svg_h; // suppress unused warning when width is zero
+                    scene.append(svg_scene, None);
+                }
+            }
         }
 
         commands.entity(entity).insert(UiVelloScene::from(scene));
@@ -247,15 +271,80 @@ pub fn render_rich_content(
     }
 }
 
+/// Maximum SVG source size we'll attempt to parse (100KB).
+const SVG_MAX_BYTES: usize = 100 * 1024;
+
+/// Maximum rendered height for inline SVGs.
+const SVG_MAX_HEIGHT: f32 = 400.0;
+
+/// Try to extract and parse SVG content from block text.
+///
+/// Recognizes two patterns:
+/// - Raw SVG: text starts with `<svg`
+/// - Fenced SVG: ` ```svg\n...\n``` `
+fn try_parse_svg(text: &str) -> Option<(Arc<vello::Scene>, f32, f32)> {
+    let svg_str = if text.trim_start().starts_with("<svg") {
+        text.trim()
+    } else if let Some(inner) = extract_fenced_block(text, "svg") {
+        inner
+    } else {
+        return None;
+    };
+
+    if svg_str.len() > SVG_MAX_BYTES {
+        return None;
+    }
+
+    match bevy_vello::integrations::svg::load_svg_from_str(svg_str) {
+        Ok(svg) => {
+            let w = svg.width;
+            let h = svg.height.min(SVG_MAX_HEIGHT);
+            Some((svg.scene, w, h))
+        }
+        Err(e) => {
+            warn!("SVG parse failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Extract content from a fenced code block with the given language tag.
+fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+    let fence_start = format!("```{}", lang);
+    let trimmed = text.trim();
+    if !trimmed.starts_with(&fence_start) {
+        return None;
+    }
+    // Find the end fence
+    let after_fence = &trimmed[fence_start.len()..];
+    let content_start = after_fence.find('\n')? + 1;
+    let content = &after_fence[content_start..];
+    let end_idx = content.rfind("```")?;
+    let inner = content[..end_idx].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner)
+}
+
 /// Detect rich content from a block's text.
 ///
-/// Tries sparkline first (more specific fence pattern), then markdown.
+/// Tries sparkline first (most specific), then SVG, then markdown.
 /// Returns `None` for plain text with no formatting.
 pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
     // Try sparkline first — more specific pattern
     if let Some(data) = try_parse_sparkline(text) {
         return Some(RichContent {
             kind: RichContentKind::Sparkline(data),
+            version,
+            last_render_version: 0,
+        });
+    }
+
+    // Try SVG
+    if let Some((scene, width, height)) = try_parse_svg(text) {
+        return Some(RichContent {
+            kind: RichContentKind::Svg { scene, width, height },
             version,
             last_render_version: 0,
         });

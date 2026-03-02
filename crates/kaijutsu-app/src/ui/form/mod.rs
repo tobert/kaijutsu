@@ -41,6 +41,8 @@ impl Plugin for FormPlugin {
                 selectable::sync_selectable_list_visuals,
                 tree::rebuild_tree_view,
                 field::sync_form_field_outlines,
+                selectable::handle_selectable_list_click,
+                tree::handle_tree_view_click,
             ),
         );
     }

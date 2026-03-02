@@ -5,8 +5,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
+use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -181,7 +181,7 @@ impl TreeView {
 
 /// Marker on each row entity spawned by the rebuild system.
 #[derive(Component)]
-pub struct TreeViewRow(#[allow(dead_code)] pub usize);
+pub struct TreeViewRow(pub usize);
 
 // ============================================================================
 // REBUILD SYSTEM
@@ -193,6 +193,7 @@ pub struct TreeViewRow(#[allow(dead_code)] pub usize);
 pub fn rebuild_tree_view(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     mut trees: Query<(Entity, &mut TreeView), Changed<TreeView>>,
     existing_rows: Query<(Entity, &TreeViewRow, &ChildOf)>,
 ) {
@@ -210,6 +211,7 @@ pub fn rebuild_tree_view(
 
         let font_size = tree.font_size;
         let row_height = (font_size * 1.2).ceil() + 5.0;
+        let font = &font_handles.mono;
 
         let mut flat_idx = 0;
         for cat in &tree.categories {
@@ -242,13 +244,13 @@ pub fn rebuild_tree_view(
                 ))
                 .with_children(|r| {
                     r.spawn((
-                        KjUiText::new(&label)
-                            .with_font_size(font_size)
-                            .with_color(color),
-                        UiVelloText::default(),
+                        UiVelloText {
+                            value: label.clone(),
+                            style: vello_style(font, color, font_size),
+                            ..default()
+                        },
                         Node {
                             width: Val::Percent(100.0),
-                            height: Val::Px((font_size * 1.2).ceil()),
                             ..default()
                         },
                     ));
@@ -289,13 +291,13 @@ pub fn rebuild_tree_view(
                         ))
                         .with_children(|r| {
                             r.spawn((
-                                KjUiText::new(&label)
-                                    .with_font_size(font_size)
-                                    .with_color(color),
-                                UiVelloText::default(),
+                                UiVelloText {
+                                    value: label.clone(),
+                                    style: vello_style(font, color, font_size),
+                                    ..default()
+                                },
                                 Node {
                                     width: Val::Percent(100.0),
-                                    height: Val::Px((font_size * 1.2).ceil()),
                                     ..default()
                                 },
                             ));
@@ -308,5 +310,42 @@ pub fn rebuild_tree_view(
         }
 
         tree.dirty = false;
+    }
+}
+
+// ============================================================================
+// CLICK HANDLER
+// ============================================================================
+
+/// Handle clicks on tree rows.
+///
+/// Clicking a category row toggles expand/collapse.
+/// Clicking an item row moves the cursor there and toggles the item.
+pub fn handle_tree_view_click(
+    rows: Query<(&TreeViewRow, &Interaction, &ChildOf), Changed<Interaction>>,
+    mut trees: Query<&mut TreeView>,
+) {
+    for (row, interaction, child_of) in rows.iter() {
+        if !matches!(interaction, Interaction::Pressed) {
+            continue;
+        }
+        let Ok(mut tree) = trees.get_mut(child_of.0) else {
+            continue;
+        };
+        let idx = row.0;
+        if idx < tree.total_visible_rows() && idx != tree.cursor {
+            tree.cursor = idx;
+            tree.dirty = true;
+        }
+        // After moving cursor, toggle (expand/collapse for categories, enable/disable for items)
+        match tree.resolve_cursor() {
+            Some(TreeCursorTarget::Category(_)) => {
+                tree.toggle_expand();
+            }
+            Some(TreeCursorTarget::Item(_, _)) => {
+                tree.toggle_item();
+            }
+            None => {}
+        }
     }
 }

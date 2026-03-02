@@ -32,8 +32,8 @@ use bevy::prelude::*;
 use super::tiling::*;
 use super::theme::Theme;
 use crate::cell::ConversationContainer;
-use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
+use crate::text::{FontHandles, vello_style};
 
 // ============================================================================
 // MARKERS
@@ -465,6 +465,7 @@ pub fn sync_unfocused_pane_summaries(
     mut commands: Commands,
     tree: Res<TilingTree>,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     doc_cache: Res<crate::cell::DocumentCache>,
     conv_containers: Query<(Entity, &PaneMarker, &PaneSavedState, Option<&Children>), With<ConversationContainer>>,
     summaries: Query<Entity, With<UnfocusedPaneSummary>>,
@@ -530,10 +531,11 @@ pub fn sync_unfocused_pane_summaries(
                 let summary_entity = commands
                     .spawn((
                         UnfocusedPaneSummary,
-                        KjUiText::new(&summary_text)
-                            .with_font_size(14.0)
-                            .with_color(theme.fg_dim),
-                        UiVelloText::default(),
+                        UiVelloText {
+                            value: summary_text,
+                            style: vello_style(&font_handles.mono, theme.fg_dim, 14.0),
+                            ..default()
+                        },
                         Node {
                             width: Val::Percent(100.0),
                             padding: UiRect::all(Val::Px(16.0)),

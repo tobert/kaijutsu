@@ -6,8 +6,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
+use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -138,7 +138,7 @@ impl SelectableList {
 
 /// Marker on each row entity spawned by the sync system.
 #[derive(Component)]
-pub struct SelectableListRow(#[allow(dead_code)] pub usize);
+pub struct SelectableListRow(pub usize);
 
 /// Marker on the text entity within a row.
 #[derive(Component)]
@@ -154,6 +154,7 @@ struct SelectableListRowText;
 pub fn sync_selectable_list_visuals(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     mut lists: Query<(Entity, &mut SelectableList), Changed<SelectableList>>,
     existing_rows: Query<(Entity, &SelectableListRow, &ChildOf)>,
 ) {
@@ -173,6 +174,7 @@ pub fn sync_selectable_list_visuals(
         let font_size = list.font_size;
         let row_height = (font_size * 1.2).ceil() + 5.0;
         let header_font_size = font_size - 2.0;
+        let font = &font_handles.mono;
 
         for (i, item) in list.items.iter().enumerate() {
             let is_selected = i == list.selected && !item.is_header;
@@ -197,13 +199,13 @@ pub fn sync_selectable_list_visuals(
                     .with_children(|r| {
                         r.spawn((
                             SelectableListRowText,
-                            KjUiText::new(&item.label)
-                                .with_font_size(header_font_size)
-                                .with_color(theme.fg_dim),
-                            UiVelloText::default(),
+                            UiVelloText {
+                                value: item.label.clone(),
+                                style: vello_style(font, theme.fg_dim, header_font_size),
+                                ..default()
+                            },
                             Node {
                                 width: Val::Percent(100.0),
-                                height: Val::Px((header_font_size * 1.2).ceil()),
                                 ..default()
                             },
                         ));
@@ -242,13 +244,13 @@ pub fn sync_selectable_list_visuals(
                     .with_children(|r| {
                         r.spawn((
                             SelectableListRowText,
-                            KjUiText::new(&text)
-                                .with_font_size(font_size)
-                                .with_color(color),
-                            UiVelloText::default(),
+                            UiVelloText {
+                                value: text,
+                                style: vello_style(font, color, font_size),
+                                ..default()
+                            },
                             Node {
                                 width: Val::Percent(100.0),
-                                height: Val::Px((font_size * 1.2).ceil()),
                                 ..default()
                             },
                         ));
@@ -259,5 +261,31 @@ pub fn sync_selectable_list_visuals(
         }
 
         list.dirty = false;
+    }
+}
+
+// ============================================================================
+// CLICK HANDLER
+// ============================================================================
+
+/// Select a list item when its row is clicked.
+///
+/// Supplements keyboard navigation — clicking a non-header row selects it.
+pub fn handle_selectable_list_click(
+    rows: Query<(&SelectableListRow, &Interaction, &ChildOf), Changed<Interaction>>,
+    mut lists: Query<&mut SelectableList>,
+) {
+    for (row, interaction, child_of) in rows.iter() {
+        if !matches!(interaction, Interaction::Pressed) {
+            continue;
+        }
+        let Ok(mut list) = lists.get_mut(child_of.0) else {
+            continue;
+        };
+        let idx = row.0;
+        if idx < list.items.len() && !list.items[idx].is_header && idx != list.selected {
+            list.selected = idx;
+            list.dirty = true;
+        }
     }
 }

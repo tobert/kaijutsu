@@ -20,8 +20,8 @@ use uuid::Uuid;
 use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
 use crate::input::action::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
-use crate::text::KjUiText;
 use bevy_vello::prelude::UiVelloText;
+use crate::text::{FontHandles, vello_style, bevy_color_to_brush};
 use crate::ui::form::{
     handle_form_action, handle_form_space, ActiveFormField, AsyncSlot, ButtonDesc, FieldDesc, Form,
     FormActionResult, FormFieldContainer, FormLayout, FormLoadingText, FormPresentation, ListItem,
@@ -307,6 +307,7 @@ fn handle_open_fork_form(
 fn init_name_display(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     containers: Query<(Entity, &FormFieldContainer), Added<FormFieldContainer>>,
     existing: Query<&ForkFormNameDisplay>,
 ) {
@@ -319,13 +320,13 @@ fn init_name_display(
             let child = commands
                 .spawn((
                     ForkFormNameDisplay,
-                    KjUiText::new("hex ID if blank")
-                        .with_font_size(14.0)
-                        .with_color(theme.fg_dim),
-                    UiVelloText::default(),
+                    UiVelloText {
+                        value: "hex ID if blank".into(),
+                        style: vello_style(&font_handles.mono, theme.fg_dim, 14.0),
+                        ..default()
+                    },
                     Node {
                         width: Val::Percent(100.0),
-                        height: Val::Px(16.0),
                         ..default()
                     },
                 ))
@@ -342,6 +343,7 @@ fn init_name_display(
 fn poll_fork_form_models(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     model_slot: Res<AsyncSlot<FetchedModels>>,
     mut state_query: Query<&mut ForkFormState>,
     loading_query: Query<(Entity, &FormLoadingText)>,
@@ -396,13 +398,13 @@ fn poll_fork_form_models(
     if list_items.is_empty() {
         let hint = commands
             .spawn((
-                KjUiText::new("No models available (will inherit parent)")
-                    .with_font_size(13.0)
-                    .with_color(theme.fg_dim),
-                UiVelloText::default(),
+                UiVelloText {
+                    value: "No models available (will inherit parent)".into(),
+                    style: vello_style(&font_handles.mono, theme.fg_dim, 13.0),
+                    ..default()
+                },
                 Node {
                     width: Val::Percent(100.0),
-                    height: Val::Px(15.0),
                     ..default()
                 },
             ))
@@ -438,6 +440,7 @@ fn poll_fork_form_models(
 fn poll_fork_form_tools(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     tool_slot: Res<AsyncSlot<FetchedTools>>,
     mut state_query: Query<&mut ForkFormState>,
     loading_query: Query<(Entity, &FormLoadingText)>,
@@ -473,13 +476,13 @@ fn poll_fork_form_tools(
     if fetched.categories.is_empty() {
         let hint = commands
             .spawn((
-                KjUiText::new("No tools available")
-                    .with_font_size(13.0)
-                    .with_color(theme.fg_dim),
-                UiVelloText::default(),
+                UiVelloText {
+                    value: "No tools available".into(),
+                    style: vello_style(&font_handles.mono, theme.fg_dim, 13.0),
+                    ..default()
+                },
                 Node {
                     width: Val::Percent(100.0),
-                    height: Val::Px(15.0),
                     ..default()
                 },
             ))
@@ -510,7 +513,7 @@ fn handle_fork_form_input(
             &mut ActiveFormField,
         ),
     >,
-    mut name_display: Query<&mut KjUiText, With<ForkFormNameDisplay>>,
+    mut name_display: Query<&mut UiVelloText, With<ForkFormNameDisplay>>,
     mut list_query: Query<(&FormFieldContainer, &mut SelectableList)>,
     mut tree_query: Query<(&FormFieldContainer, &mut TreeView)>,
     theme: Res<Theme>,
@@ -580,13 +583,13 @@ fn handle_fork_form_input(
         }
     }
 
-    if text_changed && let Ok(mut kj) = name_display.single_mut() {
+    if text_changed && let Ok(mut vt) = name_display.single_mut() {
         if state.name_text.is_empty() {
-            kj.text = "hex ID if blank".to_string();
-            kj.color = theme.fg_dim;
+            vt.value = "hex ID if blank".to_string();
+            vt.style.brush = bevy_color_to_brush(theme.fg_dim);
         } else {
-            kj.text = state.name_text.clone();
-            kj.color = theme.fg;
+            vt.value = state.name_text.clone();
+            vt.style.brush = bevy_color_to_brush(theme.fg);
         }
     }
 }

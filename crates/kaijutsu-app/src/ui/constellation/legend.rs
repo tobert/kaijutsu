@@ -112,6 +112,7 @@ fn update_legend_content(
     drift_state: Res<DriftState>,
     constellation: Res<Constellation>,
     theme: Res<Theme>,
+    font_handles: Res<crate::text::FontHandles>,
     legend_q: Query<Entity, With<ConstellationLegend>>,
     content_q: Query<Entity, With<LegendContent>>,
     mut last_fingerprint: Local<u64>,
@@ -177,13 +178,15 @@ fn update_legend_content(
 
     let unique_providers = provider_counts.len();
 
+    let font = &font_handles.mono;
+
     // Header: kernel name
-    let header = spawn_legend_text(&mut commands, &truncate_name(kernel_name, 22), theme.fg, 11.0);
+    let header = spawn_legend_text(&mut commands, font, &truncate_name(kernel_name, 22), theme.fg, 11.0);
     commands.entity(legend_entity).add_child(header);
 
     // Summary line
     let summary = format!("{} contexts \u{00b7} {} agents", total_contexts, unique_providers);
-    let summary_entity = spawn_legend_text(&mut commands, &summary, theme.fg_dim, 9.0);
+    let summary_entity = spawn_legend_text(&mut commands, font, &summary, theme.fg_dim, 9.0);
     commands.entity(legend_entity).add_child(summary_entity);
 
     // Separator
@@ -209,7 +212,7 @@ fn update_legend_content(
             "human" => "amy",
             l => l,
         };
-        let row = spawn_legend_agent_row(&mut commands, display_name, *color, *count, &theme);
+        let row = spawn_legend_agent_row(&mut commands, font, display_name, *color, *count, &theme);
         commands.entity(legend_entity).add_child(row);
     }
 
@@ -230,7 +233,7 @@ fn update_legend_content(
         commands.entity(legend_entity).add_child(sep2);
 
         let drift_text = format!("{} staged drifts", staged_count);
-        let drift_entity = spawn_legend_text(&mut commands, &drift_text, theme.ansi.cyan, 9.0);
+        let drift_entity = spawn_legend_text(&mut commands, font, &drift_text, theme.ansi.cyan, 9.0);
         commands.entity(legend_entity).add_child(drift_entity);
     }
 
@@ -245,7 +248,13 @@ fn truncate_name(name: &str, max_len: usize) -> String {
     }
 }
 
-fn spawn_legend_text(commands: &mut Commands, text: &str, color: Color, font_size: f32) -> Entity {
+fn spawn_legend_text(
+    commands: &mut Commands,
+    font: &Handle<bevy_vello::prelude::VelloFont>,
+    text: &str,
+    color: Color,
+    font_size: f32,
+) -> Entity {
     commands
         .spawn((
             LegendContent,
@@ -256,13 +265,13 @@ fn spawn_legend_text(commands: &mut Commands, text: &str, color: Color, font_siz
         ))
         .with_children(|parent| {
             parent.spawn((
-                crate::text::KjUiText::new(text)
-                    .with_font_size(font_size)
-                    .with_color(color),
-                bevy_vello::prelude::UiVelloText::default(),
+                bevy_vello::prelude::UiVelloText {
+                    value: text.into(),
+                    style: crate::text::vello_style(font, color, font_size),
+                    ..default()
+                },
                 Node {
                     width: Val::Percent(100.0),
-                    height: Val::Px(font_size + 2.0),
                     ..default()
                 },
             ));
@@ -272,6 +281,7 @@ fn spawn_legend_text(commands: &mut Commands, text: &str, color: Color, font_siz
 
 fn spawn_legend_agent_row(
     commands: &mut Commands,
+    font: &Handle<bevy_vello::prelude::VelloFont>,
     name: &str,
     color: Color,
     count: usize,
@@ -301,26 +311,26 @@ fn spawn_legend_agent_row(
             ));
             // Agent name
             parent.spawn((
-                crate::text::KjUiText::new(name)
-                    .with_font_size(10.0)
-                    .with_color(color),
-                bevy_vello::prelude::UiVelloText::default(),
+                bevy_vello::prelude::UiVelloText {
+                    value: name.into(),
+                    style: crate::text::vello_style(font, color, 10.0),
+                    ..default()
+                },
                 Node {
                     width: Val::Px(70.0),
-                    height: Val::Px(12.0),
                     ..default()
                 },
             ));
             // Count
             let count_text = format!("{} ctx", count);
             parent.spawn((
-                crate::text::KjUiText::new(&count_text)
-                    .with_font_size(9.0)
-                    .with_color(theme.fg_dim),
-                bevy_vello::prelude::UiVelloText::default(),
+                bevy_vello::prelude::UiVelloText {
+                    value: count_text,
+                    style: crate::text::vello_style(font, theme.fg_dim, 9.0),
+                    ..default()
+                },
                 Node {
                     width: Val::Px(50.0),
-                    height: Val::Px(11.0),
                     margin: UiRect::left(Val::Auto),
                     ..default()
                 },

@@ -13,8 +13,8 @@
 
 use bevy::prelude::*;
 
-use crate::text::KjUiText;
-use bevy_vello::prelude::UiVelloText;
+use bevy_vello::prelude::{UiVelloText, VelloFont};
+use crate::text::{FontHandles, vello_style};
 use crate::ui::form::field::{ActiveFormField, FormField};
 use crate::ui::form::text::{vello_label, vello_text};
 use crate::ui::theme::Theme;
@@ -96,6 +96,7 @@ pub struct FormLoadingText(pub u8);
 pub fn build_form(
     mut commands: Commands,
     theme: Res<Theme>,
+    font_handles: Res<FontHandles>,
     query: Query<(Entity, &Form, &FormPresentation), Added<Form>>,
 ) {
     for (entity, form, presentation) in query.iter() {
@@ -110,10 +111,10 @@ pub fn build_form(
                 width,
                 max_height_pct,
             } => {
-                build_full_viewport(&mut commands, entity, form, &theme, *width, *max_height_pct);
+                build_full_viewport(&mut commands, entity, form, &theme, &font_handles, *width, *max_height_pct);
             }
             FormPresentation::Modal { width, min_height } => {
-                build_modal(&mut commands, entity, form, &theme, *width, *min_height);
+                build_modal(&mut commands, entity, form, &theme, &font_handles, *width, *min_height);
             }
         }
     }
@@ -128,9 +129,11 @@ fn build_full_viewport(
     form_entity: Entity,
     form: &Form,
     theme: &Theme,
+    font_handles: &FontHandles,
     width: f32,
     max_height_pct: f32,
 ) {
+    let font = font_handles.mono.clone();
     // Content wrapper (centered, constrained)
     let content = commands
         .spawn(Node {
@@ -143,7 +146,7 @@ fn build_full_viewport(
         })
         .with_children(|content| {
             // Title
-            vello_label(content, &form.title, 18.0, theme.fg);
+            vello_label(content, &font, &form.title, 18.0, theme.fg);
 
             // Layout container
             match &form.layout {
@@ -157,7 +160,7 @@ fn build_full_viewport(
                         })
                         .with_children(|col| {
                             for field in fields {
-                                spawn_field(col, field, form, theme);
+                                spawn_field(col, field, form, theme, &font);
                             }
                         });
                 }
@@ -181,7 +184,7 @@ fn build_full_viewport(
                                 })
                                 .with_children(|col| {
                                     for field in left {
-                                        spawn_field(col, field, form, theme);
+                                        spawn_field(col, field, form, theme, &font);
                                     }
                                 });
 
@@ -196,7 +199,7 @@ fn build_full_viewport(
                                 })
                                 .with_children(|col| {
                                     for field in right {
-                                        spawn_field(col, field, form, theme);
+                                        spawn_field(col, field, form, theme, &font);
                                     }
                                 });
                         });
@@ -216,14 +219,14 @@ fn build_full_viewport(
                     })
                     .with_children(|buttons| {
                         for desc in &form.buttons {
-                            spawn_button(buttons, desc, theme);
+                            spawn_button(buttons, desc, theme, &font);
                         }
                     });
             }
 
             // Hints
             if !form.hints.is_empty() {
-                vello_label(content, &form.hints, 11.0, theme.fg_dim);
+                vello_label(content, &font, &form.hints, 11.0, theme.fg_dim);
             }
         })
         .id();
@@ -240,9 +243,11 @@ fn build_modal(
     form_entity: Entity,
     form: &Form,
     theme: &Theme,
+    font_handles: &FontHandles,
     width: f32,
     min_height: f32,
 ) {
+    let font = font_handles.mono.clone();
     // Dialog panel
     let dialog = commands
         .spawn((
@@ -261,7 +266,7 @@ fn build_modal(
         ))
         .with_children(|dialog| {
             // Title
-            vello_label(dialog, &form.title, 16.0, theme.fg);
+            vello_label(dialog, &font, &form.title, 16.0, theme.fg);
 
             // Fields
             let all_fields = match &form.layout {
@@ -274,15 +279,15 @@ fn build_modal(
 
             for field in all_fields {
                 if field.bordered {
-                    spawn_field(dialog, field, form, theme);
+                    spawn_field(dialog, field, form, theme, &font);
                 } else {
-                    spawn_bare_field(dialog, field, form, theme);
+                    spawn_bare_field(dialog, field, theme, &font);
                 }
             }
 
             // Hints
             if !form.hints.is_empty() {
-                vello_label(dialog, &form.hints, 11.0, theme.fg_dim);
+                vello_label(dialog, &font, &form.hints, 11.0, theme.fg_dim);
             }
         })
         .id();
@@ -295,7 +300,13 @@ fn build_modal(
 // ============================================================================
 
 /// Spawn a bordered field section: label + outlined container with FormFieldContainer marker.
-fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form, theme: &Theme) {
+fn spawn_field(
+    parent: &mut ChildSpawnerCommands,
+    desc: &FieldDesc,
+    form: &Form,
+    theme: &Theme,
+    font: &Handle<VelloFont>,
+) {
     let is_active = desc.field_id == form.initial_field;
     let outline_color = if is_active { theme.accent } else { theme.border };
 
@@ -309,7 +320,7 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
         .with_children(|section| {
             // Label (if non-empty)
             if !desc.label.is_empty() {
-                vello_label(section, &desc.label, 12.0, theme.fg_dim);
+                vello_label(section, font, &desc.label, 12.0, theme.fg_dim);
             }
 
             // Bordered container
@@ -327,6 +338,11 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
                 node.max_height = Val::Px(max);
             }
 
+            let font = font.clone();
+            let fg_dim = theme.fg_dim;
+            let loading_text = desc.loading_text.clone();
+            let field_id = desc.field_id;
+
             section
                 .spawn((
                     FormField {
@@ -340,16 +356,16 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
                     Interaction::None,
                 ))
                 .with_children(|container| {
-                    if let Some(ref text) = desc.loading_text {
+                    if let Some(ref text) = loading_text {
                         container.spawn((
-                            FormLoadingText(desc.field_id),
-                            KjUiText::new(text)
-                                .with_font_size(14.0)
-                                .with_color(theme.fg_dim),
-                            UiVelloText::default(),
+                            FormLoadingText(field_id),
+                            UiVelloText {
+                                value: text.clone(),
+                                style: vello_style(&font, fg_dim, 14.0),
+                                ..default()
+                            },
                             Node {
                                 width: Val::Percent(100.0),
-                                height: Val::Px(16.0),
                                 ..default()
                             },
                         ));
@@ -362,9 +378,14 @@ fn spawn_field(parent: &mut ChildSpawnerCommands, desc: &FieldDesc, form: &Form,
 fn spawn_bare_field(
     parent: &mut ChildSpawnerCommands,
     desc: &FieldDesc,
-    _form: &Form,
     theme: &Theme,
+    font: &Handle<VelloFont>,
 ) {
+    let font = font.clone();
+    let fg_dim = theme.fg_dim;
+    let loading_text = desc.loading_text.clone();
+    let field_id = desc.field_id;
+
     parent
         .spawn((
             FormFieldContainer(desc.field_id),
@@ -375,16 +396,16 @@ fn spawn_bare_field(
             },
         ))
         .with_children(|container| {
-            if let Some(ref text) = desc.loading_text {
+            if let Some(ref text) = loading_text {
                 container.spawn((
-                    FormLoadingText(desc.field_id),
-                    KjUiText::new(text)
-                        .with_font_size(12.0)
-                        .with_color(theme.fg_dim),
-                    UiVelloText::default(),
+                    FormLoadingText(field_id),
+                    UiVelloText {
+                        value: text.clone(),
+                        style: vello_style(&font, fg_dim, 12.0),
+                        ..default()
+                    },
                     Node {
                         width: Val::Percent(100.0),
-                        height: Val::Px(14.0),
                         ..default()
                     },
                 ));
@@ -396,7 +417,12 @@ fn spawn_bare_field(
 // BUTTON SPAWNING
 // ============================================================================
 
-fn spawn_button(parent: &mut ChildSpawnerCommands, desc: &ButtonDesc, theme: &Theme) {
+fn spawn_button(
+    parent: &mut ChildSpawnerCommands,
+    desc: &ButtonDesc,
+    theme: &Theme,
+    font: &Handle<VelloFont>,
+) {
     let (bg, text_color) = if desc.primary {
         (theme.accent.with_alpha(0.3), theme.accent)
     } else {
@@ -413,6 +439,6 @@ fn spawn_button(parent: &mut ChildSpawnerCommands, desc: &ButtonDesc, theme: &Th
             BackgroundColor(bg),
         ))
         .with_children(|btn| {
-            vello_text(btn, &desc.label, 13.0, text_color, 60.0);
+            vello_text(btn, font, &desc.label, 13.0, text_color, 60.0);
         });
 }
