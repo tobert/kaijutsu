@@ -14,10 +14,10 @@ use crate::cell::{
     EditorEntities, FocusTarget, LayoutGeneration, MainCell, RoleGroupBorder,
     RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell,
 };
-use crate::text::{KjText, KjTextEffects, TextMetrics, FontHandles, bevy_color_to_brush};
+use crate::text::{KjText, FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
-use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
+use bevy_vello::prelude::{UiVelloText, VelloFont};
 
 use super::format::{block_color, format_single_block};
 use super::lifecycle::{INDENT_WIDTH, BLOCK_SPACING, ROLE_HEADER_SPACING};
@@ -26,48 +26,22 @@ use super::lifecycle::{INDENT_WIDTH, BLOCK_SPACING, ROLE_HEADER_SPACING};
 // BUFFER INIT / SYNC
 // ============================================================================
 
-/// Initialize UiVelloText for BlockCells that don't have one.
+/// Safety net: log a warning if any BlockCell lacks UiVelloText.
 ///
-/// **Key change:** Uses `VelloTextAnchor::TopLeft` so text starts at the
-/// content box origin. No UiTransform centering hack needed.
+/// With single-phase spawning in `spawn_block_cells`, this should never fire.
+/// If it does, something bypassed the normal spawn path.
 pub fn init_block_cell_buffers(
-    mut commands: Commands,
     block_cells: Query<Entity, (With<BlockCell>, With<KjText>, Without<UiVelloText>)>,
-    font_handles: Res<FontHandles>,
-    fonts: Res<Assets<VelloFont>>,
-    text_metrics: Res<TextMetrics>,
 ) {
-    // Wait until the font asset is actually loaded. If we insert UiVelloText
-    // before the font is ready, bevy_vello's content sizing skips the entity.
-    if fonts.get(&font_handles.mono).is_none() {
-        return;
-    }
-
-    for entity in block_cells.iter() {
-        commands.entity(entity).try_insert((
-            UiVelloText {
-                value: "IF_YOU_SEE_THIS_THERE_IS_A_BUG".to_string(),
-                style: bevy_vello::prelude::VelloTextStyle {
-                    font: font_handles.mono.clone(),
-                    brush: bevy_color_to_brush(Color::WHITE),
-                    font_size: text_metrics.cell_font_size,
-                    ..default()
-                },
-                ..default()
-            },
-            // TopLeft: text starts at content box top-left corner.
-            // Bevy flex layout determines position; Parley measures height
-            // via ContentSize. No manual offset needed.
-            VelloTextAnchor::TopLeft,
-        ));
+    let count = block_cells.iter().count();
+    if count > 0 {
+        warn!(
+            "{} BlockCell entities missing UiVelloText — spawn_block_cells should include it",
+            count
+        );
     }
 }
 
-/// Sync BlockCell UiVelloText with their corresponding block content.
-///
-/// Only updates cells whose content has changed (tracked via version).
-/// When any buffer is updated, bumps LayoutGeneration to trigger re-layout.
-/// Also applies block-specific text colors based on BlockKind and Role.
 pub fn sync_block_cell_buffers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
@@ -92,11 +66,13 @@ pub fn sync_block_cell_buffers(
 
     let doc_version = editor.version();
 
-    // Quick dirty check before allocating
+    // Quick dirty check before allocating. 
+    // We must run if the document has a new version, OR if any cell 
+    // in the container has never been rendered (None).
     let needs_update = container.block_cells.iter().any(|e| {
         block_cells
             .get(*e)
-            .map(|(bc, _, _)| bc.last_render_version < doc_version)
+            .map(|(bc, _, _)| bc.last_render_version.map_or(true, |v| v < doc_version))
             .unwrap_or(false)
     });
 
@@ -116,7 +92,8 @@ pub fn sync_block_cell_buffers(
             continue;
         };
 
-        if block_cell.last_render_version >= doc_version {
+        // Run if content changed OR if this is the first render pass
+        if block_cell.last_render_version.map_or(false, |v| v >= doc_version) {
             continue;
         }
 
@@ -128,7 +105,7 @@ pub fn sync_block_cell_buffers(
         let local_ctx = doc_cache.active_id();
         let text = format_single_block(block, local_ctx);
 
-        // Debounce large blocks
+        // Debounce large blocks — only re-render when growth exceeds threshold
         const DEBOUNCE_CHARS: usize = 200;
         const DEBOUNCE_MIN_SIZE: usize = 10_000;
         if text.len() > DEBOUNCE_MIN_SIZE && block_cell.last_text_len > 0 {
@@ -143,11 +120,14 @@ pub fn sync_block_cell_buffers(
         // Rainbow effect for user text
         let rainbow = theme.font_rainbow && block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::User;
         if block_cell.last_rainbow != rainbow {
-            commands.entity(*entity).insert(KjTextEffects { rainbow });
+            commands.entity(*entity).insert(crate::text::KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
         }
 
-        if vello_text.value != text {
+        // Always set the value if this is the first render for this block entity,
+        // or if the text actually changed. This ensures `Changed<UiVelloText>`
+        // triggers for `bevy_vello`'s measurement system.
+        if vello_text.value != text || block_cell.last_render_version.is_none() {
             vello_text.value = text.clone();
         }
 
@@ -169,7 +149,7 @@ pub fn sync_block_cell_buffers(
             commands.entity(*entity).remove::<crate::text::RichContent>();
         }
 
-        // Apply color (skip when rainbow or rich is active)
+        // Apply color (skip when rainbow or rich content is active)
         if !rainbow && !is_rich {
             let color = if let Some(vis) = timeline_vis {
                 base_color.with_alpha(base_color.alpha() * vis.opacity)
@@ -188,7 +168,7 @@ pub fn sync_block_cell_buffers(
             layout_changed = true;
         }
 
-        block_cell.last_render_version = doc_version;
+        block_cell.last_render_version = Some(doc_version);
     }
 
     if layout_changed {
@@ -436,6 +416,7 @@ pub fn readback_block_heights(
     for child in children.iter() {
         if let Ok((computed, node)) = block_cells.get(child) {
             let height = computed.size().y;
+
             let margin_bottom = match node.margin.bottom {
                 Val::Px(px) => px,
                 _ => 0.0,

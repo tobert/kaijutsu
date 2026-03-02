@@ -912,7 +912,7 @@ pub struct BlockCell {
     /// The block ID this cell represents.
     pub block_id: BlockId,
     /// Last known content hash/version for dirty tracking.
-    pub last_render_version: u64,
+    pub last_render_version: Option<u64>,
     /// Last known text length for layout dirty detection.
     /// Word-wrap line count can only change when text length changes,
     /// so this catches wrapping that newline-count missed.
@@ -925,7 +925,7 @@ impl BlockCell {
     pub fn new(block_id: BlockId) -> Self {
         Self {
             block_id,
-            last_render_version: 0,
+            last_render_version: None,
             last_text_len: 0,
             last_rainbow: false,
         }
