@@ -6,9 +6,6 @@
 //! flex layout for positioning — no UiTransform hack.
 
 use bevy::prelude::*;
-use bevy::ui::ContentSize;
-use bevy::ui::ui_transform::UiTransform;
-use bevy::camera::visibility::VisibilityClass;
 use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 
 use crate::cell::{
@@ -26,7 +23,7 @@ pub struct EditorEntities {
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
 }
-use crate::text::{KjText, KjTextEffects, FontHandles, TextMetrics, bevy_color_to_brush};
+use crate::text::{FontHandles, TextMetrics, bevy_color_to_brush};
 use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
@@ -82,6 +79,7 @@ pub fn spawn_main_cell(
 
     entities.main_cell = Some(entity);
     info!("Spawned main kernel cell");
+
 }
 
 /// Track the focused ConversationContainer and re-parent block cells when it changes.
@@ -162,7 +160,27 @@ pub fn spawn_block_cells(
     };
 
     let current_blocks = editor.block_ids();
+    if current_blocks.is_empty() {
+        // No blocks in the editor — nothing to spawn.
+        // This is normal on startup before sync completes.
+        return;
+    }
     let current_ids: std::collections::HashSet<_> = current_blocks.iter().collect();
+
+    // Log diagnostics once when blocks first appear or counts change
+    {
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let key = (current_blocks.len() as u64).wrapping_mul(1000003)
+            .wrapping_add(container.block_cells.len() as u64);
+        if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+            info!(
+                "spawn_block_cells: editor has {} blocks, container has {} cells, conv={:?}",
+                current_blocks.len(),
+                container.block_cells.len(),
+                entities.conversation_container.map(|e| e.index()),
+            );
+        }
+    }
 
     // Purge stale entity references — the tiling reconciler despawns pane
     // children recursively, which kills block cells without telling the container.
@@ -218,14 +236,13 @@ pub fn spawn_block_cells(
     for block_id in &current_blocks {
         if !container.contains(block_id) {
             // Single-phase spawn: BlockCell + UiVelloText in one bundle.
-            // This avoids the font handle corruption seen with deferred
-            // try_insert of UiVelloText onto an existing entity.
+            // Let UiVelloText's #[require] system handle ContentSize,
+            // UiTransform, VisibilityClass (with on_add hook), etc.
+            // Only override VelloTextAnchor (TopLeft, not default Center).
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
                     BlockCellLayout::default(),
-                    KjText,
-                    KjTextEffects::default(),
                     UiVelloText {
                         value: String::new(),
                         style: bevy_vello::prelude::VelloTextStyle {
@@ -234,22 +251,10 @@ pub fn spawn_block_cells(
                             font_size: text_metrics.cell_font_size,
                             ..default()
                         },
-                        // Initial estimate for width to allow word wrapping on Frame N.
-                        // Will be corrected by `sync_text_max_advance` once the node is laid out.
                         max_advance: Some(1200.0),
                         ..default()
                     },
-                    // Pre-emptively seed all required components for `UiVelloText`.
-                    // Providing these manually prevents Bevy's requirement system 
-                    // from triggering archetype moves later, which can reset 
-                    // `UiVelloText` to its default state and corrupt the font handle.
-                    // Note: `UiTransform` is a framework requirement for Bevy 0.18 UI
-                    // but we still rely entirely on flex layout for positioning.
-                    ContentSize::default(),
                     VelloTextAnchor::TopLeft,
-                    UiTransform::default(),
-                    Visibility::Inherited,
-                    VisibilityClass::default(),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()
@@ -270,6 +275,10 @@ pub fn spawn_block_cells(
     }
 
     if had_additions || had_removals {
+        info!(
+            "spawn_block_cells: additions={} removals={} container_now={}",
+            had_additions, had_removals, container.block_cells.len(),
+        );
         layout_gen.bump();
     }
 

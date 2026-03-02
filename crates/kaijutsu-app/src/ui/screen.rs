@@ -21,7 +21,6 @@ use bevy::prelude::*;
 use super::constellation::{ConstellationContainer, viewport::ConstellationCamera3d};
 use super::state::ConversationRoot;
 use crate::cell::{BlockCell, RoleGroupBorder};
-use crate::text::KjText;
 
 /// Which full-viewport view is currently active.
 ///
@@ -204,7 +203,7 @@ fn set_focus_conversation(
 /// screen transition.
 fn hide_new_cell_text_outside_conversation(
     mut new_blocks: Query<&mut Visibility, Or<(
-        (Added<KjText>, With<BlockCell>),
+        Added<BlockCell>,
         Added<RoleGroupBorder>,
     )>>,
 ) {

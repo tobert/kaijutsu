@@ -14,7 +14,7 @@ use crate::cell::{
     EditorEntities, LayoutGeneration, MainCell, RoleGroupBorder,
     RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell,
 };
-use crate::text::{KjText, FontHandles, bevy_color_to_brush};
+use crate::text::{FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 use bevy_vello::prelude::{UiVelloText, VelloFont};
@@ -31,7 +31,7 @@ use super::lifecycle::{INDENT_WIDTH, BLOCK_SPACING, ROLE_HEADER_SPACING};
 /// With single-phase spawning in `spawn_block_cells`, this should never fire.
 /// If it does, something bypassed the normal spawn path.
 pub fn init_block_cell_buffers(
-    block_cells: Query<Entity, (With<BlockCell>, With<KjText>, Without<UiVelloText>)>,
+    block_cells: Query<Entity, (With<BlockCell>, Without<UiVelloText>)>,
 ) {
     let count = block_cells.iter().count();
     if count > 0 {
