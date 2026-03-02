@@ -251,7 +251,7 @@ pub fn spawn_block_cells(
                             font_size: text_metrics.cell_font_size,
                             ..default()
                         },
-                        max_advance: Some(1200.0),
+                        max_advance: None, // set dynamically from ComputedNode width
                         ..default()
                     },
                     VelloTextAnchor::TopLeft,

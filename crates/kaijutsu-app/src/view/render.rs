@@ -47,7 +47,7 @@ pub fn sync_block_cell_buffers(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut UiVelloText, Option<&TimelineVisibility>)>,
+    mut block_cells: Query<(&mut BlockCell, &mut UiVelloText, &ComputedNode, Option<&TimelineVisibility>)>,
     theme: Res<Theme>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut layout_gen: ResMut<LayoutGeneration>,
@@ -72,7 +72,7 @@ pub fn sync_block_cell_buffers(
     let needs_update = container.entities().any(|e| {
         block_cells
             .get(e)
-            .map(|(bc, _, _)| bc.last_render_version.map_or(true, |v| v < doc_version))
+            .map(|(bc, _, _, _)| bc.last_render_version.map_or(true, |v| v < doc_version))
             .unwrap_or(false)
     });
 
@@ -88,7 +88,7 @@ pub fn sync_block_cell_buffers(
 
     let mut layout_changed = false;
     for &entity in container.block_cells.values() {
-        let Ok((mut block_cell, mut vello_text, timeline_vis)) = block_cells.get_mut(entity) else {
+        let Ok((mut block_cell, mut vello_text, computed_node, timeline_vis)) = block_cells.get_mut(entity) else {
             continue;
         };
 
@@ -122,6 +122,16 @@ pub fn sync_block_cell_buffers(
         if block_cell.last_rainbow != rainbow {
             commands.entity(entity).insert(crate::text::KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
+        }
+
+        // Keep max_advance in sync with actual layout width so Parley
+        // wraps at the same width that Taffy allocated.
+        let available_width = computed_node.size().x;
+        if available_width > 0.0 {
+            let new_advance = Some(available_width);
+            if vello_text.max_advance != new_advance {
+                vello_text.max_advance = new_advance;
+            }
         }
 
         // Always set the value if this is the first render for this block entity,
