@@ -6,7 +6,10 @@
 //! flex layout for positioning — no UiTransform hack.
 
 use bevy::prelude::*;
-use bevy::ui::measurement::ContentSize;
+use bevy::ui::ContentSize;
+use bevy::ui::ui_transform::UiTransform;
+use bevy::camera::visibility::VisibilityClass;
+use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, Cell, CellEditor, CellPosition, CellState,
@@ -23,7 +26,7 @@ pub struct EditorEntities {
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
 }
-use crate::text::{KjText, KjTextEffects};
+use crate::text::{KjText, KjTextEffects, FontHandles, TextMetrics, bevy_color_to_brush};
 use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
@@ -111,31 +114,23 @@ pub fn track_conversation_container(
         return;
     }
 
-    let old = entities.conversation_container;
-    entities.conversation_container = Some(focused);
-
     let Some(main_ent) = entities.main_cell else {
         return;
     };
-    let Ok(container) = containers.get(main_ent) else {
-        return;
-    };
 
-    info!(
-        "Conversation container changed: {:?} -> {:?}, re-parenting {} block cells + {} role headers",
-        old, focused, container.block_cells.len(), container.role_headers.len()
-    );
-
-    for &entity in &container.block_cells {
-        if let Ok(mut ec) = commands.get_entity(entity) {
-            ec.set_parent_in_place(focused);
+    // RE-PARENTING: When the container changes (e.g. pane split), 
+    // all existing block cells must move to the new container.
+    if let Ok(container) = containers.get(main_ent) {
+        trace!("Re-parenting {} block cells to new container {:?}", container.block_cells.len(), focused);
+        for &block_ent in &container.block_cells {
+            commands.entity(focused).add_child(block_ent);
+        }
+        for &header_ent in &container.role_headers {
+            commands.entity(focused).add_child(header_ent);
         }
     }
-    for &entity in &container.role_headers {
-        if let Ok(mut ec) = commands.get_entity(entity) {
-            ec.set_parent_in_place(focused);
-        }
-    }
+
+    entities.conversation_container = Some(focused);
 }
 
 /// Spawn or update BlockCell entities to match the MainCell's BlockStore.
@@ -145,16 +140,20 @@ pub fn track_conversation_container(
 /// - Despawns BlockCells for removed blocks
 /// - Maintains order in BlockCellContainer
 ///
-/// **Vello-native architecture:** Block cells are plain flex children with
-/// `VelloTextAnchor::TopLeft`. No UiTransform hack. Bevy flex layout handles
-/// positioning; Parley handles text measurement via ContentSize.
+/// **Single-phase spawning:** UiVelloText is included in the initial spawn
+/// bundle to avoid font handle corruption during deferred try_insert.
+/// Spawning is gated on font availability — block cells appear once the
+/// font asset loads (typically within the first few frames).
 pub fn spawn_block_cells(
     mut commands: Commands,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
-    _block_cells: Query<(Entity, &BlockCell)>,
+    existing_block_cells: Query<Entity, With<BlockCell>>,
     mut layout_gen: ResMut<LayoutGeneration>,
+    font_handles: Res<FontHandles>,
+    fonts: Res<Assets<VelloFont>>,
+    text_metrics: Res<TextMetrics>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -174,6 +173,23 @@ pub fn spawn_block_cells(
     let current_blocks = editor.block_ids();
     let current_ids: std::collections::HashSet<_> = current_blocks.iter().collect();
 
+    // Purge stale entity references — the tiling reconciler despawns pane
+    // children recursively, which kills block cells without telling the container.
+    let live_entities: std::collections::HashSet<Entity> =
+        existing_block_cells.iter().collect();
+    let stale: Vec<Entity> = container
+        .block_cells
+        .iter()
+        .filter(|e| !live_entities.contains(e))
+        .copied()
+        .collect();
+    if !stale.is_empty() {
+        warn!("Purging {} stale block cell refs from container", stale.len());
+        for entity in stale {
+            container.remove(entity);
+        }
+    }
+
     // Despawn removed blocks
     let to_remove: Vec<_> = container
         .block_to_entity
@@ -188,25 +204,53 @@ pub fn spawn_block_cells(
         container.remove(entity);
     }
 
+    // Gate new spawns on font availability — UiVelloText needs a valid font
+    // handle at spawn time to avoid content sizing failures.
+    let font_loaded = fonts.get(&font_handles.mono).is_some();
+    if !font_loaded && current_blocks.iter().any(|id| !container.contains(id)) {
+        // Blocks waiting to spawn but font not ready yet — will retry next frame.
+        return;
+    }
+
     let current_version = editor.version();
     let conv_entity = entities.conversation_container;
     let mut had_additions = false;
 
     for block_id in &current_blocks {
         if !container.contains(block_id) {
-            // Spawn new BlockCell as flex child of ConversationContainer.
-            //
-            // KEY CHANGE: No UiTransform. VelloTextAnchor::TopLeft is set by
-            // init_block_cell_buffers when inserting UiVelloText. Bevy flex
-            // layout handles all positioning. Indentation is applied by
-            // update_block_cell_nodes via Node margin.
+            // Single-phase spawn: BlockCell + UiVelloText in one bundle.
+            // This avoids the font handle corruption seen with deferred
+            // try_insert of UiVelloText onto an existing entity.
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
                     BlockCellLayout::default(),
                     KjText,
                     KjTextEffects::default(),
+                    UiVelloText {
+                        value: String::new(),
+                        style: bevy_vello::prelude::VelloTextStyle {
+                            font: font_handles.mono.clone(),
+                            brush: bevy_color_to_brush(Color::WHITE),
+                            font_size: text_metrics.cell_font_size,
+                            ..default()
+                        },
+                        // Initial estimate for width to allow word wrapping on Frame N.
+                        // Will be corrected by `sync_text_max_advance` once the node is laid out.
+                        max_advance: Some(1200.0),
+                        ..default()
+                    },
+                    // Pre-emptively seed all required components for `UiVelloText`.
+                    // Providing these manually prevents Bevy's requirement system 
+                    // from triggering archetype moves later, which can reset 
+                    // `UiVelloText` to its default state and corrupt the font handle.
+                    // Note: `UiTransform` is a framework requirement for Bevy 0.18 UI
+                    // but we still rely entirely on flex layout for positioning.
                     ContentSize::default(),
+                    VelloTextAnchor::TopLeft,
+                    UiTransform::default(),
+                    Visibility::Inherited,
+                    VisibilityClass::default(),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()

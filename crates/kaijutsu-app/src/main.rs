@@ -183,13 +183,14 @@ fn setup_ui(
                 ui::state::ContentArea,
                 Node {
                     flex_grow: 1.0,
+                    height: Val::Percent(100.0),
                     flex_direction: FlexDirection::Column,
                     ..default()
                 },
                 ZIndex(constants::ZLayer::CONTENT),
             ))
             .with_children(|content| {
-                // CONVERSATION VIEW (visible immediately — no dashboard)
+                // CONVERSATION VIEW (hidden initially — Constellation is default)
                 // The tiling reconciler spawns ConversationContainer inside
                 content.spawn((
                     ui::state::ConversationRoot,
@@ -197,10 +198,10 @@ fn setup_ui(
                         width: Val::Percent(100.0),
                         height: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
-                        display: Display::Flex,
+                        display: Display::None,
                         ..default()
                     },
-                    Visibility::Inherited,
+                    Visibility::Hidden,
                 ));
             });
         });
