@@ -164,6 +164,7 @@ impl Plugin for CellPlugin {
         app.add_systems(
             Update,
             (
+                view_render::sync_text_max_advance,
                 view_render::layout_block_cells,
                 view_render::update_block_cell_nodes.after(view_render::layout_block_cells),
                 view_render::reorder_conversation_children.after(view_render::update_block_cell_nodes),
