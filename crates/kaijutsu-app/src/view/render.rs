@@ -577,3 +577,42 @@ pub fn highlight_focused_block(
     }
 }
 
+/// Cull off-screen block cells by toggling Visibility.
+///
+/// Blocks entirely outside the visible scroll range are hidden so bevy_vello
+/// skips them during extract — no Parley layout, no Vello scene encoding.
+/// A margin of one screen height above/below prevents pop-in during fast scroll.
+///
+/// This dramatically reduces per-frame rendering work when large tool results
+/// (thousands of lines) are in the document but not on screen.
+pub fn cull_offscreen_blocks(
+    entities: Res<EditorEntities>,
+    scroll_state: Res<ConversationScrollState>,
+    containers: Query<&BlockCellContainer>,
+    mut block_cells: Query<(&BlockCellLayout, &mut Visibility), With<BlockCell>>,
+) {
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let margin = scroll_state.visible_height;
+    let top = scroll_state.offset - margin;
+    let bottom = scroll_state.offset + scroll_state.visible_height + margin;
+
+    for &entity in container.block_cells.values() {
+        let Ok((layout, mut vis)) = block_cells.get_mut(entity) else {
+            continue;
+        };
+        let block_top = layout.y_offset;
+        let block_bottom = layout.y_offset + layout.height;
+        let should_show = block_bottom >= top && block_top <= bottom;
+        let target = if should_show { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != target {
+            *vis = target;
+        }
+    }
+}
+

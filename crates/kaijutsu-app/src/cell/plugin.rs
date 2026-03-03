@@ -170,6 +170,7 @@ impl Plugin for CellPlugin {
                 view_render::update_block_cell_nodes.after(view_render::layout_block_cells),
                 view_render::reorder_conversation_children.after(view_render::update_block_cell_nodes),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
+                view_render::cull_offscreen_blocks.after(view_scroll::smooth_scroll),
                 view_cursor::update_cursor,
                 view_cursor::update_block_edit_cursor.after(view_cursor::update_cursor),
             )
