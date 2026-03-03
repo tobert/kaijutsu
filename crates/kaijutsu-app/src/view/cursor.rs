@@ -117,21 +117,31 @@ pub fn update_cursor(
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = cell_left + (col as f32 * char_width);
-    let y = cell_top + (row as f32 * line_height);
+    // Round to integer pixels to prevent subpixel jitter from float drift.
+    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    let y = (cell_top + (row as f32 * line_height)).round();
 
-    node.left = Val::Px(x - 2.0);
-    node.top = Val::Px(y);
+    let target_left = Val::Px(x);
+    let target_top = Val::Px(y);
+    if node.left != target_left {
+        node.left = target_left;
+    }
+    if node.top != target_top {
+        node.top = target_top;
+    }
 
+    let (cursor_mode, color, params) = if focus_area.is_text_input() {
+        (CursorMode::Beam, theme.cursor_insert, Vec4::new(0.25, 1.2, 2.0, 0.0))
+    } else {
+        (CursorMode::Block, theme.cursor_normal, Vec4::new(0.2, 1.0, 1.5, 0.6))
+    };
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {
-        let (cursor_mode, color, params) = if focus_area.is_text_input() {
-            (CursorMode::Beam, theme.cursor_insert, Vec4::new(0.25, 1.2, 2.0, 0.0))
-        } else {
-            (CursorMode::Block, theme.cursor_normal, Vec4::new(0.2, 1.0, 1.5, 0.6))
-        };
-        material.time.y = cursor_mode as u8 as f32;
-        material.color = color;
-        material.params = params;
+        let mode_f = cursor_mode as u8 as f32;
+        if material.time.y != mode_f || material.color != color {
+            material.time.y = mode_f;
+            material.color = color;
+            material.params = params;
+        }
     }
 }
 
@@ -225,11 +235,17 @@ pub fn update_block_edit_cursor(
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = cell_left + (col as f32 * char_width);
-    let y = cell_top + (row as f32 * line_height);
+    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    let y = (cell_top + (row as f32 * line_height)).round();
 
-    node.left = Val::Px(x - 2.0);
-    node.top = Val::Px(y);
+    let target_left = Val::Px(x);
+    let target_top = Val::Px(y);
+    if node.left != target_left {
+        node.left = target_left;
+    }
+    if node.top != target_top {
+        node.top = target_top;
+    }
 }
 
 /// Position the cursor in the InputOverlay.
@@ -270,12 +286,24 @@ pub fn update_input_overlay_cursor(
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
 
-    node.left = Val::Px(cell_left + (col as f32 * char_width) - 2.0);
-    node.top = Val::Px(cell_top + (row as f32 * line_height));
+    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    let y = (cell_top + (row as f32 * line_height)).round();
+
+    let target_left = Val::Px(x);
+    let target_top = Val::Px(y);
+    if node.left != target_left {
+        node.left = target_left;
+    }
+    if node.top != target_top {
+        node.top = target_top;
+    }
 
     if let Some(material) = cursor_materials.get_mut(&material_node.0) {
-        material.time.y = CursorMode::Beam as u8 as f32;
-        material.color = theme.cursor_insert;
-        material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
+        let mode_f = CursorMode::Beam as u8 as f32;
+        if material.time.y != mode_f || material.color != theme.cursor_insert {
+            material.time.y = mode_f;
+            material.color = theme.cursor_insert;
+            material.params = Vec4::new(0.25, 1.2, 2.0, 0.0);
+        }
     }
 }

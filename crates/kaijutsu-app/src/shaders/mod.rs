@@ -10,6 +10,8 @@ use bevy::{
     shader::ShaderRef,
 };
 
+use crate::ui::screen::Screen;
+
 /// Plugin that registers shader effect materials.
 pub struct ShaderFxPlugin;
 
@@ -19,20 +21,32 @@ impl Plugin for ShaderFxPlugin {
             UiMaterialPlugin::<CursorBeamMaterial>::default(),
             UiMaterialPlugin::<ConstellationCardMaterial>::default(),
         ))
-        .add_systems(Update, update_shader_time);
+        // Only update cursor time when in conversation (cursor visible).
+        // Only update card time when in constellation (cards visible).
+        .add_systems(Update, (
+            update_cursor_shader_time.run_if(in_state(Screen::Conversation)),
+            update_card_shader_time.run_if(in_state(Screen::Constellation)),
+        ));
     }
 }
 
-/// Update time uniforms on shader materials.
-fn update_shader_time(
+/// Update time uniform on cursor beam materials (only when cursor is visible).
+fn update_cursor_shader_time(
     time: Res<Time>,
     mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
-    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
 ) {
     let t = time.elapsed_secs();
     for (_, mat) in cursor_materials.iter_mut() {
         mat.time.x = t;
     }
+}
+
+/// Update time uniform on constellation card materials (only when cards are visible).
+fn update_card_shader_time(
+    time: Res<Time>,
+    mut card_materials: ResMut<Assets<ConstellationCardMaterial>>,
+) {
+    let t = time.elapsed_secs();
     for (_, mat) in card_materials.iter_mut() {
         mat.time.x = t;
     }
