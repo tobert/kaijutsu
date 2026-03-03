@@ -144,13 +144,16 @@ pub fn sync_block_cell_buffers(
                 vello_text.style.brush = bevy_color_to_brush(Color::NONE);
                 commands.entity(entity).insert(rich);
                 actually_rich = true;
+                block_cell.is_rich = true;
             } else {
                 commands.entity(entity).remove::<crate::text::RichContent>();
                 commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
+                block_cell.is_rich = false;
             }
         } else {
             commands.entity(entity).remove::<crate::text::RichContent>();
             commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
+            block_cell.is_rich = false;
         }
 
         // Apply color (skip when rainbow or actively rendering rich content)
@@ -552,6 +555,11 @@ pub fn highlight_focused_block(
         .collect();
 
     for (block_cell, mut vello_text) in focused_cells.iter_mut() {
+        // Skip rich content blocks — their UiVelloText brush must stay transparent
+        // so the rich renderer (UiVelloScene) is the only visible text layer.
+        if block_cell.is_rich {
+            continue;
+        }
         if let Some(block) = blocks.get(&block_cell.block_id) {
             let base_color = block_color(block, &theme);
             let srgba = base_color.to_srgba();

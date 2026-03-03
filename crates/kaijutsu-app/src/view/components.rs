@@ -690,6 +690,10 @@ pub struct BlockCell {
     pub last_text_len: usize,
     /// Last known rainbow effect state for change detection.
     pub last_rainbow: bool,
+    /// True when this block has active rich content (markdown/sparkline/SVG).
+    /// Used to prevent highlight_focused_block from overriding the transparent
+    /// brush that hides the UiVelloText while RichContent renders via UiVelloScene.
+    pub is_rich: bool,
 }
 
 impl BlockCell {
@@ -699,6 +703,7 @@ impl BlockCell {
             last_render_version: None,
             last_text_len: 0,
             last_rainbow: false,
+            is_rich: false,
         }
     }
 }
