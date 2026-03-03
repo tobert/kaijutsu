@@ -152,8 +152,8 @@ impl Plugin for ActorPlugin {
         // Spawn the bootstrap thread
         let bootstrap_channel = bootstrap::spawn_bootstrap_thread();
 
-        // Send initial SpawnActor command — kernel_id is a placeholder;
-        // the actor replaces it with the server-authoritative ID on connect.
+        // Initial connection — no context joined. Constellation populates from
+        // list_contexts(); user picks or creates a context explicitly.
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: SshConfig::default(),
             kernel_id: KernelId::nil(),
@@ -208,8 +208,8 @@ fn poll_bootstrap_results(
 
                 // Eagerly connect: fire whoami to trigger ensure_connected
                 // (SSH → attach_kernel → subscriptions → Connected).
-                // If a context was specified, also fetch document state and
-                // emit ContextJoined. Otherwise just get identity.
+                // If a context was specified, fetch its state and emit ContextJoined.
+                // Otherwise just get identity + populate constellation from list_contexts().
                 let h = handle.clone();
                 let tx = result_channel.sender();
                 let ctx_id = context_id;
@@ -227,32 +227,40 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 2. If we joined a context, fetch its state
-                        let Some(ctx_id) = ctx_id else { return };
+                        // 2. If we joined a specific context, fetch its state
+                        if let Some(ctx_id) = ctx_id {
+                            let initial_sync = match h.get_context_sync(ctx_id).await {
+                                Ok(state) => Some(state),
+                                Err(e) => {
+                                    log::warn!("Initial get_context_sync failed: {e}");
+                                    None
+                                }
+                            };
 
-                        let initial_sync = match h.get_context_sync(ctx_id).await {
-                            Ok(state) => Some(state),
-                            Err(e) => {
-                                log::warn!("Initial get_context_sync failed: {e}");
-                                None
+                            let nick = identity.map(|id| id.username).unwrap_or_default();
+                            let membership = ContextMembership {
+                                context_id: ctx_id,
+                                kernel_id,
+                                nick,
+                                instance: "bevy-client".to_string(),
+                            };
+
+                            let _ = tx.send(RpcResultMessage::ContextJoined {
+                                membership,
+                                initial_sync,
+                            });
+                            return;
+                        }
+
+                        // 3. No context specified — fetch context list to populate constellation
+                        match h.list_contexts().await {
+                            Ok(contexts) => {
+                                let _ = tx.send(RpcResultMessage::DriftContextsReceived { contexts });
                             }
-                        };
-
-                        // 3. Construct ContextMembership from what we know
-                        // kernel_id here is the placeholder — the real one arrives
-                        // via ConnectionStatus::Connected and is stored on RpcConnectionState
-                        let nick = identity.map(|id| id.username).unwrap_or_default();
-                        let membership = ContextMembership {
-                            context_id: ctx_id,
-                            kernel_id,
-                            nick,
-                            instance: "bevy-client".to_string(),
-                        };
-
-                        let _ = tx.send(RpcResultMessage::ContextJoined {
-                            membership,
-                            initial_sync,
-                        });
+                            Err(e) => {
+                                log::debug!("Startup list_contexts failed: {e}");
+                            }
+                        }
                     })
                     .detach();
 

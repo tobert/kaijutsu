@@ -249,7 +249,6 @@ impl ConversationCache {
 pub struct SharedKernelState {
     pub id: KernelId,
     pub name: String,
-    pub default_context_id: ContextId,
     pub kernel: Arc<Kernel>,
     pub documents: SharedBlockStore,
     pub config_backend: Arc<ConfigCrdtBackend>,
@@ -292,9 +291,10 @@ impl ConnectionState {
         }
     }
 
-    /// Get the connection's active context, falling back to the given default.
-    pub fn current_context_or(&self, default: ContextId) -> ContextId {
-        self.current_context_id.unwrap_or(default)
+    /// Get the connection's active context, or error if none joined.
+    pub fn require_context(&self) -> Result<ContextId, capnp::Error> {
+        self.current_context_id
+            .ok_or_else(|| capnp::Error::failed("no context joined — call joinContext first".into()))
     }
 
     fn next_exec_id(&self) -> u64 {
@@ -331,29 +331,6 @@ fn kernel_data_dir() -> std::path::PathBuf {
     }
 
     dir
-}
-
-/// Read the default context ID from the bootstrap table in the block store's DB.
-fn read_bootstrap_context(documents: &SharedBlockStore) -> Option<ContextId> {
-    let db_handle = documents.db()?;
-    let db = db_handle.lock().ok()?;
-    let hex = db.get_bootstrap("default_context_id").ok()??;
-    ContextId::parse(&hex).ok()
-}
-
-/// Write the default context ID to the bootstrap table in the block store's DB.
-fn write_bootstrap_context(documents: &SharedBlockStore, ctx_id: ContextId) {
-    if let Some(db_handle) = documents.db() {
-        if let Ok(db) = db_handle.lock() {
-            if let Err(e) = db.ensure_bootstrap_table() {
-                log::warn!("Failed to create bootstrap table: {}", e);
-                return;
-            }
-            if let Err(e) = db.set_bootstrap("default_context_id", &ctx_id.to_hex()) {
-                log::warn!("Failed to write default_context_id to bootstrap: {}", e);
-            }
-        }
-    }
 }
 
 /// Open or create a BlockStore with database persistence for a kernel.
@@ -716,33 +693,6 @@ pub async fn create_shared_kernel(
         Some(&resolved_data_dir),
     );
 
-    // Resolve default context: bootstrap from DB → existing, or create new
-    let ctx_id = if let Some(persisted_id) = read_bootstrap_context(&documents) {
-        if documents.contains(persisted_id) {
-            log::info!("Restored default context {} from bootstrap", persisted_id.short());
-            persisted_id
-        } else {
-            log::warn!(
-                "Bootstrap context {} not found in DB, creating new default",
-                persisted_id.short()
-            );
-            let new_id = ContextId::new();
-            documents
-                .create_document(new_id, DocumentKind::Conversation, None)
-                .map_err(|e| capnp::Error::failed(e))?;
-            write_bootstrap_context(&documents, new_id);
-            new_id
-        }
-    } else {
-        let new_id = ContextId::new();
-        log::info!("Creating default context {} for kernel {}", new_id.short(), id_str);
-        documents
-            .create_document(new_id, DocumentKind::Conversation, None)
-            .map_err(|e| capnp::Error::failed(e))?;
-        write_bootstrap_context(&documents, new_id);
-        new_id
-    };
-
     // Create config backend
     let (config_backend, config_watcher) =
         create_config_backend(documents.clone(), config_flows, config_dir).await;
@@ -753,35 +703,18 @@ pub async fn create_shared_kernel(
 
     // Recover contexts from persisted document IDs.
     // Documents are keyed by ContextId directly; register each in the drift router.
-    let recovered_ids: Vec<ContextId> = documents.list_ids()
-        .into_iter()
-        .filter(|cid| *cid != ctx_id)
-        .collect();
+    let recovered_ids: Vec<ContextId> = documents.list_ids();
 
-    // Register "default" context in kernel's own DriftRouter
-    {
+    if !recovered_ids.is_empty() {
         let mut drift = kernel_arc.drift().write().await;
-        drift.register(ctx_id, Some("default"), None);
-
-        // Register recovered non-default contexts
         for recovered_ctx_id in &recovered_ids {
-            drift.register(*recovered_ctx_id, None, Some(ctx_id));
+            drift.register(*recovered_ctx_id, None, None);
             log::info!("Recovered context {} in kernel DriftRouter", recovered_ctx_id.short());
         }
     }
 
     // Initialize LLM registry + embedding config from models.rhai
     let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
-
-    // Set root context's provider/model from the now-populated LLM registry
-    {
-        let registry = kernel_arc.llm().read().await;
-        if let (Some(provider), Some(model)) = (registry.default_provider_name(), registry.default_model()) {
-            let mut drift = kernel_arc.drift().write().await;
-            let _ = drift.configure_llm(ctx_id, provider, model);
-            log::info!("Root context model: provider={}, model={}", provider, model);
-        }
-    }
 
     // Initialize MCP servers from mcp.rhai config
     initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
@@ -830,7 +763,6 @@ pub async fn create_shared_kernel(
     let shared = SharedKernelState {
         id,
         name: id_str,
-        default_context_id: ctx_id,
         kernel: kernel_arc,
         documents,
         config_backend,
@@ -957,7 +889,7 @@ impl kernel::Server for KernelImpl {
 
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                    let context_id = conn.current_context_or(kernel.default_context_id);
+                    let context_id = conn.require_context()?;
                     match EmbeddedKaish::with_identity(
                         &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
@@ -1180,14 +1112,13 @@ impl kernel::Server for KernelImpl {
 
         let kernel_arc = self.kernel.kernel.clone();
         let kernel_id = self.kernel.id;
-        let default_context_id = self.kernel.default_context_id;
 
         // Extract identity and kaish ref for async cwd resolution
         let (principal_id, context_id, session_id, kaish_ref) = {
             let conn = self.connection.borrow();
             (
                 conn.principal.id,
-                conn.current_context_or(default_context_id),
+                pry!(conn.require_context()),
                 conn.session_id,
                 conn.kaish.clone(),
             )
@@ -1666,10 +1597,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
 
-        let parent_ctx = {
-            let conn = connection.borrow();
-            conn.current_context_or(kernel.default_context_id)
-        };
+        let parent_ctx = connection.borrow().current_context_id;
 
         log::info!("create_context: label='{}' kernel='{}'", label, kernel.id.to_hex());
 
@@ -1696,7 +1624,7 @@ impl kernel::Server for KernelImpl {
             {
                 let mut drift = kernel.kernel.drift().write().await;
                 let label_ref = if label.is_empty() { None } else { Some(label.as_str()) };
-                drift.register(context_id, label_ref, Some(parent_ctx));
+                drift.register(context_id, label_ref, parent_ctx);
                 log::info!("Created context {} (label={:?}) in kernel DriftRouter", context_id, label_ref);
             }
 
@@ -1726,10 +1654,7 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         // Determine parent from connection's current context before switching
-        let parent_ctx = {
-            let conn = connection.borrow();
-            conn.current_context_or(kernel.default_context_id)
-        };
+        let parent_ctx = connection.borrow().current_context_id;
 
         log::info!("join_context: context_id={} instance='{}' kernel='{}'",
             context_id, instance, kernel.id.to_hex());
@@ -1759,7 +1684,7 @@ impl kernel::Server for KernelImpl {
             {
                 let mut drift = kernel.kernel.drift().write().await;
                 if drift.get(context_id).is_none() {
-                    drift.register(context_id, None, Some(parent_ctx));
+                    drift.register(context_id, None, parent_ctx);
                     log::info!("Registered context {} in kernel DriftRouter", context_id);
                 }
                 let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
@@ -2053,7 +1978,7 @@ impl kernel::Server for KernelImpl {
                         kernel.kernel.clone(),
                         None,
                         conn.principal.id,
-                        conn.current_context_or(kernel.default_context_id),
+                        conn.require_context()?,
                         conn.session_id,
                         kernel.id,
                     ) {
@@ -3200,7 +3125,7 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetContextIdParams,
         mut results: kernel::GetContextIdResults,
     ) -> Promise<(), capnp::Error> {
-        let ctx_id = self.connection.borrow().current_context_or(self.kernel.default_context_id);
+        let ctx_id = pry!(self.connection.borrow().require_context());
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_context_id");
@@ -3231,7 +3156,7 @@ impl kernel::Server for KernelImpl {
             pry!(ContextId::try_from_slice(ctx_id_bytes)
                 .ok_or_else(|| capnp::Error::failed("invalid context ID".into())))
         } else {
-            self.connection.borrow().current_context_or(self.kernel.default_context_id)
+            pry!(self.connection.borrow().require_context())
         };
 
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
@@ -3281,7 +3206,7 @@ impl kernel::Server for KernelImpl {
         let content = pry!(pry!(params_reader.get_content()).to_str()).to_owned();
         let summarize = params_reader.get_summarize();
 
-        let source_ctx = self.connection.borrow().current_context_or(self.kernel.default_context_id);
+        let source_ctx = pry!(self.connection.borrow().require_context());
         let kernel_arc = self.kernel.kernel.clone();
         let documents = self.kernel.documents.clone();
 
@@ -3372,7 +3297,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::DriftFlushResults,
     ) -> Promise<(), capnp::Error> {
         let trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
-        let caller_ctx = self.connection.borrow().current_context_or(self.kernel.default_context_id);
+        let caller_ctx = pry!(self.connection.borrow().require_context());
         let kernel_arc = self.kernel.kernel.clone();
         let documents = self.kernel.documents.clone();
 
@@ -3492,7 +3417,7 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
-        let target_ctx_id = self.connection.borrow().current_context_or(kernel.default_context_id);
+        let target_ctx_id = pry!(self.connection.borrow().require_context());
 
         Promise::from_future(async move {
             let kernel_arc = kernel.kernel.clone();
@@ -4277,7 +4202,7 @@ impl kernel::Server for KernelImpl {
                             kernel_ref.kernel.clone(),
                             None,
                             conn.principal.id,
-                            conn.current_context_or(kernel_ref.default_context_id),
+                            conn.require_context()?,
                             conn.session_id,
                             kernel_ref.id,
                         ) {

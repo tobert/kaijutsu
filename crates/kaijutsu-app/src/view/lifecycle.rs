@@ -65,7 +65,7 @@ pub fn spawn_main_cell(
 
     entities.conversation_container = Some(conv_entity);
 
-    let welcome_text = "Welcome to 会術 Kaijutsu\n\nPress 'i' to start typing...";
+    let welcome_text = "No context joined\n\nOpen constellation (Tab) to select or create a context";
 
     // MainCell does NOT get UiVelloText directly.
     // The BlockCell system handles per-block rendering.
