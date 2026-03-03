@@ -68,9 +68,13 @@ pub fn smooth_scroll(
 
     if let Some(conv) = entities.conversation_container {
         if let Ok((mut scroll_pos, _)) = scroll_positions.get_mut(conv) {
+            // Round to integer pixels to prevent sub-pixel jitter at clip boundaries.
+            // Fractional scroll offsets cause clip rects to land between pixels,
+            // producing antialiasing artifacts at the container edge.
+            let pixel_offset = new_offset.round();
             let current_y = scroll_pos.y;
-            if (new_offset - current_y).abs() > 0.01 {
-                **scroll_pos = Vec2::new(scroll_pos.x, new_offset);
+            if (pixel_offset - current_y).abs() > 0.01 {
+                **scroll_pos = Vec2::new(scroll_pos.x, pixel_offset);
             }
         }
     }
