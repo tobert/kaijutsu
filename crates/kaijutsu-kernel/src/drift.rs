@@ -110,7 +110,13 @@ pub struct StagedDrift {
     pub drift_kind: DriftKind,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at: u64,
+    /// Number of times this drift has been requeued after a delivery failure.
+    /// Items exceeding [`MAX_DRIFT_RETRIES`] are dropped on requeue.
+    pub retry_count: u32,
 }
+
+/// Maximum number of requeue attempts before a staged drift is discarded.
+const MAX_DRIFT_RETRIES: u32 = 5;
 
 // ============================================================================
 // DriftRouter — central coordinator
@@ -130,10 +136,16 @@ pub struct DriftRouter {
     contexts: HashMap<ContextId, ContextHandle>,
     /// Staging queue for pending drift operations.
     staging: Vec<StagedDrift>,
+    /// Dead letter queue: drifts that exceeded retry limit or whose target was
+    /// unregistered before delivery. Drained by the flush engine into the
+    /// "lost+found" context so content is never silently discarded.
+    dead_letter: Vec<StagedDrift>,
     /// Counter for staged drift IDs.
     next_staged_id: u64,
     /// Reverse lookup: label → ContextId (for prefix matching).
     label_to_id: HashMap<String, ContextId>,
+    /// ContextId for the lazy "lost+found" context, created on first dead letter.
+    lost_found_id: Option<ContextId>,
 }
 
 impl Default for DriftRouter {
@@ -148,8 +160,10 @@ impl DriftRouter {
         Self {
             contexts: HashMap::new(),
             staging: Vec::new(),
+            dead_letter: Vec::new(),
             next_staged_id: 1,
             label_to_id: HashMap::new(),
+            lost_found_id: None,
         }
     }
 
@@ -226,6 +240,23 @@ impl DriftRouter {
             if let Some(label) = &handle.label {
                 self.label_to_id.remove(label);
             }
+        }
+        // Move staged drifts involving this context to the dead letter queue
+        // so content is never silently discarded. Source-deleted drifts are
+        // still deliverable (we have the content string); target-deleted drifts
+        // can never reach their destination. Both go to dead letter so the
+        // flush engine can write them to "lost+found" for human recovery.
+        let (dead, keep): (Vec<_>, Vec<_>) = self.staging
+            .drain(..)
+            .partition(|s| s.source_ctx == id || s.target_ctx == id);
+        self.staging = keep;
+        if !dead.is_empty() {
+            tracing::info!(
+                context = %id.short(),
+                count = dead.len(),
+                "moving staged drifts to dead letter for unregistered context"
+            );
+            self.dead_letter.extend(dead);
         }
     }
 
@@ -364,6 +395,7 @@ impl DriftRouter {
             source_model,
             drift_kind,
             created_at: now_epoch(),
+            retry_count: 0,
         });
 
         Ok(id)
@@ -404,8 +436,52 @@ impl DriftRouter {
     }
 
     /// Re-queue staged drifts that failed to deliver.
+    ///
+    /// Increments each item's `retry_count`. Items that have already been
+    /// requeued [`MAX_DRIFT_RETRIES`] times move to the dead letter queue
+    /// rather than accumulating indefinitely under persistent failure.
+    /// The flush engine writes dead letter items to "lost+found" so content
+    /// is never silently discarded.
     pub fn requeue(&mut self, items: Vec<StagedDrift>) {
-        self.staging.extend(items);
+        for mut item in items {
+            item.retry_count += 1;
+            if item.retry_count > MAX_DRIFT_RETRIES {
+                tracing::warn!(
+                    drift_id = item.id,
+                    source = %item.source_ctx.short(),
+                    target = %item.target_ctx.short(),
+                    retries = item.retry_count,
+                    "staged drift exceeded {} retries, moving to dead letter queue",
+                    MAX_DRIFT_RETRIES,
+                );
+                self.dead_letter.push(item);
+            } else {
+                self.staging.push(item);
+            }
+        }
+    }
+
+    /// Drain all items from the dead letter queue.
+    ///
+    /// Called by the flush engine to write dead letter content to the
+    /// "lost+found" context in the block store.
+    pub fn drain_dead_letter(&mut self) -> Vec<StagedDrift> {
+        std::mem::take(&mut self.dead_letter)
+    }
+
+    /// Get or create the ContextId for the "lost+found" context.
+    ///
+    /// Lazily creates and registers the context on first call. The caller is
+    /// responsible for creating the corresponding block store document.
+    pub fn ensure_lost_found(&mut self) -> (ContextId, bool) {
+        if let Some(id) = self.lost_found_id {
+            return (id, false);
+        }
+        let id = ContextId::new();
+        self.lost_found_id = Some(id);
+        self.register(id, Some("lost+found"), None);
+        tracing::info!(context = %id.short(), "created lost+found context");
+        (id, true)
     }
 }
 
@@ -909,7 +985,8 @@ impl ExecutionEngine for DriftFlushEngine {
             }
         }
 
-        // Re-queue any failed items so they aren't lost
+        // Re-queue any failed items. requeue() moves items that exceeded
+        // MAX_DRIFT_RETRIES to the dead letter queue instead of discarding them.
         if !failed.is_empty() {
             let requeued = failed.len();
             let mut router = kernel.drift().write().await;
@@ -917,7 +994,73 @@ impl ExecutionEngine for DriftFlushEngine {
             tracing::warn!("Re-queued {} failed drift items", requeued);
         }
 
-        Ok(ExecResult::success(format!("Flushed {} drifts ({} injected)", count, injected)))
+        // Drain the dead letter queue and write to "lost+found" context so
+        // content that couldn't be delivered is preserved and recoverable.
+        let dead = {
+            let mut router = kernel.drift().write().await;
+            router.drain_dead_letter()
+        };
+
+        let mut lost_found_count = 0;
+        if !dead.is_empty() {
+            // Ensure the lost+found context exists (creates lazily on first use).
+            let lf_id = {
+                let mut router = kernel.drift().write().await;
+                let (id, is_new) = router.ensure_lost_found();
+                if is_new {
+                    // Create the block store document for this new context.
+                    if let Err(e) = self.documents.create_document(
+                        id,
+                        crate::db::DocumentKind::Conversation,
+                        None,
+                    ) {
+                        tracing::error!("Failed to create lost+found document: {}", e);
+                    }
+                }
+                id
+            };
+
+            for item in dead {
+                let after = self.documents.last_block_id(lf_id);
+                let content = format!(
+                    "⚠ undelivered drift: {} → {} (retries={}, kind={:?})\n\n{}",
+                    item.source_ctx.short(),
+                    item.target_ctx.short(),
+                    item.retry_count,
+                    item.drift_kind,
+                    item.content,
+                );
+                match self.documents.insert_drift_block(
+                    lf_id,
+                    None,
+                    after.as_ref(),
+                    content,
+                    item.source_ctx,
+                    item.source_model,
+                    item.drift_kind,
+                ) {
+                    Ok(_) => lost_found_count += 1,
+                    Err(e) => tracing::error!(
+                        "Failed to write dead letter to lost+found: {}. Content: {}",
+                        e, item.content,
+                    ),
+                }
+            }
+
+            if lost_found_count > 0 {
+                tracing::warn!(
+                    count = lost_found_count,
+                    "wrote undeliverable drifts to lost+found context — use `drift pull lost+found` to recover"
+                );
+            }
+        }
+
+        let summary = if lost_found_count > 0 {
+            format!("Flushed {} drifts ({} injected, {} → lost+found)", count, injected, lost_found_count)
+        } else {
+            format!("Flushed {} drifts ({} injected)", count, injected)
+        };
+        Ok(ExecResult::success(summary))
     }
 
     async fn is_available(&self) -> bool { true }
@@ -1532,18 +1675,20 @@ mod tests {
         assert_eq!(router.queue().len(), 1);
         assert_eq!(router.queue()[0].id, staged_id);
 
-        // Unregister target (simulating context shutdown)
+        // Unregister target (simulating context shutdown).
+        // New behavior: staged drifts targeting the removed context move to the
+        // dead letter queue rather than remaining in staging indefinitely.
         router.unregister(tgt);
 
-        let staged = router.drain(None);
-        assert_eq!(staged.len(), 1);
-        assert_eq!(staged[0].id, staged_id);
+        // Staging queue is now empty — item moved to dead letter.
+        assert!(router.queue().is_empty(), "staging queue should be empty after unregister");
 
-        router.requeue(staged);
-
-        assert_eq!(router.queue().len(), 1);
-        assert_eq!(router.queue()[0].id, staged_id);
-        assert_eq!(router.queue()[0].content, "test content");
+        // Dead letter should have exactly the item that was waiting for tgt.
+        let dead = router.drain_dead_letter();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].id, staged_id);
+        assert_eq!(dead[0].content, "test content");
+        assert_eq!(dead[0].target_ctx, tgt);
     }
 
     #[test]
@@ -1571,6 +1716,52 @@ mod tests {
         let ids: Vec<_> = router.queue().iter().map(|s| s.id).collect();
         assert!(ids.contains(&id1));
         assert!(ids.contains(&id2));
+        // retry_count should have been incremented
+        assert!(router.queue().iter().all(|s| s.retry_count == 1));
+    }
+
+    #[test]
+    fn test_requeue_retry_limit_moves_to_dead_letter() {
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("source"), None);
+        router.register(tgt, Some("target"), None);
+
+        let _id = router
+            .stage(src, tgt, "persistent failure".into(), None, DriftKind::Push)
+            .unwrap();
+
+        // Drain and requeue MAX_DRIFT_RETRIES + 1 times — last requeue should
+        // push to dead letter.
+        for i in 0..=MAX_DRIFT_RETRIES {
+            let drained = router.drain(None);
+            assert_eq!(drained.len(), 1, "expected item in queue on iteration {}", i);
+            router.requeue(drained);
+            if i < MAX_DRIFT_RETRIES {
+                assert_eq!(router.queue().len(), 1, "item should still be in queue after {} requeues", i + 1);
+                assert!(router.drain_dead_letter().is_empty(), "dead letter should be empty at retry {}", i);
+            }
+        }
+
+        // After MAX_DRIFT_RETRIES+1 requeues, staging is empty and dead letter has the item.
+        assert!(router.queue().is_empty(), "staging should be empty after retry limit");
+        let dead = router.drain_dead_letter();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].content, "persistent failure");
+        assert_eq!(dead[0].retry_count, MAX_DRIFT_RETRIES + 1);
+    }
+
+    #[test]
+    fn test_ensure_lost_found_idempotent() {
+        let mut router = DriftRouter::new();
+        let (id1, is_new1) = router.ensure_lost_found();
+        assert!(is_new1);
+        let (id2, is_new2) = router.ensure_lost_found();
+        assert!(!is_new2);
+        assert_eq!(id1, id2);
+        // Should be registered with label "lost+found"
+        assert!(router.resolve_context("lost+found").is_ok());
     }
 
     #[test]
