@@ -27,10 +27,10 @@ pub fn cursor_row_col(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
     let before = &text[..offset];
     let row = before.matches('\n').count();
-    let col = before
-        .rfind('\n')
-        .map(|pos| offset - pos - 1)
-        .unwrap_or(offset);
+    let col = match before.rfind('\n') {
+        Some(pos) => before[pos + 1..].chars().count(),
+        None => before.chars().count(),
+    };
     (row, col)
 }
 
@@ -118,7 +118,10 @@ pub fn update_cursor(
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
     // Round to integer pixels to prevent subpixel jitter from float drift.
-    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    // Beam draws at uv.x=0.3 within node width (char_width + 8.0); subtract to align.
+    let node_width = char_width + 8.0;
+    let beam_frac = 0.3_f32;
+    let x = (cell_left + col as f32 * char_width - beam_frac * node_width).round();
     let y = (cell_top + (row as f32 * line_height)).round();
 
     let target_left = Val::Px(x);
@@ -235,7 +238,9 @@ pub fn update_block_edit_cursor(
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    let node_width = char_width + 8.0;
+    let beam_frac = 0.3_f32;
+    let x = (cell_left + col as f32 * char_width - beam_frac * node_width).round();
     let y = (cell_top + (row as f32 * line_height)).round();
 
     let target_left = Val::Px(x);
@@ -285,8 +290,9 @@ pub fn update_input_overlay_cursor(
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
-
-    let x = (cell_left + (col as f32 * char_width) - 2.0).round();
+    let node_width = char_width + 8.0;
+    let beam_frac = 0.3_f32;
+    let x = (cell_left + col as f32 * char_width - beam_frac * node_width).round();
     let y = (cell_top + (row as f32 * line_height)).round();
 
     let target_left = Val::Px(x);

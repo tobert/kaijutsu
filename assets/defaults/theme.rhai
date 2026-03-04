@@ -185,8 +185,8 @@ let hud_font_size = 12.0;
 // Compose Block (Input Area)
 // ============================================================================
 
-let compose_border = hexa("#7aa2f7", 0.6);     // Blue border matching accent
-let compose_bg = hexa("#1a1b26", 0.8);         // Dark bg with slight transparency
+let compose_border = hexa("#7aa2f7", 0.8);     // Blue border matching accent
+let compose_bg = hexa("#1a1b26", 1.0);         // Fully opaque background
 
 // ============================================================================
 // Modal Overlays (Create Dialog, Model Picker)
