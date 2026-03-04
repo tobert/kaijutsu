@@ -472,6 +472,12 @@ fn parse_gamepad_button(s: &str) -> Result<GamepadButton, String> {
 
 // ============================================================================
 // HOT-RELOAD (mtime polling)
+// TODO: replace mtime polling with notify crate (inotify/kqueue/FSEvents).
+//   The `notify` crate isn't in the workspace yet. When adding it, replace
+//   BindingsWatcher + poll_bindings_reload with a notify::Watcher that sends
+//   on a crossbeam channel; a Bevy system drains the channel each frame.
+//   The `notify` workspace dep should live in kaijutsu-server first (it already
+//   uses filesystem watching) so the version is shared.
 // ============================================================================
 
 /// Resource that tracks the last bindings file modification time for hot-reload.
