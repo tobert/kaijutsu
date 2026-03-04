@@ -111,9 +111,9 @@ pub fn update_cursor(
     let (row, col) = cursor_position(&mut editor);
 
     let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = computed.content_box();
-    let cell_left = translation.x + content.min.x;
-    let cell_top = translation.y + content.min.y;
+    let node_size = computed.size();
+    let cell_left = translation.x - node_size.x / 2.0;
+    let cell_top = translation.y - node_size.y / 2.0;
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
@@ -232,9 +232,9 @@ pub fn update_block_edit_cursor(
     };
 
     let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = computed.content_box();
-    let cell_left = translation.x + content.min.x;
-    let cell_top = translation.y + content.min.y;
+    let node_size = computed.size();
+    let cell_left = translation.x - node_size.x / 2.0;
+    let cell_top = translation.y - node_size.y / 2.0;
 
     let char_width = text_metrics.cell_char_width + text_metrics.letter_spacing;
     let line_height = text_metrics.cell_line_height;
@@ -281,9 +281,12 @@ pub fn update_input_overlay_cursor(
     *visibility = Visibility::Inherited;
 
     let (_, _, translation) = transform.to_scale_angle_translation();
-    let content = computed.content_box();
-    let cell_left = translation.x + content.min.x;
-    let cell_top = translation.y + content.min.y;
+    // UiGlobalTransform.translation is the node CENTER in screen px.
+    // Vello renders UiVelloText at the node's top-left edge (TopLeft anchor = -size/2 offset),
+    // ignoring padding. Use node top-left (not content_box) so cursor aligns with text.
+    let node_size = computed.size();
+    let cell_left = translation.x - node_size.x / 2.0;
+    let cell_top = translation.y - node_size.y / 2.0;
 
     let display = overlay.display_text();
     let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
