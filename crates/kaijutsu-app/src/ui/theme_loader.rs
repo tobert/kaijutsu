@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use super::theme::{AnsiColors, Theme};
 
 /// Get the theme file path (~/.config/kaijutsu/theme.rhai).
+#[allow(dead_code)] // Kept as convenience wrapper; loading now goes through config::load_app_config
 pub fn theme_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("kaijutsu").join("theme.rhai"))
 }
@@ -34,6 +35,7 @@ pub fn theme_file_path() -> Option<PathBuf> {
 ///
 /// Loads from `~/.config/kaijutsu/theme.rhai`. Falls back to `Theme::default()`
 /// if the file doesn't exist or has errors.
+#[allow(dead_code)] // Kept as convenience wrapper; loading now goes through config::load_app_config
 pub fn load_theme() -> Theme {
     let Some(base_path) = theme_file_path() else {
         info!("No config directory available, using default theme");
@@ -83,21 +85,18 @@ fn load_theme_from_file(path: &PathBuf) -> Result<Theme, String> {
     parse_theme_script(&script)
 }
 
-/// Create a Rhai engine with theme functions registered.
-fn create_engine() -> Engine {
-    let mut engine = Engine::new();
-
-    // hex("#rrggbb") → [r, g, b, 1.0]
-    engine.register_fn("hex", |s: &str| -> Array {
-        parse_hex_color(s, 1.0)
-    });
-
-    // hexa("#rrggbb", alpha) → [r, g, b, alpha]
+/// Register color helper functions on a Rhai engine.
+///
+/// Available to both theme.rhai and (via the shared engine) bindings.rhai:
+/// - `hex("#rrggbb")` → `[r, g, b, 1.0]`
+/// - `hexa("#rrggbb", alpha)` → `[r, g, b, alpha]`
+/// - `rgba(r, g, b, a)` → `[r, g, b, a]`
+/// - `rgb(r, g, b)` → `[r, g, b, 1.0]`
+pub fn register_color_fns(engine: &mut Engine) {
+    engine.register_fn("hex", |s: &str| -> Array { parse_hex_color(s, 1.0) });
     engine.register_fn("hexa", |s: &str, alpha: f64| -> Array {
         parse_hex_color(s, alpha as f32)
     });
-
-    // rgba(r, g, b, a) → [r, g, b, a] (values 0.0-1.0)
     engine.register_fn("rgba", |r: f64, g: f64, b: f64, a: f64| -> Array {
         vec![
             Dynamic::from_float(r),
@@ -106,8 +105,6 @@ fn create_engine() -> Engine {
             Dynamic::from_float(a),
         ]
     });
-
-    // rgb(r, g, b) → [r, g, b, 1.0] (values 0.0-1.0)
     engine.register_fn("rgb", |r: f64, g: f64, b: f64| -> Array {
         vec![
             Dynamic::from_float(r),
@@ -116,7 +113,12 @@ fn create_engine() -> Engine {
             Dynamic::from_float(1.0),
         ]
     });
+}
 
+/// Create a Rhai engine with theme functions registered.
+fn create_engine() -> Engine {
+    let mut engine = Engine::new();
+    register_color_fns(&mut engine);
     engine
 }
 
@@ -152,6 +154,16 @@ fn parse_hex_color(s: &str, alpha: f32) -> Array {
     ]
 }
 
+/// Extract theme variables from a pre-populated Rhai scope.
+///
+/// Starts from `Theme::default()` and overlays any variables found in scope.
+/// Used by the shared config engine to support sequential evaluation.
+pub fn parse_theme_from_scope(scope: &Scope) -> Theme {
+    let mut theme = Theme::default();
+    apply_theme_from_scope(scope, &mut theme);
+    theme
+}
+
 /// Parse a theme script and build a Theme struct.
 fn parse_theme_script(script: &str) -> Result<Theme, String> {
     let engine = create_engine();
@@ -161,9 +173,11 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
         .run_with_scope(&mut scope, script)
         .map_err(|e| format!("Rhai parse error: {}", e))?;
 
-    // Start with default theme
-    let mut theme = Theme::default();
+    Ok(parse_theme_from_scope(&scope))
+}
 
+/// Apply scope variables to a mutable Theme reference.
+fn apply_theme_from_scope(scope: &Scope, theme: &mut Theme) {
     // Extract variables from scope and apply to theme
     // Base UI colors
     if let Some(c) = get_color(&scope, "bg") {
@@ -455,8 +469,6 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     if let Some(c) = get_color_with_alpha(&scope, "block_border_assistant") {
         theme.block_border_assistant = c;
     }
-
-    Ok(theme)
 }
 
 /// Extract a color from scope (ignores alpha, sets to 1.0).

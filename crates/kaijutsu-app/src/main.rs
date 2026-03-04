@@ -21,6 +21,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod agents;
 mod cell;
 mod commands;
+mod config;
 mod connection;
 mod constants;
 mod input;
@@ -56,8 +57,9 @@ fn main() {
 
     info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
 
-    // Load theme from ~/.config/kaijutsu/theme.rhai (or use defaults)
-    let theme = ui::theme_loader::load_theme();
+    // Load theme and bindings from ~/.config/kaijutsu/ (or use defaults)
+    let app_config = config::load_app_config();
+    let theme = app_config.theme;
 
     App::new()
         .add_plugins(DefaultPlugins

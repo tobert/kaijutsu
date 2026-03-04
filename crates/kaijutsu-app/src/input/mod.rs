@@ -86,8 +86,8 @@ pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
-        // Write default bindings.rhai to XDG config if not present
-        rhai_config::write_default_config_if_missing();
+        // Write default config files (bindings.rhai + theme.rhai) if not present
+        crate::config::write_default_configs_if_missing();
 
         // Register messages
         app.add_message::<events::ActionFired>()

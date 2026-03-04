@@ -87,7 +87,14 @@ pub fn parse_bindings_script(script: &str) -> Result<Vec<Binding>, String> {
     let result: Dynamic = engine
         .eval::<Dynamic>(script)
         .map_err(|e| format!("Rhai eval error: {e}"))?;
+    parse_bindings_from_dynamic(result)
+}
 
+/// Parse bindings from a Rhai Dynamic return value.
+///
+/// Used by the shared config engine to extract bindings from a bindings script's
+/// return value without requiring a separate engine instance.
+pub fn parse_bindings_from_dynamic(result: Dynamic) -> Result<Vec<Binding>, String> {
     let arr = result
         .try_cast::<Array>()
         .ok_or_else(|| "bindings.rhai must return an array".to_string())?;
@@ -111,10 +118,12 @@ pub fn parse_bindings_script(script: &str) -> Result<Vec<Binding>, String> {
 // RHAI ENGINE SETUP
 // ============================================================================
 
-fn build_engine() -> Engine {
-    let mut engine = Engine::new();
-    let defaults = default_bindings();
-
+/// Register binding helper functions on a Rhai engine.
+///
+/// Exposes `binding()`, `binding_mod()`, `gamepad()`, and `default_bindings()`
+/// to scripts. Called by both the local `build_engine()` and the shared
+/// `config::build_app_engine()` so the same helpers are available in all scripts.
+pub fn register_binding_fns(engine: &mut Engine, defaults: Vec<Binding>) {
     // Register `default_bindings()` → Array of maps (the Rust defaults)
     engine.register_fn("default_bindings", move || -> Array {
         defaults
@@ -165,7 +174,11 @@ fn build_engine() -> Engine {
             m
         },
     );
+}
 
+fn build_engine() -> Engine {
+    let mut engine = Engine::new();
+    register_binding_fns(&mut engine, default_bindings());
     engine
 }
 
@@ -474,38 +487,5 @@ fn parse_gamepad_button(s: &str) -> Result<GamepadButton, String> {
 //   flow through the kernel and trigger a reload event — or the file is
 //   exposed via v9fs/fuse so all edits are kernel-mediated anyway.
 //   The XDG file is write-only from Kaijutsu's perspective (persistence +
-//   re-hydration on next launch). See write_default_config_if_missing().
-
-// ============================================================================
-// WRITE DEFAULT CONFIG
-// ============================================================================
-
-/// Write the default bindings.rhai to the user config dir on first run.
-///
-/// This file is **managed by Kaijutsu** — it is written on first launch and
-/// will be overwritten when bindings change from inside the app. Do not edit
-/// it directly; changes will be lost. To customize bindings, use Kaijutsu's
-/// built-in editor (future: via the kernel VFS / v9fs mount).
-///
-/// Only writes if the file doesn't exist.
-pub fn write_default_config_if_missing() {
-    let Some(path) = bindings_file_path() else {
-        return;
-    };
-
-    if path.exists() {
-        return;
-    }
-
-    let config_dir = path.parent().unwrap();
-    if let Err(e) = std::fs::create_dir_all(config_dir) {
-        warn!("Could not create config dir {:?}: {}", config_dir, e);
-        return;
-    }
-
-    let default_content = include_str!("../../assets/defaults/bindings.rhai");
-    match std::fs::write(&path, default_content) {
-        Ok(()) => info!("Wrote default bindings to {:?}", path),
-        Err(e) => warn!("Could not write default bindings to {:?}: {}", path, e),
-    }
-}
+//   re-hydration on next launch). Default config writing is handled by
+//   crate::config::write_default_configs_if_missing().
