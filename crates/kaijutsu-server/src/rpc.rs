@@ -4040,7 +4040,10 @@ impl kernel::Server for KernelImpl {
         };
 
         // Per-block DTE stores don't need compaction — each block's DTE
-        // is already minimal. Return 0 as no-op.
+        // is already minimal. This is intentionally a no-op; sync_generation
+        // stays 0 and SyncReset is never emitted. If compaction is ever
+        // reintroduced, bump DocumentEntry.sync_generation and emit
+        // BlockFlow::SyncReset so clients can resync their frontier.
         let mut r = results.get();
         r.set_new_size(0);
         r.set_generation(0);
@@ -5119,6 +5122,8 @@ async fn process_llm_stream(
     // Track total iterations to prevent infinite loops
     let max_iterations = 20;
     let mut iteration = 0;
+    // Max retries for transient LLM provider failures (network blips, rate limits)
+    const MAX_LLM_RETRIES: u32 = 2;
 
     // Track last inserted block for ordering - each new block goes after the previous
     let mut last_block_id = after_block_id;
@@ -5140,16 +5145,36 @@ async fn process_llm_stream(
             .with_max_tokens(max_output_tokens)
             .with_tools(tools.clone());
 
-        // Start streaming
-        let mut stream = match provider.stream(stream_request).await {
-            Ok(s) => {
-                log::info!("LLM stream started successfully");
-                s
-            }
-            Err(e) => {
-                log::error!("Failed to start LLM stream: {}", e);
-                let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
-                return;
+        // Start streaming with exponential backoff retry for transient failures.
+        // Retries cover network blips and rate limits before any content is emitted;
+        // mid-stream errors are not retried to avoid duplicate CRDT blocks.
+        let mut stream = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match provider.stream(stream_request.clone()).await {
+                    Ok(s) => {
+                        if attempt > 1 {
+                            log::info!("LLM stream started on attempt {}", attempt);
+                        } else {
+                            log::info!("LLM stream started successfully");
+                        }
+                        break s;
+                    }
+                    Err(e) if attempt <= MAX_LLM_RETRIES => {
+                        let delay_secs = attempt as u64;
+                        log::warn!(
+                            "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
+                            attempt, MAX_LLM_RETRIES + 1, e, delay_secs
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to start LLM stream after {} attempts: {}", attempt, e);
+                        let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
+                        return;
+                    }
+                }
             }
         };
 
@@ -5351,19 +5376,28 @@ async fn process_llm_stream(
                     // Step 3: Let BlockInserted flush to clients before text ops
                     tokio::task::yield_now().await;
 
-                    // Step 4: Execute tool
-                    let result = kernel.execute_with(&tool_name, &params, &tool_ctx).await;
+                    // Step 4: Execute tool with timeout to prevent hung tools from
+                    // blocking the entire agentic loop indefinitely.
+                    const TOOL_TIMEOUT_SECS: u64 = 120;
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        kernel.execute_with(&tool_name, &params, &tool_ctx),
+                    ).await;
 
                     let (result_content, is_error) = match result {
-                        Ok(r) if r.success => {
+                        Err(_elapsed) => {
+                            log::error!("Tool {} timed out after {}s", tool_name, TOOL_TIMEOUT_SECS);
+                            (format!("Error: tool '{}' timed out after {}s", tool_name, TOOL_TIMEOUT_SECS), true)
+                        }
+                        Ok(Ok(r)) if r.success => {
                             log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
                             (r.stdout, false)
                         }
-                        Ok(r) => {
+                        Ok(Ok(r)) => {
                             log::warn!("Tool {} failed: {}", tool_name, r.stderr);
                             (format!("Error: {}", r.stderr), true)
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             log::error!("Tool {} execution error: {}", tool_name, e);
                             (format!("Execution error: {}", e), true)
                         }

@@ -652,7 +652,10 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                 match rx.recv().await {
                     Ok(msg) => return Some(msg),
                     Err(async_broadcast::RecvError::Overflowed(n)) => {
-                        tracing::debug!(skipped = n, "subscription overflowed");
+                        // Slow subscriber — oldest messages dropped from the channel buffer.
+                        // CRDT data is safe in BlockStore; the caller may want to re-fetch
+                        // ops_since() to recover any missed text ops after streaming ends.
+                        tracing::warn!(skipped = n, "subscription overflowed — missed realtime updates");
                         continue;
                     }
                     Err(async_broadcast::RecvError::Closed) => return None,
@@ -673,10 +676,12 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                             match receivers[i].1.try_recv() {
                                 Ok(msg) => return Some(msg),
                                 Err(async_broadcast::TryRecvError::Overflowed(n)) => {
-                                    tracing::debug!(
+                                    // Slow subscriber — oldest messages dropped.
+                                    // CRDT data is safe; caller may re-fetch ops_since() to recover.
+                                    tracing::warn!(
                                         topic = receivers[i].0,
                                         skipped = n,
-                                        "multi-subscription overflowed"
+                                        "multi-subscription overflowed — missed realtime updates"
                                     );
                                     continue;
                                 }
@@ -737,7 +742,7 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                 match rx.try_recv() {
                     Ok(msg) => return Some(msg),
                     Err(async_broadcast::TryRecvError::Overflowed(n)) => {
-                        tracing::debug!(skipped = n, "subscription overflowed on try_recv");
+                        tracing::warn!(skipped = n, "subscription overflowed on try_recv — missed realtime updates");
                         continue;
                     }
                     Err(async_broadcast::TryRecvError::Empty
@@ -751,7 +756,7 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                         match rx.try_recv() {
                             Ok(msg) => return Some(msg),
                             Err(async_broadcast::TryRecvError::Overflowed(n)) => {
-                                tracing::debug!(skipped = n, "multi try_recv overflowed");
+                                tracing::warn!(skipped = n, "multi try_recv overflowed — missed realtime updates");
                                 continue;
                             }
                             Err(async_broadcast::TryRecvError::Empty
