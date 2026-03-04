@@ -57,12 +57,6 @@ pub fn in_compose(focus: Res<FocusArea>) -> bool {
     matches!(*focus, FocusArea::Compose)
 }
 
-/// System run condition: any text input mode (Compose only now).
-#[allow(dead_code)]
-pub fn in_text_input(focus: Res<FocusArea>) -> bool {
-    focus.is_text_input()
-}
-
 /// System run condition: FocusArea allows conversation scrolling.
 pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
     matches!(

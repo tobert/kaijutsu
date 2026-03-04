@@ -121,24 +121,6 @@ pub fn handle_unfocus(
     }
 }
 
-/// Handle Activate action in Navigation context (Enter on focused block).
-///
-/// Currently a placeholder — inline block editing was removed with EditingBlock focus mode.
-/// Future: could open block actions menu or expand block to reader.
-pub fn handle_activate_navigation(
-    mut actions: MessageReader<ActionFired>,
-    focus_target: Res<FocusTarget>,
-) {
-    for ActionFired(action) in actions.read() {
-        if !matches!(action, Action::Activate) {
-            continue;
-        }
-
-        if focus_target.block_id.is_some() {
-            debug!("Activate on focused block (no-op, block editing removed)");
-        }
-    }
-}
 
 // ============================================================================
 // DEBUG HANDLERS — migrated from ui/debug.rs to consume ActionFired

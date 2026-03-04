@@ -220,24 +220,29 @@ fn get_str(m: &Map, key: &str) -> Result<String, String> {
 }
 
 fn modifiers_to_str(m: &Modifiers) -> String {
-    match (m.ctrl, m.shift, m.alt, m.super_key) {
-        (false, false, false, false) => String::new(),
-        (true, false, false, false) => "CTRL".to_string(),
-        (false, true, false, false) => "SHIFT".to_string(),
-        (false, false, true, false) => "ALT".to_string(),
-        (true, true, false, false) => "CTRL+SHIFT".to_string(),
-        _ => String::new(),
-    }
+    let mut parts = Vec::new();
+    if m.ctrl { parts.push("CTRL"); }
+    if m.shift { parts.push("SHIFT"); }
+    if m.alt { parts.push("ALT"); }
+    if m.super_key { parts.push("SUPER"); }
+    parts.join("+")
 }
 
 fn parse_modifiers(s: &str) -> Modifiers {
-    match s {
-        "CTRL" => Modifiers::CTRL,
-        "SHIFT" => Modifiers::SHIFT,
-        "ALT" => Modifiers::ALT,
-        "CTRL+SHIFT" => Modifiers::CTRL_SHIFT,
-        _ => Modifiers::NONE,
+    if s.is_empty() {
+        return Modifiers::NONE;
     }
+    let mut m = Modifiers::NONE;
+    for part in s.split('+') {
+        match part.trim() {
+            "CTRL" => m.ctrl = true,
+            "SHIFT" => m.shift = true,
+            "ALT" => m.alt = true,
+            "SUPER" => m.super_key = true,
+            other => warn!("Unknown modifier '{other}' in bindings.rhai"),
+        }
+    }
+    m
 }
 
 fn context_to_str(ctx: InputContext) -> String {

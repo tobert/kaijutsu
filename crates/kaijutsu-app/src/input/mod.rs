@@ -176,7 +176,6 @@ impl Plugin for InputPlugin {
                 systems::handle_navigate_blocks.run_if(focus::in_conversation),
                 systems::handle_expand_block.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
-                systems::handle_activate_navigation.run_if(focus::in_conversation),
                 // Constellation context (gated by Screen state, not FocusArea)
                 systems::handle_constellation_nav.run_if(
                     in_state(crate::ui::screen::Screen::Constellation)
