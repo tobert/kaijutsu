@@ -91,7 +91,7 @@ async fn register_block_tools(
 
     kernel.register_tool_with_engine(
         ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
-        Arc::new(BlockCreateEngine::new(documents.clone(), "server")),
+        Arc::new(BlockCreateEngine::new(documents.clone())),
     ).await;
 
     kernel.register_tool_with_engine(
@@ -101,7 +101,7 @@ async fn register_block_tools(
 
     kernel.register_tool_with_engine(
         ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
-        Arc::new(BlockEditEngine::new(documents.clone(), "server")),
+        Arc::new(BlockEditEngine::new(documents.clone())),
     ).await;
 
     kernel.register_tool_with_engine(

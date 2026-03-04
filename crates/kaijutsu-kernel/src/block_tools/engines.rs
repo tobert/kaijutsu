@@ -227,7 +227,7 @@ pub struct BlockCreateEngine {
 }
 
 impl BlockCreateEngine {
-    pub fn new(documents: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+    pub fn new(documents: SharedBlockStore) -> Self {
         Self { documents }
     }
 
@@ -262,7 +262,7 @@ impl BlockCreateEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockCreateParams) -> Result<serde_json::Value> {
+    fn execute_inner(&self, params: BlockCreateParams, ctx: &ToolContext) -> Result<serde_json::Value> {
         let role = parse_role(&params.role)?;
         let kind = parse_kind(&params.kind)?;
         let content = params.content.unwrap_or_default();
@@ -274,20 +274,24 @@ impl BlockCreateEngine {
             .map(|s| parse_block_id(s))
             .transpose()?;
 
-        // For now, create blocks in a default document or first available document
-        let context_id = self.documents.list_ids().into_iter().next().ok_or_else(|| {
-            EditError::StoreError("no documents available, create a document first".into())
-        })?;
+        let context_id = ctx.context_id;
+
+        if !self.documents.contains(context_id) {
+            return Err(EditError::StoreError(format!(
+                "no document for context {}", context_id.short()
+            )));
+        }
 
         let block_id = self
             .documents
-            .insert_block(
+            .insert_block_as(
                 context_id,
                 parent_id.as_ref(),
                 None, // after
                 role,
                 kind,
                 &content,
+                Some(ctx.principal_id),
             )
             .map_err(|e| EditError::StoreError(e))?;
 
@@ -318,8 +322,8 @@ impl ExecutionEngine for BlockCreateEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_create")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.block_create")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockCreateParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -327,7 +331,7 @@ impl ExecutionEngine for BlockCreateEngine {
             }
         };
 
-        match self.execute_inner(params) {
+        match self.execute_inner(params, ctx) {
             Ok(result) => Ok(ExecResult::success(result.to_string())),
             Err(e) => Ok(ExecResult::failure(1, e.to_string())),
         }
@@ -371,11 +375,11 @@ impl BlockAppendEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockAppendParams) -> Result<serde_json::Value> {
+    fn execute_inner(&self, params: BlockAppendParams, ctx: &ToolContext) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         self.documents
-            .append_text(context_id, &block_id, &params.text)
+            .append_text_as(context_id, &block_id, &params.text, Some(ctx.principal_id))
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
@@ -404,8 +408,8 @@ impl ExecutionEngine for BlockAppendEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_append")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.block_append")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockAppendParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -413,7 +417,7 @@ impl ExecutionEngine for BlockAppendEngine {
             }
         };
 
-        match self.execute_inner(params) {
+        match self.execute_inner(params, ctx) {
             Ok(result) => Ok(ExecResult::success(result.to_string())),
             Err(e) => Ok(ExecResult::failure(1, e.to_string())),
         }
@@ -436,7 +440,7 @@ pub struct BlockEditEngine {
 }
 
 impl BlockEditEngine {
-    pub fn new(documents: SharedBlockStore, _agent_name: impl Into<String>) -> Self {
+    pub fn new(documents: SharedBlockStore) -> Self {
         Self { documents }
     }
 
@@ -490,7 +494,7 @@ impl BlockEditEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockEditParams) -> Result<serde_json::Value> {
+    fn execute_inner(&self, params: BlockEditParams, ctx: &ToolContext) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         // Pre-validate CAS checks before applying any operations.
@@ -510,7 +514,7 @@ impl BlockEditEngine {
 
         // Apply operations sequentially (offsets depend on prior edits).
         for (idx, op) in params.operations.into_iter().enumerate() {
-            self.apply_op(context_id, &block_id, op)
+            self.apply_op(context_id, &block_id, op, ctx)
                 .map_err(|e| e.in_batch(idx))?;
         }
 
@@ -525,7 +529,7 @@ impl BlockEditEngine {
         }))
     }
 
-    fn apply_op(&self, context_id: ContextId, block_id: &BlockId, op: EditOp) -> Result<()> {
+    fn apply_op(&self, context_id: ContextId, block_id: &BlockId, op: EditOp, ctx: &ToolContext) -> Result<()> {
         // Get current content
         let content = {
             let entry = self
@@ -550,7 +554,7 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text(context_id, block_id, pos, &text_with_newline, 0)
+                    .edit_text_as(context_id, block_id, pos, &text_with_newline, 0, Some(ctx.principal_id))
                     .map_err(|e| EditError::StoreError(e))?;
             }
             EditOp::Delete {
@@ -560,7 +564,7 @@ impl BlockEditEngine {
                 let (start, end) = line_range_to_byte_range(&content, start_line, end_line)?;
                 if start < end {
                     self.documents
-                        .edit_text(context_id, block_id, start, "", end - start)
+                        .edit_text_as(context_id, block_id, start, "", end - start, Some(ctx.principal_id))
                         .map_err(|e| EditError::StoreError(e))?;
                 }
             }
@@ -582,7 +586,7 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text(context_id, block_id, start, &text_with_newline, end - start)
+                    .edit_text_as(context_id, block_id, start, &text_with_newline, end - start, Some(ctx.principal_id))
                     .map_err(|e| EditError::StoreError(e))?;
             }
         }
@@ -605,8 +609,8 @@ impl ExecutionEngine for BlockEditEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_edit")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.block_edit")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockEditParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -614,7 +618,7 @@ impl ExecutionEngine for BlockEditEngine {
             }
         };
 
-        match self.execute_inner(params) {
+        match self.execute_inner(params, ctx) {
             Ok(result) => Ok(ExecResult::success(result.to_string())),
             Err(e) => Ok(ExecResult::failure(1, e.to_string())),
         }
@@ -668,13 +672,13 @@ impl BlockSpliceEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockSpliceParams) -> Result<serde_json::Value> {
+    fn execute_inner(&self, params: BlockSpliceParams, ctx: &ToolContext) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let insert = params.insert.unwrap_or_default();
 
         self.documents
-            .edit_text(context_id, &block_id, params.offset, &insert, params.delete_count)
+            .edit_text_as(context_id, &block_id, params.offset, &insert, params.delete_count, Some(ctx.principal_id))
             .map_err(|e| EditError::StoreError(e))?;
 
         let version = self
@@ -703,8 +707,8 @@ impl ExecutionEngine for BlockSpliceEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_splice")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.block_splice")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: BlockSpliceParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -712,7 +716,7 @@ impl ExecutionEngine for BlockSpliceEngine {
             }
         };
 
-        match self.execute_inner(params) {
+        match self.execute_inner(params, ctx) {
             Ok(result) => Ok(ExecResult::success(result.to_string())),
             Err(e) => Ok(ExecResult::failure(1, e.to_string())),
         }
@@ -1242,6 +1246,9 @@ pub struct KernelSearchParams {
     pub context_lines: u32,
     /// Maximum number of matches to return.
     pub max_matches: Option<usize>,
+    /// Search all documents instead of just the current context.
+    #[serde(default)]
+    pub all_documents: bool,
 }
 
 /// A match from kernel_search.
@@ -1281,7 +1288,12 @@ impl KernelSearchEngine {
                 },
                 "document_id": {
                     "type": "string",
-                    "description": "Limit search to this document"
+                    "description": "Limit search to a specific document (overrides all_documents)"
+                },
+                "all_documents": {
+                    "type": "boolean",
+                    "description": "Search all documents instead of just the current context (default: false)",
+                    "default": false
                 },
                 "kind": {
                     "type": "string",
@@ -1306,7 +1318,7 @@ impl KernelSearchEngine {
         })
     }
 
-    fn execute_inner(&self, params: KernelSearchParams) -> Result<serde_json::Value> {
+    fn execute_inner(&self, params: KernelSearchParams, ctx: &ToolContext) -> Result<serde_json::Value> {
         let regex = Regex::new(&params.query)
             .map_err(|e| EditError::InvalidRegex(e.to_string()))?;
 
@@ -1316,15 +1328,16 @@ impl KernelSearchEngine {
         let max_matches = params.max_matches.unwrap_or(100);
         let mut matches = Vec::new();
 
-        // Get documents to search
+        // Get documents to search: explicit document_id > all_documents > current context
         let context_ids: Vec<ContextId> = if let Some(ref doc_id_str) = params.document_id {
-            // Parse string to ContextId for filtering
             match ContextId::parse(doc_id_str) {
                 Ok(ctx) if self.documents.contains(ctx) => vec![ctx],
                 _ => vec![],
             }
-        } else {
+        } else if params.all_documents {
             self.documents.list_ids()
+        } else {
+            vec![ctx.context_id]
         };
 
         'outer: for context_id in context_ids {
@@ -1409,8 +1422,8 @@ impl ExecutionEngine for KernelSearchEngine {
         Some(Self::schema())
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.kernel_search")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.kernel_search")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let params: KernelSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1418,7 +1431,7 @@ impl ExecutionEngine for KernelSearchEngine {
             }
         };
 
-        match self.execute_inner(params) {
+        match self.execute_inner(params, ctx) {
             Ok(result) => Ok(ExecResult::success(result.to_string())),
             Err(e) => Ok(ExecResult::failure(1, e.to_string())),
         }
@@ -1441,20 +1454,24 @@ mod tests {
         ContextId::new()
     }
 
-    fn setup_test_store() -> (SharedBlockStore, ContextId) {
+    fn setup_test_store() -> (SharedBlockStore, ContextId, ToolContext) {
         let store = shared_block_store(PrincipalId::new());
         let ctx = test_context_id();
         store.create_document(ctx, DocumentKind::Code, Some("rust".into())).unwrap();
-        (store, ctx)
+        let tool_ctx = ToolContext {
+            context_id: ctx,
+            ..ToolContext::test()
+        };
+        (store, ctx, tool_ctx)
     }
 
     #[tokio::test]
     async fn test_block_create() {
-        let (store, _ctx) = setup_test_store();
-        let engine = BlockCreateEngine::new(store.clone(), "test-agent");
+        let (store, _ctx, tool_ctx) = setup_test_store();
+        let engine = BlockCreateEngine::new(store.clone());
 
         let params = r#"{"role": "user", "kind": "text", "content": "hello world"}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1464,14 +1481,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_append() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, tool_ctx) = setup_test_store();
 
         // Create a block first
         let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello").unwrap();
 
         let engine = BlockAppendEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
 
         assert!(result.success, "append failed: {}", result.stderr);
 
@@ -1482,16 +1499,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_edit_insert() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, tool_ctx) = setup_test_store();
 
         let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
 
-        let engine = BlockEditEngine::new(store.clone(), "test-agent");
+        let engine = BlockEditEngine::new(store.clone());
         let params = format!(
             r#"{{"block_id": "{}", "operations": [{{"op": "insert", "line": 1, "content": "line2"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
 
         assert!(result.success, "edit insert failed: {}", result.stderr);
 
@@ -1503,18 +1520,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_edit_replace_with_cas() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, tool_ctx) = setup_test_store();
 
         let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
 
-        let engine = BlockEditEngine::new(store.clone(), "test-agent");
+        let engine = BlockEditEngine::new(store.clone());
 
         // Valid CAS should succeed
         let params = format!(
             r#"{{"block_id": "{}", "operations": [{{"op": "replace", "start_line": 1, "end_line": 2, "content": "rust", "expected_text": "world"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
         assert!(result.success, "CAS should succeed: {}", result.stderr);
 
         // Invalid CAS should fail
@@ -1522,14 +1539,14 @@ mod tests {
             r#"{{"block_id": "{}", "operations": [{{"op": "replace", "start_line": 0, "end_line": 1, "content": "goodbye", "expected_text": "wrong"}}]}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
         assert!(!result.success, "CAS should fail with wrong expected text");
         assert!(result.stderr.contains("content mismatch"));
     }
 
     #[tokio::test]
     async fn test_block_read() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, _tool_ctx) = setup_test_store();
 
         let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
 
@@ -1545,7 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_search() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, _tool_ctx) = setup_test_store();
 
         let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
 
@@ -1561,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_list() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, _tool_ctx) = setup_test_store();
 
         store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
         store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
@@ -1577,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_list_with_filter() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, _tool_ctx) = setup_test_store();
 
         store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
         store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
@@ -1593,7 +1610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_status() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, _tool_ctx) = setup_test_store();
 
         let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
 
@@ -1611,7 +1628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kernel_search() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, tool_ctx) = setup_test_store();
 
         // Create blocks in different documents
         let ctx2 = ContextId::new();
@@ -1623,29 +1640,34 @@ mod tests {
 
         let engine = KernelSearchEngine::new(store.clone());
 
-        // Search for "hello" across all blocks
+        // Default: search current context only
         let params = r#"{"query": "hello"}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
         assert!(result.success, "search failed: {}", result.stderr);
-
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-        assert_eq!(response["total"], 3, "should find 3 matches for 'hello'");
+        assert_eq!(response["total"], 2, "should find 2 matches in current context");
+
+        // Search across all documents with all_documents flag
+        let params = r#"{"query": "hello", "all_documents": true}"#;
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(response["total"], 3, "should find 3 matches across all docs");
 
         // Search with document filter (using hex ContextId)
         let params = format!(r#"{{"query": "hello", "document_id": "{}"}}"#, ctx.to_hex());
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 2, "should find 2 matches in ctx");
 
-        // Search with role filter
+        // Search with role filter (current context only)
         let params = r#"{"query": "hello", "role": "model"}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         assert_eq!(response["total"], 1, "should find 1 match from model");
 
         // Search with context lines
         let params = r#"{"query": "foo", "context_lines": 1, "max_matches": 1}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         let matches = response["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
@@ -1654,11 +1676,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_edit_cas_pre_validation_rejects_whole_batch() {
-        let (store, ctx) = setup_test_store();
+        let (store, ctx, tool_ctx) = setup_test_store();
         let block_id = store
             .insert_block(ctx, None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n")
             .unwrap();
-        let engine = BlockEditEngine::new(store.clone(), "test-agent");
+        let engine = BlockEditEngine::new(store.clone());
 
         // Batch: first op is valid replace, second has wrong CAS expected_text.
         // Pre-validation should reject the entire batch — no ops applied.
@@ -1672,7 +1694,7 @@ mod tests {
             }}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
         assert!(!result.success, "batch should fail due to CAS mismatch in op[1]");
         assert!(result.stderr.contains("content mismatch"), "error: {}", result.stderr);
 
@@ -1694,7 +1716,7 @@ mod tests {
             }}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &tool_ctx).await.unwrap();
         assert!(result.success, "valid batch should succeed: {}", result.stderr);
 
         let entry = store.get(ctx).unwrap();
