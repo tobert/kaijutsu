@@ -27,13 +27,11 @@ use bevy::input::gamepad::GamepadButton;
 use bevy::prelude::*;
 use rhai::{Array, Dynamic, Engine, Map};
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use super::action::Action;
 use super::binding::{Binding, Modifiers};
 use super::context::InputContext;
 use super::defaults::default_bindings;
-use super::map::InputMap;
 
 // ============================================================================
 // FILE PATH
@@ -470,88 +468,13 @@ fn parse_gamepad_button(s: &str) -> Result<GamepadButton, String> {
     }
 }
 
-// ============================================================================
-// HOT-RELOAD (mtime polling)
-// TODO: replace mtime polling with notify crate (inotify/kqueue/FSEvents).
-//   The `notify` crate isn't in the workspace yet. When adding it, replace
-//   BindingsWatcher + poll_bindings_reload with a notify::Watcher that sends
-//   on a crossbeam channel; a Bevy system drains the channel each frame.
-//   The `notify` workspace dep should live in kaijutsu-server first (it already
-//   uses filesystem watching) so the version is shared.
-// ============================================================================
-
-/// Resource that tracks the last bindings file modification time for hot-reload.
-#[derive(Resource)]
-pub struct BindingsWatcher {
-    pub path: Option<PathBuf>,
-    pub last_mtime: Option<SystemTime>,
-    pub check_timer: f32,
-    /// Interval between mtime checks (seconds).
-    pub check_interval: f32,
-}
-
-impl Default for BindingsWatcher {
-    fn default() -> Self {
-        Self {
-            path: bindings_file_path(),
-            last_mtime: None,
-            check_timer: 0.0,
-            check_interval: 2.0,
-        }
-    }
-}
-
-/// Bevy system: poll bindings file mtime and reload if changed.
-pub fn poll_bindings_reload(
-    mut watcher: ResMut<BindingsWatcher>,
-    mut input_map: ResMut<InputMap>,
-    time: Res<Time>,
-) {
-    watcher.check_timer += time.delta_secs();
-    if watcher.check_timer < watcher.check_interval {
-        return;
-    }
-    watcher.check_timer = 0.0;
-
-    let Some(ref path) = watcher.path.clone() else {
-        return;
-    };
-
-    if !path.exists() {
-        return;
-    }
-
-    // Check mtime
-    let current_mtime = std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-
-    if current_mtime == watcher.last_mtime {
-        return;
-    }
-
-    // File changed — reload
-    info!("bindings.rhai changed, reloading...");
-    watcher.last_mtime = current_mtime;
-
-    let script = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to read bindings on reload: {}", e);
-            return;
-        }
-    };
-
-    match parse_bindings_script(&script) {
-        Ok(bindings) => {
-            info!("Reloaded {} bindings from {:?}", bindings.len(), path);
-            input_map.bindings = bindings;
-        }
-        Err(e) => {
-            warn!("Failed to parse bindings on reload: {}", e);
-        }
-    }
-}
+// TODO: live bindings reload should come through the kernel VFS, not the
+//   filesystem directly. When bindings are editable inside Kaijutsu, the
+//   config lives at e.g. /docs/config/bindings in the CRDT store. Changes
+//   flow through the kernel and trigger a reload event — or the file is
+//   exposed via v9fs/fuse so all edits are kernel-mediated anyway.
+//   The XDG file is write-only from Kaijutsu's perspective (persistence +
+//   re-hydration on next launch). See write_default_config_if_missing().
 
 // ============================================================================
 // WRITE DEFAULT CONFIG
@@ -559,7 +482,12 @@ pub fn poll_bindings_reload(
 
 /// Write the default bindings.rhai to the user config dir on first run.
 ///
-/// Only writes if the file doesn't exist (never overwrites user customizations).
+/// This file is **managed by Kaijutsu** — it is written on first launch and
+/// will be overwritten when bindings change from inside the app. Do not edit
+/// it directly; changes will be lost. To customize bindings, use Kaijutsu's
+/// built-in editor (future: via the kernel VFS / v9fs mount).
+///
+/// Only writes if the file doesn't exist.
 pub fn write_default_config_if_missing() {
     let Some(path) = bindings_file_path() else {
         return;

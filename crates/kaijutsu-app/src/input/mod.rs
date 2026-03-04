@@ -108,8 +108,7 @@ impl Plugin for InputPlugin {
             .init_resource::<focus::FocusStack>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
-            .init_resource::<events::AnalogInput>()
-            .init_resource::<rhai_config::BindingsWatcher>();
+            .init_resource::<events::AnalogInput>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -151,11 +150,6 @@ impl Plugin for InputPlugin {
             dispatch::dispatch_input.in_set(InputPhase::Dispatch),
         );
 
-        // Bindings hot-reload: poll file mtime every 2s, update InputMap on change
-        app.add_systems(
-            Update,
-            rhai_config::poll_bindings_reload,
-        );
 
         // Handle phase: consume ActionFired for focus management + domain actions
         app.add_systems(

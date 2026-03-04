@@ -1,7 +1,10 @@
-// Kaijutsu default key bindings
+// Kaijutsu key bindings — managed by Kaijutsu, do not edit directly.
 //
-// This file is loaded from ~/.config/kaijutsu/bindings.rhai on startup
-// and hot-reloaded when changed (checked every 2 seconds).
+// This file is written by Kaijutsu and will be OVERWRITTEN when bindings
+// change from inside the app. Direct edits will be lost.
+// To customize bindings, use Kaijutsu's built-in editor.
+//
+// Loaded from ~/.config/kaijutsu/bindings.rhai on startup.
 //
 // ## API
 //
