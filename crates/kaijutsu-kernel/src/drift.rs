@@ -760,6 +760,8 @@ impl ExecutionEngine for DriftPushEngine {
                 Some(p) => p,
                 None => return Ok(ExecResult::failure(1, "LLM not configured — check llm.rhai")),
             };
+            // TODO: error explicitly when no model is configured rather than falling
+            // back to a hardcoded ID that may not exist in future provider configs.
             let model = source_model.as_deref().unwrap_or_else(|| {
                 provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
             });
@@ -958,6 +960,12 @@ impl ExecutionEngine for DriftFlushEngine {
             router.drain(Some(ctx.context_id))
         };
 
+        // TODO: validate all target contexts exist before starting injection —
+        // there is a small window where a target can be unregistered after drain()
+        // releases the write lock but before insert_drift_block() runs. Currently
+        // this just fails into the requeue/dead-letter path, which is safe but
+        // costs a round-trip. Pre-validating would skip the injection attempt
+        // entirely and route directly to dead letter.
         let count = staged.len();
         let mut injected = 0;
         let mut failed: Vec<StagedDrift> = Vec::new();

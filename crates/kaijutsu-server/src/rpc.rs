@@ -5112,6 +5112,10 @@ async fn process_llm_stream(
         Err(e) => {
             // Hydration failed — fall back to appending the user message to
             // whatever the cache currently holds (may be stale or empty).
+            // TODO: surface this as a user-visible error block instead of silently
+            // falling back. An empty cache means the model sees no history, which
+            // produces confusing responses after cache eviction or first prompt
+            // post-restart. Consider inserting a System block explaining the gap.
             log::warn!("Could not hydrate cache for {}: {}, falling back to cache + append", context_id, e);
             messages.push(LlmMessage::user(&content));
         }
@@ -5366,6 +5370,10 @@ async fn process_llm_stream(
                                 result_block_id = Some(id);
                             }
                             Err(e) => log::warn!(
+                                // TODO: surface this in the UI — the model continues with a result
+                                // the user never sees, which is confusing to debug. One option:
+                                // insert a System/Text block with an error notice so the gap is
+                                // visible in the conversation view.
                                 "Failed to insert tool result block for {} — \
                                  model will still receive result but user won't see it: {}",
                                 tool_name, e,
