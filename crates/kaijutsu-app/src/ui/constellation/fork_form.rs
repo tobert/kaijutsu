@@ -113,7 +113,6 @@ pub fn setup_fork_form_systems(app: &mut App) {
 
 fn handle_open_fork_form(
     mut commands: Commands,
-    theme: Res<Theme>,
     mut next_screen: ResMut<NextState<Screen>>,
     mut events: MessageReader<OpenForkForm>,
     existing: Query<Entity, With<ForkFormRoot>>,
@@ -194,7 +193,7 @@ fn handle_open_fork_form(
                 initial_field: FIELD_MODEL,
             },
             FormPresentation::FullViewport {
-                width: 720.0,
+                max_width: None,
                 max_height_pct: 85.0,
             },
             DespawnOnExit(Screen::ForkForm),
@@ -209,7 +208,8 @@ fn handle_open_fork_form(
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(theme.bg),
+            // No BackgroundColor — it would cover the Vello canvas and hide all
+            // Vello-rendered text. Camera2d clear_color provides the dark bg.
             ZIndex(crate::constants::ZLayer::MODAL),
         ));
 

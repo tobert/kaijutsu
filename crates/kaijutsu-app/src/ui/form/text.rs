@@ -58,6 +58,7 @@ pub fn vello_label_with<M: Component>(
 }
 
 /// Spawn a fixed-width text entity (for button labels, badges, etc.).
+#[allow(dead_code)]
 pub fn vello_text(
     parent: &mut ChildSpawnerCommands,
     font: &Handle<VelloFont>,

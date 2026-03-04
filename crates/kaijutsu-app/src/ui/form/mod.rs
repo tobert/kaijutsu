@@ -12,12 +12,14 @@
 pub mod async_slot;
 pub mod field;
 pub mod navigation;
+pub mod scene;
 pub mod schema;
 pub mod selectable;
 pub mod text;
 pub mod tree;
 
 use bevy::prelude::*;
+use bevy::ui::UiSystems;
 
 pub use async_slot::AsyncSlot;
 pub use field::ActiveFormField;
@@ -40,10 +42,22 @@ impl Plugin for FormPlugin {
                 schema::build_form,
                 selectable::sync_selectable_list_visuals,
                 tree::rebuild_tree_view,
-                field::sync_form_field_outlines,
+                field::sync_form_field_borders,
                 selectable::handle_selectable_list_click,
                 tree::handle_tree_view_click,
             ),
+        );
+        // PostUpdate systems that read ComputedNode for responsive Vello scenes
+        app.add_systems(
+            PostUpdate,
+            (
+                field::sync_form_field_borders_on_resize,
+                field::sync_row_highlights,
+                field::sync_modal_panel_scene,
+                field::sync_form_button_scenes,
+                field::sync_form_overlay_scene,
+            )
+                .after(UiSystems::Layout),
         );
     }
 }

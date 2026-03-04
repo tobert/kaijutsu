@@ -55,6 +55,7 @@ impl Plugin for ScreenPlugin {
         ));
         app.add_systems(OnExit(Screen::Constellation), (
             deactivate_constellation_camera,
+            hide_constellation_container,
         ));
 
         // ── Conversation ──

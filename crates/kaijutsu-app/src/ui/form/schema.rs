@@ -13,10 +13,10 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::{UiVelloText, VelloFont};
+use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::form::field::{ActiveFormField, FormField};
-use crate::ui::form::text::{vello_label, vello_text};
+use crate::ui::form::text::vello_label;
 use crate::ui::theme::Theme;
 
 // ============================================================================
@@ -70,9 +70,10 @@ pub struct ButtonDesc {
 #[derive(Component)]
 pub enum FormPresentation {
     /// Full-viewport overlay (centered content with max width/height).
-    FullViewport { width: f32, max_height_pct: f32 },
+    /// `max_width: None` means fill container width (responsive).
+    FullViewport { max_width: Option<f32>, max_height_pct: f32 },
     /// Modal dialog over a backdrop.
-    Modal { width: f32, min_height: f32 },
+    Modal { max_width: f32, min_height: f32 },
 }
 
 /// Marker on each field's inner container. Domain code queries this to insert content.
@@ -87,6 +88,23 @@ pub struct FormRoot;
 #[derive(Component)]
 pub struct FormLoadingText(pub u8);
 
+/// Marker on the modal dialog panel entity. The `sync_modal_panel_scene` system
+/// draws the panel background + border from `ComputedNode` dimensions.
+#[derive(Component)]
+pub struct ModalPanel;
+
+/// Marker on button entities. The `sync_form_button_scenes` system
+/// draws button backgrounds from `ComputedNode` dimensions.
+#[derive(Component)]
+pub struct FormButton {
+    pub primary: bool,
+}
+
+/// Marker on the full-viewport form overlay. Background drawn via Vello scene
+/// (not `BackgroundColor`, which would cover all Vello text underneath).
+#[derive(Component)]
+pub struct FormOverlay;
+
 // ============================================================================
 // BUILD SYSTEM
 // ============================================================================
@@ -100,6 +118,7 @@ pub fn build_form(
     query: Query<(Entity, &Form, &FormPresentation), Added<Form>>,
 ) {
     for (entity, form, presentation) in query.iter() {
+        info!("build_form: building {:?} with {} fields", entity, form.field_count);
         // Insert FormRoot + ActiveFormField on the form entity
         commands.entity(entity).insert((
             FormRoot,
@@ -108,13 +127,13 @@ pub fn build_form(
 
         match presentation {
             FormPresentation::FullViewport {
-                width,
+                max_width,
                 max_height_pct,
             } => {
-                build_full_viewport(&mut commands, entity, form, &theme, &font_handles, *width, *max_height_pct);
+                build_full_viewport(&mut commands, entity, form, &theme, &font_handles, *max_width, *max_height_pct);
             }
-            FormPresentation::Modal { width, min_height } => {
-                build_modal(&mut commands, entity, form, &theme, &font_handles, *width, *min_height);
+            FormPresentation::Modal { max_width, min_height } => {
+                build_modal(&mut commands, entity, form, &theme, &font_handles, *max_width, *min_height);
             }
         }
     }
@@ -130,20 +149,24 @@ fn build_full_viewport(
     form: &Form,
     theme: &Theme,
     font_handles: &FontHandles,
-    width: f32,
+    max_width: Option<f32>,
     max_height_pct: f32,
 ) {
     let font = font_handles.mono.clone();
     // Content wrapper (centered, constrained)
+    let mut node = Node {
+        width: Val::Percent(100.0),
+        max_height: Val::Percent(max_height_pct),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(16.0),
+        padding: UiRect::all(Val::Px(24.0)),
+        ..default()
+    };
+    if let Some(mw) = max_width {
+        node.max_width = Val::Px(mw);
+    }
     let content = commands
-        .spawn(Node {
-            width: Val::Px(width),
-            max_height: Val::Percent(max_height_pct),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(16.0),
-            padding: UiRect::all(Val::Px(24.0)),
-            ..default()
-        })
+        .spawn(node)
         .with_children(|content| {
             // Title
             vello_label(content, &font, &form.title, 18.0, theme.fg);
@@ -160,7 +183,7 @@ fn build_full_viewport(
                         })
                         .with_children(|col| {
                             for field in fields {
-                                spawn_field(col, field, form, theme, &font);
+                                spawn_field(col, field, theme, &font);
                             }
                         });
                 }
@@ -184,7 +207,7 @@ fn build_full_viewport(
                                 })
                                 .with_children(|col| {
                                     for field in left {
-                                        spawn_field(col, field, form, theme, &font);
+                                        spawn_field(col, field, theme, &font);
                                     }
                                 });
 
@@ -199,7 +222,7 @@ fn build_full_viewport(
                                 })
                                 .with_children(|col| {
                                     for field in right {
-                                        spawn_field(col, field, form, theme, &font);
+                                        spawn_field(col, field, theme, &font);
                                     }
                                 });
                         });
@@ -244,25 +267,24 @@ fn build_modal(
     form: &Form,
     theme: &Theme,
     font_handles: &FontHandles,
-    width: f32,
+    max_width: f32,
     min_height: f32,
 ) {
     let font = font_handles.mono.clone();
-    // Dialog panel
+    // Dialog panel — Vello scene draws the border/bg (sync_modal_panel_scene fills it in)
     let dialog = commands
         .spawn((
+            ModalPanel,
             Node {
-                width: Val::Px(width),
+                width: Val::Percent(100.0),
+                max_width: Val::Px(max_width),
                 min_height: Val::Px(min_height),
                 flex_direction: FlexDirection::Column,
                 padding: UiRect::all(Val::Px(20.0)),
-                border_radius: BorderRadius::all(Val::Px(8.0)),
                 row_gap: Val::Px(12.0),
                 ..default()
             },
-            BackgroundColor(theme.panel_bg),
-            BorderColor::all(theme.border),
-            Outline::new(Val::Px(1.0), Val::ZERO, theme.border),
+            UiVelloScene::default(),
         ))
         .with_children(|dialog| {
             // Title
@@ -279,7 +301,7 @@ fn build_modal(
 
             for field in all_fields {
                 if field.bordered {
-                    spawn_field(dialog, field, form, theme, &font);
+                    spawn_field(dialog, field, theme, &font);
                 } else {
                     spawn_bare_field(dialog, field, theme, &font);
                 }
@@ -303,13 +325,9 @@ fn build_modal(
 fn spawn_field(
     parent: &mut ChildSpawnerCommands,
     desc: &FieldDesc,
-    form: &Form,
     theme: &Theme,
     font: &Handle<VelloFont>,
 ) {
-    let is_active = desc.field_id == form.initial_field;
-    let outline_color = if is_active { theme.accent } else { theme.border };
-
     parent
         .spawn(Node {
             width: Val::Percent(100.0),
@@ -323,13 +341,12 @@ fn spawn_field(
                 vello_label(section, font, &desc.label, 12.0, theme.fg_dim);
             }
 
-            // Bordered container
+            // Bordered container — Vello scene draws the border
             let mut node = Node {
                 width: Val::Percent(100.0),
                 min_height: Val::Px(desc.min_height),
                 flex_direction: FlexDirection::Column,
                 padding: UiRect::all(Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
                 row_gap: Val::Px(2.0),
                 overflow: Overflow::scroll_y(),
                 ..default()
@@ -350,9 +367,7 @@ fn spawn_field(
                     },
                     FormFieldContainer(desc.field_id),
                     node,
-                    BackgroundColor(theme.panel_bg),
-                    BorderColor::all(outline_color),
-                    Outline::new(Val::Px(1.0), Val::ZERO, outline_color),
+                    UiVelloScene::default(),
                     Interaction::None,
                 ))
                 .with_children(|container| {
@@ -423,22 +438,20 @@ fn spawn_button(
     theme: &Theme,
     font: &Handle<VelloFont>,
 ) {
-    let (bg, text_color) = if desc.primary {
-        (theme.accent.with_alpha(0.3), theme.accent)
-    } else {
-        (theme.fg_dim.with_alpha(0.2), theme.fg_dim)
-    };
+    let text_color = if desc.primary { theme.accent } else { theme.fg_dim };
 
-    parent
-        .spawn((
-            Node {
-                padding: UiRect::axes(Val::Px(20.0), Val::Px(10.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                ..default()
-            },
-            BackgroundColor(bg),
-        ))
-        .with_children(|btn| {
-            vello_text(btn, font, &desc.label, 13.0, text_color, 60.0);
-        });
+    // Scene is filled in by sync_form_button_scenes (PostUpdate, after layout)
+    parent.spawn((
+        FormButton { primary: desc.primary },
+        Node {
+            padding: UiRect::axes(Val::Px(20.0), Val::Px(10.0)),
+            ..default()
+        },
+        UiVelloText {
+            value: desc.label.clone(),
+            style: vello_style(font, text_color, 13.0),
+            ..default()
+        },
+        UiVelloScene::default(),
+    ));
 }

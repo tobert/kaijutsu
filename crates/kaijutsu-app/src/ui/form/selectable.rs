@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::UiVelloText;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
 
@@ -140,10 +140,6 @@ impl SelectableList {
 #[derive(Component)]
 pub struct SelectableListRow(pub usize);
 
-/// Marker on the text entity within a row.
-#[derive(Component)]
-struct SelectableListRowText;
-
 // ============================================================================
 // SYNC SYSTEM
 // ============================================================================
@@ -151,6 +147,7 @@ struct SelectableListRowText;
 /// Rebuilds `SelectableList` visuals when the component changes and `dirty` is set.
 ///
 /// Full despawn+rebuild approach. Lists are small (<100 items) so this is fine.
+/// Rows are flat entities with `UiVelloText` + `UiVelloScene` (no child text entities).
 pub fn sync_selectable_list_visuals(
     mut commands: Commands,
     theme: Res<Theme>,
@@ -194,26 +191,16 @@ pub fn sync_selectable_list_visuals(
                             }),
                             ..default()
                         },
-                        BackgroundColor(Color::NONE),
+                        UiVelloText {
+                            value: item.label.clone(),
+                            style: vello_style(font, theme.fg_dim, header_font_size),
+                            ..default()
+                        },
                     ))
-                    .with_children(|r| {
-                        r.spawn((
-                            SelectableListRowText,
-                            UiVelloText {
-                                value: item.label.clone(),
-                                style: vello_style(font, theme.fg_dim, header_font_size),
-                                ..default()
-                            },
-                            Node {
-                                width: Val::Percent(100.0),
-                                ..default()
-                            },
-                        ));
-                    })
                     .id();
                 commands.entity(list_entity).add_child(row);
             } else {
-                // Normal item row
+                // Normal item row — text + scene highlight on same entity
                 let indicator = if is_selected { "\u{25B8} " } else { "  " };
                 let text = format!("{}{}{}", indicator, item.label, item.suffix);
                 let color = if is_selected {
@@ -223,12 +210,8 @@ pub fn sync_selectable_list_visuals(
                 } else {
                     theme.fg_dim
                 };
-                let bg = if is_selected {
-                    theme.accent.with_alpha(list.selected_bg_alpha)
-                } else {
-                    Color::NONE
-                };
 
+                // Scene filled in by sync_row_highlights (PostUpdate, after layout)
                 let row = commands
                     .spawn((
                         SelectableListRow(i),
@@ -238,23 +221,14 @@ pub fn sync_selectable_list_visuals(
                             padding: UiRect::left(Val::Px(12.0)),
                             ..default()
                         },
-                        BackgroundColor(bg),
-                        Interaction::None, // Touch-ready
+                        UiVelloText {
+                            value: text,
+                            style: vello_style(font, color, font_size),
+                            ..default()
+                        },
+                        UiVelloScene::default(),
+                        Interaction::None,
                     ))
-                    .with_children(|r| {
-                        r.spawn((
-                            SelectableListRowText,
-                            UiVelloText {
-                                value: text,
-                                style: vello_style(font, color, font_size),
-                                ..default()
-                            },
-                            Node {
-                                width: Val::Percent(100.0),
-                                ..default()
-                            },
-                        ));
-                    })
                     .id();
                 commands.entity(list_entity).add_child(row);
             }

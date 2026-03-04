@@ -119,7 +119,7 @@ fn handle_open_model_picker(
                 initial_field: FIELD_MODELS,
             },
             FormPresentation::Modal {
-                width: 300.0,
+                max_width: 300.0,
                 min_height: 120.0,
             },
             Node {

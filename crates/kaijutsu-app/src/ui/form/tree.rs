@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::UiVelloText;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
 
@@ -190,6 +190,7 @@ pub struct TreeViewRow(pub usize);
 /// Rebuilds `TreeView` visuals when the component changes and `dirty` is set.
 ///
 /// Full despawn+rebuild approach (tree is small, <100 rows).
+/// Rows are flat entities with `UiVelloText` + `UiVelloScene` (no child text entities).
 pub fn rebuild_tree_view(
     mut commands: Commands,
     theme: Res<Theme>,
@@ -225,12 +226,8 @@ pub fn rebuild_tree_view(
                 cat.total_count()
             );
             let color = if is_cursor { theme.accent } else { theme.fg };
-            let bg = if is_cursor {
-                theme.accent.with_alpha(0.1)
-            } else {
-                Color::NONE
-            };
 
+            // Scene filled in by sync_row_highlights (PostUpdate, after layout)
             let row = commands
                 .spawn((
                     TreeViewRow(flat_idx),
@@ -239,22 +236,14 @@ pub fn rebuild_tree_view(
                         height: Val::Px(row_height),
                         ..default()
                     },
-                    BackgroundColor(bg),
-                    Interaction::None, // Touch-ready
+                    UiVelloText {
+                        value: label.clone(),
+                        style: vello_style(font, color, font_size),
+                        ..default()
+                    },
+                    UiVelloScene::default(),
+                    Interaction::None,
                 ))
-                .with_children(|r| {
-                    r.spawn((
-                        UiVelloText {
-                            value: label.clone(),
-                            style: vello_style(font, color, font_size),
-                            ..default()
-                        },
-                        Node {
-                            width: Val::Percent(100.0),
-                            ..default()
-                        },
-                    ));
-                })
                 .id();
             commands.entity(tree_entity).add_child(row);
             flat_idx += 1;
@@ -271,11 +260,6 @@ pub fn rebuild_tree_view(
                     } else {
                         theme.fg_dim
                     };
-                    let bg = if is_cursor {
-                        theme.accent.with_alpha(0.1)
-                    } else {
-                        Color::NONE
-                    };
 
                     let row = commands
                         .spawn((
@@ -286,22 +270,14 @@ pub fn rebuild_tree_view(
                                 padding: UiRect::left(Val::Px(8.0)),
                                 ..default()
                             },
-                            BackgroundColor(bg),
-                            Interaction::None, // Touch-ready
+                            UiVelloText {
+                                value: label.clone(),
+                                style: vello_style(font, color, font_size),
+                                ..default()
+                            },
+                            UiVelloScene::default(),
+                            Interaction::None,
                         ))
-                        .with_children(|r| {
-                            r.spawn((
-                                UiVelloText {
-                                    value: label.clone(),
-                                    style: vello_style(font, color, font_size),
-                                    ..default()
-                                },
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    ..default()
-                                },
-                            ));
-                        })
                         .id();
                     commands.entity(tree_entity).add_child(row);
                     flat_idx += 1;
