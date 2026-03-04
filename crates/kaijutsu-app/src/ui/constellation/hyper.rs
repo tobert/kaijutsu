@@ -1,4 +1,6 @@
 //! Hyperbolic geometry math library for Poincaré ball constellation layout.
+// Math library: not all functions are called by current rendering code.
+#![allow(dead_code)]
 //!
 //! All internal computation uses f64 for numerical stability. The f64→f32
 //! boundary is crossed only at `HyperPoint::to_ball_f32()` for rendering.

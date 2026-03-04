@@ -12,7 +12,6 @@
 //! - `viewport.rs` — ViewportNode setup, 3D camera, render target
 //! - `render3d.rs` — Node/edge spawning, visual updates in 3D scene
 //! - `navigation.rs` — Focus animation via geodesic lerp, camera orbit
-//! - `render.rs` — Old 2D rendering (disabled, kept for reference)
 //!
 //! ## Activation
 //!
@@ -32,9 +31,7 @@
 
 mod create_dialog;
 pub mod fork_form;
-#[allow(dead_code)] // Phase 2+: layout/navigation
 pub mod hyper;
-#[allow(dead_code)] // Phase 2: layout engine used by viewport
 pub mod layout;
 mod legend;
 pub mod model_picker;

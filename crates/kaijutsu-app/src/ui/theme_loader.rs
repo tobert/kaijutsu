@@ -381,33 +381,6 @@ fn apply_theme_from_scope(scope: &Scope, theme: &mut Theme) {
     if let Some(v) = get_float(&scope, "constellation_ring_spacing") {
         theme.constellation_ring_spacing = v;
     }
-    if let Some(v) = get_float(&scope, "constellation_node_size") {
-        theme.constellation_node_size = v;
-    }
-    if let Some(v) = get_float(&scope, "constellation_node_size_focused") {
-        theme.constellation_node_size_focused = v;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_idle") {
-        theme.constellation_node_glow_idle = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_active") {
-        theme.constellation_node_glow_active = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_streaming") {
-        theme.constellation_node_glow_streaming = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "constellation_node_glow_error") {
-        theme.constellation_node_glow_error = c;
-    }
-    if let Some(v) = get_float(&scope, "constellation_connection_glow") {
-        theme.constellation_connection_glow = v;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "constellation_connection_color") {
-        theme.constellation_connection_color = c;
-    }
-    if let Some(v) = get_int(&scope, "constellation_particle_budget") {
-        theme.constellation_particle_budget = v;
-    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block border configuration
@@ -512,11 +485,6 @@ fn get_vec4(scope: &Scope, name: &str) -> Option<Vec4> {
 /// Extract a float from scope.
 fn get_float(scope: &Scope, name: &str) -> Option<f32> {
     scope.get_value::<f64>(name).map(|v| v as f32)
-}
-
-/// Extract an integer from scope (as u32).
-fn get_int(scope: &Scope, name: &str) -> Option<u32> {
-    scope.get_value::<i64>(name).map(|v| v as u32)
 }
 
 /// Extract a bool from scope.

@@ -253,28 +253,10 @@ pub struct Theme {
     // Constellation Configuration
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Base radius for radial tree root ring (pixels)
+    /// Base radius for radial tree root ring (pixels, 2D fallback layout)
     pub constellation_base_radius: f32,
-    /// Spacing between concentric rings in radial tree (pixels)
+    /// Spacing between concentric rings in radial tree (pixels, 2D fallback layout)
     pub constellation_ring_spacing: f32,
-    /// Node orb size when idle (pixels)
-    pub constellation_node_size: f32,
-    /// Node orb size when focused (pixels)
-    pub constellation_node_size_focused: f32,
-    /// Node glow color for idle state
-    pub constellation_node_glow_idle: Color,
-    /// Node glow color for active state
-    pub constellation_node_glow_active: Color,
-    /// Node glow color for streaming state
-    pub constellation_node_glow_streaming: Color,
-    /// Node glow color for error state
-    pub constellation_node_glow_error: Color,
-    /// Connection line glow intensity (0.0-1.0)
-    pub constellation_connection_glow: f32,
-    /// Connection line color
-    pub constellation_connection_color: Color,
-    /// Max particles per context for streaming effects
-    pub constellation_particle_budget: u32,
     /// Agent color: default (dim cyan) — used when provider is unknown
     pub agent_color_default: Color,
     /// Agent color: human user (electric cyan)
@@ -296,9 +278,6 @@ pub struct Theme {
     pub constellation_base_leaf_radius: f64,
     /// Packing factor for hemisphere area sums (gap compensation)
     pub constellation_packing_factor: f64,
-    /// Camera distance from the Poincaré ball center
-    #[allow(dead_code)] // Phase 4: focus navigation
-    pub constellation_camera_distance: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
@@ -482,18 +461,10 @@ impl Default for Theme {
             // Font effects
             font_rainbow: true,
 
-            // Constellation
+            // Constellation (2D fallback layout)
             constellation_base_radius: 120.0,
             constellation_ring_spacing: 160.0,
-            constellation_node_size: 160.0,
-            constellation_node_size_focused: 200.0,
-            constellation_node_glow_idle: Color::srgba(0.337, 0.373, 0.537, 0.3), // #565f89
-            constellation_node_glow_active: Color::srgba(0.478, 0.635, 0.969, 0.6), // #7aa2f7
-            constellation_node_glow_streaming: Color::srgba(0.620, 0.808, 0.416, 0.8), // #9ece6a
-            constellation_node_glow_error: Color::srgba(0.969, 0.463, 0.557, 0.7), // #f7768e
-            constellation_connection_glow: 0.3,
-            constellation_connection_color: Color::srgba(0.231, 0.259, 0.380, 0.5), // #3b4261
-            constellation_particle_budget: 500,
+
             agent_color_default: Color::srgba(0.49, 0.85, 0.82, 0.8),   // #7dd9d1 dim cyan
             agent_color_human: Color::srgba(0.49, 0.98, 1.00, 0.9),     // #7df9ff electric cyan
             agent_color_claude: Color::srgba(1.00, 0.43, 0.78, 0.9),    // #ff6ec7 hot pink
@@ -504,7 +475,6 @@ impl Default for Theme {
             // Constellation 3D
             constellation_base_leaf_radius: 0.3,
             constellation_packing_factor: 1.4,
-            constellation_camera_distance: 3.0,
 
             // Block borders
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber

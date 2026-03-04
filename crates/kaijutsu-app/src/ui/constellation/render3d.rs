@@ -19,7 +19,7 @@ use super::{
     Constellation, ConstellationContainer,
     hyper::{HyperPoint, LorentzTransform},
     layout::H3Layout,
-    viewport::{ViewportState, ConstellationCamera3d, TestSphere},
+    viewport::{ViewportState, ConstellationCamera3d},
 };
 use crate::ui::screen::Screen;
 use bevy_vello::prelude::UiVelloText;
@@ -80,7 +80,6 @@ pub fn setup_render3d_systems(app: &mut App) {
                 update_3d_node_visuals,
                 rebuild_3d_edges,
                 update_node_labels,
-                cleanup_test_spheres,
             )
                 .chain(),
         );
@@ -445,15 +444,25 @@ fn update_node_labels(
                 continue;
             }
 
-            // Get label text: prefer human label, fall back to short hex
+            // Get label text: prefer model short name, fall back to first 8 hex chars of UUID
             let label_text = constellation
                 .node_by_id(&node_3d.context_id)
-                .and_then(|n| n.model.as_deref().or(Some(&n.context_id)))
-                .map(|s| {
-                    if s.len() > 16 {
-                        format!("{}...", &s[..13])
+                .map(|n| {
+                    if let Some(ref model) = n.model {
+                        // Strip provider prefix (e.g. "claude-sonnet-4-6" not "anthropic/claude-...")
+                        let short = model.rsplit('/').next().unwrap_or(model.as_str());
+                        if short.len() > 18 {
+                            format!("{}…", &short[..17])
+                        } else {
+                            short.to_string()
+                        }
                     } else {
-                        s.to_string()
+                        // Short UUID prefix — first 8 hex chars (before the first dash)
+                        n.context_id
+                            .split('-')
+                            .next()
+                            .unwrap_or(&n.context_id[..8.min(n.context_id.len())])
+                            .to_string()
                     }
                 })
                 .unwrap_or_default();
@@ -513,17 +522,3 @@ fn update_node_labels(
     }
 }
 
-/// Remove Phase 1.5 test spheres once real nodes are being rendered.
-fn cleanup_test_spheres(
-    mut commands: Commands,
-    scene: Res<ConstellationScene>,
-    test_spheres: Query<Entity, With<TestSphere>>,
-) {
-    if scene.layout.nodes.is_empty() {
-        return; // Keep test spheres until we have real data
-    }
-
-    for entity in test_spheres.iter() {
-        commands.entity(entity).despawn();
-    }
-}

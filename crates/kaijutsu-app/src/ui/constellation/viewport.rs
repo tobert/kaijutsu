@@ -21,10 +21,6 @@ use super::ConstellationContainer;
 #[derive(Component)]
 pub struct ConstellationCamera3d;
 
-/// Marker for test spheres spawned during the viewport prototype phase.
-#[derive(Component)]
-pub struct TestSphere;
-
 /// Marker for the translucent ball boundary sphere.
 #[derive(Component)]
 pub struct BallBoundary;
@@ -95,61 +91,6 @@ fn setup_constellation_3d(
             RenderLayers::layer(CONSTELLATION_LAYER),
         ))
         .id();
-
-    // Spawn test spheres at known positions on layer 1
-    let sphere_mesh = meshes.add(Sphere::new(0.08));
-
-    // Red at origin
-    commands.spawn((
-        TestSphere,
-        Mesh3d(sphere_mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.2, 0.2),
-            emissive: LinearRgba::new(2.0, 0.4, 0.4, 1.0),
-            ..default()
-        })),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        RenderLayers::layer(CONSTELLATION_LAYER),
-    ));
-
-    // Green at (0.3, 0.3, 0.0)
-    commands.spawn((
-        TestSphere,
-        Mesh3d(sphere_mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.2, 1.0, 0.2),
-            emissive: LinearRgba::new(0.4, 2.0, 0.4, 1.0),
-            ..default()
-        })),
-        Transform::from_xyz(0.3, 0.3, 0.0),
-        RenderLayers::layer(CONSTELLATION_LAYER),
-    ));
-
-    // Blue at (-0.5, 0.0, 0.2)
-    commands.spawn((
-        TestSphere,
-        Mesh3d(sphere_mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.2, 0.2, 1.0),
-            emissive: LinearRgba::new(0.4, 0.4, 2.0, 1.0),
-            ..default()
-        })),
-        Transform::from_xyz(-0.5, 0.0, 0.2),
-        RenderLayers::layer(CONSTELLATION_LAYER),
-    ));
-
-    // Cyan at (0.0, -0.4, -0.3)
-    commands.spawn((
-        TestSphere,
-        Mesh3d(sphere_mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.2, 0.8, 0.8),
-            emissive: LinearRgba::new(0.4, 1.6, 1.6, 1.0),
-            ..default()
-        })),
-        Transform::from_xyz(0.0, -0.4, -0.3),
-        RenderLayers::layer(CONSTELLATION_LAYER),
-    ));
 
     // Translucent ball boundary sphere (r=0.95) — IGNORE picking so clicks
     // pass through to the node spheres inside
