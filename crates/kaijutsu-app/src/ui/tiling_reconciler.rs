@@ -221,7 +221,7 @@ fn spawn_content_subtree(
             let border_color = if is_focused {
                 theme.accent
             } else {
-                Color::NONE
+                theme.border
             };
 
             let mut entity_cmd = commands.spawn((
@@ -303,7 +303,7 @@ pub fn update_pane_focus(
         *border = if is_focused && has_multiple {
             BorderColor::all(theme.accent)
         } else {
-            BorderColor::all(Color::NONE)
+            BorderColor::all(theme.border)
         };
     }
 }
