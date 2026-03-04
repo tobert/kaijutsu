@@ -182,6 +182,7 @@ fn setup_ui(
                     flex_grow: 1.0,
                     height: Val::Percent(100.0),
                     flex_direction: FlexDirection::Column,
+                    overflow: Overflow::clip(),  // Hard boundary for all children
                     ..default()
                 },
                 ZIndex(constants::ZLayer::CONTENT),
@@ -192,9 +193,8 @@ fn setup_ui(
                 content.spawn((
                     ui::state::ConversationRoot,
                     Node {
-                        position_type: PositionType::Absolute,
                         width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
+                        flex_grow: 1.0,  // Participate in flex layout properly
                         flex_direction: FlexDirection::Column,
                         ..default()
                     },

@@ -321,7 +321,7 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             UiVelloScene::default(),
-            ZIndex(crate::constants::ZLayer::HUD),
+            GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
     commands.entity(root).insert_children(0, &[north]);
@@ -338,7 +338,7 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             UiVelloScene::default(),
-            ZIndex(crate::constants::ZLayer::HUD),
+            GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
     commands.entity(root).add_child(south);
