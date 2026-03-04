@@ -97,15 +97,22 @@ pub enum Action {
     // ========================================================================
     /// Backtick — toggle constellation overlay
     ToggleConstellation,
-    /// hjkl spatial navigation between constellation nodes
+    /// Spatial navigation between constellation nodes.
+    /// Keyboard hjkl bindings removed — use gamepad DPad (Phase N: gamepad workflow).
+    // Phase N: gamepad workflow — DPad constellation nav
     SpatialNav(Vec2),
-    /// Shift+hjkl — pan the constellation camera
+    /// Pan the constellation camera.
+    /// Keyboard Shift+hjkl bindings removed — gamepad left stick (Phase N: gamepad workflow).
+    // Phase N: gamepad workflow — analog stick pan/orbit
     Pan(Vec2),
-    /// + or = — zoom in
+    /// Zoom in — gamepad only for now (Phase N: gamepad workflow).
+    // Phase N: gamepad workflow
     ZoomIn,
-    /// - — zoom out
+    /// Zoom out — gamepad only for now (Phase N: gamepad workflow).
+    // Phase N: gamepad workflow
     ZoomOut,
-    /// 0 — reset zoom to default
+    /// Reset zoom — gamepad only for now (Phase N: gamepad workflow).
+    // Phase N: gamepad workflow
     ZoomReset,
     /// f in constellation — fork focused context
     ConstellationFork,
@@ -113,10 +120,6 @@ pub enum Action {
     ConstellationCreate,
     /// m in constellation — open model picker
     ConstellationModelPicker,
-    /// g→t — next context
-    NextContext,
-    /// g→T — previous context
-    PrevContext,
     /// Ctrl+^ — toggle alternate context
     ToggleAlternate,
 
@@ -159,20 +162,6 @@ pub enum Action {
     Redo,
     /// Shift+Enter — insert newline (without submitting)
     InsertNewline,
-
-    // ========================================================================
-    // Timeline (Navigation context)
-    // ========================================================================
-    /// [ — step back in history
-    TimelineStepBack,
-    /// ] — step forward in history
-    TimelineStepForward,
-    /// \ — jump to live/now
-    TimelineJumpToLive,
-    /// Ctrl+F (when historical) — fork from current timeline position
-    TimelineFork,
-    /// t — toggle timeline visibility
-    TimelineToggle,
 
     // ========================================================================
     // App (Global)

@@ -90,18 +90,12 @@ pub fn handle_focus_compose(
 /// Escape precedence:
 /// 1. FocusArea::Dialog → ignored (handled by dialog systems via FocusStack)
 /// 2. Screen::Constellation → go to Conversation
-/// 3. FocusArea::EditingBlock → clean up markers, FocusArea::Conversation
-/// 4. FocusArea::Compose → FocusArea::Conversation
+/// 3. FocusArea::Compose → FocusArea::Conversation
 pub fn handle_unfocus(
-    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
-    editing_cells: Query<(Entity, &BlockEditCursor), With<EditingBlockCell>>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     use crate::ui::screen::Screen;
     for ActionFired(action) in actions.read() {
@@ -121,108 +115,27 @@ pub fn handle_unfocus(
         }
 
         // 3. Normal focus transitions
-        match focus.as_ref() {
-            FocusArea::EditingBlock => {
-                // Extract ops and push to server before cleanup
-                if let Some(main_ent) = entities.main_cell {
-                    if let Ok(editor) = main_cells.get(main_ent) {
-                        for (_, cursor) in editing_cells.iter() {
-                            if let Some(ref frontiers) = cursor.edit_frontier {
-                                // Build SyncPayload (native BlockStore format — matches server).
-                                let payload = editor.store.ops_since(frontiers);
-                                if !payload.is_empty() {
-                                    if let Some(ref actor) = actor {
-                                        match postcard::to_stdvec(&payload) {
-                                            Ok(ops_bytes) => {
-                                                let ctx_id = editor.store.context_id();
-                                                let handle = actor.handle.clone();
-                                                info!("Pushing {} bytes of edit ops for {}", ops_bytes.len(), ctx_id);
-                                                bevy::tasks::IoTaskPool::get()
-                                                    .spawn(async move {
-                                                        match handle.push_ops(ctx_id, &ops_bytes).await {
-                                                            Ok(v) => log::info!("Edit ops pushed, ack version: {v}"),
-                                                            Err(e) => log::error!("Failed to push edit ops: {e}"),
-                                                        }
-                                                    })
-                                                    .detach();
-                                            }
-                                            Err(e) => warn!("Failed to serialize edit ops: {e}"),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ECS Cleanup
-                for (entity, _) in editing_cells.iter() {
-                    commands.entity(entity).remove::<EditingBlockCell>();
-                    commands.entity(entity).remove::<BlockEditCursor>();
-                }
-                *focus = FocusArea::Conversation;
-            }
-            FocusArea::Compose => {
-                *focus = FocusArea::Conversation;
-            }
-            _ => {}
+        if matches!(focus.as_ref(), FocusArea::Compose) {
+            *focus = FocusArea::Conversation;
         }
     }
 }
 
-/// Handle Activate action in Navigation context (Enter on focused block → edit).
+/// Handle Activate action in Navigation context (Enter on focused block).
+///
+/// Currently a placeholder — inline block editing was removed with EditingBlock focus mode.
+/// Future: could open block actions menu or expand block to reader.
 pub fn handle_activate_navigation(
-    mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
     focus_target: Res<FocusTarget>,
-    entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
-    containers: Query<&BlockCellContainer>,
 ) {
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Activate) {
             continue;
         }
 
-        let Some(ref block_id) = focus_target.block_id else {
-            continue;
-        };
-
-        let Some(main_ent) = entities.main_cell else {
-            continue;
-        };
-        let Ok(editor) = main_cells.get(main_ent) else {
-            continue;
-        };
-        let Ok(container) = containers.get(main_ent) else {
-            continue;
-        };
-
-        // Only allow editing User Text blocks
-        let Some(block) = editor.store.get_block_snapshot(block_id) else {
-            continue;
-        };
-
-        if block.role != kaijutsu_crdt::Role::User || block.kind != kaijutsu_crdt::BlockKind::Text {
-            warn!("Cannot edit block {:?}: only User Text blocks are editable", block_id);
-            continue;
-        }
-
-        if let Some(entity) = container.get_entity(block_id) {
-            info!("Entering edit mode for block {:?}", block_id);
-
-            let edit_frontier = editor.store.frontier();
-            commands.entity(entity).insert((
-                EditingBlockCell,
-                BlockEditCursor {
-                    offset: block.content.len(),
-                    selection_anchor: None,
-                    edit_frontier: Some(edit_frontier),
-                },
-            ));
-
-            *focus = FocusArea::EditingBlock;
+        if focus_target.block_id.is_some() {
+            debug!("Activate on focused block (no-op, block editing removed)");
         }
     }
 }
@@ -616,9 +529,7 @@ pub fn handle_tiling(
 // CONSTELLATION NAVIGATION
 // ============================================================================
 
-use crate::cell::{
-    BlockEditCursor, EditingBlockCell, PromptSubmitted,
-};
+use crate::cell::PromptSubmitted;
 use crate::ui::constellation::{
     CameraOrbit, Constellation, ConstellationCamera, ConstellationScene,
     NewContextConfig, OpenForkForm, create_or_fork_context,
@@ -707,28 +618,6 @@ pub fn handle_constellation_nav(
                     }
                 }
             }
-            Action::NextContext => {
-                if let Some(id) = constellation.next_context_id().map(|s| s.to_string()) {
-                    constellation.focus(&id);
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&id) {
-                        switch_writer.write(crate::cell::ContextSwitchRequested {
-                            context_id: ctx_id,
-                        });
-                        next_screen.set(crate::ui::screen::Screen::Conversation);
-                    }
-                }
-            }
-            Action::PrevContext => {
-                if let Some(id) = constellation.prev_context_id().map(|s| s.to_string()) {
-                    constellation.focus(&id);
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&id) {
-                        switch_writer.write(crate::cell::ContextSwitchRequested {
-                            context_id: ctx_id,
-                        });
-                        next_screen.set(crate::ui::screen::Screen::Conversation);
-                    }
-                }
-            }
             Action::ToggleAlternate => {
                 if let Some(alt_id) = constellation.alternate_id.clone() {
                     constellation.focus(&alt_id);
@@ -773,53 +662,6 @@ pub fn handle_constellation_nav(
                         context_name: focus_id.clone(),
                     });
                 }
-            }
-            _ => {}
-        }
-    }
-}
-
-// ============================================================================
-// TIMELINE NAVIGATION
-// ============================================================================
-
-use crate::ui::timeline::{ForkRequest, TimelineState};
-
-/// Handle timeline navigation actions.
-///
-/// Guarded to Conversation focus — timeline keys are Navigation-only.
-pub fn handle_timeline(
-    mut actions: MessageReader<ActionFired>,
-    mut timeline: ResMut<TimelineState>,
-    mut fork_writer: MessageWriter<ForkRequest>,
-) {
-    for ActionFired(action) in actions.read() {
-        match action {
-            Action::TimelineStepBack => {
-                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
-                let new_pos = (timeline.target_position - step).max(0.0);
-                timeline.begin_scrub(new_pos);
-                timeline.end_scrub();
-            }
-            Action::TimelineStepForward => {
-                let step = 1.0 / (timeline.snapshot_count.max(1) as f32);
-                let new_pos = (timeline.target_position + step).min(1.0);
-                timeline.begin_scrub(new_pos);
-                timeline.end_scrub();
-            }
-            Action::TimelineJumpToLive => {
-                timeline.jump_to_live();
-            }
-            Action::TimelineFork => {
-                if timeline.is_historical() {
-                    fork_writer.write(ForkRequest {
-                        from_version: timeline.viewing_version,
-                        name: None,
-                    });
-                }
-            }
-            Action::TimelineToggle => {
-                timeline.expanded = !timeline.expanded;
             }
             _ => {}
         }
@@ -1099,276 +941,23 @@ pub fn handle_compose_input(
     }
 }
 
-/// Handle text input in inline block editing mode.
-///
-/// Consumes TextInputReceived for character insertion and ActionFired for
-/// editing actions. Operates on CRDT via BlockStore.
-pub fn handle_block_edit_input(
-    mut text_events: MessageReader<super::events::TextInputReceived>,
-    mut actions: MessageReader<ActionFired>,
-    entities: Res<EditorEntities>,
-    mut main_cells: Query<&mut CellEditor, With<MainCell>>,
-    mut editing_cells: Query<(&BlockCell, &mut BlockEditCursor), With<EditingBlockCell>>,
-    mut clipboard: Option<ResMut<super::SystemClipboard>>,
-) {
-    let Ok((block_cell, mut cursor)) = editing_cells.single_mut() else {
-        return;
-    };
-    let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-    let Ok(mut editor) = main_cells.get_mut(main_ent) else {
-        return;
-    };
-
-    // Handle text insertion — clears selection, replaces if active
-    for super::events::TextInputReceived(text) in text_events.read() {
-        // Delete selection before inserting
-        if let Some(anchor) = cursor.selection_anchor {
-            let start = anchor.min(cursor.offset);
-            let end = anchor.max(cursor.offset);
-            let _ = editor.store.edit_text(&block_cell.block_id, start, "", end - start);
-            cursor.offset = start;
-            cursor.selection_anchor = None;
-        }
-        for c in text.chars() {
-            if c.is_control() {
-                continue;
-            }
-            let s = c.to_string();
-            if editor
-                .store
-                .edit_text(&block_cell.block_id, cursor.offset, &s, 0)
-                .is_ok()
-            {
-                cursor.offset += s.len();
-            }
-        }
-    }
-
-    // Handle editing actions
-    for ActionFired(action) in actions.read() {
-        match action {
-            Action::InsertNewline => {
-                // Delete selection first if active
-                if let Some(anchor) = cursor.selection_anchor {
-                    let start = anchor.min(cursor.offset);
-                    let end = anchor.max(cursor.offset);
-                    let _ = editor.store.edit_text(&block_cell.block_id, start, "", end - start);
-                    cursor.offset = start;
-                    cursor.selection_anchor = None;
-                }
-                if editor
-                    .store
-                    .edit_text(&block_cell.block_id, cursor.offset, "\n", 0)
-                    .is_ok()
-                {
-                    cursor.offset += 1;
-                }
-            }
-            Action::Backspace => {
-                // Delete selection if active
-                if let Some(anchor) = cursor.selection_anchor {
-                    let start = anchor.min(cursor.offset);
-                    let end = anchor.max(cursor.offset);
-                    if editor.store.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
-                        cursor.offset = start;
-                    }
-                    cursor.selection_anchor = None;
-                } else if cursor.offset > 0
-                    && let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id)
-                {
-                    let text = &block.content;
-                    let mut new_offset = cursor.offset.saturating_sub(1);
-                    while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                        new_offset -= 1;
-                    }
-                    let delete_len = cursor.offset - new_offset;
-                    if editor
-                        .store
-                        .edit_text(&block_cell.block_id, new_offset, "", delete_len)
-                        .is_ok()
-                    {
-                        cursor.offset = new_offset;
-                    }
-                }
-            }
-            Action::Delete => {
-                // Delete selection if active
-                if let Some(anchor) = cursor.selection_anchor {
-                    let start = anchor.min(cursor.offset);
-                    let end = anchor.max(cursor.offset);
-                    if editor.store.edit_text(&block_cell.block_id, start, "", end - start).is_ok() {
-                        cursor.offset = start;
-                    }
-                    cursor.selection_anchor = None;
-                } else if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    if cursor.offset < text.len() {
-                        let mut end = cursor.offset + 1;
-                        while end < text.len() && !text.is_char_boundary(end) {
-                            end += 1;
-                        }
-                        let delete_len = end - cursor.offset;
-                        let _ = editor
-                            .store
-                            .edit_text(&block_cell.block_id, cursor.offset, "", delete_len);
-                    }
-                }
-            }
-            Action::CursorLeft => {
-                cursor.selection_anchor = None;
-                if cursor.offset > 0
-                    && let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id)
-                {
-                    let text = &block.content;
-                    let mut new_offset = cursor.offset - 1;
-                    while new_offset > 0 && !text.is_char_boundary(new_offset) {
-                        new_offset -= 1;
-                    }
-                    cursor.offset = new_offset;
-                }
-            }
-            Action::CursorRight => {
-                cursor.selection_anchor = None;
-                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    if cursor.offset < text.len() {
-                        let mut new_offset = cursor.offset + 1;
-                        while new_offset < text.len() && !text.is_char_boundary(new_offset) {
-                            new_offset += 1;
-                        }
-                        cursor.offset = new_offset;
-                    }
-                }
-            }
-            Action::CursorHome => {
-                cursor.selection_anchor = None;
-                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    let before_cursor = &text[..cursor.offset];
-                    cursor.offset = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                }
-            }
-            Action::CursorEnd => {
-                cursor.selection_anchor = None;
-                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                    let text = &block.content;
-                    let after_cursor = &text[cursor.offset..];
-                    cursor.offset += after_cursor.find('\n').unwrap_or(after_cursor.len());
-                }
-            }
-            Action::SelectAll => {
-                if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                    if !block.content.is_empty() {
-                        cursor.selection_anchor = Some(0);
-                        cursor.offset = block.content.len();
-                    }
-                }
-            }
-            Action::Copy => {
-                if let Some(ref mut clip) = clipboard {
-                    if let Some(anchor) = cursor.selection_anchor {
-                        if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                            let start = anchor.min(cursor.offset);
-                            let end = anchor.max(cursor.offset);
-                            if end <= block.content.len() {
-                                let selected = &block.content[start..end];
-                                if let Err(e) = clip.0.set_text(selected) {
-                                    warn!("Copy failed: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Action::Cut => {
-                if let Some(ref mut clip) = clipboard {
-                    if let Some(anchor) = cursor.selection_anchor {
-                        if let Some(block) = editor.store.get_block_snapshot(&block_cell.block_id) {
-                            let start = anchor.min(cursor.offset);
-                            let end = anchor.max(cursor.offset);
-                            if end <= block.content.len() {
-                                let selected = block.content[start..end].to_string();
-                                if let Err(e) = clip.0.set_text(&selected) {
-                                    warn!("Cut failed: {e}");
-                                } else {
-                                    let _ = editor.store.edit_text(
-                                        &block_cell.block_id, start, "", end - start,
-                                    );
-                                    cursor.offset = start;
-                                    cursor.selection_anchor = None;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Action::Paste => {
-                if let Some(ref mut clip) = clipboard {
-                    match clip.0.get_text() {
-                        Ok(pasted) => {
-                            // Delete selection first if active
-                            if let Some(anchor) = cursor.selection_anchor {
-                                let start = anchor.min(cursor.offset);
-                                let end = anchor.max(cursor.offset);
-                                let _ = editor.store.edit_text(
-                                    &block_cell.block_id, start, "", end - start,
-                                );
-                                cursor.offset = start;
-                                cursor.selection_anchor = None;
-                            }
-                            if editor
-                                .store
-                                .edit_text(&block_cell.block_id, cursor.offset, &pasted, 0)
-                                .is_ok()
-                            {
-                                cursor.offset += pasted.len();
-                            }
-                        }
-                        Err(e) => warn!("Paste failed: {e}"),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
+// handle_block_edit_input removed with FocusArea::EditingBlock.
+// To restore inline block editing: add EditingBlock to FocusArea enum,
+// re-add the system body, and wire it back in mod.rs.
 
 // ============================================================================
 // DEFENSIVE CLEANUP
 // ============================================================================
 
-/// Safety net: remove EditingBlockCell/BlockEditCursor if FocusArea is not EditingBlock.
-/// 
-/// This prevents stale markers from accumulating due to logic bugs in transition handlers.
-/// Runs at the end of InputPhase::Handle so it catches anything the handlers missed.
-pub fn cleanup_stale_editing_markers(
-    mut commands: Commands,
-    focus_area: Res<FocusArea>,
-    editing_cells: Query<Entity, With<EditingBlockCell>>,
-) {
-    if matches!(*focus_area, FocusArea::EditingBlock) {
-        return; // Markers are valid
-    }
-    for entity in editing_cells.iter() {
-        commands.entity(entity).remove::<EditingBlockCell>();
-        commands.entity(entity).remove::<BlockEditCursor>();
-        trace!("Cleaned up stale EditingBlockCell on {:?}", entity);
-    }
-}
-
-/// Safety net: remove FocusedBlockCell if FocusArea is not suitable for navigation.
-/// 
-/// Prevents ghost highlights when focus switches to areas where j/k navigation
-/// is not active (Compose, Constellation, etc).
+/// Safety net: remove FocusedBlockCell if FocusArea is not Conversation.
+///
+/// Prevents ghost highlights when focus switches to Compose or Dialog.
 pub fn cleanup_stale_focused_markers(
     mut commands: Commands,
     focus_area: Res<FocusArea>,
     focused_markers: Query<Entity, With<FocusedBlockCell>>,
 ) {
-    // Only valid in Conversation or EditingBlock (where it serves as an edit anchor)
-    if matches!(*focus_area, FocusArea::Conversation | FocusArea::EditingBlock) {
+    if matches!(*focus_area, FocusArea::Conversation) {
         return;
     }
     for entity in focused_markers.iter() {

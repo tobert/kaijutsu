@@ -221,35 +221,44 @@ fn handle_open_fork_form(
             let slot = model_slot.sender();
             bevy::tasks::IoTaskPool::get()
                 .spawn(async move {
-                    match handle.get_llm_config().await {
-                        Ok(config) => {
-                            let providers: Vec<ProviderModels> = config
-                                .providers
-                                .into_iter()
-                                .filter(|p| p.available)
-                                .map(|p| {
-                                    let models = if p.models.is_empty() {
-                                        if p.default_model.is_empty() {
-                                            Vec::new()
-                                        } else {
-                                            vec![p.default_model.clone()]
-                                        }
-                                    } else {
-                                        p.models
-                                    };
-                                    ProviderModels {
-                                        name: p.name,
-                                        models,
-                                    }
-                                })
-                                .filter(|p| !p.models.is_empty())
-                                .collect();
-                            *slot.lock().unwrap() = Some(FetchedModels { providers });
-                        }
-                        Err(e) => {
-                            error!("Failed to fetch LLM config: {}", e);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        handle.get_llm_config(),
+                    ).await {
+                        Err(_) => {
+                            error!("Timeout fetching LLM config (5s)");
                             *slot.lock().unwrap() = Some(FetchedModels { providers: vec![] });
                         }
+                        Ok(result) => match result {
+                            Ok(config) => {
+                                let providers: Vec<ProviderModels> = config
+                                    .providers
+                                    .into_iter()
+                                    .filter(|p| p.available)
+                                    .map(|p| {
+                                        let models = if p.models.is_empty() {
+                                            if p.default_model.is_empty() {
+                                                Vec::new()
+                                            } else {
+                                                vec![p.default_model.clone()]
+                                            }
+                                        } else {
+                                            p.models
+                                        };
+                                        ProviderModels {
+                                            name: p.name,
+                                            models,
+                                        }
+                                    })
+                                    .filter(|p| !p.models.is_empty())
+                                    .collect();
+                                *slot.lock().unwrap() = Some(FetchedModels { providers });
+                            }
+                            Err(e) => {
+                                error!("Failed to fetch LLM config: {}", e);
+                                *slot.lock().unwrap() = Some(FetchedModels { providers: vec![] });
+                            }
+                        },
                     }
                 })
                 .detach();
@@ -258,36 +267,45 @@ fn handle_open_fork_form(
             let tool_sender = tool_slot.sender();
             bevy::tasks::IoTaskPool::get()
                 .spawn(async move {
-                    match handle2.get_tool_schemas().await {
-                        Ok(schemas) => {
-                            let mut by_category: BTreeMap<String, Vec<TreeItem>> =
-                                BTreeMap::new();
-                            for s in schemas {
-                                by_category.entry(s.category.clone()).or_default().push(
-                                    TreeItem {
-                                        label: s.name.clone(),
-                                        enabled: true,
-                                    },
-                                );
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        handle2.get_tool_schemas(),
+                    ).await {
+                        Err(_) => {
+                            error!("Timeout fetching tool schemas (5s)");
+                            *tool_sender.lock().unwrap() = Some(FetchedTools { categories: vec![] });
+                        }
+                        Ok(result) => match result {
+                            Ok(schemas) => {
+                                let mut by_category: BTreeMap<String, Vec<TreeItem>> =
+                                    BTreeMap::new();
+                                for s in schemas {
+                                    by_category.entry(s.category.clone()).or_default().push(
+                                        TreeItem {
+                                            label: s.name.clone(),
+                                            enabled: true,
+                                        },
+                                    );
+                                }
+                                let categories: Vec<TreeCategory> = by_category
+                                    .into_iter()
+                                    .map(|(name, mut items)| {
+                                        items.sort_by(|a, b| a.label.cmp(&b.label));
+                                        TreeCategory {
+                                            name,
+                                            expanded: false,
+                                            items,
+                                        }
+                                    })
+                                    .collect();
+                                *tool_sender.lock().unwrap() = Some(FetchedTools { categories });
                             }
-                            let categories: Vec<TreeCategory> = by_category
-                                .into_iter()
-                                .map(|(name, mut items)| {
-                                    items.sort_by(|a, b| a.label.cmp(&b.label));
-                                    TreeCategory {
-                                        name,
-                                        expanded: false,
-                                        items,
-                                    }
-                                })
-                                .collect();
-                            *tool_sender.lock().unwrap() = Some(FetchedTools { categories });
-                        }
-                        Err(e) => {
-                            error!("Failed to fetch tool schemas: {}", e);
-                            *tool_sender.lock().unwrap() =
-                                Some(FetchedTools { categories: vec![] });
-                        }
+                            Err(e) => {
+                                error!("Failed to fetch tool schemas: {}", e);
+                                *tool_sender.lock().unwrap() =
+                                    Some(FetchedTools { categories: vec![] });
+                            }
+                        },
                     }
                 })
                 .detach();

@@ -268,7 +268,8 @@ impl Constellation {
         }
     }
 
-    /// Get the next context ID (for gt navigation)
+    /// Get the next context ID (for cycle navigation)
+    #[allow(dead_code)] // Phase N: restore when NextContext action is re-added
     pub fn next_context_id(&self) -> Option<&str> {
         let focus_idx = self.focus_id.as_ref().and_then(|id| {
             self.nodes.iter().position(|n| &n.context_id == id)
@@ -278,7 +279,8 @@ impl Constellation {
         Some(&self.nodes[next_idx].context_id)
     }
 
-    /// Get the previous context ID (for gT navigation)
+    /// Get the previous context ID (for cycle navigation)
+    #[allow(dead_code)] // Phase N: restore when PrevContext action is re-added
     pub fn prev_context_id(&self) -> Option<&str> {
         let focus_idx = self.focus_id.as_ref().and_then(|id| {
             self.nodes.iter().position(|n| &n.context_id == id)

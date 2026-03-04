@@ -244,7 +244,9 @@ pub struct EditingBlockCell;
 /// This is separate from CellEditor's cursor because BlockCells don't have
 /// a full CellEditor - they render from the MainCell's BlockStore.
 /// The cursor is an offset within the block's content string.
+/// Phase N: inline block editing — restore FocusArea::EditingBlock to reactivate.
 #[derive(Component, Default)]
+#[allow(dead_code)]
 pub struct BlockEditCursor {
     /// Byte offset within the block's content.
     pub offset: usize,

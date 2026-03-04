@@ -84,13 +84,10 @@ pub struct Binding {
     pub action: Action,
     /// Human-readable description (for hint widget + Claude introspection)
     pub description: String,
-    /// For multi-key sequences (g→t): the prefix key that must be pending.
-    /// None = direct binding, Some(key) = second key in a sequence.
-    pub sequence_prefix: Option<InputSource>,
 }
 
 impl Binding {
-    /// Create a simple key binding with no modifiers or sequence.
+    /// Create a simple key binding with no modifiers.
     pub fn key(key: KeyCode, context: InputContext, action: Action, desc: impl Into<String>) -> Self {
         Self {
             source: InputSource::Key(key),
@@ -98,7 +95,6 @@ impl Binding {
             context,
             action,
             description: desc.into(),
-            sequence_prefix: None,
         }
     }
 
@@ -116,44 +112,6 @@ impl Binding {
             context,
             action,
             description: desc.into(),
-            sequence_prefix: None,
-        }
-    }
-
-    /// Create a sequence binding (e.g. g→t).
-    pub fn key_seq(
-        prefix: KeyCode,
-        key: KeyCode,
-        context: InputContext,
-        action: Action,
-        desc: impl Into<String>,
-    ) -> Self {
-        Self {
-            source: InputSource::Key(key),
-            modifiers: Modifiers::NONE,
-            context,
-            action,
-            description: desc.into(),
-            sequence_prefix: Some(InputSource::Key(prefix)),
-        }
-    }
-
-    /// Create a sequence binding with modifiers on the second key (e.g. g→Shift+T).
-    pub fn key_seq_mod(
-        prefix: KeyCode,
-        key: KeyCode,
-        modifiers: Modifiers,
-        context: InputContext,
-        action: Action,
-        desc: impl Into<String>,
-    ) -> Self {
-        Self {
-            source: InputSource::Key(key),
-            modifiers,
-            context,
-            action,
-            description: desc.into(),
-            sequence_prefix: Some(InputSource::Key(prefix)),
         }
     }
 
@@ -170,7 +128,6 @@ impl Binding {
             context,
             action,
             description: desc.into(),
-            sequence_prefix: None,
         }
     }
 }

@@ -238,7 +238,6 @@ pub fn sync_main_cell_to_conversation(
     entities: Res<EditorEntities>,
     mut main_cell: Query<(&mut CellEditor, Option<&mut ViewingConversation>), With<MainCell>>,
     mut commands: Commands,
-    focus_area: Res<crate::input::focus::FocusArea>,
 ) {
     let Some(active_id) = doc_cache.active_id() else {
         return;
@@ -273,11 +272,9 @@ pub fn sync_main_cell_to_conversation(
     editor.store = kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id);
     editor.store.set_version(sync_version);
 
-    if !matches!(*focus_area, crate::input::focus::FocusArea::EditingBlock) {
-        if let Some(last_block) = editor.blocks().last() {
-            let len = last_block.content.len();
-            editor.cursor = crate::cell::BlockCursor::at(last_block.id, len);
-        }
+    if let Some(last_block) = editor.blocks().last() {
+        let len = last_block.content.len();
+        editor.cursor = crate::cell::BlockCursor::at(last_block.id, len);
     }
 
     match viewing_opt {

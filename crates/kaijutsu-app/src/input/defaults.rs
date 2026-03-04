@@ -79,46 +79,12 @@ pub fn default_bindings() -> Vec<Binding> {
     // Backtick toggles constellation
     b.push(Binding::key(KeyCode::Backquote, InputContext::Navigation, Action::ToggleConstellation, "Toggle constellation"));
 
-    // Timeline navigation
-    b.push(Binding::key(KeyCode::BracketLeft, InputContext::Navigation, Action::TimelineStepBack, "Timeline step back"));
-    b.push(Binding::key(KeyCode::BracketRight, InputContext::Navigation, Action::TimelineStepForward, "Timeline step forward"));
-    b.push(Binding::key(KeyCode::Backslash, InputContext::Navigation, Action::TimelineJumpToLive, "Jump to live"));
-    b.push(Binding::key_mod(KeyCode::KeyF, Modifiers::CTRL, InputContext::Navigation, Action::TimelineFork, "Fork from timeline"));
-    b.push(Binding::key(KeyCode::KeyT, InputContext::Navigation, Action::TimelineToggle, "Toggle timeline"));
 
-    // Sequences: g→t, g→T (Shift+T), g→g
-    b.push(Binding::key_seq(KeyCode::KeyG, KeyCode::KeyT, InputContext::Navigation, Action::NextContext, "Next context"));
-    b.push(Binding::key_seq_mod(
-        KeyCode::KeyG,
-        KeyCode::KeyT,
-        Modifiers::SHIFT,
-        InputContext::Navigation,
-        Action::PrevContext,
-        "Previous context",
-    ));
-    b.push(Binding::key_seq(KeyCode::KeyG, KeyCode::KeyG, InputContext::Navigation, Action::FocusFirstBlock, "First block"));
 
     // ====================================================================
     // Constellation (constellation node graph focused)
+    // Keyboard nav removed — use mouse. Gamepad DPad bindings below.
     // ====================================================================
-
-    // Spatial nav: hjkl
-    b.push(Binding::key(KeyCode::KeyH, InputContext::Constellation, Action::SpatialNav(Vec2::new(-1.0, 0.0)), "Navigate left"));
-    b.push(Binding::key(KeyCode::KeyJ, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, 1.0)), "Navigate down"));
-    b.push(Binding::key(KeyCode::KeyK, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, -1.0)), "Navigate up"));
-    b.push(Binding::key(KeyCode::KeyL, InputContext::Constellation, Action::SpatialNav(Vec2::new(1.0, 0.0)), "Navigate right"));
-
-    // Pan: Shift+hjkl
-    b.push(Binding::key_mod(KeyCode::KeyH, Modifiers::SHIFT, InputContext::Constellation, Action::Pan(Vec2::new(-1.0, 0.0)), "Pan left"));
-    b.push(Binding::key_mod(KeyCode::KeyJ, Modifiers::SHIFT, InputContext::Constellation, Action::Pan(Vec2::new(0.0, 1.0)), "Pan down"));
-    b.push(Binding::key_mod(KeyCode::KeyK, Modifiers::SHIFT, InputContext::Constellation, Action::Pan(Vec2::new(0.0, -1.0)), "Pan up"));
-    b.push(Binding::key_mod(KeyCode::KeyL, Modifiers::SHIFT, InputContext::Constellation, Action::Pan(Vec2::new(1.0, 0.0)), "Pan right"));
-
-    // Zoom
-    b.push(Binding::key_mod(KeyCode::Equal, Modifiers::SHIFT, InputContext::Constellation, Action::ZoomIn, "Zoom in"));
-    b.push(Binding::key(KeyCode::Equal, InputContext::Constellation, Action::ZoomIn, "Zoom in"));
-    b.push(Binding::key(KeyCode::Minus, InputContext::Constellation, Action::ZoomOut, "Zoom out"));
-    b.push(Binding::key(KeyCode::Digit0, InputContext::Constellation, Action::ZoomReset, "Reset zoom"));
 
     // Actions
     b.push(Binding::key(KeyCode::Enter, InputContext::Constellation, Action::Activate, "Switch to context"));
@@ -128,16 +94,6 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(KeyCode::Tab, InputContext::Constellation, Action::CycleFocusForward, "Cycle focus"));
     b.push(Binding::key(KeyCode::Escape, InputContext::Constellation, Action::Unfocus, "Close constellation"));
 
-    // Sequences in constellation
-    b.push(Binding::key_seq(KeyCode::KeyG, KeyCode::KeyT, InputContext::Constellation, Action::NextContext, "Next context"));
-    b.push(Binding::key_seq_mod(
-        KeyCode::KeyG,
-        KeyCode::KeyT,
-        Modifiers::SHIFT,
-        InputContext::Constellation,
-        Action::PrevContext,
-        "Previous context",
-    ));
 
     // ====================================================================
     // TextInput (compose area or block editing focused)
@@ -176,6 +132,9 @@ pub fn default_bindings() -> Vec<Binding> {
 
     b.push(Binding::key(KeyCode::Escape, InputContext::Dialog, Action::Unfocus, "Cancel dialog"));
     b.push(Binding::key(KeyCode::Enter, InputContext::Dialog, Action::Activate, "Confirm dialog"));
+    // Tab cycles form fields in dialogs (Dialog has priority 2 > TextInput priority 1, so this wins)
+    b.push(Binding::key(KeyCode::Tab, InputContext::Dialog, Action::CycleFocusForward, "Cycle form field"));
+    b.push(Binding::key_mod(KeyCode::Tab, Modifiers::SHIFT, InputContext::Dialog, Action::CycleFocusBackward, "Cycle form field backward"));
     b.push(Binding::key(KeyCode::KeyJ, InputContext::Dialog, Action::FocusNextBlock, "Next item"));
     b.push(Binding::key(KeyCode::KeyK, InputContext::Dialog, Action::FocusPrevBlock, "Previous item"));
     b.push(Binding::key(KeyCode::ArrowDown, InputContext::Dialog, Action::FocusNextBlock, "Next item"));

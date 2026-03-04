@@ -57,12 +57,7 @@ pub fn in_compose(focus: Res<FocusArea>) -> bool {
     matches!(*focus, FocusArea::Compose)
 }
 
-/// System run condition: FocusArea is EditingBlock.
-pub fn in_editing_block(focus: Res<FocusArea>) -> bool {
-    matches!(*focus, FocusArea::EditingBlock)
-}
-
-/// System run condition: any text input mode (Compose or EditingBlock).
+/// System run condition: any text input mode (Compose only now).
 #[allow(dead_code)]
 pub fn in_text_input(focus: Res<FocusArea>) -> bool {
     focus.is_text_input()
@@ -72,7 +67,7 @@ pub fn in_text_input(focus: Res<FocusArea>) -> bool {
 pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
     matches!(
         *focus,
-        FocusArea::Conversation | FocusArea::Compose | FocusArea::EditingBlock
+        FocusArea::Conversation | FocusArea::Compose
     )
 }
 
@@ -90,16 +85,14 @@ pub enum FocusArea {
     Compose,
     /// Conversation block list. j/k navigates, Enter/i activates, f expands.
     Conversation,
-    /// Inline editing of an existing block (User Text blocks only).
-    EditingBlock,
     /// Modal dialog. Captures all input. Enter confirms, Escape cancels.
     Dialog,
 }
 
 impl FocusArea {
-    /// Check if focus is on text input (Compose or EditingBlock).
+    /// Check if focus is on text input (Compose).
     pub fn is_text_input(&self) -> bool {
-        matches!(self, FocusArea::Compose | FocusArea::EditingBlock)
+        matches!(self, FocusArea::Compose)
     }
 
     /// Check if focus is on navigation (Conversation blocks).
@@ -113,7 +106,6 @@ impl FocusArea {
         match self {
             FocusArea::Compose => "COMPOSE",
             FocusArea::Conversation => "NAVIGATE",
-            FocusArea::EditingBlock => "EDITING",
             FocusArea::Dialog => "DIALOG",
         }
     }

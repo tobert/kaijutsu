@@ -706,7 +706,6 @@ pub fn update_mode(
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => (theme.mode_chat, "INPUT"),
             FocusArea::Conversation => (theme.mode_normal, focus_area.name()),
-            FocusArea::EditingBlock => (theme.mode_chat, focus_area.name()),
             FocusArea::Dialog => (theme.mode_shell, focus_area.name()),
         },
     };
@@ -831,12 +830,11 @@ pub fn update_hints(
 
     use crate::ui::screen::Screen;
     let hints = match screen.get() {
-        Screen::Constellation => "h/j/k/l: navigate \u{2502} Enter: switch \u{2502} f: fork \u{2502} m: model \u{2502} Tab: compose \u{2502} +/-: zoom \u{2502} 0: reset",
+        Screen::Constellation => "Enter: switch \u{2502} f: fork \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back",
         Screen::ForkForm => "Tab: switch field \u{2502} j/k: select model \u{2502} Enter: fork \u{2502} Esc: cancel",
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Tab: mode ring \u{2502} Esc: dismiss",
             FocusArea::Conversation => "i: chat \u{2502} :: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane",
-            FocusArea::EditingBlock => "Enter: newline \u{2502} Esc: stop editing \u{2502} \u{2190}/\u{2192}: cursor \u{2502} Home/End: line",
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
     };

@@ -1,10 +1,8 @@
 //! Input dispatcher — the ONE system that reads raw input and emits actions.
 //!
 //! Single-pass dispatch with context priority. For each raw input event:
-//! 1. Check sequence completion (if pending)
-//! 2. Check sequence start (is this key a known prefix?)
-//! 3. Check direct binding match (active contexts, source + modifiers)
-//! 4. If no match AND in TextInput context → emit TextInputReceived
+//! 1. Check direct binding match (active contexts, source + modifiers)
+//! 2. If no match AND in TextInput context → emit TextInputReceived
 //!
 //! Mouse wheel → ScrollDelta action.
 //! Gamepad buttons → direct binding match.
@@ -20,7 +18,6 @@ use super::binding::{InputSource, Modifiers};
 use super::context::{ActiveInputContexts, InputContext};
 use super::events::{ActionFired, AnalogInput, TextInputReceived};
 use super::map::InputMap;
-use super::sequence::SequenceState;
 
 /// The main input dispatch system.
 ///
@@ -39,16 +36,10 @@ pub fn dispatch_input(
     time: Res<Time>,
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
-    mut sequence: ResMut<SequenceState>,
     mut action_writer: MessageWriter<ActionFired>,
     mut text_writer: MessageWriter<TextInputReceived>,
     mut analog_input: ResMut<AnalogInput>,
 ) {
-    // Clear expired sequences
-    if sequence.pending.is_some() && sequence.is_expired(input_map.sequence_timeout_ms) {
-        sequence.clear();
-    }
-
     // --- Mouse wheel → ScrollDelta ---
     for event in mouse_wheel.read() {
         let delta = match event.unit {
@@ -69,34 +60,7 @@ pub fn dispatch_input(
         let key = event.key_code;
         let is_repeat = event.repeat;
 
-        // 1. Check sequence completion
-        if sequence.pending.is_some() {
-            if let Some(action) = find_sequence_match(
-                key,
-                &keys,
-                &sequence,
-                &input_map,
-                &active_contexts,
-            ) {
-                sequence.clear();
-                if !is_repeat {
-                    action_writer.write(ActionFired(action));
-                }
-                continue;
-            }
-            // Key didn't complete a sequence — clear and fall through to direct match
-            if !is_repeat {
-                sequence.clear();
-            }
-        }
-
-        // 2. Check if this key starts a sequence (skip repeats)
-        if !is_repeat && is_sequence_prefix(key, &input_map, &active_contexts) && no_modifiers_held(&keys) {
-            sequence.start(InputSource::Key(key));
-            continue;
-        }
-
-        // 3. Check direct binding match
+        // 1. Check direct binding match.
         // Always check for a match — if bound, consume the event even on repeat
         // to prevent fallthrough to text input (Bug: action leak on key repeat)
         if let Some(action) = find_direct_match(key, &keys, &input_map, &active_contexts) {
@@ -106,7 +70,7 @@ pub fn dispatch_input(
             continue;
         }
 
-        // 4. No match in TextInput context → emit text
+        // 2. No match in TextInput context → emit text
         if active_contexts.contains(InputContext::TextInput)
             && let Some(ref text) = event.text
         {
@@ -173,63 +137,7 @@ pub fn dispatch_input(
     }
 }
 
-/// Check if no modifiers are held (for sequence prefix detection).
-fn no_modifiers_held(keys: &ButtonInput<KeyCode>) -> bool {
-    !(keys.pressed(KeyCode::ControlLeft)
-        || keys.pressed(KeyCode::ControlRight)
-        || keys.pressed(KeyCode::ShiftLeft)
-        || keys.pressed(KeyCode::ShiftRight)
-        || keys.pressed(KeyCode::AltLeft)
-        || keys.pressed(KeyCode::AltRight)
-        || keys.pressed(KeyCode::SuperLeft)
-        || keys.pressed(KeyCode::SuperRight))
-}
-
-/// Check if a key is a known sequence prefix in any active context.
-fn is_sequence_prefix(
-    key: KeyCode,
-    input_map: &InputMap,
-    active_contexts: &ActiveInputContexts,
-) -> bool {
-    let source = InputSource::Key(key);
-    input_map.bindings.iter().any(|binding| {
-        binding.sequence_prefix.as_ref() == Some(&source)
-            && active_contexts.contains(binding.context)
-    })
-}
-
-/// Find a binding that completes a pending sequence.
-fn find_sequence_match(
-    key: KeyCode,
-    keys: &ButtonInput<KeyCode>,
-    sequence: &SequenceState,
-    input_map: &InputMap,
-    active_contexts: &ActiveInputContexts,
-) -> Option<Action> {
-    for binding in &input_map.bindings {
-        // Must be a sequence binding
-        let Some(ref prefix) = binding.sequence_prefix else {
-            continue;
-        };
-
-        // Prefix must match pending
-        if !sequence.matches_prefix(prefix) {
-            continue;
-        }
-
-        // Second key + modifiers must match
-        if let InputSource::Key(bind_key) = &binding.source
-            && *bind_key == key
-            && binding.modifiers.matches(keys)
-            && active_contexts.contains(binding.context)
-        {
-            return Some(binding.action.clone());
-        }
-    }
-    None
-}
-
-/// Find a direct (non-sequence) binding match.
+/// Find a direct binding match.
 fn find_direct_match(
     key: KeyCode,
     keys: &ButtonInput<KeyCode>,
@@ -241,11 +149,6 @@ fn find_direct_match(
     let mut best_match: Option<(usize, &super::binding::Binding)> = None;
 
     for binding in &input_map.bindings {
-        // Skip sequence bindings (handled separately)
-        if binding.sequence_prefix.is_some() {
-            continue;
-        }
-
         // Source must match
         if let InputSource::Key(bind_key) = &binding.source {
             if *bind_key != key {

@@ -14,7 +14,6 @@
 //!     ▼
 //! dispatch_input        — ONE system, reads ALL raw input
 //!     │                    matches bindings in active context
-//!     │                    handles sequences (g→t)
 //!     ├──────┬──────┐
 //!     │      │      │
 //!     ▼      ▼      ▼
@@ -30,7 +29,6 @@
 //! - `FocusArea` — what has focus right now
 //! - `InputMap` — all bindings (readable + mutable)
 //! - `ActiveInputContexts` — which contexts are active
-//! - `SequenceState` — pending multi-key sequence
 
 pub mod action;
 pub mod binding;
@@ -40,7 +38,7 @@ pub mod dispatch;
 pub mod events;
 pub mod focus;
 pub mod map;
-pub mod sequence;
+pub mod rhai_config;
 pub mod systems;
 
 // Re-export core types for ergonomic use.
@@ -88,6 +86,9 @@ pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
+        // Write default bindings.rhai to XDG config if not present
+        rhai_config::write_default_config_if_missing();
+
         // Register messages
         app.add_message::<events::ActionFired>()
             .add_message::<events::TextInputReceived>();
@@ -107,8 +108,8 @@ impl Plugin for InputPlugin {
             .init_resource::<focus::FocusStack>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
-            .init_resource::<sequence::SequenceState>()
-            .init_resource::<events::AnalogInput>();
+            .init_resource::<events::AnalogInput>()
+            .init_resource::<rhai_config::BindingsWatcher>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -116,7 +117,6 @@ impl Plugin for InputPlugin {
             .register_type::<map::InputMap>()
             .register_type::<context::ActiveInputContexts>()
             .register_type::<context::InputContext>()
-            .register_type::<sequence::SequenceState>()
             .register_type::<events::AnalogInput>()
             .register_type::<events::ActionFired>()
             .register_type::<events::TextInputReceived>()
@@ -151,6 +151,12 @@ impl Plugin for InputPlugin {
             dispatch::dispatch_input.in_set(InputPhase::Dispatch),
         );
 
+        // Bindings hot-reload: poll file mtime every 2s, update InputMap on change
+        app.add_systems(
+            Update,
+            rhai_config::poll_bindings_reload,
+        );
+
         // Handle phase: consume ActionFired for focus management + domain actions
         app.add_systems(
             Update,
@@ -170,7 +176,6 @@ impl Plugin for InputPlugin {
                 systems::handle_navigate_blocks.run_if(focus::in_conversation),
                 systems::handle_expand_block.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
-                systems::handle_timeline.run_if(focus::in_conversation),
                 systems::handle_activate_navigation.run_if(focus::in_conversation),
                 // Constellation context (gated by Screen state, not FocusArea)
                 systems::handle_constellation_nav.run_if(
@@ -178,9 +183,8 @@ impl Plugin for InputPlugin {
                 ),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),
-                // Text input contexts
+                // Text input context
                 systems::handle_compose_input.run_if(focus::in_compose),
-                systems::handle_block_edit_input.run_if(focus::in_editing_block),
             )
                 .in_set(InputPhase::Handle),
         );
@@ -188,10 +192,7 @@ impl Plugin for InputPlugin {
         // Cleanup phase: defensive logic
         app.add_systems(
             Update,
-            (
-                systems::cleanup_stale_editing_markers,
-                systems::cleanup_stale_focused_markers,
-            )
+            systems::cleanup_stale_focused_markers
                 .in_set(InputPhase::Cleanup),
         );
     }
