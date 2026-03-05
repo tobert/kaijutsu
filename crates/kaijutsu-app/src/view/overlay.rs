@@ -10,7 +10,7 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::prelude::{UiVelloScene, UiVelloText};
+use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloTextAnchor};
 use bevy_vello::vello;
 use vello::kurbo::{Affine, RoundedRect, Shape, Stroke};
 use vello::peniko::Fill;
@@ -120,6 +120,8 @@ pub fn spawn_input_overlay(
             },
             ..default()
         },
+        // Override default Center anchor — text starts at content-box top-left
+        VelloTextAnchor::TopLeft,
         // Scene for background/border rendering (avoids BackgroundColor conflict)
         UiVelloScene::default(),
         Node {
