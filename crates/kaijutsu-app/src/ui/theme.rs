@@ -309,6 +309,12 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     pub compose_border: Color,
     pub compose_bg: Color,
+    /// Command palette border color (accent blue)
+    pub compose_palette_border: Color,
+    /// Command palette glow spread radius
+    pub compose_palette_glow_radius: f32,
+    /// Command palette glow alpha multiplier
+    pub compose_palette_glow_intensity: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Modal overlays
@@ -491,6 +497,9 @@ impl Default for Theme {
             // Compose block
             compose_border: Color::srgb(0.231, 0.259, 0.380), // #3b4261 matches border
             compose_bg: Color::srgb(0.102, 0.106, 0.149),     // #1a1b26 matches bg
+            compose_palette_border: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 accent blue
+            compose_palette_glow_radius: 6.0,
+            compose_palette_glow_intensity: 0.25,
 
             // Modal backdrop — semi-transparent dark overlay
             modal_backdrop: Color::srgba(0.0, 0.0, 0.0, 0.6),

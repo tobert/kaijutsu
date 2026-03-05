@@ -508,7 +508,7 @@ fn animation_alpha(animation: &BorderAnimation, time: f32) -> f32 {
 }
 
 /// Apply alpha to a brush (creates a new brush with modified alpha).
-fn apply_alpha(brush: &Brush, alpha: f32) -> Brush {
+pub fn apply_alpha(brush: &Brush, alpha: f32) -> Brush {
     if (alpha - 1.0).abs() < 0.01 {
         return brush.clone();
     }

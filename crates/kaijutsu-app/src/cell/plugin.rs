@@ -36,6 +36,7 @@ use crate::view::{
     PendingContextSwitch, PromptSubmitted, RoleGroupBorderLayout, SubmitFailed,
     ViewingConversation, EditorEntities,
 };
+use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
 use super::block_border;
 
 use crate::view::cursor as view_cursor;
@@ -66,7 +67,9 @@ impl Plugin for CellPlugin {
             .register_type::<BlockCellContainer>()
             .register_type::<BlockCellLayout>()
             .register_type::<RoleGroupBorderLayout>()
-            .register_type::<block_border::BlockBorderStyle>();
+            .register_type::<block_border::BlockBorderStyle>()
+            .register_type::<OverlayStyle>()
+            .register_type::<OverlayAnimation>();
 
         // Configure SystemSet execution order
         app.configure_sets(
@@ -86,7 +89,8 @@ impl Plugin for CellPlugin {
             .init_resource::<SessionAgent>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
-            .init_resource::<EditorEntities>();
+            .init_resource::<EditorEntities>()
+            .init_resource::<OverlaySummonState>();
 
         // ====================================================================
         // CellPhase::Sync — server events, document sync, prompt submission
@@ -141,9 +145,11 @@ impl Plugin for CellPlugin {
                 view_render::sync_block_cell_buffers
                     .after(view_render::init_block_cell_buffers),
                 // Input overlay
-                view_overlay::sync_overlay_visibility,
+                view_overlay::update_summon_animation,
+                view_overlay::sync_overlay_visibility.after(view_overlay::update_summon_animation),
                 view_overlay::sync_input_overlay_buffer,
                 view_overlay::sync_overlay_max_advance,
+                view_overlay::sync_overlay_style_to_theme,
                 // Highlighting
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
                 // Block border style
@@ -182,6 +188,7 @@ impl Plugin for CellPlugin {
             (
                 view_submit::animate_compose_error,
                 block_border::cleanup_block_borders,
+                view_overlay::animate_summon,
             )
                 .in_set(CellPhase::Layout),
         );
@@ -201,6 +208,7 @@ impl Plugin for CellPlugin {
                 block_border::animate_vello_borders
                     .after(block_border::update_vello_borders),
                 view_render::update_role_group_scenes.after(bevy::ui::UiSystems::Layout),
+                view_overlay::update_overlay_scene.after(bevy::ui::UiSystems::Layout),
             ),
         );
     }
