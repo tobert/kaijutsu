@@ -1,7 +1,6 @@
 //! Shader effects for Kaijutsu UI
 //!
 //! Custom `UiMaterial` implementations:
-//! - `CursorBeamMaterial` - Glowing cursor beam (beam/block/underline modes)
 //! - `ConstellationCardMaterial` - Rounded card for constellation nodes
 
 use bevy::{
@@ -17,27 +16,12 @@ pub struct ShaderFxPlugin;
 
 impl Plugin for ShaderFxPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            UiMaterialPlugin::<CursorBeamMaterial>::default(),
-            UiMaterialPlugin::<ConstellationCardMaterial>::default(),
-        ))
-        // Only update cursor time when in conversation (cursor visible).
-        // Only update card time when in constellation (cards visible).
-        .add_systems(Update, (
-            update_cursor_shader_time.run_if(in_state(Screen::Conversation)),
-            update_card_shader_time.run_if(in_state(Screen::Constellation)),
-        ));
-    }
-}
-
-/// Update time uniform on cursor beam materials (only when cursor is visible).
-fn update_cursor_shader_time(
-    time: Res<Time>,
-    mut cursor_materials: ResMut<Assets<CursorBeamMaterial>>,
-) {
-    let t = time.elapsed_secs();
-    for (_, mat) in cursor_materials.iter_mut() {
-        mat.time.x = t;
+        app.add_plugins(UiMaterialPlugin::<ConstellationCardMaterial>::default())
+            // Only update card time when in constellation (cards visible).
+            .add_systems(
+                Update,
+                update_card_shader_time.run_if(in_state(Screen::Constellation)),
+            );
     }
 }
 
@@ -49,54 +33,6 @@ fn update_card_shader_time(
     let t = time.elapsed_secs();
     for (_, mat) in card_materials.iter_mut() {
         mat.time.x = t;
-    }
-}
-
-// ============================================================================
-// CURSOR BEAM MATERIAL
-// ============================================================================
-
-/// Glowing cursor beam with cyberpunk energy effects.
-///
-/// Supports three modes:
-/// - Beam (0): Vertical line cursor (insert mode)
-/// - Block (1): Filled block cursor (normal mode)
-/// - Underline (2): Horizontal underline cursor
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-pub struct CursorBeamMaterial {
-    /// Cursor color (RGBA)
-    #[uniform(0)]
-    pub color: Vec4,
-    /// Parameters: x=glow_width, y=intensity, z=pulse_speed, w=blink_rate
-    #[uniform(1)]
-    pub params: Vec4,
-    /// Time: x=elapsed_time, y=mode (0=beam, 1=block, 2=underline)
-    #[uniform(2)]
-    pub time: Vec4,
-}
-
-/// Cursor display modes
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CursorMode {
-    Beam = 0,      // Vertical line (insert mode)
-    Block = 1,     // Filled block (normal mode)
-    #[allow(dead_code)]
-    Underline = 2, // Bottom line (future: replace mode)
-}
-
-impl Default for CursorBeamMaterial {
-    fn default() -> Self {
-        Self {
-            color: Vec4::new(1.0, 0.5, 0.75, 0.95), // Hot pink
-            params: Vec4::new(0.25, 1.2, 2.0, 0.0),
-            time: Vec4::new(0.0, 1.0, 0.0, 0.0), // time, mode (default block)
-        }
-    }
-}
-
-impl UiMaterial for CursorBeamMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "shaders/cursor_beam.wgsl".into()
     }
 }
 

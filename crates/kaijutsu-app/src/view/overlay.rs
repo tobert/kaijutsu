@@ -19,6 +19,7 @@ use crate::cell::{InputOverlay, InputOverlayMarker};
 use crate::input::FocusArea;
 use crate::text::{bevy_color_to_brush, FontHandles, KjText, KjTextEffects, TextMetrics};
 use crate::ui::theme::Theme;
+use crate::view::cursor::cursor_row_col;
 use crate::view::fieldset::apply_alpha;
 
 // ============================================================================
@@ -275,21 +276,36 @@ pub fn sync_overlay_style_to_theme(
 
 /// Rebuild overlay scene in PostUpdate (after Layout).
 ///
-/// This renders the background, glow, and animated border using Vello,
+/// This renders the background, glow, animated border, and cursor using Vello,
 /// avoiding the BackgroundColor/Vello compositing conflict.
 pub fn update_overlay_scene(
     summon: Res<OverlaySummonState>,
+    focus_area: Res<FocusArea>,
     time: Res<Time>,
+    text_metrics: Res<TextMetrics>,
+    theme: Res<Theme>,
     mut query: Query<
-        (&OverlayStyle, &ComputedNode, &mut UiVelloScene),
+        (&OverlayStyle, &InputOverlay, &ComputedNode, &mut UiVelloScene),
         With<InputOverlayMarker>,
     >,
 ) {
-    for (style, computed, mut vello_scene) in query.iter_mut() {
+    // Only show cursor when in compose mode
+    let show_cursor = matches!(*focus_area, FocusArea::Compose);
+
+    for (style, overlay, computed, mut vello_scene) in query.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 || size.y < 1.0 {
             continue;
         }
+
+        // Calculate cursor position
+        let display = overlay.display_text();
+        let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
+
+        // Get content box offset (padding inset)
+        let content = computed.content_box();
+        let padding_left = -content.min.x as f64; // content.min.x is negative
+        let padding_top = -content.min.y as f64;
 
         let mut scene = vello::Scene::new();
         build_overlay_panel(
@@ -300,6 +316,26 @@ pub fn update_overlay_scene(
             time.elapsed_secs(),
             summon.progress,
         );
+
+        // Draw cursor if visible
+        if show_cursor && summon.progress > 0.0 {
+            let char_width = text_metrics.cell_char_width as f64;
+            let line_height = text_metrics.cell_line_height as f64;
+
+            let cursor_x = padding_left + col as f64 * char_width;
+            let cursor_y = padding_top + row as f64 * line_height;
+
+            draw_cursor_beam(
+                &mut scene,
+                cursor_x,
+                cursor_y,
+                line_height,
+                theme.cursor_insert,
+                summon.progress,
+                time.elapsed_secs(),
+            );
+        }
+
         *vello_scene = UiVelloScene::from(scene);
     }
 }
@@ -428,6 +464,24 @@ fn draw_chase_overlay(
         .with_dashes(position, &[chase_len, perimeter - chase_len]);
 
     scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
+}
+
+/// Draw a simple cursor beam (vertical line).
+fn draw_cursor_beam(
+    scene: &mut vello::Scene,
+    x: f64,
+    y: f64,
+    height: f64,
+    color: bevy::math::Vec4,
+    alpha: f32,
+    _time: f32, // Reserved for future blink animation
+) {
+    let beam_width = 2.0;
+    let beam_color = Color::srgba(color.x, color.y, color.z, color.w * alpha);
+    let brush = bevy_color_to_brush(beam_color);
+
+    let rect = vello::kurbo::Rect::new(x, y, x + beam_width, y + height);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);
 }
 
 /// Compute animation alpha multiplier.

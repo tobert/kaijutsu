@@ -16,8 +16,6 @@ use crate::cell::{
 /// Consolidated resource tracking editor-related singleton entities.
 #[derive(Resource, Default)]
 pub struct EditorEntities {
-    /// The cursor UI entity.
-    pub cursor: Option<Entity>,
     /// The main conversation cell entity.
     pub main_cell: Option<Entity>,
     /// The ConversationContainer entity (flex parent for BlockCells).

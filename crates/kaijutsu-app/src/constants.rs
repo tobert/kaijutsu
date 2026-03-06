@@ -28,7 +28,8 @@ pub struct ZLayer;
 impl ZLayer {
     /// Main content area (dashboard columns, conversation blocks)
     pub const CONTENT: i32 = 10;
-    /// Cursor overlay (in focused document)
+    /// Cursor overlay (reserved, cursor now drawn in Vello scene)
+    #[allow(dead_code)]
     pub const CURSOR: i32 = 20;
     /// HUD panels (agent status, keybinds, etc.)
     pub const HUD: i32 = 50;

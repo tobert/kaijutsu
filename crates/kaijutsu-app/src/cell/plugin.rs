@@ -39,7 +39,6 @@ use crate::view::{
 use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
 use super::block_border;
 
-use crate::view::cursor as view_cursor;
 use crate::view::lifecycle as view_lifecycle;
 use crate::view::overlay as view_overlay;
 use crate::view::render as view_render;
@@ -127,7 +126,6 @@ impl Plugin for CellPlugin {
                 view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
                 view_lifecycle::spawn_block_cells,
                 view_lifecycle::sync_role_headers.after(view_lifecycle::spawn_block_cells),
-                view_cursor::spawn_cursor,
                 ApplyDeferred.after(view_lifecycle::sync_role_headers),
             )
                 .in_set(CellPhase::Spawn),
@@ -177,8 +175,6 @@ impl Plugin for CellPlugin {
                 view_render::reorder_conversation_children.after(view_render::update_block_cell_nodes),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
                 view_render::cull_offscreen_blocks.after(view_scroll::smooth_scroll),
-                view_cursor::update_cursor,
-                view_cursor::update_block_edit_cursor.after(view_cursor::update_cursor),
             )
                 .in_set(CellPhase::Layout),
         );
@@ -199,7 +195,6 @@ impl Plugin for CellPlugin {
         app.add_systems(
             PostUpdate,
             (
-                view_cursor::update_input_overlay_cursor.after(bevy::ui::UiSystems::Layout),
                 view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
                 block_border::spawn_vello_borders
                     .after(view_render::readback_block_heights),
