@@ -302,10 +302,12 @@ pub fn update_overlay_scene(
         let display = overlay.display_text();
         let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
 
-        // Get content box offset (padding inset)
+        // Get content box offset (padding inset from border-box origin)
+        // content.min is offset from CENTER to content corner, so:
+        // padding = content.min + size/2
         let content = computed.content_box();
-        let padding_left = -content.min.x as f64; // content.min.x is negative
-        let padding_top = -content.min.y as f64;
+        let padding_left = (content.min.x + size.x / 2.0) as f64;
+        let padding_top = (content.min.y + size.y / 2.0) as f64;
 
         let mut scene = vello::Scene::new();
         build_overlay_panel(
