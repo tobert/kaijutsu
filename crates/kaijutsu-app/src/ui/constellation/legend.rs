@@ -96,10 +96,10 @@ fn spawn_legend_panel(
                 position_type: PositionType::Absolute,
                 left: Val::Px(16.0),
                 top: Val::Px(16.0),
-                width: Val::Px(220.0),
-                min_height: Val::Px(80.0),
+                width: Val::Px(160.0),
+                min_height: Val::Px(40.0),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(12.0)),
+                padding: UiRect::all(Val::Px(10.0)),
                 row_gap: Val::Px(4.0),
                 ..default()
             },
@@ -154,91 +154,19 @@ fn update_legend_content(
     let staged_count = drift_state.staged_count();
     let kernel_name = "(kernel)";
 
-    let mut provider_counts: Vec<(&str, Color, usize)> = Vec::new();
-    let provider_groups = [
-        ("human", theme.agent_color_human),
-        ("anthropic", theme.agent_color_claude),
-        ("google", theme.agent_color_gemini),
-        ("deepseek", theme.agent_color_deepseek),
-        ("local", theme.agent_color_local),
-    ];
-
-    for (provider_key, color) in &provider_groups {
-        let count = drift_state.contexts
-            .iter()
-            .filter(|c| {
-                let p = c.provider.to_ascii_lowercase();
-                match *provider_key {
-                    "anthropic" => p.contains("anthropic") || p.contains("claude"),
-                    "google" => p.contains("google") || p.contains("gemini"),
-                    "deepseek" => p.contains("deepseek"),
-                    "local" => p.contains("ollama") || p.contains("local") || p.contains("llama"),
-                    "human" => p.is_empty(),
-                    _ => false,
-                }
-            })
-            .count();
-        if count > 0 {
-            provider_counts.push((provider_key, *color, count));
-        }
-    }
-
-    let unique_providers = provider_counts.len();
-
     let font = &font_handles.mono;
 
     // Header: kernel name
-    let header = spawn_legend_text(&mut commands, font, &truncate_name(kernel_name, 22), theme.fg, 11.0);
+    let header = spawn_legend_text(&mut commands, font, &truncate_name(kernel_name, 18), theme.fg, 11.0);
     commands.entity(legend_entity).add_child(header);
 
     // Summary line
-    let summary = format!("{} contexts \u{00b7} {} agents", total_contexts, unique_providers);
+    let summary = format!("{} contexts", total_contexts);
     let summary_entity = spawn_legend_text(&mut commands, font, &summary, theme.fg_dim, 9.0);
     commands.entity(legend_entity).add_child(summary_entity);
 
-    // Separator
-    let sep = commands
-        .spawn((
-            LegendContent,
-            Node {
-                width: Val::Percent(100.0),
-                height: Val::Px(1.0),
-                margin: UiRect::vertical(Val::Px(3.0)),
-                ..default()
-            },
-            BackgroundColor(theme.border.with_alpha(0.4)),
-        ))
-        .id();
-    commands.entity(legend_entity).add_child(sep);
-
-    // Per-provider rows
-    for (label, color, count) in &provider_counts {
-        let display_name = match *label {
-            "anthropic" => "claude",
-            "google" => "gemini",
-            "human" => "amy",
-            l => l,
-        };
-        let row = spawn_legend_agent_row(&mut commands, font, display_name, *color, *count, &theme);
-        commands.entity(legend_entity).add_child(row);
-    }
-
     // Staged drift count
     if staged_count > 0 {
-        let sep2 = commands
-            .spawn((
-                LegendContent,
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Px(1.0),
-                    margin: UiRect::vertical(Val::Px(3.0)),
-                    ..default()
-                },
-                BackgroundColor(theme.border.with_alpha(0.4)),
-            ))
-            .id();
-        commands.entity(legend_entity).add_child(sep2);
-
         let drift_text = format!("{} staged drifts", staged_count);
         let drift_entity = spawn_legend_text(&mut commands, font, &drift_text, theme.ansi.cyan, 9.0);
         commands.entity(legend_entity).add_child(drift_entity);
@@ -286,62 +214,3 @@ fn spawn_legend_text(
         .id()
 }
 
-fn spawn_legend_agent_row(
-    commands: &mut Commands,
-    font: &Handle<bevy_vello::prelude::VelloFont>,
-    name: &str,
-    color: Color,
-    count: usize,
-    theme: &Theme,
-) -> Entity {
-    commands
-        .spawn((
-            LegendContent,
-            Node {
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(6.0),
-                min_height: Val::Px(16.0),
-                ..default()
-            },
-        ))
-        .with_children(|parent| {
-            // Colored dot
-            parent.spawn((
-                Node {
-                    width: Val::Px(8.0),
-                    height: Val::Px(8.0),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(color),
-            ));
-            // Agent name
-            parent.spawn((
-                bevy_vello::prelude::UiVelloText {
-                    value: name.into(),
-                    style: crate::text::vello_style(font, color, 10.0),
-                    ..default()
-                },
-                Node {
-                    width: Val::Px(70.0),
-                    ..default()
-                },
-            ));
-            // Count
-            let count_text = format!("{} ctx", count);
-            parent.spawn((
-                bevy_vello::prelude::UiVelloText {
-                    value: count_text,
-                    style: crate::text::vello_style(font, theme.fg_dim, 9.0),
-                    ..default()
-                },
-                Node {
-                    width: Val::Px(50.0),
-                    margin: UiRect::left(Val::Auto),
-                    ..default()
-                },
-            ));
-        })
-        .id()
-}

@@ -257,6 +257,8 @@ pub struct Theme {
     pub constellation_base_radius: f32,
     /// Spacing between concentric rings in radial tree (pixels, 2D fallback layout)
     pub constellation_ring_spacing: f32,
+    /// Card width in constellation view (pixels)
+    pub constellation_card_width: f32,
     /// Agent color: default (dim cyan) — used when provider is unknown
     pub agent_color_default: Color,
     /// Agent color: human user (electric cyan)
@@ -467,9 +469,10 @@ impl Default for Theme {
             // Font effects
             font_rainbow: true,
 
-            // Constellation (2D fallback layout)
-            constellation_base_radius: 120.0,
-            constellation_ring_spacing: 160.0,
+            // Constellation radial tree layout
+            constellation_base_radius: 500.0,
+            constellation_ring_spacing: 550.0,
+            constellation_card_width: 180.0,
 
             agent_color_default: Color::srgba(0.49, 0.85, 0.82, 0.8),   // #7dd9d1 dim cyan
             agent_color_human: Color::srgba(0.49, 0.98, 1.00, 0.9),     // #7df9ff electric cyan
@@ -478,9 +481,9 @@ impl Default for Theme {
             agent_color_local: Color::srgba(0.31, 0.98, 0.48, 0.9),     // #50fa7b matrix green
             agent_color_deepseek: Color::srgba(1.00, 0.72, 0.42, 0.9),  // #ffb86c orange
 
-            // Constellation 3D
-            constellation_base_leaf_radius: 0.3,
-            constellation_packing_factor: 1.4,
+            // Constellation 2.5D layout
+            constellation_base_leaf_radius: 1.2,  // Increased for better spread with many nodes
+            constellation_packing_factor: 1.8,    // More gap between nodes
 
             // Block borders
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber

@@ -1,17 +1,16 @@
-//! Constellation - Context navigation in 3D hyperbolic space
+//! Constellation - Context navigation in 2.5D hyperbolic space
 //!
-//! Renders the constellation as an H3-inspired hyperbolic cone tree inside a
-//! Poincaré ball, displayed via Bevy's `ViewportNode` in the existing flexbox
-//! layout. Focus changes are Lorentz boosts — the space moves through the
-//! camera, providing navigational stability.
+//! Renders the constellation as an H3-inspired hyperbolic cone tree projected
+//! to the Poincaré ball, visualized using pure Vello 2D with depth cues for
+//! a 2.5D feel. Focus changes are Lorentz boosts — the space moves through
+//! the camera, providing navigational stability.
 //!
 //! ## Architecture
 //!
 //! - `hyper.rs` — Hyperbolic math (HyperPoint, LorentzTransform, Poincaré projection)
 //! - `layout.rs` — H3 layout engine (bottom-up hemisphere sizing, top-down placement)
-//! - `viewport.rs` — ViewportNode setup, 3D camera, render target
-//! - `render3d.rs` — Node/edge spawning, visual updates in 3D scene
-//! - `navigation.rs` — Focus animation via geodesic lerp, camera orbit
+//! - `render2d.rs` — Vello scene building with depth-based size/opacity/glow
+//! - `navigation.rs` — Focus animation via geodesic lerp
 //!
 //! ## Activation
 //!
@@ -36,8 +35,7 @@ pub mod layout;
 mod legend;
 pub mod model_picker;
 mod navigation;
-mod render3d;
-pub(crate) mod viewport;
+mod render2d;
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
@@ -46,10 +44,7 @@ use crate::agents::AgentActivityMessage;
 
 pub use create_dialog::create_or_fork_context;
 pub use fork_form::OpenForkForm;
-pub use navigation::{CameraOrbit, find_nearest_in_direction_3d};
-pub use render3d::ConstellationScene;
-#[allow(unused_imports)] // Phase 5+: available for despawn queries from other modules
-pub use render3d::NodeLabel3d;
+pub use navigation::CameraOrbit;
 
 // Render module provides visual systems (used by the plugin internally)
 
@@ -96,13 +91,10 @@ impl Plugin for ConstellationPlugin {
         // Constellation container + legend panel (extracted from deleted render.rs)
         legend::setup_legend_systems(app);
 
-        // Add 3D viewport systems (Phase 1.5+)
-        viewport::setup_viewport_systems(app);
+        // Add 2D Vello rendering systems
+        render2d::setup_render2d_systems(app);
 
-        // Add 3D rendering systems (Phase 3+)
-        render3d::setup_render3d_systems(app);
-
-        // Add 3D navigation systems (Phase 4+)
+        // Add navigation systems (focus animation, camera orbit)
         navigation::setup_navigation_systems(app);
 
         // Add create context dialog systems
@@ -137,6 +129,10 @@ pub struct ConstellationCamera {
     pub target_offset: Vec2,
     /// Target zoom level for smooth interpolation
     pub target_zoom: f32,
+    /// Current carousel rotation angle (radians)
+    pub carousel_angle: f32,
+    /// Target carousel rotation for smooth interpolation
+    pub target_carousel_angle: f32,
     /// Interpolation speed (higher = snappier)
     pub speed: f32,
 }
@@ -148,6 +144,8 @@ impl Default for ConstellationCamera {
             zoom: 1.0,
             target_offset: Vec2::ZERO,
             target_zoom: 1.0,
+            carousel_angle: 0.0,
+            target_carousel_angle: 0.0,
             speed: 8.0,
         }
     }
@@ -158,6 +156,7 @@ impl ConstellationCamera {
     pub fn reset(&mut self) {
         self.target_offset = Vec2::ZERO;
         self.target_zoom = 1.0;
+        self.target_carousel_angle = 0.0;
     }
 }
 
@@ -201,11 +200,15 @@ impl Constellation {
         let node = ContextNode {
             context_id: context_id.clone(),
             parent_id: None, // Populated by sync_model_info_to_constellation
-            position: Vec2::ZERO, // Will be calculated by layout
+            label: None,     // Populated by sync_model_info_to_constellation
+            position: Vec2::ZERO,
+            depth: 0.0,
+            ring_index: self.nodes.len(),
             activity: ActivityState::default(),
             model: None,
             provider: None,
             joined: true,
+            last_activity_time: 0.0,
         };
 
         self.nodes.push(node);
@@ -227,11 +230,15 @@ impl Constellation {
         let node = ContextNode {
             context_id: context_id.clone(),
             parent_id: ctx_info.parent_id.as_ref().map(|p| p.to_string()),
+            label: if ctx_info.label.is_empty() { None } else { Some(ctx_info.label.clone()) },
             position: Vec2::ZERO,
+            depth: 0.0,
+            ring_index: self.nodes.len(),
             activity: ActivityState::Idle,
             model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
             provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
             joined: false,
+            last_activity_time: 0.0,
         };
 
         self.nodes.push(node);
@@ -299,8 +306,14 @@ pub struct ContextNode {
     pub context_id: String,
     /// Parent context ID (from drift router, for tree layout)
     pub parent_id: Option<String>,
+    /// Human-readable label (e.g. "default", "debug-auth")
+    pub label: Option<String>,
     /// Position in constellation space (calculated by layout)
     pub position: Vec2,
+    /// Depth in carousel space: 1.0 = front (closest), -1.0 = back (furthest)
+    pub depth: f32,
+    /// Index in the ring order (for h/l navigation)
+    pub ring_index: usize,
     /// Current activity state (affects visual rendering)
     pub activity: ActivityState,
     /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
@@ -309,6 +322,8 @@ pub struct ContextNode {
     pub provider: Option<String>,
     /// Whether we have an active actor connection to this context
     pub joined: bool,
+    /// When activity last changed (from `Time::elapsed_secs_f64()`)
+    pub last_activity_time: f64,
 }
 
 /// Activity state of a context node
@@ -331,6 +346,7 @@ pub enum ActivityState {
 
 impl ActivityState {
     /// Get the glow intensity for this state
+    #[allow(dead_code)] // Phase 3: will use for depth-based glow
     pub fn glow_intensity(&self) -> f32 {
         match self {
             Self::Idle => 0.2,
@@ -381,7 +397,9 @@ fn track_context_events(
 fn track_agent_activity(
     mut constellation: ResMut<Constellation>,
     mut events: MessageReader<AgentActivityMessage>,
+    time: Res<Time>,
 ) {
+    let now = time.elapsed_secs_f64();
     for event in events.read() {
         // Update the focused node's activity based on agent events
         // (In the future, we could map block_id to context for more precision)
@@ -390,6 +408,7 @@ fn track_agent_activity(
                 info!("Agent {} started: {}", nick, action);
                 if let Some(node) = constellation.focused_node_mut() {
                     node.activity = ActivityState::Streaming;
+                    node.last_activity_time = now;
                 }
             }
             AgentActivityMessage::Progress { .. } => {
@@ -398,6 +417,7 @@ fn track_agent_activity(
                     if node.activity != ActivityState::Streaming {
                         node.activity = ActivityState::Streaming;
                     }
+                    node.last_activity_time = now;
                 }
             }
             AgentActivityMessage::Completed { success, .. } => {
@@ -407,6 +427,7 @@ fn track_agent_activity(
                     } else {
                         ActivityState::Error
                     };
+                    node.last_activity_time = now;
                 }
             }
             AgentActivityMessage::CursorMoved { .. } => {
@@ -415,6 +436,7 @@ fn track_agent_activity(
                     if node.activity == ActivityState::Idle {
                         node.activity = ActivityState::Active;
                     }
+                    node.last_activity_time = now;
                 }
             }
         }
@@ -423,13 +445,12 @@ fn track_agent_activity(
 
 /// Handle clicks on constellation nodes to focus that context.
 ///
+/// Click only focuses — Enter or double-click switches context.
 /// Guarded by `FocusStack::is_modal()` — clicks are ignored when a dialog
 /// is open over the constellation, preventing focus theft.
 fn handle_node_click(
     mut constellation: ResMut<Constellation>,
-    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     nodes: Query<(&Interaction, &ConstellationNode), Changed<Interaction>>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     focus_stack: Res<crate::input::focus::FocusStack>,
 ) {
     if focus_stack.is_modal() {
@@ -440,57 +461,87 @@ fn handle_node_click(
         if *interaction == Interaction::Pressed {
             info!("Clicked constellation node: {}", node.context_id);
             constellation.focus(&node.context_id);
-            if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&node.context_id) {
-                switch_writer.write(crate::cell::ContextSwitchRequested {
-                    context_id: ctx_id,
-                });
-                next_screen.set(crate::ui::screen::Screen::Conversation);
-            }
         }
     }
 }
 
 // Input handling in input::systems (toggle_constellation + constellation_nav)
 
-/// Update node positions using radial tree layout.
+/// How much the ring curves upward as cards recede (px per unit).
+/// Higher = more vertical spread. The ring appears as a tilted plane.
+const CAROUSEL_TILT: f32 = 0.3;
+
+/// Minimum spacing between adjacent cards on the ring circumference (px).
+const CAROUSEL_MIN_SPACING: f32 = 240.0;
+
+/// Update node positions using a tilted carousel ring.
 ///
-/// Root nodes (no parent) are placed at center. Children radiate outward in
-/// concentric rings, with angular sectors proportional to descendant count.
+/// The focused card sits at (0, 0) — viewport center. Other cards fan out
+/// left/right and curve upward, like a ring on a tilted plane viewed from
+/// slightly above. The ring radius scales with node count so cards never overlap.
+/// h/l spins the carousel, bringing adjacent cards to front.
 fn update_node_positions(
     mut constellation: ResMut<Constellation>,
-    theme: Res<crate::ui::theme::Theme>,
+    camera: Res<ConstellationCamera>,
 ) {
-    let node_count = constellation.nodes.len();
-    if node_count == 0 {
+    let n = constellation.nodes.len();
+    if n == 0 {
         return;
     }
 
-    if !constellation.is_changed() {
-        return;
+    // Build DFS ring order: parent before children, sorted by context_id
+    let ring_order = build_ring_order(&constellation);
+
+    // Assign ring indices
+    for (ring_idx, &node_idx) in ring_order.iter().enumerate() {
+        constellation.nodes[node_idx].ring_index = ring_idx;
     }
 
-    let base_radius = theme.constellation_base_radius;
-    let ring_spacing = theme.constellation_ring_spacing;
+    // Ring radius: ensure minimum angular spacing for card width
+    let circumference = n as f32 * CAROUSEL_MIN_SPACING;
+    let radius = (circumference / std::f32::consts::TAU).max(400.0);
 
-    // Build parent→children adjacency and identify roots
-    let ids: Vec<String> = constellation.nodes.iter().map(|n| n.context_id.clone()).collect();
-    let parents: Vec<Option<String>> = constellation.nodes.iter().map(|n| n.parent_id.clone()).collect();
+    for &node_idx in &ring_order {
+        let ring_idx = constellation.nodes[node_idx].ring_index;
+        let base_angle = std::f32::consts::TAU * ring_idx as f32 / n as f32;
+        let angle = base_angle + camera.carousel_angle;
+
+        // Front card (angle≈0) at origin, others fan out and curve up.
+        // x = R * sin(θ)  — horizontal spread
+        // y = -R * (1 - cos(θ)) * TILT — curves upward (negative = up in screen coords)
+        let x = radius * angle.sin();
+        let y = -radius * (1.0 - angle.cos()) * CAROUSEL_TILT;
+
+        // Depth: cos(angle) → 1.0 at front (angle=0), -1.0 at back (angle=π)
+        let depth = angle.cos();
+
+        constellation.nodes[node_idx].position = Vec2::new(x, y);
+        constellation.nodes[node_idx].depth = depth;
+    }
+}
+
+/// Build a DFS traversal order for the ring: parents before children,
+/// siblings sorted by context_id. This keeps parent-child groups adjacent.
+fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
+    let n = constellation.nodes.len();
+    let ids: Vec<&str> = constellation.nodes.iter().map(|n| n.context_id.as_str()).collect();
 
     // Map context_id → index
-    let id_to_idx: std::collections::HashMap<&str, usize> = ids.iter().enumerate()
-        .map(|(i, id)| (id.as_str(), i))
+    let id_to_idx: std::collections::HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
         .collect();
 
     // Build children lists
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut roots: Vec<usize> = Vec::new();
 
-    for (i, parent) in parents.iter().enumerate() {
-        if let Some(pid) = parent {
+    for (i, node) in constellation.nodes.iter().enumerate() {
+        if let Some(ref pid) = node.parent_id {
             if let Some(&parent_idx) = id_to_idx.get(pid.as_str()) {
                 children[parent_idx].push(i);
             } else {
-                // Parent not in constellation — treat as root
                 roots.push(i);
             }
         } else {
@@ -498,102 +549,49 @@ fn update_node_positions(
         }
     }
 
-    // If no roots found (shouldn't happen), treat all as roots
     if roots.is_empty() {
-        roots = (0..node_count).collect();
+        roots = (0..n).collect();
     }
 
-    // Stable sort: children by context_id so tree layout is deterministic
+    // Stable sort by context_id
     for ch in &mut children {
         ch.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
     }
     roots.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
 
-    // BFS layout: assign positions
-    let mut positions: Vec<Vec2> = vec![Vec2::ZERO; node_count];
-
-    if roots.len() == 1 {
-        // Single root at center
-        positions[roots[0]] = Vec2::ZERO;
-        layout_children(roots[0], 0.0, std::f32::consts::TAU, 1, base_radius, ring_spacing, &children, &mut positions);
-    } else {
-        // Multiple roots: distribute around center at ring 0 (or small offset)
-        let total_desc: usize = roots.iter().map(|&r| count_tree_descendants(r, &children)).sum();
-        let mut angle_start = -std::f32::consts::FRAC_PI_2;
-        for &root_idx in &roots {
-            let desc = count_tree_descendants(root_idx, &children);
-            let sector = std::f32::consts::TAU * (desc as f32 / total_desc.max(1) as f32);
-            let mid_angle = angle_start + sector / 2.0;
-
-            // Place root at a small radius to separate them
-            let root_radius = if roots.len() > 1 { base_radius * 0.5 } else { 0.0 };
-            positions[root_idx] = Vec2::new(mid_angle.cos() * root_radius, mid_angle.sin() * root_radius);
-
-            layout_children(root_idx, angle_start, sector, 1, base_radius, ring_spacing, &children, &mut positions);
-            angle_start += sector;
+    // DFS
+    let mut order = Vec::with_capacity(n);
+    let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(idx) = stack.pop() {
+        order.push(idx);
+        for &child in children[idx].iter().rev() {
+            stack.push(child);
         }
     }
 
-    // Apply positions back to nodes
-    for (i, node) in constellation.nodes.iter_mut().enumerate() {
-        node.position = positions[i];
-    }
+    order
 }
 
-/// Count descendants (including self) for angular sector sizing.
-/// Depth-limited to prevent stack overflow from malformed cyclic parentage data.
-fn count_tree_descendants(idx: usize, children: &[Vec<usize>]) -> usize {
-    count_tree_descendants_inner(idx, children, 0)
+/// Get the ring index of the focused node (for carousel navigation).
+pub fn focused_ring_index(constellation: &Constellation) -> Option<usize> {
+    constellation.focus_id.as_ref().and_then(|id| {
+        constellation.nodes.iter().find(|n| n.context_id == *id).map(|n| n.ring_index)
+    })
 }
 
-fn count_tree_descendants_inner(idx: usize, children: &[Vec<usize>], depth: usize) -> usize {
-    const MAX_DEPTH: usize = 64;
-    if depth >= MAX_DEPTH {
-        return 1;
-    }
-    let mut count = 1; // self
-    for &child in &children[idx] {
-        count += count_tree_descendants_inner(child, children, depth + 1);
-    }
-    count
+/// Get context_id of the node at a given ring index.
+pub fn context_id_at_ring_index(constellation: &Constellation, ring_idx: usize) -> Option<&str> {
+    constellation.nodes.iter()
+        .find(|n| n.ring_index == ring_idx)
+        .map(|n| n.context_id.as_str())
 }
 
-/// Recursively layout children in angular sectors at increasing ring depths.
-fn layout_children(
-    parent_idx: usize,
-    angle_start: f32,
-    sector: f32,
-    depth: usize,
-    base_radius: f32,
-    ring_spacing: f32,
-    children: &[Vec<usize>],
-    positions: &mut [Vec2],
-) {
-    let child_indices = &children[parent_idx];
-    if child_indices.is_empty() {
-        return;
-    }
-
-    let radius = base_radius + depth as f32 * ring_spacing;
-
-    let total_desc: usize = child_indices.iter().map(|&c| count_tree_descendants(c, children)).sum();
-    let mut current_angle = angle_start;
-
-    for &child_idx in child_indices {
-        let desc = count_tree_descendants(child_idx, children);
-        let child_sector = sector * (desc as f32 / total_desc.max(1) as f32);
-        let mid_angle = current_angle + child_sector / 2.0;
-
-        positions[child_idx] = Vec2::new(mid_angle.cos() * radius, mid_angle.sin() * radius);
-
-        // Recurse for grandchildren
-        layout_children(child_idx, current_angle, child_sector, depth + 1, base_radius, ring_spacing, children, positions);
-
-        current_angle += child_sector;
-    }
+/// Compute the target carousel angle to bring a ring index to the front.
+pub fn carousel_angle_for_ring_index(ring_idx: usize, total: usize) -> f32 {
+    -std::f32::consts::TAU * ring_idx as f32 / total as f32
 }
 
-/// Smoothly interpolate camera offset and zoom toward targets.
+/// Smoothly interpolate camera offset, zoom, and carousel rotation toward targets.
 fn interpolate_camera(
     mut camera: ResMut<ConstellationCamera>,
     screen: Res<State<crate::ui::screen::Screen>>,
@@ -618,6 +616,21 @@ fn interpolate_camera(
         camera.zoom += zoom_diff * t;
     } else {
         camera.zoom = camera.target_zoom;
+    }
+
+    // Carousel rotation (shortest-path angular interpolation)
+    let mut angle_diff = camera.target_carousel_angle - camera.carousel_angle;
+    // Normalize to [-π, π] for shortest rotation
+    while angle_diff > std::f32::consts::PI {
+        angle_diff -= std::f32::consts::TAU;
+    }
+    while angle_diff < -std::f32::consts::PI {
+        angle_diff += std::f32::consts::TAU;
+    }
+    if angle_diff.abs() > 0.001 {
+        camera.carousel_angle += angle_diff * t;
+    } else {
+        camera.carousel_angle = camera.target_carousel_angle;
     }
 }
 

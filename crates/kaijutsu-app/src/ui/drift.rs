@@ -258,6 +258,16 @@ fn sync_model_info_to_constellation(
             if node.parent_id != new_parent_id {
                 node.parent_id = new_parent_id;
             }
+
+            // Sync label
+            let new_label = if ctx_info.label.is_empty() {
+                None
+            } else {
+                Some(ctx_info.label.clone())
+            };
+            if node.label != new_label {
+                node.label = new_label;
+            }
         } else {
             // Create placeholder node for server-known contexts not yet in constellation.
             // This makes all contexts visible in the constellation, not just joined ones.

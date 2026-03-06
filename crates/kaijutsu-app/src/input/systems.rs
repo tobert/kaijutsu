@@ -513,9 +513,10 @@ pub fn handle_tiling(
 
 use crate::cell::PromptSubmitted;
 use crate::ui::constellation::{
-    CameraOrbit, Constellation, ConstellationCamera, ConstellationScene,
+    CameraOrbit, Constellation, ConstellationCamera,
     NewContextConfig, OpenForkForm, create_or_fork_context,
-    find_nearest_in_direction, find_nearest_in_direction_3d,
+    find_nearest_in_direction,
+    focused_ring_index, context_id_at_ring_index, carousel_angle_for_ring_index,
     model_picker::OpenModelPicker,
 };
 
@@ -528,7 +529,6 @@ pub fn handle_constellation_nav(
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
-    scene: Option<Res<ConstellationScene>>,
     mut orbit: Option<ResMut<CameraOrbit>>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut model_writer: MessageWriter<OpenModelPicker>,
@@ -541,17 +541,28 @@ pub fn handle_constellation_nav(
     for ActionFired(action) in actions.read() {
         match action {
             Action::SpatialNav(direction) => {
-                // Use 3D navigation if scene is available, fall back to 2D
-                let target_id = if let Some(ref scene) = scene {
-                    find_nearest_in_direction_3d(&constellation, scene, *direction)
+                let n = constellation.nodes.len();
+                if n == 0 { continue; }
+
+                // h/l spin the carousel ring; j/k use spatial navigation
+                if direction.x.abs() > direction.y.abs() {
+                    // Horizontal: spin carousel
+                    if let Some(ring_idx) = focused_ring_index(&constellation) {
+                        let step = if direction.x > 0.0 { 1 } else { n - 1 };
+                        let new_idx = (ring_idx + step) % n;
+                        if let Some(target_id) = context_id_at_ring_index(&constellation, new_idx) {
+                            let target_id = target_id.to_string();
+                            constellation.focus(&target_id);
+                            camera.target_carousel_angle = carousel_angle_for_ring_index(new_idx, n);
+                        }
+                    }
                 } else {
-                    find_nearest_in_direction(&constellation, *direction)
-                };
-                if let Some(target_id) = target_id {
-                    constellation.focus(&target_id);
-                    // 2D camera fallback (kept for non-3D mode)
-                    if let Some(node) = constellation.node_by_id(&target_id) {
-                        camera.target_offset = -node.position * camera.zoom;
+                    // Vertical: spatial nearest-neighbor (still useful for finding nearby nodes)
+                    if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
+                        constellation.focus(&target_id);
+                        if let Some(node) = constellation.node_by_id(&target_id) {
+                            camera.target_carousel_angle = carousel_angle_for_ring_index(node.ring_index, n);
+                        }
                     }
                 }
             }
