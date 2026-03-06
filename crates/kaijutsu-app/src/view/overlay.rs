@@ -298,16 +298,9 @@ pub fn update_overlay_scene(
             continue;
         }
 
-        // Calculate cursor position
+        // Calculate cursor position (row, col in text)
         let display = overlay.display_text();
         let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
-
-        // Get content box offset (padding inset from border-box origin)
-        // content.min is offset from CENTER to content corner, so:
-        // padding = content.min + size/2
-        let content = computed.content_box();
-        let padding_left = (content.min.x + size.x / 2.0) as f64;
-        let padding_top = (content.min.y + size.y / 2.0) as f64;
 
         let mut scene = vello::Scene::new();
         build_overlay_panel(
@@ -324,8 +317,10 @@ pub fn update_overlay_scene(
             let char_width = text_metrics.cell_char_width as f64;
             let line_height = text_metrics.cell_line_height as f64;
 
-            let cursor_x = padding_left + col as f64 * char_width;
-            let cursor_y = padding_top + row as f64 * line_height;
+            // Scene origin appears to be at content-box, not border-box.
+            // No padding offsets needed.
+            let cursor_x = col as f64 * char_width;
+            let cursor_y = row as f64 * line_height;
 
             draw_cursor_beam(
                 &mut scene,
