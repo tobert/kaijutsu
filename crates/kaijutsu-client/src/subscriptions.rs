@@ -315,12 +315,11 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e.into()),
         };
 
-        // Parse optional displayHint (JSON-serialized OutputData)
-        let output = params.get_display_hint()
+        // Parse optional outputData (postcard binary OutputData)
+        let output = params.get_output_data()
             .ok()
-            .and_then(|s| s.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str::<kaijutsu_types::OutputData>(s).ok());
+            .filter(|b| !b.is_empty())
+            .and_then(|b| postcard::from_bytes::<kaijutsu_types::OutputData>(b).ok());
 
         let _ = self.event_tx.send(ServerEvent::BlockStatusChanged {
             context_id,

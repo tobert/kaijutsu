@@ -1855,14 +1855,12 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.is_error(true);
     }
 
-    // Structured output data (JSON-serialized OutputData)
+    // Structured output data (postcard binary)
     if reader.has_display_hint() {
-        if let Ok(hint) = reader.get_display_hint() {
-            if let Ok(s) = hint.to_str() {
-                if !s.is_empty() {
-                    if let Ok(data) = serde_json::from_str::<kaijutsu_types::OutputData>(s) {
-                        builder = builder.output(data);
-                    }
+        if let Ok(bytes) = reader.get_display_hint() {
+            if !bytes.is_empty() {
+                if let Ok(data) = postcard::from_bytes::<kaijutsu_types::OutputData>(bytes) {
+                    builder = builder.output(data);
                 }
             }
         }

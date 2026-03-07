@@ -135,8 +135,8 @@ struct BlockSnapshot {
   hasExitCode @13 :Bool;      # True if exitCode is set (Int32 value type)
   isError @14 :Bool;          # True if toolResult is an error
 
-  # Structured output data for richer formatting (JSON-serialized OutputData)
-  displayHint @15 :Text;      # JSON OutputData (tables/trees) — field name kept for wire compat
+  # Structured output data for richer formatting (postcard-serialized OutputData)
+  displayHint @15 :Data;      # postcard OutputData (tables/trees) — field name kept for wire compat
 
   # Drift-specific fields (cross-context transfer)
   sourceContext @16 :Data;    # 16-byte ContextId of originating context
@@ -245,7 +245,7 @@ interface BlockEvents {
   onBlockDeleted @1 (contextId :Data, blockId :BlockId);
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, displayHint :Text);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, outputData :Data);
   onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data);
   onSyncReset @6 (contextId :Data, generation :UInt64);
 

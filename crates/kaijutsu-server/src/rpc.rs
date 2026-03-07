@@ -1365,8 +1365,8 @@ impl kernel::Server for KernelImpl {
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
                                         if let Some(output_data) = output {
-                                            if let Ok(json) = serde_json::to_string(output_data) {
-                                                params.set_display_hint(&json);
+                                            if let Ok(bytes) = postcard::to_allocvec(output_data) {
+                                                params.set_output_data(&bytes);
                                             }
                                         }
                                     }
@@ -4631,8 +4631,8 @@ impl kernel::Server for KernelImpl {
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
                                         if let Some(output_data) = output {
-                                            if let Ok(json) = serde_json::to_string(output_data) {
-                                                params.set_display_hint(&json);
+                                            if let Ok(bytes) = postcard::to_allocvec(output_data) {
+                                                params.set_output_data(&bytes);
                                             }
                                         }
                                     }
@@ -5602,10 +5602,10 @@ fn set_block_snapshot(
     }
     builder.set_is_error(block.is_error);
 
-    // Set output data if present (JSON-serialized for wire)
+    // Set output data if present (postcard binary for wire)
     if let Some(ref output) = block.output {
-        if let Ok(json) = serde_json::to_string(output) {
-            builder.set_display_hint(&json);
+        if let Ok(bytes) = postcard::to_allocvec(output) {
+            builder.set_display_hint(&bytes);
         }
     }
 
@@ -5926,13 +5926,12 @@ fn parse_block_snapshot(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
-    // Read output data from wire protocol (JSON-deserialized)
+    // Read output data from wire protocol (postcard binary)
     let output = if reader.has_display_hint() {
         reader.get_display_hint()
             .ok()
-            .and_then(|s| s.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str::<kaijutsu_types::OutputData>(s).ok())
+            .filter(|b| !b.is_empty())
+            .and_then(|b| postcard::from_bytes::<kaijutsu_types::OutputData>(b).ok())
     } else {
         None
     };
