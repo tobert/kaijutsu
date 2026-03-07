@@ -508,24 +508,53 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
         BlockKind::Text => block.content.clone(),
         BlockKind::ToolCall => {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
-            let status_tag = match block.status {
-                Status::Running => " [running]",
-                Status::Pending => " [pending]",
-                _ => "",
-            };
-            let mut output = format!("{}{}", name, status_tag);
+            // For shell commands, show just the code value
+            // For other tools, show "ToolName: primary_arg" on one line
             if let Some(ref input_str) = block.tool_input {
                 if let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str) {
+                    if let Some(obj) = input_val.as_object() {
+                        // Shell: just show the code
+                        if let Some(code) = obj.get("code").and_then(|v| v.as_str()) {
+                            return code.to_string();
+                        }
+                        // Single-arg tool: "ToolName: value"
+                        if obj.len() == 1 {
+                            let (key, val) = obj.iter().next().unwrap();
+                            let val_str = match val {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
+                            let _ = key; // suppress unused
+                            return format!("{}: {}", name, val_str);
+                        }
+                        // Multi-arg: "ToolName: primary" then remaining args
+                        if !obj.is_empty() {
+                            let mut iter = obj.iter();
+                            let (_, first_val) = iter.next().unwrap();
+                            let primary = match first_val {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
+                            let mut output = format!("{}: {}", name, primary);
+                            let remaining: serde_json::Map<String, serde_json::Value> =
+                                iter.map(|(k, v)| (k.clone(), v.clone())).collect();
+                            if !remaining.is_empty() {
+                                let args = format_tool_args(&serde_json::Value::Object(remaining));
+                                output.push('\n');
+                                output.push_str(&args);
+                            }
+                            return output;
+                        }
+                    }
                     if !input_val.is_null() {
                         let args = format_tool_args(&input_val);
                         if !args.is_empty() {
-                            output.push('\n');
-                            output.push_str(&args);
+                            return format!("{}: {}", name, args);
                         }
                     }
                 }
             }
-            output
+            name.to_string()
         }
         BlockKind::ToolResult => {
             // Prefer structured OutputData when available
@@ -629,11 +658,13 @@ mod tests {
             None,
         );
         let result = format_single_block(&block, None);
+        // New format: "ToolName: primary_arg" — no status tag, no box chars
         assert!(!result.contains('┌'));
         assert!(!result.contains('└'));
         assert!(result.contains("read_file"));
-        assert!(result.contains("path: /etc/hosts"));
-        assert!(result.contains("[running]"));
+        assert!(result.contains("/etc/hosts"));
+        // Status tag moved to border label — not in body
+        assert!(!result.contains("[running]"));
     }
 
     #[test]

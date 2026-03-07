@@ -7,6 +7,8 @@
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
 
+use kaijutsu_types::ToolKind;
+
 use crate::view::{
     BlockCell, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell,
     BlockCellContainer, EditorEntities, Role,
@@ -14,6 +16,9 @@ use crate::view::{
 use crate::view::fieldset;
 use crate::text::FontHandles;
 use crate::ui::theme::Theme;
+use crate::connection::RpcConnectionState;
+use crate::ui::drift::DriftState;
+use crate::view::document::DocumentCache;
 
 // ============================================================================
 // COMPONENTS
@@ -67,6 +72,10 @@ pub enum BorderKind {
     TopAccent,
     /// Dashed rectangle (thinking).
     Dashed,
+    /// Top + left + right edges, no bottom (tool call with result below).
+    OpenBottom,
+    /// Left + right + bottom edges, horizontal divider at top (tool result connected to call above).
+    OpenTop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
@@ -94,6 +103,12 @@ pub struct BlockBorderActive;
 // SYSTEMS
 // ============================================================================
 
+/// Context for computing border labels (username, model name).
+struct BorderContext {
+    username: String,
+    model: String,
+}
+
 /// Examine each BlockCell's snapshot and add/update/remove `BlockBorderStyle`.
 ///
 /// Runs in CellPhase::Buffer (after sync_block_cell_buffers).
@@ -105,6 +120,9 @@ pub fn determine_block_border_style(
     block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>)>,
     theme: Res<Theme>,
     layout_gen: Res<super::components::LayoutGeneration>,
+    conn_state: Res<RpcConnectionState>,
+    drift_state: Res<DriftState>,
+    doc_cache: Res<DocumentCache>,
     mut last_gen: Local<u64>,
 ) {
     // Border styles only change when blocks change (add/remove/line count/status)
@@ -123,11 +141,27 @@ pub fn determine_block_border_style(
         return;
     };
 
-    let blocks: std::collections::HashMap<_, _> = editor
-        .blocks()
-        .into_iter()
-        .map(|b| (b.id.clone(), b))
+    let blocks_vec = editor.blocks();
+    let blocks: std::collections::HashMap<_, _> = blocks_vec
+        .iter()
+        .map(|b| (b.id, b))
         .collect();
+
+    // Build set of tool_call_ids that have a ToolResult
+    let has_result: std::collections::HashSet<_> = blocks_vec
+        .iter()
+        .filter(|b| b.kind == BlockKind::ToolResult)
+        .filter_map(|b| b.tool_call_id)
+        .collect();
+
+    // Build context for labels
+    let ctx = BorderContext {
+        username: conn_state.identity.as_ref().map(|i| i.username.clone()).unwrap_or_default(),
+        model: doc_cache.active_id()
+            .and_then(|ctx_id| drift_state.contexts.iter().find(|c| c.id == ctx_id))
+            .map(|c| c.model.clone())
+            .unwrap_or_default(),
+    };
 
     for &entity in container.block_cells.values() {
         let Ok((ent, block_cell, existing_style)) = block_cells.get(entity) else {
@@ -142,7 +176,8 @@ pub fn determine_block_border_style(
             continue;
         };
 
-        let new_style = compute_border_style(block, &theme);
+        let has_result_below = has_result.contains(&block.id);
+        let new_style = compute_border_style(block, &theme, &ctx, has_result_below);
 
         match (&new_style, existing_style) {
             (Some(style), Some(existing)) if style == existing => {
@@ -160,7 +195,14 @@ pub fn determine_block_border_style(
 }
 
 /// Decide border style for a block based on kind, status, and content.
-fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBorderStyle> {
+///
+/// `has_result`: true if this ToolCall block has a paired ToolResult below.
+fn compute_border_style(
+    block: &BlockSnapshot,
+    theme: &Theme,
+    ctx: &BorderContext,
+    has_result: bool,
+) -> Option<BlockBorderStyle> {
     use kaijutsu_crdt::Status;
 
     let padding = BorderPadding {
@@ -173,68 +215,112 @@ fn compute_border_style(block: &BlockSnapshot, theme: &Theme) -> Option<BlockBor
     match block.kind {
         BlockKind::ToolCall => {
             let (animation, color) = match block.status {
-                Status::Running => (BorderAnimation::Chase, theme.block_border_tool_call),
-                Status::Pending => (BorderAnimation::Chase, theme.block_border_tool_call),
-                _ => (BorderAnimation::None, theme.block_border_tool_call.with_alpha(0.5)),
+                Status::Running | Status::Pending => {
+                    (BorderAnimation::Chase, theme.block_border_tool_call)
+                }
+                _ => {
+                    // Unified boxes (with result below) keep higher opacity for visible sides
+                    let alpha = if has_result { 0.7 } else { 0.5 };
+                    (BorderAnimation::None, theme.block_border_tool_call.with_alpha(alpha))
+                }
             };
-            let tool_name = if block.content.is_empty() {
-                "tool call".to_string()
+
+            // Top label: "COMMAND @username" for shell, "TOOL CALL model" for others
+            let top_label = match block.tool_kind {
+                Some(ToolKind::Shell) => {
+                    if ctx.username.is_empty() {
+                        "COMMAND".to_string()
+                    } else {
+                        format!("COMMAND @{}", ctx.username)
+                    }
+                }
+                _ => {
+                    if ctx.model.is_empty() {
+                        "TOOL CALL".to_string()
+                    } else {
+                        let model = ctx.model.rsplit('/').next().unwrap_or(&ctx.model);
+                        format!("TOOL CALL {}", model)
+                    }
+                }
+            };
+
+            // Status label on the call only when there's no result block yet
+            let status_label = if has_result {
+                None // status moves to the result's bottom label
             } else {
-                // First line often has tool name
-                let first_line = block.content.lines().next().unwrap_or("tool call");
-                format!("tool call: {}", first_line.chars().take(30).collect::<String>())
+                match block.status {
+                    Status::Running => Some("running".to_string()),
+                    Status::Pending => Some("pending".to_string()),
+                    Status::Done => None,
+                    Status::Error => Some("error".to_string()),
+                }
             };
-            let status_label = match block.status {
-                Status::Running => Some("running".to_string()),
-                Status::Pending => Some("pending".to_string()),
-                Status::Done => None, // done tools don't need a status label
-                Status::Error => Some("error".to_string()),
+
+            // Use OpenBottom when paired with a result block
+            let kind = if has_result {
+                BorderKind::OpenBottom
+            } else {
+                BorderKind::Full
             };
+
             Some(BlockBorderStyle {
-                kind: BorderKind::Full,
+                kind,
                 color,
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
                 padding,
                 animation,
-                top_label: Some(tool_name),
+                top_label: Some(top_label),
                 bottom_label: status_label,
             })
         }
         BlockKind::ToolResult => {
             let content = block.content.trim();
-            if content.is_empty() && !block.is_error {
+            let has_output = block.output.is_some();
+            if content.is_empty() && !has_output && !block.is_error {
                 return None; // empty success — no border
             }
-            if block.is_error {
-                Some(BlockBorderStyle {
-                    kind: BorderKind::Full,
-                    color: theme.block_border_error,
-                    thickness: theme.block_border_thickness,
-                    corner_radius: theme.block_border_corner_radius,
-                    padding,
-                    animation: BorderAnimation::Pulse,
-                    top_label: Some("result".to_string()),
-                    bottom_label: Some("error".to_string()),
-                })
+
+            let has_paired_call = block.tool_call_id.is_some();
+            let color = if block.is_error {
+                theme.block_border_error
             } else {
-                let line_count = content.lines().count();
-                let kind = if line_count <= 3 {
-                    BorderKind::TopAccent
-                } else {
-                    BorderKind::Full
-                };
-                Some(BlockBorderStyle {
-                    kind,
-                    color: theme.block_border_tool_result,
-                    thickness: theme.block_border_thickness,
-                    corner_radius: theme.block_border_corner_radius,
-                    padding,
-                    animation: BorderAnimation::None,
-                    top_label: Some("result".to_string()),
-                    bottom_label: None,
-                })
-            }
+                theme.block_border_tool_call // same color as call for unified look
+            };
+            let animation = if block.is_error {
+                BorderAnimation::Pulse
+            } else {
+                BorderAnimation::None
+            };
+
+            // Connected to call above → OpenTop, standalone → Full
+            let kind = if has_paired_call {
+                BorderKind::OpenTop
+            } else {
+                BorderKind::Full
+            };
+
+            // Status label on the bottom
+            let status_label = match block.status {
+                Status::Running => Some("running".to_string()),
+                Status::Pending => Some("pending".to_string()),
+                Status::Done => None,
+                Status::Error => Some("error".to_string()),
+            };
+
+            Some(BlockBorderStyle {
+                kind,
+                color,
+                thickness: theme.block_border_thickness,
+                corner_radius: theme.block_border_corner_radius,
+                padding: BorderPadding {
+                    top: if has_paired_call { theme.block_border_padding * 0.5 } else { padding.top },
+                    ..padding
+                },
+                animation,
+                top_label: None, // divider line, no label
+                bottom_label: status_label,
+            })
         }
         BlockKind::Thinking => {
             if block.collapsed {

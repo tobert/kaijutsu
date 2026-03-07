@@ -186,6 +186,11 @@ pub fn sync_block_cell_buffers(
             block_cell.last_text_len = text_len;
             layout_changed = true;
         }
+        // Status changes affect border kind/animation (Running→Done turns off chase)
+        if block_cell.last_status != block.status {
+            block_cell.last_status = block.status;
+            layout_changed = true;
+        }
 
         block_cell.last_render_version = Some(doc_version);
     }
@@ -252,8 +257,8 @@ pub fn layout_block_cells(
     };
 
     let blocks_ordered = editor.blocks();
-    let block_lookup: std::collections::HashMap<&kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
-        blocks_ordered.iter().map(|b| (&b.id, b)).collect();
+    let block_lookup: std::collections::HashMap<kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
+        blocks_ordered.iter().map(|b| (b.id, b)).collect();
 
     for &entity in container.block_cells.values() {
         let Ok((block_cell, mut block_layout)) = block_cells.get_mut(entity) else {
@@ -261,8 +266,11 @@ pub fn layout_block_cells(
         };
 
         let indent_level = if let Some(block) = block_lookup.get(&block_cell.block_id) {
-            if block.kind == kaijutsu_crdt::BlockKind::ToolResult && block.tool_call_id.is_some() {
-                1
+            // Tool call/result blocks are flush (no indent) — they form unified boxes
+            if block.kind == kaijutsu_crdt::BlockKind::ToolCall
+                || block.kind == kaijutsu_crdt::BlockKind::ToolResult
+            {
+                0
             } else if block.parent_id.is_some() {
                 1
             } else {
@@ -324,9 +332,18 @@ pub fn update_block_cell_nodes(
             UiRect::ZERO
         };
 
+        // Zero bottom margin for OpenBottom borders (ToolCall connected to ToolResult below)
+        let bottom_spacing = if border_style.map(|s| s.kind) == Some(crate::cell::block_border::BorderKind::OpenBottom) {
+            0.0
+        } else {
+            BLOCK_SPACING
+        };
+        // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge
+        let h_margin = if border_style.is_some() { 2.0 } else { 0.0 };
         let target_margin = UiRect {
-            left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH),
-            bottom: Val::Px(BLOCK_SPACING),
+            left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH + h_margin),
+            right: Val::Px(h_margin),
+            bottom: Val::Px(bottom_spacing),
             ..default()
         };
         if node.margin != target_margin {
@@ -408,16 +425,22 @@ pub fn reorder_conversation_children(
     }
 
     for block in &blocks {
-        let is_transition = prev_role != Some(block.role);
-        if is_transition {
-            if let Some(&header_ent) = header_map.get(&block.id) {
-                ordered_children.push(header_ent);
+        // Skip tool blocks for role transition tracking (they use fieldset borders)
+        let dominated_by_border = block.kind == kaijutsu_crdt::BlockKind::ToolCall
+            || block.kind == kaijutsu_crdt::BlockKind::ToolResult;
+
+        if !dominated_by_border {
+            let is_transition = prev_role != Some(block.role);
+            if is_transition {
+                if let Some(&header_ent) = header_map.get(&block.id) {
+                    ordered_children.push(header_ent);
+                }
             }
+            prev_role = Some(block.role);
         }
         if let Some(block_ent) = container.get_entity(&block.id) {
             ordered_children.push(block_ent);
         }
-        prev_role = Some(block.role);
     }
 
     let current_children = children_query.get(conv_entity).ok();

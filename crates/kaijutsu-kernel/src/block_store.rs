@@ -884,10 +884,24 @@ impl BlockStore {
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
     ) -> Result<(), String> {
-        let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-        let agent_id = self.agent_id();
-        entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
-        entry.touch(agent_id);
+        let ops = {
+            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let agent_id = self.agent_id();
+            // Capture frontier before mutation to extract ops
+            let frontier = entry.doc.frontier();
+            entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
+            entry.touch(agent_id);
+            let ops = entry.doc.ops_since(&frontier);
+            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+        };
+
+        // Emit ops so clients receive the OutputData update
+        self.emit(BlockFlow::TextOps {
+            context_id,
+            block_id: *block_id,
+            ops: Arc::from(ops),
+            source: OpSource::Local,
+        });
         Ok(())
     }
 

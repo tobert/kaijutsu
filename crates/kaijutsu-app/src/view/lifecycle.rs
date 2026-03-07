@@ -343,11 +343,18 @@ pub fn sync_role_headers(
         return;
     };
 
-    // Compute expected role transitions
+    // Compute expected role transitions (skip tool blocks — they use fieldset borders)
     let blocks = editor.blocks();
     let mut expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = Vec::new();
     let mut prev_role: Option<kaijutsu_crdt::Role> = None;
     for block in &blocks {
+        // Tool blocks get their attribution from the fieldset border label,
+        // so they don't need role group headers ("ASSISTANT", "TOOL", etc.)
+        if block.kind == kaijutsu_crdt::BlockKind::ToolCall
+            || block.kind == kaijutsu_crdt::BlockKind::ToolResult
+        {
+            continue;
+        }
         if prev_role != Some(block.role) {
             expected.push((block.role, block.id));
         }

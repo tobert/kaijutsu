@@ -70,6 +70,14 @@ pub fn build_fieldset_border(
 
             draw_fieldset_rect(scene, width, height, r, &stroke, &brush, top_gap, bottom_gap);
         }
+        BorderKind::OpenBottom => {
+            let top_gap = top_label.map(|l| measure_label_width(l, font));
+            draw_open_bottom(scene, width, height, r, &stroke, &brush, top_gap);
+        }
+        BorderKind::OpenTop => {
+            let bottom_gap = bottom_label.map(|l| measure_label_width(l, font));
+            draw_open_top(scene, width, height, r, &stroke, &brush, bottom_gap);
+        }
         BorderKind::TopAccent => {
             // Just the top line with optional label gap
             let top_gap = top_label.map(|l| measure_label_width(l, font));
@@ -94,17 +102,25 @@ pub fn build_fieldset_border(
     // Animation overlays (before labels so labels are always on top)
     match style.animation {
         BorderAnimation::Chase => {
-            chase_overlay(scene, width, height, r, style.thickness as f64, time, &style.color);
+            chase_overlay(scene, width, height, r, style.thickness as f64, time, &style.color, style.kind);
         }
         _ => {}
     }
 
     // Labels drawn last — always visible above borders and animations
     match style.kind {
-        BorderKind::Full => {
+        BorderKind::Full | BorderKind::OpenBottom => {
             if let (Some(label), Some(font)) = (top_label, font) {
                 draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush, bg_color);
             }
+            if let (Some(label), Some(font)) = (bottom_label, font) {
+                let label_w = measure_label_width(label, Some(font));
+                let x = width - LABEL_INSET - LABEL_PAD - label_w;
+                draw_label_text(scene, label, x, height, font, &brush, bg_color);
+            }
+        }
+        BorderKind::OpenTop => {
+            // Bottom label only (status on the result block)
             if let (Some(label), Some(font)) = (bottom_label, font) {
                 let label_w = measure_label_width(label, Some(font));
                 let x = width - LABEL_INSET - LABEL_PAD - label_w;
@@ -284,6 +300,134 @@ fn draw_fieldset_rect(
         path.move_to((x0, y1 - r));
         path.line_to((x0, y0 + r));
         scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+    }
+}
+
+/// Draw top + left + right edges (no bottom) with optional top label gap.
+///
+/// Used for ToolCall when a ToolResult follows below.
+fn draw_open_bottom(
+    scene: &mut vello::Scene,
+    width: f64,
+    height: f64,
+    radius: f64,
+    stroke: &Stroke,
+    brush: &Brush,
+    top_gap_width: Option<f64>,
+) {
+    let half_t = stroke.width / 2.0;
+    let r = radius.min(width / 2.0).min(height / 2.0);
+    let x0 = half_t;
+    let y0 = half_t;
+    let x1 = width - half_t;
+    let y1 = height; // extend to full height (no bottom inset)
+
+    // === Top edge with label gap ===
+    match top_gap_width {
+        Some(gap_w) => {
+            let gap_start = LABEL_INSET;
+            let gap_end = gap_start + LABEL_PAD + gap_w + LABEL_PAD;
+
+            let mut path = BezPath::new();
+            arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
+            if gap_start > x0 + r {
+                path.line_to((gap_start, y0));
+            }
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+
+            let mut path = BezPath::new();
+            let clamped_end = gap_end.min(x1 - r);
+            path.move_to((clamped_end, y0));
+            path.line_to((x1 - r, y0));
+            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+        }
+        None => {
+            let mut path = BezPath::new();
+            arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
+            path.line_to((x1 - r, y0));
+            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+        }
+    }
+
+    // === Left edge (top to bottom, no corner at bottom) ===
+    scene.stroke(stroke, Affine::IDENTITY, brush, None,
+        &Line::new((x0, y0 + r), (x0, y1)));
+
+    // === Right edge (top to bottom, no corner at bottom) ===
+    scene.stroke(stroke, Affine::IDENTITY, brush, None,
+        &Line::new((x1, y0 + r), (x1, y1)));
+}
+
+/// Draw left + right + bottom edges with horizontal divider at top.
+///
+/// Used for ToolResult connected to a ToolCall above.
+fn draw_open_top(
+    scene: &mut vello::Scene,
+    width: f64,
+    height: f64,
+    radius: f64,
+    stroke: &Stroke,
+    brush: &Brush,
+    bottom_gap_width: Option<f64>,
+) {
+    let half_t = stroke.width / 2.0;
+    let r = radius.min(width / 2.0).min(height / 2.0);
+    let x0 = half_t;
+    let y0 = 0.0; // start at very top (no top inset)
+    let x1 = width - half_t;
+    let y1 = height - half_t;
+
+    // === Horizontal divider at top (full width) ===
+    scene.stroke(stroke, Affine::IDENTITY, brush, None,
+        &Line::new((x0, half_t), (x1, half_t)));
+
+    // === Left edge (top to bottom corner) ===
+    {
+        let mut path = BezPath::new();
+        path.move_to((x0, y0));
+        path.line_to((x0, y1 - r));
+        scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+    }
+
+    // === Right edge (top to bottom corner) ===
+    {
+        let mut path = BezPath::new();
+        path.move_to((x1, y0));
+        path.line_to((x1, y1 - r));
+        scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+    }
+
+    // === Bottom edge with optional label gap ===
+    match bottom_gap_width {
+        Some(gap_w) => {
+            let gap_total = LABEL_PAD + gap_w + LABEL_PAD;
+            let gap_end = width - LABEL_INSET;
+            let gap_start = gap_end - gap_total;
+
+            // Bottom-right corner + segment to gap
+            let mut path = BezPath::new();
+            arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
+            let clamped_gap_end = gap_end.min(x1 - r);
+            path.line_to((clamped_gap_end, y1));
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+
+            // Gap start to bottom-left corner
+            let mut path = BezPath::new();
+            let clamped_gap_start = gap_start.max(x0 + r);
+            path.move_to((clamped_gap_start, y1));
+            path.line_to((x0 + r, y1));
+            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+        }
+        None => {
+            let mut path = BezPath::new();
+            arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
+            path.line_to((x0 + r, y1));
+            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
+        }
     }
 }
 
@@ -480,15 +624,14 @@ fn chase_overlay(
     thickness: f64,
     time: f32,
     color: &Color,
+    kind: BorderKind,
 ) {
-    // Build the full border path for dash calculation
     let half_t = thickness / 2.0;
-    let rect = RoundedRect::new(half_t, half_t, width - half_t, height - half_t, radius);
-    let perimeter = rect.perimeter(0.1);
-
-    // Chase segment: ~15% of perimeter, traveling at effect_chase_speed
-    let chase_len = perimeter * 0.15;
-    let position = (time as f64 * 2.0) % perimeter; // speed factor
+    let r = radius.min(width / 2.0).min(height / 2.0);
+    let x0 = half_t;
+    let y0 = half_t;
+    let x1 = width - half_t;
+    let y1 = height - half_t;
 
     // Bright version of the border color
     let srgba = color.to_srgba();
@@ -500,12 +643,53 @@ fn chase_overlay(
     );
     let brush = bevy_color_to_brush(bright);
 
-    // Use dashed stroke to create a single bright segment
-    let stroke = Stroke::new(thickness * 1.5)
-        .with_caps(Cap::Round)
-        .with_dashes(position, &[chase_len, perimeter - chase_len]);
-
-    scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
+    match kind {
+        BorderKind::OpenBottom => {
+            // U-shape: left side up, across top, right side down
+            let mut path = BezPath::new();
+            path.move_to((x0, height));
+            path.line_to((x0, y0 + r));
+            arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
+            path.line_to((x1 - r, y0));
+            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            path.line_to((x1, height));
+            let perimeter = path.perimeter(0.1);
+            let chase_len = perimeter * 0.15;
+            let position = (time as f64 * 2.0) % perimeter;
+            let stroke = Stroke::new(thickness * 1.5)
+                .with_caps(Cap::Round)
+                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+            scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &path);
+        }
+        BorderKind::OpenTop => {
+            // Inverted U: left side down, across bottom, right side up
+            let mut path = BezPath::new();
+            path.move_to((x0, 0.0));
+            path.line_to((x0, y1 - r));
+            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            path.line_to((x1 - r, y1));
+            arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
+            path.line_to((x1, 0.0));
+            let perimeter = path.perimeter(0.1);
+            let chase_len = perimeter * 0.15;
+            let position = (time as f64 * 2.0) % perimeter;
+            let stroke = Stroke::new(thickness * 1.5)
+                .with_caps(Cap::Round)
+                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+            scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &path);
+        }
+        _ => {
+            // Full rectangle
+            let rect = RoundedRect::new(x0, y0, x1, y1, r);
+            let perimeter = rect.perimeter(0.1);
+            let chase_len = perimeter * 0.15;
+            let position = (time as f64 * 2.0) % perimeter;
+            let stroke = Stroke::new(thickness * 1.5)
+                .with_caps(Cap::Round)
+                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+            scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
+        }
+    }
 }
 
 /// Compute animation alpha multiplier.

@@ -700,6 +700,9 @@ pub struct BlockCell {
     /// Word-wrap line count can only change when text length changes,
     /// so this catches wrapping that newline-count missed.
     pub last_text_len: usize,
+    /// Last known block status for border dirty detection.
+    /// Status changes (Running→Done) affect border kind/animation.
+    pub last_status: kaijutsu_crdt::Status,
     /// Last known rainbow effect state for change detection.
     pub last_rainbow: bool,
     /// True when this block has active rich content (markdown/sparkline/SVG).
@@ -714,6 +717,7 @@ impl BlockCell {
             block_id,
             last_render_version: None,
             last_text_len: 0,
+            last_status: kaijutsu_crdt::Status::Running,
             last_rainbow: false,
             is_rich: false,
         }
