@@ -1365,9 +1365,7 @@ impl kernel::Server for KernelImpl {
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
                                         if let Some(output_data) = output {
-                                            if let Ok(bytes) = postcard::to_allocvec(output_data) {
-                                                params.set_output_data(&bytes);
-                                            }
+                                            build_output_data(params.reborrow().init_output_data(), output_data);
                                         }
                                     }
                                     req.send().promise.await.is_ok()
@@ -2205,17 +2203,14 @@ impl kernel::Server for KernelImpl {
                 result_builder.set_stdout(exec_result.out.as_bytes());
                 result_builder.set_stderr(&exec_result.err);
 
-                // Serialize data if present (convert kaish Value to JSON)
+                // Serialize data if present
                 if let Some(ref data) = exec_result.data {
-                    let json_value = crate::kaish_backend::kaish_value_to_json(data);
-                    result_builder.set_data(&serde_json::to_string(&json_value).unwrap_or_default());
+                    value_to_shell_value(result_builder.reborrow().init_data(), data);
                 }
 
-                // Serialize structured output data as JSON
+                // Serialize structured output data
                 if let Some(ref output_data) = exec_result.output {
-                    if let Ok(json) = serde_json::to_string(output_data) {
-                        result_builder.set_hint(&json);
-                    }
+                    build_output_data(result_builder.reborrow().init_output_data(), output_data);
                 }
             } else {
                 // No last result - return empty/zero values
@@ -2223,8 +2218,6 @@ impl kernel::Server for KernelImpl {
                 result_builder.set_ok(true);
                 result_builder.set_stdout(&[]);
                 result_builder.set_stderr("");
-                result_builder.set_data("");
-                result_builder.set_hint("");
             }
 
             Ok(())
@@ -4631,9 +4624,7 @@ impl kernel::Server for KernelImpl {
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
                                         if let Some(output_data) = output {
-                                            if let Ok(bytes) = postcard::to_allocvec(output_data) {
-                                                params.set_output_data(&bytes);
-                                            }
+                                            build_output_data(params.reborrow().init_output_data(), output_data);
                                         }
                                     }
                                     req.send().promise.await.is_ok()
@@ -4768,6 +4759,118 @@ fn shell_value_to_value(reader: shell_value::Reader<'_>) -> Result<kaish_kernel:
                 content_type: String::new(),
                 hash: None,
             }))
+        }
+    }
+}
+
+// ============================================================================
+// OutputData Build Helpers
+// ============================================================================
+
+fn entry_type_to_capnp(et: kaijutsu_types::OutputEntryType) -> crate::kaijutsu_capnp::EntryType {
+    use kaijutsu_types::OutputEntryType;
+    use crate::kaijutsu_capnp::EntryType;
+    match et {
+        OutputEntryType::Text => EntryType::Text,
+        OutputEntryType::File => EntryType::File,
+        OutputEntryType::Directory => EntryType::Directory,
+        OutputEntryType::Executable => EntryType::Executable,
+        OutputEntryType::Symlink => EntryType::Symlink,
+        _ => EntryType::Text,
+    }
+}
+
+fn build_output_node(mut builder: crate::kaijutsu_capnp::output_node::Builder<'_>, node: &kaijutsu_types::OutputNode) {
+    builder.set_name(&node.name);
+    builder.set_entry_type(entry_type_to_capnp(node.entry_type));
+    if let Some(ref text) = node.text {
+        builder.set_has_text(true);
+        builder.set_text(text);
+    }
+    if !node.cells.is_empty() {
+        let mut cells = builder.reborrow().init_cells(node.cells.len() as u32);
+        for (i, cell) in node.cells.iter().enumerate() {
+            cells.set(i as u32, cell);
+        }
+    }
+    if !node.children.is_empty() {
+        let mut children = builder.reborrow().init_children(node.children.len() as u32);
+        for (i, child) in node.children.iter().enumerate() {
+            build_output_node(children.reborrow().get(i as u32), child);
+        }
+    }
+}
+
+fn entry_type_from_capnp(et: crate::kaijutsu_capnp::EntryType) -> kaijutsu_types::OutputEntryType {
+    use crate::kaijutsu_capnp::EntryType;
+    use kaijutsu_types::OutputEntryType;
+    match et {
+        EntryType::Text => OutputEntryType::Text,
+        EntryType::File => OutputEntryType::File,
+        EntryType::Directory => OutputEntryType::Directory,
+        EntryType::Executable => OutputEntryType::Executable,
+        EntryType::Symlink => OutputEntryType::Symlink,
+    }
+}
+
+fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
+    let name = reader.get_name()?.to_str()?.to_owned();
+    let entry_type = entry_type_from_capnp(reader.get_entry_type()?);
+    let text = if reader.get_has_text() {
+        Some(reader.get_text()?.to_str()?.to_owned())
+    } else {
+        None
+    };
+    let cells_reader = reader.get_cells()?;
+    let mut cells = Vec::with_capacity(cells_reader.len() as usize);
+    for i in 0..cells_reader.len() {
+        cells.push(cells_reader.get(i)?.to_str()?.to_owned());
+    }
+    let children_reader = reader.get_children()?;
+    let mut children = Vec::with_capacity(children_reader.len() as usize);
+    for i in 0..children_reader.len() {
+        children.push(parse_output_node(children_reader.get(i))?);
+    }
+    Ok(kaijutsu_types::OutputNode {
+        name,
+        entry_type,
+        text,
+        cells,
+        children,
+    })
+}
+
+fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Reader<'_>) -> Result<kaijutsu_types::OutputData, capnp::Error> {
+    let headers = if reader.get_has_headers() {
+        let hlist = reader.get_headers()?;
+        let mut v = Vec::with_capacity(hlist.len() as usize);
+        for i in 0..hlist.len() {
+            v.push(hlist.get(i)?.to_str()?.to_owned());
+        }
+        Some(v)
+    } else {
+        None
+    };
+    let root_reader = reader.get_root()?;
+    let mut root = Vec::with_capacity(root_reader.len() as usize);
+    for i in 0..root_reader.len() {
+        root.push(parse_output_node(root_reader.get(i))?);
+    }
+    Ok(kaijutsu_types::OutputData { headers, root })
+}
+
+fn build_output_data(mut builder: crate::kaijutsu_capnp::output_data::Builder<'_>, data: &kaijutsu_types::OutputData) {
+    if let Some(ref headers) = data.headers {
+        builder.set_has_headers(true);
+        let mut hlist = builder.reborrow().init_headers(headers.len() as u32);
+        for (i, h) in headers.iter().enumerate() {
+            hlist.set(i as u32, h);
+        }
+    }
+    if !data.root.is_empty() {
+        let mut root = builder.reborrow().init_root(data.root.len() as u32);
+        for (i, node) in data.root.iter().enumerate() {
+            build_output_node(root.reborrow().get(i as u32), node);
         }
     }
 }
@@ -4924,7 +5027,8 @@ fn parse_block_filter_from_capnp(
     let ids_list = reader.get_exclude_block_ids()?;
     let mut exclude_block_ids = std::collections::HashSet::new();
     for i in 0..ids_list.len() {
-        exclude_block_ids.insert(ids_list.get(i)?.to_str()?.to_string());
+        let id = parse_block_id_from_reader(&ids_list.get(i))?;
+        exclude_block_ids.insert(id.to_key());
     }
 
     Ok(ForkBlockFilter {
@@ -5602,11 +5706,9 @@ fn set_block_snapshot(
     }
     builder.set_is_error(block.is_error);
 
-    // Set output data if present (postcard binary for wire)
+    // Set output data if present
     if let Some(ref output) = block.output {
-        if let Ok(bytes) = postcard::to_allocvec(output) {
-            builder.set_display_hint(&bytes);
-        }
+        build_output_data(builder.reborrow().init_output_data(), output);
     }
 
     // Set tool mechanism metadata
@@ -5926,15 +6028,10 @@ fn parse_block_snapshot(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
-    // Read output data from wire protocol (postcard binary)
-    let output = if reader.has_display_hint() {
-        reader.get_display_hint()
-            .ok()
-            .filter(|b| !b.is_empty())
-            .and_then(|b| postcard::from_bytes::<kaijutsu_types::OutputData>(b).ok())
-    } else {
-        None
-    };
+    // Read output data from wire protocol
+    let output = reader.get_output_data()
+        .ok()
+        .and_then(|r| parse_output_data(r).ok());
 
     Ok(kaijutsu_crdt::BlockSnapshot {
         id,

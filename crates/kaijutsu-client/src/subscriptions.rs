@@ -315,11 +315,11 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e.into()),
         };
 
-        // Parse optional outputData (postcard binary OutputData)
+        // Parse optional outputData
         let output = params.get_output_data()
             .ok()
-            .filter(|b| !b.is_empty())
-            .and_then(|b| postcard::from_bytes::<kaijutsu_types::OutputData>(b).ok());
+            .and_then(|r| crate::rpc::parse_output_data(r).ok())
+            .filter(|d| !d.root.is_empty() || d.headers.is_some());
 
         let _ = self.event_tx.send(ServerEvent::BlockStatusChanged {
             context_id,

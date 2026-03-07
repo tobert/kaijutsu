@@ -135,8 +135,8 @@ struct BlockSnapshot {
   hasExitCode @13 :Bool;      # True if exitCode is set (Int32 value type)
   isError @14 :Bool;          # True if toolResult is an error
 
-  # Structured output data for richer formatting (postcard-serialized OutputData)
-  displayHint @15 :Data;      # postcard OutputData (tables/trees) — field name kept for wire compat
+  # Structured output data for richer formatting (typed Cap'n Proto struct)
+  outputData @15 :OutputData;
 
   # Drift-specific fields (cross-context transfer)
   sourceContext @16 :Data;    # 16-byte ContextId of originating context
@@ -245,7 +245,7 @@ interface BlockEvents {
   onBlockDeleted @1 (contextId :Data, blockId :BlockId);
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, outputData :Data);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, outputData :OutputData);
   onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data);
   onSyncReset @6 (contextId :Data, generation :UInt64);
 
@@ -413,7 +413,34 @@ struct ForkBlockFilter {
   excludeKinds @1 :List(Text);    # Skip blocks with these BlockKind names
   excludeRoles @2 :List(Text);    # Skip blocks with these Role names
   maxBlocks @3 :UInt32;           # Limit total blocks (0 = unlimited)
-  excludeBlockIds @4 :List(Text); # Skip specific blocks by BlockId key (context:agent:seq)
+  excludeBlockIds @4 :List(BlockId); # Skip specific blocks by typed BlockId
+}
+
+# ============================================================================
+# OutputData Types (Structured Output from kaish commands)
+# ============================================================================
+
+enum EntryType {
+  text @0;
+  file @1;
+  directory @2;
+  executable @3;
+  symlink @4;
+}
+
+struct OutputNode {
+  name @0 :Text;
+  entryType @1 :EntryType;
+  text @2 :Text;             # content when hasText=true; None vs Some("") distinction
+  hasText @3 :Bool;
+  cells @4 :List(Text);
+  children @5 :List(OutputNode);
+}
+
+struct OutputData {
+  headers @0 :List(Text);
+  hasHeaders @1 :Bool;       # None vs Some([]) distinction
+  root @2 :List(OutputNode);
 }
 
 # ============================================================================
@@ -432,8 +459,8 @@ struct ShellExecResult {
   ok @1 :Bool;              # Convenience: code == 0
   stdout @2 :Data;          # Raw bytes (may be binary — images, postcard, etc.)
   stderr @3 :Text;          # Always text (diagnostics, warnings)
-  data @4 :Text;            # JSON-encoded parsed data (if applicable)
-  hint @5 :Text;            # JSON-encoded OutputData for tables/trees
+  data @4 :ShellValue;      # Parsed result value (structured)
+  outputData @5 :OutputData; # Structured output for tables/trees
 }
 
 # Shell variable value (mirrors kaish ast::Value)
@@ -472,7 +499,7 @@ struct OutputEvent {
     stdout @0 :Text;
     stderr @1 :Text;
     exitCode @2 :Int32;
-    structured @3 :Text;        # JSON structured output
+    structured @3 :OutputData;  # Structured output
   }
 }
 

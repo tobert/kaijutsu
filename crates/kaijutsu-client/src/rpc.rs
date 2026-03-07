@@ -1338,9 +1338,9 @@ impl KernelHandle {
                 }
             }
             {
-                let mut ids = bf.init_exclude_block_ids(block_filter.exclude_block_ids.len() as u32);
+                let mut ids = bf.reborrow().init_exclude_block_ids(block_filter.exclude_block_ids.len() as u32);
                 for (i, id) in block_filter.exclude_block_ids.iter().enumerate() {
-                    ids.set(i as u32, id);
+                    set_block_id_builder(&mut ids.reborrow().get(i as u32), id);
                 }
             }
 
@@ -1703,6 +1703,64 @@ fn set_block_id_builder(
     builder.set_seq(id.seq);
 }
 
+fn entry_type_from_capnp(et: crate::kaijutsu_capnp::EntryType) -> kaijutsu_types::OutputEntryType {
+    use crate::kaijutsu_capnp::EntryType;
+    use kaijutsu_types::OutputEntryType;
+    match et {
+        EntryType::Text => OutputEntryType::Text,
+        EntryType::File => OutputEntryType::File,
+        EntryType::Directory => OutputEntryType::Directory,
+        EntryType::Executable => OutputEntryType::Executable,
+        EntryType::Symlink => OutputEntryType::Symlink,
+    }
+}
+
+fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
+    let name = reader.get_name()?.to_str()?.to_owned();
+    let entry_type = entry_type_from_capnp(reader.get_entry_type()?);
+    let text = if reader.get_has_text() {
+        Some(reader.get_text()?.to_str()?.to_owned())
+    } else {
+        None
+    };
+    let cells_reader = reader.get_cells()?;
+    let mut cells = Vec::with_capacity(cells_reader.len() as usize);
+    for i in 0..cells_reader.len() {
+        cells.push(cells_reader.get(i)?.to_str()?.to_owned());
+    }
+    let children_reader = reader.get_children()?;
+    let mut children = Vec::with_capacity(children_reader.len() as usize);
+    for i in 0..children_reader.len() {
+        children.push(parse_output_node(children_reader.get(i))?);
+    }
+    Ok(kaijutsu_types::OutputNode {
+        name,
+        entry_type,
+        text,
+        cells,
+        children,
+    })
+}
+
+pub(crate) fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Reader<'_>) -> Result<kaijutsu_types::OutputData, capnp::Error> {
+    let headers = if reader.get_has_headers() {
+        let hlist = reader.get_headers()?;
+        let mut v = Vec::with_capacity(hlist.len() as usize);
+        for i in 0..hlist.len() {
+            v.push(hlist.get(i)?.to_str()?.to_owned());
+        }
+        Some(v)
+    } else {
+        None
+    };
+    let root_reader = reader.get_root()?;
+    let mut root = Vec::with_capacity(root_reader.len() as usize);
+    for i in 0..root_reader.len() {
+        root.push(parse_output_node(root_reader.get(i))?);
+    }
+    Ok(kaijutsu_types::OutputData { headers, root })
+}
+
 fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
     ContextId::try_from_slice(data).ok_or_else(|| {
         RpcError::ServerError(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
@@ -1855,13 +1913,11 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.is_error(true);
     }
 
-    // Structured output data (postcard binary)
-    if reader.has_display_hint() {
-        if let Ok(bytes) = reader.get_display_hint() {
-            if !bytes.is_empty() {
-                if let Ok(data) = postcard::from_bytes::<kaijutsu_types::OutputData>(bytes) {
-                    builder = builder.output(data);
-                }
+    // Structured output data
+    if let Ok(output_data_reader) = reader.get_output_data() {
+        if let Ok(data) = parse_output_data(output_data_reader) {
+            if !data.root.is_empty() || data.headers.is_some() {
+                builder = builder.output(data);
             }
         }
     }
@@ -2047,8 +2103,8 @@ pub struct ClientForkBlockFilter {
     pub exclude_roles: Vec<String>,
     /// Limit total blocks (None = unlimited).
     pub max_blocks: Option<usize>,
-    /// Skip specific blocks by BlockId key.
-    pub exclude_block_ids: Vec<String>,
+    /// Skip specific blocks by typed BlockId.
+    pub exclude_block_ids: Vec<BlockId>,
 }
 
 /// Shell variable value (mirrors kaish `ast::Value`).
