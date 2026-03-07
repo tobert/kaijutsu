@@ -41,10 +41,10 @@ fn load_fonts(
     asset_server: Res<AssetServer>,
     mut font_handles: ResMut<FontHandles>,
 ) {
-    font_handles.mono = asset_server.load("fonts/NotoMono-Regular.ttf");
+    font_handles.mono = asset_server.load("fonts/CascadiaCodeNF.ttf");
     font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
     font_handles.cjk = asset_server.load("fonts/NotoSansCJKJP-Light.ttf");
-    info!("Loaded Vello fonts: NotoMono, NotoSerif, NotoSansCJKJP");
+    info!("Loaded Vello fonts: CascadiaCodeNF, NotoSerif, NotoSansCJKJP");
 }
 
 /// Measure actual line height and character width from the loaded font.
@@ -67,6 +67,10 @@ fn update_text_metrics_from_font(
     let style = VelloTextStyle {
         font_size: text_metrics.cell_font_size,
         font: font_handles.mono.clone(),
+        font_axes: VelloFontAxes {
+            weight: Some(200.0),
+            ..default()
+        },
         ..default()
     };
 

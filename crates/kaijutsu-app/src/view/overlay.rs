@@ -117,6 +117,10 @@ pub fn spawn_input_overlay(
                 font: font_handles.mono.clone(),
                 brush: bevy_color_to_brush(theme.fg_dim),
                 font_size: text_metrics.cell_font_size,
+                font_axes: bevy_vello::prelude::VelloFontAxes {
+                    weight: Some(200.0),
+                    ..default()
+                },
                 ..default()
             },
             ..default()

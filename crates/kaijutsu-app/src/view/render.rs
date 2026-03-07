@@ -192,7 +192,7 @@ pub fn sync_block_cell_buffers(
 pub fn sync_text_max_advance(
     mut block_cells: Query<
         (&mut UiVelloText, &ComputedNode),
-        (With<BlockCell>, Changed<ComputedNode>),
+        With<BlockCell>,
     >,
 ) {
     for (mut vello_text, computed_node) in block_cells.iter_mut() {
@@ -475,6 +475,14 @@ pub fn readback_block_heights(
 
             y_offset += height + margin_bottom;
         }
+    }
+
+    // When new blocks were added this frame, record the pre-update content height
+    // as an anchor. smooth_scroll uses min(max, anchor) next frame so the new
+    // content is revealed from its start rather than jumping to its bottom.
+    if scroll_state.new_blocks_added {
+        scroll_state.pending_scroll_anchor = Some(scroll_state.content_height);
+        scroll_state.new_blocks_added = false;
     }
 
     if (scroll_state.content_height - y_offset).abs() > 0.5 {

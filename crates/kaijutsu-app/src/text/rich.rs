@@ -41,6 +41,8 @@ pub struct RichContent {
     pub version: u64,
     /// Last rendered version.
     pub last_render_version: u64,
+    /// The max_advance used for the last render (0.0 = None).
+    pub last_max_advance: f32,
 }
 
 impl RichContent {
@@ -212,7 +214,11 @@ pub fn render_rich_content(
     };
 
     for (entity, mut rich, vello_text, node) in query.iter_mut() {
-        if rich.version == rich.last_render_version {
+        let current_advance = node.size().x;
+        let advance_changed = (rich.last_max_advance - current_advance).abs() > 1.0
+            && current_advance > 0.0;
+
+        if rich.version == rich.last_render_version && !advance_changed {
             continue;
         }
 
@@ -225,8 +231,7 @@ pub fn render_rich_content(
                 };
 
                 let max_advance = {
-                    let w = node.size().x;
-                    if w > 0.0 { Some(w) } else { None }
+                    if current_advance > 0.0 { Some(current_advance) } else { None }
                 };
 
                 let layout = font.layout(
@@ -268,6 +273,7 @@ pub fn render_rich_content(
 
         commands.entity(entity).insert(UiVelloScene::from(scene));
         rich.last_render_version = rich.version;
+        rich.last_max_advance = current_advance;
     }
 }
 
@@ -338,6 +344,7 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
             kind: RichContentKind::Sparkline(data),
             version,
             last_render_version: 0,
+            last_max_advance: 0.0,
         });
     }
 
@@ -347,6 +354,7 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
             kind: RichContentKind::Svg { scene, width, height },
             version,
             last_render_version: 0,
+            last_max_advance: 0.0,
         });
     }
 
@@ -367,5 +375,6 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
         kind: RichContentKind::Markdown { spans, plain_text },
         version,
         last_render_version: 0,
+        last_max_advance: 0.0,
     })
 }

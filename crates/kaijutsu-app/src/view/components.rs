@@ -559,6 +559,14 @@ pub struct ConversationScrollState {
     /// Used to detect content changes for scroll auto-follow.
     #[reflect(ignore)]
     pub last_content_gen: u64,
+    /// Set when new block entities are spawned this frame.
+    /// Consumed by readback_block_heights (PostUpdate) to compute the scroll anchor.
+    pub new_blocks_added: bool,
+    /// When new blocks are added, this holds the content height *before* the new
+    /// blocks were measured. smooth_scroll uses min(max, anchor) so the viewport
+    /// reveals new content from its start rather than jumping to its bottom.
+    /// Cleared after one smooth_scroll consumption.
+    pub pending_scroll_anchor: Option<f32>,
 }
 
 impl Default for ConversationScrollState {
@@ -571,6 +579,8 @@ impl Default for ConversationScrollState {
             following: true, // Start in follow mode
             user_scrolled_this_frame: false,
             last_content_gen: 0,
+            new_blocks_added: false,
+            pending_scroll_anchor: None,
         }
     }
 }
@@ -802,6 +812,8 @@ mod tests {
             following: false,
             user_scrolled_this_frame: false,
             last_content_gen: 0,
+            new_blocks_added: false,
+            pending_scroll_anchor: None,
         }
     }
 

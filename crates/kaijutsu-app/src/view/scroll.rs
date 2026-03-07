@@ -25,8 +25,18 @@ pub fn smooth_scroll(
     let clamped_target = scroll_state.target_offset.min(max).max(0.0);
 
     let (new_offset, new_target) = if scroll_state.following {
-        if (max - old_offset).abs() >= 1.0 {
-            (max, max)
+        // When new blocks just appeared, reveal them from their start rather than
+        // jumping to the absolute bottom. The anchor is the content height before
+        // the new blocks were measured, i.e. the y-offset where they begin.
+        // Using min(max, anchor) ensures we show the new block's top when it's
+        // taller than the viewport, but still scroll normally for small blocks.
+        let target = if let Some(anchor) = scroll_state.pending_scroll_anchor.take() {
+            anchor.min(max)
+        } else {
+            max
+        };
+        if (target - old_offset).abs() >= 1.0 {
+            (target, target)
         } else {
             (old_offset, old_target)
         }

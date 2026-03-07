@@ -6,7 +6,7 @@
 //! flex layout for positioning — no UiTransform hack.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
+use bevy_vello::prelude::{UiVelloText, VelloFont, VelloFontAxes, VelloTextAnchor};
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor,
@@ -141,6 +141,8 @@ pub fn spawn_block_cells(
     font_handles: Res<FontHandles>,
     fonts: Res<Assets<VelloFont>>,
     text_metrics: Res<TextMetrics>,
+    computed_nodes: Query<&ComputedNode>,
+    mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -229,6 +231,16 @@ pub fn spawn_block_cells(
 
     let current_version = editor.version();
     let conv_entity = entities.conversation_container;
+
+    // Use the container's current content width as the initial max_advance so
+    // Parley wraps text correctly from the very first frame. Without this,
+    // blocks spawn with max_advance=None, measure as a single line, then snap
+    // to their true wrapped height one frame later — causing a visible scroll jump.
+    let initial_max_advance = conv_entity
+        .and_then(|e| computed_nodes.get(e).ok())
+        .map(|cn| cn.content_box().width())
+        .filter(|&w| w > 0.0);
+
     let mut had_additions = false;
 
     for block_id in &current_blocks {
@@ -247,9 +259,13 @@ pub fn spawn_block_cells(
                             font: font_handles.mono.clone(),
                             brush: bevy_color_to_brush(Color::WHITE),
                             font_size: text_metrics.cell_font_size,
+                            font_axes: VelloFontAxes {
+                                weight: Some(200.0),
+                                ..default()
+                            },
                             ..default()
                         },
-                        max_advance: None, // set dynamically from ComputedNode width
+                        max_advance: initial_max_advance,
                         ..default()
                     },
                     VelloTextAnchor::TopLeft,
@@ -278,6 +294,10 @@ pub fn spawn_block_cells(
             had_additions, had_removals, container.block_cells.len(),
         );
         layout_gen.bump();
+    }
+
+    if had_additions {
+        scroll_state.new_blocks_added = true;
     }
 
     // Reorder container.block_cells to match document order

@@ -30,6 +30,10 @@ pub fn vello_style(font: &Handle<VelloFont>, color: Color, font_size: f32) -> Ve
         font: font.clone(),
         brush: bevy_color_to_brush(color),
         font_size,
+        font_axes: VelloFontAxes {
+            weight: Some(200.0),
+            ..default()
+        },
         ..default()
     }
 }

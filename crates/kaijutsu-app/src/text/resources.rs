@@ -52,9 +52,9 @@ pub struct TextMetrics {
 impl Default for TextMetrics {
     fn default() -> Self {
         Self {
-            cell_font_size: 16.0,
-            cell_line_height: 24.0,
-            cell_char_width: 16.0 * 0.6, // 9.6 — approximation until font loads
+            cell_font_size: 20.0,
+            cell_line_height: 30.0,
+            cell_char_width: 20.0 * 0.6, // 12.0 — approximation until font loads
             letter_spacing: 1.0,
             scale_factor: 1.0,
             cell_line_height_from_font: false,
