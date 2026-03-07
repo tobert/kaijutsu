@@ -246,7 +246,7 @@ fn spawn_content_subtree(
                         },
                         flex_direction: FlexDirection::Column,
                         overflow: Overflow::scroll_y(),
-                        padding: UiRect::axes(Val::Px(16.0), Val::Px(4.0)),
+                        padding: UiRect::axes(Val::Px(4.0), Val::Px(4.0)),
                         border: UiRect::all(Val::Px(2.0)),
                         ..default()
                     },

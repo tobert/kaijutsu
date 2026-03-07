@@ -338,8 +338,9 @@ pub fn update_block_cell_nodes(
         } else {
             theme.block_spacing
         };
-        // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge
-        let h_margin = if border_style.is_some() { theme.block_border_thickness * 2.0 } else { 0.0 };
+        // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge.
+        // Use stroke width as the margin — just enough to clear the stroke on each side.
+        let h_margin = if border_style.is_some() { theme.block_border_thickness } else { 0.0 };
         let target_margin = UiRect {
             left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH + h_margin),
             right: Val::Px(h_margin),
