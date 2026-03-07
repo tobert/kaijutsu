@@ -31,9 +31,6 @@ use crate::ui::timeline::TimelineVisibility;
 /// Horizontal indentation per nesting level (for nested tool results, etc.)
 pub(crate) const INDENT_WIDTH: f32 = 24.0;
 
-/// Vertical spacing between blocks.
-pub(crate) const BLOCK_SPACING: f32 = 8.0;
-
 /// Height reserved for role transition headers (e.g., "User", "Assistant").
 pub(crate) const ROLE_HEADER_HEIGHT: f32 = 20.0;
 

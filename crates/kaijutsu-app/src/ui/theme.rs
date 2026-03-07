@@ -316,8 +316,10 @@ pub struct Theme {
     pub block_border_glow_radius: f32,
     /// Glow intensity (0.0-1.0)
     pub block_border_glow_intensity: f32,
-    /// Base padding inside borders (pixels)
+    /// Multiplier against cell_font_size for border inner padding
     pub block_border_padding: f32,
+    /// Vertical spacing between blocks (pixels)
+    pub block_spacing: f32,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Compose block (input area)
@@ -514,7 +516,8 @@ impl Default for Theme {
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 0.15,
             block_border_glow_intensity: 0.6,
-            block_border_padding: 2.0,
+            block_border_padding: 0.4,
+            block_spacing: 12.0,
 
             // Compose block
             compose_border: Color::srgb(0.231, 0.259, 0.380), // #3b4261 matches border

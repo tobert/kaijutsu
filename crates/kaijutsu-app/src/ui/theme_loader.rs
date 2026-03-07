@@ -415,6 +415,9 @@ fn apply_theme_from_scope(scope: &Scope, theme: &mut Theme) {
     if let Some(v) = get_float(&scope, "block_border_padding") {
         theme.block_border_padding = v;
     }
+    if let Some(v) = get_float(&scope, "block_spacing") {
+        theme.block_spacing = v;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Compose block

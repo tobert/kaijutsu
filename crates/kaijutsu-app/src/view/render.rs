@@ -20,7 +20,7 @@ use crate::ui::timeline::TimelineVisibility;
 use bevy_vello::prelude::{UiVelloText, VelloFont};
 
 use super::format::{block_color, format_single_block};
-use super::lifecycle::{INDENT_WIDTH, BLOCK_SPACING, ROLE_HEADER_SPACING};
+use super::lifecycle::{INDENT_WIDTH, ROLE_HEADER_SPACING};
 
 // ============================================================================
 // BUFFER INIT / SYNC
@@ -332,14 +332,14 @@ pub fn update_block_cell_nodes(
             UiRect::ZERO
         };
 
-        // Zero bottom margin for OpenBottom borders (ToolCall connected to ToolResult below)
+        // Tiny gap for OpenBottom (ToolCall → ToolResult) so the divider line has breathing room
         let bottom_spacing = if border_style.map(|s| s.kind) == Some(crate::cell::block_border::BorderKind::OpenBottom) {
-            0.0
+            1.0
         } else {
-            BLOCK_SPACING
+            theme.block_spacing
         };
         // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge
-        let h_margin = if border_style.is_some() { 2.0 } else { 0.0 };
+        let h_margin = if border_style.is_some() { theme.block_border_thickness * 2.0 } else { 0.0 };
         let target_margin = UiRect {
             left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH + h_margin),
             right: Val::Px(h_margin),

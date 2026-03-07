@@ -14,7 +14,7 @@ use crate::view::{
     BlockCellContainer, EditorEntities, Role,
 };
 use crate::view::fieldset;
-use crate::text::FontHandles;
+use crate::text::{FontHandles, TextMetrics};
 use crate::ui::theme::Theme;
 use crate::connection::RpcConnectionState;
 use crate::ui::drift::DriftState;
@@ -119,6 +119,7 @@ pub fn determine_block_border_style(
     containers: Query<&BlockCellContainer>,
     block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>)>,
     theme: Res<Theme>,
+    text_metrics: Res<TextMetrics>,
     layout_gen: Res<super::components::LayoutGeneration>,
     conn_state: Res<RpcConnectionState>,
     drift_state: Res<DriftState>,
@@ -177,7 +178,7 @@ pub fn determine_block_border_style(
         };
 
         let has_result_below = has_result.contains(&block.id);
-        let new_style = compute_border_style(block, &theme, &ctx, has_result_below);
+        let new_style = compute_border_style(block, &theme, &ctx, has_result_below, text_metrics.cell_font_size);
 
         match (&new_style, existing_style) {
             (Some(style), Some(existing)) if style == existing => {
@@ -202,14 +203,17 @@ fn compute_border_style(
     theme: &Theme,
     ctx: &BorderContext,
     has_result: bool,
+    font_size: f32,
 ) -> Option<BlockBorderStyle> {
     use kaijutsu_crdt::Status;
 
+    // Padding scales with font size: block_border_padding is a multiplier
+    let base = theme.block_border_padding * font_size;
     let padding = BorderPadding {
-        top: theme.block_border_padding,
-        bottom: theme.block_border_padding * 0.75,
-        left: theme.block_border_padding * 1.5,
-        right: theme.block_border_padding * 1.5,
+        top: base * 0.5,
+        bottom: base * 0.375,
+        left: base * 0.75,
+        right: base * 0.75,
     };
 
     match block.kind {
@@ -220,7 +224,7 @@ fn compute_border_style(
                 }
                 _ => {
                     // Unified boxes (with result below) keep higher opacity for visible sides
-                    let alpha = if has_result { 0.7 } else { 0.5 };
+                    let alpha = if has_result { 0.85 } else { 0.7 };
                     (BorderAnimation::None, theme.block_border_tool_call.with_alpha(alpha))
                 }
             };
@@ -284,8 +288,11 @@ fn compute_border_style(
             let has_paired_call = block.tool_call_id.is_some();
             let color = if block.is_error {
                 theme.block_border_error
+            } else if has_paired_call {
+                // Match the ToolCall's alpha for a unified box look
+                theme.block_border_tool_call.with_alpha(0.85)
             } else {
-                theme.block_border_tool_call // same color as call for unified look
+                theme.block_border_tool_call
             };
             let animation = if block.is_error {
                 BorderAnimation::Pulse
@@ -314,7 +321,7 @@ fn compute_border_style(
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
                 padding: BorderPadding {
-                    top: if has_paired_call { theme.block_border_padding * 0.5 } else { padding.top },
+                    top: if has_paired_call { base * 0.25 } else { padding.top },
                     ..padding
                 },
                 animation,
