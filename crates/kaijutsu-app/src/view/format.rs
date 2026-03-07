@@ -4,7 +4,7 @@
 //! display strings. No ECS, no systems, just data transforms.
 
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, OutputData, OutputNode};
 use crate::ui::theme::Theme;
 
 /// Map a block to its semantic text color based on BlockKind and Role.
@@ -197,6 +197,130 @@ fn format_tool_args(value: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
+/// Format structured `OutputData` into space-aligned text.
+///
+/// Dispatch order:
+/// 1. Simple text → passthrough
+/// 2. Tabular (has headers or cells) → `format_output_table()`
+/// 3. Tree (has children) → indented tree
+/// 4. Flat list (names only) → one name per line
+/// 5. Fallback → `to_canonical_string()`
+fn format_output_data(data: &OutputData) -> String {
+    // 1. Simple text passthrough
+    if let Some(text) = data.as_text() {
+        return text.to_string();
+    }
+
+    // 2. Tabular
+    if data.headers.is_some() || data.is_tabular() {
+        return format_output_table(data);
+    }
+
+    // 3. Tree
+    if !data.is_flat() {
+        return format_output_tree(data);
+    }
+
+    // 4. Flat list (names only)
+    if !data.root.is_empty() && data.root.iter().all(|n| n.cells.is_empty()) {
+        return data.root.iter()
+            .map(|n| n.display_name().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // 5. Fallback
+    data.to_canonical_string()
+}
+
+/// Format tabular OutputData as space-padded aligned columns.
+fn format_output_table(data: &OutputData) -> String {
+    let headers = data.headers.as_deref();
+
+    // Build rows as [name, cell0, cell1, ...]
+    let rows: Vec<Vec<&str>> = data.root.iter().map(|node| {
+        let mut row = vec![node.display_name()];
+        row.extend(node.cells.iter().map(|s| s.as_str()));
+        row
+    }).collect();
+
+    // Determine number of columns
+    let header_cols = headers.map_or(0, |h| h.len());
+    let max_row_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let num_cols = header_cols.max(max_row_cols);
+
+    if num_cols == 0 {
+        return String::new();
+    }
+
+    // Calculate max width per column
+    let mut widths = vec![0usize; num_cols];
+    if let Some(hdrs) = headers {
+        for (i, h) in hdrs.iter().enumerate() {
+            widths[i] = widths[i].max(h.len());
+        }
+    }
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < num_cols {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+
+    let gap = "  ";
+    let mut lines = Vec::new();
+
+    // Header line
+    if let Some(hdrs) = headers {
+        let line: String = hdrs.iter().enumerate().map(|(i, h)| {
+            if i + 1 < num_cols {
+                format!("{:<width$}", h, width = widths[i])
+            } else {
+                h.to_string()
+            }
+        }).collect::<Vec<_>>().join(gap);
+        lines.push(line);
+    }
+
+    // Data rows
+    for row in &rows {
+        let line: String = (0..num_cols).map(|i| {
+            let cell = row.get(i).copied().unwrap_or("");
+            if i + 1 < num_cols {
+                format!("{:<width$}", cell, width = widths[i])
+            } else {
+                cell.to_string()
+            }
+        }).collect::<Vec<_>>().join(gap);
+        lines.push(line);
+    }
+
+    lines.join("\n")
+}
+
+/// Format tree OutputData with indentation.
+fn format_output_tree(data: &OutputData) -> String {
+    let mut lines = Vec::new();
+    for node in &data.root {
+        format_tree_node(node, 0, &mut lines);
+    }
+    lines.join("\n")
+}
+
+fn format_tree_node(node: &OutputNode, depth: usize, lines: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    if node.cells.is_empty() {
+        lines.push(format!("{}{}", indent, node.display_name()));
+    } else {
+        let cells = node.cells.join("  ");
+        lines.push(format!("{}{}  {}", indent, node.display_name(), cells));
+    }
+    for child in &node.children {
+        format_tree_node(child, depth + 1, lines);
+    }
+}
+
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
@@ -233,21 +357,25 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
             output
         }
         BlockKind::ToolResult => {
-            let content = block.content.trim();
-            if block.is_error {
-                if content.is_empty() {
-                    "error".to_string()
-                } else {
-                    format!("error \u{2717}\n{}", content)
-                }
-            } else if content.is_empty() {
-                "done".to_string()
+            // Prefer structured OutputData when available
+            let body = if let Some(ref output) = block.output {
+                let formatted = format_output_data(output);
+                if formatted.is_empty() { None } else { Some(formatted) }
             } else {
-                let line_count = content.lines().count();
-                if line_count <= 3 {
-                    format!("done\n{}", content)
-                } else {
-                    format!("result\n{}", content)
+                let trimmed = block.content.trim();
+                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+            };
+
+            if block.is_error {
+                match body {
+                    None => "error".to_string(),
+                    Some(text) => format!("error \u{2717}\n{}", text),
+                }
+            } else {
+                match body {
+                    None => "done".to_string(),
+                    Some(ref text) if text.lines().count() <= 3 => format!("done\n{}", text),
+                    Some(text) => format!("result\n{}", text),
                 }
             }
         }
@@ -262,7 +390,7 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_types::{BlockId, PrincipalId, ToolKind};
+    use kaijutsu_types::{BlockId, OutputData, OutputNode, PrincipalId, ToolKind};
 
     fn test_block_id() -> BlockId {
         BlockId::new(ContextId::new(), PrincipalId::new(), 0)
@@ -373,6 +501,102 @@ mod tests {
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "done");
+    }
+
+    #[test]
+    fn test_format_output_table_with_headers() {
+        let data = OutputData::table(
+            vec!["PID".into(), "NAME".into(), "STATUS".into()],
+            vec![
+                OutputNode::new("1").with_cells(vec!["init".into(), "running".into()]),
+                OutputNode::new("42").with_cells(vec!["bash".into(), "sleeping".into()]),
+                OutputNode::new("1337").with_cells(vec!["vim".into(), "running".into()]),
+            ],
+        );
+        let result = format_output_data(&data);
+        assert!(!result.contains('\t'), "should not contain tabs");
+        // Check alignment: PID column should be padded to 4 chars ("1337")
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 4); // header + 3 rows
+        assert!(lines[0].starts_with("PID "));
+        assert!(lines[1].starts_with("1   "));
+        assert!(lines[3].starts_with("1337"));
+    }
+
+    #[test]
+    fn test_format_output_table_no_headers() {
+        let data = OutputData::nodes(vec![
+            OutputNode::new("foo").with_cells(vec!["100".into()]),
+            OutputNode::new("barbaz").with_cells(vec!["2".into()]),
+        ]);
+        let result = format_output_data(&data);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("foo   "));
+        assert!(lines[1].starts_with("barbaz"));
+    }
+
+    #[test]
+    fn test_format_output_simple_text() {
+        let data = OutputData::text("hello world");
+        assert_eq!(format_output_data(&data), "hello world");
+    }
+
+    #[test]
+    fn test_format_output_flat_list() {
+        let data = OutputData::nodes(vec![
+            OutputNode::new("alpha"),
+            OutputNode::new("beta"),
+            OutputNode::new("gamma"),
+        ]);
+        assert_eq!(format_output_data(&data), "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn test_format_output_tree() {
+        let data = OutputData::nodes(vec![
+            OutputNode::new("src").with_children(vec![
+                OutputNode::new("main.rs"),
+                OutputNode::new("lib").with_children(vec![
+                    OutputNode::new("utils.rs"),
+                ]),
+            ]),
+        ]);
+        let result = format_output_data(&data);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines[0], "src");
+        assert_eq!(lines[1], "  main.rs");
+        assert_eq!(lines[2], "  lib");
+        assert_eq!(lines[3], "    utils.rs");
+    }
+
+    #[test]
+    fn test_tool_result_with_output_data() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
+        let output = OutputData::table(
+            vec!["PID".into(), "CMD".into()],
+            vec![
+                OutputNode::new("1").with_cells(vec!["init".into()]),
+                OutputNode::new("2").with_cells(vec!["bash".into()]),
+            ],
+        );
+        let mut block = BlockSnapshot::tool_result(
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Shell,
+            "1\tinit\n2\tbash",
+            false,
+            Some(0),
+            None,
+        );
+        block.output = Some(output);
+        let result = format_single_block(&block, None);
+        assert!(result.starts_with("result\n") || result.starts_with("done\n"));
+        assert!(!result.contains('\t'), "should use OutputData, not raw TSV");
+        assert!(result.contains("PID"));
+        assert!(result.contains("init"));
     }
 
     #[test]
