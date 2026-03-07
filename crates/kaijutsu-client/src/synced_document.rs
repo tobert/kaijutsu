@@ -166,12 +166,19 @@ impl SyncedDocument {
                 context_id,
                 block_id,
                 status,
+                output,
             } => {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
                 if let Err(e) = self.doc.set_status(block_id, *status) {
                     warn!("SyncedDocument: set_status error: {e}");
+                }
+                // Apply piggybacked output data (output is not DTE-tracked)
+                if let Some(output_data) = output {
+                    if let Err(e) = self.doc.set_output(block_id, Some(output_data.clone())) {
+                        warn!("SyncedDocument: set_output error: {e}");
+                    }
                 }
                 SyncEffect::Updated {
                     block_count: self.doc.block_count(),

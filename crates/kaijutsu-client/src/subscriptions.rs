@@ -45,6 +45,8 @@ pub enum ServerEvent {
         context_id: ContextId,
         block_id: BlockId,
         status: kaijutsu_types::Status,
+        /// Structured output data piggybacked on status change (output is not DTE-tracked).
+        output: Option<kaijutsu_types::OutputData>,
     },
     /// A block was deleted from a document.
     BlockDeleted {
@@ -313,10 +315,18 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e.into()),
         };
 
+        // Parse optional displayHint (JSON-serialized OutputData)
+        let output = params.get_display_hint()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str::<kaijutsu_types::OutputData>(s).ok());
+
         let _ = self.event_tx.send(ServerEvent::BlockStatusChanged {
             context_id,
             block_id,
             status,
+            output,
         });
         Promise::ok(())
     }

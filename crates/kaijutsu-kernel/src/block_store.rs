@@ -815,10 +815,18 @@ impl BlockStore {
         self.auto_save(context_id);
 
         // Emit flow event
+        // Include output data if present — output is a struct field that can't
+        // travel via DTE ops, so we piggyback it on StatusChanged
+        let output = {
+            let entry = self.get(context_id);
+            entry.and_then(|e| e.doc.get_block_snapshot(block_id))
+                .and_then(|s| s.output)
+        };
         self.emit(BlockFlow::StatusChanged {
             context_id,
             block_id: block_id.clone(),
             status,
+            output,
             source: OpSource::Local,
         });
 
@@ -878,30 +886,19 @@ impl BlockStore {
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.
+    /// Does NOT emit a flow event — output is a struct field, not DTE-tracked.
+    /// The caller should call `set_status` afterward, which reads the snapshot
+    /// (including output) and sends it via `StatusChanged` to clients.
     pub fn set_output(
         &self,
         context_id: ContextId,
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
     ) -> Result<(), String> {
-        let ops = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
-            let agent_id = self.agent_id();
-            // Capture frontier before mutation to extract ops
-            let frontier = entry.doc.frontier();
-            entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
-            entry.touch(agent_id);
-            let ops = entry.doc.ops_since(&frontier);
-            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
-        };
-
-        // Emit ops so clients receive the OutputData update
-        self.emit(BlockFlow::TextOps {
-            context_id,
-            block_id: *block_id,
-            ops: Arc::from(ops),
-            source: OpSource::Local,
-        });
+        let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        let agent_id = self.agent_id();
+        entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
+        entry.touch(agent_id);
         Ok(())
     }
 
@@ -1080,6 +1077,7 @@ impl BlockStore {
                         context_id,
                         block_id: snap.id,
                         status: snap.status,
+                        output: snap.output.clone(),
                         source: OpSource::Remote,
                     });
                 }

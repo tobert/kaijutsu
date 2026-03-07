@@ -2218,9 +2218,15 @@ fn apply_server_event(
                 }
             }
         }
-        ServerEvent::BlockStatusChanged { context_id: event_ctx_id, block_id, status } => {
+        ServerEvent::BlockStatusChanged { context_id: event_ctx_id, block_id, status, ref output } => {
             if event_ctx_id != context_id {
                 return;
+            }
+            // Apply piggybacked output data (not DTE-tracked)
+            if let Some(output_data) = output {
+                if let Err(e) = store.set_output(context_id, &block_id, Some(output_data)) {
+                    tracing::warn!("BlockStatusChanged set_output error: {e}");
+                }
             }
             // Use store's set_status — handles version bump and flow events
             if let Err(e) = store.set_status(context_id, &block_id, status) {
@@ -3118,6 +3124,7 @@ mod tests {
                 context_id: ctx_id,
                 block_id,
                 status: Status::Error,
+                output: None,
             },
         );
 
@@ -3226,6 +3233,7 @@ mod tests {
             context_id: ctx_id,
             block_id: first_new_block,
             status: Status::Running,
+            output: None,
         });
 
         // Verify everything is visible through store.get() — the path MCP tools use
@@ -3304,6 +3312,7 @@ mod tests {
                 context_id: ctx_id,
                 block_id: BlockId::new(ctx_id, ghost_agent, 999),
                 status: Status::Done,
+                output: None,
             },
         );
 

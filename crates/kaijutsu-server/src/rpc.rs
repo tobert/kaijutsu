@@ -1357,13 +1357,18 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, ref output, .. } => {
                                     let mut req = callback.on_block_status_changed_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
+                                        if let Some(output_data) = output {
+                                            if let Ok(json) = serde_json::to_string(output_data) {
+                                                params.set_display_hint(&json);
+                                            }
+                                        }
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -4618,13 +4623,18 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, ref output, .. } => {
                                     let mut req = callback.on_block_status_changed_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
+                                        if let Some(output_data) = output {
+                                            if let Ok(json) = serde_json::to_string(output_data) {
+                                                params.set_display_hint(&json);
+                                            }
+                                        }
                                     }
                                     req.send().promise.await.is_ok()
                                 }

@@ -245,7 +245,7 @@ interface BlockEvents {
   onBlockDeleted @1 (contextId :Data, blockId :BlockId);
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, displayHint :Text);
   onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data);
   onSyncReset @6 (contextId :Data, generation :UInt64);
 
