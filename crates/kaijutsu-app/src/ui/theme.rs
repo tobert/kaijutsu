@@ -219,6 +219,19 @@ pub struct Theme {
     pub input_backdrop_color: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // OutputData Rendering Colors (structured tool results)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Directory entries in structured output (soft blue)
+    pub output_directory: Color,
+    /// Executable entries in structured output (soft green)
+    pub output_executable: Color,
+    /// Symlink entries in structured output (cyan)
+    pub output_symlink: Color,
+    /// Column headers in structured output (dim text)
+    pub output_header: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Markdown Rendering Colors — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -454,6 +467,12 @@ impl Default for Theme {
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
             input_backdrop_color: Color::srgba(0.102, 0.106, 0.149, 0.85),
+
+            // OutputData rendering (structured tool results)
+            output_directory: Color::srgb(0.478, 0.635, 0.969),  // #7aa2f7 soft blue
+            output_executable: Color::srgb(0.620, 0.808, 0.416), // #9ece6a soft green
+            output_symlink: Color::srgb(0.490, 0.812, 1.00),     // #7dcfff cyan
+            output_header: Color::srgb(0.337, 0.373, 0.537),     // #565f89 dim
 
             // Markdown rendering
             md_heading_color: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple

@@ -328,6 +328,7 @@ pub fn update_vello_borders(
     >,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
+    theme: Res<Theme>,
 ) {
     let font = fonts.get(&font_handles.mono);
 
@@ -347,6 +348,7 @@ pub fn update_vello_borders(
             style.bottom_label.as_deref(),
             font,
             0.0, // initial time — animate_vello_borders handles ongoing animation
+            theme.bg,
         );
 
         *scene_component = UiVelloScene::from(scene);
@@ -361,6 +363,7 @@ pub fn animate_vello_borders(
     mut block_cells: Query<(&BlockBorderStyle, &mut UiVelloScene, &ComputedNode)>,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
+    theme: Res<Theme>,
 ) {
     let t = time.elapsed_secs();
     let font = fonts.get(&font_handles.mono);
@@ -386,6 +389,7 @@ pub fn animate_vello_borders(
             style.bottom_label.as_deref(),
             font,
             t,
+            theme.bg,
         );
 
         *scene_component = UiVelloScene::from(scene);

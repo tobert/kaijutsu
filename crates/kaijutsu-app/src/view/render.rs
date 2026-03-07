@@ -133,6 +133,11 @@ pub fn sync_block_cell_buffers(
 
         // Rich content rendering for Model/Text blocks (markdown, sparklines)
         let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::Model;
+        // Rich content for ToolResult blocks with structured OutputData
+        let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
+            && block.output.is_some()
+            && !block.is_error;
+
         let mut actually_rich = false;
         if is_rich_candidate {
             if let Some(rich) = crate::text::detect_rich_content(&text, doc_version) {
@@ -145,12 +150,19 @@ pub fn sync_block_cell_buffers(
                 commands.entity(entity).insert(rich);
                 actually_rich = true;
                 block_cell.is_rich = true;
-            } else {
-                commands.entity(entity).remove::<crate::text::RichContent>();
-                commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
-                block_cell.is_rich = false;
             }
-        } else {
+        }
+        if !actually_rich && is_output_candidate {
+            if let Some(ref output) = block.output {
+                if let Some(rich) = crate::text::rich::detect_output_content(output, doc_version) {
+                    vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+                    commands.entity(entity).insert(rich);
+                    actually_rich = true;
+                    block_cell.is_rich = true;
+                }
+            }
+        }
+        if !actually_rich {
             commands.entity(entity).remove::<crate::text::RichContent>();
             commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
             block_cell.is_rich = false;

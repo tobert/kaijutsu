@@ -16,9 +16,13 @@ use vello::peniko::{Brush, Fill};
 
 use std::sync::Arc;
 
+use kaijutsu_types::{OutputData, OutputEntryType};
+
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
 use super::sparkline::{SparklineData, SparklineColors, try_parse_sparkline, build_sparkline_paths, render_sparkline_scene};
 use super::components::bevy_color_to_brush;
+
+use crate::view::format::{OutputLayout, compute_output_layout, format_output_data};
 
 /// Per-span brush mapping: byte range → Brush.
 struct SpanBrush {
@@ -55,6 +59,7 @@ impl RichContent {
             RichContentKind::Markdown { .. } => None,
             RichContentKind::Sparkline(_) => Some(theme.sparkline_height),
             RichContentKind::Svg { height, .. } => Some(*height),
+            RichContentKind::Output { .. } => None,
         }
     }
 }
@@ -76,6 +81,13 @@ pub enum RichContentKind {
         width: f32,
         /// Display height (capped to a reasonable maximum).
         height: f32,
+    },
+    /// Structured OutputData with per-cell coloring by EntryType.
+    Output {
+        /// Pre-computed column→byte mapping for per-cell brushes.
+        layout: OutputLayout,
+        /// Whitespace-padded measurement text (same as UiVelloText.value).
+        plain_text: String,
     },
 }
 
@@ -269,12 +281,101 @@ pub fn render_rich_content(
                     scene.append(svg_scene, None);
                 }
             }
+            RichContentKind::Output { layout, plain_text } => {
+                let Some(font) = fonts.get(&font_handles.mono) else {
+                    continue;
+                };
+
+                let max_advance = if current_advance > 0.0 { Some(current_advance) } else { None };
+
+                let parley_layout = font.layout(
+                    plain_text,
+                    &vello_text.style,
+                    vello_text.text_align,
+                    max_advance,
+                );
+
+                let span_brushes = build_output_span_brushes(layout, &theme);
+                let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
+                render_layout_with_brushes(&mut scene, &parley_layout, &span_brushes, &fallback_brush);
+            }
         }
 
         commands.entity(entity).insert(UiVelloScene::from(scene));
         rich.last_render_version = rich.version;
         rich.last_max_advance = current_advance;
     }
+}
+
+/// Map an `OutputEntryType` to a theme color for the name column.
+fn entry_type_color(entry_type: OutputEntryType, theme: &crate::ui::theme::Theme) -> Color {
+    match entry_type {
+        OutputEntryType::Directory => theme.output_directory,
+        OutputEntryType::Executable => theme.output_executable,
+        OutputEntryType::Symlink => theme.output_symlink,
+        OutputEntryType::File | OutputEntryType::Text => theme.block_tool_result,
+        // non_exhaustive fallback
+        _ => theme.block_tool_result,
+    }
+}
+
+/// Build `SpanBrush` vec from an `OutputLayout` for per-cell coloring.
+///
+/// - Header rows → `theme.output_header` for all columns
+/// - Data rows: name column (index 0) → `entry_type_color`, others → `theme.block_tool_result`
+fn build_output_span_brushes(
+    layout: &OutputLayout,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<SpanBrush> {
+    let mut result = Vec::new();
+
+    for row in &layout.rows {
+        for (col_idx, &(start, end)) in row.col_byte_ranges.iter().enumerate() {
+            if start == end {
+                continue;
+            }
+            let color = if row.is_header {
+                theme.output_header
+            } else if col_idx == 0 {
+                entry_type_color(row.entry_type, theme)
+            } else {
+                theme.block_tool_result
+            };
+            result.push(SpanBrush {
+                start,
+                end,
+                brush: bevy_color_to_brush(color),
+            });
+        }
+    }
+
+    result
+}
+
+/// Detect rich content from structured OutputData.
+///
+/// Returns `None` for simple text (no coloring needed).
+/// For tabular/tree/list data, returns a `RichContent::Output` with
+/// pre-computed layout for per-cell coloring.
+pub fn detect_output_content(output: &OutputData, version: u64) -> Option<RichContent> {
+    // Simple text gets no rich treatment
+    if output.as_text().is_some() {
+        return None;
+    }
+
+    let plain_text = format_output_data(output);
+    if plain_text.is_empty() {
+        return None;
+    }
+
+    let layout = compute_output_layout(output, &plain_text)?;
+
+    Some(RichContent {
+        kind: RichContentKind::Output { layout, plain_text },
+        version,
+        last_render_version: 0,
+        last_max_advance: 0.0,
+    })
 }
 
 /// Maximum SVG source size we'll attempt to parse (100KB).

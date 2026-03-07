@@ -4,7 +4,7 @@
 //! display strings. No ECS, no systems, just data transforms.
 
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
-use kaijutsu_types::{ContextId, OutputData, OutputNode};
+use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
 use crate::ui::theme::Theme;
 
 /// Map a block to its semantic text color based on BlockKind and Role.
@@ -197,6 +197,177 @@ fn format_tool_args(value: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
+/// Pre-computed layout for an OutputData table.
+///
+/// Maps each line's columns to byte ranges in the formatted text,
+/// enabling per-cell coloring in the Vello rich content renderer.
+pub struct OutputLayout {
+    pub rows: Vec<OutputLayoutRow>,
+}
+
+/// Layout info for a single row in the formatted output.
+pub struct OutputLayoutRow {
+    /// Entry type of this row's node (for coloring the name column).
+    pub entry_type: OutputEntryType,
+    /// Whether this is a header row.
+    pub is_header: bool,
+    /// Byte start..end per column within the line.
+    pub col_byte_ranges: Vec<(usize, usize)>,
+    /// Byte offset of this line within the full formatted text.
+    pub line_start: usize,
+}
+
+/// Compute layout mapping for a formatted OutputData table.
+///
+/// Returns `None` for non-tabular data (simple text, flat lists, trees).
+/// The byte ranges reference positions in the string returned by `format_output_data`.
+pub fn compute_output_layout(data: &OutputData, formatted_text: &str) -> Option<OutputLayout> {
+    // Only tabular data gets rich coloring
+    if data.as_text().is_some() {
+        return None;
+    }
+    let is_tabular = data.headers.is_some() || data.is_tabular();
+    let is_tree = !data.is_flat();
+    let is_flat_names = !data.root.is_empty() && data.root.iter().all(|n| n.cells.is_empty());
+
+    if !is_tabular && !is_tree && !is_flat_names {
+        return None;
+    }
+
+    // For flat name lists: one name per line, full line = name column
+    if !is_tabular && !is_tree && is_flat_names {
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        for node in &data.root {
+            let name = node.display_name();
+            rows.push(OutputLayoutRow {
+                entry_type: node.entry_type,
+                is_header: false,
+                col_byte_ranges: vec![(offset, offset + name.len())],
+                line_start: offset,
+            });
+            offset += name.len() + 1; // +1 for newline
+        }
+        return Some(OutputLayout { rows });
+    }
+
+    // For trees: compute byte ranges from indented lines
+    if is_tree {
+        let mut rows = Vec::new();
+        let mut flat_nodes = Vec::new();
+        fn collect_nodes(node: &OutputNode, flat: &mut Vec<OutputEntryType>) {
+            flat.push(node.entry_type);
+            for child in &node.children {
+                collect_nodes(child, flat);
+            }
+        }
+        for node in &data.root {
+            collect_nodes(node, &mut flat_nodes);
+        }
+
+        let mut offset = 0;
+        for (i, line) in formatted_text.lines().enumerate() {
+            let entry_type = flat_nodes.get(i).copied().unwrap_or_default();
+            rows.push(OutputLayoutRow {
+                entry_type,
+                is_header: false,
+                col_byte_ranges: vec![(offset, offset + line.len())],
+                line_start: offset,
+            });
+            offset += line.len() + 1;
+        }
+        return Some(OutputLayout { rows });
+    }
+
+    // Tabular: recompute column widths (same logic as format_output_table)
+    let headers = data.headers.as_deref();
+    let node_rows: Vec<Vec<&str>> = data.root.iter().map(|node| {
+        let mut row = vec![node.display_name()];
+        row.extend(node.cells.iter().map(|s| s.as_str()));
+        row
+    }).collect();
+
+    let header_cols = headers.map_or(0, |h| h.len());
+    let max_row_cols = node_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let num_cols = header_cols.max(max_row_cols);
+    if num_cols == 0 {
+        return None;
+    }
+
+    let mut widths = vec![0usize; num_cols];
+    if let Some(hdrs) = headers {
+        for (i, h) in hdrs.iter().enumerate() {
+            widths[i] = widths[i].max(h.len());
+        }
+    }
+    for row in &node_rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < num_cols {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+
+    let gap = 2; // "  "
+    let mut rows = Vec::new();
+    let mut byte_offset = 0;
+
+    // Header row
+    if let Some(hdrs) = headers {
+        let line_start = byte_offset;
+        let mut col_ranges = Vec::new();
+        let mut col_offset = byte_offset;
+        for (i, h) in hdrs.iter().enumerate() {
+            let start = col_offset;
+            let end = start + h.len();
+            col_ranges.push((start, end));
+            if i + 1 < num_cols {
+                col_offset = start + widths[i] + gap;
+            } else {
+                col_offset = end;
+            }
+        }
+        let line_len = formatted_text.lines().next().map_or(0, |l| l.len());
+        byte_offset += line_len + 1; // +1 for newline
+        rows.push(OutputLayoutRow {
+            entry_type: OutputEntryType::Text,
+            is_header: true,
+            col_byte_ranges: col_ranges,
+            line_start,
+        });
+    }
+
+    // Data rows
+    for (row_idx, node_row) in node_rows.iter().enumerate() {
+        let line_start = byte_offset;
+        let mut col_ranges = Vec::new();
+        let mut col_offset = byte_offset;
+        for i in 0..num_cols {
+            let cell = node_row.get(i).copied().unwrap_or("");
+            let start = col_offset;
+            let end = start + cell.len();
+            col_ranges.push((start, end));
+            if i + 1 < num_cols {
+                col_offset = start + widths[i] + gap;
+            } else {
+                col_offset = end;
+            }
+        }
+        let line_idx = if headers.is_some() { row_idx + 1 } else { row_idx };
+        let line_len = formatted_text.lines().nth(line_idx).map_or(0, |l| l.len());
+        byte_offset += line_len + 1;
+
+        rows.push(OutputLayoutRow {
+            entry_type: data.root[row_idx].entry_type,
+            is_header: false,
+            col_byte_ranges: col_ranges,
+            line_start,
+        });
+    }
+
+    Some(OutputLayout { rows })
+}
+
 /// Format structured `OutputData` into space-aligned text.
 ///
 /// Dispatch order:
@@ -205,7 +376,7 @@ fn format_tool_args(value: &serde_json::Value) -> String {
 /// 3. Tree (has children) → indented tree
 /// 4. Flat list (names only) → one name per line
 /// 5. Fallback → `to_canonical_string()`
-fn format_output_data(data: &OutputData) -> String {
+pub fn format_output_data(data: &OutputData) -> String {
     // 1. Simple text passthrough
     if let Some(text) = data.as_text() {
         return text.to_string();
@@ -592,6 +763,61 @@ mod tests {
         assert!(!result.contains('\t'), "should use OutputData, not raw TSV");
         assert!(result.contains("PID"));
         assert!(result.contains("init"));
+    }
+
+    #[test]
+    fn test_compute_output_layout_table_byte_ranges() {
+        use kaijutsu_types::OutputEntryType;
+        let data = OutputData::table(
+            vec!["NAME".into(), "SIZE".into()],
+            vec![
+                OutputNode::new("foo").with_entry_type(OutputEntryType::File).with_cells(vec!["100".into()]),
+                OutputNode::new("bar").with_entry_type(OutputEntryType::Directory).with_cells(vec!["4096".into()]),
+            ],
+        );
+        let text = format_output_data(&data);
+        let layout = compute_output_layout(&data, &text).expect("should produce layout");
+        assert_eq!(layout.rows.len(), 3); // header + 2 data rows
+
+        // Header row
+        assert!(layout.rows[0].is_header);
+        let (hs, he) = layout.rows[0].col_byte_ranges[0];
+        assert_eq!(&text[hs..he], "NAME");
+
+        // First data row — name column
+        assert!(!layout.rows[1].is_header);
+        let (ns, ne) = layout.rows[1].col_byte_ranges[0];
+        assert_eq!(&text[ns..ne], "foo");
+        assert_eq!(layout.rows[1].entry_type, OutputEntryType::File);
+
+        // Second data row — name column
+        let (ns2, ne2) = layout.rows[2].col_byte_ranges[0];
+        assert_eq!(&text[ns2..ne2], "bar");
+        assert_eq!(layout.rows[2].entry_type, OutputEntryType::Directory);
+    }
+
+    #[test]
+    fn test_compute_output_layout_flat_list() {
+        use kaijutsu_types::OutputEntryType;
+        let data = OutputData::nodes(vec![
+            OutputNode::new("src").with_entry_type(OutputEntryType::Directory),
+            OutputNode::new("main.rs").with_entry_type(OutputEntryType::File),
+        ]);
+        let text = format_output_data(&data);
+        let layout = compute_output_layout(&data, &text).expect("should produce layout");
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!(layout.rows[0].entry_type, OutputEntryType::Directory);
+        assert_eq!(layout.rows[1].entry_type, OutputEntryType::File);
+
+        let (s, e) = layout.rows[0].col_byte_ranges[0];
+        assert_eq!(&text[s..e], "src");
+    }
+
+    #[test]
+    fn test_compute_output_layout_simple_text_returns_none() {
+        let data = OutputData::text("hello");
+        let text = format_output_data(&data);
+        assert!(compute_output_layout(&data, &text).is_none());
     }
 
     #[test]

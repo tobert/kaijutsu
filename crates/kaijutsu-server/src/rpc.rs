@@ -2036,6 +2036,7 @@ impl kernel::Server for KernelImpl {
 
             // Spawn execution in background
             let output_block_id_clone = output_block_id;
+            let command_block_id_clone = command_block_id;
             let documents_clone = documents.clone();
 
             tokio::task::spawn_local(async move {
@@ -2076,10 +2077,13 @@ impl kernel::Server for KernelImpl {
                             }
                         }
 
-                        // Mark complete — status reflects exit code
+                        // Mark complete — status reflects exit code on both blocks
                         let final_status = if result.code == 0 { Status::Done } else { Status::Error };
                         if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
                             log::error!("Failed to set output block status: {}", e);
+                        }
+                        if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
+                            log::error!("Failed to set command block status: {}", e);
                         }
                     }
                     Err(e) => {
@@ -2089,9 +2093,12 @@ impl kernel::Server for KernelImpl {
                         if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
                             log::error!("Failed to update shell output with error: {}", e);
                         }
-                        // Mark as error
+                        // Mark both blocks as error
                         if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
                             log::error!("Failed to set output block error status: {}", e);
+                        }
+                        if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
+                            log::error!("Failed to set command block error status: {}", e);
                         }
                     }
                 }
@@ -4245,6 +4252,7 @@ impl kernel::Server for KernelImpl {
                 // Spawn execution in background
                 let documents_clone = documents.clone();
                 let output_block_id_clone = output_block_id;
+                let command_block_id_clone = command_block_id;
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
 
@@ -4272,6 +4280,9 @@ impl kernel::Server for KernelImpl {
                             if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
                                 log::error!("Failed to set output block status: {}", e);
                             }
+                            if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
+                                log::error!("Failed to set command block status: {}", e);
+                            }
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
@@ -4281,6 +4292,9 @@ impl kernel::Server for KernelImpl {
                             }
                             if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
                                 log::error!("Failed to set output block error status: {}", e);
+                            }
+                            if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
+                                log::error!("Failed to set command block error status: {}", e);
                             }
                         }
                     }

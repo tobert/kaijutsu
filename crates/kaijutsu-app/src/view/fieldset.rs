@@ -52,6 +52,7 @@ pub fn build_fieldset_border(
     bottom_label: Option<&str>,
     font: Option<&bevy_vello::prelude::VelloFont>,
     time: f32,
+    bg_color: Color,
 ) {
     let brush = bevy_color_to_brush(style.color);
     let alpha = animation_alpha(&style.animation, time);
@@ -68,23 +69,11 @@ pub fn build_fieldset_border(
             let bottom_gap = bottom_label.map(|l| measure_label_width(l, font));
 
             draw_fieldset_rect(scene, width, height, r, &stroke, &brush, top_gap, bottom_gap);
-
-            // Draw label text
-            if let (Some(label), Some(font)) = (top_label, font) {
-                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush);
-            }
-            if let (Some(label), Some(font)) = (bottom_label, font) {
-                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, height, font, &brush);
-            }
         }
         BorderKind::TopAccent => {
             // Just the top line with optional label gap
             let top_gap = top_label.map(|l| measure_label_width(l, font));
             draw_top_accent(scene, width, &stroke, &brush, top_gap);
-
-            if let (Some(label), Some(font)) = (top_label, font) {
-                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush);
-            }
         }
         BorderKind::Dashed => {
             let dashed_stroke = Stroke::new(style.thickness as f64)
@@ -102,10 +91,30 @@ pub fn build_fieldset_border(
         }
     }
 
-    // Animation overlays
+    // Animation overlays (before labels so labels are always on top)
     match style.animation {
         BorderAnimation::Chase => {
             chase_overlay(scene, width, height, r, style.thickness as f64, time, &style.color);
+        }
+        _ => {}
+    }
+
+    // Labels drawn last — always visible above borders and animations
+    match style.kind {
+        BorderKind::Full => {
+            if let (Some(label), Some(font)) = (top_label, font) {
+                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush, bg_color);
+            }
+            if let (Some(label), Some(font)) = (bottom_label, font) {
+                let label_w = measure_label_width(label, Some(font));
+                let x = width - LABEL_INSET - LABEL_PAD - label_w;
+                draw_label_text(scene, label, x, height, font, &brush, bg_color);
+            }
+        }
+        BorderKind::TopAccent => {
+            if let (Some(label), Some(font)) = (top_label, font) {
+                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush, bg_color);
+            }
         }
         _ => {}
     }
@@ -159,9 +168,9 @@ pub fn build_role_group_line(
         );
     }
 
-    // Draw label text centered vertically on the line
+    // Draw label text centered vertically on the line (no knockout needed — no animation)
     if let Some(font) = font {
-        draw_label_text(scene, role_label, LABEL_INSET + LABEL_PAD, y, font, &brush);
+        draw_label_text(scene, role_label, LABEL_INSET + LABEL_PAD, y, font, &brush, Color::NONE);
     }
 }
 
@@ -237,26 +246,24 @@ fn draw_fieldset_rect(
         scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
     }
 
-    // === Bottom edge ===
+    // === Bottom edge (gap is right-aligned for bottom label) ===
     match bottom_gap_width {
         Some(gap_w) => {
-            let gap_start = LABEL_INSET;
-            let gap_end = gap_start + LABEL_PAD + gap_w + LABEL_PAD;
+            let gap_total = LABEL_PAD + gap_w + LABEL_PAD;
+            let gap_end = width - LABEL_INSET;
+            let gap_start = gap_end - gap_total;
 
-            // Bottom-right corner arc + segment left of gap
+            // Bottom-right corner arc + segment to gap end
             let mut path = BezPath::new();
             arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
-            let clamped_end = gap_end.min(x1 - r);
-            if clamped_end < x1 - r {
-                // There's line before the gap ends, going right-to-left
-            }
-            // bottom segment from right corner to gap end
-            path.line_to((clamped_end, y1));
+            let clamped_gap_end = gap_end.min(x1 - r);
+            path.line_to((clamped_gap_end, y1));
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
 
             // Bottom segment from gap start to left corner
             let mut path = BezPath::new();
-            path.move_to((gap_start, y1));
+            let clamped_gap_start = gap_start.max(x0 + r);
+            path.move_to((clamped_gap_start, y1));
             path.line_to((x0 + r, y1));
             arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
@@ -354,7 +361,8 @@ fn arc_corner(path: &mut BezPath, cx: f64, cy: f64, radius: f64, start_angle: f6
 /// Draw label text at a given position using VelloFont.
 ///
 /// The label is vertically centered around `y` (baseline offset accounts
-/// for font metrics).
+/// for font metrics). A background knockout rect is drawn first to mask
+/// any animation overlay (chase, pulse) behind the label.
 fn draw_label_text(
     scene: &mut vello::Scene,
     text: &str,
@@ -362,6 +370,7 @@ fn draw_label_text(
     y: f64,
     font: &bevy_vello::prelude::VelloFont,
     brush: &Brush,
+    bg_color: Color,
 ) {
     let style = bevy_vello::prelude::VelloTextStyle {
         font_size: FIELDSET_LABEL_FONT_SIZE,
@@ -376,6 +385,16 @@ fn draw_label_text(
     // We shift by half the line height for visual centering.
     let line_height = layout.height() as f64;
     let text_y = y - line_height / 2.0;
+
+    // Background knockout — mask chase/pulse animation behind the label
+    let label_w = layout.width() as f64;
+    let bg_rect = vello::kurbo::Rect::new(
+        x - LABEL_PAD,
+        text_y,
+        x + label_w + LABEL_PAD,
+        text_y + line_height,
+    );
+    scene.fill(Fill::NonZero, Affine::IDENTITY, &bevy_color_to_brush(bg_color), None, &bg_rect);
 
     let transform = Affine::translate((x, text_y));
 
