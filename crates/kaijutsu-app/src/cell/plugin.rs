@@ -198,8 +198,13 @@ impl Plugin for CellPlugin {
                 view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
                 block_border::spawn_vello_borders
                     .after(view_render::readback_block_heights),
-                block_border::update_vello_borders
+                // Flush UiVelloScene insertions from spawn_vello_borders so
+                // update_vello_borders can see Added<UiVelloScene> this frame.
+                ApplyDeferred
                     .after(block_border::spawn_vello_borders),
+                block_border::update_vello_borders
+                    .after(block_border::spawn_vello_borders)
+                    .after(ApplyDeferred),
                 block_border::animate_vello_borders
                     .after(block_border::update_vello_borders),
                 view_render::update_role_group_scenes.after(bevy::ui::UiSystems::Layout),

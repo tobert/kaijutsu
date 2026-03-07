@@ -411,13 +411,21 @@ pub fn spawn_vello_borders(
     }
 }
 
-/// Rebuild border scenes when style or size changes.
+/// Rebuild border scenes when style or size changes, or when first added.
 ///
-/// Runs in PostUpdate (after UiSystems::Layout).
+/// `Added<UiVelloScene>` handles the initial render: `spawn_vello_borders`
+/// inserts `UiVelloScene::default()` (empty), then `ApplyDeferred` flushes
+/// the insertion, then this system sees `Added<UiVelloScene>` and builds the
+/// scene. Without `Added`, static borders (`BorderAnimation::None`) would
+/// never be populated because `Changed<BlockBorderStyle>` only fires once
+/// (the frame the component is inserted) while `UiVelloScene` isn't available
+/// until after `ApplyDeferred` runs.
+///
+/// Runs in PostUpdate (after ApplyDeferred after spawn_vello_borders).
 pub fn update_vello_borders(
     mut block_cells: Query<
         (&BlockBorderStyle, &mut UiVelloScene, &ComputedNode),
-        Or<(Changed<BlockBorderStyle>, Changed<ComputedNode>)>,
+        Or<(Added<UiVelloScene>, Changed<BlockBorderStyle>, Changed<ComputedNode>)>,
     >,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,

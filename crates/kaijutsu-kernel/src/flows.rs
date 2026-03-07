@@ -1403,6 +1403,7 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 status: Status::Done,
+                output: None,
                 source: OpSource::Local,
             }
             .subject(),
