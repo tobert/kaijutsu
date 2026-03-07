@@ -368,15 +368,11 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
 
             if block.is_error {
                 match body {
-                    None => "error".to_string(),
-                    Some(text) => format!("error \u{2717}\n{}", text),
+                    None => "\u{2717}".to_string(),
+                    Some(text) => text,
                 }
             } else {
-                match body {
-                    None => "done".to_string(),
-                    Some(ref text) if text.lines().count() <= 3 => format!("done\n{}", text),
-                    Some(text) => format!("result\n{}", text),
-                }
+                body.unwrap_or_default()
             }
         }
         BlockKind::File => {
@@ -500,7 +496,7 @@ mod tests {
             None,
         );
         let result = format_single_block(&result_block, None);
-        assert_eq!(result, "done");
+        assert_eq!(result, "");
     }
 
     #[test]
@@ -593,7 +589,6 @@ mod tests {
         );
         block.output = Some(output);
         let result = format_single_block(&block, None);
-        assert!(result.starts_with("result\n") || result.starts_with("done\n"));
         assert!(!result.contains('\t'), "should use OutputData, not raw TSV");
         assert!(result.contains("PID"));
         assert!(result.contains("init"));
@@ -614,7 +609,6 @@ mod tests {
             None,
         );
         let result = format_single_block(&result_block, None);
-        assert!(result.starts_with("done\n"));
-        assert!(result.contains("file contents here"));
+        assert_eq!(result, "file contents here");
     }
 }
