@@ -10,6 +10,7 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
+use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloTextAnchor};
 use bevy_vello::vello;
 use vello::kurbo::{Affine, RoundedRect, Shape, Stroke};
@@ -117,7 +118,7 @@ pub fn spawn_input_overlay(
                 font: font_handles.mono.clone(),
                 brush: bevy_color_to_brush(theme.fg_dim),
                 font_size: text_metrics.cell_font_size,
-                font_axes: bevy_vello::prelude::VelloFontAxes {
+                font_axes: VelloFontAxes {
                     weight: Some(200.0),
                     ..default()
                 },

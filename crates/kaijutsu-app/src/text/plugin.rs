@@ -5,6 +5,7 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_vello::VelloPlugin;
+use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
 use super::components::{KjTextEffects, rainbow_brush};

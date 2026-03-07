@@ -4,6 +4,7 @@
 //! onto bevy_vello's text rendering.
 
 use bevy::prelude::*;
+use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
 /// Marker component for block-level text entities (conversation blocks, role headers).

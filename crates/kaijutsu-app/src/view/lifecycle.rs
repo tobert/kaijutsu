@@ -6,7 +6,8 @@
 //! flex layout for positioning — no UiTransform hack.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::{UiVelloText, VelloFont, VelloFontAxes, VelloTextAnchor};
+use bevy_vello::integrations::text::VelloFontAxes;
+use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor,

@@ -19,7 +19,7 @@ bevy_brp_extras.workspace = true  # includes RemotePlugin
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
 
 # Text rendering (Vello-based)
-bevy_vello = { path = "/home/atobey/src/wt/test", features = ["text", "svg", "picking"] }
+bevy_vello = { path = "/home/atobey/src/wt/pr6", features = ["text", "svg", "picking"] }
 pulldown-cmark.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
 
