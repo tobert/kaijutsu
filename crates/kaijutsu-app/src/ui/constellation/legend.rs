@@ -176,10 +176,12 @@ fn update_legend_content(
 }
 
 fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
+    let char_count = name.chars().count();
+    if char_count <= max_len {
         name.to_string()
     } else {
-        format!("{}...", &name[..max_len - 3])
+        let truncated: String = name.chars().take(max_len - 1).collect();
+        format!("{truncated}…")
     }
 }
 

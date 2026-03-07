@@ -569,6 +569,16 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
         }
     }
 
+    // Append any nodes missed due to cycles in parent_id
+    if order.len() < n {
+        let in_order: std::collections::HashSet<usize> = order.iter().copied().collect();
+        for i in 0..n {
+            if !in_order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+
     order
 }
 
@@ -586,10 +596,6 @@ pub fn context_id_at_ring_index(constellation: &Constellation, ring_idx: usize) 
         .map(|n| n.context_id.as_str())
 }
 
-/// Compute the target carousel angle to bring a ring index to the front.
-pub fn carousel_angle_for_ring_index(ring_idx: usize, total: usize) -> f32 {
-    -std::f32::consts::TAU * ring_idx as f32 / total as f32
-}
 
 /// Smoothly interpolate camera offset, zoom, and carousel rotation toward targets.
 fn interpolate_camera(

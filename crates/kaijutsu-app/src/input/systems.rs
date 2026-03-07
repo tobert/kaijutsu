@@ -516,7 +516,7 @@ use crate::ui::constellation::{
     CameraOrbit, Constellation, ConstellationCamera,
     NewContextConfig, OpenForkForm, create_or_fork_context,
     find_nearest_in_direction,
-    focused_ring_index, context_id_at_ring_index, carousel_angle_for_ring_index,
+    focused_ring_index, context_id_at_ring_index,
     model_picker::OpenModelPicker,
 };
 
@@ -544,25 +544,37 @@ pub fn handle_constellation_nav(
                 let n = constellation.nodes.len();
                 if n == 0 { continue; }
 
+                let step_angle = std::f32::consts::TAU / n as f32;
+
                 // h/l spin the carousel ring; j/k use spatial navigation
                 if direction.x.abs() > direction.y.abs() {
-                    // Horizontal: spin carousel
+                    // Horizontal: spin carousel by one step (relative delta)
                     if let Some(ring_idx) = focused_ring_index(&constellation) {
                         let step = if direction.x > 0.0 { 1 } else { n - 1 };
                         let new_idx = (ring_idx + step) % n;
                         if let Some(target_id) = context_id_at_ring_index(&constellation, new_idx) {
                             let target_id = target_id.to_string();
                             constellation.focus(&target_id);
-                            camera.target_carousel_angle = carousel_angle_for_ring_index(new_idx, n);
+                            // Relative delta avoids unbounded angle growth
+                            if direction.x > 0.0 {
+                                camera.target_carousel_angle -= step_angle;
+                            } else {
+                                camera.target_carousel_angle += step_angle;
+                            }
                         }
                     }
                 } else {
-                    // Vertical: spatial nearest-neighbor (still useful for finding nearby nodes)
+                    // Vertical: spatial nearest-neighbor
                     if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
-                        constellation.focus(&target_id);
                         if let Some(node) = constellation.node_by_id(&target_id) {
-                            camera.target_carousel_angle = carousel_angle_for_ring_index(node.ring_index, n);
+                            let old_idx = focused_ring_index(&constellation).unwrap_or(0);
+                            let new_idx = node.ring_index;
+                            // Compute shortest ring distance as relative delta
+                            let fwd = (new_idx as isize - old_idx as isize).rem_euclid(n as isize) as usize;
+                            let delta_steps = if fwd <= n / 2 { fwd as f32 } else { fwd as f32 - n as f32 };
+                            camera.target_carousel_angle -= delta_steps * step_angle;
                         }
+                        constellation.focus(&target_id);
                     }
                 }
             }

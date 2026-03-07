@@ -300,7 +300,7 @@ fn update_card_visuals(
 ) {
     let elapsed = time.elapsed_secs();
     let elapsed_f64 = time.elapsed_secs_f64();
-    let card_width = theme.constellation_card_width as f64;
+    let base_card_width = theme.constellation_card_width;
 
     for node in &constellation.nodes {
         let Some(&card_entity) = card_map.map.get(&node.context_id) else {
@@ -311,9 +311,14 @@ fn update_card_visuals(
         let bevy_color = agent_color_for_provider(&theme, node.provider.as_deref());
         let vello_color = bevy_to_vello_color(bevy_color);
 
-        // Build background scene
+        // Build background scene (scaled to match depth-adjusted card size)
+        let depth_t = (node.depth + 1.0) / 2.0;
+        let scale = 0.4 + 0.6 * depth_t;
+        let card_w = (base_card_width * scale) as f64;
+        let card_h = (CARD_HEIGHT * scale) as f64;
+
         let mut scene = bevy_vello::vello::Scene::new();
-        let rect = RoundedRect::new(0.0, 0.0, card_width, CARD_HEIGHT as f64, CARD_CORNER_RADIUS);
+        let rect = RoundedRect::new(0.0, 0.0, card_w, card_h, CARD_CORNER_RADIUS);
 
         // Depth-based opacity: front=1.0, back=0.3
         let depth_t = (node.depth + 1.0) / 2.0;
@@ -367,7 +372,7 @@ fn update_card_visuals(
         // Error accent: red left edge stripe
         if node.activity == ActivityState::Error {
             let error_color = VelloColor::new([0.97, 0.46, 0.56, 0.8]);
-            let error_rect = RoundedRect::new(0.0, 0.0, 3.0, CARD_HEIGHT as f64, 0.0);
+            let error_rect = RoundedRect::new(0.0, 0.0, 3.0, card_h, 0.0);
             scene.fill(Fill::NonZero, Affine::IDENTITY, error_color, None, &error_rect);
         }
 
@@ -491,15 +496,11 @@ fn rebuild_edge_scene(
 /// Primary label for a card: label > short context ID.
 fn card_label_text(node: &super::ContextNode) -> String {
     if let Some(ref label) = node.label {
-        if label.len() > 20 {
-            format!("{}…", &label[..19])
-        } else {
-            label.clone()
-        }
+        truncate_chars(label, 20)
     } else {
         // Short context ID (first 8 hex chars)
         let id = &node.context_id;
-        id.split('-').next().unwrap_or(&id[..8.min(id.len())]).to_string()
+        id.split('-').next().unwrap_or_default().to_string()
     }
 }
 
@@ -507,13 +508,20 @@ fn card_label_text(node: &super::ContextNode) -> String {
 fn card_model_text(node: &super::ContextNode) -> String {
     if let Some(ref model) = node.model {
         let short = model.rsplit('/').next().unwrap_or(model.as_str());
-        if short.len() > 22 {
-            format!("{}…", &short[..21])
-        } else {
-            short.to_string()
-        }
+        truncate_chars(short, 22)
     } else {
         "(no model)".to_string()
+    }
+}
+
+/// Char-aware truncation (safe for multi-byte UTF-8).
+fn truncate_chars(s: &str, max: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
     }
 }
 
