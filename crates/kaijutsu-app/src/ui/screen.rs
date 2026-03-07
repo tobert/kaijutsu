@@ -6,7 +6,7 @@
 //!
 //! ## Screens
 //!
-//! - `Constellation` — 3D context navigation graph (default)
+//! - `Constellation` — 2.5D context navigation graph (default)
 //! - `Conversation` — chat/shell conversation view
 //! - `ForkForm` — full-viewport fork configuration form
 //!
@@ -18,7 +18,7 @@
 
 use bevy::prelude::*;
 
-use super::constellation::{ConstellationContainer, viewport::ConstellationCamera3d};
+use super::constellation::ConstellationContainer;
 use super::state::ConversationRoot;
 use crate::cell::{BlockCell, RoleGroupBorder};
 
@@ -29,7 +29,7 @@ use crate::cell::{BlockCell, RoleGroupBorder};
 /// `OnEnter`/`OnExit` schedules handle visibility transitions.
 #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug, Reflect)]
 pub enum Screen {
-    /// 3D context navigation graph (default — app starts here).
+    /// 2.5D context navigation graph (default — app starts here).
     #[default]
     Constellation,
     /// Chat/shell conversation view.
@@ -48,13 +48,11 @@ impl Plugin for ScreenPlugin {
 
         // ── Constellation ──
         app.add_systems(OnEnter(Screen::Constellation), (
-            activate_constellation_camera,
             show_constellation_container,
             hide_conversation_root,
             hide_cell_text,
         ));
         app.add_systems(OnExit(Screen::Constellation), (
-            deactivate_constellation_camera,
             hide_constellation_container,
         ));
 
@@ -85,24 +83,6 @@ impl Plugin for ScreenPlugin {
 // ============================================================================
 // OnEnter/OnExit SYSTEMS
 // ============================================================================
-
-/// Activate the 3D constellation camera.
-fn activate_constellation_camera(
-    mut cameras: Query<&mut Camera, With<ConstellationCamera3d>>,
-) {
-    for mut camera in cameras.iter_mut() {
-        camera.is_active = true;
-    }
-}
-
-/// Deactivate the 3D constellation camera (saves GPU work).
-fn deactivate_constellation_camera(
-    mut cameras: Query<&mut Camera, With<ConstellationCamera3d>>,
-) {
-    for mut camera in cameras.iter_mut() {
-        camera.is_active = false;
-    }
-}
 
 /// Show the constellation container.
 fn show_constellation_container(
