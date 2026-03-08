@@ -1,16 +1,17 @@
-//! Constellation - Context navigation in 2.5D hyperbolic space
+//! Constellation — carousel ring context navigator.
 //!
-//! Renders the constellation as an H3-inspired hyperbolic cone tree projected
-//! to the Poincaré ball, visualized using pure Vello 2D with depth cues for
-//! a 2.5D feel. Focus changes are Lorentz boosts — the space moves through
-//! the camera, providing navigational stability.
+//! Contexts are arranged on a tilted carousel ring. The focused card sits at
+//! viewport center; other cards fan out left/right and curve upward, receding
+//! in depth. h/l spins the ring; j/k use spatial nearest-neighbor navigation.
 //!
 //! ## Architecture
 //!
-//! - `hyper.rs` — Hyperbolic math (HyperPoint, LorentzTransform, Poincaré projection)
-//! - `layout.rs` — H3 layout engine (bottom-up hemisphere sizing, top-down placement)
-//! - `render2d.rs` — Vello scene building with depth-based size/opacity/glow
-//! - `navigation.rs` — Focus animation via geodesic lerp
+//! - `mod.rs` — Data model (Constellation, ContextNode), carousel ring layout, camera interpolation
+//! - `render2d.rs` — Vello card rendering (spawn/despawn, depth-based scale/opacity, edge curves)
+//! - `legend.rs` — Info panel overlay (context count, staged drifts)
+//! - `create_dialog.rs` — "New context" dialog
+//! - `fork_form.rs` — Full-viewport fork configuration form
+//! - `model_picker.rs` — Model selection overlay
 //!
 //! ## Activation
 //!
@@ -20,12 +21,14 @@
 //!
 //! ## Navigation
 //!
-//! - `hjkl` — Spatial focus navigation (Lorentz boost to nearest node)
-//! - `Shift+hjkl` — Orbit camera around Poincaré ball
-//! - `+/-` — Zoom (orbit distance)
+//! - `h/l` — Spin carousel ring (step one card left/right)
+//! - `j/k` — Spatial nearest-neighbor navigation
+//! - `Shift+hjkl` — Pan camera
+//! - `+/-` — Zoom in/out
 //! - `0` — Reset camera to default view
 //! - `Enter` — Switch to focused context
-//! - `f` — Fork focused context
+//! - `f` — Fork focused context (opens fork form)
+//! - `n` — Create new context
 //! - `m` — Model picker for focused context
 
 mod create_dialog;
