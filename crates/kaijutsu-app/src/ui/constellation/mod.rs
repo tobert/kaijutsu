@@ -175,6 +175,20 @@ impl Constellation {
         self.nodes.iter().find(|n| n.context_id == id)
     }
 
+    /// Find node by block_id string (format: `{context_hex}_{agent_hex}_{seq}`).
+    ///
+    /// Extracts the context hex prefix and matches against node context_id.
+    /// Falls back to the focused node if the block_id can't be parsed.
+    fn node_by_block_id_mut(&mut self, block_id: &str) -> Option<&mut ContextNode> {
+        let ctx_hex = block_id.split('_').next()?;
+        if let Some(idx) = self.nodes.iter().position(|n| n.context_id.replace('-', "").starts_with(ctx_hex)) {
+            return Some(&mut self.nodes[idx]);
+        }
+        // Fallback to focused node
+        let focus_id = self.focus_id.clone();
+        focus_id.and_then(move |id| self.nodes.iter_mut().find(|n| n.context_id == id))
+    }
+
     /// Add a node for a context we've actively joined (have an actor connection).
     pub fn add_node(&mut self, membership: &ContextMembership) {
         let context_id = &membership.context_id.to_string();
@@ -341,27 +355,24 @@ fn track_agent_activity(
 ) {
     let now = time.elapsed_secs_f64();
     for event in events.read() {
-        // Update the focused node's activity based on agent events
-        // (In the future, we could map block_id to context for more precision)
         match event {
-            AgentActivityMessage::Started { nick, action, .. } => {
+            AgentActivityMessage::Started { nick, action, block_id } => {
                 info!("Agent {} started: {}", nick, action);
-                if let Some(node) = constellation.focused_node_mut() {
+                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     node.activity = ActivityState::Streaming;
                     node.last_activity_time = now;
                 }
             }
-            AgentActivityMessage::Progress { .. } => {
-                // Keep streaming state during progress
-                if let Some(node) = constellation.focused_node_mut() {
+            AgentActivityMessage::Progress { block_id, .. } => {
+                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     if node.activity != ActivityState::Streaming {
                         node.activity = ActivityState::Streaming;
                     }
                     node.last_activity_time = now;
                 }
             }
-            AgentActivityMessage::Completed { success, .. } => {
-                if let Some(node) = constellation.focused_node_mut() {
+            AgentActivityMessage::Completed { block_id, success, .. } => {
+                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     node.activity = if *success {
                         ActivityState::Completed
                     } else {
@@ -370,9 +381,8 @@ fn track_agent_activity(
                     node.last_activity_time = now;
                 }
             }
-            AgentActivityMessage::CursorMoved { .. } => {
-                // Cursor movement indicates active editing
-                if let Some(node) = constellation.focused_node_mut() {
+            AgentActivityMessage::CursorMoved { block_id, .. } => {
+                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     if node.activity == ActivityState::Idle {
                         node.activity = ActivityState::Active;
                     }
