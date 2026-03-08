@@ -1075,6 +1075,12 @@ interface Kernel {
                     blockFilter :ForkBlockFilter, toolFilter :ToolFilterConfig,
                     applyToolFilter :Bool,
                     trace :TraceContext) -> (newContextId :Data);
+
+  # Interrupt a running LLM stream or shell jobs for a context.
+  # immediate=false → soft interrupt (stop agentic loop after current tool turn).
+  # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
+  # Returns success=false when context has no active interrupt state (i.e. nothing running).
+  interruptContext @88 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
 }
 
 # ============================================================================

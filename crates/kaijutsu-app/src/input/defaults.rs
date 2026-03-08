@@ -60,8 +60,8 @@ pub fn default_bindings() -> Vec<Binding> {
     // Activate (Enter on focused block → edit, or generic "do the thing")
     b.push(Binding::key(KeyCode::Enter, InputContext::Navigation, Action::Activate, "Activate focused block"));
 
-    // Escape — pop view or close constellation
-    b.push(Binding::key(KeyCode::Escape, InputContext::Navigation, Action::Unfocus, "Pop view / close overlay"));
+    // Escape — multi-press cancel (soft → hard → hard+clear)
+    b.push(Binding::key(KeyCode::Escape, InputContext::Navigation, Action::InterruptContext { immediate: false }, "Interrupt / pop view"));
 
     // Collapse toggle (Tab on thinking block — currently reuses Tab, but dispatch priority
     // means CycleFocusForward fires first. CollapseToggle is bound to a dedicated key
@@ -101,7 +101,7 @@ pub fn default_bindings() -> Vec<Binding> {
 
     b.push(Binding::key(KeyCode::Enter, InputContext::TextInput, Action::Submit, "Submit"));
     b.push(Binding::key_mod(KeyCode::Enter, Modifiers::SHIFT, InputContext::TextInput, Action::InsertNewline, "Insert newline"));
-    b.push(Binding::key(KeyCode::Escape, InputContext::TextInput, Action::Unfocus, "Return to navigation"));
+    b.push(Binding::key(KeyCode::Escape, InputContext::TextInput, Action::InterruptContext { immediate: false }, "Interrupt / return to navigation"));
     b.push(Binding::key(KeyCode::Tab, InputContext::TextInput, Action::CycleModeRing, "Cycle mode ring"));
     b.push(Binding::key(KeyCode::Backspace, InputContext::TextInput, Action::Backspace, "Backspace"));
     b.push(Binding::key(KeyCode::Delete, InputContext::TextInput, Action::Delete, "Delete"));

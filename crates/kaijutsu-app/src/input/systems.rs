@@ -121,6 +121,70 @@ pub fn handle_unfocus(
     }
 }
 
+/// Handle InterruptContext action — multi-press Escape cancel.
+///
+/// Press count determines escalation:
+/// - 1st press: soft interrupt (stop agentic loop after current tool turn)
+/// - 2nd press: hard interrupt (abort LLM stream + kill kaish jobs)
+/// - 3rd press: hard interrupt + clear compose buffer
+///
+/// Also transitions focus from Compose → Conversation (mirrors old Unfocus behavior).
+pub fn handle_escape(
+    mut actions: MessageReader<ActionFired>,
+    mut escape_state: ResMut<crate::input::escape::EscapeState>,
+    mut focus: ResMut<FocusArea>,
+    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+) {
+    for ActionFired(action) in actions.read() {
+        let _immediate = match action {
+            Action::InterruptContext { immediate } => *immediate,
+            _ => continue,
+        };
+
+        let count = escape_state.press();
+
+        // Escalate based on press count
+        let effective_immediate = count >= 2;
+
+        // Fire RPC interrupt (fire-and-forget)
+        if let Some(ref actor) = actor {
+            if let Some(ctx_id) = doc_cache.active_id() {
+                let handle = actor.handle.clone();
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        match handle.interrupt_context(ctx_id, effective_immediate).await {
+                            Ok(success) => {
+                                log::debug!(
+                                    "interrupt_context: ctx={}, immediate={}, success={}",
+                                    ctx_id, effective_immediate, success
+                                );
+                            }
+                            Err(e) => log::warn!("interrupt_context failed: {e}"),
+                        }
+                    })
+                    .detach();
+            }
+        }
+
+        // 3rd press: also clear the compose buffer
+        if count >= 3 {
+            if let Ok(mut ov) = overlay.single_mut() {
+                ov.text.clear();
+                ov.cursor = 0;
+                ov.selection_anchor = None;
+            }
+            escape_state.reset();
+        }
+
+        // Always transition Compose → Conversation (mirrors old Unfocus behavior)
+        if matches!(focus.as_ref(), FocusArea::Compose) {
+            *focus = FocusArea::Conversation;
+        }
+    }
+}
+
 
 // ============================================================================
 // DEBUG HANDLERS — migrated from ui/debug.rs to consume ActionFired

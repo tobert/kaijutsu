@@ -8,6 +8,7 @@ pub mod context_engine;
 pub mod docs_filesystem;
 pub mod embedded_kaish;
 pub mod input_filesystem;
+pub mod interrupt;
 pub mod kaish_backend;
 pub mod mount_backend;
 pub mod rpc;

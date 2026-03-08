@@ -139,6 +139,9 @@ enum RpcCommand {
     // ── Kernel Info ──────────────────────────────────────────────────────
     GetInfo { reply: oneshot::Sender<Result<KernelInfo, ActorError>> },
 
+    // ── Interrupt ─────────────────────────────────────────────────────────
+    InterruptContext { context_id: ContextId, immediate: bool, reply: oneshot::Sender<Result<bool, ActorError>> },
+
     // ── World-level (handled inline, not dispatched to child tasks) ──────
     Whoami { reply: oneshot::Sender<Result<Identity, ActorError>> },
     ListKernels { reply: oneshot::Sender<Result<Vec<KernelInfo>, ActorError>> },
@@ -192,6 +195,7 @@ impl RpcCommand {
             Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::InterruptContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Whoami { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
         }
@@ -672,6 +676,22 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn get_info(&self) -> Result<KernelInfo, ActorError> {
         self.send(|reply| RpcCommand::GetInfo { reply }).await
+    }
+
+    // ── Interrupt ───────────────────────────────────────────────────────
+
+    /// Interrupt a running LLM stream or shell jobs for a context.
+    ///
+    /// `immediate=false` → soft interrupt (stop after current tool turn).
+    /// `immediate=true`  → hard interrupt (abort stream + kill kaish jobs).
+    /// Returns `false` when the context has no active stream (no-op).
+    #[tracing::instrument(skip(self))]
+    pub async fn interrupt_context(
+        &self,
+        context_id: ContextId,
+        immediate: bool,
+    ) -> Result<bool, ActorError> {
+        self.send(|reply| RpcCommand::InterruptContext { context_id, immediate, reply }).await
     }
 
     // ── World-level Methods ──────────────────────────────────────────────
@@ -1169,6 +1189,11 @@ async fn dispatch_command(
         // ── Kernel Info ──────────────────────────────────────────
         RpcCommand::GetInfo { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.get_info());
+        }
+
+        // ── Interrupt ────────────────────────────────────────────
+        RpcCommand::InterruptContext { context_id, immediate, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.interrupt_context(context_id, immediate));
         }
 
         // World-level commands are handled inline in run() — unreachable here

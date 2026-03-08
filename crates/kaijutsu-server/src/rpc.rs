@@ -8,10 +8,12 @@
 #![allow(refining_impl_trait)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock as TokioRwLock;
 // tokio::sync::Mutex used inside ConversationCache for per-context locking
 
 use capnp::capability::Promise;
@@ -20,6 +22,7 @@ use capnp_rpc::pry;
 use crate::kaijutsu_capnp::*;
 use crate::context_engine::ContextEngine;
 use crate::embedded_kaish::EmbeddedKaish;
+use crate::interrupt::ContextInterruptState;
 
 use kaijutsu_kernel::{
     DocumentDb, DocumentKind, Kernel,
@@ -257,9 +260,38 @@ pub struct SharedKernelState {
     /// Semantic vector index for context search/clustering.
     /// None if embedding model not configured or unavailable.
     pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+    /// Per-context interrupt state. Created fresh at the start of each
+    /// `process_llm_stream` call; looked up by `interruptContext` RPC.
+    pub context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
+
+impl SharedKernelState {
+    /// Create a fresh `ContextInterruptState` for a new prompt, replacing any previous entry.
+    ///
+    /// `CancellationToken` cannot be reset — so each prompt gets a new one.
+    pub async fn create_interrupt(&self, context_id: ContextId) -> Arc<ContextInterruptState> {
+        let state = ContextInterruptState::new();
+        let mut map = self.context_interrupts.write().await;
+        map.insert(context_id, state.clone());
+        state
+    }
+
+    /// Look up an existing interrupt state for a context.
+    ///
+    /// Returns `None` if the context has no active interrupt (nothing running).
+    pub async fn get_interrupt(&self, context_id: ContextId) -> Option<Arc<ContextInterruptState>> {
+        let map = self.context_interrupts.read().await;
+        map.get(&context_id).cloned()
+    }
+
+    /// Remove the interrupt state for a context (called when stream finishes).
+    pub async fn remove_interrupt(&self, context_id: ContextId) {
+        let mut map = self.context_interrupts.write().await;
+        map.remove(&context_id);
+    }
+}
 
 /// Server-wide state. Shared via Arc across all SSH connections.
 pub struct ServerRegistry {
@@ -769,6 +801,7 @@ pub async fn create_shared_kernel(
         config_watcher,
         conversation_cache: Arc::new(ConversationCache::new(64)),
         semantic_index,
+        context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
     };
 
     Ok(Arc::new(shared))
@@ -4723,6 +4756,53 @@ impl kernel::Server for KernelImpl {
         }
         Promise::ok(())
     }
+
+    // =========================================================================
+    // Context Interrupt
+    // =========================================================================
+
+    fn interrupt_context(
+        self: Rc<Self>,
+        params: kernel::InterruptContextParams,
+        mut results: kernel::InterruptContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let params_reader = pry!(params.get());
+        let context_id_bytes = pry!(params_reader.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let immediate = params_reader.get_immediate();
+
+        // Cancel kaish synchronously — cancel() is a sync method.
+        if immediate {
+            if let Some(kaish) = self.connection.borrow().kaish.as_ref() {
+                kaish.cancel();
+            }
+        }
+
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let success = if let Some(interrupt) = kernel.get_interrupt(context_id).await {
+                if immediate {
+                    interrupt.hard();
+                } else {
+                    interrupt.soft();
+                }
+                true
+            } else {
+                // No active stream for this context — no-op (idempotent).
+                false
+            };
+
+            log::info!(
+                "interruptContext: context={}, immediate={}, success={}",
+                context_id, immediate, success
+            );
+
+            results.get().set_success(success);
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================
@@ -5109,6 +5189,9 @@ async fn spawn_llm_for_prompt(
     let kernel_arc = kernel.kernel.clone();
     let config_backend = kernel.config_backend.clone();
     let conversation_cache = kernel.conversation_cache.clone();
+    // Create a fresh interrupt state for this prompt (replaces any previous entry).
+    let interrupt = kernel.create_interrupt(context_id).await;
+    let context_interrupts = kernel.context_interrupts.clone();
 
     // Load system prompt from config
     let system_prompt = {
@@ -5184,6 +5267,8 @@ async fn spawn_llm_for_prompt(
         conversation_cache,
         user_agent_id,
         tool_ctx,
+        interrupt,
+        context_interrupts,
     ));
 
     Ok(())
@@ -5224,6 +5309,8 @@ async fn process_llm_stream(
     // TODO: use for per-user attribution on model-generated blocks
     _user_agent_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ToolContext,
+    interrupt: Arc<ContextInterruptState>,
+    context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
 ) {
     // Get per-context lock — held for the entire stream, serializing
     // concurrent prompts to the same context (Fix D+E).
@@ -5273,6 +5360,12 @@ async fn process_llm_stream(
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
             let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Some(PrincipalId::system()));
+            break;
+        }
+
+        // Soft interrupt: stop before the next LLM call.
+        if interrupt.stop_after_turn.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("Soft interrupt requested for {}, stopping agentic loop", context_id);
             break;
         }
 
@@ -5327,7 +5420,24 @@ async fn process_llm_stream(
         let mut assistant_text = String::new();
 
         log::debug!("Entering stream event loop");
-        while let Some(event) = stream.next_event().await {
+        'stream: loop {
+            let event = tokio::select! {
+                _ = interrupt.cancel.cancelled() => {
+                    log::info!("Hard interrupt: aborting LLM stream for {}", context_id);
+                    if let Some(ref block_id) = current_block_id {
+                        let _ = documents.set_status(context_id, block_id, kaijutsu_crdt::Status::Error);
+                    }
+                    // Clean up interrupt state and exit the entire function
+                    context_interrupts.write().await.remove(&context_id);
+                    return;
+                }
+                maybe_event = stream.next_event() => {
+                    match maybe_event {
+                        Some(ev) => ev,
+                        None => break 'stream,
+                    }
+                }
+            };
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
@@ -5611,6 +5721,9 @@ async fn process_llm_stream(
     if let Err(e) = documents.save_snapshot(context_id) {
         log::warn!("Failed to save snapshot for cell {}: {}", context_id, e);
     }
+
+    // Clean up interrupt state — the context is no longer actively streaming.
+    context_interrupts.write().await.remove(&context_id);
 
     log::info!("LLM stream processing complete for cell {}", context_id);
 }

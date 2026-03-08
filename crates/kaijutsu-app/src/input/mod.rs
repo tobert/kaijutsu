@@ -35,6 +35,7 @@ pub mod binding;
 pub mod context;
 pub mod defaults;
 pub mod dispatch;
+pub mod escape;
 pub mod events;
 pub mod focus;
 pub mod map;
@@ -108,7 +109,8 @@ impl Plugin for InputPlugin {
             .init_resource::<focus::FocusStack>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
-            .init_resource::<events::AnalogInput>();
+            .init_resource::<events::AnalogInput>()
+            .init_resource::<escape::EscapeState>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -159,6 +161,7 @@ impl Plugin for InputPlugin {
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
                 systems::handle_unfocus,
+                systems::handle_escape,
                 systems::handle_toggle_constellation,
                 // App-level actions (global)
                 systems::handle_quit,

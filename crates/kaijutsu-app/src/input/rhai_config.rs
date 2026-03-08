@@ -340,6 +340,7 @@ fn action_to_str(a: &Action) -> String {
         Action::Quit => "Quit",
         Action::Screenshot => "Screenshot",
         Action::DebugToggle => "DebugToggle",
+        Action::InterruptContext { .. } => "InterruptContext",
     }
     .to_string()
 }
@@ -403,6 +404,8 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "Quit" => Ok(Action::Quit),
         "Screenshot" => Ok(Action::Screenshot),
         "DebugToggle" => Ok(Action::DebugToggle),
+        // InterruptContext defaults immediate=false — press count escalates in handle_escape
+        "InterruptContext" => Ok(Action::InterruptContext { immediate: false }),
         _ => Err(format!("unknown action '{s}'")),
     }
 }

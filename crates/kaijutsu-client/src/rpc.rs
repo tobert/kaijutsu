@@ -1376,6 +1376,37 @@ impl KernelHandle {
     }
 
     // =========================================================================
+    // Context Interrupt
+    // =========================================================================
+
+    /// Interrupt a running LLM stream or shell jobs for a context.
+    ///
+    /// `immediate=false` → soft interrupt (stop after current tool turn).
+    /// `immediate=true`  → hard interrupt (abort stream + kill kaish jobs).
+    /// Returns `false` when the context has no active stream (no-op).
+    #[tracing::instrument(skip(self), name = "rpc_client.interrupt_context")]
+    pub async fn interrupt_context(
+        &self,
+        context_id: ContextId,
+        immediate: bool,
+    ) -> Result<bool, RpcError> {
+        let mut request = self.kernel.interrupt_context_request();
+        {
+            let mut params = request.get();
+            params.set_context_id(context_id.as_bytes());
+            params.set_immediate(immediate);
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_success())
+    }
+
+    // =========================================================================
     // Shell Variable Introspection
     // =========================================================================
 

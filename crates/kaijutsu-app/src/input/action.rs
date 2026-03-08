@@ -172,4 +172,16 @@ pub enum Action {
     Screenshot,
     /// F1 — toggle debug overlay
     DebugToggle,
+
+    // ========================================================================
+    // Context Interrupt (Escape in TextInput/Navigation)
+    // ========================================================================
+    /// Multi-press Escape — graduated cancel:
+    /// - 1st press: soft interrupt (stop agentic loop after current tool turn)
+    /// - 2nd press: hard interrupt (abort LLM stream + kill jobs)
+    /// - 3rd press: hard interrupt + clear compose buffer
+    ///
+    /// `immediate` is the starting mode from the binding. The `handle_escape`
+    /// system escalates based on press count.
+    InterruptContext { immediate: bool },
 }

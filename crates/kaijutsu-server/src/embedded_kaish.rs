@@ -190,6 +190,16 @@ impl EmbeddedKaish {
         Some(self.kernel.last_result().await)
     }
 
+    /// Cancel all running kaish execution (best-effort).
+    ///
+    /// Signals the kaish cancellation token, which causes any active
+    /// `execute()` or `execute_streaming()` call to abort at its next
+    /// yield point. Background jobs within the same session are also
+    /// terminated when their containing pipeline is cancelled.
+    pub fn cancel(&self) {
+        self.kernel.cancel();
+    }
+
 }
 
 #[cfg(test)]
