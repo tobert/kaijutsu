@@ -9,6 +9,8 @@ use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 use bevy_vello::vello::kurbo::{Affine, BezPath, Cap, Point, RoundedRect, Stroke};
 use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
 
+use kaijutsu_types::ContextId;
+
 use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationContainer, ConstellationNode,
 };
@@ -45,7 +47,7 @@ pub fn setup_render2d_systems(app: &mut App) {
 /// Maps context_id → card root entity for lifecycle management.
 #[derive(Resource, Default)]
 struct CardEntityMap {
-    map: std::collections::HashMap<String, Entity>,
+    map: std::collections::HashMap<ContextId, Entity>,
 }
 
 /// Marker on the card root entity.
@@ -96,18 +98,18 @@ fn sync_card_entities(
     let card_width = theme.constellation_card_width;
 
     // Current node IDs
-    let current_ids: std::collections::HashSet<&str> = constellation
+    let current_ids: std::collections::HashSet<ContextId> = constellation
         .nodes
         .iter()
-        .map(|n| n.context_id.as_str())
+        .map(|n| n.context_id)
         .collect();
 
     // Despawn cards for removed nodes
-    let stale: Vec<String> = card_map
+    let stale: Vec<ContextId> = card_map
         .map
         .keys()
-        .filter(|id| !current_ids.contains(id.as_str()))
-        .cloned()
+        .filter(|id| !current_ids.contains(id))
+        .copied()
         .collect();
     for id in stale {
         if let Some(entity) = card_map.map.remove(&id) {
@@ -123,7 +125,7 @@ fn sync_card_entities(
 
         let card_entity = spawn_card(&mut commands, node, &theme, &font_handles, card_width);
         commands.entity(container_entity).add_child(card_entity);
-        card_map.map.insert(node.context_id.clone(), card_entity);
+        card_map.map.insert(node.context_id, card_entity);
     }
 }
 
@@ -142,7 +144,7 @@ fn spawn_card(
         .spawn((
             CardMarker,
             ConstellationNode {
-                context_id: node.context_id.clone(),
+                context_id: node.context_id.to_string(),
             },
             Interaction::default(),
             Node {
@@ -283,6 +285,7 @@ fn update_card_positions(
         let z = (depth_t * 100.0) as i32;
         commands.entity(entity).insert(ZIndex(z));
     }
+    // card_map.map is now HashMap<ContextId, Entity> — direct lookup, no string conversion
 }
 
 /// Update card visuals: background scenes, text content, focus highlighting.
@@ -307,7 +310,7 @@ fn update_card_visuals(
             continue;
         };
 
-        let is_focused = constellation.focus_id.as_deref() == Some(&node.context_id);
+        let is_focused = constellation.focus_id == Some(node.context_id);
         let bevy_color = agent_color_for_provider(&theme, node.provider.as_deref());
         let vello_color = bevy_to_vello_color(bevy_color);
 
@@ -440,12 +443,12 @@ fn rebuild_edge_scene(
     let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * 0.55);
 
     // Build id → screen position map
-    let positions: std::collections::HashMap<&str, Vec2> = constellation
+    let positions: std::collections::HashMap<ContextId, Vec2> = constellation
         .nodes
         .iter()
         .map(|n| {
             let screen_pos = center + (n.position + camera.offset) * camera.zoom;
-            (n.context_id.as_str(), screen_pos)
+            (n.context_id, screen_pos)
         })
         .collect();
 
@@ -454,13 +457,13 @@ fn rebuild_edge_scene(
     let mut vello_scene = bevy_vello::vello::Scene::new();
 
     for node in &constellation.nodes {
-        let Some(ref parent_id) = node.parent_id else {
+        let Some(parent_id) = node.parent_id else {
             continue;
         };
-        let Some(&from) = positions.get(parent_id.as_str()) else {
+        let Some(&from) = positions.get(&parent_id) else {
             continue;
         };
-        let Some(&to) = positions.get(node.context_id.as_str()) else {
+        let Some(&to) = positions.get(&node.context_id) else {
             continue;
         };
 
@@ -498,9 +501,7 @@ fn card_label_text(node: &super::ContextNode) -> String {
     if let Some(ref label) = node.label {
         truncate_chars(label, 20)
     } else {
-        // Short context ID (first 8 hex chars)
-        let id = &node.context_id;
-        id.split('-').next().unwrap_or_default().to_string()
+        node.context_id.short()
     }
 }
 

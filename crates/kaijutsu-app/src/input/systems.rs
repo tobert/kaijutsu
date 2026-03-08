@@ -616,8 +616,7 @@ pub fn handle_constellation_nav(
                         let step = if direction.x > 0.0 { 1 } else { n - 1 };
                         let new_idx = (ring_idx + step) % n;
                         if let Some(target_id) = context_id_at_ring_index(&constellation, new_idx) {
-                            let target_id = target_id.to_string();
-                            constellation.focus(&target_id);
+                            constellation.focus(target_id);
                             // Relative delta avoids unbounded angle growth
                             if direction.x > 0.0 {
                                 camera.target_carousel_angle -= step_angle;
@@ -629,7 +628,7 @@ pub fn handle_constellation_nav(
                 } else {
                     // Vertical: spatial nearest-neighbor
                     if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
-                        if let Some(node) = constellation.node_by_id(&target_id) {
+                        if let Some(node) = constellation.node_by_id(target_id) {
                             let old_idx = focused_ring_index(&constellation).unwrap_or(0);
                             let new_idx = node.ring_index;
                             // Compute shortest ring distance as relative delta
@@ -637,7 +636,7 @@ pub fn handle_constellation_nav(
                             let delta_steps = if fwd <= n / 2 { fwd as f32 } else { fwd as f32 - n as f32 };
                             camera.target_carousel_angle -= delta_steps * step_angle;
                         }
-                        constellation.focus(&target_id);
+                        constellation.focus(target_id);
                     }
                 }
             }
@@ -656,43 +655,34 @@ pub fn handle_constellation_nav(
             }
             Action::Activate => {
                 // Enter → switch context and go to conversation
-                if let Some(ref focus_id) = constellation.focus_id {
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
-                        info!("Constellation: switching to {}", focus_id);
-                        switch_writer.write(crate::cell::ContextSwitchRequested {
-                            context_id: ctx_id,
-                        });
-                        next_screen.set(crate::ui::screen::Screen::Conversation);
-                    }
+                if let Some(focus_id) = constellation.focus_id {
+                    info!("Constellation: switching to {}", focus_id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_id: focus_id,
+                    });
+                    next_screen.set(crate::ui::screen::Screen::Conversation);
                 }
             }
             Action::ToggleAlternate => {
-                if let Some(alt_id) = constellation.alternate_id.clone() {
-                    constellation.focus(&alt_id);
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(&alt_id) {
-                        switch_writer.write(crate::cell::ContextSwitchRequested {
-                            context_id: ctx_id,
-                        });
-                        next_screen.set(crate::ui::screen::Screen::Conversation);
-                    }
+                if let Some(alt_id) = constellation.alternate_id {
+                    constellation.focus(alt_id);
+                    switch_writer.write(crate::cell::ContextSwitchRequested {
+                        context_id: alt_id,
+                    });
+                    next_screen.set(crate::ui::screen::Screen::Conversation);
                 }
             }
             Action::ConstellationFork => {
-                if let Some(ref focus_id) = constellation.focus_id {
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(focus_id) {
-                        // Get parent's model/provider from constellation node
-                        let node = constellation.node_by_id(focus_id);
-                        let parent_provider = node.and_then(|n| n.provider.clone());
-                        let parent_model = node.and_then(|n| n.model.clone());
-                        fork_form_writer.write(OpenForkForm {
-                            source_context: focus_id.clone(),
-                            source_context_id: ctx_id,
-                            parent_provider,
-                            parent_model,
-                        });
-                    } else {
-                        warn!("Cannot fork '{}': invalid context ID", focus_id);
-                    }
+                if let Some(focus_id) = constellation.focus_id {
+                    let node = constellation.node_by_id(focus_id);
+                    let parent_provider = node.and_then(|n| n.provider.clone());
+                    let parent_model = node.and_then(|n| n.model.clone());
+                    fork_form_writer.write(OpenForkForm {
+                        source_context: focus_id.to_string(),
+                        source_context_id: focus_id,
+                        parent_provider,
+                        parent_model,
+                    });
                 }
             }
             Action::ConstellationCreate => {
@@ -705,9 +695,9 @@ pub fn handle_constellation_nav(
                 );
             }
             Action::ConstellationModelPicker => {
-                if let Some(ref focus_id) = constellation.focus_id {
+                if let Some(focus_id) = constellation.focus_id {
                     model_writer.write(OpenModelPicker {
-                        context_name: focus_id.clone(),
+                        context_name: focus_id.to_string(),
                     });
                 }
             }

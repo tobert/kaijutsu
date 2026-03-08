@@ -36,6 +36,7 @@ mod render2d;
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
+use kaijutsu_types::ContextId;
 
 use crate::agents::AgentActivityMessage;
 
@@ -158,20 +159,20 @@ pub struct Constellation {
     /// All context nodes in the constellation
     pub nodes: Vec<ContextNode>,
     /// Currently focused context ID (center of constellation)
-    pub focus_id: Option<String>,
+    pub focus_id: Option<ContextId>,
     /// Alternate context ID (for Ctrl-^ switching)
-    pub alternate_id: Option<String>,
+    pub alternate_id: Option<ContextId>,
 }
 
 impl Constellation {
     /// Get a mutable reference to the focused node
     pub fn focused_node_mut(&mut self) -> Option<&mut ContextNode> {
-        let focus_id = self.focus_id.clone();
-        focus_id.and_then(move |id| self.nodes.iter_mut().find(|n| n.context_id == id))
+        let focus_id = self.focus_id?;
+        self.nodes.iter_mut().find(|n| n.context_id == focus_id)
     }
 
     /// Get node by context ID
-    pub fn node_by_id(&self, id: &str) -> Option<&ContextNode> {
+    pub fn node_by_id(&self, id: ContextId) -> Option<&ContextNode> {
         self.nodes.iter().find(|n| n.context_id == id)
     }
 
@@ -181,20 +182,22 @@ impl Constellation {
     /// Falls back to the focused node if the block_id can't be parsed.
     fn node_by_block_id_mut(&mut self, block_id: &str) -> Option<&mut ContextNode> {
         let ctx_hex = block_id.split('_').next()?;
-        if let Some(idx) = self.nodes.iter().position(|n| n.context_id.replace('-', "").starts_with(ctx_hex)) {
-            return Some(&mut self.nodes[idx]);
+        if let Ok(ctx_id) = ContextId::parse(ctx_hex) {
+            if let Some(idx) = self.nodes.iter().position(|n| n.context_id == ctx_id) {
+                return Some(&mut self.nodes[idx]);
+            }
         }
         // Fallback to focused node
-        let focus_id = self.focus_id.clone();
-        focus_id.and_then(move |id| self.nodes.iter_mut().find(|n| n.context_id == id))
+        let focus_id = self.focus_id?;
+        self.nodes.iter_mut().find(|n| n.context_id == focus_id)
     }
 
     /// Add a node for a context we've actively joined (have an actor connection).
     pub fn add_node(&mut self, membership: &ContextMembership) {
-        let context_id = &membership.context_id.to_string();
+        let context_id = membership.context_id;
 
         // If node already exists (e.g. from DriftState), mark it as joined
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.context_id == *context_id) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.context_id == context_id) {
             if !node.joined {
                 info!("Constellation: Marking existing node {} as joined", context_id);
                 node.joined = true;
@@ -203,7 +206,7 @@ impl Constellation {
         }
 
         let node = ContextNode {
-            context_id: context_id.clone(),
+            context_id,
             parent_id: None, // Populated by sync_model_info_to_constellation
             label: None,     // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO,
@@ -220,21 +223,21 @@ impl Constellation {
 
         // If no focus, set this as focus
         if self.focus_id.is_none() {
-            self.focus_id = Some(context_id.clone());
+            self.focus_id = Some(context_id);
         }
     }
 
     /// Add a placeholder node from DriftState context info (not yet joined).
     pub fn add_node_from_context_info(&mut self, ctx_info: &kaijutsu_client::ContextInfo) {
-        let context_id = ctx_info.id.to_string();
+        let context_id = ctx_info.id;
 
-        if self.node_by_id(&context_id).is_some() {
+        if self.node_by_id(context_id).is_some() {
             return;
         }
 
         let node = ContextNode {
-            context_id: context_id.clone(),
-            parent_id: ctx_info.parent_id.as_ref().map(|p| p.to_string()),
+            context_id,
+            parent_id: ctx_info.parent_id,
             label: if ctx_info.label.is_empty() { None } else { Some(ctx_info.label.clone()) },
             position: Vec2::ZERO,
             depth: 0.0,
@@ -250,12 +253,12 @@ impl Constellation {
 
         // If no focus, set this as focus
         if self.focus_id.is_none() {
-            self.focus_id = Some(context_id.clone());
+            self.focus_id = Some(context_id);
         }
     }
 
     /// Switch focus to a different context
-    pub fn focus(&mut self, context_id: &str) {
+    pub fn focus(&mut self, context_id: ContextId) {
         if self.node_by_id(context_id).is_some() {
             // Save current focus as alternate
             if let Some(current) = self.focus_id.take() {
@@ -263,7 +266,7 @@ impl Constellation {
                     self.alternate_id = Some(current);
                 }
             }
-            self.focus_id = Some(context_id.to_string());
+            self.focus_id = Some(context_id);
         }
     }
 
@@ -272,10 +275,10 @@ impl Constellation {
 /// A node in the constellation representing a context
 #[derive(Clone)]
 pub struct ContextNode {
-    /// Unique context identifier (context name)
-    pub context_id: String,
+    /// Unique context identifier
+    pub context_id: ContextId,
     /// Parent context ID (from drift router, for tree layout)
-    pub parent_id: Option<String>,
+    pub parent_id: Option<ContextId>,
     /// Human-readable label (e.g. "default", "debug-auth")
     pub label: Option<String>,
     /// Position in constellation space (calculated by layout)
@@ -410,7 +413,9 @@ fn handle_node_click(
     for (interaction, node) in nodes.iter() {
         if *interaction == Interaction::Pressed {
             info!("Clicked constellation node: {}", node.context_id);
-            constellation.focus(&node.context_id);
+            if let Ok(ctx_id) = ContextId::parse(&node.context_id) {
+                constellation.focus(ctx_id);
+            }
         }
     }
 }
@@ -474,13 +479,13 @@ fn update_node_positions(
 /// siblings sorted by context_id. This keeps parent-child groups adjacent.
 fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
     let n = constellation.nodes.len();
-    let ids: Vec<&str> = constellation.nodes.iter().map(|n| n.context_id.as_str()).collect();
 
     // Map context_id → index
-    let id_to_idx: std::collections::HashMap<&str, usize> = ids
+    let id_to_idx: std::collections::HashMap<ContextId, usize> = constellation
+        .nodes
         .iter()
         .enumerate()
-        .map(|(i, id)| (*id, i))
+        .map(|(i, n)| (n.context_id, i))
         .collect();
 
     // Build children lists
@@ -488,8 +493,8 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
     let mut roots: Vec<usize> = Vec::new();
 
     for (i, node) in constellation.nodes.iter().enumerate() {
-        if let Some(ref pid) = node.parent_id {
-            if let Some(&parent_idx) = id_to_idx.get(pid.as_str()) {
+        if let Some(pid) = node.parent_id {
+            if let Some(&parent_idx) = id_to_idx.get(&pid) {
                 children[parent_idx].push(i);
             } else {
                 roots.push(i);
@@ -503,11 +508,12 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
         roots = (0..n).collect();
     }
 
-    // Stable sort by context_id
+    // Stable sort by context_id (ContextId is Ord via UUIDv7)
+    let nodes = &constellation.nodes;
     for ch in &mut children {
-        ch.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
+        ch.sort_by(|a, b| nodes[*a].context_id.cmp(&nodes[*b].context_id));
     }
-    roots.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
+    roots.sort_by(|a, b| nodes[*a].context_id.cmp(&nodes[*b].context_id));
 
     // DFS
     let mut order = Vec::with_capacity(n);
@@ -534,16 +540,15 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
 
 /// Get the ring index of the focused node (for carousel navigation).
 pub fn focused_ring_index(constellation: &Constellation) -> Option<usize> {
-    constellation.focus_id.as_ref().and_then(|id| {
-        constellation.nodes.iter().find(|n| n.context_id == *id).map(|n| n.ring_index)
-    })
+    let focus_id = constellation.focus_id?;
+    constellation.nodes.iter().find(|n| n.context_id == focus_id).map(|n| n.ring_index)
 }
 
 /// Get context_id of the node at a given ring index.
-pub fn context_id_at_ring_index(constellation: &Constellation, ring_idx: usize) -> Option<&str> {
+pub fn context_id_at_ring_index(constellation: &Constellation, ring_idx: usize) -> Option<ContextId> {
     constellation.nodes.iter()
         .find(|n| n.ring_index == ring_idx)
-        .map(|n| n.context_id.as_str())
+        .map(|n| n.context_id)
 }
 
 
@@ -594,15 +599,14 @@ fn interpolate_camera(
 ///
 /// Filters nodes to the correct half-plane (dot product with direction > 0),
 /// then scores by `distance / cos_angle` to prefer closer, more on-axis nodes.
-pub fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<String> {
-    let focus_pos = constellation.focus_id.as_ref()
-        .and_then(|id| constellation.node_by_id(id))
-        .map(|n| n.position)?;
+pub fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<ContextId> {
+    let focus_id = constellation.focus_id?;
+    let focus_pos = constellation.node_by_id(focus_id)?.position;
 
-    let mut best: Option<(f32, &str)> = None;
+    let mut best: Option<(f32, ContextId)> = None;
 
     for node in &constellation.nodes {
-        if constellation.focus_id.as_deref() == Some(&node.context_id) {
+        if node.context_id == focus_id {
             continue;
         }
 
@@ -620,11 +624,11 @@ pub fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2)
         let score = dist / cos_angle.max(0.01);
 
         if best.is_none() || score < best.unwrap().0 {
-            best = Some((score, &node.context_id));
+            best = Some((score, node.context_id));
         }
     }
 
-    best.map(|(_, id)| id.to_string())
+    best.map(|(_, id)| id)
 }
 
 // ============================================================================

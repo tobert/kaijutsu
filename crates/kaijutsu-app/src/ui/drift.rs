@@ -223,13 +223,11 @@ fn sync_model_info_to_constellation(
     }
 
     for ctx_info in &drift_state.contexts {
-        // Find matching constellation node by context id (full or short)
-        let ctx_id_str = ctx_info.id.to_string();
-        let ctx_short = ctx_info.id.short();
+        // Find matching constellation node by context id
         if let Some(node) = constellation
             .nodes
             .iter_mut()
-            .find(|n| n.context_id == ctx_id_str || n.context_id == ctx_short)
+            .find(|n| n.context_id == ctx_info.id)
         {
             // Update model if it changed
             let new_model = if ctx_info.model.is_empty() {
@@ -254,9 +252,8 @@ fn sync_model_info_to_constellation(
             }
 
             // Sync parent_id for radial tree layout
-            let new_parent_id = ctx_info.parent_id.as_ref().map(|p| p.to_string());
-            if node.parent_id != new_parent_id {
-                node.parent_id = new_parent_id;
+            if node.parent_id != ctx_info.parent_id {
+                node.parent_id = ctx_info.parent_id;
             }
 
             // Sync label
