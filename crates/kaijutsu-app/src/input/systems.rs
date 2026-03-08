@@ -577,7 +577,7 @@ pub fn handle_tiling(
 
 use crate::cell::PromptSubmitted;
 use crate::ui::constellation::{
-    CameraOrbit, Constellation, ConstellationCamera,
+    Constellation, ConstellationCamera,
     NewContextConfig, OpenForkForm, create_or_fork_context,
     find_nearest_in_direction,
     focused_ring_index, context_id_at_ring_index,
@@ -593,7 +593,6 @@ pub fn handle_constellation_nav(
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
-    mut orbit: Option<ResMut<CameraOrbit>>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut model_writer: MessageWriter<OpenModelPicker>,
     mut fork_form_writer: MessageWriter<OpenForkForm>,
@@ -643,37 +642,17 @@ pub fn handle_constellation_nav(
                 }
             }
             Action::Pan(direction) => {
-                // Use orbit yaw/pitch if available, fall back to 2D pan
-                if let Some(ref mut orbit) = orbit {
-                    let orbit_speed = 0.3;
-                    orbit.target_yaw += direction.x * orbit_speed;
-                    orbit.target_pitch = (orbit.target_pitch + direction.y * orbit_speed)
-                        .clamp(-std::f32::consts::FRAC_PI_2 + 0.1, std::f32::consts::FRAC_PI_2 - 0.1);
-                } else {
-                    let pan_speed = 50.0;
-                    camera.target_offset += *direction * pan_speed;
-                }
+                let pan_speed = 50.0;
+                camera.target_offset += *direction * pan_speed;
             }
             Action::ZoomIn => {
-                if let Some(ref mut orbit) = orbit {
-                    orbit.target_distance = (orbit.target_distance / 1.15).max(1.5);
-                } else {
-                    camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
-                }
+                camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
             }
             Action::ZoomOut => {
-                if let Some(ref mut orbit) = orbit {
-                    orbit.target_distance = (orbit.target_distance * 1.15).min(10.0);
-                } else {
-                    camera.target_zoom = (camera.target_zoom / 1.25).max(0.25);
-                }
+                camera.target_zoom = (camera.target_zoom / 1.25).max(0.25);
             }
             Action::ZoomReset => {
-                if let Some(ref mut orbit) = orbit {
-                    orbit.reset();
-                } else {
-                    camera.reset();
-                }
+                camera.reset();
             }
             Action::Activate => {
                 // Enter → switch context and go to conversation

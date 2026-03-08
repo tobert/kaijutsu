@@ -30,11 +30,8 @@
 
 mod create_dialog;
 pub mod fork_form;
-pub mod hyper;
-pub mod layout;
 mod legend;
 pub mod model_picker;
-mod navigation;
 mod render2d;
 
 use bevy::prelude::*;
@@ -44,7 +41,6 @@ use crate::agents::AgentActivityMessage;
 
 pub use create_dialog::create_or_fork_context;
 pub use fork_form::OpenForkForm;
-pub use navigation::CameraOrbit;
 
 // Render module provides visual systems (used by the plugin internally)
 
@@ -72,8 +68,6 @@ impl Plugin for ConstellationPlugin {
             .register_type::<ActivityState>()
             .register_type::<ConstellationContainer>()
             .register_type::<ConstellationNode>()
-            .register_type::<ConstellationConnection>()
-            .register_type::<DriftConnectionKind>()
             .register_type::<ConstellationCamera>()
             .add_systems(
                 Update,
@@ -93,9 +87,6 @@ impl Plugin for ConstellationPlugin {
 
         // Add 2D Vello rendering systems
         render2d::setup_render2d_systems(app);
-
-        // Add navigation systems (focus animation, camera orbit)
-        navigation::setup_navigation_systems(app);
 
         // Add create context dialog systems
         create_dialog::setup_create_dialog_systems(app);
@@ -262,41 +253,6 @@ impl Constellation {
         }
     }
 
-    /// Switch to alternate context (Ctrl-^)
-    #[allow(dead_code)]
-    pub fn toggle_alternate(&mut self) {
-        if let Some(alt) = self.alternate_id.take() {
-            let current = self.focus_id.take();
-            self.focus_id = Some(alt);
-            self.alternate_id = current;
-        }
-    }
-
-    /// Get the next context ID (for cycle navigation)
-    #[allow(dead_code)] // Phase N: restore when NextContext action is re-added
-    pub fn next_context_id(&self) -> Option<&str> {
-        let focus_idx = self.focus_id.as_ref().and_then(|id| {
-            self.nodes.iter().position(|n| &n.context_id == id)
-        })?;
-
-        let next_idx = (focus_idx + 1) % self.nodes.len();
-        Some(&self.nodes[next_idx].context_id)
-    }
-
-    /// Get the previous context ID (for cycle navigation)
-    #[allow(dead_code)] // Phase N: restore when PrevContext action is re-added
-    pub fn prev_context_id(&self) -> Option<&str> {
-        let focus_idx = self.focus_id.as_ref().and_then(|id| {
-            self.nodes.iter().position(|n| &n.context_id == id)
-        })?;
-
-        let prev_idx = if focus_idx == 0 {
-            self.nodes.len() - 1
-        } else {
-            focus_idx - 1
-        };
-        Some(&self.nodes[prev_idx].context_id)
-    }
 }
 
 /// A node in the constellation representing a context
@@ -343,22 +299,6 @@ pub enum ActivityState {
     /// Task completed recently
     Completed,
 }
-
-impl ActivityState {
-    /// Get the glow intensity for this state
-    #[allow(dead_code)] // Phase 3: will use for depth-based glow
-    pub fn glow_intensity(&self) -> f32 {
-        match self {
-            Self::Idle => 0.2,
-            Self::Active => 0.6,
-            Self::Streaming => 0.9,
-            Self::Waiting => 0.5,
-            Self::Error => 0.8,
-            Self::Completed => 0.7,
-        }
-    }
-}
-
 
 
 // ============================================================================
@@ -693,21 +633,3 @@ pub struct ConstellationNode {
     pub context_id: String,
 }
 
-/// What kind of connection this line represents.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
-pub enum DriftConnectionKind {
-    /// Parent-child ancestry from fork/thread
-    #[default]
-    Ancestry,
-    /// Active staged drift between contexts
-    StagedDrift,
-}
-
-/// Marker for a constellation connection line entity
-#[derive(Component, Reflect, Default)]
-#[reflect(Component)]
-pub struct ConstellationConnection {
-    pub from: String,
-    pub to: String,
-    pub kind: DriftConnectionKind,
-}
