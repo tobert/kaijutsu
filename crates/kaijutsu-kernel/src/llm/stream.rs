@@ -371,7 +371,29 @@ enum RigStreamInner {
     Ollama(RigStreamingResponse<ollama::StreamingCompletionResponse>),
 }
 
+impl RigStreamInner {
+    fn cancel(&self) {
+        match self {
+            RigStreamInner::Anthropic(s) => s.cancel(),
+            RigStreamInner::Gemini(s) => s.cancel(),
+            RigStreamInner::OpenAI(s) => s.cancel(),
+            RigStreamInner::Ollama(s) => s.cancel(),
+        }
+    }
+}
+
 impl RigStreamAdapter {
+    /// Signal the underlying HTTP stream to abort.
+    ///
+    /// Rig wraps the reqwest byte stream in an `Abortable`. Calling `cancel()`
+    /// fires the `AbortHandle`, which causes the next poll to return `None`
+    /// (treated as stream end by `RigStreamAdapter::next_event`). The adapter
+    /// will emit any pending block-close events followed by a `Done` event with
+    /// `stop_reason: None` — distinguishable from a natural stream end.
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
     /// Create a new streaming adapter from a provider and request.
     pub async fn new(provider: RigProvider, request: StreamRequest) -> LlmResult<Self> {
         let model = request.model.clone();

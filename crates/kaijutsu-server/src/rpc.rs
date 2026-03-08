@@ -5420,21 +5420,28 @@ async fn process_llm_stream(
         let mut assistant_text = String::new();
 
         log::debug!("Entering stream event loop");
+        let mut stream_cancelled = false;
         'stream: loop {
-            let event = tokio::select! {
-                _ = interrupt.cancel.cancelled() => {
-                    log::info!("Hard interrupt: aborting LLM stream for {}", context_id);
-                    if let Some(ref block_id) = current_block_id {
-                        let _ = documents.set_status(context_id, block_id, kaijutsu_crdt::Status::Error);
-                    }
-                    // Clean up interrupt state and exit the entire function
-                    context_interrupts.write().await.remove(&context_id);
-                    return;
+            // After cancel: only poll the stream (not the cancel signal) so rig
+            // can flush its pending block-close + Done events before we stop.
+            let event = if stream_cancelled {
+                match stream.next_event().await {
+                    Some(ev) => ev,
+                    None => break 'stream,
                 }
-                maybe_event = stream.next_event() => {
-                    match maybe_event {
-                        Some(ev) => ev,
-                        None => break 'stream,
+            } else {
+                tokio::select! {
+                    _ = interrupt.cancel.cancelled() => {
+                        log::info!("Hard interrupt: cancelling LLM stream for {}", context_id);
+                        stream.cancel();  // signals rig's AbortHandle → HTTP stream drops
+                        stream_cancelled = true;
+                        continue 'stream;  // drain one Done event for confirmation
+                    }
+                    maybe_event = stream.next_event() => {
+                        match maybe_event {
+                            Some(ev) => ev,
+                            None => break 'stream,
+                        }
                     }
                 }
             };
@@ -5520,6 +5527,22 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
+                    if stream_cancelled {
+                        // Hard interrupt confirmation: rig flushed its buffer cleanly.
+                        // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).
+                        log::info!(
+                            "LLM stream cancelled: tokens_in={:?}, tokens_out={:?}",
+                            input_tokens, output_tokens
+                        );
+                        let _ = documents.insert_block_as(
+                            context_id, None, Some(&last_block_id),
+                            Role::Model, BlockKind::Text,
+                            "⛔ Interrupted",
+                            Some(PrincipalId::system()),
+                        );
+                        // Exit the agentic loop; cleanup runs below.
+                        break;
+                    }
                     log::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
                         stop_reason, input_tokens, output_tokens
@@ -5532,6 +5555,11 @@ async fn process_llm_stream(
                     return;
                 }
             }
+        }
+
+        // After a hard interrupt, break the agentic loop immediately.
+        if stream_cancelled {
+            break;
         }
 
         // Check if we need to execute tools.
