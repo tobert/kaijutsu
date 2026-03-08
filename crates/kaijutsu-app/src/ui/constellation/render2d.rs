@@ -14,11 +14,14 @@ use kaijutsu_types::ContextId;
 use super::{
     ActivityState, Constellation, ConstellationCamera, ConstellationContainer, ConstellationNode,
 };
+use crate::text::truncate_chars;
 use crate::ui::screen::Screen;
 use crate::ui::theme::{agent_color_for_provider, Theme};
 
 /// Card height estimate for positioning (3 text lines + padding).
 const CARD_HEIGHT: f32 = 75.0;
+/// Vertical center fraction for card positioning (slightly below center for visual comfort).
+const CAROUSEL_VERTICAL_CENTER: f32 = 0.55;
 /// Corner radius for card background.
 const CARD_CORNER_RADIUS: f64 = 6.0;
 /// Border thickness for card outlines.
@@ -250,7 +253,7 @@ fn update_card_positions(
     }
 
     // Center cards slightly below vertical center (60%) for visual comfort
-    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * 0.55);
+    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * CAROUSEL_VERTICAL_CENTER);
     let base_card_width = theme.constellation_card_width;
 
     for node in &constellation.nodes {
@@ -440,7 +443,7 @@ fn rebuild_edge_scene(
         return;
     }
 
-    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * 0.55);
+    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * CAROUSEL_VERTICAL_CENTER);
 
     // Build id → screen position map
     let positions: std::collections::HashMap<ContextId, Vec2> = constellation
@@ -512,17 +515,6 @@ fn card_model_text(node: &super::ContextNode) -> String {
         truncate_chars(short, 22)
     } else {
         "(no model)".to_string()
-    }
-}
-
-/// Char-aware truncation (safe for multi-byte UTF-8).
-fn truncate_chars(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{truncated}…")
     }
 }
 

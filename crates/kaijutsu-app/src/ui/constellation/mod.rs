@@ -438,25 +438,27 @@ const CAROUSEL_MIN_SPACING: f32 = 240.0;
 fn update_node_positions(
     mut constellation: ResMut<Constellation>,
     camera: Res<ConstellationCamera>,
+    mut cached_ring: Local<Vec<usize>>,
 ) {
     let n = constellation.nodes.len();
     if n == 0 {
         return;
     }
 
-    // Build DFS ring order: parent before children, sorted by context_id
-    let ring_order = build_ring_order(&constellation);
-
-    // Assign ring indices
-    for (ring_idx, &node_idx) in ring_order.iter().enumerate() {
-        constellation.nodes[node_idx].ring_index = ring_idx;
+    // Only rebuild ring order when constellation data changes
+    if constellation.is_changed() || cached_ring.len() != n {
+        *cached_ring = build_ring_order(&constellation);
+        // Assign ring indices
+        for (ring_idx, &node_idx) in cached_ring.iter().enumerate() {
+            constellation.nodes[node_idx].ring_index = ring_idx;
+        }
     }
 
     // Ring radius: ensure minimum angular spacing for card width
     let circumference = n as f32 * CAROUSEL_MIN_SPACING;
     let radius = (circumference / std::f32::consts::TAU).max(400.0);
 
-    for &node_idx in &ring_order {
+    for &node_idx in cached_ring.iter() {
         let ring_idx = constellation.nodes[node_idx].ring_index;
         let base_angle = std::f32::consts::TAU * ring_idx as f32 / n as f32;
         let angle = base_angle + camera.carousel_angle;

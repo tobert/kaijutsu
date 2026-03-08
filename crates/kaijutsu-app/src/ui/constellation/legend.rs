@@ -5,8 +5,12 @@
 //! - `spawn_legend_panel` + `update_legend_content` — info panel (top-left overlay)
 
 use bevy::prelude::*;
+use bevy_vello::prelude::UiVelloScene;
+use bevy_vello::vello::kurbo::RoundedRect;
+use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
 
 use super::{Constellation, ConstellationContainer};
+use crate::text::truncate_chars;
 use crate::ui::drift::DriftState;
 use crate::ui::screen::Screen;
 use crate::ui::theme::Theme;
@@ -18,6 +22,10 @@ struct ConstellationLegend;
 /// Marker for legend content entities (rebuilt on data change).
 #[derive(Component)]
 struct LegendContent;
+
+/// Marker for the legend background scene.
+#[derive(Component)]
+struct LegendBg;
 
 pub fn setup_legend_systems(app: &mut App) {
     app.add_systems(
@@ -66,7 +74,6 @@ fn spawn_constellation_container(
                 ..default()
             },
             vis,
-            BackgroundColor(Color::NONE),
         ))
         .id();
 
@@ -89,6 +96,13 @@ fn spawn_legend_panel(
         return;
     };
 
+    // Build background scene (renders in Vello pass, not UI pass — won't cover Vello text)
+    let bg_color = theme.panel_bg.with_alpha(0.85).to_srgba();
+    let vello_bg = VelloColor::new([bg_color.red, bg_color.green, bg_color.blue, bg_color.alpha]);
+    let mut scene = bevy_vello::vello::Scene::new();
+    let rect = RoundedRect::new(0.0, 0.0, 160.0, 120.0, 4.0);
+    scene.fill(Fill::NonZero, bevy_vello::vello::kurbo::Affine::IDENTITY, vello_bg, None, &rect);
+
     let legend_entity = commands
         .spawn((
             ConstellationLegend,
@@ -103,9 +117,21 @@ fn spawn_legend_panel(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
-            BackgroundColor(theme.panel_bg.with_alpha(0.85)),
             ZIndex(1),
         ))
+        .with_children(|parent| {
+            // Background scene — absolute, covers full panel
+            parent.spawn((
+                LegendBg,
+                UiVelloScene::from(scene),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+            ));
+        })
         .id();
 
     commands.entity(container_entity).add_child(legend_entity);
@@ -157,7 +183,7 @@ fn update_legend_content(
     let font = &font_handles.mono;
 
     // Header: kernel name
-    let header = spawn_legend_text(&mut commands, font, &truncate_name(kernel_name, 18), theme.fg, 11.0);
+    let header = spawn_legend_text(&mut commands, font, &truncate_chars(kernel_name, 18), theme.fg, 11.0);
     commands.entity(legend_entity).add_child(header);
 
     // Summary line
@@ -173,16 +199,6 @@ fn update_legend_content(
     }
 
     *last_fingerprint = fingerprint;
-}
-
-fn truncate_name(name: &str, max_len: usize) -> String {
-    let char_count = name.chars().count();
-    if char_count <= max_len {
-        name.to_string()
-    } else {
-        let truncated: String = name.chars().take(max_len - 1).collect();
-        format!("{truncated}…")
-    }
 }
 
 fn spawn_legend_text(
