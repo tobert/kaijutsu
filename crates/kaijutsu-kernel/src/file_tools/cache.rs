@@ -179,7 +179,7 @@ impl FileDocumentCache {
                     0,
                     content,
                     old_content.len(),
-                )?;
+                ).map_err(|e| e.to_string())?;
 
                 return Ok((entry.context_id, entry.block_id.clone()));
             }

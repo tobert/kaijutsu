@@ -304,7 +304,7 @@ impl KernelBackend for KaijutsuBackend {
                         }
                         self.blocks
                             .create_document(ctx_id, DocumentKind::Code, None)
-                            .map_err(|e| BackendError::Io(e))?;
+                            .map_err(|e| BackendError::Io(e.to_string()))?;
                     }
                     WriteMode::UpdateOnly => {
                         if !self.blocks.contains(ctx_id) {
@@ -315,7 +315,7 @@ impl KernelBackend for KaijutsuBackend {
                         if !self.blocks.contains(ctx_id) {
                             self.blocks
                                 .create_document(ctx_id, DocumentKind::Code, None)
-                                .map_err(|e| BackendError::Io(e))?;
+                                .map_err(|e| BackendError::Io(e.to_string()))?;
                         }
                     }
                     _ => {
@@ -355,7 +355,7 @@ impl KernelBackend for KaijutsuBackend {
                 // Delete all content then insert new content
                 self.blocks
                     .edit_text(ctx_id, &block_id, 0, content_str, current_len)
-                    .map_err(|e| BackendError::Io(e))?;
+                    .map_err(|e| BackendError::Io(e.to_string()))?;
 
                 Ok(())
             }
@@ -377,7 +377,7 @@ impl KernelBackend for KaijutsuBackend {
             PathResolution::Block(ctx_id, block_id) => {
                 self.blocks
                     .append_text(ctx_id, &block_id, content_str)
-                    .map_err(|e| BackendError::Io(e))?;
+                    .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
             PathResolution::Document(_) | PathResolution::DocsRoot | PathResolution::Root => {
@@ -508,7 +508,7 @@ impl KernelBackend for KaijutsuBackend {
                 }
                 self.blocks
                     .create_document(ctx_id, DocumentKind::Code, None)
-                    .map_err(|e| BackendError::Io(e))?;
+                    .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
             PathResolution::Root | PathResolution::DocsRoot => {
@@ -540,13 +540,13 @@ impl KernelBackend for KaijutsuBackend {
                 }
                 self.blocks
                     .delete_document(ctx_id)
-                    .map_err(|e| BackendError::Io(e))?;
+                    .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
             PathResolution::Block(ctx_id, block_id) => {
                 self.blocks
                     .delete_block(ctx_id, &block_id)
-                    .map_err(|e| BackendError::Io(e))?;
+                    .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
             PathResolution::Root | PathResolution::DocsRoot => {
@@ -733,7 +733,7 @@ fn apply_patch_op(
         PatchOp::Insert { offset, content } => {
             blocks
                 .edit_text(ctx_id, block_id, *offset, content, 0)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.insert_str(*offset, content);
             Ok(result)
@@ -751,7 +751,7 @@ fn apply_patch_op(
             }
             blocks
                 .edit_text(ctx_id, block_id, *offset, "", *len)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, "");
             Ok(result)
@@ -769,7 +769,7 @@ fn apply_patch_op(
             }
             blocks
                 .edit_text(ctx_id, block_id, *offset, content, *len)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, content);
             Ok(result)
@@ -778,7 +778,7 @@ fn apply_patch_op(
             let line_offset = line_to_byte_offset(current_content, *line);
             blocks
                 .edit_text(ctx_id, block_id, line_offset, &format!("{}\n", content), 0)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.insert_str(line_offset, &format!("{}\n", content));
             Ok(result)
@@ -799,7 +799,7 @@ fn apply_patch_op(
 
             blocks
                 .edit_text(ctx_id, block_id, start, "", end - start)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, "");
             Ok(result)
@@ -821,7 +821,7 @@ fn apply_patch_op(
             let replacement = format!("{}\n", content);
             blocks
                 .edit_text(ctx_id, block_id, start, &replacement, end - start)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, &replacement);
             Ok(result)
@@ -829,7 +829,7 @@ fn apply_patch_op(
         PatchOp::Append { content } => {
             blocks
                 .append_text(ctx_id, block_id, content)
-                .map_err(|e| BackendError::Io(e))?;
+                .map_err(|e| BackendError::Io(e.to_string()))?;
             Ok(format!("{}{}", current_content, content))
         }
     }

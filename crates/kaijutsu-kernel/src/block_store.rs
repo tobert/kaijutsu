@@ -26,6 +26,44 @@ use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
 use crate::input_doc::InputDocEntry;
 
+// ============================================================================
+// Error types
+// ============================================================================
+
+/// Structured error for BlockStore operations.
+#[derive(Debug, thiserror::Error)]
+pub enum BlockStoreError {
+    #[error("document not found: {0}")]
+    DocumentNotFound(ContextId),
+
+    #[error("input document not found: {0}")]
+    InputDocNotFound(ContextId),
+
+    #[error("document already exists: {0}")]
+    DocumentAlreadyExists(ContextId),
+
+    #[error("block not found after insert")]
+    BlockNotFoundAfterInsert,
+
+    #[error(transparent)]
+    Crdt(#[from] kaijutsu_crdt::CrdtError),
+
+    #[error("database error: {0}")]
+    Db(String),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("no database configured")]
+    NoDatabaseConfigured,
+
+    #[error("{0}")]
+    Validation(String),
+}
+
+/// Result type alias for BlockStore operations.
+pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
+
 /// Thread-safe database handle.
 pub type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
 
@@ -209,18 +247,18 @@ impl BlockStore {
         context_id: ContextId,
         kind: DocumentKind,
         language: Option<String>,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         use dashmap::mapref::entry::Entry;
 
         let id_hex = context_id.to_hex();
         match self.documents.entry(context_id) {
             Entry::Occupied(_) => {
-                Err(format!("Document {} already exists", id_hex))
+                Err(BlockStoreError::DocumentAlreadyExists(context_id))
             }
             Entry::Vacant(vacant) => {
                 // Persist metadata if we have a DB
                 if let Some(db) = &self.db {
-                    let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+                    let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
                     let meta = DocumentMeta {
                         id: id_hex.clone(),
                         kind,
@@ -236,7 +274,7 @@ impl BlockStore {
                             // DashMap insert so the document becomes usable again.
                             tracing::warn!(context_id = %id_hex, "Document already in DB but not in memory, recovering");
                         }
-                        Err(e) => return Err(format!("DB error: {}", e)),
+                        Err(e) => return Err(BlockStoreError::Db(e.to_string())),
                     }
                 }
 
@@ -259,13 +297,13 @@ impl BlockStore {
         kind: DocumentKind,
         language: Option<String>,
         snapshot_bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&context_id) {
-            return Err(format!("Document {} already exists", context_id.to_hex()));
+            return Err(BlockStoreError::DocumentAlreadyExists(context_id));
         }
 
         let snapshot: StoreSnapshot = postcard::from_bytes(snapshot_bytes)
-            .map_err(|e| format!("Failed to deserialize store snapshot: {}", e))?;
+            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
         let agent_id = self.agent_id();
         let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, agent_id);
@@ -295,12 +333,12 @@ impl BlockStore {
     }
 
     /// Delete a document.
-    pub fn delete_document(&self, context_id: ContextId) -> Result<(), String> {
+    pub fn delete_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
             db_guard
                 .delete_document(&context_id.to_hex())
-                .map_err(|e| format!("DB error: {}", e))?;
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
         self.documents.remove(&context_id);
@@ -330,13 +368,13 @@ impl BlockStore {
         &self,
         source_id: ContextId,
         new_id: ContextId,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
-            return Err(format!("Document {} already exists", new_id.to_hex()));
+            return Err(BlockStoreError::DocumentAlreadyExists(new_id));
         }
 
         let source_entry = self.get(source_id)
-            .ok_or_else(|| format!("Source document {} not found", source_id.to_hex()))?;
+            .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
         let agent_id = self.agent_id();
         let forked_store = source_entry.doc.fork(new_id, agent_id);
@@ -346,7 +384,7 @@ impl BlockStore {
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
             let meta = DocumentMeta {
                 id: new_id.to_hex(),
                 kind,
@@ -356,7 +394,7 @@ impl BlockStore {
             };
             db_guard
                 .create_document(&meta)
-                .map_err(|e| format!("DB error: {}", e))?;
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
         let version = forked_store.version();
@@ -392,21 +430,21 @@ impl BlockStore {
         source_id: ContextId,
         new_id: ContextId,
         at_version: u64,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
-            return Err(format!("Document {} already exists", new_id.to_hex()));
+            return Err(BlockStoreError::DocumentAlreadyExists(new_id));
         }
 
         let source_entry = self.get(source_id)
-            .ok_or_else(|| format!("Source document {} not found", source_id.to_hex()))?;
+            .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
         // Validate version
         let current_version = source_entry.version();
         if at_version > current_version {
-            return Err(format!(
+            return Err(BlockStoreError::Validation(format!(
                 "Requested version {} is in the future (current: {})",
                 at_version, current_version
-            ));
+            )));
         }
 
         let agent_id = self.agent_id();
@@ -417,7 +455,7 @@ impl BlockStore {
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
             let meta = DocumentMeta {
                 id: new_id.to_hex(),
                 kind,
@@ -427,7 +465,7 @@ impl BlockStore {
             };
             db_guard
                 .create_document(&meta)
-                .map_err(|e| format!("DB error: {}", e))?;
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
         let version = forked_store.version();
@@ -454,20 +492,20 @@ impl BlockStore {
         new_id: ContextId,
         at_version: u64,
         filter: &ForkBlockFilter,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
-            return Err(format!("Document {} already exists", new_id.to_hex()));
+            return Err(BlockStoreError::DocumentAlreadyExists(new_id));
         }
 
         let source_entry = self.get(source_id)
-            .ok_or_else(|| format!("Source document {} not found", source_id.to_hex()))?;
+            .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
         let current_version = source_entry.version();
         if at_version > current_version {
-            return Err(format!(
+            return Err(BlockStoreError::Validation(format!(
                 "Requested version {} is in the future (current: {})",
                 at_version, current_version
-            ));
+            )));
         }
 
         let agent_id = self.agent_id();
@@ -478,7 +516,7 @@ impl BlockStore {
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
             let meta = DocumentMeta {
                 id: new_id.to_hex(),
                 kind,
@@ -488,7 +526,7 @@ impl BlockStore {
             };
             db_guard
                 .create_document(&meta)
-                .map_err(|e| format!("DB error: {}", e))?;
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
         let version = forked_store.version();
@@ -550,7 +588,7 @@ impl BlockStore {
         role: Role,
         kind: BlockKind,
         content: impl Into<String>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         self.insert_block_as(context_id, parent_id, after, role, kind, content, None)
     }
 
@@ -567,10 +605,10 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
         agent_id: Option<PrincipalId>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
 
             // Set the agent for this operation so BlockId gets the right author
@@ -582,13 +620,13 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
 
             let block_id = entry.doc.insert_block(parent_id, after, role, kind, content)
-                .map_err(|e| e.to_string())?;
+                ?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
-                .ok_or_else(|| "Block not found after insert".to_string())?;
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -615,7 +653,7 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         tool_kind: Option<ToolKind>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, tool_kind, None, None)
     }
 
@@ -633,10 +671,10 @@ impl BlockStore {
         tool_kind: Option<ToolKind>,
         agent_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
 
@@ -644,20 +682,20 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
 
             let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, tool_kind)
-                .map_err(|e| e.to_string())?;
+                ?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips
             if let Some(ref tui) = tool_use_id {
                 entry.doc.set_tool_use_id(&block_id, Some(tui.clone()))
-                    .map_err(|e| e.to_string())?;
+                    ?;
             }
 
             let snapshot = entry.doc.get_block_snapshot(&block_id)
-                .ok_or_else(|| "Block not found after insert".to_string())?;
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -685,7 +723,7 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
         tool_kind: Option<ToolKind>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         self.insert_tool_result_as(context_id, tool_call_id, after, content, is_error, exit_code, tool_kind, None, None)
     }
 
@@ -704,10 +742,10 @@ impl BlockStore {
         tool_kind: Option<ToolKind>,
         agent_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
 
@@ -715,20 +753,20 @@ impl BlockStore {
             let frontier_before = entry.doc.frontier();
 
             let block_id = entry.doc.insert_tool_result_block(tool_call_id, after, content, is_error, exit_code, tool_kind)
-                .map_err(|e| e.to_string())?;
+                ?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips
             if let Some(ref tui) = tool_use_id {
                 entry.doc.set_tool_use_id(&block_id, Some(tui.clone()))
-                    .map_err(|e| e.to_string())?;
+                    ?;
             }
 
             let snapshot = entry.doc.get_block_snapshot(&block_id)
-                .ok_or_else(|| "Block not found after insert".to_string())?;
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };
@@ -755,7 +793,7 @@ impl BlockStore {
         context_id: ContextId,
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         self.insert_from_snapshot_as(context_id, snapshot, after, None)
     }
 
@@ -766,23 +804,23 @@ impl BlockStore {
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
         agent_id: Option<PrincipalId>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, final_snapshot, ops) = {
             let mut entry = self.get_mut(context_id)
-                .ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
             let block_id = entry.doc.insert_from_snapshot(snapshot, after)
-                .map_err(|e| e.to_string())?;
+                ?;
             let final_snapshot = entry.doc.get_block_snapshot(&block_id)
-                .ok_or_else(|| "Block not found after insert".to_string())?;
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, final_snapshot, ops_bytes)
         };
@@ -805,11 +843,11 @@ impl BlockStore {
         context_id: ContextId,
         block_id: &BlockId,
         status: Status,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
-            entry.doc.set_status(block_id, status).map_err(|e| e.to_string())?;
+            entry.doc.set_status(block_id, status)?;
             entry.touch(agent_id);
         }
         self.auto_save(context_id);
@@ -844,7 +882,7 @@ impl BlockStore {
         pos: usize,
         insert: &str,
         delete: usize,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         self.edit_text_as(context_id, block_id, pos, insert, delete, None)
     }
 
@@ -857,18 +895,18 @@ impl BlockStore {
         insert: &str,
         delete: usize,
         agent_id: Option<PrincipalId>,
-    ) -> Result<(), String> {
+    ) -> BlockStoreResult<()> {
         let ops = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
             // Capture frontier before edit
             let frontier = entry.doc.frontier();
-            entry.doc.edit_text(block_id, pos, insert, delete).map_err(|e| e.to_string())?;
+            entry.doc.edit_text(block_id, pos, insert, delete)?;
             entry.touch(effective_agent);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?
         };
         // Note: No auto-save for text edits (high frequency during streaming)
 
@@ -886,19 +924,27 @@ impl BlockStore {
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.
-    /// Does NOT emit a flow event — output is a struct field, not DTE-tracked.
-    /// The caller should call `set_status` afterward, which reads the snapshot
-    /// (including output) and sends it via `StatusChanged` to clients.
+    /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
+    /// wire compat — see `set_status`.
     pub fn set_output(
         &self,
         context_id: ContextId,
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
-    ) -> Result<(), String> {
-        let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    ) -> BlockStoreResult<()> {
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let agent_id = self.agent_id();
-        entry.doc.set_output(block_id, output.cloned()).map_err(|e| e.to_string())?;
+        entry.doc.set_output(block_id, output.cloned())?;
         entry.touch(agent_id);
+        drop(entry);
+
+        self.emit(BlockFlow::OutputChanged {
+            context_id,
+            block_id: *block_id,
+            output: output.cloned(),
+            source: OpSource::Local,
+        });
+
         Ok(())
     }
 
@@ -908,11 +954,19 @@ impl BlockStore {
         context_id: ContextId,
         block_id: &BlockId,
         tool_use_id: Option<String>,
-    ) -> Result<(), String> {
-        let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    ) -> BlockStoreResult<()> {
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let agent_id = self.agent_id();
-        entry.doc.set_tool_use_id(block_id, tool_use_id).map_err(|e| e.to_string())?;
+        entry.doc.set_tool_use_id(block_id, tool_use_id)?;
         entry.touch(agent_id);
+        drop(entry);
+
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
         Ok(())
     }
 
@@ -920,23 +974,23 @@ impl BlockStore {
     ///
     /// Note: Does not auto-save to avoid excessive I/O during streaming.
     /// Call `save_snapshot()` explicitly when streaming is complete.
-    pub fn append_text(&self, context_id: ContextId, block_id: &BlockId, text: &str) -> Result<(), String> {
+    pub fn append_text(&self, context_id: ContextId, block_id: &BlockId, text: &str) -> BlockStoreResult<()> {
         self.append_text_as(context_id, block_id, text, None)
     }
 
     /// Append text to a block with an explicit author identity.
-    pub fn append_text_as(&self, context_id: ContextId, block_id: &BlockId, text: &str, agent_id: Option<PrincipalId>) -> Result<(), String> {
+    pub fn append_text_as(&self, context_id: ContextId, block_id: &BlockId, text: &str, agent_id: Option<PrincipalId>) -> BlockStoreResult<()> {
         let ops = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
             // Capture frontier before append
             let frontier = entry.doc.frontier();
-            entry.doc.append_text(block_id, text).map_err(|e| e.to_string())?;
+            entry.doc.append_text(block_id, text)?;
             entry.touch(effective_agent);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?
+            postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?
         };
         // Note: No auto-save for text appends (high frequency during streaming)
 
@@ -952,11 +1006,11 @@ impl BlockStore {
     }
 
     /// Set collapsed state for a thinking block.
-    pub fn set_collapsed(&self, context_id: ContextId, block_id: &BlockId, collapsed: bool) -> Result<(), String> {
+    pub fn set_collapsed(&self, context_id: ContextId, block_id: &BlockId, collapsed: bool) -> BlockStoreResult<()> {
         {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
-            entry.doc.set_collapsed(block_id, collapsed).map_err(|e| e.to_string())?;
+            entry.doc.set_collapsed(block_id, collapsed)?;
             entry.touch(agent_id);
         }
         self.auto_save(context_id);
@@ -973,11 +1027,11 @@ impl BlockStore {
     }
 
     /// Delete a block from a document.
-    pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> Result<(), String> {
+    pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<()> {
         {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
-            entry.doc.delete_block(block_id).map_err(|e| e.to_string())?;
+            entry.doc.delete_block(block_id)?;
             entry.touch(agent_id);
         }
         self.auto_save(context_id);
@@ -997,18 +1051,18 @@ impl BlockStore {
     // =========================================================================
 
     /// Get sync payload since a frontier for a document.
-    pub fn ops_since(&self, context_id: ContextId, frontier: &HashMap<BlockId, Frontier>) -> Result<SyncPayload, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn ops_since(&self, context_id: ContextId, frontier: &HashMap<BlockId, Frontier>) -> BlockStoreResult<SyncPayload> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(entry.doc.ops_since(frontier))
     }
 
     /// Merge a sync payload into a document.
-    pub fn merge_ops(&self, context_id: ContextId, payload: SyncPayload) -> Result<u64, String> {
+    pub fn merge_ops(&self, context_id: ContextId, payload: SyncPayload) -> BlockStoreResult<u64> {
         let (version, events) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let before = entry.doc.blocks_ordered();
             let frontier_before = entry.doc.frontier();
-            entry.doc.merge_ops(payload).map_err(|e| e.to_string())?;
+            entry.doc.merge_ops(payload)?;
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
@@ -1104,8 +1158,8 @@ impl BlockStore {
     }
 
     /// Get the current frontier for a document (per-block frontiers).
-    pub fn frontier(&self, context_id: ContextId) -> Result<HashMap<BlockId, Frontier>, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn frontier(&self, context_id: ContextId) -> BlockStoreResult<HashMap<BlockId, Frontier>> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(entry.doc.frontier())
     }
 
@@ -1114,20 +1168,20 @@ impl BlockStore {
     // =========================================================================
 
     /// Get block snapshots for a document.
-    pub fn block_snapshots(&self, context_id: ContextId) -> Result<Vec<BlockSnapshot>, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn block_snapshots(&self, context_id: ContextId) -> BlockStoreResult<Vec<BlockSnapshot>> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(entry.doc.blocks_ordered())
     }
 
     /// Get a single block snapshot by ID.
-    pub fn get_block_snapshot(&self, context_id: ContextId, block_id: &BlockId) -> Result<Option<BlockSnapshot>, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn get_block_snapshot(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<Option<BlockSnapshot>> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(entry.doc.get_block_snapshot(block_id))
     }
 
     /// Get multiple block snapshots by ID. Missing blocks are silently skipped.
-    pub fn get_blocks_by_ids(&self, context_id: ContextId, ids: &[BlockId]) -> Result<Vec<BlockSnapshot>, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn get_blocks_by_ids(&self, context_id: ContextId, ids: &[BlockId]) -> BlockStoreResult<Vec<BlockSnapshot>> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(snap) = entry.doc.get_block_snapshot(id) {
@@ -1141,8 +1195,8 @@ impl BlockStore {
     ///
     /// If `filter.parent_id` is set, only descendants (up to `max_depth`) are considered.
     /// Otherwise iterates all blocks in order, applying the filter predicate.
-    pub fn query_blocks(&self, context_id: ContextId, filter: &BlockFilter) -> Result<Vec<BlockSnapshot>, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn query_blocks(&self, context_id: ContextId, filter: &BlockFilter) -> BlockStoreResult<Vec<BlockSnapshot>> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
 
         // If parent_id is set, compute descendant set via BFS
         let descendant_ids = if let Some(ref root_id) = filter.parent_id {
@@ -1174,17 +1228,17 @@ impl BlockStore {
     }
 
     /// Get CRDT sync state (serialized ops + version) without blocks.
-    pub fn context_sync_state(&self, context_id: ContextId) -> Result<(Vec<u8>, u64), String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn context_sync_state(&self, context_id: ContextId) -> BlockStoreResult<(Vec<u8>, u64)> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let snapshot = entry.doc.snapshot();
         let bytes = postcard::to_allocvec(&snapshot)
-            .map_err(|e| format!("failed to serialize store snapshot: {}", e))?;
+            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         Ok((bytes, entry.version()))
     }
 
     /// Get the full text content of a document.
-    pub fn get_content(&self, context_id: ContextId) -> Result<String, String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    pub fn get_content(&self, context_id: ContextId) -> BlockStoreResult<String> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok(entry.content())
     }
 
@@ -1192,8 +1246,8 @@ impl BlockStore {
     pub fn get_document_state(
         &self,
         context_id: ContextId,
-    ) -> Result<(DocumentKind, Option<String>, Vec<BlockSnapshot>, u64), String> {
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+    ) -> BlockStoreResult<(DocumentKind, Option<String>, Vec<BlockSnapshot>, u64)> {
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         Ok((
             entry.kind,
             entry.language.clone(),
@@ -1210,13 +1264,13 @@ impl BlockStore {
     ///
     /// For each document, loads both metadata and content from the snapshot table.
     /// The `oplog_bytes` column stores postcard-encoded StoreSnapshot.
-    pub fn load_from_db(&self) -> Result<(), String> {
-        let db = self.db.as_ref().ok_or("No database configured")?;
-        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+    pub fn load_from_db(&self) -> BlockStoreResult<()> {
+        let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         let document_metas = db_guard
             .list_documents()
-            .map_err(|e| format!("DB error: {}", e))?;
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         let agent_id = self.agent_id();
         for meta in document_metas {
@@ -1272,23 +1326,23 @@ impl BlockStore {
     /// Save a document's content to the database as a snapshot.
     ///
     /// Stores the StoreSnapshot as postcard binary in the `oplog_bytes` column.
-    pub fn save_snapshot(&self, context_id: ContextId) -> Result<(), String> {
-        let db = self.db.as_ref().ok_or("No database configured")?;
+    pub fn save_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
+        let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
 
-        let entry = self.get(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+        let entry = self.get(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let snapshot = entry.doc.snapshot();
         let version = entry.version() as i64;
         let content = entry.content();
 
         let snapshot_bytes = postcard::to_allocvec(&snapshot)
-            .map_err(|e| format!("Failed to serialize store snapshot: {}", e))?;
+            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
         drop(entry); // Release the read lock before acquiring DB lock
 
-        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
         db_guard
             .save_snapshot(&context_id.to_hex(), version, &content, Some(&snapshot_bytes))
-            .map_err(|e| format!("DB error: {}", e))?;
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         Ok(())
     }
@@ -1317,7 +1371,7 @@ impl BlockStore {
     /// Create an input document for a context.
     ///
     /// Idempotent — returns Ok if the input doc already exists.
-    pub fn create_input_doc(&self, context_id: ContextId) -> Result<(), String> {
+    pub fn create_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
         use dashmap::mapref::entry::Entry;
 
         match self.input_docs.entry(context_id) {
@@ -1328,7 +1382,7 @@ impl BlockStore {
 
                 // Persist if we have a DB
                 if let Some(db) = &self.db {
-                    let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+                    let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
                     let _ = db_guard.create_input_doc(&context_id.to_hex());
                 }
 
@@ -1347,11 +1401,11 @@ impl BlockStore {
         pos: usize,
         insert: &str,
         delete: usize,
-    ) -> Result<Vec<u8>, String> {
+    ) -> BlockStoreResult<Vec<u8>> {
         let mut entry = self.input_docs.get_mut(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
 
-        let ops = entry.edit_text(pos, insert, delete)?;
+        let ops = entry.edit_text(pos, insert, delete).map_err(BlockStoreError::Serialization)?;
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
@@ -1363,35 +1417,35 @@ impl BlockStore {
     }
 
     /// Get the current input text for a context.
-    pub fn get_input_text(&self, context_id: ContextId) -> Result<String, String> {
+    pub fn get_input_text(&self, context_id: ContextId) -> BlockStoreResult<String> {
         let entry = self.input_docs.get(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
         Ok(entry.get_text())
     }
 
     /// Get the full input document state (text + ops + version) for sync.
-    pub fn get_input_state(&self, context_id: ContextId) -> Result<(String, Vec<u8>, u64), String> {
+    pub fn get_input_state(&self, context_id: ContextId) -> BlockStoreResult<(String, Vec<u8>, u64)> {
         let entry = self.input_docs.get(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
         let text = entry.get_text();
-        let ops = entry.all_ops()?;
+        let ops = entry.all_ops().map_err(BlockStoreError::Serialization)?;
         let version = entry.version();
         Ok((text, ops, version))
     }
 
     /// Get input ops since a frontier (for incremental sync).
-    pub fn input_ops_since(&self, context_id: ContextId, frontier: &Frontier) -> Result<Vec<u8>, String> {
+    pub fn input_ops_since(&self, context_id: ContextId, frontier: &Frontier) -> BlockStoreResult<Vec<u8>> {
         let entry = self.input_docs.get(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
-        entry.ops_since(frontier)
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
+        entry.ops_since(frontier).map_err(BlockStoreError::Serialization)
     }
 
     /// Merge remote ops into an input document.
-    pub fn merge_input_ops(&self, context_id: ContextId, ops_bytes: &[u8]) -> Result<u64, String> {
+    pub fn merge_input_ops(&self, context_id: ContextId, ops_bytes: &[u8]) -> BlockStoreResult<u64> {
         let mut entry = self.input_docs.get_mut(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
 
-        entry.merge_ops(ops_bytes)?;
+        entry.merge_ops(ops_bytes).map_err(BlockStoreError::Serialization)?;
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
@@ -1405,11 +1459,11 @@ impl BlockStore {
     /// Clear the input document for a context.
     ///
     /// Returns the text that was in the input doc before clearing.
-    pub fn clear_input(&self, context_id: ContextId) -> Result<String, String> {
+    pub fn clear_input(&self, context_id: ContextId) -> BlockStoreResult<String> {
         let mut entry = self.input_docs.get_mut(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
 
-        let (text, _ops) = entry.clear()?;
+        let (text, _ops) = entry.clear().map_err(BlockStoreError::Serialization)?;
 
         self.emit_input(InputDocFlow::Cleared { context_id });
 
@@ -1424,31 +1478,31 @@ impl BlockStore {
     }
 
     /// Save the current input document state to the database.
-    pub fn save_input_snapshot(&self, context_id: ContextId) -> Result<(), String> {
-        let db = self.db.as_ref().ok_or("No database configured")?;
+    pub fn save_input_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
+        let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
 
         let entry = self.input_docs.get(&context_id)
-            .ok_or_else(|| format!("Input doc for context {} not found", context_id.to_hex()))?;
+            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
 
         let text = entry.get_text();
-        let ops_bytes = entry.all_ops()?;
+        let ops_bytes = entry.all_ops().map_err(BlockStoreError::Serialization)?;
         let version = entry.version() as i64;
         drop(entry);
 
-        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
         db_guard.upsert_input_doc(&context_id.to_hex(), &text, Some(&ops_bytes), version)
-            .map_err(|e| format!("DB error: {}", e))?;
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         Ok(())
     }
 
     /// Load input documents from database on startup.
-    pub fn load_input_docs_from_db(&self) -> Result<(), String> {
-        let db = self.db.as_ref().ok_or("No database configured")?;
-        let db_guard = db.lock().map_err(|e| format!("DB lock error: {}", e))?;
+    pub fn load_input_docs_from_db(&self) -> BlockStoreResult<()> {
+        let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         let rows = db_guard.list_input_docs()
-            .map_err(|e| format!("DB error: {}", e))?;
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         drop(db_guard);
 
         let agent_id = self.agent_id();
@@ -1496,7 +1550,7 @@ impl BlockStore {
         source_context: ContextId,
         source_model: Option<String>,
         drift_kind: kaijutsu_crdt::DriftKind,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         self.insert_drift_block_as(context_id, parent_id, after, content, source_context, source_model, drift_kind, None)
     }
 
@@ -1511,22 +1565,22 @@ impl BlockStore {
         source_model: Option<String>,
         drift_kind: kaijutsu_crdt::DriftKind,
         agent_id: Option<PrincipalId>,
-    ) -> Result<BlockId, String> {
+    ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
-            let mut entry = self.get_mut(context_id).ok_or_else(|| format!("Document {} not found", context_id.to_hex()))?;
+            let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
             entry.doc.set_agent_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
             let block_id = entry.doc.insert_drift_block(parent_id, after, content, source_context, source_model, drift_kind)
-                .map_err(|e| e.to_string())?;
+                ?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
-                .ok_or_else(|| "Block not found after insert".to_string())?;
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| format!("serialize ops: {e}"))?;
+            let ops_bytes = postcard::to_allocvec(&ops).map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops_bytes)
         };

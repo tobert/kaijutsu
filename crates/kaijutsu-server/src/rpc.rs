@@ -641,7 +641,7 @@ struct BlockStoreSource(SharedBlockStore);
 
 impl kaijutsu_index::BlockSource for BlockStoreSource {
     fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
-        BlockStore::block_snapshots(&self.0, ctx)
+        BlockStore::block_snapshots(&self.0, ctx).map_err(|e| e.to_string())
     }
 }
 
@@ -1289,14 +1289,14 @@ impl kernel::Server for KernelImpl {
                     &block.content,
                     Some(user_agent_id),
                 ) {
-                    return Promise::err(capnp::Error::failed(e));
+                    return Promise::err(capnp::Error::failed(e.to_string()));
                 }
             }
             Which::DeleteBlock(id_result) => {
                 let id_reader = pry!(id_result);
                 let block_id = pry!(parse_block_id_from_reader(&id_reader));
                 if let Err(e) = documents.delete_block(context_id, &block_id) {
-                    return Promise::err(capnp::Error::failed(e));
+                    return Promise::err(capnp::Error::failed(e.to_string()));
                 }
             }
             Which::EditBlockText(_) => {
@@ -1307,7 +1307,7 @@ impl kernel::Server for KernelImpl {
                 let block_id = pry!(parse_block_id_from_reader(&id_reader));
                 let collapsed = group.get_collapsed();
                 if let Err(e) = documents.set_collapsed(context_id, &block_id, collapsed) {
-                    return Promise::err(capnp::Error::failed(e));
+                    return Promise::err(capnp::Error::failed(e.to_string()));
                 }
             }
             Which::SetStatus(group) => {
@@ -1320,7 +1320,7 @@ impl kernel::Server for KernelImpl {
                     crate::kaijutsu_capnp::Status::Error => kaijutsu_crdt::Status::Error,
                 };
                 if let Err(e) = documents.set_status(context_id, &block_id, status) {
-                    return Promise::err(capnp::Error::failed(e));
+                    return Promise::err(capnp::Error::failed(e.to_string()));
                 }
             }
             Which::MoveBlock(_group) => {
@@ -1445,6 +1445,9 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
+                                // No wire protocol for these yet — drop silently
+                                BlockFlow::OutputChanged { .. }
+                                | BlockFlow::MetadataChanged { .. } => true,
                             }
                         }
                         Some(msg) = async {
@@ -4518,7 +4521,7 @@ impl kernel::Server for KernelImpl {
         let blocks = match query {
             kaijutsu_types::BlockQuery::All => {
                 pry!(documents.block_snapshots(context_id)
-                    .map_err(|e| capnp::Error::failed(e)))
+                    .map_err(|e| capnp::Error::failed(e.to_string())))
             }
             kaijutsu_types::BlockQuery::ByIds(ids) => {
                 if ids.is_empty() {
@@ -4527,12 +4530,12 @@ impl kernel::Server for KernelImpl {
                     ));
                 }
                 pry!(documents.get_blocks_by_ids(context_id, &ids)
-                    .map_err(|e| capnp::Error::failed(e)))
+                    .map_err(|e| capnp::Error::failed(e.to_string())))
             }
             kaijutsu_types::BlockQuery::ByFilter(filter) => {
-                pry!(filter.validate().map_err(|e| capnp::Error::failed(e)));
+                pry!(filter.validate().map_err(|e| capnp::Error::failed(e.to_string())));
                 pry!(documents.query_blocks(context_id, &filter)
-                    .map_err(|e| capnp::Error::failed(e)))
+                    .map_err(|e| capnp::Error::failed(e.to_string())))
             }
         };
 
@@ -4558,7 +4561,7 @@ impl kernel::Server for KernelImpl {
 
         let documents = &self.kernel.documents;
         let (ops, version) = pry!(documents.context_sync_state(context_id)
-            .map_err(|e| capnp::Error::failed(e)));
+            .map_err(|e| capnp::Error::failed(e.to_string())));
 
         let mut r = results.get();
         r.set_context_id(context_id.as_bytes());
@@ -4601,6 +4604,8 @@ impl kernel::Server for KernelImpl {
                     kaijutsu_types::BlockFlowKind::CollapsedChanged => "block.collapsed",
                     kaijutsu_types::BlockFlowKind::Moved => "block.moved",
                     kaijutsu_types::BlockFlowKind::SyncReset => "block.sync_reset",
+                    kaijutsu_types::BlockFlowKind::OutputChanged => "block.output",
+                    kaijutsu_types::BlockFlowKind::MetadataChanged => "block.metadata",
                 }
             } else {
                 "block.*"
@@ -4711,6 +4716,9 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
+                                // No wire protocol for these yet — drop silently
+                                BlockFlow::OutputChanged { .. }
+                                | BlockFlow::MetadataChanged { .. } => true,
                             }
                         }
                         Some(msg) = async {

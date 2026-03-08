@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 use std::str::FromStr;
 use strum::EnumString;
+use tracing::warn;
 
 /// Database handle for document persistence.
 pub struct DocumentDb {
@@ -134,7 +135,10 @@ impl DocumentDb {
             let kind_str: String = row.get(1)?;
             Ok(Some(DocumentMeta {
                 id: row.get(0)?,
-                kind: DocumentKind::from_str(&kind_str).unwrap_or(DocumentKind::Conversation),
+                kind: DocumentKind::from_str(&kind_str).unwrap_or_else(|| {
+                    warn!(kind = %kind_str, "unknown DocumentKind in DB, defaulting to Conversation");
+                    DocumentKind::Conversation
+                }),
                 language: row.get(2)?,
                 parent_document: row.get(3)?,
                 created_at: row.get(4)?,
@@ -155,7 +159,10 @@ impl DocumentDb {
             let kind_str: String = row.get(1)?;
             Ok(DocumentMeta {
                 id: row.get(0)?,
-                kind: DocumentKind::from_str(&kind_str).unwrap_or(DocumentKind::Conversation),
+                kind: DocumentKind::from_str(&kind_str).unwrap_or_else(|| {
+                    warn!(kind = %kind_str, "unknown DocumentKind in DB, defaulting to Conversation");
+                    DocumentKind::Conversation
+                }),
                 language: row.get(2)?,
                 parent_document: row.get(3)?,
                 created_at: row.get(4)?,

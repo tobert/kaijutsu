@@ -293,7 +293,7 @@ impl BlockCreateEngine {
                 &content,
                 Some(ctx.principal_id),
             )
-            .map_err(|e| EditError::StoreError(e))?;
+            .map_err(|e| EditError::StoreError(e.to_string()))?;
 
         let version = self
             .documents
@@ -380,7 +380,7 @@ impl BlockAppendEngine {
 
         self.documents
             .append_text_as(context_id, &block_id, &params.text, Some(ctx.principal_id))
-            .map_err(|e| EditError::StoreError(e))?;
+            .map_err(|e| EditError::StoreError(e.to_string()))?;
 
         let version = self
             .documents
@@ -555,7 +555,7 @@ impl BlockEditEngine {
                 };
                 self.documents
                     .edit_text_as(context_id, block_id, pos, &text_with_newline, 0, Some(ctx.principal_id))
-                    .map_err(|e| EditError::StoreError(e))?;
+                    .map_err(|e| EditError::StoreError(e.to_string()))?;
             }
             EditOp::Delete {
                 start_line,
@@ -565,7 +565,7 @@ impl BlockEditEngine {
                 if start < end {
                     self.documents
                         .edit_text_as(context_id, block_id, start, "", end - start, Some(ctx.principal_id))
-                        .map_err(|e| EditError::StoreError(e))?;
+                        .map_err(|e| EditError::StoreError(e.to_string()))?;
                 }
             }
             EditOp::Replace {
@@ -587,7 +587,7 @@ impl BlockEditEngine {
                 };
                 self.documents
                     .edit_text_as(context_id, block_id, start, &text_with_newline, end - start, Some(ctx.principal_id))
-                    .map_err(|e| EditError::StoreError(e))?;
+                    .map_err(|e| EditError::StoreError(e.to_string()))?;
             }
         }
 
@@ -679,7 +679,7 @@ impl BlockSpliceEngine {
 
         self.documents
             .edit_text_as(context_id, &block_id, params.offset, &insert, params.delete_count, Some(ctx.principal_id))
-            .map_err(|e| EditError::StoreError(e))?;
+            .map_err(|e| EditError::StoreError(e.to_string()))?;
 
         let version = self
             .documents
@@ -1178,7 +1178,7 @@ impl BlockStatusEngine {
 
         self.documents
             .set_status(context_id, &block_id, status)
-            .map_err(|e| EditError::StoreError(e))?;
+            .map_err(|e| EditError::StoreError(e.to_string()))?;
 
         let version = self
             .documents

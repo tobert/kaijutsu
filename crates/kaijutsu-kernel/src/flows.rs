@@ -181,6 +181,8 @@ impl FlowTopics for BlockFlow {
         "block.collapsed",
         "block.moved",
         "block.sync_reset",
+        "block.output",
+        "block.metadata",
     ];
 
     fn topic_capacity(topic: &str) -> Option<usize> {
@@ -292,7 +294,8 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// The new status.
         status: Status,
-        /// Structured output data (piggybacked — output is a struct field, not DTE-tracked).
+        /// DEPRECATED: Piggybacked for wire compat. Prefer `OutputChanged` event.
+        /// Remove once `onBlockStatusChanged` drops `outputData` from Cap'n Proto schema.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<kaijutsu_types::OutputData>,
         /// Origin of this operation (Local or Remote).
@@ -334,6 +337,30 @@ pub enum BlockFlow {
         /// New sync generation after compaction.
         generation: u64,
     },
+
+    /// Block output data changed.
+    OutputChanged {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose output changed.
+        block_id: BlockId,
+        /// The new output data.
+        output: Option<kaijutsu_types::OutputData>,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
+    },
+
+    /// Block metadata changed (tool_use_id, etc).
+    MetadataChanged {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose metadata changed.
+        block_id: BlockId,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
+    },
 }
 
 impl BlockFlow {
@@ -347,6 +374,8 @@ impl BlockFlow {
             Self::CollapsedChanged { .. } => "block.collapsed",
             Self::Moved { .. } => "block.moved",
             Self::SyncReset { .. } => "block.sync_reset",
+            Self::OutputChanged { .. } => "block.output",
+            Self::MetadataChanged { .. } => "block.metadata",
         }
     }
 
@@ -359,7 +388,9 @@ impl BlockFlow {
             | Self::StatusChanged { context_id, .. }
             | Self::CollapsedChanged { context_id, .. }
             | Self::Moved { context_id, .. }
-            | Self::SyncReset { context_id, .. } => *context_id,
+            | Self::SyncReset { context_id, .. }
+            | Self::OutputChanged { context_id, .. }
+            | Self::MetadataChanged { context_id, .. } => *context_id,
         }
     }
 
@@ -371,7 +402,9 @@ impl BlockFlow {
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }
-            | Self::Moved { block_id, .. } => Some(block_id),
+            | Self::Moved { block_id, .. }
+            | Self::OutputChanged { block_id, .. }
+            | Self::MetadataChanged { block_id, .. } => Some(block_id),
             Self::SyncReset { .. } => None,
         }
     }
@@ -392,7 +425,9 @@ impl BlockFlow {
             | Self::Deleted { source, .. }
             | Self::StatusChanged { source, .. }
             | Self::CollapsedChanged { source, .. }
-            | Self::Moved { source, .. } => *source,
+            | Self::Moved { source, .. }
+            | Self::OutputChanged { source, .. }
+            | Self::MetadataChanged { source, .. } => *source,
             Self::SyncReset { .. } => OpSource::Local,
         }
     }
@@ -417,6 +452,8 @@ impl BlockFlow {
             Self::CollapsedChanged { .. } => BlockFlowKind::CollapsedChanged,
             Self::Moved { .. } => BlockFlowKind::Moved,
             Self::SyncReset { .. } => BlockFlowKind::SyncReset,
+            Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,
+            Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
         }
     }
 
@@ -1625,9 +1662,9 @@ mod tests {
         let _s2 = bus.subscribe("block.status");
         assert_eq!(bus.subscriber_count(), 2);
 
-        // Wildcard creates one subscription per matching topic (7 for block.*)
+        // Wildcard creates one subscription per matching topic (9 for block.*)
         let _s3 = bus.subscribe("block.*");
-        assert_eq!(bus.subscriber_count(), 2 + 7);
+        assert_eq!(bus.subscriber_count(), 2 + 9);
     }
 
     /// Subscribe to a pattern that matches no topics.

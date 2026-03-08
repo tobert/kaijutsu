@@ -128,7 +128,7 @@ impl ExecutionEngine for EditEngine {
                 &p.new_string,
                 p.old_string.len(),
             ) {
-                return Ok(ExecResult::failure(1, e));
+                return Ok(ExecResult::failure(1, e.to_string()));
             }
             replacements += 1;
         }

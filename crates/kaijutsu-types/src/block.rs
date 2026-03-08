@@ -346,15 +346,6 @@ impl BlockKind {
         }
     }
 
-    /// Check if this block type has editable text content via Text CRDT.
-    ///
-    /// Currently returns true for all variants — every block kind uses the
-    /// DTE text CRDT for its content field. This may become variant-specific
-    /// if we add binary-only block kinds in the future.
-    pub fn has_text_crdt(&self) -> bool {
-        true
-    }
-
     /// Check if this is a tool-related block (call or result).
     pub fn is_tool(&self) -> bool {
         matches!(self, BlockKind::ToolCall | BlockKind::ToolResult)
@@ -1155,6 +1146,8 @@ pub enum BlockFlowKind {
     CollapsedChanged,
     Moved,
     SyncReset,
+    OutputChanged,
+    MetadataChanged,
 }
 
 /// Server-side filter for block event subscriptions.
@@ -1354,7 +1347,6 @@ mod tests {
         assert_eq!(BlockKind::from_str("tool_call"), Some(BlockKind::ToolCall));
         assert_eq!(BlockKind::from_str("toolresult"), Some(BlockKind::ToolResult));
         assert_eq!(BlockKind::from_str("drift"), Some(BlockKind::Drift));
-        assert!(BlockKind::Text.has_text_crdt());
         assert!(BlockKind::ToolCall.is_tool());
         assert!(BlockKind::ToolResult.is_tool());
         assert!(!BlockKind::Text.is_tool());
@@ -1363,7 +1355,6 @@ mod tests {
         assert_eq!(BlockKind::from_str("file"), Some(BlockKind::File));
         assert!(BlockKind::File.is_file());
         assert!(!BlockKind::Text.is_file());
-        assert!(BlockKind::File.has_text_crdt());
     }
 
     #[test]

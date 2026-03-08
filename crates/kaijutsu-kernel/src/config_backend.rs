@@ -311,7 +311,7 @@ impl ConfigCrdtBackend {
         // Create CRDT document with content
         self.blocks
             .create_document(ctx, DocumentKind::Config, None)
-            .map_err(|e| ConfigError::Crdt(e))?;
+            .map_err(|e| ConfigError::Crdt(e.to_string()))?;
 
         // Insert content as a single block
         self.blocks
@@ -323,7 +323,7 @@ impl ConfigCrdtBackend {
                 BlockKind::Text,
                 &content,
             )
-            .map_err(|e| ConfigError::Crdt(e))?;
+            .map_err(|e| ConfigError::Crdt(e.to_string()))?;
 
         // Emit loaded event
         self.emit(ConfigFlow::Loaded {
@@ -364,7 +364,7 @@ impl ConfigCrdtBackend {
         if !self.blocks.contains(ctx) {
             self.blocks
                 .create_document(ctx, DocumentKind::Config, None)
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
         if let Some(block_id) = self.first_block_id(ctx) {
@@ -375,12 +375,12 @@ impl ConfigCrdtBackend {
 
             self.blocks
                 .edit_text(ctx, &block_id, 0, &content, current_len)
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         } else {
             // Create new block
             self.blocks
                 .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content)
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
         // Emit loaded event
@@ -406,7 +406,7 @@ impl ConfigCrdtBackend {
         if !self.blocks.contains(ctx) {
             self.blocks
                 .create_document(ctx, DocumentKind::Config, None)
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
         if let Some(block_id) = self.first_block_id(ctx) {
@@ -417,7 +417,7 @@ impl ConfigCrdtBackend {
 
             self.blocks
                 .edit_text(ctx, &block_id, 0, &default_content, current_len)
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         } else {
             // Create new block
             self.blocks
@@ -429,7 +429,7 @@ impl ConfigCrdtBackend {
                     BlockKind::Text,
                     &default_content,
                 )
-                .map_err(|e| ConfigError::Crdt(e))?;
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
         // Write to disk
@@ -694,7 +694,7 @@ impl ConfigCrdtBackend {
                 if !self.blocks.contains(ctx) {
                     self.blocks
                         .create_document(ctx, DocumentKind::Config, None)
-                        .map_err(|e| ConfigError::Crdt(e))?;
+                        .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }
 
                 if let Some(block_id) = self.first_block_id(ctx) {
@@ -705,12 +705,12 @@ impl ConfigCrdtBackend {
 
                     self.blocks
                         .edit_text(ctx, &block_id, 0, &content, current_len)
-                        .map_err(|e| ConfigError::Crdt(e))?;
+                        .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 } else {
                     // Create new block
                     self.blocks
                         .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content)
-                        .map_err(|e| ConfigError::Crdt(e))?;
+                        .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }
 
                 // Emit changed event (source is Remote since it came from external edit)

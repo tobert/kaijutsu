@@ -34,18 +34,14 @@ pub use agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
     AgentStatus, SharedAgentRegistry, shared_agent_registry,
 };
-pub use block_store::{BlockStore, DbHandle, DocumentEntry, SharedBlockStore, shared_block_store, shared_block_store_with_db};
+pub use block_store::{BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store};
 pub use block_tools::{
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
-    EditError, EditOp,
-    // Batching
-    AppendBatcher, BatchConfig, BatcherStats,
-    // Cursor tracking
-    CursorEvent, CursorPosition, CursorTracker,
+    EditOp,
 };
 pub use control::ConsentMode;
-pub use db::{DocumentDb, DocumentKind, DocumentMeta, Snapshot};
+pub use db::{DocumentDb, DocumentKind, DocumentMeta};
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
@@ -79,9 +75,8 @@ pub use mcp_pool::{
 };
 pub use mcp_config::{McpConfig, load_mcp_config};
 pub use config_backend::{
-    ConfigCrdtBackend, ConfigError, ConfigFileChange, ConfigChangeKind,
-    ConfigWatcherHandle, ValidationResult,
-    DEFAULT_THEME, DEFAULT_LLM_CONFIG, DEFAULT_MODELS_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_SYSTEM_PROMPT,
+    ConfigCrdtBackend, ConfigWatcherHandle, ValidationResult,
+    DEFAULT_SYSTEM_PROMPT,
 };
 
 pub use drift::{

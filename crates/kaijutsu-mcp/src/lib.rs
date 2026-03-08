@@ -844,7 +844,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(PrincipalId::system()))
+                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(PrincipalId::system())).map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line number {}: block has {} line{} (valid range: 0-{})",
@@ -856,7 +856,7 @@ impl KaijutsuMcp {
                     let total_lines = line_count(&content);
                     if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
                         if start < end {
-                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(PrincipalId::system()))
+                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(PrincipalId::system())).map_err(|e| e.to_string())
                         } else {
                             Ok(())
                         }
@@ -890,7 +890,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(PrincipalId::system()))
+                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(PrincipalId::system())).map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
