@@ -2053,8 +2053,8 @@ impl kernel::Server for KernelImpl {
                 log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
                 match kaish.execute(&code).await {
                     Ok(result) => {
-                        log::info!("shell_execute: kaish returned code={} out_len={} err_len={}",
-                            result.code, result.out.len(), result.err.len());
+                        log::info!("shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
+                            result.code, result.original_code, result.did_spill, result.out.len(), result.err.len());
                         log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
 
                         // Combine out and err (kaish uses out/err/code fields)
@@ -2081,7 +2081,14 @@ impl kernel::Server for KernelImpl {
                         }
 
                         // Mark complete — status reflects exit code on both blocks
-                        let final_status = if result.code == 0 { Status::Done } else { Status::Error };
+                        // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
+                        // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
+                        let final_status = match result.code {
+                            0 => Status::Done,
+                            2 => Status::Done,   // latch gate: rm/trash awaiting --confirm
+                            3 => Status::Done,   // spill: output too large, path in content
+                            _ => Status::Error,
+                        };
                         if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
                             log::error!("Failed to set output block status: {}", e);
                         }
