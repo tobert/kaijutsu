@@ -4,7 +4,9 @@
 //! and per-context tool filtering.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
+// ToolFilter definition lives in kaijutsu-types; re-export for backward compat.
+pub use kaijutsu_types::ToolFilter;
 
 /// Configuration for an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,77 +112,6 @@ impl ProviderConfig {
             _ => return None,
         };
         std::env::var(standard_env).ok()
-    }
-}
-
-/// Filter for which tools are available in a context.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "tools")]
-pub enum ToolFilter {
-    /// All registered tools are available.
-    #[default]
-    All,
-
-    /// Only these specific tools are available.
-    AllowList(HashSet<String>),
-
-    /// All tools except these are available.
-    DenyList(HashSet<String>),
-}
-
-impl ToolFilter {
-    /// Create an allow list filter.
-    pub fn allow<I, S>(tools: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::AllowList(tools.into_iter().map(Into::into).collect())
-    }
-
-    /// Create a deny list filter.
-    pub fn deny<I, S>(tools: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::DenyList(tools.into_iter().map(Into::into).collect())
-    }
-
-    /// Check if a tool is allowed by this filter.
-    pub fn allows(&self, tool_name: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::AllowList(allowed) => allowed.contains(tool_name),
-            Self::DenyList(denied) => !denied.contains(tool_name),
-        }
-    }
-
-    /// Merge with another filter (intersection of allowed tools).
-    pub fn merge(&self, other: &Self) -> Self {
-        match (self, other) {
-            // All + anything = the other filter
-            (Self::All, other) => other.clone(),
-            (this, Self::All) => this.clone(),
-
-            // AllowList + AllowList = intersection
-            (Self::AllowList(a), Self::AllowList(b)) => {
-                Self::AllowList(a.intersection(b).cloned().collect())
-            }
-
-            // DenyList + DenyList = union of denied
-            (Self::DenyList(a), Self::DenyList(b)) => {
-                Self::DenyList(a.union(b).cloned().collect())
-            }
-
-            // AllowList + DenyList = allow list minus denied
-            (Self::AllowList(allowed), Self::DenyList(denied)) => {
-                Self::AllowList(allowed.difference(denied).cloned().collect())
-            }
-            (Self::DenyList(denied), Self::AllowList(allowed)) => {
-                Self::AllowList(allowed.difference(denied).cloned().collect())
-            }
-        }
     }
 }
 

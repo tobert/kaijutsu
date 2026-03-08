@@ -32,6 +32,16 @@ pub struct ContextId(uuid::Uuid);
 #[serde(transparent)]
 pub struct SessionId(uuid::Uuid);
 
+/// A workspace identifier (UUIDv7).
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkspaceId(uuid::Uuid);
+
+/// A preset identifier (UUIDv7).
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PresetId(uuid::Uuid);
+
 // ── Shared behavior ─────────────────────────────────────────────────────────
 
 macro_rules! impl_typed_id {
@@ -160,6 +170,8 @@ impl_typed_id!(PrincipalId, "PrincipalId");
 impl_typed_id!(KernelId, "KernelId");
 impl_typed_id!(ContextId, "ContextId");
 impl_typed_id!(SessionId, "SessionId");
+impl_typed_id!(WorkspaceId, "WorkspaceId");
+impl_typed_id!(PresetId, "PresetId");
 
 // ── PrefixResolvable ────────────────────────────────────────────────────────
 

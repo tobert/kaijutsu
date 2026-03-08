@@ -22,6 +22,7 @@ pub mod drift;
 pub mod file_tools;
 pub mod flows;
 pub mod kernel;
+pub mod kernel_db;
 pub mod llm;
 pub mod mcp_config;
 pub mod mcp_pool;
@@ -111,3 +112,7 @@ pub use flows::{
     InputDocFlow, SharedInputDocFlowBus, shared_input_doc_flow_bus,
 };
 pub use input_doc::InputDocEntry;
+pub use kernel_db::{
+    KernelDb, KernelDbError, KernelDbResult,
+    ContextRow, PresetRow, WorkspaceRow, WorkspacePathRow, ContextEdgeRow,
+};

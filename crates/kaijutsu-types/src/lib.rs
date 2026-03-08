@@ -44,6 +44,7 @@
 //! |-------------------|----------------------------------------------|
 
 pub mod ids;
+pub mod enums;
 pub mod principal;
 pub mod block;
 pub mod compaction;
@@ -55,7 +56,7 @@ pub mod session;
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
 
 // Re-export primary types at crate root for convenience.
-pub use ids::{ContextId, KernelId, PrincipalId, SessionId};
+pub use ids::{ContextId, KernelId, PrincipalId, PresetId, SessionId, WorkspaceId};
 pub use ids::{PrefixError, PrefixResolvable, resolve_prefix, resolve_context_prefix};
 pub use principal::{Principal, Credential, CredentialKind};
 pub use block::{
@@ -67,6 +68,7 @@ pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
 pub use kernel::Kernel;
 pub use session::Session;
+pub use enums::{ConsentMode, EdgeKind, ForkKind, ToolFilter};
 
 /// Current time as Unix milliseconds. Used by constructors throughout the crate.
 pub(crate) fn now_millis() -> u64 {
