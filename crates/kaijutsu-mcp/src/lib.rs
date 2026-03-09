@@ -1653,6 +1653,92 @@ impl KaijutsuMcp {
         }
     }
 
+    #[tool(description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. kj builtins available for context/drift/fork management. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect.",
+        annotations(open_world_hint = true))]
+    #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
+    async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
+        // Route through shell_execute — same path as the shell tool.
+        // The command is passed verbatim to kaish (no auto-prepending).
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: context_shell requires --connect to kaijutsu-server".to_string(),
+        };
+
+        let actor = &remote.actor;
+        let ctx_id = remote.context_id;
+
+        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id).await {
+            Ok(id) => id,
+            Err(e) => return format!("Error starting command: {e}"),
+        };
+
+        tracing::info!(
+            command = %req.command,
+            cmd_block = %cmd_block_id.to_key(),
+            ctx = %ctx_id,
+            "Context shell command dispatched"
+        );
+
+        // Same completion polling as shell tool
+        let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
+        let start = std::time::Instant::now();
+        let mut event_rx = remote.actor.subscribe_events();
+        let fallback_interval = tokio::time::Duration::from_millis(500);
+
+        let check_completion = |source: &str| -> Option<String> {
+            let entry = remote.store.get(ctx_id)?;
+            let blocks = entry.doc.blocks_ordered();
+            let output = blocks.iter().find(|b| {
+                b.parent_id.as_ref() == Some(&cmd_block_id)
+                    && b.is_shell()
+                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
+                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
+            })?;
+            tracing::info!(
+                command = %req.command,
+                status = %output.status.as_str(),
+                output_len = output.content.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Context shell command completed (via {source})"
+            );
+            Some(if output.content.is_empty() {
+                "(no output)".to_string()
+            } else {
+                output.content.clone()
+            })
+        };
+
+        loop {
+            if start.elapsed().as_secs() > timeout_secs {
+                return format!(
+                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
+                    timeout_secs, cmd_block_id.to_key()
+                );
+            }
+
+            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
+
+            match event {
+                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
+                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
+                {
+                    if let Some(result) = check_completion("event") {
+                        return result;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return "Error: event stream closed".to_string();
+                }
+                Err(_timeout) => {
+                    if let Some(result) = check_completion("fallback") {
+                        return result;
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
     // ========================================================================
     // Context Identity
     // ========================================================================

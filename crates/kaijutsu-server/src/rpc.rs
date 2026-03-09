@@ -259,14 +259,16 @@ pub struct SharedKernelState {
     pub config_watcher: Option<ConfigWatcherHandle>,
     pub conversation_cache: Arc<ConversationCache>,
     /// SQLite persistence for context metadata, edges, presets, workspaces.
-    /// std::sync::Mutex (not tokio) — all ops are sync and sub-ms.
-    pub kernel_db: std::sync::Mutex<KernelDb>,
+    /// Arc<std::sync::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
+    pub kernel_db: Arc<std::sync::Mutex<KernelDb>>,
     /// Semantic vector index for context search/clustering.
     /// None if embedding model not configured or unavailable.
     pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
     /// Per-context interrupt state. Created fresh at the start of each
     /// `process_llm_stream` call; looked up by `interruptContext` RPC.
     pub context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
+    /// kj command dispatcher — shared across all connections.
+    pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -869,6 +871,15 @@ pub async fn create_shared_kernel(
         None
     };
 
+    // Create kj dispatcher — shared across all connections
+    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
+    let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new(
+        kernel_arc.drift().clone(),
+        documents.clone(),
+        kernel_db_arc.clone(),
+        id,
+    ));
+
     let shared = SharedKernelState {
         id,
         name: id_str,
@@ -877,9 +888,10 @@ pub async fn create_shared_kernel(
         config_backend,
         config_watcher,
         conversation_cache: Arc::new(ConversationCache::new(64)),
-        kernel_db: std::sync::Mutex::new(kernel_db),
+        kernel_db: kernel_db_arc,
         semantic_index,
         context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
+        kj_dispatcher,
     };
 
     Ok(Arc::new(shared))
@@ -1001,6 +1013,9 @@ impl kernel::Server for KernelImpl {
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
                     let context_id = conn.require_context()?;
+                    let kj_disp = kernel.kj_dispatcher.clone();
+                    let kj_principal = conn.principal.id;
+                    let kj_session = conn.session_id;
                     match EmbeddedKaish::with_identity(
                         &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
@@ -1010,6 +1025,11 @@ impl kernel::Server for KernelImpl {
                         context_id,
                         conn.session_id,
                         kernel.id,
+                        |shared_ctx, tools| {
+                            tools.register(crate::kj_builtin::KjBuiltin::new(
+                                kj_disp, shared_ctx, kj_principal, kj_session,
+                            ));
+                        },
                     ) {
                         Ok(kaish) => {
                             conn.kaish = Some(Rc::new(kaish));
@@ -2145,6 +2165,9 @@ impl kernel::Server for KernelImpl {
 
                 if conn.kaish.is_none() {
                     log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
+                    let kj_disp = kernel.kj_dispatcher.clone();
+                    let kj_principal = conn.principal.id;
+                    let kj_session = conn.session_id;
                     match EmbeddedKaish::with_identity(
                         &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
                         kernel.documents.clone(),
@@ -2154,6 +2177,11 @@ impl kernel::Server for KernelImpl {
                         conn.require_context()?,
                         conn.session_id,
                         kernel.id,
+                        |shared_ctx, tools| {
+                            tools.register(crate::kj_builtin::KjBuiltin::new(
+                                kj_disp, shared_ctx, kj_principal, kj_session,
+                            ));
+                        },
                     ) {
                         Ok(kaish) => {
                             conn.kaish = Some(Rc::new(kaish));
@@ -4482,6 +4510,9 @@ impl kernel::Server for KernelImpl {
 
                     if conn.kaish.is_none() {
                         log::info!("Creating embedded kaish for kernel {}", kernel_ref.id.to_hex());
+                        let kj_disp = kernel_ref.kj_dispatcher.clone();
+                        let kj_principal = conn.principal.id;
+                        let kj_session = conn.session_id;
                         match EmbeddedKaish::with_identity(
                             &format!("{}-{}-{}", kernel_ref.name, conn.principal.username, conn.session_id.short()),
                             kernel_ref.documents.clone(),
@@ -4491,6 +4522,11 @@ impl kernel::Server for KernelImpl {
                             conn.require_context()?,
                             conn.session_id,
                             kernel_ref.id,
+                            |shared_ctx, tools| {
+                                tools.register(crate::kj_builtin::KjBuiltin::new(
+                                    kj_disp, shared_ctx, kj_principal, kj_session,
+                                ));
+                            },
                         ) {
                             Ok(kaish) => {
                                 conn.kaish = Some(Rc::new(kaish));

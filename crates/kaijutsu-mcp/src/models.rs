@@ -266,6 +266,21 @@ pub struct ShellRequest {
     pub timeout_secs: Option<u64>,
 }
 
+/// Context-bound kaish shell. Commands execute in the caller's kernel context.
+/// kj builtins available for context/drift/fork management.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContextShellRequest {
+    /// kaish command to execute. The shell is bound to your current context.
+    /// kj commands are available (e.g., "kj context list --tree",
+    /// "kj fork --name alt", "kj drift push impl 'found it'").
+    /// Standard kaish also works (pipes, variables, scripting).
+    #[schemars(description = "kaish command to execute in the current kernel context")]
+    pub command: String,
+    /// Timeout in seconds (default: 300, max: 600)
+    #[schemars(description = "Timeout in seconds (default: 300, max: 600)")]
+    pub timeout_secs: Option<u64>,
+}
+
 // ============================================================================
 // Drift Types
 // ============================================================================

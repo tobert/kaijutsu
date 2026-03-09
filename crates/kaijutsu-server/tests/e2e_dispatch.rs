@@ -63,6 +63,7 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
     let kaish = EmbeddedKaish::with_identity(
         "e2e-drift", documents.clone(), kernel.clone(), None,
         PrincipalId::system(), ctx_id, SessionId::new(), KernelId::new(),
+        |_, _| {},
     ).expect("EmbeddedKaish::with_identity failed");
 
     (kaish, kernel, documents)

@@ -74,6 +74,7 @@ impl EmbeddedKaish {
             ContextId::new(),
             SessionId::new(),
             KernelId::new(),
+            |_, _| {},
         )
     }
 
@@ -82,6 +83,9 @@ impl EmbeddedKaish {
     /// Identity flows through to `ToolContext` for drift/whoami engines.
     /// The `context_id` is wrapped in `Arc<RwLock>` so that context switches
     /// (via `set_context_id`) propagate to all tool calls without rebuilding.
+    ///
+    /// The `configure_tools` callback receives the `SharedContextId` so callers
+    /// can register tools (like KjBuiltin) that need the shared context reference.
     pub fn with_identity(
         name: &str,
         blocks: SharedBlockStore,
@@ -91,6 +95,7 @@ impl EmbeddedKaish {
         context_id: ContextId,
         session_id: SessionId,
         kernel_id: KernelId,
+        configure_tools: impl FnOnce(SharedContextId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         let shared_context_id: SharedContextId = Arc::new(RwLock::new(context_id));
         let input_fs = Arc::new(InputFilesystem::new(
@@ -126,9 +131,12 @@ impl EmbeddedKaish {
             None => KaishConfig::named(name),
         };
 
+        let ctx_for_tools = shared_context_id.clone();
         let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
             vfs.mount_arc("/v/docs", docs_fs);
             vfs.mount_arc("/v/input", input_fs);
+        }, |tools| {
+            configure_tools(ctx_for_tools, tools);
         })?;
 
         Ok(Self {
