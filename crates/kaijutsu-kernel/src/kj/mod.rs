@@ -12,6 +12,7 @@ pub mod context;
 pub mod drift;
 pub mod fork;
 pub mod format;
+pub mod parse;
 pub mod preset;
 pub mod refs;
 pub mod workspace;
@@ -37,6 +38,8 @@ pub struct KjCaller {
     pub principal_id: PrincipalId,
     pub context_id: ContextId,
     pub session_id: SessionId,
+    /// True when the caller has verified a latch nonce (destructive op confirmed).
+    pub confirmed: bool,
 }
 
 // ============================================================================
@@ -53,6 +56,16 @@ pub enum KjResult {
     /// Context switch — carries the resolved ContextId for the caller to act on.
     /// The dispatcher resolves the target; the caller (KjBuiltin) updates SharedContextId.
     Switch(ContextId, String),
+    /// Destructive op needs confirmation. KjBuiltin converts to ExecResult code 2
+    /// via kaish's latch/nonce system.
+    Latch {
+        /// Nonce scope: the kj subcommand path (e.g., "kj context archive").
+        command: String,
+        /// Nonce scope: the target label/identifier.
+        target: String,
+        /// Human-readable summary of what will be affected.
+        message: String,
+    },
 }
 
 impl KjResult {
@@ -60,9 +73,14 @@ impl KjResult {
         matches!(self, KjResult::Ok(_) | KjResult::Switch(_, _))
     }
 
+    pub fn is_latch(&self) -> bool {
+        matches!(self, KjResult::Latch { .. })
+    }
+
     pub fn message(&self) -> &str {
         match self {
             KjResult::Ok(s) | KjResult::Err(s) | KjResult::Switch(_, s) => s,
+            KjResult::Latch { message, .. } => message,
         }
     }
 }
@@ -124,11 +142,11 @@ USAGE:
     kj <command> [args...]
 
 COMMANDS:
-    context (ctx)   Context management (list, info, switch, create)
-    fork            Fork the current context
-    drift           Cross-context communication (push, flush, queue, cancel)
-    preset          Preset templates (list, show)
-    workspace (ws)  Workspace management (list, show)
+    context (ctx)   Context management (list, info, switch, create, set, log, move, archive, remove, retag)
+    fork            Fork the current context (full, shallow, subtree, preset)
+    drift           Cross-context communication (push, pull, merge, flush, queue, cancel, history)
+    preset          Preset templates (list, show, save, remove)
+    workspace (ws)  Workspace management (list, show, create, add, bind, remove)
     help            Show this help"
             .to_string()
     }
@@ -175,6 +193,7 @@ pub(crate) mod test_helpers {
             principal_id: PrincipalId::new(),
             context_id: ContextId::new(),
             session_id: SessionId::new(),
+            confirmed: false,
         }
     }
 
@@ -184,6 +203,17 @@ pub(crate) mod test_helpers {
             principal_id: PrincipalId::new(),
             context_id,
             session_id: SessionId::new(),
+            confirmed: false,
+        }
+    }
+
+    /// Create a confirmed caller (for testing destructive ops post-latch).
+    pub fn confirmed_caller(context_id: ContextId) -> KjCaller {
+        KjCaller {
+            principal_id: PrincipalId::new(),
+            context_id,
+            session_id: SessionId::new(),
+            confirmed: true,
         }
     }
 

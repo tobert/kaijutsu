@@ -13,9 +13,12 @@ impl KjDispatcher {
 
         match argv[0].as_str() {
             "push" => self.drift_push(argv, caller).await,
+            "pull" => KjResult::Err("not yet implemented (requires LLM)".to_string()),
+            "merge" => KjResult::Err("not yet implemented (requires LLM)".to_string()),
             "flush" => self.drift_flush(caller).await,
             "queue" | "q" => self.drift_queue().await,
             "cancel" => self.drift_cancel(argv).await,
+            "history" => self.drift_history(argv, caller),
             "help" | "--help" | "-h" => KjResult::Ok(self.drift_help()),
             other => KjResult::Err(format!(
                 "kj drift: unknown subcommand '{}'\n\n{}",
@@ -34,9 +37,12 @@ USAGE:
 
 SUBCOMMANDS:
     push <dst> [content]    Stage content for target context
+    pull <src> [prompt]     Pull + distill from source (not yet implemented)
+    merge [ctx]             Summarize fork into parent (not yet implemented)
     flush                   Deliver all staged drifts
     queue                   Show staging queue
-    cancel <id>             Remove a staged drift by ID"
+    cancel <id>             Remove a staged drift by ID
+    history [ctx]           Show drift history for a context"
             .to_string()
     }
 
@@ -145,6 +151,23 @@ SUBCOMMANDS:
         let router = self.drift_router().read().await;
         let queue = router.queue();
         KjResult::Ok(format_drift_queue(queue))
+    }
+
+    /// `kj drift history [ctx]` — show drift history (edges) for a context.
+    fn drift_history(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        let db = self.kernel_db().lock().unwrap();
+        let kernel_id = self.kernel_id();
+
+        let target_arg = argv.get(1).map(|s| s.as_str());
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj drift history: {e}")),
+        };
+
+        let outgoing = db.drift_provenance(target_id).unwrap_or_default();
+        let incoming = db.edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift)).unwrap_or_default();
+
+        KjResult::Ok(super::format::format_drift_history(&outgoing, &incoming, &db))
     }
 
     async fn drift_cancel(&self, argv: &[String]) -> KjResult {
@@ -256,6 +279,36 @@ mod tests {
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
         assert!(result.message().contains("flushed 1 drift"));
+    }
+
+    #[tokio::test]
+    async fn drift_history_empty() {
+        let d = test_dispatcher();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("drift"), s("history")], &c).await;
+        assert!(result.is_ok());
+        assert!(result.message().contains("no drift history"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn drift_pull_stub() {
+        let d = test_dispatcher();
+        let c = test_caller();
+        let result = d.dispatch(&[s("drift"), s("pull"), s("src")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("not yet implemented"));
+    }
+
+    #[tokio::test]
+    async fn drift_merge_stub() {
+        let d = test_dispatcher();
+        let c = test_caller();
+        let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("not yet implemented"));
     }
 
     #[tokio::test]

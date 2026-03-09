@@ -90,7 +90,7 @@ pub fn format_context_info(
 }
 
 /// Format provider/model as a display string.
-fn format_model(provider: &Option<String>, model: &Option<String>) -> String {
+pub(crate) fn format_model(provider: &Option<String>, model: &Option<String>) -> String {
     match (provider.as_deref(), model.as_deref()) {
         (Some(p), Some(m)) => format!("{p}/{m}"),
         (None, Some(m)) => m.to_string(),
@@ -116,6 +116,77 @@ fn format_timestamp(millis: i64) -> String {
         format!("{}h ago", elapsed.as_secs() / 3600)
     } else {
         format!("{}d ago", elapsed.as_secs() / 86400)
+    }
+}
+
+/// Format fork lineage chain for `kj context log`.
+///
+/// Shows the chain from the starting context up to the root, with depth markers.
+pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: ContextId) -> String {
+    if lineage.is_empty() {
+        return "(no lineage)".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (ctx, depth) in lineage {
+        let marker = if ctx.context_id == current { "*" } else { " " };
+        let label = ctx.label.as_deref().unwrap_or("-");
+        let model = format_model(&ctx.provider, &ctx.model);
+        let id_short = ctx.context_id.short();
+
+        let depth_indicator = if *depth == 0 {
+            "".to_string()
+        } else {
+            format!("{} ← ", "·".repeat(*depth as usize))
+        };
+
+        let kind = ctx.fork_kind
+            .as_ref()
+            .map(|k| format!(" ({k:?})"))
+            .unwrap_or_default();
+
+        lines.push(format!("{marker} {depth_indicator}{id_short}  {label:<16} {model}{kind}"));
+    }
+    lines.join("\n")
+}
+
+/// Format drift history for `kj drift history`.
+pub fn format_drift_history(
+    outgoing: &[crate::kernel_db::ContextEdgeRow],
+    incoming: &[crate::kernel_db::ContextEdgeRow],
+    db: &crate::kernel_db::KernelDb,
+) -> String {
+    let mut lines = Vec::new();
+
+    if !outgoing.is_empty() {
+        lines.push("Sent:".to_string());
+        for edge in outgoing {
+            let target_label = db.get_context(edge.target_id).ok()
+                .flatten()
+                .and_then(|r| r.label)
+                .unwrap_or_else(|| edge.target_id.short());
+            lines.push(format!("  → {}  {}", target_label, format_timestamp(edge.created_at)));
+        }
+    }
+
+    if !incoming.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("Received:".to_string());
+        for edge in incoming {
+            let source_label = db.get_context(edge.source_id).ok()
+                .flatten()
+                .and_then(|r| r.label)
+                .unwrap_or_else(|| edge.source_id.short());
+            lines.push(format!("  ← {}  {}", source_label, format_timestamp(edge.created_at)));
+        }
+    }
+
+    if lines.is_empty() {
+        "(no drift history)".to_string()
+    } else {
+        lines.join("\n")
     }
 }
 

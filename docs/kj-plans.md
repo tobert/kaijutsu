@@ -120,21 +120,66 @@ MCP crate:
 - `context_shell` vs `shell` MCP tools: same `shell_execute` RPC path, different
   discoverability/description. Both dispatch through EmbeddedKaish → KjBuiltin
 
-**Phase 3b (should-have, deferred to later):**
-- `kj drift pull <src> [prompt]` — LLM-distill from source context
-- `kj drift merge [ctx]` — summarize context into fork origin
-- `kj drift history [ctx]` — query KernelDb drift provenance
+**Phase 3b (resolved in Phase 4):**
+- ~~`kj drift pull <src> [prompt]`~~ — stub added (requires LLM integration)
+- ~~`kj drift merge [ctx]`~~ — stub added (requires LLM integration)
+- ~~`kj drift history [ctx]`~~ — implemented (reads drift provenance edges)
 
 ---
 
-## Phase 4: Latch Mechanism
+## Phase 4: Complete kj Command Library ✅
 
-Nonce-based confirmation for destructive operations.
+**Status:** Complete (2026-03-09)
 
-- kaish latch API: generate nonce, store with expiry, verify on re-call
-- kj engines call latch for: archive, remove, retag, preset remove, workspace remove
-- Exit code 2 = latch gate (not error)
-- Per-context `consent_mode` determines soft vs hard latch
+Implemented the remaining 18 subcommands plus latch integration, bringing the
+kj module from 12 to 30 subcommands across 5 groups. 69 unit tests (up from 36).
+
+**What shipped:**
+
+Infrastructure (4A):
+- `kj/parse.rs` (NEW) — shared arg parsing (`extract_named_arg`, `strip_named_arg`,
+  `has_flag`, `extract_all_named_args`, `parse_model_spec`, `parse_tool_filter_spec`)
+- `KjResult::Latch { command, target, message }` variant for destructive ops
+- `KjCaller.confirmed: bool` field — set when `--confirm <nonce>` validates
+- KjBuiltin latch bridge: extracts `--confirm`, verifies via `ctx.verify_nonce()`,
+  converts `Latch` to kaish exit code 2 via `ctx.latch_result()`
+- 5 new KernelDb methods: `delete_structural_edge`, `delete_context`,
+  `contexts_using_preset`, `contexts_using_workspace`, `find_context_by_label`
+
+Non-destructive commands (4B):
+- `kj context set <ctx> [--model p/m] [--system-prompt] [--tool-filter] [--consent]` —
+  write-through to KernelDb + DriftRouter
+- `kj context log [<ctx>]` — fork lineage via `db.fork_lineage()` CTE
+- `kj context move <ctx> <new-parent>` — reparent via structural edge delete + insert
+- `kj fork --shallow [--depth N]` — uses `ForkBlockFilter { max_blocks, exclude_compacted }`
+- `kj fork --preset <label>` — applies preset settings after fork
+- `kj fork --as <template> --name <n>` — subtree fork (copies tree shape, empty docs)
+- `kj preset save <label> [--model] [--system-prompt] [--tool-filter] [--consent] [--desc]`
+- `kj workspace create <label> [--desc] [--path ...]`
+- `kj workspace add <label> <path> [--mount m]`
+- `kj workspace bind <label> [ctx]`
+- `kj drift history [ctx]` — shows outgoing/incoming drift edges with timestamps
+
+Latched destructive commands (4C):
+- `kj context archive <ctx>` — soft-delete target + recursive children via `subtree_snapshot`
+- `kj context remove <ctx>` — hard DELETE (CASCADE), BlockStore delete, DriftRouter unregister
+- `kj context retag <label> <ctx>` — move label between contexts (clears old, sets new)
+- `kj preset remove <label>` — delete (FK SET NULL on contexts)
+- `kj workspace remove <label>` — archive (soft delete)
+
+LLM stubs (4D):
+- `kj fork --compact` → "not yet implemented (requires LLM)"
+- `kj drift pull <src> [prompt]` → "not yet implemented (requires LLM)"
+- `kj drift merge [ctx]` → "not yet implemented (requires LLM)"
+
+**Design decisions:**
+- `forked_from` is immutable provenance. `context move` changes structural edges only
+- Latch is kernel-level concept (`KjResult::Latch`), nonce is kaish-level (`ctx.latch_result()`)
+- No DriftRouter changes for archive — archived contexts stay registered, filtered by
+  `list_active_contexts`. For `context remove`, `unregister()` removes from router
+- Subtree fork creates empty documents — copies tree shape and settings, not conversation history
+- `std::sync::MutexGuard<KernelDb>` is NOT Send — all async kj methods drop the DB lock
+  before any `.await` point to keep futures Send
 
 ---
 
@@ -161,7 +206,7 @@ Nonce-based confirmation for destructive operations.
 
 - **Cross-kernel drift** — schema has `kernel_id` everywhere for future use
 - **Compact quality** — what makes a good compaction summary? Preset-level setting?
-- **Retag safety** — should label moves be latch-gated? Probably yes if anything references it
+- ~~**Retag safety**~~ — resolved in Phase 4: `kj context retag` is latch-gated
 - **Workspace auto-mounts** — how workspace paths translate to VFS mounts at context join time
 - **kj CLI binary** — standalone `kj` command for headless scripting (thin adapter over kernel)
 - **Scratch/self context** — a default per-user context for dumping things (like DM-ing yourself on Slack). Could serve as staging area for drift: push to scratch, review, then push to target. Just a context with a well-known label (e.g. `scratch` or `notes`) — no special schema support needed, emerges from existing primitives

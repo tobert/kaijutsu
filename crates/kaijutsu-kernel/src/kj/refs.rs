@@ -138,6 +138,7 @@ mod tests {
             principal_id: kaijutsu_types::PrincipalId::new(),
             context_id: ctx_id,
             session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
         };
 
         let result = resolve_context_ref(&ContextRef::Current, &caller, &db, kid);
@@ -175,6 +176,7 @@ mod tests {
             principal_id: principal,
             context_id: ctx_id,
             session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
         };
 
         let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db, kid);
@@ -256,6 +258,7 @@ mod tests {
             principal_id: principal,
             context_id: child_id,
             session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
         };
 
         // .parent → parent_id

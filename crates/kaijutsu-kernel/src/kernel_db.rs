@@ -1294,6 +1294,90 @@ impl KernelDb {
         )?;
         Ok(deleted > 0)
     }
+
+    // ========================================================================
+    // Phase 4A: Additional methods for kj commands
+    // ========================================================================
+
+    /// Delete a structural edge between source and target.
+    ///
+    /// Used by `kj context move` to reparent a context.
+    pub fn delete_structural_edge(
+        &self,
+        source: ContextId,
+        target: ContextId,
+    ) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM context_edges
+             WHERE source_id = ?1 AND target_id = ?2 AND kind = 'structural'",
+            params![blob_param(source.as_bytes()), blob_param(target.as_bytes())],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Hard-delete a context and all its edges (CASCADE).
+    ///
+    /// Used by `kj context remove`. This is permanent — use `archive_context`
+    /// for soft delete.
+    pub fn delete_context(&self, id: ContextId) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(id.as_bytes())],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Count contexts using a specific preset.
+    pub fn contexts_using_preset(
+        &self,
+        kernel_id: KernelId,
+        preset_id: PresetId,
+    ) -> KernelDbResult<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM contexts
+             WHERE kernel_id = ?1 AND preset_id = ?2 AND archived_at IS NULL",
+            params![blob_param(kernel_id.as_bytes()), blob_param(preset_id.as_bytes())],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Count contexts using a specific workspace.
+    pub fn contexts_using_workspace(
+        &self,
+        kernel_id: KernelId,
+        workspace_id: WorkspaceId,
+    ) -> KernelDbResult<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM contexts
+             WHERE kernel_id = ?1 AND workspace_id = ?2 AND archived_at IS NULL",
+            params![blob_param(kernel_id.as_bytes()), blob_param(workspace_id.as_bytes())],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Find the context that currently holds a given label.
+    pub fn find_context_by_label(
+        &self,
+        kernel_id: KernelId,
+        label: &str,
+    ) -> KernelDbResult<Option<ContextRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, kernel_id, label, provider, model,
+                    system_prompt, tool_filter, consent_mode, created_at,
+                    created_by, forked_from, fork_kind, archived_at,
+                    workspace_id, preset_id
+             FROM contexts WHERE kernel_id = ?1 AND label = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), label])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_context_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // ============================================================================

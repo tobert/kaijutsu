@@ -14,6 +14,7 @@ use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
 use kaijutsu_kernel::kj::{KjCaller, KjDispatcher, KjResult};
+#[allow(unused_imports)]
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use crate::kaish_backend::SharedContextId;
@@ -64,9 +65,9 @@ impl Tool for KjBuiltin {
             .param(ParamSchema::required("subcommand", "string", "Command: context, fork, drift, preset, workspace"))
     }
 
-    async fn execute(&self, args: ToolArgs, _ctx: &mut ExecContext) -> ExecResult {
+    async fn execute(&self, args: ToolArgs, ctx: &mut ExecContext) -> ExecResult {
         // Build argv from positional args
-        let argv: Vec<String> = args
+        let mut argv: Vec<String> = args
             .positional
             .iter()
             .map(|v| match v {
@@ -78,11 +79,26 @@ impl Tool for KjBuiltin {
             })
             .collect();
 
-        let caller = KjCaller {
+        // Extract --confirm <nonce> before dispatch
+        let confirm_nonce = kaijutsu_kernel::kj::parse::extract_named_arg(&argv, &["--confirm"]);
+        kaijutsu_kernel::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
+
+        let mut caller = KjCaller {
             principal_id: self.principal_id,
             context_id: self.current_context_id(),
             session_id: self.session_id,
+            confirmed: false,
         };
+
+        // If --confirm provided, verify nonce BEFORE dispatching
+        if let Some(nonce) = &confirm_nonce {
+            let cmd_scope = build_command_scope(&argv);
+            let target_scope = build_target_scope(&argv);
+            match ctx.verify_nonce(nonce, &cmd_scope, &[&target_scope]) {
+                Ok(()) => caller.confirmed = true,
+                Err(e) => return ExecResult::failure(1, format!("kj: {e}")),
+            }
+        }
 
         let result = self.dispatcher.dispatch(&argv, &caller).await;
 
@@ -94,6 +110,38 @@ impl Tool for KjBuiltin {
                 self.set_context_id(new_id);
                 ExecResult::success(msg)
             }
+            KjResult::Latch { command, target, message } => {
+                let original_argv = argv.join(" ");
+                ctx.latch_result(&command, &[&target], &message, |nonce| {
+                    format!("kj {} --confirm {}", original_argv, nonce)
+                })
+            }
         }
     }
+}
+
+/// Build a command scope string from argv for nonce validation.
+///
+/// e.g., `["context", "archive", "old-ctx"]` → `"kj context archive"`
+fn build_command_scope(argv: &[String]) -> String {
+    let parts: Vec<&str> = argv
+        .iter()
+        .map(|s| s.as_str())
+        .take_while(|s| !s.starts_with('-'))
+        .take(2) // At most: subcommand + verb
+        .collect();
+    format!("kj {}", parts.join(" "))
+}
+
+/// Extract the target (context label/ref) from argv for nonce validation.
+///
+/// Heuristic: first positional arg after the subcommand verb.
+/// e.g., `["context", "archive", "old-ctx"]` → `"old-ctx"`
+fn build_target_scope(argv: &[String]) -> String {
+    // Skip subcommand and verb, take the first non-flag arg
+    argv.iter()
+        .skip(2) // Skip e.g. "context" "archive"
+        .find(|s| !s.starts_with('-'))
+        .cloned()
+        .unwrap_or_default()
 }
