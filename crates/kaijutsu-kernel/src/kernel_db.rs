@@ -82,7 +82,7 @@ impl ContextRow {
             id: self.context_id,
             kernel_id: self.kernel_id,
             label: self.label.clone(),
-            parent_id: self.forked_from,
+            forked_from: self.forked_from,
             created_by: self.created_by,
             created_at: self.created_at as u64,
         }
@@ -577,6 +577,25 @@ impl KernelDb {
                 system_prompt,
                 tool_filter_to_sql(tool_filter),
                 consent_mode.as_str(),
+                blob_param(id.as_bytes()),
+            ],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
+    }
+
+    /// Update a context's tool filter.
+    pub fn update_tool_filter(
+        &self,
+        id: ContextId,
+        tool_filter: &Option<ToolFilter>,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET tool_filter = ?1 WHERE context_id = ?2",
+            params![
+                tool_filter_to_sql(tool_filter),
                 blob_param(id.as_bytes()),
             ],
         )?;
@@ -1975,7 +1994,7 @@ mod tests {
         assert_eq!(ctx.id, row.context_id);
         assert_eq!(ctx.kernel_id, kid);
         assert_eq!(ctx.label, Some("test".into()));
-        assert_eq!(ctx.parent_id, Some(parent));
+        assert_eq!(ctx.forked_from, Some(parent));
         assert_eq!(ctx.created_by, creator);
         assert_eq!(ctx.created_at, now as u64);
     }

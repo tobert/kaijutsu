@@ -57,7 +57,7 @@ async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
     // Register "default" context in drift router
     {
         let mut router = kernel.drift().write().await;
-        router.register(ctx_id, Some("default"), None);
+        router.register(ctx_id, Some("default"), None, kaijutsu_types::PrincipalId::system());
     }
 
     let kaish = EmbeddedKaish::with_identity(
@@ -162,7 +162,7 @@ async fn drift_push_flush_lifecycle() {
     let target_ctx_id = ContextId::new();
     {
         let mut router = kernel.drift().write().await;
-        router.register(target_ctx_id, Some("target"), None);
+        router.register(target_ctx_id, Some("target"), None, kaijutsu_types::PrincipalId::system());
     }
 
     documents

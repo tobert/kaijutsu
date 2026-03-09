@@ -382,9 +382,9 @@ pub struct DocumentInfo {
     /// LLM model name, if configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Parent context ID, if this is a fork.
+    /// Fork source context ID, if this is a fork.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
+    pub forked_from: Option<String>,
 }
 
 /// Block summary for listing.

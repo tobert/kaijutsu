@@ -641,7 +641,7 @@ impl KaijutsuMcp {
                 label: meta.map(|m| m.label.clone()).filter(|l| !l.is_empty()),
                 provider: meta.map(|m| m.provider.clone()).filter(|p| !p.is_empty()),
                 model: meta.map(|m| m.model.clone()).filter(|m| !m.is_empty()),
-                parent_id: meta.and_then(|m| m.parent_id.map(|p| p.to_hex())),
+                forked_from: meta.and_then(|m| m.forked_from.map(|p| p.to_hex())),
             });
         }
 
@@ -1346,7 +1346,7 @@ impl KaijutsuMcp {
                 let mut lines = vec![format!("{:<8} {:<20} {:<12} {:<20} {}", "ID", "LABEL", "PROVIDER", "MODEL", "PARENT")];
                 lines.push("─".repeat(72));
                 for ctx in &contexts {
-                    let parent = ctx.parent_id.as_ref().map(|p| p.short()).unwrap_or_else(|| "—".to_string());
+                    let parent = ctx.forked_from.as_ref().map(|p| p.short()).unwrap_or_else(|| "—".to_string());
                     lines.push(format!(
                         "{:<8} {:<20} {:<12} {:<20} {}",
                         ctx.id.short(),

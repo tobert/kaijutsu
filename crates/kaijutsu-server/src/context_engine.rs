@@ -226,7 +226,7 @@ mod tests {
     async fn test_context_engine_list() {
         let drift = shared_drift_router();
         let ctx_id = ContextId::new();
-        drift.write().await.register(ctx_id, Some("default"), None);
+        drift.write().await.register(ctx_id, Some("default"), None, kaijutsu_types::PrincipalId::system());
 
         let current = current_context();
         let engine = ContextEngine::new(drift, current);
@@ -243,7 +243,7 @@ mod tests {
     async fn test_context_engine_switch() {
         let drift = shared_drift_router();
         let ctx_id = ContextId::new();
-        drift.write().await.register(ctx_id, Some("planning"), None);
+        drift.write().await.register(ctx_id, Some("planning"), None, kaijutsu_types::PrincipalId::system());
 
         let current = current_context();
         let engine = ContextEngine::new(drift, current.clone());

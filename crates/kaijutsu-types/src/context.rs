@@ -20,8 +20,8 @@ pub struct Context {
     pub kernel_id: KernelId,
     /// Human-friendly label (e.g., "default", "debug-auth"). Mutable.
     pub label: Option<String>,
-    /// Parent context for fork/thread lineage. None for root contexts.
-    pub parent_id: Option<ContextId>,
+    /// Fork source context. None for root contexts.
+    pub forked_from: Option<ContextId>,
     /// Who created this context.
     pub created_by: PrincipalId,
     /// When this context was created (Unix millis).
@@ -33,14 +33,14 @@ impl Context {
     pub fn new(
         kernel_id: KernelId,
         label: Option<String>,
-        parent_id: Option<ContextId>,
+        forked_from: Option<ContextId>,
         created_by: PrincipalId,
     ) -> Self {
         Self {
             id: ContextId::new(),
             kernel_id,
             label,
-            parent_id,
+            forked_from,
             created_by,
             created_at: crate::now_millis(),
         }
@@ -48,12 +48,12 @@ impl Context {
 
     /// Whether this is a root context (no parent).
     pub fn is_root(&self) -> bool {
-        self.parent_id.is_none()
+        self.forked_from.is_none()
     }
 
     /// Whether this context is a fork/thread of another.
     pub fn is_child(&self) -> bool {
-        self.parent_id.is_some()
+        self.forked_from.is_some()
     }
 
     /// Display string: label if present, otherwise short hex ID.
@@ -79,7 +79,7 @@ pub fn fork_lineage(
         }
         if let Some(ctx) = contexts.iter().find(|c| c.id == id) {
             chain.push(ctx);
-            current = ctx.parent_id;
+            current = ctx.forked_from;
         } else {
             break;
         }
@@ -103,7 +103,7 @@ mod tests {
 
         assert_eq!(info.kernel_id, kernel);
         assert_eq!(info.label, Some("default".to_string()));
-        assert!(info.parent_id.is_none());
+        assert!(info.forked_from.is_none());
         assert_eq!(info.created_by, creator);
         assert!(info.is_root());
         assert!(!info.is_child());
@@ -118,7 +118,7 @@ mod tests {
 
         assert!(info.is_child());
         assert!(!info.is_root());
-        assert_eq!(info.parent_id, Some(parent));
+        assert_eq!(info.forked_from, Some(parent));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
         let mut a = Context::new(kernel, Some("a".into()), None, creator);
         let b = Context::new(kernel, Some("b".into()), Some(a.id), creator);
         // Create the cycle
-        a.parent_id = Some(b.id);
+        a.forked_from = Some(b.id);
 
         let contexts = vec![a.clone(), b.clone()];
         let chain = fork_lineage(&contexts, a.id);

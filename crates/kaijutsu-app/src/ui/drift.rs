@@ -251,9 +251,9 @@ fn sync_model_info_to_constellation(
                 node.provider = new_provider;
             }
 
-            // Sync parent_id for radial tree layout
-            if node.parent_id != ctx_info.parent_id {
-                node.parent_id = ctx_info.parent_id;
+            // Sync forked_from for radial tree layout
+            if node.forked_from != ctx_info.forked_from {
+                node.forked_from = ctx_info.forked_from;
             }
 
             // Sync label

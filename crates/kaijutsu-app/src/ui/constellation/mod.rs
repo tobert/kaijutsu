@@ -210,7 +210,7 @@ impl Constellation {
 
         let node = ContextNode {
             context_id,
-            parent_id: None, // Populated by sync_model_info_to_constellation
+            forked_from: None, // Populated by sync_model_info_to_constellation
             label: None,     // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO,
             depth: 0.0,
@@ -240,7 +240,7 @@ impl Constellation {
 
         let node = ContextNode {
             context_id,
-            parent_id: ctx_info.parent_id,
+            forked_from: ctx_info.forked_from,
             label: if ctx_info.label.is_empty() { None } else { Some(ctx_info.label.clone()) },
             position: Vec2::ZERO,
             depth: 0.0,
@@ -280,8 +280,8 @@ impl Constellation {
 pub struct ContextNode {
     /// Unique context identifier
     pub context_id: ContextId,
-    /// Parent context ID (from drift router, for tree layout)
-    pub parent_id: Option<ContextId>,
+    /// Fork source context ID (from drift router, for tree layout)
+    pub forked_from: Option<ContextId>,
     /// Human-readable label (e.g. "default", "debug-auth")
     pub label: Option<String>,
     /// Position in constellation space (calculated by layout)
@@ -498,7 +498,7 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
     let mut roots: Vec<usize> = Vec::new();
 
     for (i, node) in constellation.nodes.iter().enumerate() {
-        if let Some(pid) = node.parent_id {
+        if let Some(pid) = node.forked_from {
             if let Some(&parent_idx) = id_to_idx.get(&pid) {
                 children[parent_idx].push(i);
             } else {

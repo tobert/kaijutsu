@@ -460,10 +460,10 @@ fn rebuild_edge_scene(
     let mut vello_scene = bevy_vello::vello::Scene::new();
 
     for node in &constellation.nodes {
-        let Some(parent_id) = node.parent_id else {
+        let Some(forked_from) = node.forked_from else {
             continue;
         };
-        let Some(&from) = positions.get(&parent_id) else {
+        let Some(&from) = positions.get(&forked_from) else {
             continue;
         };
         let Some(&to) = positions.get(&node.context_id) else {

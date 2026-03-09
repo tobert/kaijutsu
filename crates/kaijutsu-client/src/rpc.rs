@@ -165,7 +165,7 @@ pub struct ContextMembership {
 pub struct ContextInfo {
     pub id: ContextId,
     pub label: String,
-    pub parent_id: Option<ContextId>,
+    pub forked_from: Option<ContextId>,
     pub provider: String,
     pub model: String,
     pub created_at: u64,
@@ -1814,8 +1814,9 @@ fn parse_context_info(
 ) -> Result<ContextInfo, RpcError> {
     let id = parse_context_id(reader.get_id()?)?;
     let label = reader.get_label()?.to_string()?;
+    // Wire field is still named `parentId` — Rust side renamed to `forked_from`
     let parent_data = reader.get_parent_id()?;
-    let parent_id = if parent_data.len() == 16 {
+    let forked_from = if parent_data.len() == 16 {
         let pid = ContextId::try_from_slice(parent_data);
         pid.filter(|id| !id.is_nil())
     } else {
@@ -1834,7 +1835,7 @@ fn parse_context_info(
     Ok(ContextInfo {
         id,
         label,
-        parent_id,
+        forked_from,
         provider: reader.get_provider()?.to_string()?,
         model: reader.get_model()?.to_string()?,
         created_at: reader.get_created_at(),

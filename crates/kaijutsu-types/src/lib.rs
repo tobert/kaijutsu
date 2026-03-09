@@ -70,8 +70,9 @@ pub use kernel::Kernel;
 pub use session::Session;
 pub use enums::{ConsentMode, EdgeKind, ForkKind, ToolFilter};
 
-/// Current time as Unix milliseconds. Used by constructors throughout the crate.
-pub(crate) fn now_millis() -> u64 {
+/// Current time as Unix milliseconds. Canonical source — used by constructors
+/// throughout the crate and by downstream crates (drift, kernel_db, rpc).
+pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
