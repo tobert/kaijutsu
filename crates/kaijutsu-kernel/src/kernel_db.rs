@@ -406,10 +406,20 @@ fn validate_label(label: &str) -> KernelDbResult<()> {
     Ok(())
 }
 
-/// Map UNIQUE constraint violations to LabelConflict.
+/// Map constraint violations to typed errors.
+///
+/// SQLite extended error codes distinguish UNIQUE (2067) from FOREIGN KEY (787).
+/// We use `ConstraintViolation` as the primary code for both, so we check the
+/// extended code to produce the right error variant.
 fn map_unique_violation(e: rusqlite::Error, msg: impl Into<String>) -> KernelDbError {
-    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+    if let rusqlite::Error::SqliteFailure(err, ref detail) = e {
         if err.code == rusqlite::ErrorCode::ConstraintViolation {
+            // SQLITE_CONSTRAINT_FOREIGNKEY = 787
+            if err.extended_code == 787 {
+                let detail_str = detail.as_deref().unwrap_or("foreign key constraint failed");
+                return KernelDbError::Validation(detail_str.to_string());
+            }
+            // SQLITE_CONSTRAINT_UNIQUE = 2067, or any other constraint
             return KernelDbError::LabelConflict(msg.into());
         }
     }
@@ -1997,5 +2007,127 @@ mod tests {
         assert_eq!(ctx.forked_from, Some(parent));
         assert_eq!(ctx.created_by, creator);
         assert_eq!(ctx.created_at, now as u64);
+    }
+
+    // ── 21. Roundtrip: create context, read back, verify all 15 fields ──
+
+    #[test]
+    fn roundtrip_create_and_recover() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let parent_id = ContextId::new();
+
+        // Insert parent first (forked_from FK requires it to exist)
+        let parent = ContextRow {
+            context_id: parent_id,
+            kernel_id: kid,
+            label: Some("parent".into()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-4-6".into()),
+            system_prompt: Some("You are helpful.".into()),
+            tool_filter: Some(ToolFilter::DenyList(["dangerous".to_string()].into())),
+            consent_mode: ConsentMode::Collaborative,
+            created_at: 1000,
+            created_by: creator,
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+        };
+        db.insert_context(&parent).unwrap();
+
+        // Insert child forked from parent
+        let child_id = ContextId::new();
+        let child = ContextRow {
+            context_id: child_id,
+            kernel_id: kid,
+            label: Some("child-fork".into()),
+            provider: Some("google".into()),
+            model: Some("gemini-2.0-flash".into()),
+            system_prompt: Some("Be concise.".into()),
+            tool_filter: Some(ToolFilter::AllowList(["read".to_string(), "write".to_string()].into())),
+            consent_mode: ConsentMode::Autonomous,
+            created_at: 2000,
+            created_by: creator,
+            forked_from: Some(parent_id),
+            fork_kind: Some(ForkKind::Full),
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+        };
+        db.insert_context(&child).unwrap();
+
+        // Read back and verify all 15 fields
+        let recovered = db.get_context(child_id).unwrap().expect("child not found");
+        assert_eq!(recovered.context_id, child_id);
+        assert_eq!(recovered.kernel_id, kid);
+        assert_eq!(recovered.label, Some("child-fork".into()));
+        assert_eq!(recovered.provider, Some("google".into()));
+        assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
+        assert_eq!(recovered.system_prompt, Some("Be concise.".into()));
+        assert!(matches!(recovered.tool_filter, Some(ToolFilter::AllowList(ref s)) if s.len() == 2));
+        assert_eq!(recovered.consent_mode, ConsentMode::Autonomous);
+        assert_eq!(recovered.created_at, 2000);
+        assert_eq!(recovered.created_by, creator);
+        assert_eq!(recovered.forked_from, Some(parent_id));
+        assert_eq!(recovered.fork_kind, Some(ForkKind::Full));
+        assert!(recovered.archived_at.is_none());
+        assert!(recovered.workspace_id.is_none());
+        assert!(recovered.preset_id.is_none());
+
+        // Verify list_active_contexts returns both
+        let active = db.list_active_contexts(kid).unwrap();
+        assert_eq!(active.len(), 2);
+
+        // Verify to_context() preserves forked_from
+        let ctx = recovered.to_context();
+        assert_eq!(ctx.forked_from, Some(parent_id));
+        assert_eq!(ctx.created_by, creator);
+
+        // Verify update_tool_filter roundtrip
+        let new_filter = Some(ToolFilter::All);
+        db.update_tool_filter(child_id, &new_filter).unwrap();
+        let updated = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(updated.tool_filter, Some(ToolFilter::All));
+
+        // Verify update_model roundtrip
+        db.update_model(child_id, Some("deepseek"), Some("deepseek-r1")).unwrap();
+        let updated = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(updated.provider, Some("deepseek".into()));
+        assert_eq!(updated.model, Some("deepseek-r1".into()));
+    }
+
+    // ── 22. FK violation produces Validation, not LabelConflict ──────────
+
+    #[test]
+    fn fk_violation_is_validation_error() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+
+        // Reference a workspace_id that doesn't exist
+        let row = ContextRow {
+            context_id: ContextId::new(),
+            kernel_id: kid,
+            label: Some("fk-test".into()),
+            provider: None,
+            model: None,
+            system_prompt: None,
+            tool_filter: None,
+            consent_mode: ConsentMode::default(),
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::new(),
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: Some(WorkspaceId::new()), // doesn't exist
+            preset_id: None,
+        };
+        let err = db.insert_context(&row).unwrap_err();
+        assert!(
+            matches!(err, KernelDbError::Validation(_)),
+            "expected Validation for FK violation, got: {err}"
+        );
     }
 }
