@@ -192,12 +192,55 @@ LLM commands (4D — completed 2026-03-10):
 
 ---
 
-## Phase 5: App UI Integration
+## Phase 5: App UI Integration ✅
 
-- Constellation reads context metadata from KernelDb (model, provider, label, archived)
-- Fork form uses presets (load preset list, apply on fork)
-- Context info panel shows workspace, preset provenance, drift history
-- Tree view (`kj context list --tree`) in constellation
+**Status:** Complete (2026-03-10)
+
+Wire protocol enrichment, constellation visual encoding, preset RPC, and fork form
+preset integration. Also cleaned up debug instrumentation in render.rs.
+
+**What shipped:**
+
+Wire protocol (Cap'n Proto + server + client):
+- `ContextHandleInfo` gains `forkKind @7 :Text` and `archivedAt @8 :UInt64`
+- `listContexts` augmented: DriftRouter provides runtime data, KernelDb supplements
+  with `fork_kind` and `archived_at` via HashMap lookup
+- `PresetInfo` struct + `listPresets @89` RPC method on Kernel interface
+- Client `ContextInfo` extended with `fork_kind: Option<String>`, `archived: bool`
+- Client `PresetInfo` type + `list_presets()` on RpcClient and ActorHandle
+
+Constellation visuals (kaijutsu-app):
+- `ContextNode.fork_kind` field synced from `ContextInfo`
+- Archived contexts excluded from constellation entirely (filtered in
+  `sync_model_info_to_constellation` + `add_node_from_context_info`)
+- Nodes that become archived are removed on next poll
+- Fork kind badge on cards: `[shallow]`, `[compact]`, `[subtree]` appended to model text
+- Edge stroke varies by child's fork_kind: solid (full), dashed (shallow),
+  dotted (compact), thick (subtree)
+
+Fork form preset integration:
+- New `FIELD_PRESET` between Name and Model (4 fields total)
+- Async `list_presets()` fetch with 5s timeout (same pattern as models/tools)
+- `SelectableList` with `(none)` + preset labels (provider/model suffix)
+- `ForkFormState.presets_loaded` tracks fetch completion
+
+Debug cleanup:
+- Removed scroll investigation instrumentation from `readback_block_heights`
+  (UiVelloText query, block_idx counter, info! dumps, last_dump Local)
+
+**Design decisions:**
+- DriftRouter remains the primary list source for `listContexts` — KernelDb only
+  supplements with fork_kind/archived_at. No data source swap
+- Archived contexts never shown in constellation — accessible via `kj context list`
+- No tree layout mode — carousel with enriched edges IS the tree
+- Preset applied client-side via existing RPCs (set_context_model, set_context_tool_filter)
+  — no new "apply preset" RPC needed
+
+**Deferred to Phase 5B:**
+- Context info panel (`i` key overlay with `getContextDetail` RPC)
+- Workspace display on constellation cards
+- Push-based context metadata events (replace 5s polling)
+- Drift history visualization on edges
 
 ---
 

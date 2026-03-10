@@ -281,6 +281,16 @@ struct ContextHandleInfo {
   model @4 :Text;
   createdAt @5 :UInt64;
   traceId @6 :Data;               # 16-byte OTel trace ID for context-scoped tracing
+  forkKind @7 :Text;              # "full"/"shallow"/"compact"/"subtree" or empty
+  archivedAt @8 :UInt64;          # 0 = active, else Unix millis when archived
+}
+
+struct PresetInfo {
+  id @0 :Data;                    # 16-byte PresetId (UUIDv7)
+  label @1 :Text;
+  description @2 :Text;
+  provider @3 :Text;
+  model @4 :Text;
 }
 
 struct SimilarContext {
@@ -1081,6 +1091,9 @@ interface Kernel {
   # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
   # Returns success=false when context has no active interrupt state (i.e. nothing running).
   interruptContext @88 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
+
+  # List all presets for this kernel
+  listPresets @89 (trace :TraceContext) -> (presets :List(PresetInfo));
 }
 
 # ============================================================================

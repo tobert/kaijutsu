@@ -61,6 +61,7 @@ pub struct ForkFormState {
     pub name_text: String,
     pub parent_provider: Option<String>,
     pub parent_model: Option<String>,
+    pub presets_loaded: bool,
     pub models_loaded: bool,
     pub tools_loaded: bool,
     /// When the form was opened — used for fetch timeout (5s) on the Bevy side.
@@ -69,8 +70,9 @@ pub struct ForkFormState {
 
 /// Field IDs.
 const FIELD_NAME: u8 = 0;
-const FIELD_MODEL: u8 = 1;
-const FIELD_TOOLS: u8 = 2;
+const FIELD_PRESET: u8 = 1;
+const FIELD_MODEL: u8 = 2;
+const FIELD_TOOLS: u8 = 3;
 
 /// Marker for the name input text display.
 #[derive(Component)]
@@ -78,6 +80,10 @@ struct ForkFormNameDisplay;
 
 struct FetchedTools {
     categories: Vec<TreeCategory>,
+}
+
+struct FetchedPresets {
+    presets: Vec<kaijutsu_client::PresetInfo>,
 }
 
 struct FetchedModels {
@@ -96,12 +102,14 @@ struct ProviderModels {
 pub fn setup_fork_form_systems(app: &mut App) {
     app.init_resource::<AsyncSlot<FetchedModels>>()
         .init_resource::<AsyncSlot<FetchedTools>>()
+        .init_resource::<AsyncSlot<FetchedPresets>>()
         .add_message::<OpenForkForm>()
         .add_systems(
             Update,
             (
                 handle_open_fork_form,
                 init_name_display.run_if(in_state(Screen::ForkForm)),
+                poll_fork_form_presets.run_if(in_state(Screen::ForkForm)),
                 poll_fork_form_models.run_if(in_state(Screen::ForkForm)),
                 poll_fork_form_tools.run_if(in_state(Screen::ForkForm)),
                 handle_fork_form_input.run_if(in_state(Screen::ForkForm)),
@@ -120,6 +128,7 @@ fn handle_open_fork_form(
     existing: Query<Entity, With<ForkFormRoot>>,
     model_slot: Res<AsyncSlot<FetchedModels>>,
     tool_slot: Res<AsyncSlot<FetchedTools>>,
+    preset_slot: Res<AsyncSlot<FetchedPresets>>,
     actor: Option<Res<RpcActor>>,
 ) {
     if !existing.is_empty() {
@@ -135,6 +144,7 @@ fn handle_open_fork_form(
         next_screen.set(Screen::ForkForm);
         model_slot.clear();
         tool_slot.clear();
+        preset_slot.clear();
 
         let title = format!("Fork from {}", msg.source_context_id.short());
 
@@ -147,6 +157,7 @@ fn handle_open_fork_form(
                 name_text: String::new(),
                 parent_provider: msg.parent_provider.clone(),
                 parent_model: msg.parent_model.clone(),
+                presets_loaded: false,
                 models_loaded: false,
                 tools_loaded: false,
                 opened_at: std::time::Instant::now(),
@@ -161,6 +172,14 @@ fn handle_open_fork_form(
                             min_height: 36.0,
                             max_height: None,
                             loading_text: None,
+                            bordered: true,
+                        },
+                        FieldDesc {
+                            field_id: FIELD_PRESET,
+                            label: "Preset".into(),
+                            min_height: 40.0,
+                            max_height: Some(150.0),
+                            loading_text: Some("Loading presets...".into()),
                             bordered: true,
                         },
                         FieldDesc {
@@ -192,8 +211,8 @@ fn handle_open_fork_form(
                     },
                 ],
                 hints: "Tab: field | j/k: select | Space: toggle | Enter: expand/fork | Esc: cancel".into(),
-                field_count: 3,
-                initial_field: FIELD_MODEL,
+                field_count: 4,
+                initial_field: FIELD_PRESET,
             },
             FormPresentation::FullViewport {
                 max_width: None,
@@ -294,10 +313,27 @@ fn handle_open_fork_form(
                     }
                 })
                 .detach();
+            let handle3 = actor.handle.clone();
+            let preset_sender = preset_slot.sender();
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    match handle3.list_presets().await {
+                        Ok(presets) => {
+                            *preset_sender.lock().unwrap() = Some(FetchedPresets { presets });
+                        }
+                        Err(e) => {
+                            error!("Failed to fetch presets: {}", e);
+                            *preset_sender.lock().unwrap() =
+                                Some(FetchedPresets { presets: vec![] });
+                        }
+                    }
+                })
+                .detach();
         } else {
             warn!("No RPC actor available, fork form will have no model list");
             *model_slot.sender().lock().unwrap() = Some(FetchedModels { providers: vec![] });
             *tool_slot.sender().lock().unwrap() = Some(FetchedTools { categories: vec![] });
+            *preset_slot.sender().lock().unwrap() = Some(FetchedPresets { presets: vec![] });
         }
     }
 }
@@ -340,10 +376,75 @@ fn init_name_display(
 }
 
 // ============================================================================
-// POLL ASYNC MODEL RESULT
+// POLL ASYNC PRESET RESULT
 // ============================================================================
 
 const FETCH_TIMEOUT_SECS: u64 = 5;
+
+fn poll_fork_form_presets(
+    mut commands: Commands,
+    _theme: Res<Theme>,
+    _font_handles: Res<FontHandles>,
+    preset_slot: Res<AsyncSlot<FetchedPresets>>,
+    mut state_query: Query<&mut ForkFormState>,
+    loading_query: Query<(Entity, &FormLoadingText)>,
+    container_query: Query<(Entity, &FormFieldContainer), Without<SelectableList>>,
+) {
+    let Ok(mut state) = state_query.single_mut() else {
+        return;
+    };
+    if state.presets_loaded {
+        return;
+    }
+
+    let timed_out = state.opened_at.elapsed().as_secs() >= FETCH_TIMEOUT_SECS;
+    let fetched = if timed_out {
+        preset_slot.take().unwrap_or_else(|| {
+            warn!("Preset fetch timed out ({}s)", FETCH_TIMEOUT_SECS);
+            FetchedPresets { presets: vec![] }
+        })
+    } else {
+        let Some(f) = preset_slot.take() else { return; };
+        f
+    };
+
+    // Remove preset loading text
+    for (entity, flt) in loading_query.iter() {
+        if flt.0 == FIELD_PRESET {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    let Some((container, _)) = container_query
+        .iter()
+        .find(|(_, ffc)| ffc.0 == FIELD_PRESET)
+    else {
+        return;
+    };
+
+    state.presets_loaded = true;
+
+    // Build list: "(none)" first, then preset labels
+    let mut list_items = vec![ListItem::new("(none)")];
+    for preset in &fetched.presets {
+        let suffix = if !preset.provider.is_empty() && !preset.model.is_empty() {
+            let short_model = preset.model.rsplit('/').next().unwrap_or(&preset.model);
+            format!("  {}/{}", preset.provider, short_model)
+        } else {
+            String::new()
+        };
+        list_items.push(ListItem::new(&preset.label).with_suffix(&suffix));
+    }
+
+    let list = SelectableList::new(list_items, 13.0);
+    commands.entity(container).insert(list);
+
+    info!("Fork form presets loaded ({} presets)", fetched.presets.len());
+}
+
+// ============================================================================
+// POLL ASYNC MODEL RESULT
+// ============================================================================
 
 fn poll_fork_form_models(
     mut commands: Commands,

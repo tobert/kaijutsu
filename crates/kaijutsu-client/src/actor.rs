@@ -141,6 +141,7 @@ enum RpcCommand {
 
     // ── Interrupt ─────────────────────────────────────────────────────────
     InterruptContext { context_id: ContextId, immediate: bool, reply: oneshot::Sender<Result<bool, ActorError>> },
+    ListPresets { reply: oneshot::Sender<Result<Vec<crate::PresetInfo>, ActorError>> },
 
     // ── World-level (handled inline, not dispatched to child tasks) ──────
     Whoami { reply: oneshot::Sender<Result<Identity, ActorError>> },
@@ -196,6 +197,7 @@ impl RpcCommand {
             Self::GetContextHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::InterruptContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListPresets { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Whoami { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
         }
@@ -692,6 +694,11 @@ impl ActorHandle {
         immediate: bool,
     ) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::InterruptContext { context_id, immediate, reply }).await
+    }
+
+    /// List all presets for the current kernel.
+    pub async fn list_presets(&self) -> Result<Vec<crate::PresetInfo>, ActorError> {
+        self.send(|reply| RpcCommand::ListPresets { reply }).await
     }
 
     // ── World-level Methods ──────────────────────────────────────────────
@@ -1194,6 +1201,9 @@ async fn dispatch_command(
         // ── Interrupt ────────────────────────────────────────────
         RpcCommand::InterruptContext { context_id, immediate, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.interrupt_context(context_id, immediate));
+        }
+        RpcCommand::ListPresets { reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.list_presets());
         }
 
         // World-level commands are handled inline in run() — unreachable here

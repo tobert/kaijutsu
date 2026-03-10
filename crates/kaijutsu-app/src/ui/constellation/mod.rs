@@ -220,6 +220,7 @@ impl Constellation {
             provider: None,
             joined: true,
             last_activity_time: 0.0,
+            fork_kind: None,
         };
 
         self.nodes.push(node);
@@ -231,7 +232,13 @@ impl Constellation {
     }
 
     /// Add a placeholder node from DriftState context info (not yet joined).
+    ///
+    /// Skips archived contexts — they are not shown in the constellation.
     pub fn add_node_from_context_info(&mut self, ctx_info: &kaijutsu_client::ContextInfo) {
+        if ctx_info.archived {
+            return;
+        }
+
         let context_id = ctx_info.id;
 
         if self.node_by_id(context_id).is_some() {
@@ -250,6 +257,7 @@ impl Constellation {
             provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
             joined: false,
             last_activity_time: 0.0,
+            fork_kind: ctx_info.fork_kind.clone(),
         };
 
         self.nodes.push(node);
@@ -300,6 +308,8 @@ pub struct ContextNode {
     pub joined: bool,
     /// When activity last changed (from `Time::elapsed_secs_f64()`)
     pub last_activity_time: f64,
+    /// How this context was forked (e.g. "shallow", "compact", "subtree")
+    pub fork_kind: Option<String>,
 }
 
 /// Activity state of a context node

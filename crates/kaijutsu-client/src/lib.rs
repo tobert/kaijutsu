@@ -20,7 +20,7 @@ pub mod kaijutsu_capnp {
 pub use actor::{ActorError, ActorHandle, spawn_actor};
 pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode,
-    ContextInfo, ContextMembership, HistoryEntry, Identity, InputState,
+    ContextInfo, ContextMembership, HistoryEntry, Identity, InputState, PresetInfo,
     KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo, LlmProviderInfo, McpResource,
     McpResourceContents, McpToolResult, MountSpec, RpcClient, RpcError, ShellValue,
     StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,

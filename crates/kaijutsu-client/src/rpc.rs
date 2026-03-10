@@ -171,6 +171,20 @@ pub struct ContextInfo {
     pub created_at: u64,
     /// Long-running OTel trace ID for this context (16 bytes, or zeros if unavailable).
     pub trace_id: [u8; 16],
+    /// How this context was forked (e.g. "full", "shallow", "compact", "subtree").
+    pub fork_kind: Option<String>,
+    /// Whether this context has been archived.
+    pub archived: bool,
+}
+
+/// Preset template info from the server.
+#[derive(Debug, Clone)]
+pub struct PresetInfo {
+    pub id: Vec<u8>,
+    pub label: String,
+    pub description: String,
+    pub provider: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1406,6 +1420,31 @@ impl KernelHandle {
         Ok(response.get()?.get_success())
     }
 
+    /// List all presets for this kernel.
+    pub async fn list_presets(&self) -> Result<Vec<PresetInfo>, RpcError> {
+        let mut request = self.kernel.list_presets_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let presets = response.get()?.get_presets()?;
+
+        let mut result = Vec::with_capacity(presets.len() as usize);
+        for p in presets.iter() {
+            result.push(PresetInfo {
+                id: p.get_id()?.to_vec(),
+                label: p.get_label()?.to_string()?,
+                description: p.get_description()?.to_string()?,
+                provider: p.get_provider()?.to_string()?,
+                model: p.get_model()?.to_string()?,
+            });
+        }
+        Ok(result)
+    }
+
     // =========================================================================
     // Shell Variable Introspection
     // =========================================================================
@@ -1832,6 +1871,10 @@ fn parse_context_info(
         [0u8; 16]
     };
 
+    let fork_kind_str = reader.get_fork_kind()?.to_str().unwrap_or("");
+    let fork_kind = if fork_kind_str.is_empty() { None } else { Some(fork_kind_str.to_string()) };
+    let archived = reader.get_archived_at() > 0;
+
     Ok(ContextInfo {
         id,
         label,
@@ -1840,6 +1883,8 @@ fn parse_context_info(
         model: reader.get_model()?.to_string()?,
         created_at: reader.get_created_at(),
         trace_id,
+        fork_kind,
+        archived,
     })
 }
 

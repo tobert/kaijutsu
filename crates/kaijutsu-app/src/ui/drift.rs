@@ -222,7 +222,17 @@ fn sync_model_info_to_constellation(
         return;
     }
 
+    // Remove nodes that have been archived since last poll
+    constellation.nodes.retain(|node| {
+        !drift_state.contexts.iter().any(|c| c.id == node.context_id && c.archived)
+    });
+
     for ctx_info in &drift_state.contexts {
+        // Skip archived contexts — they don't appear in the constellation
+        if ctx_info.archived {
+            continue;
+        }
+
         // Find matching constellation node by context id
         if let Some(node) = constellation
             .nodes
@@ -264,6 +274,11 @@ fn sync_model_info_to_constellation(
             };
             if node.label != new_label {
                 node.label = new_label;
+            }
+
+            // Sync fork_kind
+            if node.fork_kind != ctx_info.fork_kind {
+                node.fork_kind = ctx_info.fork_kind.clone();
             }
         } else {
             // Create placeholder node for server-known contexts not yet in constellation.

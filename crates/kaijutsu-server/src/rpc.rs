@@ -51,7 +51,7 @@ use kaijutsu_kernel::{
 };
 use kaijutsu_crdt::{BlockKind, Role, Status};
 use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId, SessionId};
-use kaijutsu_kernel::kernel_db::{KernelDb, ContextRow, ContextEdgeRow};
+use kaijutsu_kernel::kernel_db::{KernelDb, ContextRow, ContextEdgeRow, PresetRow};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
@@ -1698,10 +1698,21 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListContextsResults,
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
+        let kernel_db_arc = self.kernel.kernel_db.clone();
+        let kernel_id = self.kernel.id;
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
         Promise::from_future(async move {
-            // Read from the kernel's drift router — the single source of truth
+            // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
+            let db_map: HashMap<ContextId, ContextRow> = {
+                let db = kernel_db_arc.lock().unwrap();
+                match db.list_all_contexts(kernel_id) {
+                    Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
+                    Err(_) => HashMap::new(),
+                }
+            };
+
+            // Read from the kernel's drift router — runtime authority for provider/model
             let drift = kernel_arc.drift().read().await;
             let contexts = drift.list_contexts();
             let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
@@ -1716,6 +1727,12 @@ impl kernel::Server for KernelImpl {
                 c.set_model(ctx.model.as_deref().unwrap_or(""));
                 c.set_created_at(ctx.created_at);
                 c.set_trace_id(&ctx.trace_id);
+
+                // Supplement with KernelDb metadata
+                if let Some(row) = db_map.get(&ctx.id) {
+                    c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
+                    c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+                }
             }
 
             Ok(())
@@ -5082,6 +5099,32 @@ impl kernel::Server for KernelImpl {
             results.get().set_success(success);
             Ok(())
         })
+    }
+
+    fn list_presets(
+        self: Rc<Self>,
+        params: kernel::ListPresetsParams,
+        mut results: kernel::ListPresetsResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_presets");
+        let kernel_id = self.kernel.id;
+
+        let presets = {
+            let db = self.kernel.kernel_db.lock().unwrap();
+            db.list_presets(kernel_id).unwrap_or_default()
+        };
+
+        let mut list = results.get().init_presets(presets.len() as u32);
+        for (i, preset) in presets.iter().enumerate() {
+            let mut p = list.reborrow().get(i as u32);
+            p.set_id(preset.preset_id.as_bytes());
+            p.set_label(&preset.label);
+            p.set_description(preset.description.as_deref().unwrap_or(""));
+            p.set_provider(preset.provider.as_deref().unwrap_or(""));
+            p.set_model(preset.model.as_deref().unwrap_or(""));
+        }
+
+        Promise::ok(())
     }
 }
 

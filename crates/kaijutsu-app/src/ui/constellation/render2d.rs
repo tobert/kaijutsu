@@ -470,7 +470,7 @@ fn rebuild_edge_scene(
             continue;
         };
 
-        draw_edge(&mut vello_scene, from, to, edge_color);
+        draw_edge(&mut vello_scene, from, to, edge_color, node.fork_kind.as_deref());
     }
 
     // Update or spawn the edge scene
@@ -508,13 +508,21 @@ fn card_label_text(node: &super::ContextNode) -> String {
     }
 }
 
-/// Model display text for a card.
+/// Model display text for a card, with fork_kind badge for non-full forks.
 fn card_model_text(node: &super::ContextNode) -> String {
-    if let Some(ref model) = node.model {
+    let model_str = if let Some(ref model) = node.model {
         let short = model.rsplit('/').next().unwrap_or(model.as_str());
-        truncate_chars(short, 22)
+        truncate_chars(short, 18)
     } else {
         "(no model)".to_string()
+    };
+
+    // Append fork_kind badge for non-full forks
+    match node.fork_kind.as_deref() {
+        Some("shallow") => format!("{model_str} [shallow]"),
+        Some("compact") => format!("{model_str} [compact]"),
+        Some("subtree") => format!("{model_str} [subtree]"),
+        _ => model_str, // "full" or None — no badge
     }
 }
 
@@ -536,7 +544,19 @@ fn format_recency(last_activity: f64, now: f64) -> String {
 }
 
 /// Draw a single edge as a quadratic Bezier curve.
-fn draw_edge(scene: &mut bevy_vello::vello::Scene, from: Vec2, to: Vec2, color: VelloColor) {
+///
+/// Stroke style varies by fork_kind of the child node:
+/// - full/None: solid 1.5px
+/// - shallow: dashed 1.5px
+/// - compact: dotted 1.5px
+/// - subtree: solid 2.5px (thicker)
+fn draw_edge(
+    scene: &mut bevy_vello::vello::Scene,
+    from: Vec2,
+    to: Vec2,
+    color: VelloColor,
+    fork_kind: Option<&str>,
+) {
     let from_pt = Point::new(from.x as f64, from.y as f64);
     let to_pt = Point::new(to.x as f64, to.y as f64);
 
@@ -553,7 +573,12 @@ fn draw_edge(scene: &mut bevy_vello::vello::Scene, from: Vec2, to: Vec2, color: 
     path.move_to(from_pt);
     path.quad_to(control, to_pt);
 
-    let stroke = Stroke::new(1.5).with_caps(Cap::Round);
+    let stroke = match fork_kind {
+        Some("shallow") => Stroke::new(1.5).with_caps(Cap::Round).with_dashes(0.0, [6.0, 4.0]),
+        Some("compact") => Stroke::new(1.5).with_caps(Cap::Round).with_dashes(0.0, [2.0, 4.0]),
+        Some("subtree") => Stroke::new(2.5).with_caps(Cap::Round),
+        _ => Stroke::new(1.5).with_caps(Cap::Round),
+    };
     scene.stroke(&stroke, Affine::IDENTITY, color, None, &path);
 }
 
