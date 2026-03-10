@@ -60,6 +60,7 @@ pub fn handle_block_events(
                 let cached = CachedDocument {
                     synced,
                     input: None,
+                    input_pending_clear: false,
                     context_name: membership.context_id.short(),
                     synced_at_generation: sync_gen.0,
                     last_accessed: std::time::Instant::now(),
@@ -187,35 +188,90 @@ pub fn handle_block_events(
 }
 
 /// Handle input document events (InputTextOps, InputCleared).
+///
+/// After submit or escape×3, `input_pending_clear` is set on the
+/// CachedDocument. While set, TextOps are suppressed (they may carry
+/// stale inserts from before the server cleared). When the server
+/// confirms via InputCleared, the flag is cleared and a fresh input
+/// state is re-fetched to restore SyncedInput with clean CRDT history.
 pub fn handle_input_doc_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut overlay: Query<&mut crate::cell::InputOverlay>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut focus: ResMut<crate::input::focus::FocusArea>,
+    session_agent: Res<crate::cell::SessionAgent>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    channel: Res<crate::connection::RpcResultChannel>,
 ) {
     use kaijutsu_client::ServerEvent;
 
     for ServerEventMessage(event) in server_events.read() {
         match event {
             ServerEvent::InputTextOps { context_id, ops } => {
-                if let Some(cached) = doc_cache.get_mut(*context_id)
-                    && let Some(input) = &mut cached.input
-                {
-                    if let Err(e) = input.apply_remote_ops(ops) {
-                        warn!("Failed to apply remote input ops for {}: {}, dropping input for re-sync", context_id, e);
-                        cached.input = None;
+                if let Some(cached) = doc_cache.get_mut(*context_id) {
+                    // Suppress late TextOps during pending clear — they carry
+                    // stale inserts from before the server's clear_input.
+                    if cached.input_pending_clear {
+                        trace!("Suppressed InputTextOps for {} (pending clear)", context_id);
+                        continue;
+                    }
+                    if let Some(input) = &mut cached.input {
+                        if let Err(e) = input.apply_remote_ops(ops) {
+                            warn!("Failed to apply remote input ops for {}: {}, dropping input for re-sync", context_id, e);
+                            cached.input = None;
+                        }
                     }
                 }
             }
             ServerEvent::InputCleared { context_id } => {
-                if let Some(cached) = doc_cache.get_mut(*context_id)
-                    && let Some(input) = &mut cached.input
-                {
-                    input.clear();
+                let ctx_id = *context_id;
+
+                // Clear the pending flag and drop the stale SyncedInput.
+                // Re-fetch from server to get clean CRDT history.
+                if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                    cached.input_pending_clear = false;
+                    cached.input = None;
                 }
 
-                if doc_cache.active_id() == Some(*context_id) {
+                // Re-fetch input state — server's doc is now clean post-clear.
+                // InputStateReceived handler will recreate SyncedInput.
+                let agent_id = session_agent.0;
+                if let Some(ref actor) = actor {
+                    let handle = actor.handle.clone();
+                    let tx = channel.sender();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            match handle.get_input_state(ctx_id).await {
+                                Ok(state) => {
+                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                        context_id: ctx_id,
+                                        state,
+                                    });
+                                }
+                                Err(e) => {
+                                    log::warn!("get_input_state re-fetch after clear failed for {}: {}", ctx_id, e);
+                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                        context_id: ctx_id,
+                                        state: kaijutsu_client::InputState {
+                                            content: String::new(),
+                                            ops: Vec::new(),
+                                            version: 0,
+                                        },
+                                    });
+                                }
+                            }
+                        })
+                        .detach();
+                } else {
+                    // No actor — create empty SyncedInput directly
+                    if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                    }
+                }
+
+                if doc_cache.active_id() == Some(ctx_id) {
+                    // Overlay may already be cleared by optimistic local clear.
                     if let Ok(mut overlay) = overlay.single_mut() {
                         overlay.text.clear();
                         overlay.cursor = 0;

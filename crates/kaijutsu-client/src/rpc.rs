@@ -1600,6 +1600,28 @@ impl KernelHandle {
             is_shell: result.get_is_shell(),
         })
     }
+
+    /// Clear the input document for a context (discard draft).
+    ///
+    /// The server clears the CRDT input doc and emits `InputCleared` to all
+    /// subscribers. Use this for Escape×3 (discard draft) — `submit_input`
+    /// already clears internally.
+    #[tracing::instrument(skip(self), name = "rpc_client.clear_input")]
+    pub async fn clear_input(
+        &self,
+        context_id: ContextId,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.clear_input_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
 }
 
 /// Read a `ShellValue` from a Cap'n Proto reader.

@@ -22,6 +22,10 @@ pub struct CachedDocument {
     pub last_accessed: std::time::Instant,
     /// Saved scroll offset (restored on switch-back).
     pub scroll_offset: f32,
+    /// Set after submit/escape×3 to suppress late-arriving TextOps and
+    /// SyncedInput restoration. Cleared when `InputCleared` arrives from
+    /// the server and triggers a clean re-fetch.
+    pub input_pending_clear: bool,
 }
 
 /// Multi-context document cache — the authoritative source for all document state.

@@ -4672,6 +4672,25 @@ impl kernel::Server for KernelImpl {
         }.instrument(trace_span))
     }
 
+    fn clear_input(
+        self: Rc<Self>,
+        params: kernel::ClearInputParams,
+        _results: kernel::ClearInputResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "clear_input").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
+            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+
+        log::info!("clear_input: context={}", context_id);
+
+        match self.kernel.documents.clear_input(context_id) {
+            Ok(_text) => Promise::ok(()),
+            Err(e) => Promise::err(capnp::Error::failed(format!("clear_input failed: {}", e))),
+        }
+    }
+
     fn search_similar(
         self: Rc<Self>,
         params: kernel::SearchSimilarParams,

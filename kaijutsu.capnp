@@ -1094,6 +1094,10 @@ interface Kernel {
 
   # List all presets for this kernel
   listPresets @89 (trace :TraceContext) -> (presets :List(PresetInfo));
+
+  # Clear the input document for a context (discard draft).
+  # Emits InputCleared so all clients can reset their compose state.
+  clearInput @90 (contextId :Data, trace :TraceContext) -> ();
 }
 
 # ============================================================================

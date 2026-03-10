@@ -67,14 +67,17 @@ pub fn handle_focus_compose(
             if let Ok(mut overlay) = overlay.single_mut() {
                 overlay.mode = mode;
                 // Restore draft from CRDT InputDocEntry if overlay is empty
+                // and no clear is pending (submit/escape×3 in flight).
                 if overlay.text.is_empty() {
                     if let Some(ctx_id) = doc_cache.active_id() {
                         if let Some(cached) = doc_cache.get(ctx_id) {
-                            if let Some(ref input) = cached.input {
-                                let crdt_text = input.text();
-                                if !crdt_text.is_empty() {
-                                    overlay.text = crdt_text;
-                                    overlay.cursor = overlay.text.len();
+                            if !cached.input_pending_clear {
+                                if let Some(ref input) = cached.input {
+                                    let crdt_text = input.text();
+                                    if !crdt_text.is_empty() {
+                                        overlay.text = crdt_text;
+                                        overlay.cursor = overlay.text.len();
+                                    }
                                 }
                             }
                         }
@@ -134,7 +137,7 @@ pub fn handle_escape(
     mut escape_state: ResMut<crate::input::escape::EscapeState>,
     mut focus: ResMut<FocusArea>,
     mut overlay: Query<&mut crate::cell::InputOverlay>,
-    doc_cache: Res<crate::cell::DocumentCache>,
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
     for ActionFired(action) in actions.read() {
@@ -168,12 +171,29 @@ pub fn handle_escape(
             }
         }
 
-        // 3rd press: also clear the compose buffer
+        // 3rd press: clear compose buffer + tell kernel to clear input doc
         if count >= 3 {
             if let Ok(mut ov) = overlay.single_mut() {
                 ov.text.clear();
                 ov.cursor = 0;
                 ov.selection_anchor = None;
+            }
+            if let Some(ctx_id) = doc_cache.active_id() {
+                // Suppress late TextOps until InputCleared re-fetch
+                if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                    cached.input_pending_clear = true;
+                }
+                // Tell the kernel to clear — emits InputCleared
+                if let Some(ref actor) = actor {
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.clear_input(ctx_id).await {
+                                log::warn!("clear_input failed: {e}");
+                            }
+                        })
+                        .detach();
+                }
             }
             escape_state.reset();
         }
@@ -725,7 +745,8 @@ pub fn handle_compose_input(
     mut submit_writer: MessageWriter<PromptSubmitted>,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
-    doc_cache: Res<crate::cell::DocumentCache>,
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
+    mut focus: ResMut<FocusArea>,
 ) {
     let Ok(mut overlay) = overlay.single_mut() else {
         return;
@@ -808,7 +829,19 @@ pub fn handle_compose_input(
                                 })
                                 .detach();
                         }
-                        // Do NOT clear locally — wait for InputCleared event.
+                        // Clear overlay optimistically. The server's InputCleared
+                        // confirms via re-fetch (see handle_input_doc_events).
+                        overlay.text.clear();
+                        overlay.cursor = 0;
+                        overlay.selection_anchor = None;
+
+                        // Suppress late TextOps until InputCleared re-fetch
+                        if let Some(cached) = doc_cache.get_mut(ctx) {
+                            cached.input_pending_clear = true;
+                        }
+
+                        // Dismiss overlay by transitioning focus
+                        *focus = FocusArea::Conversation;
                     } else {
                         // Offline fallback
                         let mut text = overlay.take();

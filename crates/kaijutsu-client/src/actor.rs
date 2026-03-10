@@ -107,6 +107,7 @@ enum RpcCommand {
     GetInputState { context_id: ContextId, reply: oneshot::Sender<Result<InputState, ActorError>> },
     PushInputOps { context_id: ContextId, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
     SubmitInput { context_id: ContextId, reply: oneshot::Sender<Result<SubmitResult, ActorError>> },
+    ClearInput { context_id: ContextId, reply: oneshot::Sender<Result<(), ActorError>> },
 
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool { tool: String, params: String, reply: oneshot::Sender<Result<ToolResult, ActorError>> },
@@ -177,6 +178,7 @@ impl RpcCommand {
             Self::GetInputState { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -486,6 +488,12 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn submit_input(&self, context_id: ContextId) -> Result<SubmitResult, ActorError> {
         self.send(|reply| RpcCommand::SubmitInput { context_id, reply }).await
+    }
+
+    /// Clear the input document (discard draft). Server emits InputCleared.
+    #[tracing::instrument(skip(self))]
+    pub async fn clear_input(&self, context_id: ContextId) -> Result<(), ActorError> {
+        self.send(|reply| RpcCommand::ClearInput { context_id, reply }).await
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -1127,6 +1135,9 @@ async fn dispatch_command(
         }
         RpcCommand::SubmitInput { context_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.submit_input(context_id));
+        }
+        RpcCommand::ClearInput { context_id, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.clear_input(context_id));
         }
 
         // ── Tool Execution ───────────────────────────────────────
