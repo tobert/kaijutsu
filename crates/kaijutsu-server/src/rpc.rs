@@ -878,6 +878,7 @@ pub async fn create_shared_kernel(
         documents.clone(),
         kernel_db_arc.clone(),
         id,
+        kernel_arc.clone(),
     ));
 
     let shared = SharedKernelState {

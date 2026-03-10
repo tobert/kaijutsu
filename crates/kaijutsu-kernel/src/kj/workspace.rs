@@ -271,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_list_empty() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("workspace"), s("list")], &c).await;
         assert!(result.is_ok());
@@ -280,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_show_not_found() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("workspace"), s("show"), s("nonexistent")], &c)
@@ -291,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_alias() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("ws"), s("list")], &c).await;
         assert!(result.is_ok());
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_create_and_list() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -317,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_create_with_paths() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -338,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_add_path() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -353,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_bind_to_context() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_remove_requires_latch() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_remove_confirmed() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
 

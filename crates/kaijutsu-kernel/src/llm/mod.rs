@@ -687,7 +687,8 @@ impl LlmRegistry {
 /// Reconstruct LLM conversation history from stored blocks.
 ///
 /// Walks blocks in order and produces the `Message` sequence expected by the
-/// LLM API. Skips thinking, drift, file, compacted, and empty blocks.
+/// LLM API. Skips thinking, file, compacted, and empty blocks.
+/// Drift blocks are included as User messages with a provenance prefix.
 ///
 /// Preserves `tool_use_id` from blocks when available, falling back to
 /// `BlockId::to_key()` for pre-migration blocks.
@@ -788,10 +789,14 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
     for block in blocks {
         // Skip blocks that shouldn't appear in LLM history
         if block.compacted { continue; }
-        if matches!(block.kind, BlockKind::Thinking | BlockKind::Drift | BlockKind::File) {
+        if matches!(block.kind, BlockKind::Thinking | BlockKind::File) {
             continue;
         }
-        if block.role == BlockRole::System || block.role == BlockRole::Asset {
+        if block.role == BlockRole::Asset {
+            continue;
+        }
+        // Skip System blocks unless they're Drift (cross-context transfer content)
+        if block.role == BlockRole::System && block.kind != BlockKind::Drift {
             continue;
         }
         if block.content.is_empty()
@@ -854,6 +859,18 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     content: block.content.clone(),
                     is_error: block.is_error,
                 });
+            }
+            (_, BlockKind::Drift) => {
+                // Drift blocks become user messages with provenance context
+                let source_label = block.source_context
+                    .map(|id| id.short())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let drift_kind = block.drift_kind
+                    .map(|k| k.as_str())
+                    .unwrap_or("drift");
+                let prefixed = format!("[{} from context {}]\n\n{}", drift_kind, source_label, block.content);
+                state.flush_all();
+                state.messages.push(Message::user(&prefixed));
             }
             _ => {
                 // Skip unexpected role/kind combinations
@@ -1111,7 +1128,7 @@ mod tests {
         }
 
         #[test]
-        fn skips_thinking_drift_file_compacted_empty() {
+        fn skips_thinking_file_compacted_empty_but_includes_drift() {
             let c = ctx();
             let u = user();
             let m = model();
@@ -1135,9 +1152,12 @@ mod tests {
             ];
 
             let msgs = hydrate_from_blocks(&blocks);
-            assert_eq!(msgs.len(), 2); // just user + assistant
+            // user + assistant + drift (as user) = 3; thinking/file/compacted/empty skipped
+            assert_eq!(msgs.len(), 3);
             assert_eq!(msgs[0].as_text(), Some("Hello"));
             assert_eq!(msgs[1].as_text(), Some("Hi"));
+            assert_eq!(msgs[2].role, Role::User); // drift becomes user message
+            assert!(msgs[2].as_text().unwrap().contains("drift content"));
         }
 
         #[test]
@@ -1310,6 +1330,82 @@ mod tests {
             assert_eq!(msgs[4].role, Role::User); // tool results
             assert_eq!(msgs[5].role, Role::Assistant);
             assert_eq!(msgs[5].as_text(), Some("Fixed!"));
+        }
+
+        #[test]
+        fn drift_blocks_become_user_messages() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let source_ctx = ctx(); // different context
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "What's happening?"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Let me check."),
+                BlockSnapshot::drift(
+                    BlockId::new(c, PrincipalId::system(), 0),
+                    None,
+                    "Found a critical bug in auth module. JWT tokens expire early.",
+                    source_ctx,
+                    Some("claude-opus-4-6".to_string()),
+                    kaijutsu_types::DriftKind::Pull,
+                ),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Got it, investigating."),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 4, "expected 4 messages, got {}: {:?}",
+                msgs.len(), msgs.iter().map(|m| &m.role).collect::<Vec<_>>());
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[1].role, Role::Assistant);
+            // Drift block becomes a User message
+            assert_eq!(msgs[2].role, Role::User);
+            let drift_text = msgs[2].as_text().unwrap();
+            assert!(drift_text.contains("pull"), "should contain drift kind: {drift_text}");
+            assert!(drift_text.contains(&source_ctx.short()), "should contain source ctx short: {drift_text}");
+            assert!(drift_text.contains("JWT tokens"), "should contain content: {drift_text}");
+            assert_eq!(msgs[3].role, Role::Assistant);
+        }
+
+        #[test]
+        fn drift_blocks_with_unknown_source() {
+            let c = ctx();
+            // Drift block with no source_context (edge case)
+            let mut drift = BlockSnapshot::drift(
+                BlockId::new(c, PrincipalId::system(), 0),
+                None,
+                "some drifted content",
+                ctx(), // will be overridden
+                None,
+                kaijutsu_types::DriftKind::Distill,
+            );
+            drift.source_context = None; // force no source
+
+            let msgs = hydrate_from_blocks(&[drift]);
+            assert_eq!(msgs.len(), 1);
+            let text = msgs[0].as_text().unwrap();
+            assert!(text.contains("unknown"), "should say 'unknown' for no source: {text}");
+            assert!(text.contains("distill"), "should contain drift kind: {text}");
+        }
+
+        #[test]
+        fn existing_behavior_unchanged_with_drift_addition() {
+            // Verify that Text/Thinking/ToolCall/ToolResult still work correctly
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::thinking(BlockId::new(c, m, 0), None, "thinking..."),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Hi!"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            // Thinking blocks are still skipped
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0].as_text(), Some("Hello"));
+            assert_eq!(msgs[1].as_text(), Some("Hi!"));
         }
     }
 }

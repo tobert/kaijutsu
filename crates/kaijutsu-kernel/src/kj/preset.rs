@@ -245,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_list_empty() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("preset"), s("list")], &c).await;
         assert!(result.is_ok());
@@ -254,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_show_not_found() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d
             .dispatch(&[s("preset"), s("show"), s("nonexistent")], &c)
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_save_and_list() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_save_update() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_remove_requires_latch() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
@@ -315,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn preset_remove_confirmed() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);

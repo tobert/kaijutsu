@@ -22,7 +22,8 @@ use std::sync::Arc;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
-use crate::drift::SharedDriftRouter;
+use crate::drift::{SharedDriftRouter, build_distillation_prompt, DISTILLATION_SYSTEM_PROMPT};
+use crate::kernel::Kernel;
 use crate::kernel_db::KernelDb;
 
 // ============================================================================
@@ -98,6 +99,7 @@ pub struct KjDispatcher {
     blocks: SharedBlockStore,
     kernel_db: Arc<std::sync::Mutex<KernelDb>>,
     kernel_id: KernelId,
+    kernel: Arc<Kernel>,
 }
 
 impl KjDispatcher {
@@ -106,12 +108,14 @@ impl KjDispatcher {
         blocks: SharedBlockStore,
         kernel_db: Arc<std::sync::Mutex<KernelDb>>,
         kernel_id: KernelId,
+        kernel: Arc<Kernel>,
     ) -> Self {
         Self {
             drift,
             blocks,
             kernel_db,
             kernel_id,
+            kernel,
         }
     }
 
@@ -167,6 +171,52 @@ COMMANDS:
     pub(crate) fn kernel_id(&self) -> KernelId {
         self.kernel_id
     }
+
+    pub(crate) fn kernel(&self) -> &Arc<Kernel> {
+        &self.kernel
+    }
+
+    /// Summarize a context's blocks via LLM.
+    ///
+    /// Used by `fork --compact`, `drift pull`, and `drift merge`.
+    /// Resolves the model from the context's DriftRouter entry, falling back
+    /// to the registry default.
+    pub(crate) async fn summarize(
+        &self,
+        context_id: ContextId,
+        directed_prompt: Option<&str>,
+    ) -> Result<String, String> {
+        let blocks = self.blocks.block_snapshots(context_id)
+            .map_err(|e| e.to_string())?;
+        if blocks.is_empty() {
+            return Err("context has no blocks to summarize".into());
+        }
+
+        let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
+
+        let model_name = {
+            let router = self.drift.read().await;
+            router.get(context_id).and_then(|h| h.model.clone())
+        };
+        let registry = self.kernel.llm().read().await;
+
+        let (provider, model) = match &model_name {
+            Some(m) => registry.resolve_model(m)
+                .ok_or_else(|| format!("model '{}' not found in registry", m))?,
+            None => {
+                let p = registry.default_provider()
+                    .ok_or("no LLM configured")?;
+                let m = registry.default_model()
+                    .ok_or("no default model configured")?
+                    .to_string();
+                (p, m)
+            }
+        };
+
+        provider.prompt_with_system(&model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
+            .await
+            .map_err(|e| format!("LLM summarization failed: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -177,14 +227,17 @@ pub(crate) mod test_helpers {
     use crate::kernel_db::KernelDb;
 
     /// Create a KjDispatcher with in-memory state for testing.
-    pub fn test_dispatcher() -> KjDispatcher {
+    ///
+    /// Must be called from an async context (e.g., `#[tokio::test]`).
+    pub async fn test_dispatcher() -> KjDispatcher {
         let drift = shared_drift_router();
         let blocks = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(std::sync::Mutex::new(
             KernelDb::in_memory().expect("in-memory KernelDb"),
         ));
         let kernel_id = KernelId::new();
-        KjDispatcher::new(drift, blocks, kernel_db, kernel_id)
+        let kernel = Arc::new(Kernel::new("test").await);
+        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
     }
 
     /// Create a KjCaller with fresh IDs for testing.

@@ -19,7 +19,7 @@ impl KjDispatcher {
             return self.fork_shallow(argv, caller).await;
         }
         if has_flag(argv, &["--compact"]) {
-            return KjResult::Err("not yet implemented (requires LLM)".to_string());
+            return self.fork_compact(argv, caller).await;
         }
         if has_flag(argv, &["--as"]) {
             return self.fork_subtree(argv, caller).await;
@@ -45,7 +45,7 @@ OPTIONS:
     --shallow             Shallow fork (recent blocks only)
     --depth N             Block depth for shallow fork (default: 50)
     --as <template>       Subtree fork: copy tree shape from template
-    --compact             LLM-summarized fork (not yet implemented)"
+    --compact             LLM-summarized fork (distills source via LLM)"
             .to_string()
     }
 
@@ -217,6 +217,102 @@ OPTIONS:
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         KjResult::Ok(format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
+    }
+
+    async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        let label = extract_named_arg(argv, &["--name", "-n"]);
+        let prompt = extract_named_arg(argv, &["--prompt"]);
+
+        let source_id = caller.context_id;
+        let new_id = ContextId::new();
+        let kernel_id = self.kernel_id();
+
+        // Summarize source context via LLM
+        let summary = match self.summarize(source_id, None).await {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+        };
+
+        // Create empty document for the new context
+        if let Err(e) = self.block_store().create_document(
+            new_id,
+            crate::DocumentKind::Conversation,
+            None,
+        ) {
+            return KjResult::Err(format!("kj fork --compact: failed to create document: {e}"));
+        }
+
+        // Seed with distilled summary as a Drift block
+        {
+            let source_model = {
+                let router = self.drift_router().read().await;
+                router.get(source_id).and_then(|h| h.model.clone())
+            };
+            if let Err(e) = self.block_store().insert_drift_block(
+                new_id,
+                None,
+                None,
+                &summary,
+                source_id,
+                source_model,
+                kaijutsu_crdt::DriftKind::Distill,
+            ) {
+                return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}"));
+            }
+        }
+
+        // If --prompt given, inject a fork note after the summary
+        if let Some(note) = prompt {
+            if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
+                tracing::warn!("failed to inject fork note: {e}");
+            }
+        }
+
+        // Write-through: KernelDb then DriftRouter
+        {
+            let db = self.kernel_db().lock().unwrap();
+            let row = ContextRow {
+                context_id: new_id,
+                kernel_id,
+                label: label.clone(),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: ConsentMode::Collaborative,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: caller.principal_id,
+                forked_from: Some(source_id),
+                fork_kind: Some(ForkKind::Compact),
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            };
+            if let Err(e) = db.insert_context(&row) {
+                return KjResult::Err(format!("kj fork --compact: {e}"));
+            }
+
+            let edge = ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id,
+                target_id: new_id,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            };
+            if let Err(e) = db.insert_edge(&edge) {
+                tracing::warn!("failed to insert compact fork edge: {e}");
+            }
+        }
+
+        {
+            let mut drift = self.drift_router().write().await;
+            drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+        }
+
+        let short = new_id.short();
+        let display = label.as_deref().unwrap_or(&short);
+        KjResult::Ok(format!("compact-forked to '{}' ({})", display, new_id.short()))
     }
 
     async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -457,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_basic() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("source"), None, principal).await;
 
@@ -479,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_no_name() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("src"), None, principal).await;
         d.block_store()
@@ -494,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_with_prompt() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("src"), None, principal).await;
         d.block_store()
@@ -513,10 +609,27 @@ mod tests {
 
     #[tokio::test]
     async fn fork_help() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("fork"), s("help")], &c).await;
         assert!(result.is_ok());
         assert!(result.message().contains("USAGE"));
+    }
+
+    #[tokio::test]
+    async fn fork_compact_empty_source_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("empty-src"), None, principal).await;
+
+        // Create empty document
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("compacted")], &c).await;
+        assert!(!result.is_ok(), "should fail on empty source: {}", result.message());
+        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
     }
 }

@@ -602,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_list_empty() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("context"), s("list")], &c).await;
         assert!(result.is_ok());
@@ -611,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_list_shows_contexts() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("default"), None, principal).await;
         let _ = register_context(&d, Some("alt"), None, principal).await;
@@ -628,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_list_tree() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let root = register_context(&d, Some("root"), None, principal).await;
 
@@ -659,7 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_info_current() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("myctx"), None, principal).await;
 
@@ -672,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_switch_by_label() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx_a = register_context(&d, Some("alpha"), None, principal).await;
         let _ctx_b = register_context(&d, Some("beta"), None, principal).await;
@@ -692,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_switch_already_current() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("only"), None, principal).await;
 
@@ -706,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_create_basic() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
 
@@ -725,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_create_duplicate_label() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
 
@@ -745,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_help() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let c = test_caller();
         let result = d.dispatch(&[s("context"), s("help")], &c).await;
         assert!(result.is_ok());
@@ -754,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_set_model() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("target"), None, principal).await;
 
@@ -774,7 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_log_shows_lineage() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let root = register_context(&d, Some("root"), None, principal).await;
         let child = register_context(&d, Some("child"), Some(root), principal).await;
@@ -789,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_move_reparent() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let a = register_context(&d, Some("a"), None, principal).await;
         let b = register_context(&d, Some("b"), None, principal).await;
@@ -824,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_archive_requires_latch() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("doomed"), None, principal).await;
 
@@ -837,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_archive_confirmed() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
         let target = register_context(&d, Some("target"), Some(parent), principal).await;
@@ -857,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_remove_requires_latch() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
         let target = register_context(&d, Some("victim"), Some(parent), principal).await;
@@ -871,7 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_remove_confirmed() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
         let target = register_context(&d, Some("target"), Some(parent), principal).await;
@@ -894,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_remove_cannot_remove_current() {
-        let d = test_dispatcher();
+        let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("current"), None, principal).await;
 

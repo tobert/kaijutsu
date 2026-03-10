@@ -167,10 +167,19 @@ Latched destructive commands (4C):
 - `kj preset remove <label>` — delete (FK SET NULL on contexts)
 - `kj workspace remove <label>` — archive (soft delete)
 
-LLM stubs (4D):
-- `kj fork --compact` → "not yet implemented (requires LLM)"
-- `kj drift pull <src> [prompt]` → "not yet implemented (requires LLM)"
-- `kj drift merge [ctx]` → "not yet implemented (requires LLM)"
+LLM commands (4D — completed 2026-03-10):
+- `kj fork --compact` — LLM-summarized fork: distills source context, seeds new doc
+  with `DriftKind::Distill` block
+- `kj drift pull <src> [prompt]` — summarizes source context (with optional directed
+  prompt), inserts `DriftKind::Pull` block + drift edge
+- `kj drift merge [ctx]` — summarizes caller's context, inserts `DriftKind::Merge`
+  block into parent (or explicit target) + drift edge
+- `KjDispatcher.summarize()` — shared helper resolving model from context → registry
+  default, calls `prompt_with_system()` with `DISTILLATION_SYSTEM_PROMPT`
+- `KjDispatcher` gains `kernel: Arc<Kernel>` for LLM registry access
+- `hydrate_from_blocks()` updated: drift blocks now included as User messages with
+  `[{drift_kind} from context {source_short}]` provenance prefix (were previously
+  skipped). Compact summaries, push/pull/merge drifts all visible to the model
 
 **Design decisions:**
 - `forked_from` is immutable provenance. `context move` changes structural edges only
@@ -205,7 +214,7 @@ LLM stubs (4D):
 ## Deferred / Open Questions
 
 - **Cross-kernel drift** — schema has `kernel_id` everywhere for future use
-- **Compact quality** — what makes a good compaction summary? Preset-level setting?
+- **Compact quality** — currently uses `DISTILLATION_SYSTEM_PROMPT` (generic "under 500 words" briefing). Consider preset-level or context-level summary style control
 - ~~**Retag safety**~~ — resolved in Phase 4: `kj context retag` is latch-gated
 - **Workspace auto-mounts** — how workspace paths translate to VFS mounts at context join time
 - **kj CLI binary** — standalone `kj` command for headless scripting (thin adapter over kernel)
