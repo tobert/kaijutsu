@@ -337,13 +337,7 @@ pub fn update_overlay_scene(
                         parley::layout::Affinity::Upstream,
                     );
                     let geom = cursor.geometry(&layout, 2.0);
-                    // UiVelloScene coordinates start at border-box top-left (0,0).
-                    // UiVelloText renders at content-box origin (padding inset).
-                    // Add the content-box inset so cursor aligns with text.
-                    let cb = computed.content_box();
-                    let inset_x = (cb.min.x + size.x / 2.0) as f64;
-                    let inset_y = (cb.min.y + size.y / 2.0) as f64;
-                    (geom.x0 + inset_x, geom.y0 + inset_y, geom.y1 - geom.y0)
+                    (geom.x0, geom.y0, geom.y1 - geom.y0)
                 } else {
                     // Font not loaded yet — approximate with metrics
                     let line_height = text_metrics.cell_line_height as f64;
