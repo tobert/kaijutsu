@@ -11,7 +11,8 @@
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
 use bevy_vello::integrations::text::VelloFontAxes;
-use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloTextAnchor};
+use bevy_vello::parley;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont, VelloTextAnchor};
 use bevy_vello::vello;
 use vello::kurbo::{Affine, RoundedRect, Shape, Stroke};
 use vello::peniko::Fill;
@@ -20,7 +21,6 @@ use crate::cell::{InputOverlay, InputOverlayMarker};
 use crate::input::FocusArea;
 use crate::text::{bevy_color_to_brush, FontHandles, KjText, KjTextEffects, TextMetrics};
 use crate::ui::theme::Theme;
-use crate::view::cursor::cursor_row_col;
 use crate::view::fieldset::apply_alpha;
 
 // ============================================================================
@@ -288,24 +288,22 @@ pub fn update_overlay_scene(
     focus_area: Res<FocusArea>,
     time: Res<Time>,
     text_metrics: Res<TextMetrics>,
+    font_handles: Res<FontHandles>,
+    fonts: Res<Assets<VelloFont>>,
     theme: Res<Theme>,
     mut query: Query<
-        (&OverlayStyle, &InputOverlay, &ComputedNode, &mut UiVelloScene),
+        (&OverlayStyle, &InputOverlay, &UiVelloText, &ComputedNode, &mut UiVelloScene),
         With<InputOverlayMarker>,
     >,
 ) {
     // Only show cursor when in compose mode
     let show_cursor = matches!(*focus_area, FocusArea::Compose);
 
-    for (style, overlay, computed, mut vello_scene) in query.iter_mut() {
+    for (style, overlay, vello_text, computed, mut vello_scene) in query.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 || size.y < 1.0 {
             continue;
         }
-
-        // Calculate cursor position (row, col in text)
-        let display = overlay.display_text();
-        let (row, col) = cursor_row_col(&display, overlay.display_cursor_offset());
 
         let mut scene = vello::Scene::new();
         build_overlay_panel(
@@ -317,21 +315,50 @@ pub fn update_overlay_scene(
             summon.progress,
         );
 
-        // Draw cursor if visible
+        // Draw cursor using Parley's actual layout positions.
+        // This replaces the manual `col * char_width` calculation which drifted
+        // because font advances don't perfectly match a single-char measurement.
         if show_cursor && summon.progress > 0.0 {
-            let char_width = text_metrics.cell_char_width as f64;
-            let line_height = text_metrics.cell_line_height as f64;
+            let display_str = overlay.display_text();
+            let cursor_byte_offset = overlay.display_cursor_offset();
 
-            // Scene origin appears to be at content-box, not border-box.
-            // No padding offsets needed.
-            let cursor_x = col as f64 * char_width;
-            let cursor_y = row as f64 * line_height;
+            let (cursor_x, cursor_y, cursor_h) =
+                if let Some(font) = fonts.get(&font_handles.mono) {
+                    // Lay out with the same style and max_advance as the UiVelloText
+                    let layout = font.layout(
+                        &display_str,
+                        &vello_text.style,
+                        vello_text.text_align,
+                        vello_text.max_advance,
+                    );
+                    let cursor = parley::editing::Cursor::from_byte_index(
+                        &layout,
+                        cursor_byte_offset,
+                        parley::layout::Affinity::Upstream,
+                    );
+                    let geom = cursor.geometry(&layout, 2.0);
+                    // UiVelloScene coordinates start at border-box top-left (0,0).
+                    // UiVelloText renders at content-box origin (padding inset).
+                    // Add the content-box inset so cursor aligns with text.
+                    let cb = computed.content_box();
+                    let inset_x = (cb.min.x + size.x / 2.0) as f64;
+                    let inset_y = (cb.min.y + size.y / 2.0) as f64;
+                    (geom.x0 + inset_x, geom.y0 + inset_y, geom.y1 - geom.y0)
+                } else {
+                    // Font not loaded yet — approximate with metrics
+                    let line_height = text_metrics.cell_line_height as f64;
+                    let char_width = text_metrics.cell_char_width as f64;
+                    let col = display_str[..cursor_byte_offset.min(display_str.len())]
+                        .chars()
+                        .count();
+                    (col as f64 * char_width, 0.0, line_height)
+                };
 
             draw_cursor_beam(
                 &mut scene,
                 cursor_x,
                 cursor_y,
-                line_height,
+                cursor_h,
                 theme.cursor_insert,
                 summon.progress,
                 time.elapsed_secs(),
