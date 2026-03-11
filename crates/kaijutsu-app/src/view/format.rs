@@ -495,8 +495,23 @@ fn format_tree_node(node: &OutputNode, depth: usize, lines: &mut Vec<String>) {
 /// Format a single block for display.
 ///
 /// Returns the formatted text for one block, including visual markers.
+/// Trailing whitespace is always stripped — LLM streaming and tool output
+/// commonly leave trailing newlines that inflate block height.
 /// `local_ctx`: optional local context ID for drift push direction.
 pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
+    let raw = format_block_inner(block, local_ctx);
+    // Universal trim — catches trailing whitespace from any block kind
+    // (Thinking, ToolResult with output data, File, Drift, etc.)
+    let trimmed = raw.trim_end();
+    if trimmed.len() == raw.len() {
+        raw
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Inner formatting dispatch — may produce trailing whitespace.
+fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
     match block.kind {
         BlockKind::Thinking => {
             if block.collapsed {
@@ -505,7 +520,9 @@ pub fn format_single_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) 
                 format!("Thinking\n{}", block.content)
             }
         }
-        BlockKind::Text => block.content.clone(),
+        BlockKind::Text => {
+            block.content.to_string()
+        }
         BlockKind::ToolCall => {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
             // For shell commands, show just the code value
@@ -867,5 +884,37 @@ mod tests {
         );
         let result = format_single_block(&result_block, None);
         assert_eq!(result, "file contents here");
+    }
+
+    #[test]
+    fn test_trim_end_all_block_kinds() {
+        // Text block — trailing whitespace stripped
+        let mut block = BlockSnapshot::text(test_block_id(), None, Role::Model, "hello\n\n\n");
+        assert_eq!(format_single_block(&block, None), "hello");
+
+        // Thinking block — trailing whitespace stripped
+        block.kind = BlockKind::Thinking;
+        block.content = "deep thought\n\n\n".to_string();
+        let result = format_single_block(&block, None);
+        assert_eq!(result, "Thinking\ndeep thought");
+
+        // ToolResult with trailing whitespace
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
+        let mut result_block = BlockSnapshot::tool_result(
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Shell,
+            "output\n\n\n",
+            false,
+            Some(0),
+            None,
+        );
+        assert_eq!(format_single_block(&result_block, None), "output");
+
+        // ToolResult with OutputData text having trailing whitespace
+        result_block.output = Some(OutputData::text("table output\n\n\n"));
+        assert_eq!(format_single_block(&result_block, None), "table output");
     }
 }

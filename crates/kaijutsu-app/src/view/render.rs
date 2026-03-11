@@ -105,10 +105,15 @@ pub fn sync_block_cell_buffers(
         let local_ctx = doc_cache.active_id();
         let text = format_single_block(block, local_ctx);
 
-        // Debounce large blocks — only re-render when growth exceeds threshold
+        // Debounce large blocks — only while still streaming. Once a block
+        // reaches Done/Error, always render the final text so trim_end takes
+        // effect and the measured height converges to the actual content.
         const DEBOUNCE_CHARS: usize = 200;
         const DEBOUNCE_MIN_SIZE: usize = 10_000;
-        if text.len() > DEBOUNCE_MIN_SIZE && block_cell.last_text_len > 0 {
+        if block.status == kaijutsu_crdt::Status::Running
+            && text.len() > DEBOUNCE_MIN_SIZE
+            && block_cell.last_text_len > 0
+        {
             let growth = text.len().saturating_sub(block_cell.last_text_len);
             if growth > 0 && growth < DEBOUNCE_CHARS {
                 continue;
