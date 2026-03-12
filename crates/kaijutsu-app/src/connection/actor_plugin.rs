@@ -255,10 +255,11 @@ fn poll_bootstrap_results(
                         // 3. No context specified — fetch context list to populate constellation
                         match h.list_contexts().await {
                             Ok(contexts) => {
+                                log::info!("Bootstrap: list_contexts returned {} contexts", contexts.len());
                                 let _ = tx.send(RpcResultMessage::DriftContextsReceived { contexts });
                             }
                             Err(e) => {
-                                log::debug!("Startup list_contexts failed: {e}");
+                                log::warn!("Bootstrap: list_contexts failed: {e}");
                             }
                         }
                     })
@@ -401,6 +402,15 @@ fn update_connection_state(
             }
             RpcResultMessage::IdentityReceived(identity) => {
                 state.identity = Some(identity.clone());
+                // If we got identity, the connection succeeded — mark connected.
+                // This is critical because the broadcast ConnectionStatus::Connected
+                // event fires before poll_connection_status subscribes (deferred
+                // command race: RpcActor is inserted via commands.insert_resource
+                // which is deferred, so the subscription happens a frame too late).
+                if !state.connected {
+                    log::info!("Connection established (from IdentityReceived)");
+                    state.connected = true;
+                }
             }
             _ => {}
         }

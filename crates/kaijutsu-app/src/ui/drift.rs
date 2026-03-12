@@ -98,16 +98,10 @@ impl Plugin for DriftPlugin {
 fn poll_drift_state(
     actor: Option<Res<RpcActor>>,
     mut drift_state: ResMut<DriftState>,
-    conn_state: Res<crate::connection::RpcConnectionState>,
     time: Res<Time>,
     result_channel: Res<RpcResultChannel>,
 ) {
     let Some(actor) = actor else { return };
-
-    // Don't fire RPCs when disconnected — they'd just trigger reconnect attempts
-    if !conn_state.connected {
-        return;
-    }
 
     let elapsed = time.elapsed_secs_f64();
 
@@ -159,6 +153,11 @@ fn update_drift_state(
     for event in events.read() {
         match event {
             RpcResultMessage::DriftContextsReceived { contexts } => {
+                if !drift_state.loaded {
+                    log::info!("DriftState: initial load, {} contexts", contexts.len());
+                } else {
+                    log::debug!("DriftState: poll, {} contexts", contexts.len());
+                }
                 drift_state.contexts = contexts.clone();
                 drift_state.loaded = true;
             }
