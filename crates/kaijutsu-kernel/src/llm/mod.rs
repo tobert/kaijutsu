@@ -54,6 +54,22 @@ use std::sync::Arc;
 /// Default model to use when none specified.
 pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// Mock LLM client for testing — returns a canned response.
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Clone, Debug)]
+pub struct MockClient {
+    pub canned_response: String,
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+impl MockClient {
+    pub fn new(response: impl Into<String>) -> Self {
+        Self {
+            canned_response: response.into(),
+        }
+    }
+}
+
 /// Role of a message in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -314,6 +330,9 @@ pub enum RigProvider {
     OpenAI(openai::Client),
     /// Ollama local models.
     Ollama(ollama::Client),
+    /// Mock provider for testing — returns canned responses.
+    #[cfg(any(test, feature = "test-mock"))]
+    Mock(MockClient),
 }
 
 impl std::fmt::Debug for RigProvider {
@@ -323,6 +342,8 @@ impl std::fmt::Debug for RigProvider {
             Self::Gemini(_) => f.debug_tuple("Gemini").field(&"[client]").finish(),
             Self::OpenAI(_) => f.debug_tuple("OpenAI").field(&"[client]").finish(),
             Self::Ollama(_) => f.debug_tuple("Ollama").field(&"[client]").finish(),
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => f.debug_tuple("Mock").field(&"[canned]").finish(),
         }
     }
 }
@@ -369,6 +390,11 @@ impl RigProvider {
                     .map_err(|e| LlmError::Unavailable(e.to_string()))?;
                 Ok(Self::Ollama(client))
             }
+            #[cfg(any(test, feature = "test-mock"))]
+            "mock" => {
+                let model = config.default_model.clone().unwrap_or_else(|| "mock-model".into());
+                Ok(Self::Mock(MockClient::new(format!("Mock summary for testing (model: {model})."))))
+            }
             other => Err(LlmError::Unavailable(format!(
                 "Unknown provider type: {}",
                 other
@@ -407,6 +433,8 @@ impl RigProvider {
             Self::Gemini(_) => "gemini",
             Self::OpenAI(_) => "openai",
             Self::Ollama(_) => "ollama",
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => "mock",
         }
     }
 
@@ -477,6 +505,8 @@ impl RigProvider {
                 let response = model.completion(request).await?;
                 extract_text(response.choice)
             }
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(mock) => mock.canned_response.clone(),
         };
 
         Ok(response_text)
@@ -505,6 +535,8 @@ impl RigProvider {
             Self::Gemini(_) => vec!["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro"],
             Self::OpenAI(_) => vec!["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
             Self::Ollama(_) => vec!["qwen2.5-coder:7b", "llama3.2", "codellama"],
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => vec!["mock-model"],
         }
     }
 }

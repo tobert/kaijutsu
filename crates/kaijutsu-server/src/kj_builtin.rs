@@ -63,6 +63,16 @@ impl Tool for KjBuiltin {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new("kj", "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
             .param(ParamSchema::required("subcommand", "string", "Command and arguments (e.g. 'drift push main \"finding\"')"))
+            // Schema-declared named params so kaish puts them in `named` (not `flags`)
+            .param(ParamSchema::optional("name", "string", Value::String(String::new()), "Label for context or fork")
+                .with_aliases(["-n"]))
+            .param(ParamSchema::optional("depth", "int", Value::Int(50), "Depth limit for shallow fork"))
+            .param(ParamSchema::optional("prompt", "string", Value::String(String::new()), "Prompt note to inject on fork"))
+            .param(ParamSchema::optional("preset", "string", Value::String(String::new()), "Preset to apply on fork"))
+            .param(ParamSchema::optional("model", "string", Value::String(String::new()), "Model spec (provider/model)"))
+            .param(ParamSchema::optional("tools", "string", Value::String(String::new()), "Tool filter spec"))
+            .param(ParamSchema::optional("confirm", "string", Value::String(String::new()), "Latch confirmation nonce"))
+            .param(ParamSchema::optional("as", "string", Value::String(String::new()), "Template context for subtree fork"))
             .example("Discover commands", "kj help")
             .example("View context topology", "kj context list --tree")
             .example("Create isolated workspace", "kj fork --name debug-auth")
@@ -77,7 +87,10 @@ impl Tool for KjBuiltin {
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut ExecContext) -> ExecResult {
-        // Build argv from positional args
+        // Build argv from positional args + named args + flags.
+        // kaish splits `kj fork --name exploration` into:
+        //   positional: ["fork"], named: {"name": "exploration"}
+        // We reconstruct the flat argv that KjDispatcher.dispatch() expects.
         let mut argv: Vec<String> = args
             .positional
             .iter()
@@ -89,6 +102,32 @@ impl Tool for KjBuiltin {
                 other => format!("{other:?}"),
             })
             .collect();
+
+        // Reconstruct --key value pairs from named args
+        for (key, val) in &args.named {
+            let flag = if key.len() == 1 {
+                format!("-{key}")
+            } else {
+                format!("--{key}")
+            };
+            argv.push(flag);
+            match val {
+                Value::String(s) => argv.push(s.clone()),
+                Value::Int(n) => argv.push(n.to_string()),
+                Value::Float(f) => argv.push(f.to_string()),
+                Value::Bool(b) => argv.push(b.to_string()),
+                other => argv.push(format!("{other:?}")),
+            }
+        }
+
+        // Reconstruct boolean flags
+        for flag in &args.flags {
+            if flag.len() == 1 {
+                argv.push(format!("-{flag}"));
+            } else {
+                argv.push(format!("--{flag}"));
+            }
+        }
 
         // Extract --confirm <nonce> before dispatch
         let confirm_nonce = kaijutsu_kernel::kj::parse::extract_named_arg(&argv, &["--confirm"]);

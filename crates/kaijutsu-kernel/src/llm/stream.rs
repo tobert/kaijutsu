@@ -420,6 +420,12 @@ impl RigStreamAdapter {
                 let stream = completion_model.stream(rig_request).await?;
                 (ProviderKind::Ollama, RigStreamInner::Ollama(stream))
             }
+            #[cfg(any(test, feature = "test-mock"))]
+            RigProvider::Mock(_) => {
+                return Err(super::LlmError::Unavailable(
+                    "mock provider does not support streaming".into(),
+                ));
+            }
         };
 
         Ok(Self {

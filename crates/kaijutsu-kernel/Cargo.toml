@@ -59,6 +59,9 @@ async-broadcast = "0.7"
 # MCP (Model Context Protocol)
 rmcp.workspace = true
 
+[features]
+test-mock = []
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs"] }
 
