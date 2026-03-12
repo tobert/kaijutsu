@@ -282,52 +282,6 @@ pub struct ContextShellRequest {
 }
 
 // ============================================================================
-// Drift Types
-// ============================================================================
-
-/// Push content to another context's staging queue.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DriftPushRequest {
-    /// Target context (short hex ID or label)
-    #[schemars(description = "Target context — short hex ID (e.g., 'a1b2c3') or label (e.g., 'default')")]
-    pub target_ctx: String,
-    /// Content to transfer
-    #[schemars(description = "Content to push to the target context")]
-    pub content: String,
-    /// Whether to LLM-summarize before transfer
-    #[schemars(description = "Summarize via LLM before transfer (default: false)")]
-    #[serde(default)]
-    pub summarize: bool,
-}
-
-/// Cancel a staged drift by ID.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DriftCancelRequest {
-    /// Staged drift ID to cancel
-    #[schemars(description = "ID of the staged drift to cancel")]
-    pub staged_id: u64,
-}
-
-/// Pull summarized content from another context.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DriftPullRequest {
-    /// Source context (short hex ID or label)
-    #[schemars(description = "Source context — short hex ID (e.g., 'a1b2c3') or label (e.g., 'default')")]
-    pub source_ctx: String,
-    /// Optional directed prompt to focus the summary
-    #[schemars(description = "Optional prompt to focus the summary (e.g., 'what decisions were made about auth?')")]
-    pub prompt: Option<String>,
-}
-
-/// Merge a forked context back into its parent.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct DriftMergeRequest {
-    /// Source context to merge (short hex ID or label)
-    #[schemars(description = "Forked context to merge — short hex ID or label")]
-    pub source_ctx: String,
-}
-
-// ============================================================================
 // Input Document Types
 // ============================================================================
 

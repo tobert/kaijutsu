@@ -84,8 +84,6 @@ pub use config_backend::{
 pub use drift::{
     ContextHandle, DriftError, DriftRouter,
     SharedDriftRouter, StagedDrift, shared_drift_router,
-    // Individual drift engines
-    DriftLsEngine, DriftPushEngine, DriftPullEngine, DriftFlushEngine, DriftMergeEngine,
     // Distillation helpers
     DISTILLATION_SYSTEM_PROMPT, build_distillation_prompt,
 };

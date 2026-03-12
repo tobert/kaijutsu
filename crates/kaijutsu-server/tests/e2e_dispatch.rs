@@ -3,71 +3,14 @@
 //! # Tiers
 //!
 //! - **Tier 0:** EngineArgs unit tests — JSON→argv reconstruction in isolation
-//! - **Tier 1:** Drift e2e through EmbeddedKaish — smoke tests exercising full dispatch:
-//!   `kaish.execute("drift_ls")` → parser → execute_command (not a builtin) →
-//!   backend fallback → KaijutsuBackend.call_tool("drift_ls", ...) →
-//!   DriftLsEngine.execute(json) → result
-//! - **Tier 2:** Drift e2e through EmbeddedKaish — lifecycle with CRDT block verification
+//! - **Tier 3:** Shell command e2e through EmbeddedKaish
 use std::sync::Arc;
 
-use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::db::DocumentKind;
-use kaijutsu_kernel::drift::{DriftLsEngine, DriftPushEngine, DriftFlushEngine};
-use kaijutsu_kernel::tools::{EngineArgs, ToolInfo};
+use kaijutsu_kernel::tools::EngineArgs;
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
 use kaijutsu_crdt::{ContextId, PrincipalId};
-use kaijutsu_types::{KernelId, SessionId};
 use kaijutsu_server::EmbeddedKaish;
-
-// ============================================================================
-// Shared test setup
-// ============================================================================
-
-/// Create an EmbeddedKaish with split drift engines for true e2e testing.
-///
-/// Returns an EmbeddedKaish that exercises the full dispatch chain:
-/// kaish parser → execute_command → backend fallback →
-/// KaijutsuBackend.call_tool() → individual drift engines.
-async fn setup_drift_e2e() -> (EmbeddedKaish, Arc<Kernel>, SharedBlockStore) {
-    let kernel = Arc::new(Kernel::new("e2e-drift").await);
-    let documents = shared_block_store(PrincipalId::system());
-
-    // Generate a ContextId for the default context
-    let ctx_id = ContextId::new();
-
-    documents
-        .create_document(ctx_id, DocumentKind::Conversation, None)
-        .unwrap();
-
-    // Register individual drift engines
-    // context_id removed from constructors — engines read it from ToolContext at call time
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_ls", "List drift contexts", "drift"),
-        Arc::new(DriftLsEngine::new(&kernel)),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_push", "Stage drift content", "drift"),
-        Arc::new(DriftPushEngine::new(&kernel, documents.clone())),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_flush", "Flush staged drifts", "drift"),
-        Arc::new(DriftFlushEngine::new(&kernel, documents.clone())),
-    ).await;
-
-    // Register "default" context in drift router
-    {
-        let mut router = kernel.drift().write().await;
-        router.register(ctx_id, Some("default"), None, kaijutsu_types::PrincipalId::system());
-    }
-
-    let kaish = EmbeddedKaish::with_identity(
-        "e2e-drift", documents.clone(), kernel.clone(), None,
-        PrincipalId::system(), ctx_id, SessionId::new(), KernelId::new(),
-        |_, _| {},
-    ).expect("EmbeddedKaish::with_identity failed");
-
-    (kaish, kernel, documents)
-}
 
 // ============================================================================
 // Tier 0: EngineArgs unit tests (kaish-style JSON → argv reconstruction)
@@ -130,78 +73,7 @@ fn engine_args_numeric_positional_coerced() {
 }
 
 // ============================================================================
-// Tier 1: Drift e2e through EmbeddedKaish — smoke tests
-// ============================================================================
-
-#[tokio::test]
-async fn drift_ls_shows_default_context() {
-    let (kaish, _kernel, _docs) = setup_drift_e2e().await;
-    let result = kaish.execute("drift_ls").await.unwrap();
-
-    assert!(result.ok(), "err: {}", result.err);
-    assert!(
-        result.out.contains("default"),
-        "expected 'default' context, got: {}",
-        result.out
-    );
-    assert!(
-        result.out.contains("* "),
-        "expected '* ' marker for current context, got: {}",
-        result.out
-    );
-}
-
-// ============================================================================
-// Tier 2: Drift e2e through EmbeddedKaish — lifecycle with CRDT verification
-// ============================================================================
-
-#[tokio::test]
-async fn drift_push_flush_lifecycle() {
-    let (kaish, kernel, documents) = setup_drift_e2e().await;
-
-    // Register a second context as drift target
-    let target_ctx_id = ContextId::new();
-    {
-        let mut router = kernel.drift().write().await;
-        router.register(target_ctx_id, Some("target"), None, kaijutsu_types::PrincipalId::system());
-    }
-
-    documents
-        .create_document(target_ctx_id, DocumentKind::Conversation, None)
-        .unwrap();
-
-    // Stage a drift push via DriftPushEngine through kaish dispatch.
-    // Use the label "target" (not short hex) because UUIDv7 IDs created in the
-    // same millisecond share their 8-char prefix, making hex prefix ambiguous.
-    let push_result = kaish
-        .execute(r#"drift_push "target" "hello from e2e test""#)
-        .await
-        .unwrap();
-    assert!(push_result.ok(), "push failed: {}", push_result.err);
-    assert!(push_result.out.contains("Staged"));
-
-    // Verify queue on router directly (no queue subcommand in split engines)
-    {
-        let router = kernel.drift().read().await;
-        let queue = router.queue();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].content, "hello from e2e test");
-    }
-
-    // Flush and verify injection
-    let flush_result = kaish.execute("drift_flush").await.unwrap();
-    assert!(flush_result.ok(), "flush failed: {}", flush_result.err);
-    assert!(flush_result.out.contains("Flushed 1 drifts"));
-
-    // Verify block was injected into target document
-    let blocks = documents.block_snapshots(target_ctx_id).unwrap();
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].kind, kaijutsu_crdt::BlockKind::Drift);
-    assert_eq!(blocks[0].content, "hello from e2e test");
-}
-
-// ============================================================================
-// Tier 3: Shell command e2e through EmbeddedKaish
+// Shell command e2e through EmbeddedKaish
 // ============================================================================
 
 /// Test filesystem fixture rooted in a tempdir.

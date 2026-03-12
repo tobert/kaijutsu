@@ -31,8 +31,6 @@ use kaijutsu_kernel::{
     // Block tools
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
-    // Drift engines (split)
-    DriftLsEngine, DriftPushEngine, DriftPullEngine, DriftFlushEngine, DriftMergeEngine,
     // File tools
     FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
     // MCP
@@ -136,29 +134,6 @@ async fn register_block_tools(
     kernel.register_tool_with_engine(
         ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
         Arc::new(KernelSearchEngine::new(documents.clone())),
-    ).await;
-
-    // ── Drift tools (split into individual engines) ──
-    // context_id removed from constructors — engines now read it from ToolContext at call time
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_ls", "List all contexts in this kernel's drift router", "drift"),
-        Arc::new(DriftLsEngine::new(kernel)),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_push", "Stage content for transfer to another context", "drift"),
-        Arc::new(DriftPushEngine::new(kernel, documents.clone())),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_pull", "Read and LLM-summarize another context's conversation", "drift"),
-        Arc::new(DriftPullEngine::new(kernel, documents.clone())),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_flush", "Deliver all staged drifts to target documents", "drift"),
-        Arc::new(DriftFlushEngine::new(kernel, documents.clone())),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("drift_merge", "Summarize a forked context back into its parent", "drift"),
-        Arc::new(DriftMergeEngine::new(kernel, documents.clone())),
     ).await;
 
     // ── File tools (CRDT-backed) ──
