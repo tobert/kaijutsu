@@ -30,24 +30,7 @@ impl KjDispatcher {
     }
 
     fn workspace_help(&self) -> String {
-        "\
-kj workspace — workspace management
-
-USAGE:
-    kj workspace <subcommand> [args...]
-
-SUBCOMMANDS:
-    list                    List active workspaces
-    show <label>            Show workspace details and paths
-    create <label> [flags]  Create a workspace
-    add <label> <path> [--mount m] [--read-only]  Add a path to a workspace
-    bind <label> [ctx]      Bind a workspace to a context
-    remove <label>          Archive a workspace (latched)
-
-CREATE FLAGS:
-    --desc <text>           Description
-    --path <p>              Add path(s) (repeatable)"
-            .to_string()
+        include_str!("../../docs/help/kj-workspace.md").to_string()
     }
 
     fn workspace_list(&self) -> KjResult {

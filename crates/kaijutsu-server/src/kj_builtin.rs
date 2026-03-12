@@ -61,8 +61,19 @@ impl Tool for KjBuiltin {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new("kj", "Kernel command interface — context, fork, drift, preset, workspace management")
-            .param(ParamSchema::required("subcommand", "string", "Command: context, fork, drift, preset, workspace"))
+        ToolSchema::new("kj", "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
+            .param(ParamSchema::required("subcommand", "string", "Command and arguments (e.g. 'drift push main \"finding\"')"))
+            .example("Discover commands", "kj help")
+            .example("View context topology", "kj context list --tree")
+            .example("Create isolated workspace", "kj fork --name debug-auth")
+            .example("Navigate to context", "kj context switch debug-auth")
+            .example("Stage finding for another context", "kj drift push main \"auth tokens are stored in Redis\"")
+            .example("Deliver all staged drifts", "kj drift flush")
+            .example("LLM-distill another context's work", "kj drift pull main \"what changed in auth?\"")
+            .example("Distill from parent context", "kj drift pull .parent \"summarize findings\"")
+            .example("Merge fork back to parent", "kj drift merge")
+            .example("Set model on current context", "kj context set . --model anthropic:claude-sonnet-4-5-20250929")
+            .example("Learn drift workflows", "kj drift help")
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut ExecContext) -> ExecResult {

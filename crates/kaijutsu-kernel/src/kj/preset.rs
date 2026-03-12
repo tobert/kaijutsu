@@ -28,25 +28,7 @@ impl KjDispatcher {
     }
 
     fn preset_help(&self) -> String {
-        "\
-kj preset — preset templates
-
-USAGE:
-    kj preset <subcommand> [args...]
-
-SUBCOMMANDS:
-    list                    List all presets
-    show <label>            Show preset details
-    save <label> [flags]    Create or update a preset
-    remove <label>          Delete a preset (latched)
-
-SAVE FLAGS:
-    --model <p/m>           Provider/model
-    --system-prompt <text>  System prompt
-    --tool-filter <spec>    Tool filter (all, allow:x,y, deny:x,y)
-    --consent <mode>        Consent mode (collaborative, autonomous)
-    --desc <text>           Description"
-            .to_string()
+        include_str!("../../docs/help/kj-preset.md").to_string()
     }
 
     fn preset_list(&self) -> KjResult {

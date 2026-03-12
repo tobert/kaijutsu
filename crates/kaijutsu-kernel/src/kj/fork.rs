@@ -29,24 +29,7 @@ impl KjDispatcher {
     }
 
     fn fork_help(&self) -> String {
-        "\
-kj fork — fork the current context
-
-USAGE:
-    kj fork [--name <label>] [--prompt \"...\"] [--preset <label>]
-    kj fork --shallow [--depth N] [--name <label>]
-    kj fork --as <template> --name <label>
-    kj fork --compact [--name <label>]
-
-OPTIONS:
-    --name, -n <label>    Label for the new context
-    --prompt \"...\"        Inject a drift block with a fork note
-    --preset <label>      Apply a preset after forking
-    --shallow             Shallow fork (recent blocks only)
-    --depth N             Block depth for shallow fork (default: 50)
-    --as <template>       Subtree fork: copy tree shape from template
-    --compact             LLM-summarized fork (distills source via LLM)"
-            .to_string()
+        include_str!("../../docs/help/kj-fork.md").to_string()
     }
 
     async fn fork_full(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -613,7 +596,7 @@ mod tests {
         let c = test_caller();
         let result = d.dispatch(&[s("fork"), s("help")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("USAGE"));
+        assert!(result.message().contains("## Fork Kinds"));
     }
 
     #[tokio::test]

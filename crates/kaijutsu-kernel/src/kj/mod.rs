@@ -139,20 +139,7 @@ impl KjDispatcher {
     }
 
     fn help(&self) -> String {
-        "\
-kj — kernel command interface
-
-USAGE:
-    kj <command> [args...]
-
-COMMANDS:
-    context (ctx)   Context management (list, info, switch, create, set, log, move, archive, remove, retag)
-    fork            Fork the current context (full, shallow, subtree, preset)
-    drift           Cross-context communication (push, pull, merge, flush, queue, cancel, history)
-    preset          Preset templates (list, show, save, remove)
-    workspace (ws)  Workspace management (list, show, create, add, bind, remove)
-    help            Show this help"
-            .to_string()
+        include_str!("../../docs/help/kj.md").to_string()
     }
 
     // Accessors for subcommand modules

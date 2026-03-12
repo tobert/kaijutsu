@@ -36,24 +36,7 @@ impl KjDispatcher {
     }
 
     fn context_help(&self) -> String {
-        "\
-kj context — context management
-
-USAGE:
-    kj context <subcommand> [args...]
-
-SUBCOMMANDS:
-    list [--tree]           List contexts (flat or tree view)
-    info [<ctx>]            Show context details (default: current)
-    switch <ctx>            Switch to a different context
-    create <label> [--parent <ctx>]  Create a new context
-    set <ctx> [flags]       Update context settings
-    log [<ctx>]             Show fork lineage
-    move <ctx> <new-parent> Reparent a context
-    archive <ctx>           Soft-delete a context (latched)
-    remove <ctx>            Permanently delete a context (latched)
-    retag <label> <ctx>     Move a label to a different context (latched)"
-            .to_string()
+        include_str!("../../docs/help/kj-context.md").to_string()
     }
 
     async fn context_list(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -749,7 +732,7 @@ mod tests {
         let c = test_caller();
         let result = d.dispatch(&[s("context"), s("help")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("SUBCOMMANDS"));
+        assert!(result.message().contains("## Subcommands"));
     }
 
     #[tokio::test]

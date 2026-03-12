@@ -31,21 +31,7 @@ impl KjDispatcher {
     }
 
     fn drift_help(&self) -> String {
-        "\
-kj drift — cross-context communication
-
-USAGE:
-    kj drift <subcommand> [args...]
-
-SUBCOMMANDS:
-    push <dst> [content]    Stage content for target context
-    pull <src> [prompt]     Pull + distill from source context via LLM
-    merge [ctx]             Summarize this fork back into parent via LLM
-    flush                   Deliver all staged drifts
-    queue                   Show staging queue
-    cancel <id>             Remove a staged drift by ID
-    history [ctx]           Show drift history for a context"
-            .to_string()
+        include_str!("../../docs/help/kj-drift.md").to_string()
     }
 
     async fn drift_push(&self, argv: &[String], caller: &KjCaller) -> KjResult {
