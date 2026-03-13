@@ -198,10 +198,33 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj workspace bind: {e}")),
         };
 
-        match db.update_workspace(target_id, Some(ws.workspace_id)) {
-            Ok(()) => KjResult::Ok(format!("bound workspace '{}' to context {}", label, target_id.short())),
-            Err(e) => KjResult::Err(format!("kj workspace bind: {e}")),
+        if let Err(e) = db.update_workspace(target_id, Some(ws.workspace_id)) {
+            return KjResult::Err(format!("kj workspace bind: {e}"));
         }
+
+        // Set cwd to workspace's first rw path if context has no cwd yet
+        let has_cwd = db.get_context_shell(target_id).ok()
+            .flatten()
+            .and_then(|s| s.cwd)
+            .is_some();
+
+        if !has_cwd {
+            if let Ok(paths) = db.list_workspace_paths(ws.workspace_id) {
+                if let Some(first_rw) = paths.iter().find(|p| !p.read_only) {
+                    let shell = crate::kernel_db::ContextShellRow {
+                        context_id: target_id,
+                        cwd: Some(first_rw.path.clone()),
+                        init_script: None,
+                        updated_at: kaijutsu_types::now_millis() as i64,
+                    };
+                    if let Err(e) = db.upsert_context_shell(&shell) {
+                        tracing::warn!("failed to set cwd on workspace bind: {e}");
+                    }
+                }
+            }
+        }
+
+        KjResult::Ok(format!("bound workspace '{}' to context {}", label, target_id.short()))
     }
 
     /// `kj workspace remove <label>` — archive a workspace (latched).

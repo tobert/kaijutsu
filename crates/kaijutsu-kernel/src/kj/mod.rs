@@ -151,7 +151,7 @@ impl KjDispatcher {
         &self.blocks
     }
 
-    pub(crate) fn kernel_db(&self) -> &Arc<std::sync::Mutex<KernelDb>> {
+    pub fn kernel_db(&self) -> &Arc<std::sync::Mutex<KernelDb>> {
         &self.kernel_db
     }
 

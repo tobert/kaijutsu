@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use kaijutsu_types::{ConsentMode, ContextId, EdgeKind, ForkKind};
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow};
+use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
 use super::parse::{extract_named_arg, has_flag};
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -42,6 +42,9 @@ impl KjDispatcher {
         // Parse --preset
         let preset_label = extract_named_arg(argv, &["--preset"]);
 
+        // Parse --pwd (override cwd on forked context)
+        let pwd_override = extract_named_arg(argv, &["--pwd"]);
+
         let source_id = caller.context_id;
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
@@ -54,6 +57,12 @@ impl KjDispatcher {
         // Write-through: KernelDb then DriftRouter
         {
             let db = self.kernel_db().lock().unwrap();
+
+            // Inherit workspace from source
+            let source_ws = db.get_context(source_id).ok()
+                .flatten()
+                .and_then(|r| r.workspace_id);
+
             let row = ContextRow {
                 context_id: new_id,
                 kernel_id,
@@ -68,11 +77,31 @@ impl KjDispatcher {
                 forked_from: Some(source_id),
                 fork_kind: Some(ForkKind::Full),
                 archived_at: None,
-                workspace_id: None,
+                workspace_id: source_ws,
                 preset_id: None,
             };
             if let Err(e) = db.insert_context(&row) {
                 return KjResult::Err(format!("kj fork: {e}"));
+            }
+
+            // Copy shell config + env vars from source
+            if let Err(e) = db.fork_context_config(source_id, new_id) {
+                tracing::warn!("failed to copy context config on fork: {e}");
+            }
+
+            // Apply --pwd override
+            if let Some(ref pwd) = pwd_override {
+                let shell = ContextShellRow {
+                    context_id: new_id,
+                    cwd: Some(pwd.clone()),
+                    init_script: db.get_context_shell(source_id).ok()
+                        .flatten()
+                        .and_then(|s| s.init_script),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                };
+                if let Err(e) = db.upsert_context_shell(&shell) {
+                    tracing::warn!("failed to set --pwd on fork: {e}");
+                }
             }
 
             // Structural edge: source → new
@@ -120,6 +149,7 @@ impl KjDispatcher {
         let label = extract_named_arg(argv, &["--name", "-n"]);
         let prompt = extract_named_arg(argv, &["--prompt"]);
         let preset_label = extract_named_arg(argv, &["--preset"]);
+        let pwd_override = extract_named_arg(argv, &["--pwd"]);
         let depth: usize = extract_named_arg(argv, &["--depth"])
             .and_then(|d| d.parse().ok())
             .unwrap_or(50);
@@ -146,6 +176,11 @@ impl KjDispatcher {
         // Write-through
         {
             let db = self.kernel_db().lock().unwrap();
+
+            let source_ws = db.get_context(source_id).ok()
+                .flatten()
+                .and_then(|r| r.workspace_id);
+
             let row = ContextRow {
                 context_id: new_id,
                 kernel_id,
@@ -160,11 +195,29 @@ impl KjDispatcher {
                 forked_from: Some(source_id),
                 fork_kind: Some(ForkKind::Shallow),
                 archived_at: None,
-                workspace_id: None,
+                workspace_id: source_ws,
                 preset_id: None,
             };
             if let Err(e) = db.insert_context(&row) {
                 return KjResult::Err(format!("kj fork --shallow: {e}"));
+            }
+
+            if let Err(e) = db.fork_context_config(source_id, new_id) {
+                tracing::warn!("failed to copy context config on shallow fork: {e}");
+            }
+
+            if let Some(ref pwd) = pwd_override {
+                let shell = ContextShellRow {
+                    context_id: new_id,
+                    cwd: Some(pwd.clone()),
+                    init_script: db.get_context_shell(source_id).ok()
+                        .flatten()
+                        .and_then(|s| s.init_script),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                };
+                if let Err(e) = db.upsert_context_shell(&shell) {
+                    tracing::warn!("failed to set --pwd on shallow fork: {e}");
+                }
             }
 
             let edge = ContextEdgeRow {
@@ -205,6 +258,7 @@ impl KjDispatcher {
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let label = extract_named_arg(argv, &["--name", "-n"]);
         let prompt = extract_named_arg(argv, &["--prompt"]);
+        let pwd_override = extract_named_arg(argv, &["--pwd"]);
 
         let source_id = caller.context_id;
         let new_id = ContextId::new();
@@ -254,6 +308,11 @@ impl KjDispatcher {
         // Write-through: KernelDb then DriftRouter
         {
             let db = self.kernel_db().lock().unwrap();
+
+            let source_ws = db.get_context(source_id).ok()
+                .flatten()
+                .and_then(|r| r.workspace_id);
+
             let row = ContextRow {
                 context_id: new_id,
                 kernel_id,
@@ -268,11 +327,29 @@ impl KjDispatcher {
                 forked_from: Some(source_id),
                 fork_kind: Some(ForkKind::Compact),
                 archived_at: None,
-                workspace_id: None,
+                workspace_id: source_ws,
                 preset_id: None,
             };
             if let Err(e) = db.insert_context(&row) {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
+            }
+
+            if let Err(e) = db.fork_context_config(source_id, new_id) {
+                tracing::warn!("failed to copy context config on compact fork: {e}");
+            }
+
+            if let Some(ref pwd) = pwd_override {
+                let shell = ContextShellRow {
+                    context_id: new_id,
+                    cwd: Some(pwd.clone()),
+                    init_script: db.get_context_shell(source_id).ok()
+                        .flatten()
+                        .and_then(|s| s.init_script),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                };
+                if let Err(e) = db.upsert_context_shell(&shell) {
+                    tracing::warn!("failed to set --pwd on compact fork: {e}");
+                }
             }
 
             let edge = ContextEdgeRow {
@@ -379,6 +456,11 @@ impl KjDispatcher {
                 };
                 if let Err(e) = db.insert_context(&new_row) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
+                }
+
+                // Copy shell config + env vars from template context
+                if let Err(e) = db.fork_context_config(row.context_id, new_id) {
+                    tracing::warn!("failed to copy context config for subtree fork: {e}");
                 }
 
                 // Create empty document for each new context
@@ -614,5 +696,107 @@ mod tests {
         let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("compacted")], &c).await;
         assert!(!result.is_ok(), "should fail on empty source: {}", result.message());
         assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_config() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Set shell config and env on source
+        {
+            let db = d.kernel_db().lock().unwrap();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: source,
+                cwd: Some("/home/user/project".into()),
+                init_script: None,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            }).unwrap();
+            db.set_context_env(source, "RUST_LOG", "debug").unwrap();
+            db.set_context_env(source, "EDITOR", "vim").unwrap();
+        }
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // Find the new context and verify config was copied
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
+        let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
+        assert_eq!(shell.cwd, Some("/home/user/project".into()));
+        let env = db.get_context_env(child.context_id).unwrap();
+        assert_eq!(env.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fork_pwd_override() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Set cwd on source
+        {
+            let db = d.kernel_db().lock().unwrap();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: source,
+                cwd: Some("/home/user/project".into()),
+                init_script: None,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            }).unwrap();
+        }
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(
+            &[s("fork"), s("--name"), s("research"), s("--pwd"), s("/home/user/src/bevy_vello")],
+            &c,
+        ).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "research").unwrap().unwrap();
+        let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
+        assert_eq!(shell.cwd, Some("/home/user/src/bevy_vello".into()));
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_workspace() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Bind a workspace to source
+        let ws_id = kaijutsu_types::WorkspaceId::new();
+        {
+            let db = d.kernel_db().lock().unwrap();
+            db.insert_workspace(&crate::kernel_db::WorkspaceRow {
+                workspace_id: ws_id,
+                kernel_id: d.kernel_id(),
+                label: "test-ws".into(),
+                description: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: principal,
+                archived_at: None,
+            }).unwrap();
+            db.update_workspace(source, Some(ws_id)).unwrap();
+        }
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
+        assert_eq!(child.workspace_id, Some(ws_id));
     }
 }

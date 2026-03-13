@@ -2,7 +2,7 @@
 
 use kaijutsu_types::{ConsentMode, ContextId, EdgeKind};
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow};
+use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
 use super::format::{format_context_info, format_context_table, format_context_tree, format_fork_lineage};
 use super::parse::{extract_named_arg, parse_model_spec, parse_tool_filter_spec};
@@ -21,6 +21,7 @@ impl KjDispatcher {
             "switch" | "sw" => self.context_switch(argv, caller).await,
             "create" | "new" => self.context_create(argv, caller).await,
             "set" => self.context_set(argv, caller).await,
+            "unset" => self.context_unset(argv, caller),
             "log" => self.context_log(argv, caller),
             "move" | "mv" => self.context_move(argv, caller).await,
             "archive" => self.context_archive(argv, caller).await,
@@ -91,12 +92,51 @@ impl KjDispatcher {
             .unwrap_or(0);
 
         let is_current = target_id == caller.context_id;
-        KjResult::Ok(format_context_info(
+        let mut info = format_context_info(
             &row,
             children_count,
             drift_from + drift_to,
             is_current,
-        ))
+        );
+
+        // Shell config
+        if let Ok(Some(shell)) = db.get_context_shell(target_id) {
+            if let Some(cwd) = &shell.cwd {
+                info.push_str(&format!("\nCwd:     {cwd}"));
+            }
+            if let Some(init) = &shell.init_script {
+                let preview = if init.len() > 60 { &init[..60] } else { init };
+                info.push_str(&format!("\nInit:    {preview}..."));
+            }
+        }
+
+        // Env vars
+        if let Ok(vars) = db.get_context_env(target_id) {
+            if !vars.is_empty() {
+                info.push_str("\nEnv:");
+                for v in &vars {
+                    info.push_str(&format!("\n  {}={}", v.key, v.value));
+                }
+            }
+        }
+
+        // Workspace paths
+        if let Ok(Some(paths)) = db.context_workspace_paths(target_id) {
+            if !paths.is_empty() {
+                // Get workspace label
+                let ws_label = row.workspace_id
+                    .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
+                    .map(|ws| ws.label)
+                    .unwrap_or_else(|| "?".into());
+                info.push_str(&format!("\nWorkspace: {ws_label}"));
+                for p in &paths {
+                    let ro = if p.read_only { " (ro)" } else { "" };
+                    info.push_str(&format!("\n  {}{ro}", p.path));
+                }
+            }
+        }
+
+        KjResult::Ok(info)
     }
 
     async fn context_switch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -212,7 +252,7 @@ impl KjDispatcher {
         KjResult::Ok(format!("created context '{}' ({})", label, new_id.short()))
     }
 
-    /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode]`
+    /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--cwd path] [--env KEY=VALUE]`
     async fn context_set(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let kernel_id = self.kernel_id();
 
@@ -224,6 +264,8 @@ impl KjDispatcher {
         let system_prompt = extract_named_arg(argv, &["--system-prompt"]);
         let tool_filter_spec = extract_named_arg(argv, &["--tool-filter"]);
         let consent_spec = extract_named_arg(argv, &["--consent"]);
+        let cwd_spec = extract_named_arg(argv, &["--cwd"]);
+        let env_spec = extract_named_arg(argv, &["--env"]);
 
         // Resolve target + apply DB changes (lock scope)
         let (target_id, changes, tool_filter_for_drift, model_for_drift) = {
@@ -296,6 +338,33 @@ impl KjDispatcher {
                 }
             }
 
+            // Update cwd
+            if let Some(ref cwd) = cwd_spec {
+                let existing = db.get_context_shell(target_id).ok().flatten();
+                let shell = ContextShellRow {
+                    context_id: target_id,
+                    cwd: Some(cwd.clone()),
+                    init_script: existing.and_then(|s| s.init_script),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                };
+                if let Err(e) = db.upsert_context_shell(&shell) {
+                    return KjResult::Err(format!("kj context set: {e}"));
+                }
+                changes.push(format!("cwd={cwd}"));
+            }
+
+            // Update env var (KEY=VALUE)
+            if let Some(ref env) = env_spec {
+                if let Some((key, value)) = env.split_once('=') {
+                    if let Err(e) = db.set_context_env(target_id, key, value) {
+                        return KjResult::Err(format!("kj context set: {e}"));
+                    }
+                    changes.push(format!("env {key}={value}"));
+                } else {
+                    return KjResult::Err("kj context set: --env requires KEY=VALUE format".to_string());
+                }
+            }
+
             (target_id, changes, tool_filter_for_drift, model_for_drift)
         };
         // db lock released here
@@ -316,6 +385,32 @@ impl KjDispatcher {
         }
 
         KjResult::Ok(format!("updated: {}", changes.join(", ")))
+    }
+
+    /// `kj context unset [<ctx>] --env KEY` — remove an env var from a context.
+    fn context_unset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        let kernel_id = self.kernel_id();
+
+        let target_arg = argv.get(1)
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str());
+        let env_key = extract_named_arg(argv, &["--env"]);
+
+        let db = self.kernel_db().lock().unwrap();
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj context unset: {e}")),
+        };
+
+        if let Some(key) = env_key {
+            match db.delete_context_env(target_id, &key) {
+                Ok(true) => KjResult::Ok(format!("unset env {key}")),
+                Ok(false) => KjResult::Err(format!("kj context unset: env var '{}' not set", key)),
+                Err(e) => KjResult::Err(format!("kj context unset: {e}")),
+            }
+        } else {
+            KjResult::Err("kj context unset: requires --env KEY".to_string())
+        }
     }
 
     /// `kj context log [<ctx>]` — show fork lineage from context up to root.
@@ -886,5 +981,123 @@ mod tests {
             .dispatch(&[s("context"), s("remove"), s("current")], &c)
             .await;
         assert!(!result.is_ok(), "should not allow removing current context");
+    }
+
+    #[tokio::test]
+    async fn context_set_cwd() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/tmp/work")], &c)
+            .await;
+        assert!(result.is_ok(), "set --cwd failed: {}", result.message());
+        assert!(result.message().contains("cwd="), "msg: {}", result.message());
+
+        let db = d.kernel_db().lock().unwrap();
+        let shell = db.get_context_shell(ctx).unwrap().unwrap();
+        assert_eq!(shell.cwd, Some("/tmp/work".into()));
+    }
+
+    #[tokio::test]
+    async fn context_set_env() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("."), s("--env"), s("RUST_LOG=debug")], &c)
+            .await;
+        assert!(result.is_ok(), "set --env failed: {}", result.message());
+        assert!(result.message().contains("env RUST_LOG=debug"), "msg: {}", result.message());
+
+        let db = d.kernel_db().lock().unwrap();
+        let env = db.get_context_env(ctx).unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].key, "RUST_LOG");
+        assert_eq!(env[0].value, "debug");
+    }
+
+    #[tokio::test]
+    async fn context_set_env_bad_format() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("."), s("--env"), s("NOEQUALS")], &c)
+            .await;
+        assert!(!result.is_ok(), "should fail without =: {}", result.message());
+        assert!(result.message().contains("KEY=VALUE"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn context_unset_env() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        // Set env var first
+        {
+            let db = d.kernel_db().lock().unwrap();
+            db.set_context_env(ctx, "FOO", "bar").unwrap();
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("unset"), s("."), s("--env"), s("FOO")], &c)
+            .await;
+        assert!(result.is_ok(), "unset failed: {}", result.message());
+        assert!(result.message().contains("unset env FOO"), "msg: {}", result.message());
+
+        // Verify it's gone
+        let db = d.kernel_db().lock().unwrap();
+        let env = db.get_context_env(ctx).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_unset_env_missing() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("unset"), s("."), s("--env"), s("NOPE")], &c)
+            .await;
+        assert!(!result.is_ok(), "should error for missing var: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn context_info_shows_shell_config() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("enriched"), None, principal).await;
+
+        // Set shell config and env
+        {
+            let db = d.kernel_db().lock().unwrap();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: ctx,
+                cwd: Some("/home/user/project".into()),
+                init_script: None,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            }).unwrap();
+            db.set_context_env(ctx, "RUST_LOG", "debug").unwrap();
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        let msg = result.message();
+        assert!(msg.contains("Cwd:"), "should show cwd: {msg}");
+        assert!(msg.contains("/home/user/project"), "should show cwd path: {msg}");
+        assert!(msg.contains("Env:"), "should show env: {msg}");
+        assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
     }
 }

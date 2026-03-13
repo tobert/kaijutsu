@@ -52,6 +52,30 @@ impl KjBuiltin {
     fn set_context_id(&self, id: ContextId) {
         *self.shared_context_id.write().expect("context_id lock poisoned") = id;
     }
+
+    /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
+    fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
+        let db = self.dispatcher.kernel_db().lock().unwrap();
+
+        // Apply cwd
+        if let Ok(Some(shell)) = db.get_context_shell(context_id) {
+            if let Some(cwd) = shell.cwd {
+                let path = std::path::PathBuf::from(&cwd);
+                if path.is_dir() {
+                    ctx.set_cwd(path);
+                } else {
+                    tracing::warn!("context cwd '{}' is not a directory, skipping", cwd);
+                }
+            }
+        }
+
+        // Apply env vars (exported so they propagate to child processes)
+        if let Ok(vars) = db.get_context_env(context_id) {
+            for var in &vars {
+                ctx.scope.set_exported(&var.key, Value::String(var.value.clone()));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -158,6 +182,10 @@ impl Tool for KjBuiltin {
             KjResult::Switch(new_id, msg) => {
                 // Side-effect: update the shared context ID
                 self.set_context_id(new_id);
+
+                // Apply context shell config (cwd + env vars)
+                self.apply_context_config(new_id, ctx);
+
                 ExecResult::success(msg)
             }
             KjResult::Latch { command, target, message } => {
