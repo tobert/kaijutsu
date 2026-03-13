@@ -10,7 +10,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use rusqlite::{params, Connection, Result as SqliteResult};
-use tracing::warn;
+use tracing::{info, warn};
 
 use kaijutsu_types::{
     ConsentMode, ContextId, EdgeKind, ForkKind, KernelId, PresetId, PrincipalId, ToolFilter,
@@ -257,6 +257,11 @@ CREATE TABLE IF NOT EXISTS context_env (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
+
+CREATE TABLE IF NOT EXISTS kernel (
+    kernel_id  BLOB NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
 "#;
 
 // ============================================================================
@@ -496,6 +501,78 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    // ========================================================================
+    // Kernel identity
+    // ========================================================================
+
+    /// Get the persisted kernel ID, or create one if this is the first run.
+    ///
+    /// The kernel table holds a single row. On first open it's empty and we
+    /// insert a fresh KernelId. On subsequent startups we return the existing
+    /// one so that context rows (which reference kernel_id) remain joinable.
+    ///
+    /// **Migration:** If the kernel table is empty but contexts already exist
+    /// (pre-stable-ID era), adopts the most recent context's kernel_id so
+    /// existing context rows remain joinable without data loss.
+    pub fn get_or_create_kernel_id(&self) -> KernelDbResult<KernelId> {
+        let existing: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT kernel_id FROM kernel LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        if let Some(bytes) = existing {
+            if let Some(id) = KernelId::try_from_slice(&bytes) {
+                return Ok(id);
+            }
+            // Corrupt row — fall through to create fresh
+            warn!("Corrupt kernel_id in kernel table, creating fresh");
+        }
+
+        // No kernel row yet. Check if contexts exist from a previous run
+        // (before the kernel table was added) and adopt their kernel_id.
+        let adopted: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT kernel_id FROM contexts ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        let id = if let Some(bytes) = adopted {
+            if let Some(kid) = KernelId::try_from_slice(&bytes) {
+                info!("Adopted kernel_id {} from existing contexts", kid.to_hex());
+                kid
+            } else {
+                KernelId::new()
+            }
+        } else {
+            KernelId::new()
+        };
+
+        self.conn.execute(
+            "INSERT INTO kernel (kernel_id) VALUES (?1)",
+            params![blob_param(id.as_bytes())],
+        )?;
+
+        // Warn if contexts reference multiple kernel_ids — needs manual cleanup
+        let distinct_count: u32 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT kernel_id) FROM contexts",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if distinct_count > 1 {
+            warn!(
+                "contexts table has {} distinct kernel_ids — run \
+                 UPDATE contexts SET kernel_id = X'{}' WHERE kernel_id != X'{}' \
+                 to consolidate",
+                distinct_count,
+                id.to_hex(),
+                id.to_hex(),
+            );
+        }
+
+        Ok(id)
     }
 
     // ========================================================================
@@ -2788,5 +2865,39 @@ mod tests {
 
         let paths = db.context_workspace_paths(ctx.context_id).unwrap();
         assert!(paths.is_none());
+    }
+
+    #[test]
+    fn get_or_create_kernel_id_stable_across_calls() {
+        let db = KernelDb::in_memory().unwrap();
+        let id1 = db.get_or_create_kernel_id().unwrap();
+        let id2 = db.get_or_create_kernel_id().unwrap();
+        assert_eq!(id1, id2, "should return same ID on second call");
+    }
+
+    #[test]
+    fn get_or_create_kernel_id_fresh_on_empty_db() {
+        let db = KernelDb::in_memory().unwrap();
+        let id = db.get_or_create_kernel_id().unwrap();
+        // Should be a valid UUIDv7 (non-zero)
+        assert_ne!(id.as_bytes(), &[0u8; 16]);
+    }
+
+    #[test]
+    fn get_or_create_kernel_id_adopts_from_existing_contexts() {
+        let db = KernelDb::in_memory().unwrap();
+
+        // Simulate pre-stable-ID era: contexts exist with an old kernel_id
+        let old_kid = KernelId::new();
+        let ctx = make_context_row(old_kid, Some("legacy"));
+        db.insert_context(&ctx).unwrap();
+
+        // kernel table is empty — should adopt the context's kernel_id
+        let id = db.get_or_create_kernel_id().unwrap();
+        assert_eq!(id, old_kid, "should adopt kernel_id from existing contexts");
+
+        // Subsequent call returns the same
+        let id2 = db.get_or_create_kernel_id().unwrap();
+        assert_eq!(id2, old_kid);
     }
 }

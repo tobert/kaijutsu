@@ -668,8 +668,43 @@ pub async fn create_shared_kernel(
     let config_flows = shared_config_flow_bus(256);
     let input_flows = shared_input_doc_flow_bus(256);
 
-    // Generate kernel ID (session marker — fresh each restart)
-    let id = KernelId::new();
+    // Resolve stable data directory (used for block store DB, kernel DB, semantic index)
+    let resolved_data_dir = match data_dir {
+        Some(dir) => {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                log::warn!("Failed to create data dir {:?}: {}", dir, e);
+            }
+            dir.to_path_buf()
+        }
+        None => kernel_data_dir(),
+    };
+
+    // Open KernelDb first — it owns the stable kernel ID
+    let kernel_db = {
+        let db_path = resolved_data_dir.join("kernel.db");
+        match KernelDb::open(&db_path) {
+            Ok(db) => {
+                log::info!("Opened KernelDb at {}", db_path.display());
+                db
+            }
+            Err(e) => {
+                log::error!("Failed to open KernelDb at {}: {}", db_path.display(), e);
+                KernelDb::in_memory().expect("in-memory KernelDb should never fail")
+            }
+        }
+    };
+
+    // Get stable kernel ID (persisted across restarts so context rows stay joinable)
+    let id = match kernel_db.get_or_create_kernel_id() {
+        Ok(kid) => {
+            log::info!("Kernel ID: {} (from kernel table)", kid.to_hex());
+            kid
+        }
+        Err(e) => {
+            log::error!("Failed to get/create kernel ID: {}, using ephemeral", e);
+            KernelId::new()
+        }
+    };
     let id_str = id.to_hex();
 
     // Create the kaijutsu kernel with shared FlowBus
@@ -688,17 +723,6 @@ pub async fn create_shared_kernel(
     // Read-write /tmp for scratch/interop with external tools
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
-    // Resolve stable data directory (used for block store DB + semantic index)
-    let resolved_data_dir = match data_dir {
-        Some(dir) => {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                log::warn!("Failed to create data dir {:?}: {}", dir, e);
-            }
-            dir.to_path_buf()
-        }
-        None => kernel_data_dir(),
-    };
-
     // Create block store with database persistence and shared FlowBus
     let block_flows_for_index = block_flows.clone();
     let documents = create_block_store_with_db(
@@ -713,21 +737,6 @@ pub async fn create_shared_kernel(
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
     register_block_tools(&kernel_arc, documents.clone()).await;
-
-    // Open KernelDb for context metadata persistence
-    let kernel_db = {
-        let db_path = resolved_data_dir.join("kernel.db");
-        match KernelDb::open(&db_path) {
-            Ok(db) => {
-                log::info!("Opened KernelDb at {}", db_path.display());
-                db
-            }
-            Err(e) => {
-                log::error!("Failed to open KernelDb at {}: {}", db_path.display(), e);
-                KernelDb::in_memory().expect("in-memory KernelDb should never fail")
-            }
-        }
-    };
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     {
