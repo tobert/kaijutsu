@@ -151,22 +151,29 @@ impl Kernel {
     }
 
     /// Mount a filesystem at the given path.
-    pub async fn mount(&self, path: impl Into<std::path::PathBuf>, fs: impl VfsOps + 'static) {
-        self.vfs.mount(path, fs).await;
+    /// Returns false if the mount table is frozen.
+    pub async fn mount(&self, path: impl Into<std::path::PathBuf>, fs: impl VfsOps + 'static) -> bool {
+        self.vfs.mount(path, fs).await
     }
 
     /// Mount a filesystem (already wrapped in Arc) at the given path.
+    /// Returns false if the mount table is frozen.
     pub async fn mount_arc(
         &self,
         path: impl Into<std::path::PathBuf>,
         fs: Arc<dyn VfsOps>,
-    ) {
-        self.vfs.mount_arc(path, fs).await;
+    ) -> bool {
+        self.vfs.mount_arc(path, fs).await
     }
 
     /// Unmount a filesystem.
     pub async fn unmount(&self, path: impl AsRef<Path>) -> bool {
         self.vfs.unmount(path).await
+    }
+
+    /// Freeze the mount table — no more mount/unmount after this.
+    pub fn freeze_mounts(&self) {
+        self.vfs.freeze();
     }
 
     /// List all mounts.

@@ -1586,6 +1586,47 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Workspace Permission Checking
+    // ========================================================================
+
+    /// Check whether a path is allowed by a context's workspace.
+    ///
+    /// Returns `None` if the context has no workspace (unbound = kernel perimeter
+    /// defaults, no restriction). Returns `Some(read_only)` if the path falls
+    /// under a workspace path. Returns an error if the path is outside all
+    /// workspace paths (bound context, path not in scope).
+    pub fn check_workspace_path(
+        &self,
+        context_id: ContextId,
+        path: &str,
+    ) -> KernelDbResult<Option<bool>> {
+        let ws_paths = match self.context_workspace_paths(context_id)? {
+            None => return Ok(None), // unbound context — no workspace restriction
+            Some(paths) => paths,
+        };
+
+        // Find longest-prefix match among workspace paths
+        let mut best: Option<&WorkspacePathRow> = None;
+        for wp in &ws_paths {
+            if path == wp.path || path.starts_with(&format!("{}/", wp.path)) {
+                match best {
+                    None => best = Some(wp),
+                    Some(prev) if wp.path.len() > prev.path.len() => best = Some(wp),
+                    _ => {}
+                }
+            }
+        }
+
+        match best {
+            Some(wp) => Ok(Some(wp.read_only)),
+            None => Err(KernelDbError::Validation(format!(
+                "path '{}' is outside workspace scope",
+                path,
+            ))),
+        }
+    }
+
+    // ========================================================================
     // Phase 4A: Additional methods for kj commands
     // ========================================================================
 
@@ -2899,5 +2940,165 @@ mod tests {
         // Subsequent call returns the same
         let id2 = db.get_or_create_kernel_id().unwrap();
         assert_eq!(id2, old_kid);
+    }
+
+    // ── 28. Workspace path permission checking ────────────────────────
+
+    #[test]
+    fn check_workspace_path_unbound_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("unbound"));
+        db.insert_context(&ctx).unwrap();
+
+        // Unbound context → None (no restriction)
+        let result = db.check_workspace_path(ctx.context_id, "/anywhere").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_workspace_path_allowed_rw() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "proj".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src/kaijutsu".into(),
+            read_only: false,
+            created_at: now,
+        }).unwrap();
+
+        let mut ctx = make_context_row(kid, Some("bound"));
+        ctx.workspace_id = Some(ws.workspace_id);
+        db.insert_context(&ctx).unwrap();
+
+        // Path inside workspace rw path → Some(false)
+        let result = db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs").unwrap();
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn check_workspace_path_allowed_ro() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "proj".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/docs".into(),
+            read_only: true,
+            created_at: now,
+        }).unwrap();
+
+        let mut ctx = make_context_row(kid, Some("bound"));
+        ctx.workspace_id = Some(ws.workspace_id);
+        db.insert_context(&ctx).unwrap();
+
+        // Path inside workspace ro path → Some(true)
+        let result = db.check_workspace_path(ctx.context_id, "/home/user/docs/README.md").unwrap();
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn check_workspace_path_outside_scope() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "proj".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src/kaijutsu".into(),
+            read_only: false,
+            created_at: now,
+        }).unwrap();
+
+        let mut ctx = make_context_row(kid, Some("bound"));
+        ctx.workspace_id = Some(ws.workspace_id);
+        db.insert_context(&ctx).unwrap();
+
+        // Path outside all workspace paths → Validation error
+        let err = db.check_workspace_path(ctx.context_id, "/etc/passwd").unwrap_err();
+        assert!(matches!(err, KernelDbError::Validation(_)));
+    }
+
+    #[test]
+    fn check_workspace_path_longest_prefix() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "proj".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src".into(),
+            read_only: false,
+            created_at: now,
+        }).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src/kaijutsu/docs".into(),
+            read_only: true,
+            created_at: now,
+        }).unwrap();
+
+        let mut ctx = make_context_row(kid, Some("bound"));
+        ctx.workspace_id = Some(ws.workspace_id);
+        db.insert_context(&ctx).unwrap();
+
+        // /home/user/src/kaijutsu/src → matches /home/user/src (rw)
+        assert_eq!(
+            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs").unwrap(),
+            Some(false),
+        );
+
+        // /home/user/src/kaijutsu/docs/README.md → matches /home/user/src/kaijutsu/docs (ro, longer prefix)
+        assert_eq!(
+            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/docs/README.md").unwrap(),
+            Some(true),
+        );
     }
 }

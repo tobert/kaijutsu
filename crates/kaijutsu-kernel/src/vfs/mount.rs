@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -26,9 +27,15 @@ pub struct MountInfo {
 /// Mount points are matched by longest prefix. For example, if `/mnt` and
 /// `/mnt/project` are both mounted, a path like `/mnt/project/src/main.rs`
 /// will be routed to the `/mnt/project` mount.
+///
+/// Once `freeze()` is called, `mount()` and `unmount()` become no-ops and
+/// return `false`. This is the security perimeter: the set of paths visible
+/// to the kernel is fixed at startup and cannot be expanded at runtime.
 pub struct MountTable {
     /// Mount points, keyed by normalized path.
     mounts: RwLock<BTreeMap<PathBuf, Arc<dyn VfsOps>>>,
+    /// When true, mount()/unmount() are rejected.
+    frozen: AtomicBool,
 }
 
 impl std::fmt::Debug for MountTable {
@@ -50,30 +57,63 @@ impl MountTable {
     pub fn new() -> Self {
         Self {
             mounts: RwLock::new(BTreeMap::new()),
+            frozen: AtomicBool::new(false),
         }
+    }
+
+    /// Freeze the mount table. After this, `mount()` and `unmount()` are rejected.
+    ///
+    /// This establishes the security perimeter: the set of real paths visible
+    /// to the kernel is fixed and cannot be expanded at runtime.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Check whether the mount table is frozen.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
     }
 
     /// Mount a filesystem at the given path.
     ///
     /// The path should be absolute (start with `/`). If a filesystem is
     /// already mounted at this path, it will be replaced.
-    pub async fn mount(&self, path: impl Into<PathBuf>, fs: impl VfsOps + 'static) {
+    ///
+    /// Returns `false` if the table is frozen.
+    pub async fn mount(&self, path: impl Into<PathBuf>, fs: impl VfsOps + 'static) -> bool {
+        if self.is_frozen() {
+            tracing::warn!("mount rejected: mount table is frozen");
+            return false;
+        }
         let path = Self::normalize_mount_path(path.into());
         let mut mounts = self.mounts.write().await;
         mounts.insert(path, Arc::new(fs));
+        true
     }
 
     /// Mount a filesystem (already wrapped in Arc) at the given path.
-    pub async fn mount_arc(&self, path: impl Into<PathBuf>, fs: Arc<dyn VfsOps>) {
+    ///
+    /// Returns `false` if the table is frozen.
+    pub async fn mount_arc(&self, path: impl Into<PathBuf>, fs: Arc<dyn VfsOps>) -> bool {
+        if self.is_frozen() {
+            tracing::warn!("mount_arc rejected: mount table is frozen");
+            return false;
+        }
         let path = Self::normalize_mount_path(path.into());
         let mut mounts = self.mounts.write().await;
         mounts.insert(path, fs);
+        true
     }
 
     /// Unmount the filesystem at the given path.
     ///
-    /// Returns `true` if a mount was removed, `false` if nothing was mounted there.
+    /// Returns `true` if a mount was removed, `false` if nothing was mounted
+    /// there or the table is frozen.
     pub async fn unmount(&self, path: impl AsRef<Path>) -> bool {
+        if self.is_frozen() {
+            tracing::warn!("unmount rejected: mount table is frozen");
+            return false;
+        }
         let path = Self::normalize_mount_path(path.as_ref().to_path_buf());
         let mut mounts = self.mounts.write().await;
         mounts.remove(&path).is_some()
@@ -554,5 +594,55 @@ mod tests {
         let real = real.unwrap();
         assert!(real.is_absolute());
         assert!(real.ends_with("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_freeze_blocks_mount() {
+        let table = MountTable::new();
+        assert!(table.mount("/scratch", MemoryBackend::new()).await);
+
+        table.freeze();
+        assert!(table.is_frozen());
+
+        // mount after freeze returns false
+        assert!(!table.mount("/other", MemoryBackend::new()).await);
+
+        // original mount still works
+        let mounts = table.list_mounts().await;
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].path, PathBuf::from("/scratch"));
+    }
+
+    #[tokio::test]
+    async fn test_freeze_blocks_unmount() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        table.freeze();
+
+        // unmount after freeze returns false
+        assert!(!table.unmount("/scratch").await);
+
+        // mount is still there
+        let mounts = table.list_mounts().await;
+        assert_eq!(mounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_freeze_does_not_block_reads_writes() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        table.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
+        table.write(Path::new("/scratch/test.txt"), 0, b"hello").await.unwrap();
+
+        table.freeze();
+
+        // reads still work
+        let data = table.read(Path::new("/scratch/test.txt"), 0, 100).await.unwrap();
+        assert_eq!(data, b"hello");
+
+        // writes still work (freeze only affects mount/unmount, not data ops)
+        table.write(Path::new("/scratch/test.txt"), 0, b"updated").await.unwrap();
+        let data = table.read(Path::new("/scratch/test.txt"), 0, 100).await.unwrap();
+        assert_eq!(data, b"updated");
     }
 }
