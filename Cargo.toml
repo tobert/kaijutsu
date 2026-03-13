@@ -11,6 +11,7 @@ members = [
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",
     "crates/kaijutsu-index",
+    "crates/kaijutsu-rhai",
 ]
 
 [workspace.package]
@@ -77,6 +78,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
 rhai = "1.21"
+kaijutsu-rhai = { path = "crates/kaijutsu-rhai" }
+palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # LLM providers - unified via rig-core
 rig-core = "0.30"

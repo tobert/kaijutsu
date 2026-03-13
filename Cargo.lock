@@ -2230,6 +2230,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
+name = "by_address"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
+
+[[package]]
 name = "bytemuck"
 version = "1.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3749,6 +3755,12 @@ dependencies = [
  "regex-automata 0.4.13",
  "regex-syntax 0.8.8",
 ]
+
+[[package]]
+name = "fast-srgb8"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
 
 [[package]]
 name = "fastrand"
@@ -5350,6 +5362,7 @@ dependencies = [
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",
+ "kaijutsu-rhai",
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaish-kernel",
@@ -5443,6 +5456,7 @@ dependencies = [
  "dunce",
  "futures",
  "kaijutsu-crdt",
+ "kaijutsu-rhai",
  "kaijutsu-types",
  "kaish-glob",
  "notify",
@@ -5489,6 +5503,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "whoami",
+]
+
+[[package]]
+name = "kaijutsu-rhai"
+version = "0.1.0"
+dependencies = [
+ "palette",
+ "rhai",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5557,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5565,7 +5589,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5596,7 +5620,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7171,6 +7195,29 @@ dependencies = [
  "tokio",
  "windows 0.62.2",
  "windows-strings 0.5.1",
+]
+
+[[package]]
+name = "palette"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cbf71184cc5ecc2e4e1baccdb21026c20e5fc3dcf63028a086131b3ab00b6e6"
+dependencies = [
+ "approx",
+ "fast-srgb8",
+ "palette_derive",
+]
+
+[[package]]
+name = "palette_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5030daf005bface118c096f510ffb781fc28f9ab6a32ab224d8631be6851d30"
+dependencies = [
+ "by_address",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

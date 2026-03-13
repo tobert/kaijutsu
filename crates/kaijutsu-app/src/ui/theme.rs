@@ -536,6 +536,155 @@ impl Default for Theme {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ThemeData → Theme conversion
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Parse a hex string into a Bevy `Color`. Returns `Color::BLACK` on failure.
+fn hex_to_color(s: &str) -> Color {
+    match kaijutsu_rhai::parse_hex(s) {
+        Some(c) => {
+            if c.alpha >= 1.0 {
+                Color::srgb(c.red, c.green, c.blue)
+            } else {
+                Color::srgba(c.red, c.green, c.blue, c.alpha)
+            }
+        }
+        None => Color::BLACK,
+    }
+}
+
+impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
+    fn from(td: kaijutsu_rhai::theme::ThemeData) -> Self {
+        let mut theme = Theme::default();
+
+        // Base UI
+        theme.bg = hex_to_color(&td.bg);
+        theme.panel_bg = hex_to_color(&td.panel_bg);
+        theme.fg = hex_to_color(&td.fg);
+        theme.fg_dim = hex_to_color(&td.fg_dim);
+        theme.accent = hex_to_color(&td.accent);
+        theme.accent2 = hex_to_color(&td.accent2);
+        theme.border = hex_to_color(&td.border);
+        theme.selection_bg = hex_to_color(&td.selection_bg);
+
+        // Row colors
+        theme.row_tool = hex_to_color(&td.row_tool);
+        theme.row_result = hex_to_color(&td.row_result);
+
+        // Semantic
+        theme.error = hex_to_color(&td.error);
+        theme.warning = hex_to_color(&td.warning);
+        theme.success = hex_to_color(&td.success);
+
+        // Mode colors
+        theme.mode_normal = hex_to_color(&td.mode_normal);
+        theme.mode_chat = hex_to_color(&td.mode_chat);
+        theme.mode_shell = hex_to_color(&td.mode_shell);
+        theme.mode_visual = hex_to_color(&td.mode_visual);
+
+        // Cursor colors
+        theme.cursor_normal = Vec4::from(td.cursor_normal);
+        theme.cursor_insert = Vec4::from(td.cursor_insert);
+        theme.cursor_visual = Vec4::from(td.cursor_visual);
+
+        // ANSI palette
+        theme.ansi.black = hex_to_color(&td.ansi.black);
+        theme.ansi.red = hex_to_color(&td.ansi.red);
+        theme.ansi.green = hex_to_color(&td.ansi.green);
+        theme.ansi.yellow = hex_to_color(&td.ansi.yellow);
+        theme.ansi.blue = hex_to_color(&td.ansi.blue);
+        theme.ansi.magenta = hex_to_color(&td.ansi.magenta);
+        theme.ansi.cyan = hex_to_color(&td.ansi.cyan);
+        theme.ansi.white = hex_to_color(&td.ansi.white);
+        theme.ansi.bright_black = hex_to_color(&td.ansi.bright_black);
+        theme.ansi.bright_red = hex_to_color(&td.ansi.bright_red);
+        theme.ansi.bright_green = hex_to_color(&td.ansi.bright_green);
+        theme.ansi.bright_yellow = hex_to_color(&td.ansi.bright_yellow);
+        theme.ansi.bright_blue = hex_to_color(&td.ansi.bright_blue);
+        theme.ansi.bright_magenta = hex_to_color(&td.ansi.bright_magenta);
+        theme.ansi.bright_cyan = hex_to_color(&td.ansi.bright_cyan);
+        theme.ansi.bright_white = hex_to_color(&td.ansi.bright_white);
+
+        // Frame config
+        theme.frame_corner_size = td.frame_corner_size;
+        theme.frame_edge_thickness = td.frame_edge_thickness;
+        theme.frame_content_padding = td.frame_content_padding;
+
+        // Frame colors
+        theme.frame_base = hex_to_color(&td.frame_base);
+        theme.frame_focused = hex_to_color(&td.frame_focused);
+        theme.frame_insert = hex_to_color(&td.frame_insert);
+        theme.frame_visual = hex_to_color(&td.frame_visual);
+        theme.frame_unfocused = hex_to_color(&td.frame_unfocused);
+        theme.frame_edge = hex_to_color(&td.frame_edge);
+
+        // Frame shader params
+        theme.frame_params_base = Vec4::from(td.frame_params_base);
+        theme.frame_params_focused = Vec4::from(td.frame_params_focused);
+        theme.frame_params_unfocused = Vec4::from(td.frame_params_unfocused);
+
+        // Edge dimming
+        theme.frame_edge_dim_unfocused = Vec4::from(td.frame_edge_dim_unfocused);
+        theme.frame_edge_dim_focused = Vec4::from(td.frame_edge_dim_focused);
+
+        // Shader effects
+        theme.effect_glow_radius = td.effect_glow_radius;
+        theme.effect_glow_intensity = td.effect_glow_intensity;
+        theme.effect_glow_falloff = td.effect_glow_falloff;
+        theme.effect_sheen_speed = td.effect_sheen_speed;
+        theme.effect_sheen_sparkle_threshold = td.effect_sheen_sparkle_threshold;
+        theme.effect_breathe_speed = td.effect_breathe_speed;
+        theme.effect_breathe_amplitude = td.effect_breathe_amplitude;
+
+        // Chasing border
+        theme.effect_chase_speed = td.effect_chase_speed;
+        theme.effect_chase_width = td.effect_chase_width;
+        theme.effect_chase_glow_radius = td.effect_chase_glow_radius;
+        theme.effect_chase_glow_intensity = td.effect_chase_glow_intensity;
+        theme.effect_chase_color_cycle = td.effect_chase_color_cycle;
+
+        // Input area
+        theme.input_minimized_height = td.input_minimized_height;
+        theme.input_docked_height = td.input_docked_height;
+        theme.input_overlay_width_pct = td.input_overlay_width_pct;
+        theme.input_backdrop_color = hex_to_color(&td.input_backdrop_color);
+
+        // Font effects
+        theme.font_rainbow = td.font_rainbow;
+
+        // Constellation
+        theme.constellation_base_radius = td.constellation_base_radius;
+        theme.constellation_ring_spacing = td.constellation_ring_spacing;
+
+        // Block borders
+        theme.block_border_tool_call = hex_to_color(&td.block_border_tool_call);
+        theme.block_border_tool_result = hex_to_color(&td.block_border_tool_result);
+        theme.block_border_error = hex_to_color(&td.block_border_error);
+        theme.block_border_thinking = hex_to_color(&td.block_border_thinking);
+        theme.block_border_drift = hex_to_color(&td.block_border_drift);
+        theme.block_border_thickness = td.block_border_thickness;
+        theme.block_border_corner_radius = td.block_border_corner_radius;
+        theme.block_border_glow_radius = td.block_border_glow_radius;
+        theme.block_border_glow_intensity = td.block_border_glow_intensity;
+        theme.block_border_padding = td.block_border_padding;
+        theme.block_spacing = td.block_spacing;
+
+        // Compose
+        theme.compose_border = hex_to_color(&td.compose_border);
+        theme.compose_bg = hex_to_color(&td.compose_bg);
+
+        // Modal
+        theme.modal_backdrop = hex_to_color(&td.modal_backdrop);
+
+        // User/assistant text borders
+        theme.block_border_user = hex_to_color(&td.block_border_user);
+        theme.block_border_assistant = hex_to_color(&td.block_border_assistant);
+
+        theme
+    }
+}
+
 /// Map a provider string to an agent color from the theme.
 ///
 /// Uses substring matching: "anthropic" or "claude" → claude color, etc.

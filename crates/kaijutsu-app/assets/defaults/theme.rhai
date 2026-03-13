@@ -6,12 +6,20 @@
 //
 // Loaded from ~/.config/kaijutsu/theme.rhai on startup.
 //
-// ## API
+// ## Color API (kaijutsu-rhai stdlib)
 //
-//   hex("#rrggbb")              // Opaque color from hex string
-//   hexa("#rrggbb", alpha)      // Color with alpha (0.0–1.0)
-//   rgba(r, g, b, a)            // Color from float components (0.0–1.0)
-//   rgb(r, g, b)                // Opaque color from float components
+//   hex("#rrggbb")              // Validate and normalize hex color
+//   hexa("#rrggbb", alpha)      // Hex color with alpha (0.0–1.0)
+//   rgb(r, g, b)                // RGB to hex (0–255 per channel)
+//   rgba(r, g, b, a)            // RGB+alpha to hex (r/g/b: 0–255, a: 0.0–1.0)
+//   hsl(h, s, l)                // HSL to hex (h: 0–360, s/l: 0–100)
+//   oklch(l, c, h)              // Oklch to hex (perceptually uniform)
+//   color_mix(hex1, hex2, t)    // Mix in Oklab space
+//   color_lighten(hex, amount)  // Lighten in Oklch
+//   color_darken(hex, amount)   // Darken in Oklch
+//   hue_shift(hex, degrees)     // Shift hue in Oklch
+//
+// Math functions also available: sin, cos, lerp, clamp, PI(), etc.
 //
 // ## Module import
 //

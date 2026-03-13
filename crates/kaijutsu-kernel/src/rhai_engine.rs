@@ -49,7 +49,10 @@ impl RhaiEngine {
     }
 
     /// Create a configured Rhai engine with all functions registered.
-    fn create_engine(block_store: SharedBlockStore, interrupted: Arc<AtomicBool>) -> Engine {
+    fn create_engine(
+        block_store: SharedBlockStore,
+        interrupted: Arc<AtomicBool>,
+    ) -> (Engine, kaijutsu_rhai::OutputCollector) {
         let mut engine = Engine::new();
 
         // Configure safety limits
@@ -60,6 +63,10 @@ impl RhaiEngine {
         engine.set_max_array_size(10_000);
         engine.set_max_map_size(10_000);
 
+        // Register shared stdlib (math, color, format) + output callbacks
+        kaijutsu_rhai::register_stdlib(&mut engine);
+        let collector = kaijutsu_rhai::register_output_callbacks(&mut engine);
+
         // Register cell functions
         Self::register_cell_functions(&mut engine, block_store.clone());
 
@@ -69,7 +76,7 @@ impl RhaiEngine {
         // Register utility functions
         Self::register_utility_functions(&mut engine, interrupted);
 
-        engine
+        (engine, collector)
     }
 
     /// Register cell-level manipulation functions.
@@ -490,20 +497,53 @@ impl RhaiEngine {
         code: &str,
         interrupted: Arc<AtomicBool>,
     ) -> ExecResult {
-        let engine = Self::create_engine(block_store.clone(), interrupted);
+        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted);
         let mut scope = Scope::new();
 
         match engine.eval_with_scope::<Dynamic>(&mut scope, code) {
             Ok(result) => {
-                // Format the result as string
-                let output = format!("{}", result);
+                let captured_print = collector.take_stdout();
+
+                // Output precedence: SVG > return value
+                let output = if let Some(svg) = collector.take_svg() {
+                    if !result.is_unit() {
+                        warn!("Rhai: svg() set AND non-unit return value — using SVG");
+                    }
+                    if captured_print.is_empty() {
+                        svg
+                    } else {
+                        format!("{captured_print}{svg}")
+                    }
+                } else {
+                    let val = format!("{}", result);
+                    if captured_print.is_empty() {
+                        val
+                    } else {
+                        format!("{captured_print}{val}")
+                    }
+                };
+
                 debug!("Rhai execution success: {}", output);
                 ExecResult::success(output)
             }
             Err(e) => {
+                // Still capture any partial output
+                let captured_print = collector.take_stdout();
+                let svg = collector.take_svg();
                 let error_msg = format!("{}", e);
                 warn!("Rhai execution error: {}", error_msg);
-                ExecResult::failure(1, error_msg)
+
+                let mut result = ExecResult::failure(1, error_msg);
+                if !captured_print.is_empty() || svg.is_some() {
+                    let partial = match svg {
+                        Some(s) => format!("{captured_print}{s}"),
+                        None => captured_print,
+                    };
+                    if !partial.is_empty() {
+                        result.stdout = partial;
+                    }
+                }
+                result
             }
         }
     }
@@ -524,7 +564,12 @@ impl ExecutionEngine for RhaiEngine {
     }
 
     fn description(&self) -> &str {
-        "Rhai scripting engine with CRDT-aware cell and block operations"
+        "Rhai scripting engine with CRDT-aware cell and block operations. \
+         Stdlib includes: math (sin, cos, lerp, clamp, etc.), \
+         color (hex, oklch, hsl, color_mix, color_lighten, hue_shift, etc.), \
+         format (xml_escape, fmt_f, to_float, to_int), \
+         output (svg(), print()). \
+         Use `list_kernel_tools` for full function catalog."
     }
 
     #[tracing::instrument(skip(self, code, _ctx), name = "engine.rhai")]
@@ -550,8 +595,9 @@ impl ExecutionEngine for RhaiEngine {
     }
 
     async fn complete(&self, partial: &str, _cursor: usize) -> Vec<String> {
-        // Basic completion for cell functions
+        // CRDT functions + utility functions + stdlib functions
         let functions = [
+            // CRDT cell/block functions
             "create_cell",
             "get_content",
             "set_content",
@@ -565,10 +611,27 @@ impl ExecutionEngine for RhaiEngine {
             "delete_block",
             "list_blocks",
             "get_block_content",
+            // Utility
             "println",
             "log",
             "is_interrupted",
             "sleep_ms",
+            // Stdlib — math
+            "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+            "sqrt", "abs_f", "floor", "ceil", "round", "min_f", "max_f",
+            "PI", "TAU", "E",
+            "pow", "exp", "ln", "log2", "log10",
+            "sinh", "cosh", "tanh",
+            "hypot", "lerp", "clamp", "degrees", "radians",
+            "fract", "signum", "rem_euclid", "copysign",
+            // Stdlib — color
+            "hex", "hexa", "rgb", "rgba", "hsl", "hsla", "oklch", "oklcha",
+            "color_mix", "color_lighten", "color_darken",
+            "color_saturate", "color_desaturate", "hue_shift",
+            // Stdlib — format
+            "to_float", "to_int", "xml_escape", "fmt_f",
+            // Stdlib — output
+            "svg",
         ];
 
         functions

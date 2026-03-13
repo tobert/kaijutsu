@@ -3,27 +3,34 @@
 //! Loads theme configuration from `~/.config/kaijutsu/theme.rhai` using the
 //! Rhai scripting language. Falls back to `Theme::default()` on any error.
 //!
+//! Theme parsing routes through `kaijutsu_rhai::theme::ThemeData` for
+//! framework-agnostic extraction, then converts to Bevy `Theme` via
+//! `From<ThemeData>`.
+//!
 //! ## Rhai API
 //!
-//! Functions available in theme scripts:
-//! - `hex("#rrggbb")` → `[r, g, b, 1.0]`
-//! - `hexa("#rrggbb", alpha)` → `[r, g, b, alpha]`
-//! - `rgba(r, g, b, a)` → `[r, g, b, a]`
-//! - `rgb(r, g, b)` → `[r, g, b, 1.0]`
+//! Functions available in theme scripts (via kaijutsu-rhai stdlib):
+//! - `hex("#rrggbb")` → `"#rrggbb"` (validates and normalizes)
+//! - `hexa("#rrggbb", alpha)` → `"#rrggbbaa"`
+//! - `oklch(l, c, h)` → `"#rrggbb"` (perceptually uniform)
+//! - `hsl(h, s, l)` → `"#rrggbb"`
+//! - `color_mix(hex1, hex2, t)` → `"#rrggbb"` (Oklab interpolation)
+//! - `color_lighten(hex, amount)` / `color_darken(hex, amount)`
+//! - `hue_shift(hex, degrees)`
+//! - plus all math functions (sin, cos, lerp, clamp, etc.)
 //!
 //! Example theme.rhai:
 //! ```rhai
 //! let bg = hex("#1a1b26");
 //! let fg = hex("#e5e5e5");
-//! let accent = hex("#7aa2f7");
+//! let accent = oklch(0.7, 0.15, 260.0);
 //! ```
 
-use bevy::math::Vec4;
 use bevy::prelude::*;
-use rhai::{Array, Dynamic, Engine, Scope};
+use rhai::{Engine, Scope};
 use std::path::PathBuf;
 
-use super::theme::{AnsiColors, Theme};
+use super::theme::Theme;
 
 /// Get the theme file path (~/.config/kaijutsu/theme.rhai).
 #[allow(dead_code)] // Kept as convenience wrapper; loading now goes through config::load_app_config
@@ -85,88 +92,19 @@ fn load_theme_from_file(path: &PathBuf) -> Result<Theme, String> {
     parse_theme_script(&script)
 }
 
-/// Register color helper functions on a Rhai engine.
-///
-/// Available to both theme.rhai and (via the shared engine) bindings.rhai:
-/// - `hex("#rrggbb")` → `[r, g, b, 1.0]`
-/// - `hexa("#rrggbb", alpha)` → `[r, g, b, alpha]`
-/// - `rgba(r, g, b, a)` → `[r, g, b, a]`
-/// - `rgb(r, g, b)` → `[r, g, b, 1.0]`
-pub fn register_color_fns(engine: &mut Engine) {
-    engine.register_fn("hex", |s: &str| -> Array { parse_hex_color(s, 1.0) });
-    engine.register_fn("hexa", |s: &str, alpha: f64| -> Array {
-        parse_hex_color(s, alpha as f32)
-    });
-    engine.register_fn("rgba", |r: f64, g: f64, b: f64, a: f64| -> Array {
-        vec![
-            Dynamic::from_float(r),
-            Dynamic::from_float(g),
-            Dynamic::from_float(b),
-            Dynamic::from_float(a),
-        ]
-    });
-    engine.register_fn("rgb", |r: f64, g: f64, b: f64| -> Array {
-        vec![
-            Dynamic::from_float(r),
-            Dynamic::from_float(g),
-            Dynamic::from_float(b),
-            Dynamic::from_float(1.0),
-        ]
-    });
-}
-
-/// Create a Rhai engine with theme functions registered.
-fn create_engine() -> Engine {
-    let mut engine = Engine::new();
-    register_color_fns(&mut engine);
-    engine
-}
-
-/// Parse a hex color string to an RGBA array.
-fn parse_hex_color(s: &str, alpha: f32) -> Array {
-    let s = s.trim_start_matches('#');
-
-    let (r, g, b) = if s.len() == 6 {
-        let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(0);
-        (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
-    } else if s.len() == 3 {
-        // Short form #rgb → #rrggbb
-        let r = u8::from_str_radix(&s[0..1], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&s[1..2], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&s[2..3], 16).unwrap_or(0);
-        (
-            (r * 17) as f32 / 255.0,
-            (g * 17) as f32 / 255.0,
-            (b * 17) as f32 / 255.0,
-        )
-    } else {
-        warn!("Invalid hex color: #{}", s);
-        (0.0, 0.0, 0.0)
-    };
-
-    vec![
-        Dynamic::from_float(r as f64),
-        Dynamic::from_float(g as f64),
-        Dynamic::from_float(b as f64),
-        Dynamic::from_float(alpha as f64),
-    ]
-}
-
 /// Extract theme variables from a pre-populated Rhai scope.
 ///
-/// Starts from `Theme::default()` and overlays any variables found in scope.
-/// Used by the shared config engine to support sequential evaluation.
+/// Routes through `kaijutsu_rhai::theme::ThemeData` for framework-agnostic parsing,
+/// then converts to Bevy `Theme` via `From<ThemeData>`.
 pub fn parse_theme_from_scope(scope: &Scope) -> Theme {
-    let mut theme = Theme::default();
-    apply_theme_from_scope(scope, &mut theme);
-    theme
+    let theme_data = kaijutsu_rhai::theme::parse_theme_data_from_scope(scope);
+    Theme::from(theme_data)
 }
 
 /// Parse a theme script and build a Theme struct.
 fn parse_theme_script(script: &str) -> Result<Theme, String> {
-    let engine = create_engine();
+    let mut engine = Engine::new();
+    kaijutsu_rhai::register_stdlib(&mut engine);
     let mut scope = Scope::new();
 
     engine
@@ -176,369 +114,9 @@ fn parse_theme_script(script: &str) -> Result<Theme, String> {
     Ok(parse_theme_from_scope(&scope))
 }
 
-/// Apply scope variables to a mutable Theme reference.
-fn apply_theme_from_scope(scope: &Scope, theme: &mut Theme) {
-    // Extract variables from scope and apply to theme
-    // Base UI colors
-    if let Some(c) = get_color(&scope, "bg") {
-        theme.bg = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "panel_bg") {
-        theme.panel_bg = c;
-    }
-    if let Some(c) = get_color(&scope, "fg") {
-        theme.fg = c;
-    }
-    if let Some(c) = get_color(&scope, "fg_dim") {
-        theme.fg_dim = c;
-    }
-    if let Some(c) = get_color(&scope, "accent") {
-        theme.accent = c;
-    }
-    if let Some(c) = get_color(&scope, "accent2") {
-        theme.accent2 = c;
-    }
-    if let Some(c) = get_color(&scope, "border") {
-        theme.border = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "selection_bg") {
-        theme.selection_bg = c;
-    }
-
-    // Row colors
-    if let Some(c) = get_color(&scope, "row_tool") {
-        theme.row_tool = c;
-    }
-    if let Some(c) = get_color(&scope, "row_result") {
-        theme.row_result = c;
-    }
-
-    // Semantic colors
-    if let Some(c) = get_color(&scope, "error") {
-        theme.error = c;
-    }
-    if let Some(c) = get_color(&scope, "warning") {
-        theme.warning = c;
-    }
-    if let Some(c) = get_color(&scope, "success") {
-        theme.success = c;
-    }
-
-    // Mode colors
-    if let Some(c) = get_color(&scope, "mode_normal") {
-        theme.mode_normal = c;
-    }
-    // Support both mode_chat (new) and mode_insert (legacy) for backward compatibility
-    if let Some(c) = get_color(&scope, "mode_chat").or_else(|| get_color(&scope, "mode_insert")) {
-        theme.mode_chat = c;
-    }
-    if let Some(c) = get_color(&scope, "mode_shell") {
-        theme.mode_shell = c;
-    }
-    if let Some(c) = get_color(&scope, "mode_visual") {
-        theme.mode_visual = c;
-    }
-
-    // Cursor colors (Vec4)
-    if let Some(v) = get_vec4(&scope, "cursor_normal") {
-        theme.cursor_normal = v;
-    }
-    if let Some(v) = get_vec4(&scope, "cursor_insert") {
-        theme.cursor_insert = v;
-    }
-    if let Some(v) = get_vec4(&scope, "cursor_visual") {
-        theme.cursor_visual = v;
-    }
-
-    // ANSI colors
-    theme.ansi = extract_ansi_colors(&scope);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Frame configuration
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Frame structure
-    if let Some(v) = get_float(&scope, "frame_corner_size") {
-        theme.frame_corner_size = v;
-    }
-    if let Some(v) = get_float(&scope, "frame_edge_thickness") {
-        theme.frame_edge_thickness = v;
-    }
-    if let Some(v) = get_float(&scope, "frame_content_padding") {
-        theme.frame_content_padding = v;
-    }
-
-    // Frame colors
-    if let Some(c) = get_color_with_alpha(&scope, "frame_base") {
-        theme.frame_base = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_focused") {
-        theme.frame_focused = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_insert") {
-        theme.frame_insert = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_visual") {
-        theme.frame_visual = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_unfocused") {
-        theme.frame_unfocused = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "frame_edge") {
-        theme.frame_edge = c;
-    }
-
-    // Frame shader params
-    if let Some(v) = get_vec4(&scope, "frame_params_base") {
-        theme.frame_params_base = v;
-    }
-    if let Some(v) = get_vec4(&scope, "frame_params_focused") {
-        theme.frame_params_focused = v;
-    }
-    if let Some(v) = get_vec4(&scope, "frame_params_unfocused") {
-        theme.frame_params_unfocused = v;
-    }
-
-    // Edge dimming multipliers
-    if let Some(v) = get_vec4(&scope, "frame_edge_dim_unfocused") {
-        theme.frame_edge_dim_unfocused = v;
-    }
-    if let Some(v) = get_vec4(&scope, "frame_edge_dim_focused") {
-        theme.frame_edge_dim_focused = v;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Shader effect parameters (GPU-reactive)
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(v) = get_float(&scope, "effect_glow_radius") {
-        theme.effect_glow_radius = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_glow_intensity") {
-        theme.effect_glow_intensity = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_glow_falloff") {
-        theme.effect_glow_falloff = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_sheen_speed") {
-        theme.effect_sheen_speed = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_sheen_sparkle_threshold") {
-        theme.effect_sheen_sparkle_threshold = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_breathe_speed") {
-        theme.effect_breathe_speed = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_breathe_amplitude") {
-        theme.effect_breathe_amplitude = v;
-    }
-
-    // Chasing border effect parameters
-    if let Some(v) = get_float(&scope, "effect_chase_speed") {
-        theme.effect_chase_speed = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_chase_width") {
-        theme.effect_chase_width = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_chase_glow_radius") {
-        theme.effect_chase_glow_radius = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_chase_glow_intensity") {
-        theme.effect_chase_glow_intensity = v;
-    }
-    if let Some(v) = get_float(&scope, "effect_chase_color_cycle") {
-        theme.effect_chase_color_cycle = v;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Input area configuration
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(v) = get_float(&scope, "input_minimized_height") {
-        theme.input_minimized_height = v;
-    }
-    if let Some(v) = get_float(&scope, "input_docked_height") {
-        theme.input_docked_height = v;
-    }
-    if let Some(v) = get_float(&scope, "input_overlay_width_pct") {
-        theme.input_overlay_width_pct = v;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "input_backdrop_color") {
-        theme.input_backdrop_color = c;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Font effects
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(v) = get_bool(&scope, "font_rainbow") {
-        theme.font_rainbow = v;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Constellation configuration
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(v) = get_float(&scope, "constellation_base_radius") {
-        theme.constellation_base_radius = v;
-    }
-    if let Some(v) = get_float(&scope, "constellation_ring_spacing") {
-        theme.constellation_ring_spacing = v;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Block border configuration
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_tool_call") {
-        theme.block_border_tool_call = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_tool_result") {
-        theme.block_border_tool_result = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_error") {
-        theme.block_border_error = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_thinking") {
-        theme.block_border_thinking = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_drift") {
-        theme.block_border_drift = c;
-    }
-    if let Some(v) = get_float(&scope, "block_border_thickness") {
-        theme.block_border_thickness = v;
-    }
-    if let Some(v) = get_float(&scope, "block_border_corner_radius") {
-        theme.block_border_corner_radius = v;
-    }
-    if let Some(v) = get_float(&scope, "block_border_glow_radius") {
-        theme.block_border_glow_radius = v;
-    }
-    if let Some(v) = get_float(&scope, "block_border_glow_intensity") {
-        theme.block_border_glow_intensity = v;
-    }
-    if let Some(v) = get_float(&scope, "block_border_padding") {
-        theme.block_border_padding = v;
-    }
-    if let Some(v) = get_float(&scope, "block_spacing") {
-        theme.block_spacing = v;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Compose block
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(c) = get_color_with_alpha(&scope, "compose_border") {
-        theme.compose_border = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "compose_bg") {
-        theme.compose_bg = c;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Modal overlays
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(c) = get_color_with_alpha(&scope, "modal_backdrop") {
-        theme.modal_backdrop = c;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // User/assistant text block borders
-    // ═══════════════════════════════════════════════════════════════════════
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_user") {
-        theme.block_border_user = c;
-    }
-    if let Some(c) = get_color_with_alpha(&scope, "block_border_assistant") {
-        theme.block_border_assistant = c;
-    }
-}
-
-/// Extract a color from scope (ignores alpha, sets to 1.0).
-fn get_color(scope: &Scope, name: &str) -> Option<Color> {
-    let arr = scope.get_value::<Array>(name)?;
-    if arr.len() < 3 {
-        return None;
-    }
-    let r = arr[0].as_float().ok()? as f32;
-    let g = arr[1].as_float().ok()? as f32;
-    let b = arr[2].as_float().ok()? as f32;
-    Some(Color::srgb(r, g, b))
-}
-
-/// Extract a color from scope (preserves alpha).
-fn get_color_with_alpha(scope: &Scope, name: &str) -> Option<Color> {
-    let arr = scope.get_value::<Array>(name)?;
-    if arr.len() < 4 {
-        return get_color(scope, name);
-    }
-    let r = arr[0].as_float().ok()? as f32;
-    let g = arr[1].as_float().ok()? as f32;
-    let b = arr[2].as_float().ok()? as f32;
-    let a = arr[3].as_float().ok()? as f32;
-    Some(Color::srgba(r, g, b, a))
-}
-
-/// Extract a Vec4 from scope.
-fn get_vec4(scope: &Scope, name: &str) -> Option<Vec4> {
-    let arr = scope.get_value::<Array>(name)?;
-    if arr.len() < 4 {
-        return None;
-    }
-    let x = arr[0].as_float().ok()? as f32;
-    let y = arr[1].as_float().ok()? as f32;
-    let z = arr[2].as_float().ok()? as f32;
-    let w = arr[3].as_float().ok()? as f32;
-    Some(Vec4::new(x, y, z, w))
-}
-
-/// Extract a float from scope.
-fn get_float(scope: &Scope, name: &str) -> Option<f32> {
-    scope.get_value::<f64>(name).map(|v| v as f32)
-}
-
-/// Extract a bool from scope.
-fn get_bool(scope: &Scope, name: &str) -> Option<bool> {
-    scope.get_value::<bool>(name)
-}
-
-/// Extract ANSI colors from scope.
-fn extract_ansi_colors(scope: &Scope) -> AnsiColors {
-    let mut ansi = AnsiColors::default();
-
-    // Helper to try to get a color or use default
-    let get = |name: &str, default: Color| -> Color {
-        get_color(scope, name).unwrap_or(default)
-    };
-
-    // Standard colors
-    ansi.black = get("ansi_black", ansi.black);
-    ansi.red = get("ansi_red", ansi.red);
-    ansi.green = get("ansi_green", ansi.green);
-    ansi.yellow = get("ansi_yellow", ansi.yellow);
-    ansi.blue = get("ansi_blue", ansi.blue);
-    ansi.magenta = get("ansi_magenta", ansi.magenta);
-    ansi.cyan = get("ansi_cyan", ansi.cyan);
-    ansi.white = get("ansi_white", ansi.white);
-
-    // Bright variants
-    ansi.bright_black = get("ansi_bright_black", ansi.bright_black);
-    ansi.bright_red = get("ansi_bright_red", ansi.bright_red);
-    ansi.bright_green = get("ansi_bright_green", ansi.bright_green);
-    ansi.bright_yellow = get("ansi_bright_yellow", ansi.bright_yellow);
-    ansi.bright_blue = get("ansi_bright_blue", ansi.bright_blue);
-    ansi.bright_magenta = get("ansi_bright_magenta", ansi.bright_magenta);
-    ansi.bright_cyan = get("ansi_bright_cyan", ansi.bright_cyan);
-    ansi.bright_white = get("ansi_bright_white", ansi.bright_white);
-
-    ansi
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_hex_parsing() {
-        let arr = parse_hex_color("#1a1b26", 1.0);
-        assert_eq!(arr.len(), 4);
-        // #1a = 26/255 ≈ 0.102
-        let r = arr[0].as_float().unwrap();
-        assert!((r - 0.102).abs() < 0.01);
-    }
 
     #[test]
     fn test_simple_script() {
@@ -554,18 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rgba_function() {
-        let script = r##"
-            let panel_bg = rgba(0.1, 0.2, 0.3, 0.9);
-        "##;
-
-        let theme = parse_theme_script(script).unwrap();
-        let srgba = theme.panel_bg.to_srgba();
-        assert!((srgba.red - 0.1).abs() < 0.01);
-        assert!((srgba.alpha - 0.9).abs() < 0.01);
-    }
-
-    #[test]
     fn test_font_rainbow_param() {
         let script = r##"
             let font_rainbow = true;
@@ -573,5 +139,31 @@ mod tests {
 
         let theme = parse_theme_script(script).unwrap();
         assert!(theme.font_rainbow);
+    }
+
+    #[test]
+    fn test_oklch_in_theme_script() {
+        let script = r#"
+            let accent = oklch(0.7, 0.15, 260.0);
+        "#;
+
+        let theme = parse_theme_script(script).unwrap();
+        // Should have a valid color (not default)
+        let srgba = theme.accent.to_srgba();
+        // oklch(0.7, 0.15, 260) is a blue-ish color
+        assert!(srgba.blue > srgba.red);
+    }
+
+    #[test]
+    fn test_color_mix_in_theme_script() {
+        let script = r##"
+            let bg = color_mix("#000000", "#ffffff", 0.5);
+        "##;
+
+        let theme = parse_theme_script(script).unwrap();
+        // 50% mix of black and white should be near gray
+        let srgba = theme.bg.to_srgba();
+        // In Oklab space, the midpoint may not be exactly 0.5 in sRGB
+        assert!(srgba.red > 0.2 && srgba.red < 0.8);
     }
 }

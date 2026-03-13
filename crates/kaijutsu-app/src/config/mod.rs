@@ -20,7 +20,6 @@ use crate::input::binding::Binding;
 use crate::input::defaults::default_bindings;
 use crate::input::rhai_config::{parse_bindings_from_dynamic, register_binding_fns};
 use crate::ui::theme::Theme;
-use crate::ui::theme_loader::{parse_theme_from_scope, register_color_fns};
 
 /// Combined output of app-side Rhai config evaluation.
 pub struct AppConfig {
@@ -37,7 +36,9 @@ pub struct AppConfig {
 /// `import "palette"` or other shared modules from the same directory.
 pub fn build_app_engine(config_dir: &Path) -> Engine {
     let mut engine = Engine::new();
-    register_color_fns(&mut engine);
+    // Register shared stdlib (math, color, format) — replaces old register_color_fns.
+    // hex() now returns String instead of Array. ThemeData parsing handles both.
+    kaijutsu_rhai::register_stdlib(&mut engine);
     register_binding_fns(&mut engine, default_bindings());
     engine.set_module_resolver(FileModuleResolver::new_with_path(config_dir));
     engine
@@ -83,7 +84,8 @@ fn load_theme_into_scope(engine: &Engine, scope: &mut Scope, config_dir: &Path) 
     match engine.run_with_scope(scope, &script) {
         Ok(()) => {
             info!("Loaded theme from {:?}", theme_path);
-            parse_theme_from_scope(scope)
+            let theme_data = kaijutsu_rhai::theme::parse_theme_data_from_scope(scope);
+            Theme::from(theme_data)
         }
         Err(e) => {
             warn!("Failed to parse theme: {}", e);

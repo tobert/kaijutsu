@@ -56,7 +56,8 @@ pub struct EmbeddingModelConfig {
 /// Parse a `models.rhai` (or `llm.rhai`) script and extract full configuration
 /// including LLM providers and embedding model settings.
 pub fn load_models_config(script: &str) -> LlmResult<ModelsConfig> {
-    let engine = rhai::Engine::new();
+    let mut engine = rhai::Engine::new();
+    kaijutsu_rhai::register_stdlib(&mut engine);
     let ast = engine.compile(script).map_err(|e| {
         LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
     })?;
@@ -79,7 +80,8 @@ pub fn load_models_config(script: &str) -> LlmResult<ModelsConfig> {
 /// - `providers` (Map of provider configs)
 /// - `model_aliases` (Map of alias -> {provider, model})
 pub fn load_llm_config(script: &str) -> LlmResult<LlmConfig> {
-    let engine = rhai::Engine::new();
+    let mut engine = rhai::Engine::new();
+    kaijutsu_rhai::register_stdlib(&mut engine);
     let ast = engine.compile(script).map_err(|e| {
         LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
     })?;
