@@ -654,13 +654,16 @@ impl BlockStore {
         tool_input: serde_json::Value,
         tool_kind: Option<ToolKind>,
     ) -> BlockStoreResult<BlockId> {
-        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, tool_kind, None, None)
+        self.insert_tool_call_as(context_id, parent_id, after, tool_name, tool_input, tool_kind, None, None, None)
     }
 
     /// Insert a tool call block with an explicit author identity.
     ///
     /// `tool_use_id` is the LLM-assigned tool invocation ID (e.g., "toolu_01ABC...").
     /// Pass `Some(id)` when capturing from LLM stream events, `None` for shell/manual calls.
+    ///
+    /// `role` overrides the block role (default: `Role::Model`). Pass `Some(Role::User)`
+    /// for human-initiated shell commands.
     pub fn insert_tool_call_as(
         &self,
         context_id: ContextId,
@@ -671,6 +674,7 @@ impl BlockStore {
         tool_kind: Option<ToolKind>,
         agent_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
+        role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops) = {
@@ -681,7 +685,7 @@ impl BlockStore {
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
 
-            let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, tool_kind)
+            let block_id = entry.doc.insert_tool_call(parent_id, after, tool_name, tool_input, tool_kind, role)
                 ?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips

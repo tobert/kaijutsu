@@ -54,7 +54,7 @@ pub fn handle_prompt_submitted(
                 let text = strip_shell_prefix(&event.text).to_string();
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        if let Err(e) = handle.shell_execute(&text, ctx_id).await {
+                        if let Err(e) = handle.shell_execute(&text, ctx_id, true).await {
                             log::error!("shell_execute failed: {e}");
                             let _ = tx.send(crate::connection::RpcResultMessage::RpcError {
                                 operation: "shell_execute".into(),

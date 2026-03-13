@@ -736,6 +736,10 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         assistant_text: Option<String>,
         tool_uses: Vec<ContentBlock>,
         tool_results: Vec<ContentBlock>,
+        /// Pending user-initiated shell commands, keyed by ToolCall BlockId.
+        /// Matched to ToolResults via `tool_call_id` for correct pairing
+        /// even when blocks interleave with model tool calls.
+        user_shell_pending: std::collections::HashMap<kaijutsu_types::BlockId, String>,
     }
 
     impl HydrationState {
@@ -745,6 +749,7 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 assistant_text: None,
                 tool_uses: Vec::new(),
                 tool_results: Vec::new(),
+                user_shell_pending: std::collections::HashMap::new(),
             }
         }
 
@@ -843,6 +848,16 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 state.flush_all();
                 state.messages.push(Message::user(&block.content));
             }
+            (BlockRole::User, BlockKind::ToolCall) => {
+                // User-initiated shell command — extract the code and wait for
+                // the paired ToolResult to emit a single user message.
+                state.flush_all();
+                let code = block.tool_input.as_ref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("code").and_then(|c| c.as_str().map(String::from)))
+                    .unwrap_or_else(|| block.content.clone());
+                state.user_shell_pending.insert(block.id, code);
+            }
             (BlockRole::Model, BlockKind::Text) => {
                 // Flush pending tool results before accumulating assistant text
                 state.flush_tool_results();
@@ -875,22 +890,37 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 });
             }
             (BlockRole::Tool, BlockKind::ToolResult) => {
-                // Flush pending assistant before accumulating tool results
-                state.flush_assistant();
-                let tool_use_id = block.tool_use_id.clone()
-                    .or_else(|| {
-                        tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing tool_use_id, falling back to tool_call_id");
-                        block.tool_call_id.map(|id| id.to_key())
-                    })
-                    .unwrap_or_else(|| {
-                        tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing both tool_use_id and tool_call_id, falling back to block ID");
-                        block.id.to_key()
+                let user_code = block.tool_call_id
+                    .and_then(|id| state.user_shell_pending.remove(&id));
+                if let Some(code) = user_code {
+                    // User-initiated shell result → emit as a single user message
+                    state.flush_all();
+                    let output = block.content.trim();
+                    if output.is_empty() {
+                        state.messages.push(Message::user(&format!("[User ran `{}`]", code)));
+                    } else {
+                        state.messages.push(Message::user(
+                            &format!("[User ran `{}`]\n{}", code, output),
+                        ));
+                    }
+                } else {
+                    // Agent-initiated tool result — existing logic
+                    state.flush_assistant();
+                    let tool_use_id = block.tool_use_id.clone()
+                        .or_else(|| {
+                            tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing tool_use_id, falling back to tool_call_id");
+                            block.tool_call_id.map(|id| id.to_key())
+                        })
+                        .unwrap_or_else(|| {
+                            tracing::warn!(block_id = %block.id.to_key(), "ToolResult block missing both tool_use_id and tool_call_id, falling back to block ID");
+                            block.id.to_key()
+                        });
+                    state.tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: block.content.clone(),
+                        is_error: block.is_error,
                     });
-                state.tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id,
-                    content: block.content.clone(),
-                    is_error: block.is_error,
-                });
+                }
             }
             (_, BlockKind::Drift) => {
                 // Drift blocks become user messages with provenance context
@@ -1418,6 +1448,171 @@ mod tests {
             let text = msgs[0].as_text().unwrap();
             assert!(text.contains("unknown"), "should say 'unknown' for no source: {text}");
             assert!(text.contains("distill"), "should contain drift kind: {text}");
+        }
+
+        #[test]
+        fn user_shell_command_with_output() {
+            let c = ctx();
+            let u = user();
+            let s = system();
+
+            let call_id = BlockId::new(c, u, 0);
+            let tool_call = BlockSnapshot::tool_call(
+                call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "cargo check"}),
+                BlockRole::User,
+                None,
+            );
+            let tool_result = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0), call_id, ToolKind::Shell,
+                "Compiling kaijutsu v0.1.0\n    Finished", false, Some(0),
+                None,
+            );
+
+            let msgs = hydrate_from_blocks(&[tool_call, tool_result]);
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].role, Role::User);
+            let text = msgs[0].as_text().unwrap();
+            assert!(text.contains("[User ran `cargo check`]"), "got: {text}");
+            assert!(text.contains("Compiling kaijutsu"), "got: {text}");
+        }
+
+        #[test]
+        fn user_shell_command_empty_output() {
+            let c = ctx();
+            let u = user();
+            let s = system();
+
+            let call_id = BlockId::new(c, u, 0);
+            let tool_call = BlockSnapshot::tool_call(
+                call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "true"}),
+                BlockRole::User,
+                None,
+            );
+            let tool_result = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0), call_id, ToolKind::Shell,
+                "", false, Some(0),
+                None,
+            );
+
+            let msgs = hydrate_from_blocks(&[tool_call, tool_result]);
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].as_text(), Some("[User ran `true`]"));
+        }
+
+        #[test]
+        fn user_shell_interleaved_with_model_tool_call() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            // User runs a shell command
+            let user_call_id = BlockId::new(c, u, 0);
+            let user_tc = BlockSnapshot::tool_call(
+                user_call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "ls"}),
+                BlockRole::User,
+                None,
+            );
+            let user_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0), user_call_id, ToolKind::Shell,
+                "src\nCargo.toml", false, Some(0),
+                None,
+            );
+
+            // Model text + tool call
+            let model_text = BlockSnapshot::text(
+                BlockId::new(c, m, 0), None, BlockRole::Model, "Let me check...",
+            );
+            let model_call_id = BlockId::new(c, m, 1);
+            let model_tc = BlockSnapshot::tool_call(
+                model_call_id, None, ToolKind::Mcp, "read_file",
+                serde_json::json!({"path": "Cargo.toml"}),
+                BlockRole::Model,
+                Some("toolu_01XYZ".to_string()),
+            );
+            let model_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 1), model_call_id, ToolKind::Mcp,
+                "[package]\nname = \"kaijutsu\"", false, Some(0),
+                Some("toolu_01XYZ".to_string()),
+            );
+
+            let msgs = hydrate_from_blocks(&[user_tc, user_tr, model_text, model_tc, model_tr]);
+            assert_eq!(msgs.len(), 3, "got: {:?}", msgs.iter().map(|m| &m.role).collect::<Vec<_>>());
+            // 1: user shell message
+            assert_eq!(msgs[0].role, Role::User);
+            assert!(msgs[0].as_text().unwrap().contains("[User ran `ls`]"));
+            // 2: assistant with text + tool use (merged)
+            assert_eq!(msgs[1].role, Role::Assistant);
+            // 3: tool result (user role per API convention)
+            assert_eq!(msgs[2].role, Role::User);
+        }
+
+        #[test]
+        fn user_shell_interleaved_out_of_order() {
+            // Gemini review catch: if blocks arrive out of order (model result
+            // before user result), the HashMap keying prevents mispairing.
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let user_call_id = BlockId::new(c, u, 0);
+            let user_tc = BlockSnapshot::tool_call(
+                user_call_id, None, ToolKind::Shell, "shell",
+                serde_json::json!({"code": "sleep 10"}),
+                BlockRole::User,
+                None,
+            );
+
+            let model_call_id = BlockId::new(c, m, 1);
+            let model_tc = BlockSnapshot::tool_call(
+                model_call_id, None, ToolKind::Mcp, "fast_tool",
+                serde_json::json!({}),
+                BlockRole::Model,
+                Some("toolu_fast".to_string()),
+            );
+
+            let model_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 1), model_call_id, ToolKind::Mcp,
+                "fast result", false, Some(0),
+                Some("toolu_fast".to_string()),
+            );
+
+            let user_tr = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0), user_call_id, ToolKind::Shell,
+                "done sleeping", false, Some(0),
+                None,
+            );
+
+            // Order: User Call, Model Call, Model Result, User Result
+            let msgs = hydrate_from_blocks(&[user_tc, model_tc, model_tr, user_tr]);
+
+            assert_eq!(msgs.len(), 3, "got: {:?}", msgs.iter().map(|m| &m.role).collect::<Vec<_>>());
+
+            // 1: Assistant with tool use (model call)
+            assert_eq!(msgs[0].role, Role::Assistant);
+
+            // 2: Tool result for model's fast_tool
+            assert_eq!(msgs[1].role, Role::User);
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => {
+                    match &blocks[0] {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            assert_eq!(tool_use_id, "toolu_fast");
+                        }
+                        _ => panic!("Expected ToolResult"),
+                    }
+                }
+                _ => panic!("Expected Blocks"),
+            }
+
+            // 3: User shell result
+            assert_eq!(msgs[2].role, Role::User);
+            assert!(msgs[2].as_text().unwrap().contains("[User ran `sleep 10`]"));
+            assert!(msgs[2].as_text().unwrap().contains("done sleeping"));
         }
 
         #[test]

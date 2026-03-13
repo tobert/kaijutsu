@@ -2145,7 +2145,8 @@ impl kernel::Server for KernelImpl {
         let context_id_bytes = pry!(params.get_context_id());
         let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
             .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
-        log::info!("Shell execute: context_id={}, code={}", context_id, code);
+        let user_initiated = params.get_user_initiated();
+        log::info!("Shell execute: context_id={}, code={}, user_initiated={}", context_id, code, user_initiated);
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
@@ -2208,10 +2209,11 @@ impl kernel::Server for KernelImpl {
             // Create ToolCall block for the shell command (authored by user)
             let last_block = documents.last_block_id(context_id);
             log::info!("Inserting shell command into context {}, after={:?}", context_id, last_block);
+            let role = if user_initiated { Some(Role::User) } else { None };
             let command_block_id = documents.insert_tool_call_as(
                 context_id, None, last_block.as_ref(),
                 "shell", serde_json::json!({"code": code}),
-                Some(TypesToolKind::Shell), Some(user_agent_id), None,
+                Some(TypesToolKind::Shell), Some(user_agent_id), None, role,
             ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
             log::info!("Created shell command block: {:?}", command_block_id);
 
@@ -4540,6 +4542,7 @@ impl kernel::Server for KernelImpl {
                     context_id, None, last_block.as_ref(),
                     "shell", serde_json::json!({"code": code}),
                     Some(TypesToolKind::Shell), Some(user_agent_id), None,
+                    Some(Role::User),
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
 
                 // Create ToolResult block (empty, filled by execution)
@@ -5826,7 +5829,7 @@ async fn process_llm_stream(
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone())) {
+                    match documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone()), None) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             tool_call_blocks.insert(id.clone(), Some(block_id));

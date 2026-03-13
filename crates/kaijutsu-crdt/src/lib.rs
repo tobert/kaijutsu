@@ -103,7 +103,7 @@ mod tests {
     fn test_tool_blocks_are_editable() {
         let mut doc = test_doc();
 
-        let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"}), None).unwrap();
+        let tool_id = doc.insert_tool_call(None, None, "read_file", serde_json::json!({"path": "/test"}), None, None).unwrap();
 
         let result = doc.append_text(&tool_id, ", \"extra\": true}");
         assert!(result.is_ok());

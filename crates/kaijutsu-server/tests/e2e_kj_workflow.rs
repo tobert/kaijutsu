@@ -32,7 +32,7 @@ async fn shell_exec_wait_timeout(
     timeout_ms: u64,
 ) -> (BlockId, String, Status) {
     let cmd_block_id = kernel
-        .shell_execute(code, context_id)
+        .shell_execute(code, context_id, false)
         .await
         .unwrap_or_else(|e| panic!("shell_execute({code:?}) failed: {e}"));
 

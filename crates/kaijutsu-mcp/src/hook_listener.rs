@@ -287,6 +287,7 @@ impl HookListener {
             Some(ToolKind::Mcp),
             Some(PrincipalId::system()),
             None,
+            None,
         ) {
             Ok(id) => id,
             Err(e) => {

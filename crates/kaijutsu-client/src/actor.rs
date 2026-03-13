@@ -92,7 +92,7 @@ enum RpcCommand {
 
     // ── Shell / Execution ────────────────────────────────────────────────
     Execute { code: String, reply: oneshot::Sender<Result<u64, ActorError>> },
-    ShellExecute { code: String, context_id: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
+    ShellExecute { code: String, context_id: ContextId, user_initiated: bool, reply: oneshot::Sender<Result<BlockId, ActorError>> },
     Interrupt { exec_id: u64, reply: oneshot::Sender<Result<(), ActorError>> },
     Complete { partial: String, cursor: u32, reply: oneshot::Sender<Result<Vec<Completion>, ActorError>> },
     GetCommandHistory { limit: u32, reply: oneshot::Sender<Result<Vec<HistoryEntry>, ActorError>> },
@@ -409,10 +409,13 @@ impl ActorHandle {
     }
 
     /// Execute shell command with block output (kaish REPL mode).
+    ///
+    /// `user_initiated`: true when a human typed this command (gets `Role::User`),
+    /// false for agent/MCP-initiated commands (gets `Role::Model`).
     #[tracing::instrument(skip(self, code))]
-    pub async fn shell_execute(&self, code: &str, context_id: ContextId) -> Result<BlockId, ActorError> {
+    pub async fn shell_execute(&self, code: &str, context_id: ContextId, user_initiated: bool) -> Result<BlockId, ActorError> {
         self.send(|reply| RpcCommand::ShellExecute {
-            code: code.into(), context_id, reply,
+            code: code.into(), context_id, user_initiated, reply,
         }).await
     }
 
@@ -1099,8 +1102,8 @@ async fn dispatch_command(
         RpcCommand::Execute { code, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.execute(&code));
         }
-        RpcCommand::ShellExecute { code, context_id, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.shell_execute(&code, context_id));
+        RpcCommand::ShellExecute { code, context_id, user_initiated, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.shell_execute(&code, context_id, user_initiated));
         }
         RpcCommand::Interrupt { exec_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.interrupt(exec_id));

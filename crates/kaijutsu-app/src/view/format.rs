@@ -28,7 +28,9 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
         }
         BlockKind::Thinking => theme.block_thinking,
         BlockKind::ToolCall => {
-            if block.status == Status::Done {
+            if block.role == Role::User {
+                theme.block_user // user-initiated shell — same color as user text
+            } else if block.status == Status::Done {
                 theme.fg
             } else {
                 theme.block_tool_call
@@ -530,9 +532,13 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             if let Some(ref input_str) = block.tool_input {
                 if let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str) {
                     if let Some(obj) = input_val.as_object() {
-                        // Shell: just show the code
+                        // Shell: show the code (with $ prefix for user-initiated)
                         if let Some(code) = obj.get("code").and_then(|v| v.as_str()) {
-                            return code.to_string();
+                            return if block.role == Role::User {
+                                format!("$ {}", code)
+                            } else {
+                                code.to_string()
+                            };
                         }
                         // Single-arg tool: "ToolName: value"
                         if obj.len() == 1 {
@@ -866,6 +872,52 @@ mod tests {
         let data = OutputData::text("hello");
         let text = format_output_data(&data);
         assert!(compute_output_layout(&data, &text).is_none());
+    }
+
+    #[test]
+    fn test_user_shell_tool_call_has_dollar_prefix() {
+        let block = BlockSnapshot::tool_call(
+            test_block_id(),
+            None,
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"code": "cargo check"}),
+            Role::User,
+            None,
+        );
+        let result = format_single_block(&block, None);
+        assert_eq!(result, "$ cargo check");
+    }
+
+    #[test]
+    fn test_model_shell_tool_call_no_prefix() {
+        let block = BlockSnapshot::tool_call(
+            test_block_id(),
+            None,
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"code": "cargo check"}),
+            Role::Model,
+            None,
+        );
+        let result = format_single_block(&block, None);
+        assert_eq!(result, "cargo check");
+    }
+
+    #[test]
+    fn test_user_shell_tool_call_color() {
+        let theme = Theme::default();
+        let block = BlockSnapshot::tool_call(
+            test_block_id(),
+            None,
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"code": "ls"}),
+            Role::User,
+            None,
+        );
+        let color = block_color(&block, &theme);
+        assert_eq!(color, theme.block_user, "user shell should use block_user color");
     }
 
     #[test]

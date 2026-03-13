@@ -311,10 +311,12 @@ impl KernelHandle {
         &self,
         code: &str,
         context_id: ContextId,
+        user_initiated: bool,
     ) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.shell_execute_request();
         request.get().set_code(code);
         request.get().set_context_id(context_id.as_bytes());
+        request.get().set_user_initiated(user_initiated);
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();

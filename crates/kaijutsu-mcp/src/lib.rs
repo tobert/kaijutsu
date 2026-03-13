@@ -1393,7 +1393,7 @@ impl KaijutsuMcp {
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
         // when execution completes.
-        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id).await {
+        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
             Err(e) => return format!("Error starting command: {e}"),
         };
@@ -1493,7 +1493,7 @@ impl KaijutsuMcp {
         let actor = &remote.actor;
         let ctx_id = remote.context_id;
 
-        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id).await {
+        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
             Err(e) => return format!("Error starting command: {e}"),
         };

@@ -846,7 +846,7 @@ interface Kernel {
 
   # Shell execution (kaish REPL with block output)
   # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
-  shellExecute @23 (code :Text, contextId :Data, trace :TraceContext) -> (commandBlockId :BlockId);
+  shellExecute @23 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
   getCwd @24 () -> (path :Text);

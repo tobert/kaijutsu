@@ -391,6 +391,7 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         tool_kind: Option<ToolKind>,
+        role: Option<Role>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
@@ -414,7 +415,7 @@ impl BlockStore {
         let header = BlockHeader {
             id,
             parent_id: parent_id.copied(),
-            role: Role::Model,
+            role: role.unwrap_or(Role::Model),
             kind: BlockKind::ToolCall,
             status: Status::Running,
             compacted: false,
@@ -1221,6 +1222,7 @@ mod tests {
                 "read_file",
                 serde_json::json!({"path": "/etc/hosts"}),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1392,7 +1394,7 @@ mod tests {
 
         // Insert a tool call and set tool_use_id
         let tc_id = store
-            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}), None)
+            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}), None, None)
             .unwrap();
         store.set_tool_use_id(&tc_id, Some("toolu_01ABC".to_string())).unwrap();
 

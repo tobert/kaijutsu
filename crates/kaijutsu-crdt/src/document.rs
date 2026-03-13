@@ -588,6 +588,7 @@ impl BlockDocument {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         tool_kind: Option<ToolKind>,
+        role: Option<Role>,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let input_json = serde_json::to_string_pretty(&tool_input)
@@ -597,7 +598,7 @@ impl BlockDocument {
             id,
             parent_id,
             after,
-            Role::Model,
+            role.unwrap_or(Role::Model),
             BlockKind::ToolCall,
             input_json.clone(),
             tool_kind,
@@ -1530,7 +1531,7 @@ mod tests {
         let tool_call_id = doc.insert_tool_call(
             None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
-            None,
+            None, None,
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&tool_call_id).unwrap();
@@ -1861,7 +1862,7 @@ mod tests {
         let tool_call_id = original.insert_tool_call(
             None, None, "read_file",
             serde_json::json!({"path": "/etc/hosts"}),
-            None,
+            None, None,
         ).unwrap();
 
         let _tool_result_id = original.insert_tool_result_block(
