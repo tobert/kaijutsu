@@ -10,11 +10,11 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::integrations::text::VelloFontAxes;
+use bevy_vello::integrations::text::{OverflowWrap, VelloFontAxes};
 use bevy_vello::parley;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont, VelloTextAnchor};
 use bevy_vello::vello;
-use vello::kurbo::{Affine, RoundedRect, Shape, Stroke};
+use vello::kurbo::{Affine, BezPath, Point, RoundedRect, Shape, Stroke};
 use vello::peniko::Fill;
 
 use crate::cell::{InputOverlay, InputOverlayMarker};
@@ -122,6 +122,7 @@ pub fn spawn_input_overlay(
                     weight: Some(200.0),
                     ..default()
                 },
+                overflow_wrap: OverflowWrap::BreakWord,
                 ..default()
             },
             ..default()
@@ -238,10 +239,11 @@ pub fn sync_input_overlay_buffer(
     }
 }
 
-/// Keep InputOverlay's `max_advance` in sync with its `ComputedNode` width.
+/// Keep InputOverlay's `max_advance` in sync with its content-box width.
 ///
-/// This prevents long compose text from overflowing or wrapping unexpectedly.
-/// Runs on `Changed<ComputedNode>` to handle window resizes.
+/// Uses content_box().width() (not border-box size) so Parley wraps text at the
+/// correct boundary — text renders at content-box origin, so the wrap width must
+/// match. Runs on `Changed<ComputedNode>` to handle window resizes.
 pub fn sync_overlay_max_advance(
     mut overlay_query: Query<
         (&mut UiVelloText, &ComputedNode),
@@ -249,7 +251,7 @@ pub fn sync_overlay_max_advance(
     >,
 ) {
     for (mut vello_text, computed_node) in overlay_query.iter_mut() {
-        let width = computed_node.size().x;
+        let width = computed_node.content_box().width();
         if width > 0.0 {
             let new_advance = Some(width);
             if vello_text.max_advance != new_advance {
@@ -305,6 +307,42 @@ pub fn update_overlay_scene(
             continue;
         }
 
+        // Content-box inset: scene draws at border-box origin, text renders at
+        // content-box origin. This offset bridges the two coordinate systems.
+        let cb = computed.content_box();
+        let pad_x = (cb.min.x + size.x / 2.0) as f64;
+        let pad_y = (cb.min.y + size.y / 2.0) as f64;
+
+        let display_str = overlay.display_text();
+        let cursor_byte_offset = overlay.display_cursor_offset();
+
+        // Collect emergency (character) break positions from text layout.
+        // These are lines where BreakWord split a word mid-character — the
+        // border warps outward at these y-positions to signal the split.
+        let mut break_warps: Vec<(f64, f64)> = Vec::new(); // (y, height)
+        let layout = fonts.get(&font_handles.mono).map(|font| {
+            let layout = font.layout(
+                &display_str,
+                &vello_text.style,
+                vello_text.text_align,
+                vello_text.max_advance,
+            );
+            for line in layout.lines() {
+                if matches!(line.break_reason(), parley::layout::BreakReason::Emergency) {
+                    let metrics = line.metrics();
+                    let line_top = pad_y + metrics.baseline as f64 - metrics.ascent as f64;
+                    let line_h = (metrics.ascent + metrics.descent) as f64;
+                    // Use 40% of line height, centered on the line — keeps arcs
+                    // compact and prevents consecutive warps from overlapping.
+                    let warp_h = line_h * 0.4;
+                    let warp_y = line_top + (line_h - warp_h) / 2.0;
+                    break_warps.push((warp_y, warp_h));
+                }
+            }
+            layout
+        });
+
+        // Build panel scene with warped border at character-break positions
         let mut scene = vello::Scene::new();
         build_overlay_panel(
             &mut scene,
@@ -313,57 +351,46 @@ pub fn update_overlay_scene(
             style,
             time.elapsed_secs(),
             summon.progress,
+            &break_warps,
         );
 
-        // Draw cursor using Parley's actual layout positions.
-        // This replaces the manual `col * char_width` calculation which drifted
-        // because font advances don't perfectly match a single-char measurement.
+        // Draw cursor
         if show_cursor && summon.progress > 0.0 {
-            let display_str = overlay.display_text();
-            let cursor_byte_offset = overlay.display_cursor_offset();
+            if let Some(layout) = &layout {
+                let cursor = parley::editing::Cursor::from_byte_index(
+                    layout,
+                    cursor_byte_offset,
+                    parley::layout::Affinity::Upstream,
+                );
+                let geom = cursor.geometry(layout, 2.0);
 
-            let (cursor_x, cursor_y, cursor_h) =
-                if let Some(font) = fonts.get(&font_handles.mono) {
-                    // Lay out with the same style and max_advance as the UiVelloText
-                    let layout = font.layout(
-                        &display_str,
-                        &vello_text.style,
-                        vello_text.text_align,
-                        vello_text.max_advance,
-                    );
-                    let cursor = parley::editing::Cursor::from_byte_index(
-                        &layout,
-                        cursor_byte_offset,
-                        parley::layout::Affinity::Upstream,
-                    );
-                    let geom = cursor.geometry(&layout, 2.0);
-                    (geom.x0, geom.y0, geom.y1 - geom.y0)
-                } else {
-                    // Font not loaded yet — approximate with metrics
-                    let line_height = text_metrics.cell_line_height as f64;
-                    let char_width = text_metrics.cell_char_width as f64;
-                    let col = display_str[..cursor_byte_offset.min(display_str.len())]
-                        .chars()
-                        .count();
-                    (col as f64 * char_width, 0.0, line_height)
-                };
+                draw_cursor_beam(
+                    &mut scene,
+                    pad_x + geom.x0,
+                    pad_y + geom.y0,
+                    geom.y1 - geom.y0,
+                    theme.cursor_insert,
+                    summon.progress,
+                    time.elapsed_secs(),
+                );
+            } else {
+                // Font not loaded yet — approximate with metrics
+                let line_height = text_metrics.cell_line_height as f64;
+                let char_width = text_metrics.cell_char_width as f64;
+                let col = display_str[..cursor_byte_offset.min(display_str.len())]
+                    .chars()
+                    .count();
 
-            // Parley cursor coords are relative to text layout (content-box origin),
-            // but the scene draws at border-box origin. Add content-box inset so
-            // the cursor aligns with the rendered text.
-            let cb = computed.content_box();
-            let pad_x = (cb.min.x + size.x / 2.0) as f64;
-            let pad_y = (cb.min.y + size.y / 2.0) as f64;
-
-            draw_cursor_beam(
-                &mut scene,
-                pad_x + cursor_x,
-                pad_y + cursor_y,
-                cursor_h,
-                theme.cursor_insert,
-                summon.progress,
-                time.elapsed_secs(),
-            );
+                draw_cursor_beam(
+                    &mut scene,
+                    pad_x + col as f64 * char_width,
+                    pad_y,
+                    line_height,
+                    theme.cursor_insert,
+                    summon.progress,
+                    time.elapsed_secs(),
+                );
+            }
         }
 
         *vello_scene = UiVelloScene::from(scene);
@@ -379,8 +406,12 @@ pub fn update_overlay_scene(
 /// Draws:
 /// 1. Multi-pass glow (if enabled)
 /// 2. Filled background (semi-transparent)
-/// 3. Border stroke
+/// 3. Border stroke (warped at character-break positions)
 /// 4. Animation overlay (chase/breathe)
+///
+/// `break_warps` contains (y, height) pairs for lines where BreakWord split
+/// a word mid-character. The right border edge bulges outward at these
+/// positions to visually signal the forced break.
 fn build_overlay_panel(
     scene: &mut vello::Scene,
     width: f64,
@@ -388,6 +419,7 @@ fn build_overlay_panel(
     style: &OverlayStyle,
     time: f32,
     summon_progress: f32,
+    break_warps: &[(f64, f64)],
 ) {
     let alpha = summon_progress * animation_alpha(&style.animation, time);
 
@@ -409,23 +441,128 @@ fn build_overlay_panel(
     let rect = RoundedRect::new(0.0, 0.0, width, height, style.corner_radius as f64);
     scene.fill(Fill::NonZero, Affine::IDENTITY, &bg_brush, None, &rect);
 
-    // 3. Draw border stroke
+    // 3. Draw border stroke — warped right edge if there are character breaks
     let border_brush = apply_alpha(&bevy_color_to_brush(style.border_color), alpha);
     let half_t = style.border_thickness as f64 / 2.0;
-    let border_rect = RoundedRect::new(
-        half_t,
-        half_t,
-        width - half_t,
-        height - half_t,
-        style.corner_radius as f64,
-    );
     let stroke = Stroke::new(style.border_thickness as f64);
-    scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &border_rect);
+
+    if break_warps.is_empty() {
+        // Simple rounded rect when no character breaks
+        let border_rect = RoundedRect::new(
+            half_t,
+            half_t,
+            width - half_t,
+            height - half_t,
+            style.corner_radius as f64,
+        );
+        scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &border_rect);
+    } else {
+        let path = build_warped_border(
+            width, height, half_t,
+            style.corner_radius as f64,
+            break_warps,
+        );
+        scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &path);
+    }
 
     // 4. Chase animation overlay (if active)
     if matches!(style.animation, OverlayAnimation::Chase) {
         draw_chase_overlay(scene, width, height, style, time, alpha);
     }
+}
+
+/// Build a border path with outward bumps on the right edge at character-break
+/// positions. The border is a rounded rect except the right side, which gets
+/// smooth cubic bulges where BreakWord forced a mid-word split.
+fn build_warped_border(
+    width: f64,
+    height: f64,
+    half_t: f64,
+    corner_radius: f64,
+    break_warps: &[(f64, f64)],
+) -> BezPath {
+    let r = corner_radius.min((width - 2.0 * half_t) / 2.0).min((height - 2.0 * half_t) / 2.0);
+    let bulge = 6.0; // How far the border bulges outward
+
+    let left = half_t;
+    let right = width - half_t;
+    let top = half_t;
+    let bottom = height - half_t;
+
+    let mut path = BezPath::new();
+
+    // Start at top-left after corner
+    path.move_to(Point::new(left + r, top));
+
+    // Top edge → top-right corner
+    path.line_to(Point::new(right - r, top));
+    quarter_arc(&mut path, Point::new(right - r, top + r), r, 270.0);
+
+    // Right edge — straight segments with bulges at break positions
+    // Sort warps by y and walk down the right edge
+    let mut sorted_warps: Vec<(f64, f64)> = break_warps.to_vec();
+    sorted_warps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let mut cursor_y = top + r;
+    for &(warp_y, warp_h) in &sorted_warps {
+        // Clamp warp to border bounds
+        let wy = warp_y.max(top + r).min(bottom - r);
+        let wh = warp_h.min(bottom - r - wy);
+        if wh < 2.0 || wy < cursor_y {
+            continue;
+        }
+
+        // Straight segment down to the warp start
+        if wy > cursor_y + 0.5 {
+            path.line_to(Point::new(right, wy));
+        }
+
+        // Smooth outward bulge: cubic bezier with control points pushed right
+        path.curve_to(
+            Point::new(right + bulge, wy + wh * 0.15),
+            Point::new(right + bulge, wy + wh * 0.85),
+            Point::new(right, wy + wh),
+        );
+        cursor_y = wy + wh;
+    }
+
+    // Finish right edge down to bottom-right corner
+    if bottom - r > cursor_y + 0.5 {
+        path.line_to(Point::new(right, bottom - r));
+    }
+
+    // Bottom-right corner
+    quarter_arc(&mut path, Point::new(right - r, bottom - r), r, 0.0);
+
+    // Bottom edge → bottom-left corner
+    path.line_to(Point::new(left + r, bottom));
+    quarter_arc(&mut path, Point::new(left + r, bottom - r), r, 90.0);
+
+    // Left edge → top-left corner
+    path.line_to(Point::new(left, top + r));
+    quarter_arc(&mut path, Point::new(left + r, top + r), r, 180.0);
+
+    path.close_path();
+    path
+}
+
+/// Approximate a 90-degree circular arc using a single cubic bezier.
+/// `center` is the arc center, `start_angle` is in degrees (0 = right, 90 = down).
+fn quarter_arc(path: &mut BezPath, center: Point, r: f64, start_angle_deg: f64) {
+    // Magic number for cubic approximation of quarter circle
+    let k = 0.5522847498;
+    let a = start_angle_deg.to_radians();
+    let cos_a = a.cos();
+    let sin_a = a.sin();
+    let cos_b = (a + std::f64::consts::FRAC_PI_2).cos();
+    let sin_b = (a + std::f64::consts::FRAC_PI_2).sin();
+
+    let p0 = Point::new(center.x + r * cos_a, center.y + r * sin_a);
+    let p3 = Point::new(center.x + r * cos_b, center.y + r * sin_b);
+    let p1 = Point::new(p0.x - r * k * sin_a, p0.y + r * k * cos_a);
+    let p2 = Point::new(p3.x + r * k * sin_b, p3.y - r * k * cos_b);
+
+    path.curve_to(p1, p2, p3);
 }
 
 /// Draw glow effect using multi-pass blur approximation.
