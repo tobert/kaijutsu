@@ -348,10 +348,17 @@ pub fn update_overlay_scene(
                     (col as f64 * char_width, 0.0, line_height)
                 };
 
+            // Parley cursor coords are relative to text layout (content-box origin),
+            // but the scene draws at border-box origin. Add content-box inset so
+            // the cursor aligns with the rendered text.
+            let cb = computed.content_box();
+            let pad_x = (cb.min.x + size.x / 2.0) as f64;
+            let pad_y = (cb.min.y + size.y / 2.0) as f64;
+
             draw_cursor_beam(
                 &mut scene,
-                cursor_x,
-                cursor_y,
+                pad_x + cursor_x,
+                pad_y + cursor_y,
                 cursor_h,
                 theme.cursor_insert,
                 summon.progress,
