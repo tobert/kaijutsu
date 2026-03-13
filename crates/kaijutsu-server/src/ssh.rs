@@ -111,6 +111,8 @@ pub struct SshServerConfig {
     pub allow_anonymous: bool,
     /// Config directory override. None = use XDG default (~/.config/kaijutsu).
     pub config_dir: Option<PathBuf>,
+    /// Data directory override. None = use XDG default (~/.local/share/kaijutsu/kernel).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl SshServerConfig {
@@ -132,7 +134,8 @@ impl SshServerConfig {
             key_source: KeySource::Ephemeral,
             auth_db_path: None,
             allow_anonymous: true, // Tests need to accept any key
-            config_dir: Some(config_dir),
+            config_dir: Some(config_dir.clone()),
+            data_dir: Some(config_dir),
         }
     }
 
@@ -144,6 +147,7 @@ impl SshServerConfig {
             auth_db_path: Some(AuthDb::default_path()),
             allow_anonymous: false,
             config_dir: None, // Use XDG default
+            data_dir: None,   // Use XDG default
         }
     }
 
@@ -303,7 +307,7 @@ impl SshServer {
         let shared_kernel = crate::rpc::create_shared_kernel(
             &mcp_pool,
             self.config.config_dir.as_deref(),
-            None, // data_dir: use XDG default
+            self.config.data_dir.as_deref(),
         ).await.map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
 
         let registry = Arc::new(ServerRegistry {
