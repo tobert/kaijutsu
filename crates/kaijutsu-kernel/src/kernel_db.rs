@@ -122,8 +122,25 @@ pub struct WorkspaceRow {
 pub struct WorkspacePathRow {
     pub workspace_id: WorkspaceId,
     pub path: String,
-    pub mount_point: Option<String>,
+    pub read_only: bool,
     pub created_at: i64,
+}
+
+/// Per-context shell configuration.
+#[derive(Debug, Clone)]
+pub struct ContextShellRow {
+    pub context_id: ContextId,
+    pub cwd: Option<String>,
+    pub init_script: Option<String>,
+    pub updated_at: i64,
+}
+
+/// Per-context environment variable.
+#[derive(Debug, Clone)]
+pub struct ContextEnvRow {
+    pub context_id: ContextId,
+    pub key: String,
+    pub value: String,
 }
 
 /// A context edge row (structural or drift).
@@ -220,10 +237,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_label
 CREATE TABLE IF NOT EXISTS workspace_paths (
     workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     path         TEXT NOT NULL,
-    mount_point  TEXT,
+    read_only    INTEGER NOT NULL DEFAULT 0,
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     PRIMARY KEY (workspace_id, path)
 );
+
+CREATE TABLE IF NOT EXISTS context_shell (
+    context_id  BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+    cwd         TEXT,
+    init_script TEXT,
+    updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
+CREATE TABLE IF NOT EXISTS context_env (
+    context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    PRIMARY KEY (context_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
 "#;
 
 // ============================================================================
@@ -1240,12 +1273,12 @@ impl KernelDb {
     /// Insert a workspace path.
     pub fn insert_workspace_path(&self, row: &WorkspacePathRow) -> KernelDbResult<()> {
         self.conn.execute(
-            "INSERT INTO workspace_paths (workspace_id, path, mount_point, created_at)
+            "INSERT INTO workspace_paths (workspace_id, path, read_only, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 blob_param(row.workspace_id.as_bytes()),
                 row.path,
-                row.mount_point,
+                row.read_only as i64,
                 row.created_at,
             ],
         ).map_err(|e| {
@@ -1263,7 +1296,7 @@ impl KernelDb {
         workspace_id: WorkspaceId,
     ) -> KernelDbResult<Vec<WorkspacePathRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT workspace_id, path, mount_point, created_at
+            "SELECT workspace_id, path, read_only, created_at
              FROM workspace_paths WHERE workspace_id = ?1
              ORDER BY path",
         )?;
@@ -1271,10 +1304,11 @@ impl KernelDb {
         let rows = stmt.query_map(
             params![blob_param(workspace_id.as_bytes())],
             |row| {
+                let ro: i64 = row.get(2)?;
                 Ok(WorkspacePathRow {
                     workspace_id: read_workspace_id(row, 0)?,
                     path: row.get(1)?,
-                    mount_point: row.get(2)?,
+                    read_only: ro != 0,
                     created_at: row.get(3)?,
                 })
             },
@@ -1293,6 +1327,185 @@ impl KernelDb {
             params![blob_param(workspace_id.as_bytes()), path],
         )?;
         Ok(deleted > 0)
+    }
+
+    // ========================================================================
+    // Context Shell Configuration
+    // ========================================================================
+
+    /// Upsert per-context shell configuration (cwd, init_script).
+    pub fn upsert_context_shell(&self, row: &ContextShellRow) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO context_shell (context_id, cwd, init_script, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(context_id) DO UPDATE SET
+                cwd = excluded.cwd,
+                init_script = excluded.init_script,
+                updated_at = excluded.updated_at",
+            params![
+                blob_param(row.context_id.as_bytes()),
+                row.cwd,
+                row.init_script,
+                row.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get per-context shell configuration. Returns None if not set.
+    pub fn get_context_shell(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<ContextShellRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, cwd, init_script, updated_at
+             FROM context_shell WHERE context_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(
+            params![blob_param(context_id.as_bytes())],
+            |row| {
+                Ok(ContextShellRow {
+                    context_id: read_context_id(row, 0)?,
+                    cwd: row.get(1)?,
+                    init_script: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Copy shell config from source to target. Returns true if source had config.
+    pub fn copy_context_shell(
+        &self,
+        source: ContextId,
+        target: ContextId,
+    ) -> KernelDbResult<bool> {
+        let src = match self.get_context_shell(source)? {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let row = ContextShellRow {
+            context_id: target,
+            cwd: src.cwd,
+            init_script: src.init_script,
+            updated_at: now_millis() as i64,
+        };
+        self.upsert_context_shell(&row)?;
+        Ok(true)
+    }
+
+    // ========================================================================
+    // Context Environment Variables
+    // ========================================================================
+
+    /// Set a single environment variable for a context (upsert).
+    pub fn set_context_env(
+        &self,
+        context_id: ContextId,
+        key: &str,
+        value: &str,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO context_env (context_id, key, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(context_id, key) DO UPDATE SET value = excluded.value",
+            params![blob_param(context_id.as_bytes()), key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Get all environment variables for a context.
+    pub fn get_context_env(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Vec<ContextEnvRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, key, value FROM context_env
+             WHERE context_id = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(context_id.as_bytes())],
+            |row| {
+                Ok(ContextEnvRow {
+                    context_id: read_context_id(row, 0)?,
+                    key: row.get(1)?,
+                    value: row.get(2)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Delete a single environment variable. Returns true if it existed.
+    pub fn delete_context_env(
+        &self,
+        context_id: ContextId,
+        key: &str,
+    ) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM context_env WHERE context_id = ?1 AND key = ?2",
+            params![blob_param(context_id.as_bytes()), key],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete all environment variables for a context. Returns count deleted.
+    pub fn clear_context_env(&self, context_id: ContextId) -> KernelDbResult<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM context_env WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Copy all env vars from source to target. Returns count copied.
+    pub fn copy_context_env(
+        &self,
+        source: ContextId,
+        target: ContextId,
+    ) -> KernelDbResult<u64> {
+        let vars = self.get_context_env(source)?;
+        for var in &vars {
+            self.set_context_env(target, &var.key, &var.value)?;
+        }
+        Ok(vars.len() as u64)
+    }
+
+    // ========================================================================
+    // Context Config Fork + Workspace Query
+    // ========================================================================
+
+    /// Copy shell config + env vars from source context to target.
+    /// Called during all fork operations.
+    pub fn fork_context_config(
+        &self,
+        source: ContextId,
+        target: ContextId,
+    ) -> KernelDbResult<()> {
+        self.copy_context_shell(source, target)?;
+        self.copy_context_env(source, target)?;
+        Ok(())
+    }
+
+    /// Get workspace paths for a context (via contexts.workspace_id FK).
+    /// Returns None if context has no workspace bound.
+    pub fn context_workspace_paths(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<Vec<WorkspacePathRow>>> {
+        let ctx = self.get_context(context_id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context_id.short())))?;
+        match ctx.workspace_id {
+            Some(ws_id) => {
+                let paths = self.list_workspace_paths(ws_id)?;
+                Ok(Some(paths))
+            }
+            None => Ok(None),
+        }
     }
 
     // ========================================================================
@@ -1782,13 +1995,13 @@ mod tests {
         let p1 = WorkspacePathRow {
             workspace_id: ws.workspace_id,
             path: "/home/user/src/kaijutsu".into(),
-            mount_point: Some("/mnt/kaijutsu".into()),
+            read_only: false,
             created_at: now,
         };
         let p2 = WorkspacePathRow {
             workspace_id: ws.workspace_id,
             path: "/home/user/src/kaish".into(),
-            mount_point: Some("/mnt/kaish".into()),
+            read_only: false,
             created_at: now,
         };
         db.insert_workspace_path(&p1).unwrap();
@@ -2213,5 +2426,367 @@ mod tests {
             matches!(err, KernelDbError::Validation(_)),
             "expected Validation for FK violation, got: {err}"
         );
+    }
+
+    // ── 23. Context shell CRUD ────────────────────────────────────────
+
+    #[test]
+    fn context_shell_upsert_and_get() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("shell-test"));
+        db.insert_context(&ctx).unwrap();
+
+        // Initially none
+        assert!(db.get_context_shell(ctx.context_id).unwrap().is_none());
+
+        // Insert
+        let row = ContextShellRow {
+            context_id: ctx.context_id,
+            cwd: Some("/home/user/src/kaijutsu".into()),
+            init_script: None,
+            updated_at: now_millis() as i64,
+        };
+        db.upsert_context_shell(&row).unwrap();
+
+        let loaded = db.get_context_shell(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded.cwd, Some("/home/user/src/kaijutsu".into()));
+        assert!(loaded.init_script.is_none());
+
+        // Update (upsert changes cwd)
+        let row2 = ContextShellRow {
+            context_id: ctx.context_id,
+            cwd: Some("/tmp/work".into()),
+            init_script: Some("set -o strict".into()),
+            updated_at: now_millis() as i64,
+        };
+        db.upsert_context_shell(&row2).unwrap();
+
+        let loaded = db.get_context_shell(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded.cwd, Some("/tmp/work".into()));
+        assert_eq!(loaded.init_script, Some("set -o strict".into()));
+    }
+
+    #[test]
+    fn context_shell_get_unknown() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(db.get_context_shell(ContextId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn context_shell_copy() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let src = make_context_row(kid, Some("src"));
+        let tgt = make_context_row(kid, Some("tgt"));
+        db.insert_context(&src).unwrap();
+        db.insert_context(&tgt).unwrap();
+
+        // Copy from context with shell config
+        let row = ContextShellRow {
+            context_id: src.context_id,
+            cwd: Some("/home/user/project".into()),
+            init_script: Some("alias ll='ls -la'".into()),
+            updated_at: now_millis() as i64,
+        };
+        db.upsert_context_shell(&row).unwrap();
+
+        assert!(db.copy_context_shell(src.context_id, tgt.context_id).unwrap());
+
+        let copied = db.get_context_shell(tgt.context_id).unwrap().unwrap();
+        assert_eq!(copied.cwd, Some("/home/user/project".into()));
+        assert_eq!(copied.init_script, Some("alias ll='ls -la'".into()));
+    }
+
+    #[test]
+    fn context_shell_copy_empty() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let src = make_context_row(kid, Some("src"));
+        let tgt = make_context_row(kid, Some("tgt"));
+        db.insert_context(&src).unwrap();
+        db.insert_context(&tgt).unwrap();
+
+        // Copy from context with no shell config → returns false
+        assert!(!db.copy_context_shell(src.context_id, tgt.context_id).unwrap());
+        assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn context_shell_cascade_delete() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("cascade"));
+        db.insert_context(&ctx).unwrap();
+
+        db.upsert_context_shell(&ContextShellRow {
+            context_id: ctx.context_id,
+            cwd: Some("/tmp".into()),
+            init_script: None,
+            updated_at: now_millis() as i64,
+        }).unwrap();
+        assert!(db.get_context_shell(ctx.context_id).unwrap().is_some());
+
+        // Delete context → shell row should cascade
+        db.delete_context(ctx.context_id).unwrap();
+        assert!(db.get_context_shell(ctx.context_id).unwrap().is_none());
+    }
+
+    // ── 24. Context env CRUD ──────────────────────────────────────────
+
+    #[test]
+    fn context_env_set_and_get() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("env-test"));
+        db.insert_context(&ctx).unwrap();
+
+        // Initially empty
+        let vars = db.get_context_env(ctx.context_id).unwrap();
+        assert!(vars.is_empty());
+
+        // Set vars
+        db.set_context_env(ctx.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(ctx.context_id, "EDITOR", "vim").unwrap();
+
+        let vars = db.get_context_env(ctx.context_id).unwrap();
+        assert_eq!(vars.len(), 2);
+        // Ordered by key
+        assert_eq!(vars[0].key, "EDITOR");
+        assert_eq!(vars[0].value, "vim");
+        assert_eq!(vars[1].key, "RUST_LOG");
+        assert_eq!(vars[1].value, "debug");
+    }
+
+    #[test]
+    fn context_env_upsert() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("env-upsert"));
+        db.insert_context(&ctx).unwrap();
+
+        db.set_context_env(ctx.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(ctx.context_id, "RUST_LOG", "trace").unwrap();
+
+        let vars = db.get_context_env(ctx.context_id).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].value, "trace");
+    }
+
+    #[test]
+    fn context_env_get_empty() {
+        let db = KernelDb::in_memory().unwrap();
+        let vars = db.get_context_env(ContextId::new()).unwrap();
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn context_env_delete() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("env-del"));
+        db.insert_context(&ctx).unwrap();
+
+        db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
+        assert!(db.delete_context_env(ctx.context_id, "FOO").unwrap());
+        assert!(!db.delete_context_env(ctx.context_id, "FOO").unwrap()); // already gone
+        assert!(!db.delete_context_env(ctx.context_id, "NEVER_SET").unwrap());
+    }
+
+    #[test]
+    fn context_env_clear() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("env-clear"));
+        db.insert_context(&ctx).unwrap();
+
+        db.set_context_env(ctx.context_id, "A", "1").unwrap();
+        db.set_context_env(ctx.context_id, "B", "2").unwrap();
+        db.set_context_env(ctx.context_id, "C", "3").unwrap();
+
+        assert_eq!(db.clear_context_env(ctx.context_id).unwrap(), 3);
+        assert!(db.get_context_env(ctx.context_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_env_copy() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let src = make_context_row(kid, Some("env-src"));
+        let tgt = make_context_row(kid, Some("env-tgt"));
+        db.insert_context(&src).unwrap();
+        db.insert_context(&tgt).unwrap();
+
+        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
+        db.set_context_env(src.context_id, "SHELL", "/bin/bash").unwrap();
+
+        let count = db.copy_context_env(src.context_id, tgt.context_id).unwrap();
+        assert_eq!(count, 3);
+
+        let vars = db.get_context_env(tgt.context_id).unwrap();
+        assert_eq!(vars.len(), 3);
+    }
+
+    #[test]
+    fn context_env_cascade_delete() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("env-cascade"));
+        db.insert_context(&ctx).unwrap();
+
+        db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
+        db.set_context_env(ctx.context_id, "BAZ", "qux").unwrap();
+
+        db.delete_context(ctx.context_id).unwrap();
+        let vars = db.get_context_env(ctx.context_id).unwrap();
+        assert!(vars.is_empty());
+    }
+
+    // ── 25. Workspace paths with read_only ────────────────────────────
+
+    #[test]
+    fn workspace_path_read_only_roundtrip() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "ro-test".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+
+        let rw = WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src".into(),
+            read_only: false,
+            created_at: now,
+        };
+        let ro = WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/docs".into(),
+            read_only: true,
+            created_at: now,
+        };
+        db.insert_workspace_path(&rw).unwrap();
+        db.insert_workspace_path(&ro).unwrap();
+
+        let paths = db.list_workspace_paths(ws.workspace_id).unwrap();
+        assert_eq!(paths.len(), 2);
+        // Ordered by path
+        assert_eq!(paths[0].path, "/home/user/docs");
+        assert!(paths[0].read_only);
+        assert_eq!(paths[1].path, "/home/user/src");
+        assert!(!paths[1].read_only);
+    }
+
+    // ── 26. Fork context config (composite) ──────────────────────────
+
+    #[test]
+    fn fork_context_config_full() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let src = make_context_row(kid, Some("fork-src"));
+        let tgt = make_context_row(kid, Some("fork-tgt"));
+        db.insert_context(&src).unwrap();
+        db.insert_context(&tgt).unwrap();
+
+        // Set up source with shell config + env vars
+        db.upsert_context_shell(&ContextShellRow {
+            context_id: src.context_id,
+            cwd: Some("/home/user/src/kaijutsu".into()),
+            init_script: None,
+            updated_at: now_millis() as i64,
+        }).unwrap();
+        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
+        db.set_context_env(src.context_id, "TERM", "xterm-256color").unwrap();
+
+        db.fork_context_config(src.context_id, tgt.context_id).unwrap();
+
+        // Shell config copied
+        let shell = db.get_context_shell(tgt.context_id).unwrap().unwrap();
+        assert_eq!(shell.cwd, Some("/home/user/src/kaijutsu".into()));
+
+        // Env vars copied
+        let vars = db.get_context_env(tgt.context_id).unwrap();
+        assert_eq!(vars.len(), 3);
+    }
+
+    #[test]
+    fn fork_context_config_empty_source() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let src = make_context_row(kid, Some("empty-src"));
+        let tgt = make_context_row(kid, Some("empty-tgt"));
+        db.insert_context(&src).unwrap();
+        db.insert_context(&tgt).unwrap();
+
+        // Fork from context with no config → no error, no data on target
+        db.fork_context_config(src.context_id, tgt.context_id).unwrap();
+
+        assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
+        assert!(db.get_context_env(tgt.context_id).unwrap().is_empty());
+    }
+
+    // ── 27. Context workspace paths query ─────────────────────────────
+
+    #[test]
+    fn context_workspace_paths_bound() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let creator = PrincipalId::new();
+        let now = now_millis() as i64;
+
+        let ws = WorkspaceRow {
+            workspace_id: WorkspaceId::new(),
+            kernel_id: kid,
+            label: "project".into(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+            archived_at: None,
+        };
+        db.insert_workspace(&ws).unwrap();
+
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/src/project".into(),
+            read_only: false,
+            created_at: now,
+        }).unwrap();
+        db.insert_workspace_path(&WorkspacePathRow {
+            workspace_id: ws.workspace_id,
+            path: "/home/user/docs".into(),
+            read_only: true,
+            created_at: now,
+        }).unwrap();
+
+        // Create context with workspace bound
+        let mut ctx = make_context_row(kid, Some("bound"));
+        ctx.workspace_id = Some(ws.workspace_id);
+        db.insert_context(&ctx).unwrap();
+
+        let paths = db.context_workspace_paths(ctx.context_id).unwrap();
+        let paths = paths.unwrap();
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn context_workspace_paths_unbound() {
+        let db = KernelDb::in_memory().unwrap();
+        let kid = KernelId::new();
+        let ctx = make_context_row(kid, Some("unbound"));
+        db.insert_context(&ctx).unwrap();
+
+        let paths = db.context_workspace_paths(ctx.context_id).unwrap();
+        assert!(paths.is_none());
     }
 }

@@ -113,6 +113,7 @@ pub use flows::{
 pub use input_doc::InputDocEntry;
 pub use kernel_db::{
     KernelDb, KernelDbError, KernelDbResult,
-    ContextRow, PresetRow, WorkspaceRow, WorkspacePathRow, ContextEdgeRow,
+    ContextRow, ContextShellRow, ContextEnvRow,
+    PresetRow, WorkspaceRow, WorkspacePathRow, ContextEdgeRow,
 };
 pub use kj::{KjDispatcher, KjCaller, KjResult};

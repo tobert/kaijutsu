@@ -4,7 +4,7 @@ use kaijutsu_types::WorkspaceId;
 
 use crate::kernel_db::{WorkspacePathRow, WorkspaceRow};
 
-use super::parse::{extract_named_arg, extract_all_named_args, has_flag};
+use super::parse::{extract_all_named_args, extract_named_arg, has_flag};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 impl KjDispatcher {
@@ -77,12 +77,8 @@ impl KjDispatcher {
                         if !paths.is_empty() {
                             lines.push("Paths:".to_string());
                             for p in &paths {
-                                let mount = p
-                                    .mount_point
-                                    .as_deref()
-                                    .map(|m| format!(" → {m}"))
-                                    .unwrap_or_default();
-                                lines.push(format!("  {}{}", p.path, mount));
+                                let ro = if p.read_only { " (ro)" } else { "" };
+                                lines.push(format!("  {}{}", p.path, ro));
                             }
                         }
                     }
@@ -130,7 +126,7 @@ impl KjDispatcher {
             let path_row = WorkspacePathRow {
                 workspace_id: ws_id,
                 path: path.clone(),
-                mount_point: None,
+                read_only: false,
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_workspace_path(&path_row) {
@@ -157,9 +153,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj workspace add: requires a path".to_string()),
         };
 
-        let mount_point = extract_named_arg(argv, &["--mount", "-m"]);
-        // --read-only is captured but not stored yet (workspace_paths doesn't have a column)
-        let _read_only = has_flag(argv, &["--read-only"]);
+        let read_only = has_flag(argv, &["--read-only"]);
 
         let db = self.kernel_db().lock().unwrap();
         let kernel_id = self.kernel_id();
@@ -173,7 +167,7 @@ impl KjDispatcher {
         let path_row = WorkspacePathRow {
             workspace_id: ws.workspace_id,
             path: path.to_string(),
-            mount_point,
+            read_only,
             created_at: kaijutsu_types::now_millis() as i64,
         };
         match db.insert_workspace_path(&path_row) {
