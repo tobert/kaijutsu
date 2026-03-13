@@ -786,38 +786,101 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
             self.flush_tool_results();
         }
 
-        /// Consume and return final messages, applying trailing-tool-use guard.
+        /// Consume and return final messages, repairing orphaned tool_uses.
+        ///
+        /// The LLM API requires that every assistant message containing
+        /// `tool_use` blocks is immediately followed by a user message with
+        /// matching `tool_result` blocks for **each** tool_use id. Forks,
+        /// interrupts, and pruning can leave orphans anywhere in the history
+        /// — not just at the tail. This pass scans the entire list and
+        /// synthesizes error results for any missing pairings.
         fn into_messages(mut self) -> Vec<Message> {
             self.flush_all();
 
-            // Trailing-tool-use guard: if the last message is an assistant with
-            // tool_uses and no tool_results follow, synthesize error results.
-            if let Some(last) = self.messages.last() {
-                if last.role == Role::Assistant {
-                    if let MessageContent::Blocks(blocks) = &last.content {
-                        let tool_use_ids: Vec<String> = blocks.iter().filter_map(|b| {
+            let mut repaired: Vec<Message> = Vec::with_capacity(self.messages.len() + 4);
+            let len = self.messages.len();
+            let mut i = 0;
+
+            while i < len {
+                let msg = &self.messages[i];
+
+                // Extract tool_use ids from this assistant message (if any).
+                let tool_use_ids: Vec<String> = if msg.role == Role::Assistant {
+                    if let MessageContent::Blocks(blocks) = &msg.content {
+                        blocks.iter().filter_map(|b| {
                             if let ContentBlock::ToolUse { id, .. } = b {
                                 Some(id.clone())
                             } else {
                                 None
                             }
-                        }).collect();
-
-                        if !tool_use_ids.is_empty() {
-                            let error_results: Vec<ContentBlock> = tool_use_ids.into_iter()
-                                .map(|id| ContentBlock::ToolResult {
-                                    tool_use_id: id,
-                                    content: "Tool execution was interrupted (context was forked or pruned)".into(),
-                                    is_error: true,
-                                })
-                                .collect();
-                            self.messages.push(Message::tool_results(error_results));
-                        }
+                        }).collect()
+                    } else {
+                        Vec::new()
                     }
+                } else {
+                    Vec::new()
+                };
+
+                repaired.push(msg.clone());
+
+                if tool_use_ids.is_empty() {
+                    i += 1;
+                    continue;
                 }
+
+                // Collect tool_result ids already present in the next message.
+                let covered: std::collections::HashSet<&str> = self.messages.get(i + 1)
+                    .and_then(|next| {
+                        if next.role != Role::User { return None; }
+                        if let MessageContent::Blocks(blocks) = &next.content {
+                            Some(blocks.iter().filter_map(|b| {
+                                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                                    Some(tool_use_id.as_str())
+                                } else {
+                                    None
+                                }
+                            }).collect())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let missing: Vec<String> = tool_use_ids.into_iter()
+                    .filter(|id| !covered.contains(id.as_str()))
+                    .collect();
+
+                if missing.is_empty() {
+                    i += 1;
+                    continue;
+                }
+
+                let error_results: Vec<ContentBlock> = missing.into_iter()
+                    .map(|id| ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content: "Tool execution was interrupted (context was forked or pruned)".into(),
+                        is_error: true,
+                    })
+                    .collect();
+
+                if covered.is_empty() {
+                    // No tool_result message follows at all — insert one.
+                    repaired.push(Message::tool_results(error_results));
+                } else {
+                    // Next message has *some* results — append the missing ones
+                    // into it so all results stay in one user message.
+                    i += 1;
+                    let mut next = self.messages[i].clone();
+                    if let MessageContent::Blocks(ref mut blocks) = next.content {
+                        blocks.extend(error_results);
+                    }
+                    repaired.push(next);
+                }
+
+                i += 1;
             }
 
-            self.messages
+            repaired
         }
     }
 
@@ -1613,6 +1676,117 @@ mod tests {
             assert_eq!(msgs[2].role, Role::User);
             assert!(msgs[2].as_text().unwrap().contains("[User ran `sleep 10`]"));
             assert!(msgs[2].as_text().unwrap().contains("done sleeping"));
+        }
+
+        #[test]
+        fn mid_conversation_orphaned_tool_use_gets_synthetic_result() {
+            // Simulates a forked context: model requested a tool, no result came,
+            // then the user typed more messages. The API requires every tool_use
+            // to have a matching tool_result in the immediately following user
+            // message — not just at the tail.
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Do it"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 0), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "cargo build"}),
+                    BlockRole::Model, Some("toolu_orphan_mid".into()),
+                ),
+                // No tool result! Then user typed again in the forked context:
+                BlockSnapshot::text(BlockId::new(c, u, 1), None, BlockRole::User, "how about now?"),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Let me try again"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+
+            // Should be: user, assistant(tool_use), user(synthetic error result), user, assistant
+            assert_eq!(msgs.len(), 5, "expected 5 messages, got {}: {:?}",
+                msgs.len(), msgs.iter().map(|m| format!("{:?}", m.role)).collect::<Vec<_>>());
+
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[0].as_text(), Some("Do it"));
+
+            assert_eq!(msgs[1].role, Role::Assistant);
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => {
+                    assert!(blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "toolu_orphan_mid")));
+                }
+                _ => panic!("Expected Blocks with ToolUse"),
+            }
+
+            // Synthetic error result inserted
+            assert_eq!(msgs[2].role, Role::User);
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 1);
+                    match &blocks[0] {
+                        ContentBlock::ToolResult { tool_use_id, is_error, content } => {
+                            assert_eq!(tool_use_id, "toolu_orphan_mid");
+                            assert!(is_error);
+                            assert!(content.contains("interrupted"));
+                        }
+                        _ => panic!("Expected ToolResult"),
+                    }
+                }
+                _ => panic!("Expected Blocks with synthetic ToolResult"),
+            }
+
+            assert_eq!(msgs[3].as_text(), Some("how about now?"));
+            assert_eq!(msgs[4].as_text(), Some("Let me try again"));
+        }
+
+        #[test]
+        fn mid_conversation_partial_tool_results_get_filled() {
+            // Two tool_uses, only one result — the missing one gets synthesized.
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Build and test"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 0), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "cargo build"}),
+                    BlockRole::Model, Some("toolu_build".into()),
+                ),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 1), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "cargo test"}),
+                    BlockRole::Model, Some("toolu_test".into()),
+                ),
+                // Only the first tool result arrived before fork/interrupt
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 0), BlockId::new(c, m, 0), ToolKind::Shell,
+                    "ok", false, Some(0), Some("toolu_build".into()),
+                ),
+                // User typed again
+                BlockSnapshot::text(BlockId::new(c, u, 1), None, BlockRole::User, "what happened?"),
+                BlockSnapshot::text(BlockId::new(c, m, 2), None, BlockRole::Model, "Sorry about that"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+
+            // Find the tool_results message and verify both IDs are covered
+            let tool_result_msg = &msgs[2];
+            assert_eq!(tool_result_msg.role, Role::User);
+            match &tool_result_msg.content {
+                MessageContent::Blocks(blocks) => {
+                    let result_ids: Vec<&str> = blocks.iter().filter_map(|b| {
+                        if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                            Some(tool_use_id.as_str())
+                        } else {
+                            None
+                        }
+                    }).collect();
+                    assert!(result_ids.contains(&"toolu_build"), "missing toolu_build: {:?}", result_ids);
+                    assert!(result_ids.contains(&"toolu_test"), "missing toolu_test: {:?}", result_ids);
+                }
+                _ => panic!("Expected Blocks with ToolResults"),
+            }
         }
 
         #[test]
