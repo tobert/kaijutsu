@@ -83,6 +83,7 @@ fn extract_rpc_trace(trace: capnp::Result<trace_context::Reader<'_>>, name: &'st
 async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
+    workspace_guard: Option<kaijutsu_kernel::file_tools::WorkspaceGuard>,
 ) {
 
     let current = crate::context_engine::current_context();
@@ -139,25 +140,26 @@ async fn register_block_tools(
     // ── File tools (CRDT-backed) ──
     // default_root removed from glob/grep — engines now read cwd from ToolContext at call time
     let file_cache = Arc::new(FileDocumentCache::new(documents.clone(), kernel.vfs().clone()));
+    let g = &workspace_guard; // borrow for closures below
     kernel.register_tool_with_engine(
         ToolInfo::new("read", "Read file content with optional line numbers", "file"),
-        Arc::new(ReadEngine::new(file_cache.clone())),
+        Arc::new(match g { Some(g) => ReadEngine::new(file_cache.clone()).with_guard(g.clone()), None => ReadEngine::new(file_cache.clone()) }),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
-        Arc::new(EditEngine::new(file_cache.clone())),
+        Arc::new(match g { Some(g) => EditEngine::new(file_cache.clone()).with_guard(g.clone()), None => EditEngine::new(file_cache.clone()) }),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("write", "Write or create a file with the given content", "file"),
-        Arc::new(WriteEngine::new(file_cache.clone())),
+        Arc::new(match g { Some(g) => WriteEngine::new(file_cache.clone()).with_guard(g.clone()), None => WriteEngine::new(file_cache.clone()) }),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
-        Arc::new(GlobEngine::new(kernel.vfs().clone())),
+        Arc::new(match g { Some(g) => GlobEngine::new(kernel.vfs().clone()).with_guard(g.clone()), None => GlobEngine::new(kernel.vfs().clone()) }),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("grep", "Search file content with regex", "file"),
-        Arc::new(GrepEngine::new(file_cache.clone(), kernel.vfs().clone())),
+        Arc::new(match g { Some(g) => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()).with_guard(g.clone()), None => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()) }),
     ).await;
     kernel.register_tool_with_engine(
         ToolInfo::new("whoami", "Show current context identity", "drift"),
@@ -740,12 +742,17 @@ pub async fn create_shared_kernel(
 
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
-    register_block_tools(&kernel_arc, documents.clone()).await;
+    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
+    let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
+        kernel_db_arc.clone(),
+    ));
+    register_block_tools(&kernel_arc, documents.clone(), workspace_guard).await;
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
-    {
+    let all_contexts = {
+        let db = kernel_db_arc.lock().unwrap();
         // Step 1: Load active contexts from KernelDb
-        let db_contexts = match kernel_db.list_active_contexts(id) {
+        let db_contexts = match db.list_active_contexts(id) {
             Ok(rows) => rows,
             Err(e) => {
                 log::warn!("Failed to load contexts from KernelDb: {}", e);
@@ -775,7 +782,7 @@ pub async fn create_shared_kernel(
                     workspace_id: None,
                     preset_id: None,
                 };
-                if let Err(e) = kernel_db.insert_context(&row) {
+                if let Err(e) = db.insert_context(&row) {
                     log::warn!("Failed to bootstrap context {} into KernelDb: {}", bs_ctx_id.short(), e);
                 } else {
                     log::info!("Bootstrapped context {} into KernelDb from BlockStore", bs_ctx_id.short());
@@ -783,32 +790,31 @@ pub async fn create_shared_kernel(
             }
         }
 
-        // Step 3: Re-read all active contexts and register into DriftRouter with full metadata
-        let all_contexts = match kernel_db.list_active_contexts(id) {
+        // Step 3: Re-read all active contexts (lock dropped after this block)
+        match db.list_active_contexts(id) {
             Ok(rows) => rows,
             Err(e) => {
                 log::warn!("Failed to re-read contexts from KernelDb: {}", e);
                 Vec::new()
             }
-        };
+        }
+    }; // db lock dropped here — safe to await below
 
-        if !all_contexts.is_empty() {
-            let mut drift = kernel_arc.drift().write().await;
-            for row in &all_contexts {
-                drift.register(row.context_id, row.label.as_deref(), row.forked_from, row.created_by);
-                // Restore provider/model if set
-                if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
-                    let _ = drift.configure_llm(row.context_id, provider, model);
-                }
-                // Restore per-context tool filter
-                if row.tool_filter.is_some() {
-                    let _ = drift.configure_tools(row.context_id, row.tool_filter.clone());
-                }
-                log::info!(
-                    "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
-                    row.context_id.short(), row.label, row.provider,
-                );
+    // Register recovered contexts into DriftRouter
+    if !all_contexts.is_empty() {
+        let mut drift = kernel_arc.drift().write().await;
+        for row in &all_contexts {
+            drift.register(row.context_id, row.label.as_deref(), row.forked_from, row.created_by);
+            if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
+                let _ = drift.configure_llm(row.context_id, provider, model);
             }
+            if row.tool_filter.is_some() {
+                let _ = drift.configure_tools(row.context_id, row.tool_filter.clone());
+            }
+            log::info!(
+                "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
+                row.context_id.short(), row.label, row.provider,
+            );
         }
     }
 
@@ -860,7 +866,6 @@ pub async fn create_shared_kernel(
     };
 
     // Create kj dispatcher — shared across all connections
-    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
     let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new(
         kernel_arc.drift().clone(),
         documents.clone(),

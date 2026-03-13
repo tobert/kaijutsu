@@ -8,15 +8,22 @@ use serde::Deserialize;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 use super::cache::FileDocumentCache;
+use super::guard::WorkspaceGuard;
 
 /// Engine for editing files via exact string replacement.
 pub struct EditEngine {
     cache: Arc<FileDocumentCache>,
+    guard: Option<WorkspaceGuard>,
 }
 
 impl EditEngine {
     pub fn new(cache: Arc<FileDocumentCache>) -> Self {
-        Self { cache }
+        Self { cache, guard: None }
+    }
+
+    pub fn with_guard(mut self, guard: WorkspaceGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -65,12 +72,18 @@ impl ExecutionEngine for EditEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.edit")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.edit")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: EditParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
+
+        if let Some(ref guard) = self.guard {
+            if let Err(denied) = guard.check_write(ctx, &p.path) {
+                return Ok(denied);
+            }
+        }
 
         if p.old_string == p.new_string {
             return Ok(ExecResult::failure(1, "old_string and new_string are identical"));

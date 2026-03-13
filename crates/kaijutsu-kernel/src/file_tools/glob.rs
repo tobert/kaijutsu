@@ -9,16 +9,23 @@ use serde::Deserialize;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use crate::vfs::MountTable;
 
+use super::guard::WorkspaceGuard;
 use super::vfs_walker::VfsWalkerAdapter;
 
 /// Engine for glob pattern matching over the VFS.
 pub struct GlobEngine {
     vfs: Arc<MountTable>,
+    guard: Option<WorkspaceGuard>,
 }
 
 impl GlobEngine {
     pub fn new(vfs: Arc<MountTable>) -> Self {
-        Self { vfs }
+        Self { vfs, guard: None }
+    }
+
+    pub fn with_guard(mut self, guard: WorkspaceGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -78,6 +85,12 @@ impl ExecutionEngine for GlobEngine {
             }
             None => std::path::PathBuf::from(base),
         };
+
+        if let Some(ref guard) = self.guard {
+            if let Err(denied) = guard.check_read(ctx, &search_root.to_string_lossy()) {
+                return Ok(denied);
+            }
+        }
 
         let adapter = VfsWalkerAdapter(&self.vfs);
         let options = WalkOptions {

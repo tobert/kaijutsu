@@ -8,15 +8,22 @@ use serde::Deserialize;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 use super::cache::FileDocumentCache;
+use super::guard::WorkspaceGuard;
 
 /// Engine for writing/creating files.
 pub struct WriteEngine {
     cache: Arc<FileDocumentCache>,
+    guard: Option<WorkspaceGuard>,
 }
 
 impl WriteEngine {
     pub fn new(cache: Arc<FileDocumentCache>) -> Self {
-        Self { cache }
+        Self { cache, guard: None }
+    }
+
+    pub fn with_guard(mut self, guard: WorkspaceGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -53,12 +60,18 @@ impl ExecutionEngine for WriteEngine {
         }))
     }
 
-    #[tracing::instrument(skip(self, params, _ctx), name = "engine.write")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, params, ctx), name = "engine.write")]
+    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         let p: WriteParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
+
+        if let Some(ref guard) = self.guard {
+            if let Err(denied) = guard.check_write(ctx, &p.path) {
+                return Ok(denied);
+            }
+        }
 
         match self.cache.create_or_replace(&p.path, &p.content).await {
             Ok(_) => {

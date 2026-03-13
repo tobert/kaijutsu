@@ -10,17 +10,24 @@ use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use crate::vfs::{MountTable, VfsOps};
 
 use super::cache::FileDocumentCache;
+use super::guard::WorkspaceGuard;
 use super::vfs_walker::VfsWalkerAdapter;
 
 /// Engine for searching file content with regex.
 pub struct GrepEngine {
     cache: Arc<FileDocumentCache>,
     vfs: Arc<MountTable>,
+    guard: Option<WorkspaceGuard>,
 }
 
 impl GrepEngine {
     pub fn new(cache: Arc<FileDocumentCache>, vfs: Arc<MountTable>) -> Self {
-        Self { cache, vfs }
+        Self { cache, vfs, guard: None }
+    }
+
+    pub fn with_guard(mut self, guard: WorkspaceGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -98,6 +105,13 @@ impl ExecutionEngine for GrepEngine {
 
         let default_root = ctx.cwd.to_string_lossy();
         let search_root = p.path.as_deref().unwrap_or(&default_root);
+
+        if let Some(ref guard) = self.guard {
+            if let Err(denied) = guard.check_read(ctx, search_root) {
+                return Ok(denied);
+            }
+        }
+
         let adapter = VfsWalkerAdapter(&self.vfs);
 
         let options = WalkOptions {
