@@ -5,6 +5,7 @@ Drift transfers knowledge between contexts without sharing conversation history.
 ## When to Use What
 
 - **push** — You have a specific fact to share. Fast, no LLM. Stages only; run `flush` to deliver.
+  - Use `--summarize` (`-s`) to LLM-distill your whole context instead of sending literal content.
 - **pull** — You want a digest of another context's work. LLM reads their blocks and writes a summary into yours.
 - **merge** — Your fork is done. LLM summarizes your work into the parent context.
 
@@ -24,6 +25,7 @@ kj drift flush                     # deliver remaining
 
 ```
 push <dst> <content>     Stage content for target context
+push <dst> --summarize   Stage LLM-distilled summary of your context
 pull <src> [prompt]      Pull + LLM-distill from source
 merge [ctx]              Summarize this fork back into parent
 flush                    Deliver all staged drifts

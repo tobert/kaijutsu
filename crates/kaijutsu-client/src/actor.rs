@@ -72,12 +72,8 @@ pub enum ActorError {
 #[allow(clippy::large_enum_variant)]
 enum RpcCommand {
     // ── Drift ────────────────────────────────────────────────────────────
-    DriftPush { target_ctx: ContextId, content: String, summarize: bool, reply: oneshot::Sender<Result<u64, ActorError>> },
-    DriftFlush { reply: oneshot::Sender<Result<u32, ActorError>> },
     DriftQueue { reply: oneshot::Sender<Result<Vec<StagedDriftInfo>, ActorError>> },
     DriftCancel { staged_id: u64, reply: oneshot::Sender<Result<bool, ActorError>> },
-    DriftPull { source_ctx: ContextId, prompt: Option<String>, reply: oneshot::Sender<Result<BlockId, ActorError>> },
-    DriftMerge { source_ctx: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
 
     // ── Context ──────────────────────────────────────────────────────────
     GetContextId { reply: oneshot::Sender<Result<(ContextId, String), ActorError>> },
@@ -153,12 +149,8 @@ impl RpcCommand {
     /// Send an error reply without matching all variant fields.
     fn reply_err(self, err: ActorError) {
         match self {
-            Self::DriftPush { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::DriftFlush { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftQueue { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::DriftPull { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::DriftMerge { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -278,25 +270,6 @@ impl ActorHandle {
 
     // ── Drift ────────────────────────────────────────────────────────────
 
-    /// Stage a drift push to another context.
-    #[tracing::instrument(skip(self, content))]
-    pub async fn drift_push(
-        &self,
-        target_ctx: ContextId,
-        content: &str,
-        summarize: bool,
-    ) -> Result<u64, ActorError> {
-        self.send(|reply| RpcCommand::DriftPush {
-            target_ctx, content: content.into(), summarize, reply,
-        }).await
-    }
-
-    /// Flush all staged drifts.
-    #[tracing::instrument(skip(self))]
-    pub async fn drift_flush(&self) -> Result<u32, ActorError> {
-        self.send(|reply| RpcCommand::DriftFlush { reply }).await
-    }
-
     /// View the drift staging queue.
     #[tracing::instrument(skip(self))]
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, ActorError> {
@@ -307,24 +280,6 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn drift_cancel(&self, staged_id: u64) -> Result<bool, ActorError> {
         self.send(|reply| RpcCommand::DriftCancel { staged_id, reply }).await
-    }
-
-    /// Pull summarized content from another context.
-    #[tracing::instrument(skip(self, prompt))]
-    pub async fn drift_pull(
-        &self,
-        source_ctx: ContextId,
-        prompt: Option<&str>,
-    ) -> Result<BlockId, ActorError> {
-        self.send(|reply| RpcCommand::DriftPull {
-            source_ctx, prompt: prompt.map(String::from), reply,
-        }).await
-    }
-
-    /// Merge a forked context back into its parent.
-    #[tracing::instrument(skip(self))]
-    pub async fn drift_merge(&self, source_ctx: ContextId) -> Result<BlockId, ActorError> {
-        self.send(|reply| RpcCommand::DriftMerge { source_ctx, reply }).await
     }
 
     // ── Context ──────────────────────────────────────────────────────────
@@ -1054,23 +1009,11 @@ async fn dispatch_command(
 ) {
     match cmd {
         // ── Drift ────────────────────────────────────────────────
-        RpcCommand::DriftPush { target_ctx, content, summarize, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_push(target_ctx, &content, summarize));
-        }
-        RpcCommand::DriftFlush { reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_flush());
-        }
         RpcCommand::DriftQueue { reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.drift_queue());
         }
         RpcCommand::DriftCancel { staged_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.drift_cancel(staged_id));
-        }
-        RpcCommand::DriftPull { source_ctx, prompt, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_pull(source_ctx, prompt.as_deref()));
-        }
-        RpcCommand::DriftMerge { source_ctx, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.drift_merge(source_ctx));
         }
 
         // ── Context ──────────────────────────────────────────────

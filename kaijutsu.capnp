@@ -959,10 +959,10 @@ interface Kernel {
   # If contextId is empty/missing, uses the connection's current context.
   configureLlm @58 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
 
-  # Push content to another context's staging queue
+  # REMOVED pre-1.0: use shell_execute("kj drift push ...") instead
   driftPush @59 (targetCtx :Data, content :Text, summarize :Bool, trace :TraceContext) -> (stagedId :UInt64);
 
-  # Flush all staged drifts (inject into target kernels)
+  # REMOVED pre-1.0: use shell_execute("kj drift flush") instead
   driftFlush @60 (trace :TraceContext) -> (count :UInt32);
 
   # List staged drifts pending flush
@@ -971,10 +971,10 @@ interface Kernel {
   # Cancel a staged drift by ID
   driftCancel @62 (stagedId :UInt64) -> (success :Bool);
 
-  # Pull summarized content from another context
+  # REMOVED pre-1.0: use shell_execute("kj drift pull ...") instead
   driftPull @63 (sourceCtx :Data, prompt :Text, trace :TraceContext) -> (blockId :BlockId);
 
-  # Merge a forked context back into its parent
+  # REMOVED pre-1.0: use shell_execute("kj drift merge ...") instead
   driftMerge @64 (sourceCtx :Data, trace :TraceContext) -> (blockId :BlockId);
 
   # Rename a context's label

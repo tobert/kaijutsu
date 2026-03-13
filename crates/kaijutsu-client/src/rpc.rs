@@ -939,45 +939,6 @@ impl KernelHandle {
         }
     }
 
-    /// Stage a drift push to another context.
-    #[tracing::instrument(skip(self, content), name = "rpc_client.drift_push")]
-    pub async fn drift_push(
-        &self,
-        target_ctx: ContextId,
-        content: &str,
-        summarize: bool,
-    ) -> Result<u64, RpcError> {
-        let mut request = self.kernel.drift_push_request();
-        {
-            let mut params = request.get();
-            params.set_target_ctx(target_ctx.as_bytes());
-            params.set_content(content);
-            params.set_summarize(summarize);
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        Ok(response.get()?.get_staged_id())
-    }
-
-    /// Flush all staged drifts.
-    #[tracing::instrument(skip(self), name = "rpc_client.drift_flush")]
-    pub async fn drift_flush(&self) -> Result<u32, RpcError> {
-        let mut request = self.kernel.drift_flush_request();
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        Ok(response.get()?.get_count())
-    }
-
     /// View the drift staging queue.
     #[tracing::instrument(skip(self), name = "rpc_client.drift_queue")]
     pub async fn drift_queue(&self) -> Result<Vec<StagedDriftInfo>, RpcError> {
@@ -1014,54 +975,6 @@ impl KernelHandle {
         request.get().set_staged_id(staged_id);
         let response = request.send().promise.await?;
         Ok(response.get()?.get_success())
-    }
-
-    /// Pull summarized content from another context into this one.
-    ///
-    /// Reads the source context's conversation, distills it via LLM,
-    /// and injects the summary as a Drift block in this kernel's document.
-    #[tracing::instrument(skip(self, prompt), name = "rpc_client.drift_pull")]
-    pub async fn drift_pull(
-        &self,
-        source_ctx: ContextId,
-        prompt: Option<&str>,
-    ) -> Result<BlockId, RpcError> {
-        let mut request = self.kernel.drift_pull_request();
-        request.get().set_source_ctx(source_ctx.as_bytes());
-        if let Some(p) = prompt {
-            request.get().set_prompt(p);
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let block_id_reader = response.get()?.get_block_id()?;
-        parse_block_id(&block_id_reader)
-    }
-
-    /// Merge a forked context back into its parent.
-    ///
-    /// Distills the source context's conversation and injects the summary
-    /// into the parent context as a Drift block with DriftKind::Merge.
-    #[tracing::instrument(skip(self), name = "rpc_client.drift_merge")]
-    pub async fn drift_merge(
-        &self,
-        source_ctx: ContextId,
-    ) -> Result<BlockId, RpcError> {
-        let mut request = self.kernel.drift_merge_request();
-        request.get().set_source_ctx(source_ctx.as_bytes());
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let block_id_reader = response.get()?.get_block_id()?;
-        parse_block_id(&block_id_reader)
     }
 
     /// Rename a context's human-friendly label.

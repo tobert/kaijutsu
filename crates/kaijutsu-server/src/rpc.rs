@@ -723,6 +723,10 @@ pub async fn create_shared_kernel(
     // Read-write /tmp for scratch/interop with external tools
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
+    // Freeze the mount table — security perimeter is now fixed.
+    // No more mount/unmount via RPC after this point.
+    kernel.freeze_mounts();
+
     // Create block store with database persistence and shared FlowBus
     let block_flows_for_index = block_flows.clone();
     let documents = create_block_store_with_db(
@@ -1187,7 +1191,11 @@ impl kernel::Server for KernelImpl {
                 LocalBackend::read_only(source_path)
             };
 
-            kernel_arc.mount(&path, backend).await;
+            if !kernel_arc.mount(&path, backend).await {
+                return Err(capnp::Error::failed(
+                    "mount table is frozen — mounts cannot be changed at runtime".to_string(),
+                ));
+            }
             Ok(())
         }.instrument(span))
     }
@@ -3457,167 +3465,26 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
+    // REMOVED pre-1.0: use shell_execute("kj drift push ...") instead
     fn drift_push(
         self: Rc<Self>,
-        params: kernel::DriftPushParams,
-        mut results: kernel::DriftPushResults,
+        _params: kernel::DriftPushParams,
+        _results: kernel::DriftPushResults,
     ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_push");
-        // Schema: driftPush(targetCtx :Data, content, summarize, trace)
-        let target_ctx_bytes = pry!(params_reader.get_target_ctx());
-        let target_ctx = pry!(ContextId::try_from_slice(target_ctx_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid target context ID".into())));
-        let content = pry!(pry!(params_reader.get_content()).to_str()).to_owned();
-        let summarize = params_reader.get_summarize();
-
-        let source_ctx = pry!(self.connection.borrow().require_context());
-        let kernel_arc = self.kernel.kernel.clone();
-        let documents = self.kernel.documents.clone();
-
-        Promise::from_future(async move {
-            let drift_ref = kernel_arc.drift();
-            let (source_model, trace_id) = {
-                let drift = drift_ref.read().await;
-                let model = drift.get(source_ctx).and_then(|h| h.model.clone());
-                let tid = drift.get(source_ctx).map(|h| h.trace_id).unwrap_or([0u8; 16]);
-                (model, tid)
-            };
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_push").entered();
-
-            if !summarize {
-                // Direct push — no LLM needed
-                let mut drift = drift_ref.write().await;
-                match drift.stage(
-                    source_ctx,
-                    target_ctx,
-                    content,
-                    source_model,
-                    kaijutsu_crdt::DriftKind::Push,
-                ) {
-                    Ok(staged_id) => {
-                        results.get().set_staged_id(staged_id);
-                        log::info!("Drift staged: {} → {} (id={})", source_ctx, target_ctx, staged_id);
-                    }
-                    Err(e) => {
-                        return Err(capnp::Error::failed(format!("drift push failed: {}", e)));
-                    }
-                }
-                return Ok(());
-            }
-
-            // Summarize path — async LLM call
-            let provider = {
-                let registry = kernel_arc.llm().read().await;
-                registry.default_provider().ok_or_else(|| {
-                    capnp::Error::failed("LLM provider not configured — cannot summarize (check llm.rhai)".into())
-                })?
-            };
-
-            let blocks = documents.block_snapshots(source_ctx)
-                .map_err(|e| capnp::Error::failed(format!("failed to read blocks: {}", e)))?;
-
-            let user_prompt = kaijutsu_kernel::build_distillation_prompt(&blocks, None);
-
-            let model = source_model.as_deref().unwrap_or_else(|| {
-                provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
-            });
-
-            log::info!("Distilling {} blocks from {} for push to {} (model={})",
-                blocks.len(), source_ctx, target_ctx, model);
-
-            let summary = provider
-                .prompt_with_system(
-                    model,
-                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
-                    &user_prompt,
-                )
-                .await
-                .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
-
-            let mut drift = drift_ref.write().await;
-            match drift.stage(
-                source_ctx,
-                target_ctx,
-                summary,
-                Some(model.to_string()),
-                kaijutsu_crdt::DriftKind::Distill,
-            ) {
-                Ok(staged_id) => {
-                    results.get().set_staged_id(staged_id);
-                    log::info!("Drift staged (distilled): {} → {} (id={})", source_ctx, target_ctx, staged_id);
-                }
-                Err(e) => {
-                    return Err(capnp::Error::failed(format!("drift push failed: {}", e)));
-                }
-            }
-
-            Ok(())
-        }.instrument(trace_span))
+        Promise::err(capnp::Error::failed(
+            "driftPush removed — use shell_execute(\"kj drift push <ctx> <content>\")".into(),
+        ))
     }
 
+    // REMOVED pre-1.0: use shell_execute("kj drift flush") instead
     fn drift_flush(
         self: Rc<Self>,
-        params: kernel::DriftFlushParams,
-        mut results: kernel::DriftFlushResults,
+        _params: kernel::DriftFlushParams,
+        _results: kernel::DriftFlushResults,
     ) -> Promise<(), capnp::Error> {
-        let trace_span = extract_rpc_trace(pry!(params.get()).get_trace(), "drift_flush");
-        let caller_ctx = pry!(self.connection.borrow().require_context());
-        let kernel_arc = self.kernel.kernel.clone();
-        let documents = self.kernel.documents.clone();
-
-        Promise::from_future(async move {
-            let trace_id = {
-                let drift = kernel_arc.drift().read().await;
-                drift.get(caller_ctx).map(|h| h.trace_id).unwrap_or([0u8; 16])
-            };
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_flush").entered();
-
-            let mut drift = kernel_arc.drift().write().await;
-            let staged = drift.drain(Some(caller_ctx));
-            let count = staged.len() as u32;
-            let mut failed: Vec<kaijutsu_kernel::StagedDrift> = Vec::new();
-
-            for drift_item in staged {
-                if drift.get(drift_item.target_ctx).is_none() {
-                    log::warn!("Drift flush: target context {} not found, re-queuing", drift_item.target_ctx);
-                    failed.push(drift_item);
-                    continue;
-                }
-
-                let target_ctx = drift_item.target_ctx;
-                let after = documents.last_block_id(target_ctx);
-
-                match documents.insert_drift_block_as(
-                    target_ctx,
-                    None,
-                    after.as_ref(),
-                    drift_item.content.clone(),
-                    drift_item.source_ctx,
-                    drift_item.source_model.clone(),
-                    drift_item.drift_kind,
-                    Some(PrincipalId::system()),
-                ) {
-                    Ok(block_id) => {
-                        log::info!("Drift flushed: {} → {} (block={})",
-                            drift_item.source_ctx, drift_item.target_ctx, block_id.to_key());
-                    }
-                    Err(e) => {
-                        log::error!("Drift flush failed for {} → {}: {}, re-queuing",
-                            drift_item.source_ctx, drift_item.target_ctx, e);
-                        failed.push(drift_item);
-                    }
-                }
-            }
-
-            if !failed.is_empty() {
-                log::warn!("Re-queued {} failed drift items", failed.len());
-                drift.requeue(failed);
-            }
-
-            results.get().set_count(count);
-            Ok(())
-        }.instrument(trace_span))
+        Promise::err(capnp::Error::failed(
+            "driftFlush removed — use shell_execute(\"kj drift flush\")".into(),
+        ))
     }
 
     fn drift_queue(
@@ -3665,186 +3532,26 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
+    // REMOVED pre-1.0: use shell_execute("kj drift pull ...") instead
     fn drift_pull(
         self: Rc<Self>,
-        params: kernel::DriftPullParams,
-        mut results: kernel::DriftPullResults,
+        _params: kernel::DriftPullParams,
+        _results: kernel::DriftPullResults,
     ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_pull");
-        // Schema: driftPull(sourceCtx :Data, prompt, trace)
-        let source_ctx_bytes = pry!(params_reader.get_source_ctx());
-        let source_ctx_id = pry!(ContextId::try_from_slice(source_ctx_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid source context ID".into())));
-        let directed_prompt = params_reader.get_prompt().ok()
-            .and_then(|p| p.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned());
-
-        let kernel = self.kernel.clone();
-        let target_ctx_id = pry!(self.connection.borrow().require_context());
-
-        Promise::from_future(async move {
-            let kernel_arc = kernel.kernel.clone();
-            let target_docs = kernel.documents.clone();
-
-            let (source_model, trace_id) = {
-                let drift = kernel_arc.drift().read().await;
-                let source_handle = drift.get(source_ctx_id)
-                    .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
-                let source_model = source_handle.model.clone();
-                let trace_id = drift.get(target_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
-                (source_model, trace_id)
-            };
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_pull").entered();
-
-            // Get LLM provider from kernel's registry
-            let provider = {
-                let registry = kernel_arc.llm().read().await;
-                registry.default_provider().ok_or_else(|| {
-                    capnp::Error::failed("LLM provider not configured — cannot pull (check llm.rhai)".into())
-                })?
-            };
-
-            // Read source context's blocks
-            let blocks = kernel.documents.block_snapshots(source_ctx_id)
-                .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
-
-            let user_prompt = kaijutsu_kernel::build_distillation_prompt(
-                &blocks,
-                directed_prompt.as_deref(),
-            );
-
-            let model = source_model.as_deref().unwrap_or_else(|| {
-                provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
-            });
-
-            log::info!("Pulling from {} ({} blocks, model={}) → {}",
-                source_ctx_id, blocks.len(), model, target_ctx_id);
-
-            let summary = provider
-                .prompt_with_system(
-                    model,
-                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
-                    &user_prompt,
-                )
-                .await
-                .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
-
-            // Insert drift block directly into target (caller's) document
-            let after = target_docs.last_block_id(target_ctx_id);
-
-            let block_id = target_docs.insert_drift_block_as(
-                target_ctx_id,
-                None,
-                after.as_ref(),
-                summary,
-                source_ctx_id,
-                Some(model.to_string()),
-                kaijutsu_crdt::DriftKind::Pull,
-                Some(PrincipalId::system()),
-            ).map_err(|e| capnp::Error::failed(format!("failed to inject drift block: {}", e)))?;
-
-            log::info!("Drift pulled: {} → {} (block={})", source_ctx_id, target_ctx_id, block_id.to_key());
-
-            let mut result_block_id = results.get().init_block_id();
-            set_block_id_builder(&mut result_block_id, &block_id);
-
-            Ok(())
-        }.instrument(trace_span))
+        Promise::err(capnp::Error::failed(
+            "driftPull removed — use shell_execute(\"kj drift pull <ctx> [prompt]\")".into(),
+        ))
     }
 
+    // REMOVED pre-1.0: use shell_execute("kj drift merge ...") instead
     fn drift_merge(
         self: Rc<Self>,
-        params: kernel::DriftMergeParams,
-        mut results: kernel::DriftMergeResults,
+        _params: kernel::DriftMergeParams,
+        _results: kernel::DriftMergeResults,
     ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let trace_span = extract_rpc_trace(params_reader.get_trace(), "drift_merge");
-        // Schema: driftMerge(sourceCtx :Data, trace)
-        let source_ctx_bytes = pry!(params_reader.get_source_ctx());
-        let source_ctx_id = pry!(ContextId::try_from_slice(source_ctx_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid source context ID".into())));
-
-        let kernel = self.kernel.clone();
-
-        Promise::from_future(async move {
-            let kernel_arc = kernel.kernel.clone();
-            let documents = kernel.documents.clone();
-
-            let (source_model, parent_ctx_id, trace_id) = {
-                let drift = kernel_arc.drift().read().await;
-                let source_handle = drift.get(source_ctx_id)
-                    .ok_or_else(|| capnp::Error::failed(format!("unknown source context: {}", source_ctx_id)))?;
-
-                let parent_ctx_id = source_handle.forked_from
-                    .ok_or_else(|| capnp::Error::failed(
-                        format!("context {} has no parent — cannot merge", source_ctx_id)
-                    ))?;
-
-                let source_model = source_handle.model.clone();
-                let trace_id = source_handle.trace_id;
-
-                if drift.get(parent_ctx_id).is_none() {
-                    return Err(capnp::Error::failed(format!("parent context {} not found", parent_ctx_id)));
-                }
-
-                (source_model, parent_ctx_id, trace_id)
-            };
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "drift_merge").entered();
-
-            // Get LLM provider from kernel's registry
-            let provider = {
-                let registry = kernel_arc.llm().read().await;
-                registry.default_provider().ok_or_else(|| {
-                    capnp::Error::failed("LLM provider not configured — cannot merge (check llm.rhai)".into())
-                })?
-            };
-
-            // Read source context's blocks
-            let blocks = documents.block_snapshots(source_ctx_id)
-                .map_err(|e| capnp::Error::failed(format!("failed to read source blocks: {}", e)))?;
-
-            let user_prompt = kaijutsu_kernel::build_distillation_prompt(&blocks, None);
-
-            let model = source_model.as_deref().unwrap_or_else(|| {
-                provider.available_models().first().copied().unwrap_or("claude-sonnet-4-5-20250929")
-            });
-
-            log::info!("Merging {} ({} blocks, model={}) → parent {}",
-                source_ctx_id, blocks.len(), model, parent_ctx_id);
-
-            let summary = provider
-                .prompt_with_system(
-                    model,
-                    Some(kaijutsu_kernel::DISTILLATION_SYSTEM_PROMPT),
-                    &user_prompt,
-                )
-                .await
-                .map_err(|e| capnp::Error::failed(format!("distillation LLM call failed: {}", e)))?;
-
-            // Insert drift block into parent document
-            let after = documents.last_block_id(parent_ctx_id);
-
-            let block_id = documents.insert_drift_block_as(
-                parent_ctx_id,
-                None,
-                after.as_ref(),
-                summary,
-                source_ctx_id,
-                Some(model.to_string()),
-                kaijutsu_crdt::DriftKind::Merge,
-                Some(PrincipalId::system()),
-            ).map_err(|e| capnp::Error::failed(format!("failed to inject merge block: {}", e)))?;
-
-            log::info!("Drift merged: {} → parent {} (block={})",
-                source_ctx_id, parent_ctx_id, block_id.to_key());
-
-            let mut result_block_id = results.get().init_block_id();
-            set_block_id_builder(&mut result_block_id, &block_id);
-
-            Ok(())
-        }.instrument(trace_span))
+        Promise::err(capnp::Error::failed(
+            "driftMerge removed — use shell_execute(\"kj drift merge [ctx]\")".into(),
+        ))
     }
 
     // listAllContexts was removed — listContexts now reads from kernel's drift router

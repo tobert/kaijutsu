@@ -35,10 +35,14 @@ impl KjDispatcher {
     }
 
     async fn drift_push(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // kj drift push <dst> [content...]
+        use super::parse::has_flag;
+
+        // kj drift push <dst> [--summarize|-s] [content...]
+        let summarize = has_flag(argv, &["--summarize", "-s"]);
+
         let dst_query = match argv.get(1) {
-            Some(q) => q.as_str(),
-            None => {
+            Some(q) if !q.starts_with('-') => q.as_str(),
+            _ => {
                 return KjResult::Err(
                     "kj drift push: requires a destination context reference".to_string(),
                 )
@@ -54,11 +58,26 @@ impl KjDispatcher {
             }
         };
 
-        // Content is everything after the destination
-        let content = if argv.len() > 2 {
-            argv[2..].join(" ")
+        // Determine content and drift kind
+        let (content, drift_kind) = if summarize {
+            // LLM-distill the caller's context
+            match self.summarize(caller.context_id, None).await {
+                Ok(s) => (s, DriftKind::Distill),
+                Err(e) => return KjResult::Err(format!("kj drift push --summarize: {e}")),
+            }
         } else {
-            return KjResult::Err("kj drift push: requires content".to_string());
+            // Content is everything after the destination, excluding flags
+            let content_args: Vec<&str> = argv[2..]
+                .iter()
+                .filter(|a| *a != "--summarize" && *a != "-s")
+                .map(|s| s.as_str())
+                .collect();
+            if content_args.is_empty() {
+                return KjResult::Err(
+                    "kj drift push: requires content (or use --summarize)".to_string(),
+                );
+            }
+            (content_args.join(" "), DriftKind::Push)
         };
 
         // Get source model for provenance
@@ -75,7 +94,7 @@ impl KjDispatcher {
                 target_id,
                 content,
                 source_model,
-                DriftKind::Push,
+                drift_kind,
             ) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
@@ -293,11 +312,60 @@ impl KjDispatcher {
             }
         }
 
-        // Requeue failures
+        // Requeue failures and drain dead letters
+        let fail_count = failed.len();
         if !failed.is_empty() {
-            let fail_count = failed.len();
             let mut router = self.drift_router().write().await;
             router.requeue(failed);
+        }
+
+        // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES) into lost+found
+        let dead = {
+            let mut router = self.drift_router().write().await;
+            router.drain_dead_letter()
+        };
+        if !dead.is_empty() {
+            let (lf_id, _is_new) = {
+                let mut router = self.drift_router().write().await;
+                router.ensure_lost_found()
+            };
+            // create_document is idempotent (DashMap entry-based)
+            let _ = self.block_store().create_document(
+                lf_id,
+                crate::DocumentKind::Conversation,
+                None,
+            );
+            let dead_count = dead.len();
+            for item in dead {
+                let after = self.block_store().last_block_id(lf_id);
+                let content = format!(
+                    "[DEAD LETTER] {} → {} (retries: {}, kind: {:?})\n\n{}",
+                    item.source_ctx.short(),
+                    item.target_ctx.short(),
+                    item.retry_count,
+                    item.drift_kind,
+                    &item.content,
+                );
+                if let Err(e) = self.block_store().insert_drift_block(
+                    lf_id,
+                    None,
+                    after.as_ref(),
+                    content,
+                    item.source_ctx,
+                    item.source_model,
+                    item.drift_kind,
+                ) {
+                    tracing::error!("failed to write dead letter to lost+found: {e}");
+                }
+            }
+            tracing::warn!(
+                count = dead_count,
+                context = %lf_id.short(),
+                "wrote dead letter drifts to lost+found"
+            );
+        }
+
+        if fail_count > 0 {
             KjResult::Ok(format!(
                 "flushed {injected}/{count} drifts ({fail_count} requeued)"
             ))
@@ -547,6 +615,73 @@ mod tests {
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("requires content"));
+        assert!(result.message().contains("requires content"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn drift_push_missing_content_suggests_summarize() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("x"), None, principal).await;
+        let _dst = register_context(&d, Some("y"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("--summarize"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn drift_push_summarize_empty_context_error() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("src"), None, principal).await;
+        let _dst = register_context(&d, Some("dst"), None, principal).await;
+
+        // Create empty document for source
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("dst"), s("--summarize")], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn drift_flush_delivers_to_existing_document() {
+        // Verify the basic flush path works and requeues on missing document
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("sender"), None, principal).await;
+        let dst_no_doc = register_context(&d, Some("nodoc"), None, principal).await;
+
+        let c = caller_with_context(src);
+
+        // Push to a context WITHOUT a document — insertion will fail
+        d.dispatch(
+            &[s("drift"), s("push"), s("nodoc"), s("will fail")],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush: {}", result.message());
+        assert!(result.message().contains("requeued"), "msg: {}", result.message());
+
+        // The item should be back in the queue
+        let result = d.dispatch(&[s("drift"), s("queue")], &c).await;
+        assert!(result.message().contains("will fail"), "queue: {}", result.message());
+
+        // Now create the document and flush successfully
+        d.block_store()
+            .create_document(dst_no_doc, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush2: {}", result.message());
+        assert!(result.message().contains("flushed 1 drift"), "msg: {}", result.message());
     }
 }
