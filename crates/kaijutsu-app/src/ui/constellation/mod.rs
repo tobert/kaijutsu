@@ -1,28 +1,29 @@
-//! Constellation — carousel ring context navigator.
+//! Constellation — force-directed graph context navigator.
 //!
-//! Contexts are arranged on a tilted carousel ring. The focused card sits at
-//! viewport center; other cards fan out left/right and curve upward, receding
-//! in depth. h/l spins the ring; j/k use spatial nearest-neighbor navigation.
+//! Contexts are arranged as a force-directed graph. The focused card is pulled
+//! to center; other cards are positioned by spring and repulsion forces. Edges
+//! connect parent→child forks. A detail sidebar shows focused node info.
 //!
 //! ## Architecture
 //!
-//! - `mod.rs` — Data model (Constellation, ContextNode), carousel ring layout, camera interpolation
-//! - `render2d.rs` — Vello card rendering (spawn/despawn, depth-based scale/opacity, edge curves)
+//! - `mod.rs` — Data model (Constellation, ContextNode), force-directed layout, camera interpolation
+//! - `render2d.rs` — Vello card rendering (spawn/despawn, distance-based scale/opacity, edge curves)
 //! - `legend.rs` — Info panel overlay (context count, staged drifts)
+//! - `detail.rs` — Detail sidebar (focused node info)
 //! - `create_dialog.rs` — "New context" dialog
 //! - `fork_form.rs` — Full-viewport fork configuration form
 //! - `model_picker.rs` — Model selection overlay
 //!
 //! ## Activation
 //!
-//! Tab toggles between conversation view and full-screen constellation.
+//! Backtick toggles between conversation view and full-screen constellation.
 //! The constellation takes over the content area, hiding conversation panes.
 //! Enter on a focused node switches context and returns to conversation.
 //!
 //! ## Navigation
 //!
-//! - `h/l` — Spin carousel ring (step one card left/right)
-//! - `j/k` — Spatial nearest-neighbor navigation
+//! - `h/l` — Spatial navigation left/right
+//! - `j/k` — Spatial navigation up/down
 //! - `Shift+hjkl` — Pan camera
 //! - `+/-` — Zoom in/out
 //! - `0` — Reset camera to default view
@@ -30,12 +31,16 @@
 //! - `f` — Fork focused context (opens fork form)
 //! - `n` — Create new context
 //! - `m` — Model picker for focused context
+//! - `a` — Archive focused context
 
 mod create_dialog;
+mod detail;
 pub mod fork_form;
 mod legend;
 pub mod model_picker;
 mod render2d;
+
+use std::collections::{HashMap, VecDeque};
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
@@ -67,6 +72,7 @@ impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Constellation>()
             .init_resource::<ConstellationCamera>()
+            .init_resource::<ForceGraph>()
             .init_resource::<NewContextConfig>()
             .register_type::<NewContextConfig>()
             .register_type::<ActivityState>()
@@ -80,14 +86,17 @@ impl Plugin for ConstellationPlugin {
                     track_agent_activity,
                     // Input handling in input::systems (toggle_constellation + constellation_nav)
                     handle_node_click,
-                    update_node_positions,
+                    run_force_simulation,
                     interpolate_camera,
                 )
                     .chain(),
             );
 
-        // Constellation container + legend panel (extracted from deleted render.rs)
+        // Constellation container + legend panel
         legend::setup_legend_systems(app);
+
+        // Detail sidebar (focused node info)
+        detail::setup_detail_systems(app);
 
         // Add 2D Vello rendering systems
         render2d::setup_render2d_systems(app);
@@ -124,10 +133,6 @@ pub struct ConstellationCamera {
     pub target_offset: Vec2,
     /// Target zoom level for smooth interpolation
     pub target_zoom: f32,
-    /// Current carousel rotation angle (radians)
-    pub carousel_angle: f32,
-    /// Target carousel rotation for smooth interpolation
-    pub target_carousel_angle: f32,
     /// Interpolation speed (higher = snappier)
     pub speed: f32,
 }
@@ -139,8 +144,6 @@ impl Default for ConstellationCamera {
             zoom: 1.0,
             target_offset: Vec2::ZERO,
             target_zoom: 1.0,
-            carousel_angle: 0.0,
-            target_carousel_angle: 0.0,
             speed: 8.0,
         }
     }
@@ -151,7 +154,6 @@ impl ConstellationCamera {
     pub fn reset(&mut self) {
         self.target_offset = Vec2::ZERO;
         self.target_zoom = 1.0;
-        self.target_carousel_angle = 0.0;
     }
 }
 
@@ -215,6 +217,7 @@ impl Constellation {
             position: Vec2::ZERO,
             depth: 0.0,
             ring_index: self.nodes.len(),
+            graph_distance: u32::MAX,
             activity: ActivityState::default(),
             model: None,
             provider: None,
@@ -252,6 +255,7 @@ impl Constellation {
             position: Vec2::ZERO,
             depth: 0.0,
             ring_index: self.nodes.len(),
+            graph_distance: u32::MAX,
             activity: ActivityState::Idle,
             model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
             provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
@@ -281,6 +285,21 @@ impl Constellation {
         }
     }
 
+    /// Walk forked_from chain to find the root ancestor of a context.
+    pub fn root_of(&self, id: ContextId) -> Option<ContextId> {
+        let mut current = id;
+        for _ in 0..self.nodes.len() {
+            match self.nodes.iter().find(|n| n.context_id == current) {
+                Some(node) => match node.forked_from {
+                    Some(parent) => current = parent,
+                    None => return Some(current),
+                },
+                None => return None,
+            }
+        }
+        Some(current)
+    }
+
 }
 
 /// A node in the constellation representing a context
@@ -292,12 +311,14 @@ pub struct ContextNode {
     pub forked_from: Option<ContextId>,
     /// Human-readable label (e.g. "default", "debug-auth")
     pub label: Option<String>,
-    /// Position in constellation space (calculated by layout)
+    /// Position in constellation space (calculated by force simulation)
     pub position: Vec2,
-    /// Depth in carousel space: 1.0 = front (closest), -1.0 = back (furthest)
+    /// Depth value: 1.0 = focused, 0.0 = max distance (repurposed from carousel depth)
     pub depth: f32,
-    /// Index in the ring order (for h/l navigation)
+    /// Index in the ring order (for tree-ordered cycling)
     pub ring_index: usize,
+    /// BFS hop count from focused node (0 = focused, u32::MAX = disconnected)
+    pub graph_distance: u32,
     /// Current activity state (affects visual rendering)
     pub activity: ActivityState,
     /// Model name from DriftState polling (e.g. "claude-sonnet-4-5")
@@ -433,61 +454,257 @@ fn handle_node_click(
     }
 }
 
-// Input handling in input::systems (toggle_constellation + constellation_nav)
+// ============================================================================
+// FORCE-DIRECTED LAYOUT
+// ============================================================================
 
-/// How much the ring curves upward as cards recede (px per unit).
-/// Higher = more vertical spread. The ring appears as a tilted plane.
-const CAROUSEL_TILT: f32 = 0.3;
+/// Force-directed graph simulation state.
+#[derive(Resource)]
+pub struct ForceGraph {
+    /// Per-node velocities for the simulation
+    velocities: Vec<Vec2>,
+    /// Whether the simulation has settled (max velocity < threshold)
+    pub settled: bool,
+}
 
-/// Minimum spacing between adjacent cards on the ring circumference (px).
-const CAROUSEL_MIN_SPACING: f32 = 240.0;
+impl Default for ForceGraph {
+    fn default() -> Self {
+        Self {
+            velocities: Vec::new(),
+            settled: false,
+        }
+    }
+}
 
-/// Update node positions using a tilted carousel ring.
+/// Force simulation constants.
+const REPULSION_STRENGTH: f32 = 80000.0;
+const SPRING_K: f32 = 0.3;
+const REST_LENGTH: f32 = 250.0;
+const CENTER_K: f32 = 0.8;
+/// Weak gravity toward center for ALL nodes — prevents disconnected nodes
+/// (no fork edges) from flying away indefinitely under repulsion.
+const GRAVITY: f32 = 0.05;
+const DAMPING: f32 = 0.85;
+const MAX_VELOCITY: f32 = 200.0;
+const SETTLE_THRESHOLD: f32 = 0.5;
+const ITERATIONS_PER_FRAME: u32 = 3;
+
+/// Run the force-directed graph simulation.
 ///
-/// The focused card sits at (0, 0) — viewport center. Other cards fan out
-/// left/right and curve upward, like a ring on a tilted plane viewed from
-/// slightly above. The ring radius scales with node count so cards never overlap.
-/// h/l spins the carousel, bringing adjacent cards to front.
-fn update_node_positions(
+/// Replaces the old carousel ring layout. Nodes repel each other (Coulomb),
+/// parent→child edges attract (Hooke spring), and the focused node is pulled
+/// toward center. Simulation runs until settled, then skips computation.
+fn run_force_simulation(
     mut constellation: ResMut<Constellation>,
-    camera: Res<ConstellationCamera>,
+    mut camera: ResMut<ConstellationCamera>,
+    mut force_graph: ResMut<ForceGraph>,
     mut cached_ring: Local<Vec<usize>>,
+    mut last_focus: Local<Option<ContextId>>,
+    mut last_node_count: Local<usize>,
 ) {
     let n = constellation.nodes.len();
     if n == 0 {
         return;
     }
 
-    // Only rebuild ring order when constellation data changes
-    if constellation.is_changed() || cached_ring.len() != n {
-        *cached_ring = build_ring_order(&constellation);
-        // Assign ring indices
-        for (ring_idx, &node_idx) in cached_ring.iter().enumerate() {
-            constellation.nodes[node_idx].ring_index = ring_idx;
+    let focus_changed = *last_focus != constellation.focus_id;
+    let topology_changed = n != *last_node_count;
+
+    if focus_changed || topology_changed {
+        // Rebuild ring order (still useful for tree-ordered cycling)
+        if topology_changed || cached_ring.len() != n {
+            *cached_ring = build_ring_order(&constellation);
+            for (ring_idx, &node_idx) in cached_ring.iter().enumerate() {
+                constellation.nodes[node_idx].ring_index = ring_idx;
+            }
+        }
+
+        // Resize velocities for new nodes
+        force_graph.velocities.resize(n, Vec2::ZERO);
+
+        // Initialize positions for new nodes (avoid all-at-origin singularity).
+        // Scatter radius scales with sqrt(n) so nodes aren't crammed together.
+        let scatter_radius = 150.0 + (n as f32).sqrt() * 50.0;
+        for i in 0..n {
+            if constellation.nodes[i].position == Vec2::ZERO
+                && Some(constellation.nodes[i].context_id) != constellation.focus_id
+            {
+                let angle = std::f32::consts::TAU * i as f32 / n as f32;
+                constellation.nodes[i].position =
+                    Vec2::new(angle.cos(), angle.sin()) * scatter_radius;
+            }
+        }
+
+        // Recompute BFS graph distances
+        if let Some(focus_id) = constellation.focus_id {
+            let distances = compute_graph_distances(&constellation, focus_id);
+            for (i, &dist) in distances.iter().enumerate() {
+                constellation.nodes[i].graph_distance = dist;
+            }
+        }
+
+        // Unsettle to trigger re-simulation
+        force_graph.settled = false;
+        *last_focus = constellation.focus_id;
+        *last_node_count = n;
+
+        // Follow-focus camera pan
+        if focus_changed {
+            if let Some(focus_id) = constellation.focus_id {
+                if let Some(node) = constellation.node_by_id(focus_id) {
+                    camera.target_offset = -node.position;
+                }
+            }
         }
     }
 
-    // Ring radius: ensure minimum angular spacing for card width
-    let circumference = n as f32 * CAROUSEL_MIN_SPACING;
-    let radius = (circumference / std::f32::consts::TAU).max(400.0);
-
-    for &node_idx in cached_ring.iter() {
-        let ring_idx = constellation.nodes[node_idx].ring_index;
-        let base_angle = std::f32::consts::TAU * ring_idx as f32 / n as f32;
-        let angle = base_angle + camera.carousel_angle;
-
-        // Front card (angle≈0) at origin, others fan out and curve up.
-        // x = R * sin(θ)  — horizontal spread
-        // y = -R * (1 - cos(θ)) * TILT — curves upward (negative = up in screen coords)
-        let x = radius * angle.sin();
-        let y = -radius * (1.0 - angle.cos()) * CAROUSEL_TILT;
-
-        // Depth: cos(angle) → 1.0 at front (angle=0), -1.0 at back (angle=π)
-        let depth = angle.cos();
-
-        constellation.nodes[node_idx].position = Vec2::new(x, y);
-        constellation.nodes[node_idx].depth = depth;
+    if force_graph.settled {
+        return;
     }
+
+    // Build index maps for O(1) lookups
+    let id_to_idx: HashMap<ContextId, usize> = constellation
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.context_id, i))
+        .collect();
+
+    // Collect edges (parent → child)
+    let edges: Vec<(usize, usize)> = constellation
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| {
+            node.forked_from
+                .and_then(|pid| id_to_idx.get(&pid).map(|&pi| (pi, i)))
+        })
+        .collect();
+
+    let focused_idx = constellation
+        .focus_id
+        .and_then(|fid| id_to_idx.get(&fid).copied());
+
+    for _ in 0..ITERATIONS_PER_FRAME {
+        let mut forces = vec![Vec2::ZERO; n];
+
+        // Repulsion: all node pairs (Coulomb's law)
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let delta =
+                    constellation.nodes[i].position - constellation.nodes[j].position;
+                let dist_sq = delta.length_squared().max(100.0); // avoid singularity
+                let force_mag = REPULSION_STRENGTH / dist_sq;
+                let force = delta.normalize_or_zero() * force_mag;
+                forces[i] += force;
+                forces[j] -= force;
+            }
+        }
+
+        // Spring attraction: parent→child edges only (Hooke's law)
+        for &(parent, child) in &edges {
+            let delta =
+                constellation.nodes[child].position - constellation.nodes[parent].position;
+            let dist = delta.length();
+            let displacement = dist - REST_LENGTH;
+            let force = delta.normalize_or_zero() * SPRING_K * displacement;
+            forces[parent] += force;
+            forces[child] -= force;
+        }
+
+        // Weak gravity toward center for all nodes (prevents disconnected nodes escaping)
+        for i in 0..n {
+            forces[i] += -GRAVITY * constellation.nodes[i].position;
+        }
+
+        // Stronger center pull on focused node
+        if let Some(fi) = focused_idx {
+            forces[fi] += -CENTER_K * constellation.nodes[fi].position;
+        }
+
+        // Apply forces with damping and velocity cap
+        let mut max_v = 0.0f32;
+        for i in 0..n {
+            force_graph.velocities[i] =
+                (force_graph.velocities[i] + forces[i]) * DAMPING;
+            let v = force_graph.velocities[i].length();
+            if v > MAX_VELOCITY {
+                force_graph.velocities[i] *= MAX_VELOCITY / v;
+            }
+            max_v = max_v.max(force_graph.velocities[i].length());
+            constellation.nodes[i].position += force_graph.velocities[i];
+        }
+
+        if max_v < SETTLE_THRESHOLD {
+            force_graph.settled = true;
+            break;
+        }
+    }
+
+    // Update depth from graph distances (compatibility: 1.0 = focused, 0.0 = far)
+    let max_dist = constellation
+        .nodes
+        .iter()
+        .filter(|n| n.graph_distance != u32::MAX)
+        .map(|n| n.graph_distance)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    for i in 0..n {
+        let dist = constellation.nodes[i].graph_distance;
+        constellation.nodes[i].depth = if dist == u32::MAX {
+            0.0
+        } else {
+            1.0 - (dist as f32 / max_dist as f32).min(1.0)
+        };
+    }
+
+    // Camera follows focused node during settling
+    if let Some(fi) = focused_idx {
+        camera.target_offset = -constellation.nodes[fi].position;
+    }
+}
+
+/// BFS from focused node to compute hop counts for all reachable nodes.
+fn compute_graph_distances(constellation: &Constellation, focus_id: ContextId) -> Vec<u32> {
+    let n = constellation.nodes.len();
+    let mut distances = vec![u32::MAX; n];
+
+    let id_to_idx: HashMap<ContextId, usize> = constellation
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.context_id, i))
+        .collect();
+
+    // Build undirected adjacency list from fork edges
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, node) in constellation.nodes.iter().enumerate() {
+        if let Some(parent_id) = node.forked_from {
+            if let Some(&parent_idx) = id_to_idx.get(&parent_id) {
+                adj[i].push(parent_idx);
+                adj[parent_idx].push(i);
+            }
+        }
+    }
+
+    // BFS
+    if let Some(&focus_idx) = id_to_idx.get(&focus_id) {
+        distances[focus_idx] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(focus_idx);
+        while let Some(idx) = queue.pop_front() {
+            for &neighbor in &adj[idx] {
+                if distances[neighbor] == u32::MAX {
+                    distances[neighbor] = distances[idx] + 1;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+
+    distances
 }
 
 /// Build a DFS traversal order for the ring: parents before children,
@@ -553,21 +770,7 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
     order
 }
 
-/// Get the ring index of the focused node (for carousel navigation).
-pub fn focused_ring_index(constellation: &Constellation) -> Option<usize> {
-    let focus_id = constellation.focus_id?;
-    constellation.nodes.iter().find(|n| n.context_id == focus_id).map(|n| n.ring_index)
-}
-
-/// Get context_id of the node at a given ring index.
-pub fn context_id_at_ring_index(constellation: &Constellation, ring_idx: usize) -> Option<ContextId> {
-    constellation.nodes.iter()
-        .find(|n| n.ring_index == ring_idx)
-        .map(|n| n.context_id)
-}
-
-
-/// Smoothly interpolate camera offset, zoom, and carousel rotation toward targets.
+/// Smoothly interpolate camera offset and zoom toward targets.
 fn interpolate_camera(
     mut camera: ResMut<ConstellationCamera>,
     screen: Res<State<crate::ui::screen::Screen>>,
@@ -592,21 +795,6 @@ fn interpolate_camera(
         camera.zoom += zoom_diff * t;
     } else {
         camera.zoom = camera.target_zoom;
-    }
-
-    // Carousel rotation (shortest-path angular interpolation)
-    let mut angle_diff = camera.target_carousel_angle - camera.carousel_angle;
-    // Normalize to [-π, π] for shortest rotation
-    while angle_diff > std::f32::consts::PI {
-        angle_diff -= std::f32::consts::TAU;
-    }
-    while angle_diff < -std::f32::consts::PI {
-        angle_diff += std::f32::consts::TAU;
-    }
-    if angle_diff.abs() > 0.001 {
-        camera.carousel_angle += angle_diff * t;
-    } else {
-        camera.carousel_angle = camera.target_carousel_angle;
     }
 }
 
@@ -661,4 +849,3 @@ pub struct ConstellationContainer;
 pub struct ConstellationNode {
     pub context_id: String,
 }
-

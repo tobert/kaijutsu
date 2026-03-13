@@ -120,6 +120,8 @@ pub enum Action {
     ConstellationCreate,
     /// m in constellation — open model picker
     ConstellationModelPicker,
+    /// a in constellation — archive focused context
+    ConstellationArchive,
     /// Ctrl+^ — toggle alternate context
     ToggleAlternate,
 

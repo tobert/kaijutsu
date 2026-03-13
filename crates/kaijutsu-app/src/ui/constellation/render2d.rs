@@ -2,7 +2,8 @@
 //!
 //! Each context node is a Bevy UI entity tree (card) absolutely positioned
 //! within the ConstellationContainer. Edges are drawn as a single Vello scene
-//! underneath cards.
+//! underneath cards. Scale and opacity are driven by graph distance from the
+//! focused node.
 
 use bevy::prelude::*;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText};
@@ -82,6 +83,11 @@ pub struct ConstellationSceneMarker;
 // ============================================================================
 
 /// Spawn/despawn card entities to match constellation nodes.
+///
+/// Uses direct set comparison instead of `constellation.is_changed()` to avoid
+/// a timing issue: the force simulation can settle before the container entity
+/// is ready (Commands are deferred), so `is_changed()` may be false by the time
+/// the container exists on the next frame.
 fn sync_card_entities(
     mut commands: Commands,
     constellation: Res<Constellation>,
@@ -90,15 +96,9 @@ fn sync_card_entities(
     container_q: Query<Entity, With<ConstellationContainer>>,
     mut card_map: ResMut<CardEntityMap>,
 ) {
-    if !constellation.is_changed() {
-        return;
-    }
-
     let Ok(container_entity) = container_q.single() else {
         return;
     };
-
-    let card_width = theme.constellation_card_width;
 
     // Current node IDs
     let current_ids: std::collections::HashSet<ContextId> = constellation
@@ -106,6 +106,15 @@ fn sync_card_entities(
         .iter()
         .map(|n| n.context_id)
         .collect();
+
+    // Quick check: if card map already matches, nothing to do
+    if card_map.map.len() == current_ids.len()
+        && card_map.map.keys().all(|id| current_ids.contains(id))
+    {
+        return;
+    }
+
+    let card_width = theme.constellation_card_width;
 
     // Despawn cards for removed nodes
     let stale: Vec<ContextId> = card_map
@@ -252,7 +261,7 @@ fn update_card_positions(
         return;
     }
 
-    // Center cards slightly below vertical center (60%) for visual comfort
+    // Center cards slightly below vertical center (55%) for visual comfort
     let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * CAROUSEL_VERTICAL_CENTER);
     let base_card_width = theme.constellation_card_width;
 
@@ -264,9 +273,8 @@ fn update_card_positions(
             continue;
         };
 
-        // Depth-based scale: front (depth=1) → 1.0, back (depth=-1) → 0.4
-        let depth_t = (node.depth + 1.0) / 2.0; // 0..1
-        let scale = 0.4 + 0.6 * depth_t;
+        // Distance-based scale: focused=1.0, 1 hop=0.8, 2 hops=0.6, 3+=0.4
+        let scale = scale_for_distance(node.graph_distance);
 
         let card_w = base_card_width * scale;
         let card_h = CARD_HEIGHT * scale;
@@ -277,18 +285,13 @@ fn update_card_positions(
         style.width = Val::Px(card_w);
         style.min_height = Val::Px(card_h);
 
-        // Hide cards that are very far back (behind the ring)
-        if node.depth < -0.85 {
-            *vis = Visibility::Hidden;
-        } else {
-            *vis = Visibility::Inherited;
-        }
+        // All nodes visible in force layout
+        *vis = Visibility::Inherited;
 
-        // ZIndex by depth: front cards render on top
-        let z = (depth_t * 100.0) as i32;
+        // ZIndex by distance: closer nodes render on top
+        let z = 100 - (node.graph_distance.min(10) * 10) as i32;
         commands.entity(entity).insert(ZIndex(z));
     }
-    // card_map.map is now HashMap<ContextId, Entity> — direct lookup, no string conversion
 }
 
 /// Update card visuals: background scenes, text content, focus highlighting.
@@ -317,18 +320,16 @@ fn update_card_visuals(
         let bevy_color = agent_color_for_provider(&theme, node.provider.as_deref());
         let vello_color = bevy_to_vello_color(bevy_color);
 
-        // Build background scene (scaled to match depth-adjusted card size)
-        let depth_t = (node.depth + 1.0) / 2.0;
-        let scale = 0.4 + 0.6 * depth_t;
+        // Distance-based scale
+        let scale = scale_for_distance(node.graph_distance);
         let card_w = (base_card_width * scale) as f64;
         let card_h = (CARD_HEIGHT * scale) as f64;
 
         let mut scene = bevy_vello::vello::Scene::new();
         let rect = RoundedRect::new(0.0, 0.0, card_w, card_h, CARD_CORNER_RADIUS);
 
-        // Depth-based opacity: front=1.0, back=0.3
-        let depth_t = (node.depth + 1.0) / 2.0;
-        let depth_alpha = 0.3 + 0.7 * depth_t;
+        // Distance-based opacity: focused=1.0, 1 hop=0.85, 2 hops=0.7, 3+=0.5
+        let depth_alpha = opacity_for_distance(node.graph_distance);
 
         // Fill
         let base_alpha = if is_focused {
@@ -348,7 +349,7 @@ fn update_card_visuals(
         };
         scene.fill(Fill::NonZero, Affine::IDENTITY, fill_color, None, &rect);
 
-        // Border (modulated by depth)
+        // Border (modulated by distance)
         let border_alpha = if is_focused {
             1.0
         } else if node.joined {
@@ -499,6 +500,26 @@ fn rebuild_edge_scene(
 // Helpers
 // ============================================================================
 
+/// Scale factor based on graph distance from focused node.
+fn scale_for_distance(dist: u32) -> f32 {
+    match dist {
+        0 => 1.0,
+        1 => 0.8,
+        2 => 0.6,
+        _ => 0.4, // 3+ hops or disconnected (u32::MAX)
+    }
+}
+
+/// Opacity factor based on graph distance from focused node.
+fn opacity_for_distance(dist: u32) -> f32 {
+    match dist {
+        0 => 1.0,
+        1 => 0.85,
+        2 => 0.7,
+        _ => 0.5,
+    }
+}
+
 /// Primary label for a card: label > short context ID.
 fn card_label_text(node: &super::ContextNode) -> String {
     if let Some(ref label) = node.label {
@@ -527,7 +548,7 @@ fn card_model_text(node: &super::ContextNode) -> String {
 }
 
 /// Format recency as a human-readable relative time.
-fn format_recency(last_activity: f64, now: f64) -> String {
+pub(super) fn format_recency(last_activity: f64, now: f64) -> String {
     if last_activity <= 0.0 {
         return "—".to_string();
     }

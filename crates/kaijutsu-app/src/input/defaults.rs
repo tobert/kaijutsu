@@ -82,15 +82,21 @@ pub fn default_bindings() -> Vec<Binding> {
 
 
     // ====================================================================
-    // Constellation (constellation node graph focused)
-    // Keyboard nav removed — use mouse. Gamepad DPad bindings below.
+    // Constellation (force-directed graph focused)
     // ====================================================================
+
+    // Spatial navigation (hjkl)
+    b.push(Binding::key(KeyCode::KeyH, InputContext::Constellation, Action::SpatialNav(Vec2::new(-1.0, 0.0)), "Navigate left"));
+    b.push(Binding::key(KeyCode::KeyL, InputContext::Constellation, Action::SpatialNav(Vec2::new(1.0, 0.0)), "Navigate right"));
+    b.push(Binding::key(KeyCode::KeyK, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, -1.0)), "Navigate up"));
+    b.push(Binding::key(KeyCode::KeyJ, InputContext::Constellation, Action::SpatialNav(Vec2::new(0.0, 1.0)), "Navigate down"));
 
     // Actions
     b.push(Binding::key(KeyCode::Enter, InputContext::Constellation, Action::Activate, "Switch to context"));
     b.push(Binding::key(KeyCode::KeyF, InputContext::Constellation, Action::ConstellationFork, "Fork context"));
     b.push(Binding::key(KeyCode::KeyN, InputContext::Constellation, Action::ConstellationCreate, "New context"));
     b.push(Binding::key(KeyCode::KeyM, InputContext::Constellation, Action::ConstellationModelPicker, "Model picker"));
+    b.push(Binding::key(KeyCode::KeyA, InputContext::Constellation, Action::ConstellationArchive, "Archive context"));
     b.push(Binding::key(KeyCode::Tab, InputContext::Constellation, Action::CycleFocusForward, "Cycle focus"));
     b.push(Binding::key(KeyCode::Escape, InputContext::Constellation, Action::Unfocus, "Close constellation"));
 
