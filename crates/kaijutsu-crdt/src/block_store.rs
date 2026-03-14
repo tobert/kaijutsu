@@ -316,6 +316,13 @@ impl BlockStore {
                         }
                     }
                     None => {
+                        // after_id not found — block was deleted or never existed.
+                        // Fall back to appending after the last block.
+                        tracing::warn!(
+                            after_id = %after_id.to_key(),
+                            total_blocks = ordered.len(),
+                            "calc_order_key: after_id not found in ordered list, appending to end"
+                        );
                         if let Some(last) = ordered.last() {
                             let last_key = self.blocks[last].order_key();
                             format!("{last_key}V")

@@ -802,45 +802,7 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         fn into_messages(mut self) -> Vec<Message> {
             self.flush_all();
 
-            // ── Pass 1: Collect all tool_use IDs that already have results ──
-            // When parallel tool calls complete out-of-order, late-arriving
-            // ToolResult blocks end up far from their ToolCall. The repair
-            // below synthesizes error results for those, but we must also
-            // suppress the late real results to avoid orphaned tool_results
-            // (tool_results not preceded by a matching tool_use).
-            let mut tool_use_ids_with_results: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            {
-                // Walk messages pairing assistant tool_uses with following user tool_results.
-                let mut pending_tool_uses: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for msg in &self.messages {
-                    if msg.role == Role::Assistant {
-                        // New assistant turn clears pending (any uncovered uses from
-                        // the previous assistant are genuinely orphaned).
-                        pending_tool_uses.clear();
-                        if let MessageContent::Blocks(blocks) = &msg.content {
-                            for b in blocks {
-                                if let ContentBlock::ToolUse { id, .. } = b {
-                                    pending_tool_uses.insert(id.clone());
-                                }
-                            }
-                        }
-                    } else if msg.role == Role::User {
-                        if let MessageContent::Blocks(blocks) = &msg.content {
-                            for b in blocks {
-                                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
-                                    if pending_tool_uses.remove(tool_use_id) {
-                                        tool_use_ids_with_results.insert(tool_use_id.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ── Pass 2: Forward repair (orphaned tool_uses → synthetic results) ──
+            // ── Pass 1: Forward repair (orphaned tool_uses → synthetic results) ──
             let mut repaired: Vec<Message> = Vec::with_capacity(self.messages.len() + 4);
             let len = self.messages.len();
             let mut i = 0;
