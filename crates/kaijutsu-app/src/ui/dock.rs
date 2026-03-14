@@ -105,44 +105,44 @@ impl Default for DockState {
             title: DockText {
                 text: "会術 Kaijutsu".into(),
                 color: Color::WHITE, // overridden by theme in render
-                font_size: 24.0,
+                font_size: 26.0,
             },
             event_pulse: DockText {
                 text: "quiet".into(),
                 color: Color::WHITE,
-                font_size: 11.0,
+                font_size: 13.0,
             },
             connection: DockText {
                 text: "Connecting...".into(),
                 color: Color::WHITE,
-                font_size: 14.0,
+                font_size: 16.0,
             },
             event_spark: DockSparkline::new(40),
             activity_spark: DockSparkline::new(40),
             mode: DockText {
                 text: "INPUT".into(),
                 color: Color::WHITE,
-                font_size: 14.0,
+                font_size: 16.0,
             },
             model_badge: DockText {
                 text: "—".into(),
                 color: Color::WHITE,
-                font_size: 11.0,
+                font_size: 13.0,
             },
             agent_activity: DockText {
                 text: String::new(),
                 color: Color::WHITE,
-                font_size: 11.0,
+                font_size: 13.0,
             },
             block_activity: DockText {
                 text: String::new(),
                 color: Color::WHITE,
-                font_size: 11.0,
+                font_size: 13.0,
             },
             hints: DockText {
                 text: "Enter: submit │ Shift+Enter: newline │ Esc: normal".into(),
                 color: Color::WHITE,
-                font_size: 11.0,
+                font_size: 13.0,
             },
             contexts: ContextsState::default(),
         }
@@ -316,7 +316,7 @@ pub fn spawn_docks(
             NorthDock,
             Node {
                 width: Val::Percent(100.0),
-                height: Val::Px(36.0),
+                height: Val::Px(40.0),
                 ..default()
             },
             BorderColor::all(theme.border),
@@ -332,7 +332,7 @@ pub fn spawn_docks(
             SouthDock,
             Node {
                 width: Val::Percent(100.0),
-                height: Val::Px(28.0),
+                height: Val::Px(32.0),
                 border: UiRect::top(Val::Px(1.0)),
                 ..default()
             },
