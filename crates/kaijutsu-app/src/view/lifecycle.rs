@@ -158,27 +158,7 @@ pub fn spawn_block_cells(
     };
 
     let current_blocks = editor.block_ids();
-    if current_blocks.is_empty() {
-        // No blocks in the editor — nothing to spawn.
-        // This is normal on startup before sync completes.
-        return;
-    }
     let current_ids: std::collections::HashSet<_> = current_blocks.iter().collect();
-
-    // Log diagnostics once when blocks first appear or counts change
-    {
-        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let key = (current_blocks.len() as u64).wrapping_mul(1000003)
-            .wrapping_add(container.block_cells.len() as u64);
-        if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
-            info!(
-                "spawn_block_cells: editor has {} blocks, container has {} cells, conv={:?}",
-                current_blocks.len(),
-                container.block_cells.len(),
-                entities.conversation_container.map(|e| e.index()),
-            );
-        }
-    }
 
     // Purge stale entity references — the tiling reconciler despawns pane
     // children recursively, which kills block cells without telling the container.
@@ -205,7 +185,7 @@ pub fn spawn_block_cells(
         }
     }
 
-    // Despawn removed blocks
+    // Despawn blocks that are no longer in the editor (context switch, welcome→real, etc.)
     let to_remove: Vec<_> = container
         .block_cells
         .iter()
@@ -217,6 +197,30 @@ pub fn spawn_block_cells(
     for entity in to_remove {
         commands.entity(entity).try_despawn();
         container.remove(entity);
+    }
+
+    if current_blocks.is_empty() {
+        // No blocks in the editor — nothing to spawn.
+        // Stale cells from the previous context were already cleaned up above.
+        if had_removals {
+            layout_gen.bump();
+        }
+        return;
+    }
+
+    // Log diagnostics once when blocks first appear or counts change
+    {
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let key = (current_blocks.len() as u64).wrapping_mul(1000003)
+            .wrapping_add(container.block_cells.len() as u64);
+        if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+            info!(
+                "spawn_block_cells: editor has {} blocks, container has {} cells, conv={:?}",
+                current_blocks.len(),
+                container.block_cells.len(),
+                entities.conversation_container.map(|e| e.index()),
+            );
+        }
     }
 
     // Gate new spawns on font availability — UiVelloText needs a valid font
