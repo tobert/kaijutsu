@@ -387,7 +387,11 @@ impl Tool for KjBuiltin {
         let result = self.dispatcher.dispatch(&argv, &caller).await;
 
         match result {
-            KjResult::Ok(msg) => ExecResult::success(msg),
+            KjResult::Ok { message, content_type } => {
+                let mut result = ExecResult::success(message);
+                result.content_type = content_type;
+                result
+            }
             KjResult::Err(msg) => ExecResult::failure(1, msg),
             KjResult::Switch(new_id, msg) => {
                 // Side-effect: update the shared context ID

@@ -5878,6 +5878,11 @@ fn set_block_snapshot(
         builder.set_tool_use_id(tui);
     }
 
+    // Set content_type hint (MIME type)
+    if let Some(ref ct) = block.content_type {
+        builder.set_content_type(ct);
+    }
+
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
         builder.set_source_context(ctx.as_bytes());
@@ -6211,6 +6216,12 @@ fn parse_block_snapshot(
         output,
         file_path: if reader.has_file_path() {
             reader.get_file_path().ok()
+                .and_then(|s| s.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+        } else { None },
+        content_type: if reader.has_content_type() {
+            reader.get_content_type().ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())

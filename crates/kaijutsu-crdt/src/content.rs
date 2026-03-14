@@ -85,6 +85,7 @@ pub struct BlockContent {
     source_model: Option<String>,
     drift_kind: Option<crate::DriftKind>,
     file_path: Option<String>,
+    content_type: Option<String>,
 
     /// Whether this block is collapsed (only meaningful for Thinking blocks).
     collapsed: bool,
@@ -119,6 +120,7 @@ impl BlockContent {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             collapsed: false,
             deleted: false,
         }
@@ -159,6 +161,7 @@ impl BlockContent {
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
         block.file_path = snap.file_path.clone();
+        block.content_type = snap.content_type.clone();
         block.collapsed = snap.collapsed;
         block
     }
@@ -192,6 +195,7 @@ impl BlockContent {
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
             file_path: snap.file_path.clone(),
+            content_type: snap.content_type.clone(),
             collapsed: snap.collapsed,
             deleted: false,
         };
@@ -341,6 +345,14 @@ impl BlockContent {
         self.tool_use_id = id;
     }
 
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    pub fn set_content_type(&mut self, ct: Option<String>) {
+        self.content_type = ct;
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).
@@ -393,6 +405,7 @@ impl BlockContent {
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,
             file_path: self.file_path.clone(),
+            content_type: self.content_type.clone(),
             order_key: Some(self.order_key.clone()),
         }
     }

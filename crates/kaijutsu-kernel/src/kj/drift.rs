@@ -21,7 +21,7 @@ impl KjDispatcher {
             "queue" | "q" => self.drift_queue().await,
             "cancel" => self.drift_cancel(argv).await,
             "history" => self.drift_history(argv, caller),
-            "help" | "--help" | "-h" => KjResult::Ok(self.drift_help()),
+            "help" | "--help" | "-h" => KjResult::ok_typed(self.drift_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj drift: unknown subcommand '{}'\n\n{}",
                 other,
@@ -101,7 +101,7 @@ impl KjDispatcher {
             }
         };
 
-        KjResult::Ok(format!("staged drift #{} → {}", staged_id, dst_query))
+        KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_query))
     }
 
     async fn drift_pull(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -182,7 +182,7 @@ impl KjDispatcher {
             summary
         };
 
-        KjResult::Ok(format!("pulled from {}:\n{}", src_query, preview))
+        KjResult::ok(format!("pulled from {}:\n{}", src_query, preview))
     }
 
     async fn drift_merge(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -272,7 +272,7 @@ impl KjDispatcher {
             summary
         };
 
-        KjResult::Ok(format!("merged into '{}':\n{}", target_label, preview))
+        KjResult::ok(format!("merged into '{}':\n{}", target_label, preview))
     }
 
     async fn drift_flush(&self, caller: &KjCaller) -> KjResult {
@@ -282,7 +282,7 @@ impl KjDispatcher {
         };
 
         if staged.is_empty() {
-            return KjResult::Ok("nothing to flush".to_string());
+            return KjResult::ok("nothing to flush".to_string());
         }
 
         let count = staged.len();
@@ -366,18 +366,18 @@ impl KjDispatcher {
         }
 
         if fail_count > 0 {
-            KjResult::Ok(format!(
+            KjResult::ok(format!(
                 "flushed {injected}/{count} drifts ({fail_count} requeued)"
             ))
         } else {
-            KjResult::Ok(format!("flushed {injected} drift(s)"))
+            KjResult::ok(format!("flushed {injected} drift(s)"))
         }
     }
 
     async fn drift_queue(&self) -> KjResult {
         let router = self.drift_router().read().await;
         let queue = router.queue();
-        KjResult::Ok(format_drift_queue(queue))
+        KjResult::ok(format_drift_queue(queue))
     }
 
     /// `kj drift history [ctx]` — show drift history (edges) for a context.
@@ -394,7 +394,7 @@ impl KjDispatcher {
         let outgoing = db.drift_provenance(target_id).unwrap_or_default();
         let incoming = db.edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift)).unwrap_or_default();
 
-        KjResult::Ok(super::format::format_drift_history(&outgoing, &incoming, &db))
+        KjResult::ok(super::format::format_drift_history(&outgoing, &incoming, &db))
     }
 
     async fn drift_cancel(&self, argv: &[String]) -> KjResult {
@@ -415,7 +415,7 @@ impl KjDispatcher {
 
         let mut router = self.drift_router().write().await;
         if router.cancel(id) {
-            KjResult::Ok(format!("cancelled drift #{}", id))
+            KjResult::ok(format!("cancelled drift #{}", id))
         } else {
             KjResult::Err(format!("kj drift cancel: drift #{} not found in queue", id))
         }

@@ -542,6 +542,14 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub file_path: Option<String>,
 
+    // Content type hint
+
+    /// MIME content type (e.g., "text/markdown", "image/svg+xml").
+    /// When set, consumers can skip heuristic detection and use the declared type directly.
+    /// Producers that know what they're generating should set this at creation time.
+    #[serde(default)]
+    pub content_type: Option<String>,
+
     // Ordering
 
     /// Fractional index for sibling ordering (base-62 lexicographic).
@@ -590,6 +598,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -626,6 +635,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -670,6 +680,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -710,6 +721,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -754,6 +766,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -793,6 +806,7 @@ impl BlockSnapshot {
             source_model,
             drift_kind: Some(drift_kind),
             file_path: None,
+            content_type: None,
             order_key: None,
         }
     }
@@ -830,6 +844,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: Some(file_path.into()),
+            content_type: None,
             order_key: None,
         }
     }
@@ -879,6 +894,7 @@ impl BlockSnapshot {
             && self.source_model == other.source_model
             && self.drift_kind == other.drift_kind
             && self.file_path == other.file_path
+            && self.content_type == other.content_type
             && self.order_key == other.order_key
     }
 }
@@ -933,6 +949,7 @@ impl BlockSnapshotBuilder {
                 source_model: None,
                 drift_kind: None,
                 file_path: None,
+                content_type: None,
                 order_key: None,
             },
         }
@@ -1028,6 +1045,11 @@ impl BlockSnapshotBuilder {
 
     pub fn file_path(mut self, path: impl Into<String>) -> Self {
         self.snap.file_path = Some(path.into());
+        self
+    }
+
+    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
+        self.snap.content_type = Some(ct.into());
         self
     }
 

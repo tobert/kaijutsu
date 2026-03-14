@@ -2034,6 +2034,17 @@ pub(crate) fn parse_block_snapshot(
         }
     }
 
+    // Content type hint (MIME type)
+    if reader.has_content_type() {
+        if let Ok(ct) = reader.get_content_type() {
+            if let Ok(s) = ct.to_str() {
+                if !s.is_empty() {
+                    builder = builder.content_type(s);
+                }
+            }
+        }
+    }
+
     Ok(builder.build())
 }
 

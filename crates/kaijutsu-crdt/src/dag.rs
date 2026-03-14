@@ -351,6 +351,7 @@ mod tests {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         };
         let snap_b = BlockSnapshot {
@@ -375,6 +376,7 @@ mod tests {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            content_type: None,
             order_key: None,
         };
 

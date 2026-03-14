@@ -493,7 +493,7 @@ impl RhaiEngine {
         engine.register_fn("svg_block", move |content: String| -> String {
             // Find the last block so we append at the end, not the beginning
             let last_block_id = block_store.get(context_id)
-                .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id.clone()));
+                .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
 
             match block_store.insert_block(
                 context_id,
@@ -505,6 +505,10 @@ impl RhaiEngine {
                 Status::Done,
             ) {
                 Ok(id) => {
+                    // Tag the block with SVG content type so the app skips heuristic detection
+                    if let Some(mut entry) = block_store.get_mut(context_id) {
+                        let _ = entry.doc.set_content_type(&id, Some("image/svg+xml".into()));
+                    }
                     let key = id.to_key();
                     info!("Rhai: svg_block inserted {} ({} bytes)", key, content.len());
                     key

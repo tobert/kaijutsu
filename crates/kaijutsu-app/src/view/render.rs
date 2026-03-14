@@ -146,7 +146,7 @@ pub fn sync_block_cell_buffers(
 
         let mut actually_rich = false;
         if is_rich_candidate {
-            if let Some(rich) = crate::text::detect_rich_content(&text, doc_version) {
+            if let Some(rich) = crate::text::rich::detect_rich_content_typed(&text, doc_version, block.content_type.as_deref()) {
                 // For sparklines: clear text so Parley won't fight min_height
                 let is_sparkline = matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
                 if is_sparkline {

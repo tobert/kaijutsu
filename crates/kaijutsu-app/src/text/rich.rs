@@ -436,9 +436,47 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 
 /// Detect rich content from a block's text.
 ///
-/// Tries sparkline first (most specific), then SVG, then markdown.
-/// Returns `None` for plain text with no formatting.
+/// When `content_type` is provided, skips heuristic detection and uses the
+/// declared type directly. Falls back to sniffing when `content_type` is `None`.
 pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
+    detect_rich_content_typed(text, version, None)
+}
+
+/// Detect rich content with an optional content type hint.
+///
+/// When `content_type` is `Some`, the declared type takes priority over sniffing:
+/// - `"image/svg+xml"` → parse as SVG directly
+/// - `"text/markdown"` → parse as markdown directly
+/// - Other types → fall through to heuristic detection
+///
+/// When `content_type` is `None`, tries sparkline, then SVG, then markdown.
+pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<&str>) -> Option<RichContent> {
+    // If content type is declared, use it directly
+    if let Some(ct) = content_type {
+        match ct {
+            "image/svg+xml" => {
+                if let Some((scene, width, height)) = try_parse_svg(text) {
+                    return Some(RichContent {
+                        kind: RichContentKind::Svg { scene, width, height },
+                        version,
+                        last_render_version: 0,
+                        last_max_advance: 0.0,
+                    });
+                }
+            }
+            "text/markdown" => {
+                let spans = parse_to_rich_spans(text);
+                let plain_text: String = spans.iter().map(|s| s.text.as_str()).collect();
+                return Some(RichContent {
+                    kind: RichContentKind::Markdown { spans, plain_text },
+                    version,
+                    last_render_version: 0,
+                    last_max_advance: 0.0,
+                });
+            }
+            _ => {} // Unknown content types fall through to heuristic detection
+        }
+    }
     // Try sparkline first — more specific pattern
     if let Some(data) = try_parse_sparkline(text) {
         return Some(RichContent {

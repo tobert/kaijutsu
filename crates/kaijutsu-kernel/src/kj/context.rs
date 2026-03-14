@@ -27,7 +27,7 @@ impl KjDispatcher {
             "archive" => self.context_archive(argv, caller).await,
             "remove" | "rm" => self.context_remove(argv, caller).await,
             "retag" => self.context_retag(argv, caller).await,
-            "help" | "--help" | "-h" => KjResult::Ok(self.context_help()),
+            "help" | "--help" | "-h" => KjResult::ok_typed(self.context_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj context: unknown subcommand '{}'\n\n{}",
                 other,
@@ -47,12 +47,12 @@ impl KjDispatcher {
         let db = self.kernel_db().lock().unwrap();
         if tree {
             match db.context_dag(kernel_id) {
-                Ok(dag) => KjResult::Ok(format_context_tree(&dag, caller.context_id)),
+                Ok(dag) => KjResult::ok(format_context_tree(&dag, caller.context_id)),
                 Err(e) => KjResult::Err(format!("kj context list: {e}")),
             }
         } else {
             match db.list_active_contexts(kernel_id) {
-                Ok(contexts) => KjResult::Ok(format_context_table(&contexts, caller.context_id)),
+                Ok(contexts) => KjResult::ok(format_context_table(&contexts, caller.context_id)),
                 Err(e) => KjResult::Err(format!("kj context list: {e}")),
             }
         }
@@ -136,7 +136,7 @@ impl KjDispatcher {
             }
         }
 
-        KjResult::Ok(info)
+        KjResult::ok(info)
     }
 
     async fn context_switch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -156,7 +156,7 @@ impl KjDispatcher {
         match resolved {
             Ok(target_id) => {
                 if target_id == caller.context_id {
-                    return KjResult::Ok("already in that context".to_string());
+                    return KjResult::ok("already in that context".to_string());
                 }
                 // Get label for display
                 let label = {
@@ -249,7 +249,7 @@ impl KjDispatcher {
             drift.register(new_id, Some(label), parent_id, caller.principal_id);
         }
 
-        KjResult::Ok(format!("created context '{}' ({})", label, new_id.short()))
+        KjResult::ok(format!("created context '{}' ({})", label, new_id.short()))
     }
 
     /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--cwd path] [--env KEY=VALUE]`
@@ -381,10 +381,10 @@ impl KjDispatcher {
         }
 
         if changes.is_empty() {
-            return KjResult::Ok("no changes specified".to_string());
+            return KjResult::ok("no changes specified".to_string());
         }
 
-        KjResult::Ok(format!("updated: {}", changes.join(", ")))
+        KjResult::ok(format!("updated: {}", changes.join(", ")))
     }
 
     /// `kj context unset [<ctx>] --env KEY` — remove an env var from a context.
@@ -404,7 +404,7 @@ impl KjDispatcher {
 
         if let Some(key) = env_key {
             match db.delete_context_env(target_id, &key) {
-                Ok(true) => KjResult::Ok(format!("unset env {key}")),
+                Ok(true) => KjResult::ok(format!("unset env {key}")),
                 Ok(false) => KjResult::Err(format!("kj context unset: env var '{}' not set", key)),
                 Err(e) => KjResult::Err(format!("kj context unset: {e}")),
             }
@@ -425,7 +425,7 @@ impl KjDispatcher {
         };
 
         match db.fork_lineage(target_id) {
-            Ok(lineage) => KjResult::Ok(format_fork_lineage(&lineage, caller.context_id)),
+            Ok(lineage) => KjResult::ok(format_fork_lineage(&lineage, caller.context_id)),
             Err(e) => KjResult::Err(format!("kj context log: {e}")),
         }
     }
@@ -486,7 +486,7 @@ impl KjDispatcher {
             .and_then(|r| r.label)
             .unwrap_or_else(|| new_parent_id.short());
 
-        KjResult::Ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
+        KjResult::ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
     }
 
     /// `kj context archive <ctx>` — soft-delete a context (latched).
@@ -539,7 +539,7 @@ impl KjDispatcher {
             }
         }
 
-        KjResult::Ok(format!("archived {} context(s)", archived))
+        KjResult::ok(format!("archived {} context(s)", archived))
     }
 
     /// `kj context remove <ctx>` — permanently delete a context (latched).
@@ -598,7 +598,7 @@ impl KjDispatcher {
         let mut drift = self.drift_router().write().await;
         drift.unregister(target_id);
 
-        KjResult::Ok(format!("removed context '{}'", target_label))
+        KjResult::ok(format!("removed context '{}'", target_label))
     }
 
     /// `kj context retag <label> <ctx>` — move a label to a different context (latched).
@@ -662,7 +662,7 @@ impl KjDispatcher {
         }
         let _ = drift.rename(new_holder_id, Some(label));
 
-        KjResult::Ok(format!("retagged '{}' → {}", label, new_holder_id.short()))
+        KjResult::ok(format!("retagged '{}' → {}", label, new_holder_id.short()))
     }
 }
 

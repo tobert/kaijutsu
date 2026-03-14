@@ -687,6 +687,14 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the content_type hint on a block (e.g., "image/svg+xml", "text/markdown").
+    pub fn set_content_type(&mut self, id: &BlockId, content_type: Option<String>) -> Result<()> {
+        let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_content_type(content_type);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {

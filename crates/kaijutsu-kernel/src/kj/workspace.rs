@@ -20,7 +20,7 @@ impl KjDispatcher {
             "add" => self.workspace_add(argv),
             "bind" => self.workspace_bind(argv, caller),
             "remove" | "rm" => self.workspace_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::Ok(self.workspace_help()),
+            "help" | "--help" | "-h" => KjResult::ok_typed(self.workspace_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj workspace: unknown subcommand '{}'\n\n{}",
                 other,
@@ -38,7 +38,7 @@ impl KjDispatcher {
         match db.list_workspaces(self.kernel_id()) {
             Ok(workspaces) => {
                 if workspaces.is_empty() {
-                    return KjResult::Ok("(no workspaces)".to_string());
+                    return KjResult::ok("(no workspaces)".to_string());
                 }
                 let lines: Vec<String> = workspaces
                     .iter()
@@ -51,7 +51,7 @@ impl KjDispatcher {
                         format!("  {}{}", w.label, desc)
                     })
                     .collect();
-                KjResult::Ok(lines.join("\n"))
+                KjResult::ok(lines.join("\n"))
             }
             Err(e) => KjResult::Err(format!("kj workspace list: {e}")),
         }
@@ -87,7 +87,7 @@ impl KjDispatcher {
                     }
                 }
 
-                KjResult::Ok(lines.join("\n"))
+                KjResult::ok(lines.join("\n"))
             }
             Ok(None) => KjResult::Err(format!("kj workspace show: '{}' not found", label)),
             Err(e) => KjResult::Err(format!("kj workspace show: {e}")),
@@ -139,7 +139,7 @@ impl KjDispatcher {
         } else {
             format!(" ({} paths)", paths.len())
         };
-        KjResult::Ok(format!("created workspace '{}'{}", label, path_msg))
+        KjResult::ok(format!("created workspace '{}'{}", label, path_msg))
     }
 
     /// `kj workspace add <label> <path> [--mount m] [--read-only]`
@@ -171,7 +171,7 @@ impl KjDispatcher {
             created_at: kaijutsu_types::now_millis() as i64,
         };
         match db.insert_workspace_path(&path_row) {
-            Ok(()) => KjResult::Ok(format!("added path '{}' to workspace '{}'", path, label)),
+            Ok(()) => KjResult::ok(format!("added path '{}' to workspace '{}'", path, label)),
             Err(e) => KjResult::Err(format!("kj workspace add: {e}")),
         }
     }
@@ -224,7 +224,7 @@ impl KjDispatcher {
             }
         }
 
-        KjResult::Ok(format!("bound workspace '{}' to context {}", label, target_id.short()))
+        KjResult::ok(format!("bound workspace '{}' to context {}", label, target_id.short()))
     }
 
     /// `kj workspace remove <label>` — archive a workspace (latched).
@@ -253,7 +253,7 @@ impl KjDispatcher {
         }
 
         match db.archive_workspace(ws.workspace_id) {
-            Ok(true) => KjResult::Ok(format!("archived workspace '{}'", label)),
+            Ok(true) => KjResult::ok(format!("archived workspace '{}'", label)),
             Ok(false) => KjResult::Err(format!("kj workspace remove: '{}' already archived", label)),
             Err(e) => KjResult::Err(format!("kj workspace remove: {e}")),
         }

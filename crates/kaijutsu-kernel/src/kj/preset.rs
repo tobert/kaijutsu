@@ -18,7 +18,7 @@ impl KjDispatcher {
             "show" => self.preset_show(argv),
             "save" => self.preset_save(argv, caller),
             "remove" | "rm" => self.preset_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::Ok(self.preset_help()),
+            "help" | "--help" | "-h" => KjResult::ok_typed(self.preset_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj preset: unknown subcommand '{}'\n\n{}",
                 other,
@@ -36,7 +36,7 @@ impl KjDispatcher {
         match db.list_presets(self.kernel_id()) {
             Ok(presets) => {
                 if presets.is_empty() {
-                    return KjResult::Ok("(no presets)".to_string());
+                    return KjResult::ok("(no presets)".to_string());
                 }
                 let lines: Vec<String> = presets
                     .iter()
@@ -54,7 +54,7 @@ impl KjDispatcher {
                         format!("  {:<20} {}{}", p.label, model, desc)
                     })
                     .collect();
-                KjResult::Ok(lines.join("\n"))
+                KjResult::ok(lines.join("\n"))
             }
             Err(e) => KjResult::Err(format!("kj preset list: {e}")),
         }
@@ -93,7 +93,7 @@ impl KjDispatcher {
                     };
                     lines.push(format!("System: {preview}"));
                 }
-                KjResult::Ok(lines.join("\n"))
+                KjResult::ok(lines.join("\n"))
             }
             Ok(None) => KjResult::Err(format!("kj preset show: '{}' not found", label)),
             Err(e) => KjResult::Err(format!("kj preset show: {e}")),
@@ -156,7 +156,7 @@ impl KjDispatcher {
                     created_by: existing.created_by,
                 };
                 match db.update_preset(&updated) {
-                    Ok(()) => KjResult::Ok(format!("updated preset '{}'", label)),
+                    Ok(()) => KjResult::ok(format!("updated preset '{}'", label)),
                     Err(e) => KjResult::Err(format!("kj preset save: {e}")),
                 }
             }
@@ -175,7 +175,7 @@ impl KjDispatcher {
                     created_by: caller.principal_id,
                 };
                 match db.insert_preset(&row) {
-                    Ok(()) => KjResult::Ok(format!("created preset '{}'", label)),
+                    Ok(()) => KjResult::ok(format!("created preset '{}'", label)),
                     Err(e) => KjResult::Err(format!("kj preset save: {e}")),
                 }
             }
@@ -209,7 +209,7 @@ impl KjDispatcher {
         }
 
         match db.delete_preset(preset.preset_id) {
-            Ok(true) => KjResult::Ok(format!("deleted preset '{}'", label)),
+            Ok(true) => KjResult::ok(format!("deleted preset '{}'", label)),
             Ok(false) => KjResult::Err(format!("kj preset remove: '{}' not found", label)),
             Err(e) => KjResult::Err(format!("kj preset remove: {e}")),
         }

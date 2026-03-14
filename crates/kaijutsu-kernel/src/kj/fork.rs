@@ -12,7 +12,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 impl KjDispatcher {
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if has_flag(argv, &["help", "--help", "-h"]) {
-            return KjResult::Ok(self.fork_help());
+            return KjResult::ok_typed(self.fork_help(), "text/markdown");
         }
 
         if has_flag(argv, &["--shallow"]) {
@@ -142,7 +142,7 @@ impl KjDispatcher {
         let display = label
             .as_deref()
             .unwrap_or(&short);
-        KjResult::Ok(format!("forked to '{}' ({})", display, new_id.short()))
+        KjResult::ok(format!("forked to '{}' ({})", display, new_id.short()))
     }
 
     async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -252,7 +252,7 @@ impl KjDispatcher {
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Ok(format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
+        KjResult::ok(format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
     }
 
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -372,7 +372,7 @@ impl KjDispatcher {
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Ok(format!("compact-forked to '{}' ({})", display, new_id.short()))
+        KjResult::ok(format!("compact-forked to '{}' ({})", display, new_id.short()))
     }
 
     async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {

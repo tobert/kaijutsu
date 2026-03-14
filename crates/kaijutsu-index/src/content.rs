@@ -91,6 +91,7 @@ mod tests {
             file_path: None,
             tool_use_id: None,
             output: None,
+            content_type: None,
             order_key: None,
         }
     }

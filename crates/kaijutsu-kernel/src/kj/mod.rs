@@ -51,7 +51,10 @@ pub struct KjCaller {
 #[derive(Debug, Clone)]
 pub enum KjResult {
     /// Success — exit 0, stdout content.
-    Ok(String),
+    Ok {
+        message: String,
+        content_type: Option<String>,
+    },
     /// Error — exit 1, stderr content.
     Err(String),
     /// Context switch — carries the resolved ContextId for the caller to act on.
@@ -71,7 +74,7 @@ pub enum KjResult {
 
 impl KjResult {
     pub fn is_ok(&self) -> bool {
-        matches!(self, KjResult::Ok(_) | KjResult::Switch(_, _))
+        matches!(self, KjResult::Ok { .. } | KjResult::Switch(_, _))
     }
 
     pub fn is_latch(&self) -> bool {
@@ -80,9 +83,19 @@ impl KjResult {
 
     pub fn message(&self) -> &str {
         match self {
-            KjResult::Ok(s) | KjResult::Err(s) | KjResult::Switch(_, s) => s,
+            KjResult::Ok { message, .. } | KjResult::Err(message) | KjResult::Switch(_, message) => message,
             KjResult::Latch { message, .. } => message,
         }
+    }
+
+    /// Convenience: create a plain text Ok result.
+    pub fn ok(msg: impl Into<String>) -> Self {
+        KjResult::Ok { message: msg.into(), content_type: None }
+    }
+
+    /// Convenience: create an Ok result with a content type hint.
+    pub fn ok_typed(msg: impl Into<String>, ct: impl Into<String>) -> Self {
+        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()) }
     }
 }
 
@@ -133,7 +146,7 @@ impl KjDispatcher {
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
-            "help" | "--help" | "-h" => KjResult::Ok(self.help()),
+            "help" | "--help" | "-h" => KjResult::ok_typed(self.help(), "text/markdown"),
             other => KjResult::Err(format!("kj: unknown command '{}'\n\n{}", other, self.help())),
         }
     }

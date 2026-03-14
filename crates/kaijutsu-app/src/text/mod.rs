@@ -13,7 +13,7 @@ mod resources;
 pub use components::{KjText, KjTextEffects, bevy_color_to_brush, vello_style};
 pub use plugin::KjTextPlugin;
 pub use resources::{FontHandles, TextMetrics};
-pub use rich::{RichContent, detect_rich_content};
+pub use rich::{RichContent, detect_rich_content, detect_rich_content_typed};
 
 /// Char-aware truncation (safe for multi-byte UTF-8).
 ///

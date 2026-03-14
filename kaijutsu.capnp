@@ -159,6 +159,9 @@ struct BlockSnapshot {
 
   # LLM-assigned tool invocation ID (e.g. "toolu_01ABC...")
   toolUseId @23 :Text;        # Present on ToolCall and ToolResult blocks
+
+  # MIME content type hint (e.g. "text/markdown", "image/svg+xml")
+  contentType @24 :Text;      # Optional — consumers fall back to heuristic detection
 }
 
 # Operations on block documents

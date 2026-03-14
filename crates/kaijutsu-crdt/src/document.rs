@@ -387,7 +387,8 @@ impl BlockDocument {
             source_model,
             drift_kind,
             file_path: None, // Legacy document doesn't track file_path
-            order_key: None, // Legacy document uses DTE-backed ordering
+            content_type: None, // Legacy document predates content_type
+        order_key: None, // Legacy document uses DTE-backed ordering
         })
     }
 
