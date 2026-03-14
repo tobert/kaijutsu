@@ -5254,6 +5254,12 @@ async fn execute_shell_command(
                     }
                 }
 
+                if result.content_type.is_some() {
+                    if let Err(e) = documents_clone.set_content_type(context_id, &output_block_id_clone, result.content_type) {
+                        log::error!("Failed to set content_type: {}", e);
+                    }
+                }
+
                 // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
                 // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
                 let final_status = match result.code {

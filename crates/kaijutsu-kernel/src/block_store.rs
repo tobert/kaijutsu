@@ -940,6 +940,19 @@ impl BlockStore {
     /// Output data provides formatting information (tables, trees) for richer output.
     /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
     /// wire compat — see `set_status`.
+    /// Set the content_type hint on a block (e.g., "text/markdown", "image/svg+xml").
+    pub fn set_content_type(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        content_type: Option<String>,
+    ) -> BlockStoreResult<()> {
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        entry.doc.set_content_type(block_id, content_type)?;
+        entry.touch(self.agent_id());
+        Ok(())
+    }
+
     pub fn set_output(
         &self,
         context_id: ContextId,
