@@ -786,17 +786,61 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
             self.flush_tool_results();
         }
 
-        /// Consume and return final messages, repairing orphaned tool_uses.
+        /// Consume and return final messages, repairing tool_use/tool_result pairing.
         ///
         /// The LLM API requires that every assistant message containing
         /// `tool_use` blocks is immediately followed by a user message with
-        /// matching `tool_result` blocks for **each** tool_use id. Forks,
-        /// interrupts, and pruning can leave orphans anywhere in the history
-        /// — not just at the tail. This pass scans the entire list and
-        /// synthesizes error results for any missing pairings.
+        /// matching `tool_result` blocks for **each** tool_use id, and
+        /// conversely that tool_result blocks only appear after an assistant
+        /// message containing the matching tool_use.
+        ///
+        /// Forks, interrupts, and out-of-order tool execution can break both
+        /// directions:
+        /// - **Orphaned tool_uses**: synthesize `is_error: true` results.
+        /// - **Late tool_results**: drop results whose tool_use already has
+        ///   a (synthetic or real) result earlier in the conversation.
         fn into_messages(mut self) -> Vec<Message> {
             self.flush_all();
 
+            // ── Pass 1: Collect all tool_use IDs that already have results ──
+            // When parallel tool calls complete out-of-order, late-arriving
+            // ToolResult blocks end up far from their ToolCall. The repair
+            // below synthesizes error results for those, but we must also
+            // suppress the late real results to avoid orphaned tool_results
+            // (tool_results not preceded by a matching tool_use).
+            let mut tool_use_ids_with_results: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            {
+                // Walk messages pairing assistant tool_uses with following user tool_results.
+                let mut pending_tool_uses: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for msg in &self.messages {
+                    if msg.role == Role::Assistant {
+                        // New assistant turn clears pending (any uncovered uses from
+                        // the previous assistant are genuinely orphaned).
+                        pending_tool_uses.clear();
+                        if let MessageContent::Blocks(blocks) = &msg.content {
+                            for b in blocks {
+                                if let ContentBlock::ToolUse { id, .. } = b {
+                                    pending_tool_uses.insert(id.clone());
+                                }
+                            }
+                        }
+                    } else if msg.role == Role::User {
+                        if let MessageContent::Blocks(blocks) = &msg.content {
+                            for b in blocks {
+                                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                                    if pending_tool_uses.remove(tool_use_id) {
+                                        tool_use_ids_with_results.insert(tool_use_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Pass 2: Forward repair (orphaned tool_uses → synthetic results) ──
             let mut repaired: Vec<Message> = Vec::with_capacity(self.messages.len() + 4);
             let len = self.messages.len();
             let mut i = 0;
@@ -855,6 +899,13 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     continue;
                 }
 
+                tracing::warn!(
+                    msg_idx = i,
+                    ?missing,
+                    covered_count = covered.len(),
+                    "hydration repair: synthesizing tool_results for orphaned tool_uses"
+                );
+
                 let error_results: Vec<ContentBlock> = missing.into_iter()
                     .map(|id| ContentBlock::ToolResult {
                         tool_use_id: id,
@@ -880,7 +931,69 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 i += 1;
             }
 
-            repaired
+            // ── Pass 3: Reverse repair (orphaned tool_results → drop) ──
+            // Late-arriving ToolResult blocks that already have a synthetic
+            // error result produce User messages with tool_results that don't
+            // match any tool_use in the preceding assistant message. The API
+            // rejects these. Strip them out.
+            let mut cleaned: Vec<Message> = Vec::with_capacity(repaired.len());
+            for (idx, msg) in repaired.iter().enumerate() {
+                if msg.role == Role::User {
+                    if let MessageContent::Blocks(blocks) = &msg.content {
+                        // Get tool_use IDs from the preceding assistant message
+                        let preceding_tool_uses: std::collections::HashSet<&str> = idx
+                            .checked_sub(1)
+                            .and_then(|prev_idx| cleaned.get(prev_idx))
+                            .and_then(|prev| {
+                                if prev.role != Role::Assistant { return None; }
+                                if let MessageContent::Blocks(pblocks) = &prev.content {
+                                    Some(pblocks.iter().filter_map(|b| {
+                                        if let ContentBlock::ToolUse { id, .. } = b {
+                                            Some(id.as_str())
+                                        } else { None }
+                                    }).collect())
+                                } else { None }
+                            })
+                            .unwrap_or_default();
+
+                        // Filter: keep only tool_results that match a preceding tool_use,
+                        // plus any non-tool-result blocks (text).
+                        let filtered: Vec<ContentBlock> = blocks.iter().filter(|b| {
+                            match b {
+                                ContentBlock::ToolResult { tool_use_id, .. } => {
+                                    if preceding_tool_uses.contains(tool_use_id.as_str()) {
+                                        true
+                                    } else {
+                                        tracing::warn!(
+                                            msg_idx = idx,
+                                            tool_use_id,
+                                            "hydration repair: dropping orphaned tool_result (late arrival)"
+                                        );
+                                        false
+                                    }
+                                }
+                                _ => true,
+                            }
+                        }).cloned().collect();
+
+                        if filtered.is_empty() {
+                            // Entire message was orphaned tool_results — skip it
+                            continue;
+                        }
+                        if filtered.len() < blocks.len() {
+                            // Some blocks were dropped — push the filtered version
+                            cleaned.push(Message {
+                                role: Role::User,
+                                content: MessageContent::Blocks(filtered),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                cleaned.push(msg.clone());
+            }
+
+            cleaned
         }
     }
 
@@ -1787,6 +1900,94 @@ mod tests {
                 }
                 _ => panic!("Expected Blocks with ToolResults"),
             }
+        }
+
+        #[test]
+        fn late_arriving_tool_results_dropped() {
+            // Reproduces the real bug: parallel tool calls where some results
+            // arrive much later (after the model has moved on). The late results
+            // become orphaned User messages with tool_results that don't match
+            // the preceding assistant's tool_uses. The API rejects these.
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let blocks = vec![
+                // Turn 1: user prompt
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Find configs"),
+                // Turn 2: model requests two tools in parallel
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Checking"),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 1), None, ToolKind::Mcp, "read",
+                    serde_json::json!({"path": "/etc/config"}),
+                    BlockRole::Model, Some("toolu_read".into()),
+                ),
+                BlockSnapshot::tool_call(
+                    BlockId::new(c, m, 2), None, ToolKind::Shell, "shell",
+                    serde_json::json!({"code": "ls"}),
+                    BlockRole::Model, Some("toolu_shell".into()),
+                ),
+                // Only the shell result arrives promptly
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 0), BlockId::new(c, m, 2), ToolKind::Shell,
+                    "file1 file2", false, Some(0), Some("toolu_shell".into()),
+                ),
+                // Model continues (toolu_read never got a result)
+                BlockSnapshot::text(BlockId::new(c, m, 3), None, BlockRole::Model, "Based on the ls output"),
+                // More conversation...
+                BlockSnapshot::text(BlockId::new(c, u, 1), None, BlockRole::User, "thanks"),
+                BlockSnapshot::text(BlockId::new(c, m, 4), None, BlockRole::Model, "You're welcome"),
+                // NOW the late read result arrives (way out of order)
+                BlockSnapshot::tool_result(
+                    BlockId::new(c, s, 1), BlockId::new(c, m, 1), ToolKind::Mcp,
+                    "config contents here", false, Some(0), Some("toolu_read".into()),
+                ),
+                // User types again after the late result
+                BlockSnapshot::text(BlockId::new(c, u, 2), None, BlockRole::User, "one more thing"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+
+            // The late tool_result for toolu_read should be dropped.
+            // Expected messages:
+            //   [0] User "Find configs"
+            //   [1] Assistant [Text, ToolUse(toolu_read), ToolUse(toolu_shell)]
+            //   [2] User [ToolResult(toolu_shell), ToolResult(toolu_read, err=true)]
+            //   [3] Assistant "Based on the ls output"
+            //   [4] User "thanks"
+            //   [5] Assistant "You're welcome"
+            //   [6] User "one more thing"   ← late result dropped, not msg[6]=Blocks[ToolResult]
+
+            // Verify no tool_result-only user messages exist after msg[2]
+            for (i, msg) in msgs.iter().enumerate() {
+                if i <= 2 { continue; }
+                if let MessageContent::Blocks(blocks) = &msg.content {
+                    let has_tool_result = blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                    assert!(!has_tool_result,
+                        "msg[{}] has unexpected tool_result (late arrival should be dropped): {:?}",
+                        i, blocks);
+                }
+            }
+
+            // Verify the synthetic error result is present for toolu_read
+            match &msgs[2].content {
+                MessageContent::Blocks(blocks) => {
+                    let result_ids: Vec<(&str, bool)> = blocks.iter().filter_map(|b| {
+                        if let ContentBlock::ToolResult { tool_use_id, is_error, .. } = b {
+                            Some((tool_use_id.as_str(), *is_error))
+                        } else { None }
+                    }).collect();
+                    assert!(result_ids.iter().any(|(id, _)| *id == "toolu_shell"),
+                        "missing toolu_shell result: {:?}", result_ids);
+                    assert!(result_ids.iter().any(|(id, err)| *id == "toolu_read" && *err),
+                        "missing synthetic error for toolu_read: {:?}", result_ids);
+                }
+                _ => panic!("Expected Blocks at msg[2]"),
+            }
+
+            // Verify the late result was dropped (check message count)
+            assert_eq!(msgs.last().unwrap().as_text(), Some("one more thing"));
         }
 
         #[test]
