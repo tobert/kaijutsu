@@ -1350,6 +1350,56 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Load a single document from the database into the in-memory store.
+    ///
+    /// Returns `true` if the document was loaded, `false` if it was already
+    /// present or not found in the database. This is an explicit hydration
+    /// path — not called automatically on `get()`.
+    pub fn load_one_from_db(&self, context_id: ContextId) -> BlockStoreResult<bool> {
+        if self.documents.contains_key(&context_id) {
+            return Ok(false); // already loaded
+        }
+
+        let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+        let hex = context_id.to_hex();
+        let meta = db_guard
+            .get_document(&hex)
+            .map_err(|e: rusqlite::Error| BlockStoreError::Db(e.to_string()))?;
+
+        let Some(meta) = meta else {
+            return Ok(false); // not in database
+        };
+
+        let agent_id = self.agent_id();
+        let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&hex) {
+            if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
+                match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
+                    Ok(store_snapshot) => {
+                        tracing::debug!(
+                            document_id = %hex,
+                            blocks = store_snapshot.blocks.len(),
+                            "Hydrated document from DB"
+                        );
+                        DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
+                    }
+                    Err(e) => {
+                        tracing::warn!(document_id = %hex, error = %e, "Failed to deserialize snapshot");
+                        return Ok(false);
+                    }
+                }
+            } else {
+                return Ok(false); // snapshot row but no oplog data
+            }
+        } else {
+            return Ok(false); // no snapshot
+        };
+
+        self.documents.insert(context_id, entry);
+        Ok(true)
+    }
+
     /// Save a document's content to the database as a snapshot.
     ///
     /// Stores the StoreSnapshot as postcard binary in the `oplog_bytes` column.

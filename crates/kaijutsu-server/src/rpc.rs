@@ -630,6 +630,10 @@ pub(crate) struct BlockStoreSource(pub(crate) SharedBlockStore);
 
 impl kaijutsu_index::BlockSource for BlockStoreSource {
     fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        // Try in-memory first; if missing, hydrate from DB on demand.
+        if !self.0.contains(ctx) {
+            let _ = self.0.load_one_from_db(ctx);
+        }
         BlockStore::block_snapshots(&self.0, ctx).map_err(|e| e.to_string())
     }
 }

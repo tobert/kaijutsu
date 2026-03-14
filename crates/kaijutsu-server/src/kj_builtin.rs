@@ -131,6 +131,7 @@ impl KjBuiltin {
         let total = contexts.len();
         let mut indexed = 0usize;
         let mut synthesized = 0usize;
+        let mut skipped = 0usize;
         let mut errors = Vec::new();
 
         for row in &contexts {
@@ -138,10 +139,15 @@ impl KjBuiltin {
             let idx = idx.clone();
             let block_source = self.block_source.clone();
 
-            // Index + synthesize on blocking thread
+            // Index + synthesize on blocking thread.
+            // BlockStoreSource auto-hydrates from DB if the document isn't in memory.
+            // Contexts with no document at all (metadata-only) are skipped.
             let result = tokio::task::spawn_blocking(move || {
-                let blocks = block_source.block_snapshots(ctx_id)
-                    .map_err(|e| format!("block fetch: {e}"))?;
+                let blocks = match block_source.block_snapshots(ctx_id) {
+                    Ok(b) if b.is_empty() => return Ok(None), // empty doc, nothing to synthesize
+                    Ok(b) => b,
+                    Err(_) => return Ok(None), // no document in DB either, skip
+                };
 
                 let was_indexed = idx.index_context(ctx_id, &blocks)
                     .map_err(|e| format!("index: {e}"))?;
@@ -152,27 +158,29 @@ impl KjBuiltin {
                     block_source,
                 );
 
-                Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((was_indexed, synth))
+                Ok::<Option<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>)>, String>(
+                    Some((was_indexed, synth))
+                )
             }).await;
 
             match result {
-                Ok(Ok((was_indexed, synth_result))) => {
+                Ok(Ok(Some((was_indexed, synth_result)))) => {
                     if was_indexed { indexed += 1; }
                     if let Some(synth) = synth_result {
-                        // Cache outside the closure — idx was moved into spawn_blocking
                         if let Some(ref si) = self.semantic_index {
                             si.synthesis_cache().insert(ctx_id, synth);
                         }
                         synthesized += 1;
                     }
                 }
+                Ok(Ok(None)) => { skipped += 1; } // no document or empty
                 Ok(Err(e)) => errors.push(format!("{}: {e}", ctx_id.short())),
                 Err(e) => errors.push(format!("{}: join error: {e}", ctx_id.short())),
             }
         }
 
         let mut out = format!(
-            "processed {total} contexts: {indexed} newly indexed, {synthesized} synthesized"
+            "{total} contexts: {indexed} indexed, {synthesized} synthesized, {skipped} skipped"
         );
         if !errors.is_empty() {
             out.push_str(&format!("\nerrors ({}):\n  {}", errors.len(), errors.join("\n  ")));
