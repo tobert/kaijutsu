@@ -102,7 +102,7 @@ enum RpcCommand {
     EditInput { context_id: ContextId, pos: u64, insert: String, delete: u64, reply: oneshot::Sender<Result<u64, ActorError>> },
     GetInputState { context_id: ContextId, reply: oneshot::Sender<Result<InputState, ActorError>> },
     PushInputOps { context_id: ContextId, ops: Vec<u8>, reply: oneshot::Sender<Result<u64, ActorError>> },
-    SubmitInput { context_id: ContextId, reply: oneshot::Sender<Result<SubmitResult, ActorError>> },
+    SubmitInput { context_id: ContextId, is_shell: bool, reply: oneshot::Sender<Result<SubmitResult, ActorError>> },
     ClearInput { context_id: ContextId, reply: oneshot::Sender<Result<(), ActorError>> },
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -444,8 +444,8 @@ impl ActorHandle {
 
     /// Submit the input document: snapshot to conversation block and clear.
     #[tracing::instrument(skip(self))]
-    pub async fn submit_input(&self, context_id: ContextId) -> Result<SubmitResult, ActorError> {
-        self.send(|reply| RpcCommand::SubmitInput { context_id, reply }).await
+    pub async fn submit_input(&self, context_id: ContextId, is_shell: bool) -> Result<SubmitResult, ActorError> {
+        self.send(|reply| RpcCommand::SubmitInput { context_id, is_shell, reply }).await
     }
 
     /// Clear the input document (discard draft). Server emits InputCleared.
@@ -1079,8 +1079,8 @@ async fn dispatch_command(
         RpcCommand::PushInputOps { context_id, ops, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.push_input_ops(context_id, &ops));
         }
-        RpcCommand::SubmitInput { context_id, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.submit_input(context_id));
+        RpcCommand::SubmitInput { context_id, is_shell, reply } => {
+            rpc_call!(kernel, reply, err_tx, k, k.submit_input(context_id, is_shell));
         }
         RpcCommand::ClearInput { context_id, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.clear_input(context_id));

@@ -595,7 +595,6 @@ pub fn handle_tiling(
 // CONSTELLATION NAVIGATION
 // ============================================================================
 
-use crate::cell::PromptSubmitted;
 use crate::ui::constellation::{
     Constellation, ConstellationCamera,
     NewContextConfig, OpenForkForm, create_or_fork_context,
@@ -728,7 +727,6 @@ pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
     mut overlay: Query<&mut crate::cell::InputOverlay>,
-    mut submit_writer: MessageWriter<PromptSubmitted>,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
@@ -769,52 +767,16 @@ pub fn handle_compose_input(
             Action::Submit => {
                 if !overlay.is_empty() {
                     if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                        // For shell mode, prefix text with `:` so server detects it
-                        if overlay.is_shell() {
-                            let shell_text = format!(":{}", overlay.text);
-                            // Rewrite the CRDT to have the prefix before submit
-                            let handle = actor.handle.clone();
-                            let text_len = overlay.text.len() as u64;
-                            let prefix_handle = handle.clone();
-                            bevy::tasks::IoTaskPool::get()
-                                .spawn(async move {
-                                    // Clear and rewrite with prefix
-                                    if let Err(e) = prefix_handle.edit_input(ctx, 0, "", text_len).await {
-                                        log::warn!("edit_input (clear for shell prefix) failed: {e}");
-                                        return;
-                                    }
-                                    if let Err(e) = prefix_handle.edit_input(ctx, 0, &shell_text, 0).await {
-                                        log::warn!("edit_input (shell prefix) failed: {e}");
-                                        return;
-                                    }
-                                    match prefix_handle.submit_input(ctx).await {
-                                        Ok(result) => {
-                                            log::info!(
-                                                "submit_input succeeded: block={:?} shell={}",
-                                                result.block_id, result.is_shell
-                                            );
-                                        }
-                                        Err(e) => log::error!("submit_input failed: {e}"),
-                                    }
-                                })
-                                .detach();
-                        } else {
-                            let handle = actor.handle.clone();
-                            info!("InputOverlay submit via submit_input (ctx={})", ctx);
-                            bevy::tasks::IoTaskPool::get()
-                                .spawn(async move {
-                                    match handle.submit_input(ctx).await {
-                                        Ok(result) => {
-                                            log::info!(
-                                                "submit_input succeeded: block={:?} shell={}",
-                                                result.block_id, result.is_shell
-                                            );
-                                        }
-                                        Err(e) => log::error!("submit_input failed: {e}"),
-                                    }
-                                })
-                                .detach();
-                        }
+                        let handle = actor.handle.clone();
+                        let is_shell = overlay.is_shell();
+                        bevy::tasks::IoTaskPool::get()
+                            .spawn(async move {
+                                match handle.submit_input(ctx, is_shell).await {
+                                    Ok(result) => log::info!("submit_input ok: {:?}", result.block_id),
+                                    Err(e) => log::error!("submit_input failed: {e}"),
+                                }
+                            })
+                            .detach();
                         // Clear overlay optimistically. The server's InputCleared
                         // confirms via re-fetch (see handle_input_doc_events).
                         overlay.text.clear();
@@ -828,15 +790,8 @@ pub fn handle_compose_input(
 
                         // Dismiss overlay by transitioning focus
                         *focus = FocusArea::Conversation;
-                    } else {
-                        // Offline fallback
-                        let mut text = overlay.take();
-                        if overlay.is_shell() {
-                            text = format!(":{}", text);
-                        }
-                        info!("InputOverlay submitted (offline): {} chars", text.len());
-                        submit_writer.write(PromptSubmitted { text });
                     }
+                    // No else — if not connected, do nothing (no offline fallback)
                 }
             }
             Action::InsertNewline => {

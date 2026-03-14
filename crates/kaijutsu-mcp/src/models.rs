@@ -329,6 +329,10 @@ pub struct InputSubmitRequest {
     /// Context ID (hex or label). Omit to use the current context.
     #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
     pub context_id: Option<String>,
+    /// Input mode: "chat" (default) or "shell".
+    #[serde(default)]
+    #[schemars(description = "Input mode: 'chat' (default) or 'shell'.")]
+    pub mode: Option<String>,
 }
 
 // ============================================================================

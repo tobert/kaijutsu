@@ -75,6 +75,12 @@ enum ToolKind {
   builtin @2;   # Kernel builtin tool (no external process)
 }
 
+# Submit routing: explicit mode instead of prefix-sniffing.
+enum InputMode {
+  chat @0;
+  shell @1;
+}
+
 # Discriminant for BlockFlow event variants (for subscription filtering).
 enum BlockFlowKind {
   inserted @0;
@@ -1037,8 +1043,9 @@ interface Kernel {
   # Raw DTE ops for CRDT-aware clients
   pushInputOps @77 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
-  # Atomic submit: read input, detect shell/chat, create block, clear input
-  submitInput @78 (contextId :Data, trace :TraceContext) -> (commandBlockId :BlockId, isShell :Bool);
+  # Atomic submit: read input, create block, clear input.
+  # Mode is explicit — no prefix detection.
+  submitInput @78 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
 
   # Semantic search: find contexts similar to a text query
   searchSimilar @79 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));

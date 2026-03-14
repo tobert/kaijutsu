@@ -1497,14 +1497,20 @@ impl KernelHandle {
 
     /// Submit the input document: snapshot to conversation block and clear.
     ///
-    /// Returns the created block ID and whether it was detected as a shell command.
+    /// `is_shell` selects the routing mode (shell command vs chat prompt).
     #[tracing::instrument(skip(self), name = "rpc_client.submit_input")]
     pub async fn submit_input(
         &self,
         context_id: ContextId,
+        is_shell: bool,
     ) -> Result<SubmitResult, RpcError> {
         let mut request = self.kernel.submit_input_request();
         request.get().set_context_id(context_id.as_bytes());
+        request.get().set_mode(if is_shell {
+            crate::kaijutsu_capnp::InputMode::Shell
+        } else {
+            crate::kaijutsu_capnp::InputMode::Chat
+        });
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -1514,10 +1520,7 @@ impl KernelHandle {
         let response = request.send().promise.await?;
         let result = response.get()?;
         let block_id = parse_block_id(&result.get_command_block_id()?)?;
-        Ok(SubmitResult {
-            block_id,
-            is_shell: result.get_is_shell(),
-        })
+        Ok(SubmitResult { block_id })
     }
 
     /// Clear the input document for a context (discard draft).
@@ -2180,7 +2183,6 @@ pub struct SyncState {
 #[derive(Debug, Clone)]
 pub struct SubmitResult {
     pub block_id: BlockId,
-    pub is_shell: bool,
 }
 
 /// Full input document state for a context.

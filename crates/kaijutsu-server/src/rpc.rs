@@ -2217,165 +2217,13 @@ impl kernel::Server for KernelImpl {
         let user_agent_id = self.connection.borrow().principal.id;
 
         Promise::from_future(async move {
-            // Get or create embedded kaish executor with real connection identity
-            let kaish = {
-                let mut conn = connection.borrow_mut();
+            let command_block_id = execute_shell_command(
+                &code, context_id, user_agent_id, user_initiated,
+                &kernel, &connection,
+            ).await?;
 
-                if conn.kaish.is_none() {
-                    log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                    let kj_disp = kernel.kj_dispatcher.clone();
-                    let kj_principal = conn.principal.id;
-                    let kj_session = conn.session_id;
-                    match EmbeddedKaish::with_identity(
-                        &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
-                        kernel.documents.clone(),
-                        kernel.kernel.clone(),
-                        None,
-                        conn.principal.id,
-                        conn.require_context()?,
-                        conn.session_id,
-                        kernel.id,
-                        |shared_ctx, tools| {
-                            tools.register(crate::kj_builtin::KjBuiltin::new(
-                                kj_disp, shared_ctx, kj_principal, kj_session,
-                            ));
-                        },
-                    ) {
-                        Ok(kaish) => {
-                            conn.kaish = Some(Rc::new(kaish));
-                        }
-                        Err(e) => {
-                            log::error!("Failed to create embedded kaish: {}", e);
-                            return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
-                        }
-                    }
-                }
-
-                conn.kaish.as_ref().unwrap().clone()
-            };
-            let documents = kernel.documents.clone();
-            let kernel_arc = kernel.kernel.clone();
-
-            // Link to context's long-running trace
-            let trace_id = {
-                let drift = kernel_arc.drift().read().await;
-                drift.trace_id_for_context(context_id).unwrap_or([0u8; 16])
-            };
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute").entered();
-
-            // Document must exist — join_context is the sole creator
-            if documents.get(context_id).is_none() {
-                return Err(capnp::Error::failed(
-                    format!("context {} not found — call join_context first", context_id)
-                ));
-            }
-
-            // Create ToolCall block for the shell command (authored by user)
-            let last_block = documents.last_block_id(context_id);
-            log::info!("Inserting shell command into context {}, after={:?}", context_id, last_block);
-            let role = if user_initiated { Some(Role::User) } else { None };
-            let command_block_id = documents.insert_tool_call_as(
-                context_id, None, last_block.as_ref(),
-                "shell", serde_json::json!({"code": code}),
-                Some(TypesToolKind::Shell), Some(user_agent_id), None, role,
-            ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
-            log::info!("Created shell command block: {:?}", command_block_id);
-
-            // Create ToolResult block (empty, will be filled by execution — system-authored)
-            let output_block_id = documents.insert_tool_result_as(
-                context_id, &command_block_id, Some(&command_block_id),
-                "", false, None,
-                Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
-            ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
-            log::debug!("Created shell output block: {:?}", output_block_id);
-
-            // Mark output block as Running — clients poll this to detect completion
-            if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
-                log::warn!("Failed to set output block to Running: {}", e);
-            }
-
-            // Spawn execution in background
-            let output_block_id_clone = output_block_id;
-            let command_block_id_clone = command_block_id;
-            let documents_clone = documents.clone();
-
-            tokio::task::spawn_local(async move {
-                // Yield to let the event loop flush BlockInserted events to clients
-                // before we start producing text ops. Without this, fast commands
-                // (like `ls`) can emit edit_text before the client has processed the
-                // BlockInserted, causing DataMissing errors on the client side.
-                tokio::task::yield_now().await;
-
-                // Execute via embedded kaish (routes through CRDT backend)
-                log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
-                match kaish.execute(&code).await {
-                    Ok(result) => {
-                        log::info!("shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
-                            result.code, result.original_code, result.did_spill, result.out.len(), result.err.len());
-                        log::debug!("shell_execute: out={:?} err={:?}", result.out, result.err);
-
-                        // Combine out and err (kaish uses out/err/code fields)
-                        let output_text = if result.err.is_empty() {
-                            result.out
-                        } else if result.out.is_empty() {
-                            result.err
-                        } else {
-                            format!("{}\n{}", result.out, result.err)
-                        };
-                        log::debug!("Shell execution completed: {} bytes, exit_code={}, has_output={}",
-                            output_text.len(), result.code, result.output.is_some());
-
-                        // Update output block with result text
-                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
-                            log::error!("Failed to update shell output: {}", e);
-                        }
-
-                        // Store structured output data if present
-                        if let Some(ref output_data) = result.output {
-                            if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
-                                log::error!("Failed to set output data: {}", e);
-                            }
-                        }
-
-                        // Mark complete — status reflects exit code on both blocks
-                        // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
-                        // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
-                        let final_status = match result.code {
-                            0 => Status::Done,
-                            2 => Status::Done,   // latch gate: rm/trash awaiting --confirm
-                            3 => Status::Done,   // spill: output too large, path in content
-                            _ => Status::Error,
-                        };
-                        if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
-                            log::error!("Failed to set output block status: {}", e);
-                        }
-                        if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
-                            log::error!("Failed to set command block status: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Error: {}", e);
-                        log::error!("Shell execution failed: {}", e);
-                        // Write error to output block
-                        if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
-                            log::error!("Failed to update shell output with error: {}", e);
-                        }
-                        // Mark both blocks as error
-                        if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
-                            log::error!("Failed to set output block error status: {}", e);
-                        }
-                        if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
-                            log::error!("Failed to set command block error status: {}", e);
-                        }
-                    }
-                }
-            });
-
-            // Return command block ID
             let mut block_id_builder = results.get().init_command_block_id();
             set_block_id_builder(&mut block_id_builder, &command_block_id);
-
-            log::debug!("shell_execute() returning command_block_id={:?}", command_block_id);
             Ok(())
         }.instrument(trace_span))
     }
@@ -4221,8 +4069,9 @@ impl kernel::Server for KernelImpl {
         let context_id_bytes = pry!(p.get_context_id());
         let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
             .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let is_shell = pry!(p.get_mode()) == InputMode::Shell;
 
-        log::info!("submit_input: context={}", context_id);
+        log::info!("submit_input: context={} shell={}", context_id, is_shell);
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
@@ -4243,140 +4092,23 @@ impl kernel::Server for KernelImpl {
             documents.clear_input(context_id)
                 .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
 
-            // Detect shell prefix: `:` or `` ` ``
-            let is_shell = text.starts_with(':') || text.starts_with('`');
-
-            // Document must exist — join_context is the sole creator
-            if documents.get(context_id).is_none() {
-                return Err(capnp::Error::failed(
-                    format!("context {} not found — call join_context first", context_id)
-                ));
-            }
-
             if is_shell {
-                // Strip the shell prefix
-                let code = if text.starts_with(':') || text.starts_with('`') {
-                    text[1..].trim().to_string()
-                } else {
-                    text.clone()
-                };
+                let command_block_id = execute_shell_command(
+                    &text, context_id, user_agent_id, true,
+                    &kernel, &connection,
+                ).await?;
 
-                // Get or create embedded kaish executor
-                let kaish = {
-                    let kernel_ref = &kernel;
-                    let mut conn = connection.borrow_mut();
-
-                    if conn.kaish.is_none() {
-                        log::info!("Creating embedded kaish for kernel {}", kernel_ref.id.to_hex());
-                        let kj_disp = kernel_ref.kj_dispatcher.clone();
-                        let kj_principal = conn.principal.id;
-                        let kj_session = conn.session_id;
-                        match EmbeddedKaish::with_identity(
-                            &format!("{}-{}-{}", kernel_ref.name, conn.principal.username, conn.session_id.short()),
-                            kernel_ref.documents.clone(),
-                            kernel_ref.kernel.clone(),
-                            None,
-                            conn.principal.id,
-                            conn.require_context()?,
-                            conn.session_id,
-                            kernel_ref.id,
-                            |shared_ctx, tools| {
-                                tools.register(crate::kj_builtin::KjBuiltin::new(
-                                    kj_disp, shared_ctx, kj_principal, kj_session,
-                                ));
-                            },
-                        ) {
-                            Ok(kaish) => {
-                                conn.kaish = Some(Rc::new(kaish));
-                            }
-                            Err(e) => {
-                                log::error!("Failed to create embedded kaish: {}", e);
-                                return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
-                            }
-                        }
-                    }
-
-                    conn.kaish.as_ref().unwrap().clone()
-                };
-
-                // Create ToolCall block for the shell command (authored by user)
-                let last_block = documents.last_block_id(context_id);
-                let command_block_id = documents.insert_tool_call_as(
-                    context_id, None, last_block.as_ref(),
-                    "shell", serde_json::json!({"code": code}),
-                    Some(TypesToolKind::Shell), Some(user_agent_id), None,
-                    Some(Role::User),
-                ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
-
-                // Create ToolResult block (empty, filled by execution)
-                let output_block_id = documents.insert_tool_result_as(
-                    context_id, &command_block_id, Some(&command_block_id),
-                    "", false, None,
-                    Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
-                ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
-
-                // Mark output block as Running
-                if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
-                    log::warn!("Failed to set output block to Running: {}", e);
-                }
-
-                // Spawn execution in background
-                let documents_clone = documents.clone();
-                let output_block_id_clone = output_block_id;
-                let command_block_id_clone = command_block_id;
-                tokio::task::spawn_local(async move {
-                    tokio::task::yield_now().await;
-
-                    match kaish.execute(&code).await {
-                        Ok(result) => {
-                            let output_text = if result.err.is_empty() {
-                                result.out
-                            } else if result.out.is_empty() {
-                                result.err
-                            } else {
-                                format!("{}\n{}", result.out, result.err)
-                            };
-
-                            if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
-                                log::error!("Failed to update shell output: {}", e);
-                            }
-
-                            if let Some(ref output_data) = result.output {
-                                if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
-                                    log::error!("Failed to set output data: {}", e);
-                                }
-                            }
-
-                            let final_status = if result.code == 0 { Status::Done } else { Status::Error };
-                            if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
-                                log::error!("Failed to set output block status: {}", e);
-                            }
-                            if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
-                                log::error!("Failed to set command block status: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            let error_msg = format!("Error: {}", e);
-                            log::error!("Shell execution failed: {}", e);
-                            if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
-                                log::error!("Failed to update shell output with error: {}", e);
-                            }
-                            if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
-                                log::error!("Failed to set output block error status: {}", e);
-                            }
-                            if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
-                                log::error!("Failed to set command block error status: {}", e);
-                            }
-                        }
-                    }
-                });
-
-                // Return command block ID
                 let mut block_id_builder = results.get().init_command_block_id();
                 set_block_id_builder(&mut block_id_builder, &command_block_id);
-                results.get().set_is_shell(true);
             } else {
                 // Chat prompt — create user message block and invoke LLM
+
+                // Document must exist — join_context is the sole creator
+                if documents.get(context_id).is_none() {
+                    return Err(capnp::Error::failed(
+                        format!("context {} not found — call join_context first", context_id)
+                    ));
+                }
 
                 // Build ToolContext from connection state
                 let (session_id, kaish_ref) = {
@@ -4406,7 +4138,6 @@ impl kernel::Server for KernelImpl {
 
                 let mut block_id_builder = results.get().init_command_block_id();
                 set_block_id_builder(&mut block_id_builder, &user_block_id);
-                results.get().set_is_shell(false);
             }
 
             Ok(())
@@ -5371,6 +5102,162 @@ fn tool_kind_for_category(category: &str) -> TypesToolKind {
         "mcp" => TypesToolKind::Mcp,
         _ => TypesToolKind::Builtin,
     }
+}
+
+/// Create kaish, insert ToolCall + ToolResult blocks, spawn execution.
+///
+/// Shared by `shell_execute` (direct RPC) and `submit_input` (shell mode).
+/// Exit codes 0/2/3 map to Done; everything else is Error.
+async fn execute_shell_command(
+    code: &str,
+    context_id: ContextId,
+    user_agent_id: PrincipalId,
+    user_initiated: bool,
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
+    // Get or create embedded kaish executor with real connection identity
+    let kaish = {
+        let mut conn = connection.borrow_mut();
+
+        if conn.kaish.is_none() {
+            log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
+            let kj_disp = kernel.kj_dispatcher.clone();
+            let kj_principal = conn.principal.id;
+            let kj_session = conn.session_id;
+            match EmbeddedKaish::with_identity(
+                &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
+                kernel.documents.clone(),
+                kernel.kernel.clone(),
+                None,
+                conn.principal.id,
+                conn.require_context()?,
+                conn.session_id,
+                kernel.id,
+                |shared_ctx, tools| {
+                    tools.register(crate::kj_builtin::KjBuiltin::new(
+                        kj_disp, shared_ctx, kj_principal, kj_session,
+                    ));
+                },
+            ) {
+                Ok(kaish) => {
+                    conn.kaish = Some(Rc::new(kaish));
+                }
+                Err(e) => {
+                    log::error!("Failed to create embedded kaish: {}", e);
+                    return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
+                }
+            }
+        }
+
+        conn.kaish.as_ref().unwrap().clone()
+    };
+
+    let documents = kernel.documents.clone();
+    let kernel_arc = kernel.kernel.clone();
+
+    // Link to context's long-running trace
+    let trace_id = {
+        let drift = kernel_arc.drift().read().await;
+        drift.trace_id_for_context(context_id).unwrap_or([0u8; 16])
+    };
+    let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute").entered();
+
+    // Document must exist — join_context is the sole creator
+    if documents.get(context_id).is_none() {
+        return Err(capnp::Error::failed(
+            format!("context {} not found — call join_context first", context_id)
+        ));
+    }
+
+    // Create ToolCall block for the shell command (authored by user if user_initiated)
+    let last_block = documents.last_block_id(context_id);
+    let role = if user_initiated { Some(Role::User) } else { None };
+    let command_block_id = documents.insert_tool_call_as(
+        context_id, None, last_block.as_ref(),
+        "shell", serde_json::json!({"code": code}),
+        Some(TypesToolKind::Shell), Some(user_agent_id), None, role,
+    ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
+
+    // Create ToolResult block (empty, will be filled by execution — system-authored)
+    let output_block_id = documents.insert_tool_result_as(
+        context_id, &command_block_id, Some(&command_block_id),
+        "", false, None,
+        Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
+    ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
+
+    // Mark output block as Running — clients poll this to detect completion
+    if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
+        log::warn!("Failed to set output block to Running: {}", e);
+    }
+
+    // Spawn execution in background
+    let code = code.to_owned();
+    let documents_clone = documents.clone();
+    let output_block_id_clone = output_block_id;
+    let command_block_id_clone = command_block_id;
+
+    tokio::task::spawn_local(async move {
+        // Yield to let the event loop flush BlockInserted events to clients
+        // before we start producing text ops. Without this, fast commands
+        // (like `ls`) can emit edit_text before the client has processed the
+        // BlockInserted, causing DataMissing errors on the client side.
+        tokio::task::yield_now().await;
+
+        log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
+        match kaish.execute(&code).await {
+            Ok(result) => {
+                log::info!("shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
+                    result.code, result.original_code, result.did_spill, result.out.len(), result.err.len());
+
+                let output_text = if result.err.is_empty() {
+                    result.out
+                } else if result.out.is_empty() {
+                    result.err
+                } else {
+                    format!("{}\n{}", result.out, result.err)
+                };
+
+                if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
+                    log::error!("Failed to update shell output: {}", e);
+                }
+
+                if let Some(ref output_data) = result.output {
+                    if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
+                        log::error!("Failed to set output data: {}", e);
+                    }
+                }
+
+                // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
+                // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
+                let final_status = match result.code {
+                    0 | 2 | 3 => Status::Done,
+                    _ => Status::Error,
+                };
+                if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
+                    log::error!("Failed to set output block status: {}", e);
+                }
+                if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
+                    log::error!("Failed to set command block status: {}", e);
+                }
+            }
+            Err(e) => {
+                let error_msg = format!("Error: {}", e);
+                log::error!("Shell execution failed: {}", e);
+                if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
+                    log::error!("Failed to update shell output with error: {}", e);
+                }
+                if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
+                    log::error!("Failed to set output block error status: {}", e);
+                }
+                if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
+                    log::error!("Failed to set command block error status: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(command_block_id)
 }
 
 /// will be inserted after this block (typically the user's message).

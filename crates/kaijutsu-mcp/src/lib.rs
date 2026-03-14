@@ -1749,12 +1749,12 @@ impl KaijutsuMcp {
                 "Error: submit_input requires --connect to kaijutsu-server".to_string()
             }
             Backend::Remote(remote) => {
-                match remote.actor.submit_input(ctx_id).await {
+                let is_shell = req.mode.as_deref() == Some("shell");
+                match remote.actor.submit_input(ctx_id, is_shell).await {
                     Ok(result) => serde_json::json!({
                         "success": true,
                         "context_id": ctx_id.short(),
                         "block_id": result.block_id.to_key(),
-                        "is_shell": result.is_shell,
                     }).to_string(),
                     Err(e) => format!("Error: {}", e),
                 }
@@ -3415,6 +3415,7 @@ mod tests {
         let ctx_id = ContextId::new();
         let result = mcp.submit_input(Parameters(InputSubmitRequest {
             context_id: Some(ctx_id.to_hex()),
+            mode: None,
         })).await;
         assert!(result.contains("Error"), "submit_input should error in local mode: {result}");
     }

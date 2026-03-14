@@ -33,7 +33,7 @@ use crate::view::{
     BlockCellContainer, BlockCellLayout,
     ContextSwitchRequested, ConversationContainer, ConversationScrollState,
     DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
-    PendingContextSwitch, PromptSubmitted, RoleGroupBorderLayout, SubmitFailed,
+    PendingContextSwitch, RoleGroupBorderLayout, SubmitFailed,
     ViewingConversation, EditorEntities,
 };
 use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
@@ -52,15 +52,13 @@ pub struct CellPlugin;
 impl Plugin for CellPlugin {
     fn build(&self, app: &mut App) {
         // Register messages
-        app.add_message::<PromptSubmitted>()
-            .add_message::<SubmitFailed>()
+        app.add_message::<SubmitFailed>()
             .add_message::<ContextSwitchRequested>();
 
         // Register types for BRP reflection
         app.register_type::<ConversationScrollState>()
             .register_type::<ConversationContainer>()
             .register_type::<MainCell>()
-            .register_type::<PromptSubmitted>()
             .register_type::<ViewingConversation>()
             .register_type::<FocusTarget>()
             .register_type::<BlockCellContainer>()
@@ -100,14 +98,11 @@ impl Plugin for CellPlugin {
                 view_sync::handle_block_events,
                 view_sync::handle_input_doc_events.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
-                view_submit::handle_prompt_submitted
-                    .after(view_sync::handle_context_switch),
                 view_submit::handle_submit_failed
-                    .after(view_submit::handle_prompt_submitted),
+                    .after(view_sync::handle_context_switch),
                 view_sync::sync_main_cell_to_conversation
                     .after(view_sync::handle_block_events)
-                    .after(view_sync::handle_context_switch)
-                    .after(view_submit::handle_prompt_submitted),
+                    .after(view_sync::handle_context_switch),
                 view_sync::check_cache_staleness
                     .after(view_sync::handle_block_events)
                     .after(view_sync::handle_context_switch),

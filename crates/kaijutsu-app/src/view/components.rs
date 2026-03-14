@@ -484,13 +484,6 @@ pub struct InputOverlayMarker;
 #[reflect(Component)]
 pub struct MainCell;
 
-/// Message fired when user submits prompt text (presses Enter).
-#[derive(Message, Reflect)]
-pub struct PromptSubmitted {
-    /// The text that was submitted.
-    pub text: String,
-}
-
 /// Message fired when prompt submission fails (e.g. disconnected).
 ///
 /// Carries the original text so it can be restored to the compose block.
