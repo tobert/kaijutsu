@@ -15,7 +15,8 @@
 // Return: #{ keywords: Array<String>, top_blocks: Array<Map> }
 
 let blocks = context_blocks(CONTEXT_ID);
-let text_blocks = blocks.filter(|b| b.kind == "text" && b.content.len() > 10);
+// Include all block kinds except file (raw code would dominate embeddings).
+let text_blocks = blocks.filter(|b| b.kind != "file" && b.content.len() > 10);
 if text_blocks.len() == 0 {
     return #{};
 }
