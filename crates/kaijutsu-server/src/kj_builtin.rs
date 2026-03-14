@@ -3,6 +3,13 @@
 //! Registered as a kaish Tool in EmbeddedKaish via the `configure_tools` callback.
 //! Each connection gets its own `KjBuiltin` instance with the shared dispatcher
 //! plus per-connection identity.
+//!
+//! ## Server-side command interception
+//!
+//! `kj synth` is intercepted here before forwarding to `KjDispatcher` because
+//! synthesis requires `kaijutsu-index` (ONNX embedder, HNSW index), which is
+//! only available in the server crate — not in `kaijutsu-kernel` where
+//! `KjDispatcher` lives.
 
 use std::sync::Arc;
 
@@ -28,6 +35,10 @@ pub struct KjBuiltin {
     shared_context_id: SharedContextId,
     principal_id: PrincipalId,
     session_id: SessionId,
+    /// Semantic index for synthesis commands. None if embedding model not configured.
+    semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+    /// Block source adapter for fetching context blocks during synthesis.
+    block_source: Arc<dyn kaijutsu_index::BlockSource>,
 }
 
 impl KjBuiltin {
@@ -36,12 +47,16 @@ impl KjBuiltin {
         shared_context_id: SharedContextId,
         principal_id: PrincipalId,
         session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Self {
         Self {
             dispatcher,
             shared_context_id,
             principal_id,
             session_id,
+            semantic_index,
+            block_source,
         }
     }
 
@@ -76,6 +91,194 @@ impl KjBuiltin {
             }
         }
     }
+
+    // ========================================================================
+    // Synthesis commands (server-side, needs kaijutsu-index)
+    // ========================================================================
+
+    /// Dispatch `kj synth <subcommand>`.
+    async fn dispatch_synth(&self, argv: &[String], caller: &KjCaller) -> ExecResult {
+        let sub = argv.first().map(|s| s.as_str()).unwrap_or("help");
+
+        match sub {
+            "all" => self.synth_all().await,
+            "status" => self.synth_status(),
+            "help" | "--help" | "-h" => ExecResult::success(Self::synth_help()),
+            // Anything else: treat as a context ref
+            _ => self.synth_context(sub, caller).await,
+        }
+    }
+
+    /// `kj synth all` — index + synthesize all active contexts.
+    async fn synth_all(&self) -> ExecResult {
+        let Some(ref idx) = self.semantic_index else {
+            return ExecResult::failure(1, "semantic index not configured (check embedding model in models.rhai)".to_string());
+        };
+
+        let kernel_id = self.dispatcher.kernel_id();
+        let contexts = {
+            let db = self.dispatcher.kernel_db().lock().unwrap();
+            match db.list_active_contexts(kernel_id) {
+                Ok(rows) => rows,
+                Err(e) => return ExecResult::failure(1, format!("failed to list contexts: {e}")),
+            }
+        };
+
+        if contexts.is_empty() {
+            return ExecResult::success("no active contexts".to_string());
+        }
+
+        let total = contexts.len();
+        let mut indexed = 0usize;
+        let mut synthesized = 0usize;
+        let mut errors = Vec::new();
+
+        for row in &contexts {
+            let ctx_id = row.context_id;
+            let idx = idx.clone();
+            let block_source = self.block_source.clone();
+
+            // Index + synthesize on blocking thread
+            let result = tokio::task::spawn_blocking(move || {
+                let blocks = block_source.block_snapshots(ctx_id)
+                    .map_err(|e| format!("block fetch: {e}"))?;
+
+                let was_indexed = idx.index_context(ctx_id, &blocks)
+                    .map_err(|e| format!("index: {e}"))?;
+
+                let synth = crate::synthesis_rhai::run_synthesis(
+                    ctx_id,
+                    idx.embedder_arc(),
+                    block_source,
+                );
+
+                Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((was_indexed, synth))
+            }).await;
+
+            match result {
+                Ok(Ok((was_indexed, synth_result))) => {
+                    if was_indexed { indexed += 1; }
+                    if let Some(synth) = synth_result {
+                        // Cache outside the closure — idx was moved into spawn_blocking
+                        if let Some(ref si) = self.semantic_index {
+                            si.synthesis_cache().insert(ctx_id, synth);
+                        }
+                        synthesized += 1;
+                    }
+                }
+                Ok(Err(e)) => errors.push(format!("{}: {e}", ctx_id.short())),
+                Err(e) => errors.push(format!("{}: join error: {e}", ctx_id.short())),
+            }
+        }
+
+        let mut out = format!(
+            "processed {total} contexts: {indexed} newly indexed, {synthesized} synthesized"
+        );
+        if !errors.is_empty() {
+            out.push_str(&format!("\nerrors ({}):\n  {}", errors.len(), errors.join("\n  ")));
+        }
+        ExecResult::success(out)
+    }
+
+    /// `kj synth <ctx_ref>` — index + synthesize a single context.
+    async fn synth_context(&self, ctx_ref: &str, caller: &KjCaller) -> ExecResult {
+        let Some(ref idx) = self.semantic_index else {
+            return ExecResult::failure(1, "semantic index not configured (check embedding model in models.rhai)".to_string());
+        };
+
+        // Resolve context reference
+        let parsed = kaijutsu_kernel::kj::refs::parse_context_ref(ctx_ref);
+        let kernel_id = self.dispatcher.kernel_id();
+        let ctx_id = {
+            let db = self.dispatcher.kernel_db().lock().unwrap();
+            match kaijutsu_kernel::kj::refs::resolve_context_ref(&parsed, caller, &db, kernel_id) {
+                Ok(id) => id,
+                Err(e) => return ExecResult::failure(1, e),
+            }
+        };
+
+        let idx = idx.clone();
+        let block_source = self.block_source.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let blocks = block_source.block_snapshots(ctx_id)
+                .map_err(|e| format!("block fetch: {e}"))?;
+
+            let was_indexed = idx.index_context(ctx_id, &blocks)
+                .map_err(|e| format!("index: {e}"))?;
+
+            let synth = crate::synthesis_rhai::run_synthesis(
+                ctx_id,
+                idx.embedder_arc(),
+                block_source,
+            );
+
+            if let Some(ref s) = synth {
+                idx.synthesis_cache().insert(ctx_id, s.clone());
+            }
+
+            Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((was_indexed, synth))
+        }).await;
+
+        match result {
+            Ok(Ok((was_indexed, synth_result))) => {
+                let mut out = format!("{}", ctx_id.short());
+                if was_indexed {
+                    out.push_str(" (newly indexed)");
+                }
+                if let Some(synth) = synth_result {
+                    let kw: Vec<&str> = synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
+                    let kw_str = if kw.is_empty() { "(none)".to_string() } else { kw.join(", ") };
+                    out.push_str(&format!("\nkeywords: {kw_str}"));
+                    if !synth.top_blocks.is_empty() {
+                        let preview = &synth.top_blocks[0].2;
+                        let end = preview.len().min(60);
+                        out.push_str(&format!("\npreview: {}...", &preview[..end]));
+                    }
+                } else {
+                    out.push_str("\nno synthesis result (empty context?)");
+                }
+                ExecResult::success(out)
+            }
+            Ok(Err(e)) => ExecResult::failure(1, format!("synthesis failed: {e}")),
+            Err(e) => ExecResult::failure(1, format!("synthesis task failed: {e}")),
+        }
+    }
+
+    /// `kj synth status` — show index statistics.
+    fn synth_status(&self) -> ExecResult {
+        let Some(ref idx) = self.semantic_index else {
+            return ExecResult::success("semantic index: not configured\n(set embedding model in models.rhai)".to_string());
+        };
+
+        let count = idx.len();
+        let model = idx.embedder().model_name().to_string();
+        let dims = idx.embedder().dimensions();
+
+        ExecResult::success(format!(
+            "semantic index: {count} contexts indexed\nmodel: {model} ({dims}d)"
+        ))
+    }
+
+    fn synth_help() -> String {
+        "\
+kj synth — semantic indexing + keyword synthesis
+
+Commands:
+  kj synth all          Index and synthesize all active contexts
+  kj synth <ctx>        Index and synthesize a specific context
+  kj synth status       Show index statistics
+  kj synth help         Show this help
+
+Context references: . (current), .parent, label, hex prefix
+
+Examples:
+  kj synth .            Synthesize current context
+  kj synth all          Bulk index + synthesize everything
+  kj synth explore      Synthesize context labeled \"explore\"
+  kj synth status       Show model info and index count"
+            .to_string()
+    }
 }
 
 #[async_trait]
@@ -108,6 +311,7 @@ impl Tool for KjBuiltin {
             .example("Merge fork back to parent", "kj drift merge")
             .example("Set model on current context", "kj context set . --model anthropic:claude-sonnet-4-5-20250929")
             .example("Learn drift workflows", "kj drift help")
+            .example("Bulk synthesize keywords", "kj synth all")
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut ExecContext) -> ExecResult {
@@ -172,6 +376,12 @@ impl Tool for KjBuiltin {
                 Ok(()) => caller.confirmed = true,
                 Err(e) => return ExecResult::failure(1, format!("kj: {e}")),
             }
+        }
+
+        // Server-crate commands intercepted here because they require
+        // dependencies that kaijutsu-kernel does not have.
+        if argv.first().map(|s| s.as_str()) == Some("synth") {
+            return self.dispatch_synth(&argv[1..], &caller).await;
         }
 
         let result = self.dispatcher.dispatch(&argv, &caller).await;

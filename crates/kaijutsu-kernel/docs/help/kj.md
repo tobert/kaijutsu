@@ -49,6 +49,7 @@ fork            Fork current context (--shallow, --compact, --as)
 drift           push, pull, merge, flush, queue, cancel, history
 preset          list, show, save, remove
 workspace (ws)  list, show, create, add, bind, remove
+synth           all, <ctx>, status — semantic indexing + keyword synthesis
 ```
 
 Run `kj <command> help` for detailed subcommand reference.

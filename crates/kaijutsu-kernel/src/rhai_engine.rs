@@ -37,6 +37,12 @@ use tracing::{debug, info, warn};
 /// across tool calls within the same conversation. The Rhai `Engine` itself is
 /// stateless and recreated each call (it only holds registered functions, which
 /// are the same every time).
+/// Optional callback to register additional Rhai functions on engine creation.
+///
+/// Used by the server crate to inject synthesis functions (`embed`, `cosine_sim`,
+/// etc.) that require `kaijutsu-index` — not available in this crate.
+pub type ExtraRegistrar = Arc<dyn Fn(&mut Engine) + Send + Sync>;
+
 pub struct RhaiEngine {
     /// Block store for CRDT operations.
     block_store: SharedBlockStore,
@@ -45,6 +51,8 @@ pub struct RhaiEngine {
     /// Per-context persistent scopes. `Scope<'static>` is the rhai convention.
     /// `Mutex` (not `RwLock`) because `eval_with_scope` requires `&mut Scope`.
     scopes: Arc<Mutex<HashMap<ContextId, Scope<'static>>>>,
+    /// Optional extension point for registering extra functions (e.g. synthesis).
+    extra_registrar: Option<ExtraRegistrar>,
 }
 
 impl RhaiEngine {
@@ -54,7 +62,18 @@ impl RhaiEngine {
             block_store,
             interrupted: Arc::new(AtomicBool::new(false)),
             scopes: Arc::new(Mutex::new(HashMap::new())),
+            extra_registrar: None,
         }
+    }
+
+    /// Register additional functions on the Rhai engine (builder pattern).
+    ///
+    /// The registrar is called on every `create_engine()` invocation, after all
+    /// standard functions are registered. This is how server-crate synthesis
+    /// functions (embed, cosine_sim, etc.) get injected.
+    pub fn with_extra_registrar(mut self, registrar: ExtraRegistrar) -> Self {
+        self.extra_registrar = Some(registrar);
+        self
     }
 
     /// Create a configured Rhai engine with all functions registered.
@@ -62,12 +81,13 @@ impl RhaiEngine {
         block_store: SharedBlockStore,
         interrupted: Arc<AtomicBool>,
         context_id: ContextId,
+        extra_registrar: Option<&ExtraRegistrar>,
     ) -> (Engine, kaijutsu_rhai::OutputCollector) {
         let mut engine = Engine::new();
 
         // Configure safety limits
         engine.set_max_expr_depths(64, 64);
-        engine.set_max_operations(100_000);
+        engine.set_max_operations(10_000_000);
         engine.set_max_modules(10);
         engine.set_max_string_size(1_000_000);
         engine.set_max_array_size(10_000);
@@ -88,6 +108,11 @@ impl RhaiEngine {
 
         // Register utility functions
         Self::register_utility_functions(&mut engine, interrupted);
+
+        // Server-injected functions (synthesis, etc.)
+        if let Some(registrar) = extra_registrar {
+            registrar(&mut engine);
+        }
 
         (engine, collector)
     }
@@ -550,8 +575,9 @@ impl RhaiEngine {
         interrupted: Arc<AtomicBool>,
         scopes: &Mutex<HashMap<ContextId, Scope<'static>>>,
         context_id: ContextId,
+        extra_registrar: Option<&ExtraRegistrar>,
     ) -> ExecResult {
-        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted, context_id);
+        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted, context_id, extra_registrar);
 
         // Take scope out of the map (or create a new one)
         let mut scope = scopes
@@ -659,10 +685,11 @@ impl ExecutionEngine for RhaiEngine {
         let interrupted = Arc::clone(&self.interrupted);
         let scopes = Arc::clone(&self.scopes);
         let context_id = ctx.context_id;
+        let extra_registrar = self.extra_registrar.clone();
 
         // Execute in spawn_blocking for async safety
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_sync(&block_store, &code, interrupted, &scopes, context_id)
+            Self::execute_sync(&block_store, &code, interrupted, &scopes, context_id, extra_registrar.as_ref())
         })
         .await?;
 

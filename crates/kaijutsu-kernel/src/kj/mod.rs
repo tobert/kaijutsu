@@ -155,7 +155,7 @@ impl KjDispatcher {
         &self.kernel_db
     }
 
-    pub(crate) fn kernel_id(&self) -> KernelId {
+    pub fn kernel_id(&self) -> KernelId {
         self.kernel_id
     }
 

@@ -168,11 +168,9 @@ async fn register_block_tools(
         Arc::new(WhoamiEngine::new(kernel.drift().clone())),
     ).await;
 
-    // ── Rhai scripting (persistent per-context state) ──
-    kernel.register_tool_with_engine(
-        ToolInfo::new("rhai", "Execute Rhai scripts with persistent per-context state", "kernel"),
-        Arc::new(RhaiEngine::new(documents.clone())),
-    ).await;
+    // Rhai scripting is registered later (after semantic index init) so synthesis
+    // functions can be injected. See the register_rhai_engine() call after
+    // initialize_kernel_models().
 }
 
 /// Per-context LLM conversation cache with per-context locking and LRU eviction.
@@ -628,7 +626,7 @@ pub struct CommandEntry {
 // ============================================================================
 
 /// Adapter: SharedBlockStore → kaijutsu_index::BlockSource
-struct BlockStoreSource(SharedBlockStore);
+pub(crate) struct BlockStoreSource(pub(crate) SharedBlockStore);
 
 impl kaijutsu_index::BlockSource for BlockStoreSource {
     fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
@@ -860,7 +858,7 @@ pub async fn create_shared_kernel(
                             let idx_clone = synth_idx.clone();
                             let blocks_clone = synth_blocks.clone();
                             tokio::task::spawn_blocking(move || {
-                                run_synthesis(
+                                crate::synthesis_rhai::run_synthesis_and_cache(
                                     ctx_id,
                                     idx_clone.embedder_arc(),
                                     blocks_clone,
@@ -892,6 +890,23 @@ pub async fn create_shared_kernel(
     } else {
         None
     };
+
+    // ── Rhai scripting (registered after semantic index so synthesis fns are available) ──
+    {
+        let rhai_engine = if let Some(ref idx) = semantic_index {
+            let embedder = idx.embedder_arc();
+            let bs: Arc<dyn kaijutsu_index::BlockSource> = Arc::new(BlockStoreSource(documents.clone()));
+            RhaiEngine::new(documents.clone()).with_extra_registrar(Arc::new(move |eng| {
+                crate::synthesis_rhai::register_synthesis_fns(eng, embedder.clone(), bs.clone());
+            }))
+        } else {
+            RhaiEngine::new(documents.clone())
+        };
+        kernel_arc.register_tool_with_engine(
+            ToolInfo::new("rhai", "Execute Rhai scripts with persistent per-context state", "kernel"),
+            Arc::new(rhai_engine),
+        ).await;
+    }
 
     // Create kj dispatcher — shared across all connections
     let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new(
@@ -1048,8 +1063,12 @@ impl kernel::Server for KernelImpl {
                         conn.session_id,
                         kernel.id,
                         |shared_ctx, tools| {
+                            let block_source: Arc<dyn kaijutsu_index::BlockSource> =
+                                Arc::new(BlockStoreSource(kernel.documents.clone()));
                             tools.register(crate::kj_builtin::KjBuiltin::new(
                                 kj_disp, shared_ctx, kj_principal, kj_session,
+                                kernel.semantic_index.clone(),
+                                block_source,
                             ));
                         },
                     ) {
@@ -5138,8 +5157,12 @@ async fn execute_shell_command(
                 conn.session_id,
                 kernel.id,
                 |shared_ctx, tools| {
+                    let block_source: Arc<dyn kaijutsu_index::BlockSource> =
+                        Arc::new(BlockStoreSource(kernel.documents.clone()));
                     tools.register(crate::kj_builtin::KjBuiltin::new(
                         kj_disp, shared_ctx, kj_principal, kj_session,
+                        kernel.semantic_index.clone(),
+                        block_source,
                     ));
                 },
             ) {
@@ -6688,132 +6711,4 @@ impl vfs::Server for VfsImpl {
 // Synthesis (Rhai-driven keyword extraction + representative block selection)
 // ============================================================================
 
-/// Default synthesis script, embedded at compile time.
-const DEFAULT_SYNTHESIS_RHAI: &str = include_str!("../../../assets/defaults/synthesis.rhai");
-
-/// Run synthesis for a context: evaluate Rhai script, cache results.
-///
-/// Called from the watcher callback (on the async task). This is a blocking
-/// operation (Rhai eval + ONNX embed calls) — acceptable because the watcher
-/// already runs on spawn_blocking for indexing.
-fn run_synthesis(
-    ctx_id: kaijutsu_types::ContextId,
-    embedder: std::sync::Arc<dyn kaijutsu_index::Embedder>,
-    block_source: std::sync::Arc<dyn kaijutsu_index::BlockSource>,
-    cache: &kaijutsu_index::synthesis::SynthesisCache,
-) {
-    // Load user override or fall back to embedded default
-    let script = load_synthesis_script();
-
-    let engine = crate::synthesis_rhai::create_synthesis_engine(embedder, block_source);
-
-    let mut scope = rhai::Scope::new();
-    scope.push_constant("CONTEXT_ID", ctx_id.to_string());
-
-    let ast = match engine.compile(&script) {
-        Ok(ast) => ast,
-        Err(e) => {
-            tracing::warn!(error = %e, "synthesis.rhai compile error");
-            return;
-        }
-    };
-
-    let result = match engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, &ast) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, ctx = %ctx_id.short(), "synthesis.rhai eval error");
-            return;
-        }
-    };
-
-    // Parse the Rhai Map into SynthesisResult
-    let map = match result.try_cast::<rhai::Map>() {
-        Some(m) => m,
-        None => {
-            tracing::debug!(ctx = %ctx_id.short(), "synthesis.rhai returned non-map, skipping");
-            return;
-        }
-    };
-
-    if map.is_empty() {
-        tracing::debug!(ctx = %ctx_id.short(), "synthesis.rhai returned empty map");
-        return;
-    }
-
-    let keywords: Vec<(String, f32)> = map
-        .get("keywords")
-        .and_then(|v| v.clone().into_array().ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|d| {
-            // Accept either plain string (from .map(|k| k.keyword)) or map with keyword+score
-            if let Ok(s) = d.clone().into_string() {
-                Some((s, 0.0))
-            } else if let Some(m) = d.try_cast::<rhai::Map>() {
-                let kw = m.get("keyword")?.clone().into_string().ok()?;
-                let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
-                Some((kw, score))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let top_blocks: Vec<(String, f32, String)> = map
-        .get("top_blocks")
-        .and_then(|v| v.clone().into_array().ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|d| {
-            let m = d.try_cast::<rhai::Map>()?;
-            let id = m.get("id")?.clone().into_string().ok()?;
-            let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
-            let preview = m.get("preview").and_then(|v| v.clone().into_string().ok()).unwrap_or_default();
-            Some((id, score, preview))
-        })
-        .collect();
-
-    let synth = kaijutsu_index::synthesis::SynthesisResult {
-        keywords,
-        top_blocks,
-        content_hash: String::new(), // hash not critical for cache — watcher already deduplicates
-    };
-
-    tracing::debug!(
-        ctx = %ctx_id.short(),
-        keywords = synth.keywords.len(),
-        blocks = synth.top_blocks.len(),
-        "synthesis complete"
-    );
-
-    cache.insert(ctx_id, synth);
-}
-
-/// Load synthesis.rhai from user config dir, falling back to embedded default.
-fn load_synthesis_script() -> String {
-    if let Some(config_dir) = dirs_config_path() {
-        let user_script = config_dir.join("synthesis.rhai");
-        if user_script.exists() {
-            match std::fs::read_to_string(&user_script) {
-                Ok(s) => return s,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        path = %user_script.display(),
-                        "failed to read user synthesis.rhai, using default"
-                    );
-                }
-            }
-        }
-    }
-    DEFAULT_SYNTHESIS_RHAI.to_string()
-}
-
-/// Get the kaijutsu config directory (~/.config/kaijutsu).
-fn dirs_config_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .map(|d| d.join("kaijutsu"))
-}
 

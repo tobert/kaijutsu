@@ -171,7 +171,7 @@ pub fn create_synthesis_engine(
 
     // Safety limits
     engine.set_max_expr_depths(64, 64);
-    engine.set_max_operations(100_000);
+    engine.set_max_operations(10_000_000);
     engine.set_max_string_size(1_000_000);
     engine.set_max_array_size(10_000);
     engine.set_max_map_size(1_000);
@@ -180,6 +180,140 @@ pub fn create_synthesis_engine(
     register_synthesis_fns(&mut engine, embedder, block_source);
 
     engine
+}
+
+// ============================================================================
+// Synthesis runner
+// ============================================================================
+
+/// Default synthesis script, embedded at compile time.
+const DEFAULT_SYNTHESIS_RHAI: &str = include_str!("../../../assets/defaults/synthesis.rhai");
+
+/// Run synthesis for a context: evaluate Rhai script, return result.
+///
+/// Blocking operation (Rhai eval + ONNX embed calls) — call from `spawn_blocking`.
+/// Returns `None` on script errors or empty results.
+pub fn run_synthesis(
+    ctx_id: ContextId,
+    embedder: Arc<dyn Embedder>,
+    block_source: Arc<dyn BlockSource>,
+) -> Option<kaijutsu_index::synthesis::SynthesisResult> {
+    let script = load_synthesis_script();
+    let engine = create_synthesis_engine(embedder, block_source);
+
+    let mut scope = rhai::Scope::new();
+    scope.push_constant("CONTEXT_ID", ctx_id.to_string());
+
+    let ast = match engine.compile(&script) {
+        Ok(ast) => ast,
+        Err(e) => {
+            tracing::warn!(error = %e, "synthesis.rhai compile error");
+            return None;
+        }
+    };
+
+    let result = match engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, &ast) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, ctx = %ctx_id.short(), "synthesis.rhai eval error");
+            return None;
+        }
+    };
+
+    let map = match result.try_cast::<rhai::Map>() {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            tracing::debug!(ctx = %ctx_id.short(), "synthesis.rhai returned empty/non-map");
+            return None;
+        }
+    };
+
+    let keywords: Vec<(String, f32)> = map
+        .get("keywords")
+        .and_then(|v| v.clone().into_array().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| {
+            if let Ok(s) = d.clone().into_string() {
+                Some((s, 0.0))
+            } else if let Some(m) = d.try_cast::<rhai::Map>() {
+                let kw = m.get("keyword")?.clone().into_string().ok()?;
+                let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
+                Some((kw, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let top_blocks: Vec<(String, f32, String)> = map
+        .get("top_blocks")
+        .and_then(|v| v.clone().into_array().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| {
+            let m = d.try_cast::<rhai::Map>()?;
+            let id = m.get("id")?.clone().into_string().ok()?;
+            let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
+            let preview = m.get("preview").and_then(|v| v.clone().into_string().ok()).unwrap_or_default();
+            Some((id, score, preview))
+        })
+        .collect();
+
+    let synth = kaijutsu_index::synthesis::SynthesisResult {
+        keywords,
+        top_blocks,
+        content_hash: String::new(),
+    };
+
+    tracing::debug!(
+        ctx = %ctx_id.short(),
+        keywords = synth.keywords.len(),
+        blocks = synth.top_blocks.len(),
+        "synthesis complete"
+    );
+
+    Some(synth)
+}
+
+/// Run synthesis and cache the result. Convenience wrapper for the watcher callback.
+pub fn run_synthesis_and_cache(
+    ctx_id: ContextId,
+    embedder: Arc<dyn Embedder>,
+    block_source: Arc<dyn BlockSource>,
+    cache: &kaijutsu_index::synthesis::SynthesisCache,
+) {
+    if let Some(synth) = run_synthesis(ctx_id, embedder, block_source) {
+        cache.insert(ctx_id, synth);
+    }
+}
+
+/// Load synthesis.rhai from user config dir, falling back to embedded default.
+pub fn load_synthesis_script() -> String {
+    if let Some(config_dir) = dirs_config_path() {
+        let user_script = config_dir.join("synthesis.rhai");
+        if user_script.exists() {
+            match std::fs::read_to_string(&user_script) {
+                Ok(s) => return s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %user_script.display(),
+                        "failed to read user synthesis.rhai, using default"
+                    );
+                }
+            }
+        }
+    }
+    DEFAULT_SYNTHESIS_RHAI.to_string()
+}
+
+/// Get the kaijutsu config directory (~/.config/kaijutsu).
+fn dirs_config_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|d| d.join("kaijutsu"))
 }
 
 // ============================================================================

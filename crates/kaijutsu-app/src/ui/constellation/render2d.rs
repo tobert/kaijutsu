@@ -19,8 +19,8 @@ use crate::text::truncate_chars;
 use crate::ui::screen::Screen;
 use crate::ui::theme::{agent_color_for_provider, Theme};
 
-/// Card height estimate for positioning (3 text lines + padding).
-const CARD_HEIGHT: f32 = 75.0;
+/// Card height estimate for positioning (4 text lines + padding).
+const CARD_HEIGHT: f32 = 105.0;
 /// Vertical center fraction for card positioning (slightly below center for visual comfort).
 const CAROUSEL_VERTICAL_CENTER: f32 = 0.55;
 /// Corner radius for card background.
@@ -203,7 +203,7 @@ fn spawn_card(
                             style: crate::text::vello_style(
                                 &font_handles.mono,
                                 theme.fg,
-                                12.0,
+                                16.0,
                             ),
                             ..default()
                         },
@@ -218,7 +218,7 @@ fn spawn_card(
                             style: crate::text::vello_style(
                                 &font_handles.mono,
                                 theme.fg_dim,
-                                10.0,
+                                13.0,
                             ),
                             ..default()
                         },
@@ -233,22 +233,22 @@ fn spawn_card(
                             style: crate::text::vello_style(
                                 &font_handles.mono,
                                 theme.fg_dim,
-                                9.0,
+                                11.0,
                             ),
                             ..default()
                         },
                         Node::default(),
                     ));
 
-                    // Keywords (only visible when non-empty)
+                    // Keywords — accent-tinted so they read as semantic tags
                     content.spawn((
                         CardKeywordsText,
                         UiVelloText {
                             value: String::new(),
                             style: crate::text::vello_style(
                                 &font_handles.mono,
-                                theme.fg_dim,
-                                9.0,
+                                theme.accent.with_alpha(0.7),
+                                12.0,
                             ),
                             ..default()
                         },
@@ -425,7 +425,7 @@ fn update_card_visuals(
                         text.style = crate::text::vello_style(
                             &font_handles.mono,
                             if is_focused { theme.fg } else if node.joined { theme.fg } else { theme.fg_dim },
-                            12.0,
+                            16.0,
                         );
                     }
                 }
@@ -573,13 +573,15 @@ fn card_model_text(node: &super::ContextNode) -> String {
     }
 }
 
-/// Keywords display text for a card: comma-separated, truncated.
+/// Keywords display text for a card: top 4, dot-separated.
 fn card_keywords_text(node: &super::ContextNode) -> String {
     if node.keywords.is_empty() {
         return String::new();
     }
-    let joined = node.keywords.join(", ");
-    truncate_chars(&joined, 30)
+    // Keywords arrive sorted by relevance (KeyBERT cosine score); take top 4
+    let top: Vec<&str> = node.keywords.iter().take(4).map(|s| s.as_str()).collect();
+    let joined = top.join(" · ");
+    truncate_chars(&joined, 36)
 }
 
 /// Format recency as a human-readable relative time.
